@@ -118,6 +118,8 @@ pub struct AppSettings {
     pub max_upload_speed: u64,
     pub max_download_speed: u64,
     pub max_concurrent_downloads: u32,
+    #[serde(default = "default_max_uploads")]
+    pub max_concurrent_uploads: u32,
     pub tcp_port: u16,
     pub udp_port: u16,
     pub nodes_dat_path: String,
@@ -138,6 +140,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_max_uploads() -> u32 {
+    5
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         let download_dir = directories::UserDirs::new()
@@ -151,6 +157,7 @@ impl Default for AppSettings {
             max_upload_speed: 0,
             max_download_speed: 0,
             max_concurrent_downloads: 5,
+            max_concurrent_uploads: 5,
             tcp_port: DEFAULT_TCP_PORT,
             udp_port: DEFAULT_UDP_PORT,
             nodes_dat_path: String::new(),

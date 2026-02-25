@@ -63,6 +63,7 @@ export interface AppSettings {
   max_upload_speed: number;
   max_download_speed: number;
   max_concurrent_downloads: number;
+  max_concurrent_uploads: number;
   tcp_port: number;
   udp_port: number;
   nodes_dat_path: string;
