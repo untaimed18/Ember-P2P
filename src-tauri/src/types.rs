@@ -78,6 +78,7 @@ pub struct NetworkStats {
     pub firewalled: bool,
     pub buddy_status: String,
     pub upnp_mapped: bool,
+    pub stores_acknowledged: u32,
 }
 
 impl Default for NetworkStats {
@@ -93,6 +94,7 @@ impl Default for NetworkStats {
             firewalled: true,
             buddy_status: String::from("none"),
             upnp_mapped: false,
+            stores_acknowledged: 0,
         }
     }
 }

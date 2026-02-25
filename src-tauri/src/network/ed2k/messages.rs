@@ -38,6 +38,10 @@ pub const OP_HASHSETANSWER: u8 = 0x52;
 // Legacy opcodes (OP_EDONKEYHEADER)
 pub const OP_QUEUERANK: u8 = 0x5C;
 
+// Source exchange opcodes (OP_EMULEPROT)
+pub const OP_REQUESTSOURCES: u8 = 0x81;
+pub const OP_ANSWERSOURCES2: u8 = 0x83;
+
 // Constants
 pub const EMBLOCKSIZE: u64 = 184_320;
 pub const PARTSIZE: u64 = 9_728_000;

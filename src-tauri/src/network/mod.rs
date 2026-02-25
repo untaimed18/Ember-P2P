@@ -1096,6 +1096,20 @@ async fn handle_udp_packet(
     }
 
     match msg {
+        KadMessage::BootstrapReq => {
+            debug!("BootstrapReq from {from}");
+            let contacts = state.routing_table.find_closest(&state.local_id, 20);
+            let res = KadMessage::BootstrapRes {
+                sender_id: state.local_id,
+                tcp_port: state.tcp_port,
+                version: KADEMLIA_VERSION,
+                contacts,
+            };
+            if let Ok(packet) = messages::encode_packet(&res) {
+                let _ = socket.send_to(&packet, from).await;
+            }
+        }
+
         KadMessage::BootstrapRes {
             sender_id,
             tcp_port,
@@ -1127,12 +1141,15 @@ async fn handle_udp_packet(
                 last_type_set: 0,
             });
 
+            let mut contact_addrs = Vec::new();
             for c in contacts {
+                let addr = SocketAddr::new(c.ip.into(), c.udp_port);
+                contact_addrs.push(addr);
                 state.routing_table.insert(c);
             }
 
-            // Send hello to the bootstrap node with our options
-            let our_options: u8 = if state.firewalled { 0x05 } else { 0x04 }; // bit 2 = request ACK
+            // Build HelloReq to send to bootstrap node and all returned contacts
+            let our_options: u8 = if state.firewalled { 0x05 } else { 0x04 };
             let mut hello_tags = vec![
                 KadTag {
                     name: TagName::Id(TAG_KADMISCOPTIONS),
@@ -1153,6 +1170,11 @@ async fn handle_udp_packet(
             };
             if let Ok(packet) = messages::encode_packet(&hello) {
                 let _ = socket.send_to(&packet, from).await;
+                // Also send HelloReq to all returned contacts to verify them
+                for addr in &contact_addrs {
+                    let _ = socket.send_to(&packet, addr).await;
+                }
+                debug!("Sent HelloReq to bootstrap node + {} returned contacts", contact_addrs.len());
             }
 
             info!(
@@ -1601,7 +1623,11 @@ async fn handle_udp_packet(
         }
 
         KadMessage::PublishResAck => {
-            debug!("PublishResAck from {from}");
+            state.stats.stores_acknowledged += 1;
+            debug!(
+                "PublishResAck from {from} (total stores acked: {})",
+                state.stats.stores_acknowledged
+            );
         }
 
         KadMessage::FirewalledReq { tcp_port: peer_tcp_port } => {
@@ -1802,9 +1828,6 @@ async fn handle_udp_packet(
             }
         }
 
-        other => {
-            info!("Unhandled KAD message from {from}: {:?}", std::mem::discriminant(&other));
-        }
     }
 }
 

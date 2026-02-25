@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::bandwidth::limiter::BandwidthLimiter;
 use crate::sharing::manager::TransferControl;
@@ -124,6 +124,9 @@ impl MultiSourceDownload {
             part_idx += 1;
         }
 
+        // Shared part hashes for per-part verification (populated by first source)
+        let part_hashes: Arc<RwLock<Vec<[u8; 16]>>> = Arc::new(RwLock::new(Vec::new()));
+
         // Progress aggregator channel
         let (progress_tx, mut progress_rx) = mpsc::channel::<(usize, u64)>(256);
         let transfer_id = self.transfer_id.clone();
@@ -162,6 +165,7 @@ impl MultiSourceDownload {
             let udp_port = self.udp_port;
             let bw = self.bandwidth_limiter.clone();
             let progress_tx = progress_tx.clone();
+            let ph = part_hashes.clone();
 
             let handle = tokio::spawn(async move {
                 let result = download_parts_from_source(
@@ -178,6 +182,7 @@ impl MultiSourceDownload {
                     udp_port,
                     bw,
                     progress_tx,
+                    ph,
                 )
                 .await;
 
@@ -193,22 +198,95 @@ impl MultiSourceDownload {
         drop(progress_tx);
 
         // Wait for all sources to complete
-        let mut failed_parts: Vec<usize> = Vec::new();
         for handle in handles {
-            if let Ok((_src_idx, parts, result)) = handle.await {
+            if let Ok((_src_idx, _parts, result)) = handle.await {
                 if result.is_err() {
-                    // Collect parts that this failed source was responsible for
-                    let t = tracker.read().await;
-                    for p in parts {
-                        if !t.is_part_complete(p) {
-                            failed_parts.push(p);
-                        }
-                    }
+                    // Parts from failed sources remain incomplete in tracker
                 }
             }
         }
 
         aggregator.await?;
+
+        // Retry incomplete parts (from failed sources or hash mismatches)
+        const MAX_RETRY_ROUNDS: usize = 3;
+        for retry_round in 1..=MAX_RETRY_ROUNDS {
+            let incomplete: Vec<usize> = {
+                let t = tracker.read().await;
+                (0..t.part_count)
+                    .filter(|&i| !t.is_part_complete(i))
+                    .collect()
+            };
+            if incomplete.is_empty() {
+                break;
+            }
+
+            warn!(
+                "Retry round {}/{}: {} incomplete parts",
+                retry_round,
+                MAX_RETRY_ROUNDS,
+                incomplete.len()
+            );
+
+            // Distribute incomplete parts across all sources round-robin
+            let mut retry_assignments: Vec<Vec<usize>> =
+                vec![Vec::new(); self.sources.len()];
+            for (i, &part_idx) in incomplete.iter().enumerate() {
+                retry_assignments[i % self.sources.len()].push(part_idx);
+            }
+
+            let (retry_tx, mut retry_rx) = mpsc::channel::<(usize, u64)>(256);
+            let tid = self.transfer_id.clone();
+            let fs = self.file_size;
+            let etx = event_tx.clone();
+            let retry_agg = tokio::spawn(async move {
+                let mut total: u64 = 0;
+                while let Some((_, bytes)) = retry_rx.recv().await {
+                    total += bytes;
+                    let _ = etx
+                        .send(DownloadEvent::Progress {
+                            transfer_id: tid.clone(),
+                            downloaded: total,
+                            total: fs,
+                        })
+                        .await;
+                }
+            });
+
+            let mut retry_handles = Vec::new();
+            for (src_idx, parts) in retry_assignments.into_iter().enumerate() {
+                if parts.is_empty() {
+                    continue;
+                }
+                let source = self.sources[src_idx].clone();
+                let tracker = tracker.clone();
+                let part_path = part_path.clone();
+                let file_hash = self.file_hash;
+                let file_size = self.file_size;
+                let user_hash = self.user_hash;
+                let nickname = self.nickname.clone();
+                let tcp_port = self.tcp_port;
+                let udp_port = self.udp_port;
+                let bw = self.bandwidth_limiter.clone();
+                let retry_tx = retry_tx.clone();
+                let ph = part_hashes.clone();
+
+                retry_handles.push(tokio::spawn(async move {
+                    let _ = download_parts_from_source(
+                        src_idx, &source, &parts, tracker, &part_path,
+                        &file_hash, file_size, &user_hash, &nickname,
+                        tcp_port, udp_port, bw, retry_tx, ph,
+                    )
+                    .await;
+                }));
+            }
+
+            drop(retry_tx);
+            for h in retry_handles {
+                let _ = h.await;
+            }
+            retry_agg.await?;
+        }
 
         // Check if all parts are complete
         let all_done = {
@@ -251,10 +329,14 @@ impl MultiSourceDownload {
                 })
                 .await;
         } else {
+            let remaining = {
+                let t = tracker.read().await;
+                t.part_count - t.completed_count()
+            };
             let _ = event_tx
                 .send(DownloadEvent::Failed {
                     transfer_id: self.transfer_id.clone(),
-                    error: format!("{} parts still incomplete", failed_parts.len()),
+                    error: format!("{remaining} parts still incomplete after retries"),
                 })
                 .await;
         }
@@ -277,6 +359,7 @@ async fn download_parts_from_source(
     udp_port: u16,
     bw: Arc<BandwidthLimiter>,
     progress_tx: mpsc::Sender<(usize, u64)>,
+    shared_part_hashes: Arc<RwLock<Vec<[u8; 16]>>>,
 ) -> anyhow::Result<()> {
     use super::messages::*;
     use flate2::read::ZlibDecoder;
@@ -319,6 +402,38 @@ async fn download_parts_from_source(
         }
         if proto == OP_EDONKEYHEADER && opcode == OP_FILESTATUS {
             break;
+        }
+    }
+
+    // Request part hashset if not already populated (first source to connect does this)
+    {
+        let existing = shared_part_hashes.read().await;
+        if existing.is_empty() {
+            drop(existing);
+            let hashset_req = build_hashset_request(file_hash);
+            write_packet_async_ms(
+                &mut writer,
+                OP_EDONKEYHEADER,
+                OP_HASHSETREQ,
+                &hashset_req,
+            )
+            .await?;
+            match read_packet_timeout_ms(&mut reader).await {
+                Ok((proto, opcode, payload))
+                    if proto == OP_EDONKEYHEADER && opcode == OP_HASHSETANSWER =>
+                {
+                    if let Ok((_h, hashes)) = parse_hashset_answer(&payload) {
+                        debug!("Got hashset with {} part hashes from source {}", hashes.len(), _src_idx);
+                        let mut ph = shared_part_hashes.write().await;
+                        if ph.is_empty() {
+                            *ph = hashes;
+                        }
+                    }
+                }
+                _ => {
+                    debug!("No hashset answer from source {} (peer may not support it)", _src_idx);
+                }
+            }
         }
     }
 
@@ -423,10 +538,48 @@ async fn download_parts_from_source(
             part_offset = chunk_end;
         }
 
-        // Mark part complete
+        // Verify part hash before marking complete
+        let hash_ok = {
+            let ph = shared_part_hashes.read().await;
+            if part_idx < ph.len() {
+                let expected_hash = ph[part_idx];
+                let t = tracker.read().await;
+                let (ps, pe) = t.part_range(part_idx);
+                let part_len = (pe - ps) as usize;
+                drop(t);
+
+                output.seek(std::io::SeekFrom::Start(ps))?;
+                let mut part_data = vec![0u8; part_len];
+                output.read_exact(&mut part_data)?;
+
+                use digest::Digest;
+                use md4::Md4;
+                let actual_hash: [u8; 16] = Md4::digest(&part_data).into();
+
+                if actual_hash != expected_hash {
+                    warn!(
+                        "Multi-source part {} hash mismatch from source {}! expected={} got={}",
+                        part_idx, _src_idx,
+                        hex::encode(expected_hash),
+                        hex::encode(actual_hash)
+                    );
+                    false
+                } else {
+                    debug!("Multi-source part {} hash verified OK (source {})", part_idx, _src_idx);
+                    true
+                }
+            } else {
+                true // no hashset available, assume OK
+            }
+        };
+
         {
             let mut t = tracker.write().await;
-            t.mark_complete(part_idx);
+            if hash_ok {
+                t.mark_complete(part_idx);
+            } else {
+                t.mark_incomplete(part_idx);
+            }
             t.save();
         }
     }

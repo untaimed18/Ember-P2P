@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{Read as _, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -50,6 +51,7 @@ struct UploadServer {
     udp_port: u16,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
+    upload_queue: Arc<tokio::sync::Mutex<VecDeque<SocketAddr>>>,
 }
 
 pub async fn start_upload_server(
@@ -68,6 +70,7 @@ pub async fn start_upload_server(
     info!("ED2K TCP upload server listening on port {tcp_port}");
 
     let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upload_queue = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
 
     let server = Arc::new(UploadServer {
         local_index,
@@ -80,6 +83,7 @@ pub async fn start_upload_server(
         udp_port,
         active_count,
         upload_event_tx,
+        upload_queue,
     });
 
     loop {
@@ -232,12 +236,31 @@ impl UploadServer {
                         .active_count
                         .load(std::sync::atomic::Ordering::Relaxed);
 
-                    if current_active >= MAX_CONCURRENT_UPLOADS {
-                        // Send queue ranking
-                        let rank = (current_active - MAX_CONCURRENT_UPLOADS + 1) as u16;
+                    let should_accept = if current_active >= MAX_CONCURRENT_UPLOADS {
+                        false
+                    } else {
+                        let mut queue = self.upload_queue.lock().await;
+                        if queue.is_empty() {
+                            true
+                        } else if queue.front() == Some(&peer_addr) {
+                            queue.pop_front();
+                            true
+                        } else {
+                            false
+                        }
+                    };
+
+                    if !should_accept {
+                        let mut queue = self.upload_queue.lock().await;
+                        let rank = if let Some(pos) = queue.iter().position(|a| *a == peer_addr) {
+                            (pos + 1) as u16
+                        } else {
+                            queue.push_back(peer_addr);
+                            queue.len() as u16
+                        };
+                        drop(queue);
                         let mut qr_payload = Vec::with_capacity(12);
                         qr_payload.extend_from_slice(&rank.to_le_bytes());
-                        // Pad to 12 bytes (eMule expects this for extended QR)
                         qr_payload.resize(12, 0);
                         write_packet_async(
                             &mut writer,
@@ -458,12 +481,33 @@ impl UploadServer {
                     }
                 }
 
+                (OP_EMULEPROT, OP_REQUESTSOURCES) => {
+                    if let Some(hash) = current_file_hash {
+                        let mut resp = Vec::with_capacity(18);
+                        resp.extend_from_slice(&hash);
+                        resp.extend_from_slice(&0u16.to_le_bytes()); // 0 sources
+                        write_packet_async(
+                            &mut writer,
+                            OP_EMULEPROT,
+                            OP_ANSWERSOURCES2,
+                            &resp,
+                        )
+                        .await?;
+                    }
+                }
+
                 _ => {
                     debug!(
                         "Upload server ignoring proto=0x{proto:02X} op=0x{opcode:02X} from {peer_addr}"
                     );
                 }
             }
+        }
+
+        // Remove from upload queue on disconnect
+        {
+            let mut queue = self.upload_queue.lock().await;
+            queue.retain(|a| *a != peer_addr);
         }
 
         // Cleanup: emit completion/failure for any tracked upload

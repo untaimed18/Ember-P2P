@@ -5,21 +5,52 @@ node_modules/
 build/
 dist/
 .svelte-kit/
+out/
 
 # Rust build
 src-tauri/target/
+
+# Tauri generated files
+src-tauri/gen/schemas
+
+# Lockfiles (keep package-lock.json, ignore Cargo.lock for apps is optional)
+# Cargo.lock is typically committed for applications, so it stays
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*.sublime-project
+*.sublime-workspace
 
 # OS
 Thumbs.db
 .DS_Store
+Desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
 
 # Environment
 .env
 .env.*
 !.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# P2P app data (nodes.dat, downloaded .part files, etc.)
+*.part
+*.part.met
+nodes.dat
+
+# Rust / Cargo extras
+**/*.rs.bk
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*

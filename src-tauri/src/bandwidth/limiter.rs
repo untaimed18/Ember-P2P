@@ -86,15 +86,27 @@ impl BandwidthLimiter {
         }
     }
 
-    pub fn refill_tokens(&self) {
+    /// Add a fraction of the rate limit worth of tokens (called at sub-second intervals).
+    /// Tokens are capped at the max rate to prevent bursting after idle periods.
+    pub fn refill_tokens_incremental(&self, fraction: u64, divisor: u64) {
         let max_up = self.max_upload_rate.load(Ordering::Relaxed);
         let max_down = self.max_download_rate.load(Ordering::Relaxed);
 
         if max_up > 0 {
-            self.upload_tokens.store(max_up, Ordering::Relaxed);
+            let add = (max_up * fraction / divisor).max(1);
+            let prev = self.upload_tokens.fetch_add(add, Ordering::Relaxed);
+            let new_val = prev + add;
+            if new_val > max_up {
+                self.upload_tokens.store(max_up, Ordering::Relaxed);
+            }
         }
         if max_down > 0 {
-            self.download_tokens.store(max_down, Ordering::Relaxed);
+            let add = (max_down * fraction / divisor).max(1);
+            let prev = self.download_tokens.fetch_add(add, Ordering::Relaxed);
+            let new_val = prev + add;
+            if new_val > max_down {
+                self.download_tokens.store(max_down, Ordering::Relaxed);
+            }
         }
     }
 
@@ -126,21 +138,29 @@ impl BandwidthLimiter {
 }
 
 pub async fn start_token_refill(limiter: std::sync::Arc<BandwidthLimiter>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    const REFILL_INTERVAL_MS: u64 = 100;
+    const TICKS_PER_SECOND: u64 = 1000 / REFILL_INTERVAL_MS;
+
+    let mut interval = tokio::time::interval(Duration::from_millis(REFILL_INTERVAL_MS));
     let mut last_uploaded = limiter.total_uploaded();
     let mut last_downloaded = limiter.total_downloaded();
+    let mut speed_tick_count: u64 = 0;
 
     loop {
         interval.tick().await;
-        limiter.refill_tokens();
+        limiter.refill_tokens_incremental(1, TICKS_PER_SECOND);
 
-        let current_up = limiter.total_uploaded();
-        let current_down = limiter.total_downloaded();
-        limiter.update_speeds(
-            current_up.saturating_sub(last_uploaded),
-            current_down.saturating_sub(last_downloaded),
-        );
-        last_uploaded = current_up;
-        last_downloaded = current_down;
+        speed_tick_count += 1;
+        if speed_tick_count >= TICKS_PER_SECOND {
+            speed_tick_count = 0;
+            let current_up = limiter.total_uploaded();
+            let current_down = limiter.total_downloaded();
+            limiter.update_speeds(
+                current_up.saturating_sub(last_uploaded),
+                current_down.saturating_sub(last_downloaded),
+            );
+            last_uploaded = current_up;
+            last_downloaded = current_down;
+        }
     }
 }

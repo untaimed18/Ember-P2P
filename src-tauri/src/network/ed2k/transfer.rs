@@ -331,124 +331,153 @@ impl Ed2kDownload {
             })
             .sum();
 
-        // Download needed parts
-        let needed = tracker.needed_parts(&available_parts);
-        for part_idx in needed {
-            self.check_control().await?;
+        // Download needed parts with retry for hash-failed parts
+        const MAX_PART_RETRIES: usize = 3;
+        for retry_round in 0..=MAX_PART_RETRIES {
+            let needed = tracker.needed_parts(&available_parts);
+            if needed.is_empty() {
+                break;
+            }
+            if retry_round > 0 {
+                warn!(
+                    "Retry round {}/{} for {} hash-failed parts",
+                    retry_round, MAX_PART_RETRIES, needed.len()
+                );
+            }
 
-            let (part_start, part_end) = tracker.part_range(part_idx);
-            let mut part_offset = part_start;
-
-            while part_offset < part_end {
+            for part_idx in needed {
                 self.check_control().await?;
 
-                let chunk_end = (part_offset + EMBLOCKSIZE).min(part_end);
-                let offsets = vec![(part_offset, chunk_end)];
-                let req_payload = build_request_parts_i64(&self.file_hash, &offsets);
-                write_packet_async(&mut writer, OP_EMULEPROT, OP_REQUESTPARTS_I64, &req_payload)
+                let (part_start, part_end) = tracker.part_range(part_idx);
+                let mut part_offset = part_start;
+
+                while part_offset < part_end {
+                    self.check_control().await?;
+
+                    let chunk_end = (part_offset + EMBLOCKSIZE).min(part_end);
+                    let offsets = vec![(part_offset, chunk_end)];
+                    let req_payload = build_request_parts_i64(&self.file_hash, &offsets);
+                    write_packet_async(
+                        &mut writer,
+                        OP_EMULEPROT,
+                        OP_REQUESTPARTS_I64,
+                        &req_payload,
+                    )
                     .await?;
 
-                let mut chunk_received = 0u64;
-                let expected = chunk_end - part_offset;
+                    let mut chunk_received = 0u64;
+                    let expected = chunk_end - part_offset;
 
-                while chunk_received < expected {
-                    let (proto, opcode, payload) = read_packet_with_timeout(&mut reader).await?;
+                    while chunk_received < expected {
+                        let (proto, opcode, payload) =
+                            read_packet_with_timeout(&mut reader).await?;
 
-                    match (proto, opcode) {
-                        (OP_EMULEPROT, OP_SENDINGPART_I64) | (OP_EDONKEYHEADER, OP_SENDINGPART) => {
-                            let (_hash, start, end, data) = if opcode == OP_SENDINGPART_I64 {
-                                parse_sending_part_i64(&payload)?
-                            } else {
-                                parse_sending_part_32(&payload)?
-                            };
+                        match (proto, opcode) {
+                            (OP_EMULEPROT, OP_SENDINGPART_I64)
+                            | (OP_EDONKEYHEADER, OP_SENDINGPART) => {
+                                let (_hash, start, end, data) =
+                                    if opcode == OP_SENDINGPART_I64 {
+                                        parse_sending_part_i64(&payload)?
+                                    } else {
+                                        parse_sending_part_32(&payload)?
+                                    };
 
-                            let piece_len = end - start;
-                            self.acquire_download_bandwidth(piece_len).await;
+                                let piece_len = end - start;
+                                self.acquire_download_bandwidth(piece_len).await;
 
-                            output.seek(std::io::SeekFrom::Start(start))?;
-                            output.write_all(data)?;
+                                output.seek(std::io::SeekFrom::Start(start))?;
+                                output.write_all(data)?;
 
-                            chunk_received += piece_len;
-                            downloaded += piece_len;
+                                chunk_received += piece_len;
+                                downloaded += piece_len;
 
-                            let _ = event_tx
-                                .send(DownloadEvent::Progress {
-                                    transfer_id: self.transfer_id.clone(),
-                                    downloaded,
-                                    total: self.file_size,
-                                })
-                                .await;
-                        }
-                        (OP_EMULEPROT, OP_COMPRESSEDPART_I64)
-                        | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
-                            let (_hash, start, _packed_len, compressed) =
-                                parse_compressed_part_i64(&payload)?;
+                                let _ = event_tx
+                                    .send(DownloadEvent::Progress {
+                                        transfer_id: self.transfer_id.clone(),
+                                        downloaded,
+                                        total: self.file_size,
+                                    })
+                                    .await;
+                            }
+                            (OP_EMULEPROT, OP_COMPRESSEDPART_I64)
+                            | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
+                                let (_hash, start, _packed_len, compressed) =
+                                    parse_compressed_part_i64(&payload)?;
 
-                            let mut decoder = ZlibDecoder::new(compressed);
-                            let mut decompressed = Vec::new();
-                            decoder.read_to_end(&mut decompressed)?;
+                                let mut decoder = ZlibDecoder::new(compressed);
+                                let mut decompressed = Vec::new();
+                                decoder.read_to_end(&mut decompressed)?;
 
-                            let piece_len = decompressed.len() as u64;
-                            self.acquire_download_bandwidth(piece_len).await;
+                                let piece_len = decompressed.len() as u64;
+                                self.acquire_download_bandwidth(piece_len).await;
 
-                            output.seek(std::io::SeekFrom::Start(start))?;
-                            output.write_all(&decompressed)?;
+                                output.seek(std::io::SeekFrom::Start(start))?;
+                                output.write_all(&decompressed)?;
 
-                            chunk_received += piece_len;
-                            downloaded += piece_len;
+                                chunk_received += piece_len;
+                                downloaded += piece_len;
 
-                            let _ = event_tx
-                                .send(DownloadEvent::Progress {
-                                    transfer_id: self.transfer_id.clone(),
-                                    downloaded,
-                                    total: self.file_size,
-                                })
-                                .await;
-                        }
-                        (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
-                            warn!("Peer ran out of part requests");
-                            break;
-                        }
-                        _ => {
-                            debug!("During download, ignoring proto=0x{proto:02X} op=0x{opcode:02X}");
+                                let _ = event_tx
+                                    .send(DownloadEvent::Progress {
+                                        transfer_id: self.transfer_id.clone(),
+                                        downloaded,
+                                        total: self.file_size,
+                                    })
+                                    .await;
+                            }
+                            (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
+                                warn!("Peer ran out of part requests");
+                                break;
+                            }
+                            _ => {
+                                debug!(
+                                    "During download, ignoring proto=0x{proto:02X} op=0x{opcode:02X}"
+                                );
+                            }
                         }
                     }
+
+                    part_offset = chunk_end;
                 }
 
-                part_offset = chunk_end;
-            }
+                // Verify part hash if we have the hashset
+                if part_idx < part_hashes.len() {
+                    let expected_hash = part_hashes[part_idx];
+                    let (ps, pe) = tracker.part_range(part_idx);
+                    let part_len = (pe - ps) as usize;
 
-            // Verify part hash if we have the hashset
-            if part_idx < part_hashes.len() {
-                let expected_hash = part_hashes[part_idx];
-                let (ps, pe) = tracker.part_range(part_idx);
-                let part_len = (pe - ps) as usize;
+                    output.seek(std::io::SeekFrom::Start(ps))?;
+                    let mut part_data = vec![0u8; part_len];
+                    output.read_exact(&mut part_data)?;
 
-                // Read the part back from disk for verification
-                output.seek(std::io::SeekFrom::Start(ps))?;
-                let mut part_data = vec![0u8; part_len];
-                output.read_exact(&mut part_data)?;
+                    use digest::Digest;
+                    use md4::Md4;
+                    let actual_hash: [u8; 16] = Md4::digest(&part_data).into();
 
-                use digest::Digest;
-                use md4::Md4;
-                let actual_hash: [u8; 16] = Md4::digest(&part_data).into();
-
-                if actual_hash != expected_hash {
-                    warn!(
-                        "Part {} hash mismatch! expected={} got={}",
-                        part_idx,
-                        hex::encode(expected_hash),
-                        hex::encode(actual_hash)
-                    );
-                    tracker.mark_incomplete(part_idx);
-                    tracker.save();
-                    continue;
+                    if actual_hash != expected_hash {
+                        warn!(
+                            "Part {} hash mismatch! expected={} got={}",
+                            part_idx,
+                            hex::encode(expected_hash),
+                            hex::encode(actual_hash)
+                        );
+                        tracker.mark_incomplete(part_idx);
+                        tracker.save();
+                        continue;
+                    }
+                    debug!("Part {} hash verified OK", part_idx);
                 }
-                debug!("Part {} hash verified OK", part_idx);
-            }
 
-            tracker.mark_complete(part_idx);
-            tracker.save();
+                tracker.mark_complete(part_idx);
+                tracker.save();
+            }
+        }
+
+        if !tracker.all_complete() {
+            let remaining = tracker.part_count - tracker.completed_count();
+            anyhow::bail!(
+                "{remaining} parts still failing hash verification after {MAX_PART_RETRIES} retries"
+            );
         }
 
         output.flush()?;
