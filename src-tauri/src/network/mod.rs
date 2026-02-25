@@ -121,10 +121,14 @@ struct NetworkState {
     publish_confirmed: u32,
     /// Store-keyword searches: search_id -> (file PublishableFile, keyword publish messages)
     store_keyword_searches: HashMap<SearchId, (PublishableFile, Vec<(KadId, KadMessage)>)>,
+    /// Store-source searches: search_id -> (file_hash, publish message)
+    store_source_searches: HashMap<SearchId, (KadId, KadMessage)>,
     /// Pending notes searches: search_id -> response sender
     pending_notes_searches: HashMap<SearchId, oneshot::Sender<Vec<SearchResult>>>,
     /// Pending note publishes: search_id -> (file_hash, rating, comment)
     pending_note_publishes: HashMap<SearchId, (KadId, u8, String)>,
+    /// Nodes that reported load=100 -- avoid publishing to them for a while
+    overloaded_nodes: HashMap<Ipv4Addr, i64>,
     flood_protection: FloodProtection,
     buddy_manager: BuddyManager,
     /// Our UDP verification key seed (random, stable for session)
@@ -334,8 +338,10 @@ pub async fn start_network(
         publish_pending: HashMap::new(),
         publish_confirmed: 0,
         store_keyword_searches: HashMap::new(),
+        store_source_searches: HashMap::new(),
         pending_notes_searches: HashMap::new(),
         pending_note_publishes: HashMap::new(),
+        overloaded_nodes: HashMap::new(),
         flood_protection: FloodProtection::new(),
         buddy_manager,
         udp_key_seed,
@@ -545,10 +551,12 @@ pub async fn start_network(
                 if !queries.is_empty() {
                     info!("Search poll: sending {} queries", queries.len());
                 }
-                for (sid, addr, msg) in &queries {
-                    info!("  Search {}: sending {:?} to {}", sid.0, std::mem::discriminant(msg), addr);
+                for (_sid, addr, msg) in &queries {
+                    if state.flood_protection.check_outgoing_rate(addr.ip()) {
+                        debug!("Throttling outgoing packet to {addr}");
+                        continue;
+                    }
                     if let Ok(packet) = messages::encode_packet(msg) {
-                        // Track outgoing request for flood protection validation
                         let opcode = packet.get(1).copied().unwrap_or(0);
                         state.flood_protection.track_request(*addr, opcode);
                         let _ = udp_socket.send_to(&packet, addr).await;
@@ -722,7 +730,10 @@ pub async fn start_network(
                             let now = chrono::Utc::now().timestamp();
                             let mut sent_any = false;
                             for (kw_hash, msg) in &kw_publishes {
-                                for contact in search.closest.iter().take(3) {
+                                for contact in search.closest.iter()
+                                    .filter(|c| !state.overloaded_nodes.contains_key(&c.ip))
+                                    .take(3)
+                                {
                                     let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                                     if let Ok(packet) = messages::encode_packet(msg) {
                                         let _ = udp_socket.send_to(&packet, addr).await;
@@ -736,6 +747,26 @@ pub async fn start_network(
                                     "StoreKeyword search {} completed: published {} keywords to {} closest nodes",
                                     sid.0, kw_publishes.len(), search.closest.len().min(3)
                                 );
+                            }
+                        }
+                    } else if let Some((file_hash, msg)) = state.store_source_searches.remove(&sid) {
+                        // StoreSource search completed - send source publish to closest nodes
+                        if let Some(search) = state.search_manager.get(&sid) {
+                            let now = chrono::Utc::now().timestamp();
+                            let mut sent = 0;
+                            for contact in search.closest.iter()
+                                .filter(|c| !state.overloaded_nodes.contains_key(&c.ip))
+                                .take(3)
+                            {
+                                let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                                if let Ok(packet) = messages::encode_packet(&msg) {
+                                    let _ = udp_socket.send_to(&packet, addr).await;
+                                    sent += 1;
+                                }
+                            }
+                            if sent > 0 {
+                                state.publish_pending.insert(file_hash, (file_hash, now, true));
+                                info!("StoreSource search {} completed: published source to {} closest nodes", sid.0, sent);
                             }
                         }
                     } else if let Some((file_hash, rating, comment)) = state.pending_note_publishes.remove(&sid) {
@@ -837,35 +868,29 @@ pub async fn start_network(
                 if state.routing_table.is_empty() {
                     debug!("Skipping publish cycle: routing table is empty");
                 } else {
-                let now = chrono::Utc::now().timestamp();
+                // Limit publishes per cycle to avoid flooding peers
+                const MAX_SOURCE_PUBLISHES_PER_CYCLE: usize = 3;
+                const MAX_KEYWORD_PUBLISHES_PER_CYCLE: usize = 2;
 
                 let source_files = state.publish_manager.files_needing_source_publish()
-                    .into_iter().cloned().collect::<Vec<_>>();
+                    .into_iter().take(MAX_SOURCE_PUBLISHES_PER_CYCLE).cloned().collect::<Vec<_>>();
                 for file in &source_files {
                     let msg = state.publish_manager.build_source_publish(file);
-                    // Prefer verified, non-firewalled contacts for publishing
-                    let mut closest = state.routing_table.find_closest_verified(&file.file_hash, K_BUCKET_SIZE);
-                    if closest.is_empty() {
-                        closest = state.routing_table.find_closest(&file.file_hash, K_BUCKET_SIZE);
-                    }
-                    // Sort non-firewalled contacts first
-                    closest.sort_by_key(|c| c.is_udp_firewalled() as u8);
-                    let mut sent = false;
-                    for contact in closest.iter().take(3) {
-                        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-                        if let Ok(packet) = messages::encode_packet(&msg) {
-                            let _ = udp_socket.send_to(&packet, addr).await;
-                            sent = true;
-                        }
-                    }
-                    if sent {
-                        state.publish_pending.insert(file.file_hash, (file.file_hash, now, true));
+                    let closest = state.routing_table.find_closest(&file.file_hash, K_BUCKET_SIZE);
+                    if !closest.is_empty() {
+                        // Use iterative search to find truly closest nodes before publishing
+                        let sid = state.search_manager.start_search(
+                            file.file_hash,
+                            SearchType::StoreKeyword, // reuse STORE type for source publish lookup
+                            closest,
+                        );
+                        state.store_source_searches.insert(sid, (file.file_hash, msg));
                         state.publish_manager.mark_source_published(&file.file_hash);
                     }
                 }
 
                 let keyword_files = state.publish_manager.files_needing_keyword_publish()
-                    .into_iter().cloned().collect::<Vec<_>>();
+                    .into_iter().take(MAX_KEYWORD_PUBLISHES_PER_CYCLE).cloned().collect::<Vec<_>>();
                 for file in &keyword_files {
                     let publishes = state.publish_manager.build_keyword_publishes(&file);
                     // Use StoreKeyword search to find truly closest nodes, then publish
@@ -1057,6 +1082,10 @@ pub async fn start_network(
                         .collect();
                     state.peer_nicknames.retain(|id, _| current_contacts.contains(id));
                 }
+
+                // Expire overloaded node entries after 10 minutes
+                let now = chrono::Utc::now().timestamp();
+                state.overloaded_nodes.retain(|_, &mut ts| now - ts < 600);
             }
 
             // Retry source search for pending downloads
@@ -1679,8 +1708,14 @@ async fn handle_udp_packet(
                 state.publish_confirmed += 1;
                 debug!("Publish confirmed for {target} (load={load}, total_confirmed={})", state.publish_confirmed);
             }
-            if load > 80 {
-                warn!("High DHT load ({load}) for target {target}");
+            if load >= 100 {
+                if let std::net::IpAddr::V4(ipv4) = from.ip() {
+                    let now = chrono::Utc::now().timestamp();
+                    state.overloaded_nodes.insert(ipv4, now);
+                    info!("Node {from} reported full load, will avoid publishing to it for 10 min");
+                }
+            } else if load > 80 {
+                warn!("High DHT load ({load}) from {from} for target {target}");
             }
         }
 

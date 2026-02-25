@@ -221,6 +221,7 @@ impl RoutingTable {
     }
 
     /// Get only verified contacts closest to a target.
+    #[allow(dead_code)]
     pub fn find_closest_verified(&self, target: &KadId, count: usize) -> Vec<KadContact> {
         let mut all: Vec<(KadId, &KadContact)> = self
             .all_contacts()
