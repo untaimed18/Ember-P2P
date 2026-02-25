@@ -144,9 +144,9 @@
       <section class="settings-section">
         <h3>Network (eMule KAD)</h3>
         <div class="field">
-          <label for="tcp-port">TCP Port (ed2k file transfer)</label>
+          <label for="tcp-port">TCP Port (peer-to-peer file transfer)</label>
           <input id="tcp-port" type="number" min="1" max="65535" bind:value={settings.tcp_port} />
-          <span class="field-hint">Default: 4662. Used for client-to-client file transfers.</span>
+          <span class="field-hint">Default: 4662. Used for peer-to-peer file transfers with other KAD clients.</span>
         </div>
         <div class="field">
           <label for="udp-port">UDP Port (KAD protocol)</label>

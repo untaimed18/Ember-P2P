@@ -18,7 +18,7 @@ use crate::sharing::manager::{TransferControl, TransferManager};
 use crate::storage::database::Database;
 use crate::types::*;
 
-use self::ed2k::server::{self as upload_server, UploadEvent, UploadEventKind};
+use self::ed2k::upload::{self as upload_server, UploadEvent, UploadEventKind};
 use self::ed2k::multi_source::{DownloadSource, MultiSourceDownload};
 use self::ed2k::transfer::{DownloadEvent, Ed2kDownload};
 use self::kad::bootstrap;
@@ -366,7 +366,7 @@ pub async fn start_network(
     // Upload event channel
     let (ul_event_tx, mut ul_event_rx) = mpsc::channel::<UploadEvent>(128);
 
-    // Start the TCP upload server
+    // Start the peer-to-peer upload listener (accepts incoming file requests from other KAD peers)
     {
         let ul_tx = ul_event_tx.clone();
         let ul_index = local_index.clone();
@@ -388,7 +388,7 @@ pub async fn start_network(
             )
             .await
             {
-                error!("Upload server error: {e}");
+                error!("Upload listener error: {e}");
             }
         });
     }
@@ -457,7 +457,7 @@ pub async fn start_network(
                 handle_download_event(event, &app_handle, &transfer_manager).await;
             }
 
-            // Upload events from the TCP server
+            // Upload events from the peer-to-peer upload listener
             Some(event) = ul_event_rx.recv() => {
                 handle_upload_event(event, &app_handle, &transfer_manager).await;
             }
