@@ -8,6 +8,9 @@ pub struct FileInfo {
     pub path: String,
     pub size: u64,
     pub hash: String,
+    /// AICH root hash (SHA-1 Merkle tree over 180KB blocks), hex-encoded
+    #[serde(default)]
+    pub aich_hash: String,
     pub extension: String,
     pub modified_at: i64,
 }

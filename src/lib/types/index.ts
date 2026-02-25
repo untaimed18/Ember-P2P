@@ -4,6 +4,7 @@ export interface FileInfo {
   path: string;
   size: number;
   hash: string;
+  aich_hash: string;
   extension: string;
   modified_at: number;
 }

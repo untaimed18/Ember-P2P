@@ -12,3 +12,7 @@ export async function updateSettings(settings: AppSettings): Promise<string> {
 export async function downloadNodesDat(): Promise<string> {
   return invoke('download_nodes_dat');
 }
+
+export async function downloadIpfilter(): Promise<string> {
+  return invoke('download_ipfilter');
+}

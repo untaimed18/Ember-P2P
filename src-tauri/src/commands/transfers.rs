@@ -101,3 +101,19 @@ pub async fn get_transfers(
     let manager = state.transfer_manager.read().await;
     Ok(manager.get_all())
 }
+
+#[tauri::command]
+pub async fn clear_completed(
+    state: tauri::State<'_, AppState>,
+) -> Result<u32, String> {
+    let mut manager = state.transfer_manager.write().await;
+    let count = manager.completed.len() as u32;
+    let ids: Vec<String> = manager.completed.iter().map(|t| t.id.clone()).collect();
+    manager.completed.clear();
+    drop(manager);
+
+    for id in &ids {
+        let _ = state.db.remove_transfer(id);
+    }
+    Ok(count)
+}

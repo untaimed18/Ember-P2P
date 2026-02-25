@@ -141,6 +141,7 @@ pub fn run() {
             commands::transfers::resume_transfer,
             commands::transfers::cancel_transfer,
             commands::transfers::get_transfers,
+            commands::transfers::clear_completed,
             commands::sharing::add_shared_folder,
             commands::sharing::remove_shared_folder,
             commands::sharing::get_shared_files,
@@ -152,6 +153,7 @@ pub fn run() {
             commands::settings::get_settings,
             commands::settings::update_settings,
             commands::settings::download_nodes_dat,
+            commands::settings::download_ipfilter,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

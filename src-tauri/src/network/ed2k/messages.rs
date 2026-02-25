@@ -108,16 +108,66 @@ pub fn build_hello(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickname
     buf
 }
 
-/// Build an EmuleInfo packet payload.
+/// Build an EmuleInfo packet payload with capability flags.
+///
+/// eMule MiscOptions1 bit layout (from opcodes.h):
+///   bits 0-3:   AICH version (we send 1)
+///   bit  4:     Unicode support (1)
+///   bits 5-7:   UDP version (4)
+///   bits 8-11:  Data compression version (1)
+///   bit  12:    Secure ident support (0 - not implemented)
+///   bits 13-15: Source exchange version (4)
+///   bits 16-19: Extended requests version (2)
+///   bits 20-23: Comments version (1)
+///   bit  24:    Peer cache (0)
+///   bit  25:    No 'view shared files' (1)
+///   bit  26:    Multi-packet (1)
+///   bit  27:    Supports preview (0)
+///
+/// MiscOptions2 bit layout:
+///   bit  0:     KAD version (>= 1)
+///   bits 1-3:   Reserved
+///   bit  4:     Supports large files (>4GB) (1)
+///   bit  5:     Ext multi-packet (1)
+///   bits 6-12:  Reserved
+///   bit  13:    Supports captcha (0)
+///   bit  14:    Supports source exchange2 (1)
+///   bit  15:    Requires crypt layer (0)
+///   bit  16:    Requests crypt layer (0)
+///   bit  17:    Supports crypt layer (1)
 pub fn build_emule_info(udp_port: u16) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
 
     buf.write_u8(1).unwrap(); // version
 
+    // MiscOptions1: AICH=1 | Unicode=1 | UDPver=4 | Compress=1 | SrcExch=4 | ExtReq=2 | Comments=1 | NoViewShared=1 | MultiPacket=1
+    let misc_options1: u32 =
+          1              // AICH ver 1
+        | (1 << 4)      // Unicode
+        | (4 << 5)      // UDP ver 4
+        | (1 << 8)      // Compression ver 1
+        | (0 << 12)     // No secure ident
+        | (4 << 13)     // Source exchange ver 4
+        | (2 << 16)     // Extended requests ver 2
+        | (1 << 20)     // Comments ver 1
+        | (0 << 24)     // No peer cache
+        | (1 << 25)     // No view shared files
+        | (1 << 26);    // Multi-packet support
+
+    // MiscOptions2: KAD=1 | LargeFiles=1 | ExtMultiPacket=1 | SrcExch2=1 | CryptSupport=1
+    let misc_options2: u32 =
+          1              // KAD version
+        | (1 << 4)      // Large files (>4GB)
+        | (1 << 5)      // Extended multi-packet
+        | (1 << 14)     // Source exchange 2
+        | (1 << 17);    // Supports crypt layer
+
     let tags: Vec<(&[u8], Ed2kTagValue)> = vec![
-        (&[0x21], Ed2kTagValue::Uint16(udp_port)), // ET_UDPPORT
-        (&[0x20], Ed2kTagValue::Uint8(1)),          // ET_COMPRESSION
-        (&[0x23], Ed2kTagValue::Uint32(4)),         // ET_SOURCEEXCHANGE2_VERSION
+        (&[0x21], Ed2kTagValue::Uint16(udp_port)),       // ET_UDPPORT
+        (&[0x20], Ed2kTagValue::Uint8(1)),                // ET_COMPRESSION
+        (&[0x23], Ed2kTagValue::Uint32(4)),               // ET_SOURCEEXCHANGE2_VERSION
+        (&[0xF5], Ed2kTagValue::Uint32(misc_options1)),   // CT_EMULE_MISCOPTIONS1
+        (&[0xF6], Ed2kTagValue::Uint32(misc_options2)),   // CT_EMULE_MISCOPTIONS2
     ];
 
     buf.write_u32::<LittleEndian>(tags.len() as u32).unwrap();

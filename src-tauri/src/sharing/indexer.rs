@@ -3,6 +3,7 @@ use std::path::Path;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
+use crate::network::ed2k::aich::compute_aich_root;
 use crate::network::ed2k::hash::ed2k_hash_file;
 use crate::types::FileInfo;
 
@@ -60,6 +61,9 @@ impl FileIndexer {
             .unwrap_or(0);
 
         let hash = ed2k_hash_file(path)?;
+        let aich_hash = compute_aich_root(path)
+            .map(|h| hex::encode(h))
+            .unwrap_or_default();
 
         Ok(FileInfo {
             id: uuid::Uuid::new_v4().to_string(),
@@ -67,6 +71,7 @@ impl FileIndexer {
             path: path.to_string_lossy().to_string(),
             size: metadata.len(),
             hash,
+            aich_hash,
             extension,
             modified_at,
         })

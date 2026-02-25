@@ -32,3 +32,7 @@ export async function cancelTransfer(transferId: string): Promise<void> {
 export async function getTransfers(): Promise<Transfer[]> {
   return invoke('get_transfers');
 }
+
+export async function clearCompleted(): Promise<number> {
+  return invoke('clear_completed');
+}

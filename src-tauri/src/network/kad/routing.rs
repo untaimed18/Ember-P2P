@@ -378,6 +378,15 @@ impl RoutingTable {
             .find(|c| c.id == *id)
     }
 
+    /// Look up a specific contact by ID (mutable).
+    pub fn get_contact_mut(&mut self, id: &KadId) -> Option<&mut KadContact> {
+        let bucket_idx = self.bucket_for(id);
+        self.buckets[bucket_idx]
+            .contacts
+            .iter_mut()
+            .find(|c| c.id == *id)
+    }
+
     /// Remove contacts not seen for longer than `max_age_secs`. Returns count removed.
     pub fn remove_stale(&mut self, max_age_secs: i64) -> usize {
         let now = chrono::Utc::now().timestamp();

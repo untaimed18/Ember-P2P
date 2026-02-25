@@ -10,6 +10,10 @@ pub struct BandwidthLimiter {
     total_downloaded: AtomicU64,
     upload_speed: AtomicU64,
     download_speed: AtomicU64,
+    /// Smoothed upload speed (exponential moving average, stored as speed * 100 for precision)
+    smoothed_upload: AtomicU64,
+    /// Smoothed download speed (exponential moving average, stored as speed * 100 for precision)
+    smoothed_download: AtomicU64,
 }
 
 impl BandwidthLimiter {
@@ -23,6 +27,8 @@ impl BandwidthLimiter {
             total_downloaded: AtomicU64::new(0),
             upload_speed: AtomicU64::new(0),
             download_speed: AtomicU64::new(0),
+            smoothed_upload: AtomicU64::new(0),
+            smoothed_download: AtomicU64::new(0),
         }
     }
 
@@ -134,6 +140,24 @@ impl BandwidthLimiter {
     pub fn update_speeds(&self, uploaded_delta: u64, downloaded_delta: u64) {
         self.upload_speed.store(uploaded_delta, Ordering::Relaxed);
         self.download_speed.store(downloaded_delta, Ordering::Relaxed);
+
+        // Exponential moving average: smoothed = alpha * current + (1-alpha) * prev
+        // Using alpha = 0.3 (30% weight on new sample), scaled by 100 for integer math
+        let prev_up = self.smoothed_upload.load(Ordering::Relaxed);
+        let smoothed_up = (uploaded_delta * 30 + prev_up * 70) / 100;
+        self.smoothed_upload.store(smoothed_up, Ordering::Relaxed);
+
+        let prev_down = self.smoothed_download.load(Ordering::Relaxed);
+        let smoothed_down = (downloaded_delta * 30 + prev_down * 70) / 100;
+        self.smoothed_download.store(smoothed_down, Ordering::Relaxed);
+    }
+
+    pub fn smoothed_upload_speed(&self) -> u64 {
+        self.smoothed_upload.load(Ordering::Relaxed)
+    }
+
+    pub fn smoothed_download_speed(&self) -> u64 {
+        self.smoothed_download.load(Ordering::Relaxed)
     }
 }
 
