@@ -72,7 +72,13 @@ pub async fn start_upload_server(
     max_uploads: u32,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
-    let listener = TcpListener::bind(addr).await?;
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("TCP port {tcp_port} is already in use: {e}. Peer-to-peer uploads will not work.");
+            anyhow::bail!("TCP port {tcp_port} already in use: {e}");
+        }
+    };
     info!("Peer-to-peer upload listener started on TCP port {tcp_port} (max {max_uploads} uploads)");
 
     let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -155,11 +161,15 @@ impl UploadHandler {
         let hello_payload = build_hello(&self.user_hash, 0, self.tcp_port, &self.nickname);
         write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_payload).await?;
 
-        // Handle EmuleInfo exchange
-        let (proto, opcode, _payload) = read_packet_timeout(&mut reader).await?;
-        if proto == OP_EMULEPROT && opcode == OP_EMULEINFO {
+        // Handle EmuleInfo exchange (or the peer may skip straight to file requests)
+        let (proto2, opcode2, payload2) = read_packet_timeout(&mut reader).await?;
+        let mut deferred_packet: Option<(u8, u8, Vec<u8>)> = None;
+        if proto2 == OP_EMULEPROT && opcode2 == OP_EMULEINFO {
             let emule_payload = build_emule_info(self.udp_port);
             write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_payload).await?;
+        } else {
+            // Peer skipped EmuleInfo; this packet is a file request -- defer it
+            deferred_packet = Some((proto2, opcode2, payload2));
         }
 
         // Now handle file requests in a loop
@@ -169,21 +179,25 @@ impl UploadHandler {
         let mut total_size: u64 = 0;
 
         loop {
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(CLIENT_TIMEOUT_SECS),
-                read_packet_async_inner(&mut reader),
-            )
-            .await;
+            let (proto, opcode, payload) = if let Some(pkt) = deferred_packet.take() {
+                pkt
+            } else {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(CLIENT_TIMEOUT_SECS),
+                    read_packet_async_inner(&mut reader),
+                )
+                .await;
 
-            let (proto, opcode, payload) = match result {
-                Ok(Ok(p)) => p,
-                Ok(Err(e)) => {
-                    debug!("Client disconnected: {e}");
-                    break;
-                }
-                Err(_) => {
-                    debug!("Client timed out");
-                    break;
+                match result {
+                    Ok(Ok(p)) => p,
+                    Ok(Err(e)) => {
+                        debug!("Client disconnected: {e}");
+                        break;
+                    }
+                    Err(_) => {
+                        debug!("Client timed out");
+                        break;
+                    }
                 }
             };
 
