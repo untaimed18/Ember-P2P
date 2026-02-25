@@ -19,9 +19,20 @@ impl Database {
 
         std::fs::create_dir_all(&app_dir)?;
         let db_path = app_dir.join("nexus.db");
-        let conn = Connection::open(db_path)?;
+        let conn = Connection::open(&db_path)?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+        }
+
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;\
+             PRAGMA foreign_keys=ON;\
+             PRAGMA secure_delete=ON;\
+             PRAGMA auto_vacuum=INCREMENTAL;",
+        )?;
 
         let db = Self {
             conn: Mutex::new(conn),
@@ -43,6 +54,7 @@ impl Database {
                 path TEXT NOT NULL UNIQUE,
                 size INTEGER NOT NULL,
                 hash TEXT NOT NULL,
+                aich_hash TEXT NOT NULL DEFAULT '',
                 extension TEXT NOT NULL DEFAULT '',
                 modified_at INTEGER NOT NULL DEFAULT 0
             );
@@ -81,20 +93,43 @@ impl Database {
             ",
         )?;
 
+        // Add columns that may be missing from older schema versions
+        Self::add_column_if_missing(&conn, "shared_files", "aich_hash", "TEXT NOT NULL DEFAULT ''");
+
         Ok(())
+    }
+
+    fn add_column_if_missing(conn: &Connection, table: &str, column: &str, col_type: &str) {
+        let valid_ident =
+            |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid_ident(table) || !valid_ident(column) {
+            tracing::warn!("Rejecting invalid SQL identifier in migration: {table}.{column}");
+            return;
+        }
+        let has_column = conn
+            .prepare(&format!("SELECT {column} FROM {table} LIMIT 0"))
+            .is_ok();
+        if !has_column {
+            let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {col_type}");
+            match conn.execute(&sql, []) {
+                Ok(_) => info!("Added column {table}.{column}"),
+                Err(e) => tracing::warn!("Failed to add column {table}.{column}: {e}"),
+            }
+        }
     }
 
     pub fn save_shared_file(&self, file: &FileInfo) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO shared_files (id, name, path, size, hash, extension, modified_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO shared_files (id, name, path, size, hash, aich_hash, extension, modified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 file.id,
                 file.name,
                 file.path,
                 file.size,
                 file.hash,
+                file.aich_hash,
                 file.extension,
                 file.modified_at,
             ],
@@ -105,7 +140,7 @@ impl Database {
     pub fn get_shared_files(&self) -> anyhow::Result<Vec<FileInfo>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, path, size, hash, extension, modified_at FROM shared_files",
+            "SELECT id, name, path, size, hash, aich_hash, extension, modified_at FROM shared_files",
         )?;
 
         let files = stmt
@@ -116,8 +151,9 @@ impl Database {
                     path: row.get(2)?,
                     size: row.get(3)?,
                     hash: row.get(4)?,
-                    extension: row.get(5)?,
-                    modified_at: row.get(6)?,
+                    aich_hash: row.get::<_, String>(5).unwrap_or_default(),
+                    extension: row.get(6)?,
+                    modified_at: row.get(7)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -205,6 +241,76 @@ impl Database {
     pub fn clear_shared_files(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM shared_files", [])?;
+        Ok(())
+    }
+
+    pub fn save_transfer(&self, transfer: &Transfer) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO transfers (id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                transfer.id,
+                transfer.file_name,
+                transfer.file_hash,
+                transfer.peer_id,
+                transfer.peer_name,
+                serde_json::to_string(&transfer.direction).unwrap_or_default(),
+                serde_json::to_string(&transfer.status).unwrap_or_default(),
+                transfer.progress,
+                transfer.speed as i64,
+                transfer.total_size as i64,
+                transfer.transferred as i64,
+                transfer.started_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_incomplete_downloads(&self) -> anyhow::Result<Vec<Transfer>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at
+             FROM transfers WHERE status NOT IN ('\"completed\"', '\"failed\"') AND direction = '\"download\"'"
+        )?;
+
+        let transfers = stmt
+            .query_map([], |row| {
+                let direction_str: String = row.get(5)?;
+                let status_str: String = row.get(6)?;
+                Ok(Transfer {
+                    id: row.get(0)?,
+                    file_name: row.get(1)?,
+                    file_hash: row.get(2)?,
+                    peer_id: row.get(3)?,
+                    peer_name: row.get(4)?,
+                    direction: serde_json::from_str(&direction_str).unwrap_or(TransferDirection::Download),
+                    status: serde_json::from_str(&status_str).unwrap_or(TransferStatus::Searching),
+                    progress: row.get(7)?,
+                    speed: row.get::<_, i64>(8)? as u64,
+                    total_size: row.get::<_, i64>(9)? as u64,
+                    transferred: row.get::<_, i64>(10)? as u64,
+                    started_at: row.get(11)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(transfers)
+    }
+
+    pub fn remove_transfer(&self, transfer_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM transfers WHERE id = ?1", params![transfer_id])?;
+        Ok(())
+    }
+
+    pub fn update_transfer_status(&self, transfer_id: &str, status: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE transfers SET status = ?1 WHERE id = ?2",
+            params![status, transfer_id],
+        )?;
         Ok(())
     }
 }

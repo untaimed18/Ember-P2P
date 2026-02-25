@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getSettings, updateSettings, downloadNodesDat } from '$lib/api/settings';
+  import { getSettings, updateSettings, downloadNodesDat, downloadIpfilter } from '$lib/api/settings';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
 
@@ -10,6 +10,9 @@
   let downloadingNodes = $state(false);
   let nodesResult: string | null = $state(null);
   let nodesError: string | null = $state(null);
+  let downloadingFilter = $state(false);
+  let filterResult: string | null = $state(null);
+  let filterError: string | null = $state(null);
 
   onMount(async () => {
     try {
@@ -48,6 +51,21 @@
       }
     } catch (e) {
       console.error('Folder pick failed:', e);
+    }
+  }
+
+  async function handleDownloadFilter() {
+    downloadingFilter = true;
+    filterResult = null;
+    filterError = null;
+    try {
+      filterResult = await downloadIpfilter();
+      setTimeout(() => (filterResult = null), 5000);
+    } catch (e: any) {
+      filterError = typeof e === 'string' ? e : e?.message ?? 'Download failed';
+      setTimeout(() => (filterError = null), 5000);
+    } finally {
+      downloadingFilter = false;
     }
   }
 
@@ -120,6 +138,21 @@
             bind:value={settings.max_concurrent_downloads}
           />
         </div>
+        <div class="field">
+          <label for="max-uploads">Max Concurrent Uploads</label>
+          <input
+            id="max-uploads"
+            type="number"
+            min="1"
+            max="20"
+            bind:value={settings.max_concurrent_uploads}
+          />
+          <span class="field-hint">
+            Number of simultaneous upload slots for other peers.
+            Higher values share more bandwidth with the network.
+            Requires restart to take effect.
+          </span>
+        </div>
       </section>
 
       <section class="settings-section">
@@ -144,9 +177,9 @@
       <section class="settings-section">
         <h3>Network (eMule KAD)</h3>
         <div class="field">
-          <label for="tcp-port">TCP Port (ed2k file transfer)</label>
+          <label for="tcp-port">TCP Port (peer-to-peer file transfer)</label>
           <input id="tcp-port" type="number" min="1" max="65535" bind:value={settings.tcp_port} />
-          <span class="field-hint">Default: 4662. Used for client-to-client file transfers.</span>
+          <span class="field-hint">Default: 4662. Used for peer-to-peer file transfers with other KAD clients.</span>
         </div>
         <div class="field">
           <label for="udp-port">UDP Port (KAD protocol)</label>
@@ -195,6 +228,53 @@
           </div>
           <span class="field-hint">
             Fetches the latest nodes.dat from emule-security.org and loads bootstrap contacts.
+          </span>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h3>Security</h3>
+        <div class="field toggle-field">
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={settings.obfuscation_enabled} />
+            <span>Protocol Obfuscation</span>
+          </label>
+          <span class="field-hint">
+            Encrypt KAD UDP packets using RC4 when communicating with peers that support it.
+            Compatible with eMule's protocol obfuscation.
+            Requires restart to take effect.
+          </span>
+        </div>
+        <div class="field toggle-field">
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={settings.ip_filter_enabled} />
+            <span>IP Filter (ipfilter.dat)</span>
+          </label>
+          <span class="field-hint">
+            Block known-bad IP ranges using an ipfilter.dat file (eMule compatible format).
+            Requires restart to take effect.
+          </span>
+          <div class="nodes-download" style="margin-top: 6px;">
+            <button onclick={handleDownloadFilter} disabled={downloadingFilter}>
+              {downloadingFilter ? 'Downloading...' : 'Download ipfilter.dat'}
+            </button>
+            {#if filterResult}
+              <span class="nodes-success">{filterResult}</span>
+            {/if}
+            {#if filterError}
+              <span class="nodes-error">{filterError}</span>
+            {/if}
+          </div>
+        </div>
+        <div class="field toggle-field">
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={settings.block_private_ips} />
+            <span>Block Private/Reserved IPs</span>
+          </label>
+          <span class="field-hint">
+            Prevent private network IPs (10.x.x.x, 192.168.x.x, etc.) from being
+            added to the KAD routing table. Protects against routing table poisoning attacks.
+            Requires restart to take effect.
           </span>
         </div>
       </section>

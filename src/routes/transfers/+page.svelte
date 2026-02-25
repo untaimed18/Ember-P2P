@@ -1,7 +1,7 @@
 <script lang="ts">
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import { transfers, startTransferPoll } from '$lib/stores/transfers';
-  import { pauseTransfer, resumeTransfer, cancelTransfer } from '$lib/api/transfers';
+  import { pauseTransfer, resumeTransfer, cancelTransfer, clearCompleted } from '$lib/api/transfers';
   import { onMount } from 'svelte';
 
   onMount(() => {
@@ -30,7 +30,14 @@
 
 <div class="page-header">
   <h2>Transfers</h2>
-  <span class="count">{activeTransfers.length} active</span>
+  <div class="header-actions">
+    <span class="count">{activeTransfers.length} active</span>
+    {#if completedTransfers.length > 0}
+      <button class="ghost" onclick={async () => { await clearCompleted(); }}>
+        Clear Completed ({completedTransfers.length})
+      </button>
+    {/if}
+  </div>
 </div>
 
 <div class="page-content">

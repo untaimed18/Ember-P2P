@@ -1,20 +1,20 @@
 # Nexus — Decentralized P2P File Sharing
 
-Nexus is a decentralized, peer-to-peer file sharing application built with **Tauri v2** (Rust backend) and **SvelteKit** (TypeScript frontend). It uses **libp2p** for all networking — peer discovery, encrypted communication, distributed search, and file transfers — with zero central servers.
+Nexus is a **KAD-only** decentralized file sharing client built with **Tauri v2** (Rust backend) and **SvelteKit** (TypeScript frontend). It connects exclusively to the **eMule Kademlia (KAD) network** for peer discovery, search, and source finding — it never connects to centralized eMule/eDonkey servers. File transfers use the standard peer-to-peer protocol, so Nexus is fully compatible with eMule clients that have KAD enabled.
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────┐
 │                    Svelte Frontend                        │
-│  Dashboard │ Search │ Transfers │ Sharing │ Chat │ Peers  │
+│  Dashboard │ Search │ Transfers │ Sharing │ Peers        │
 ├────────────────────────┬─────────────────────────────────┤
 │      Tauri IPC         │        Tauri Events             │
 ├────────────────────────┴─────────────────────────────────┤
 │                     Rust Backend                         │
 │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐  │
-│  │ Network  │ │ Sharing  │ │  Search  │ │    Chat    │  │
-│  │ (libp2p) │ │ (Files)  │ │  (DHT)   │ │ (Gossipsub)│  │
+│  │ Network  │ │ Sharing  │ │  Search  │ │  Security  │  │
+│  │(KAD-only)│ │ (Files)  │ │  (DHT)   │ │ (Filters)  │  │
 │  └──────────┘ └──────────┘ └──────────┘ └────────────┘  │
 │  ┌──────────┐ ┌──────────┐ ┌──────────────────────────┐  │
 │  │Bandwidth │ │ Storage  │ │     Command Handlers     │  │
@@ -28,40 +28,64 @@ Nexus is a decentralized, peer-to-peer file sharing application built with **Tau
 | Layer       | Technology                                    |
 |-------------|-----------------------------------------------|
 | Frontend    | SvelteKit 5 + TypeScript + Vite               |
-| App Shell   | Tauri v2 (Windows 64-bit)                     |
+| App Shell   | Tauri v2                                      |
 | Backend     | Rust (2021 edition)                           |
-| Networking  | libp2p (Kademlia, Gossipsub, Noise, Yamux)    |
+| Networking  | eMule KAD (Kademlia DHT), peer-to-peer transfers|
 | Database    | SQLite via rusqlite                           |
-| Hashing     | BLAKE3                                        |
+| Hashing     | MD4 (ED2K file hashes), MD5 (obfuscation keys)|
 
-### libp2p Protocols Used
+### Protocols
 
-- **Kademlia DHT** — Peer discovery and content routing
-- **Gossipsub** — Pub/sub messaging for chat channels
-- **Request-Response** — File transfers and search queries
-- **Noise** — End-to-end encryption for all connections
-- **Yamux** — Stream multiplexing
-- **mDNS** — Local network peer discovery (development)
-- **AutoNAT** — NAT type detection
-- **Relay + DCUtR** — NAT traversal via relay and hole punching
+- **Kademlia DHT (KAD)** — Peer discovery, keyword search, source finding, and DHT publish/store over UDP
+- **Peer-to-Peer Transfers** — Direct TCP file transfers between peers using the standard eMule client-to-client protocol (Hello, FileRequest, SendingPart, etc.)
+- **Protocol Obfuscation** — RC4-based packet encryption compatible with eMule's obfuscation layer
+- **UPnP** — Automatic router port mapping for NAT traversal
+- **Buddy System** — Relay-based connectivity for firewalled clients
+
+> **No eMule server connections.** Nexus does not implement the eDonkey server protocol — no server login, server search, or server-based source finding. All discovery happens through the KAD DHT. File transfers use the same peer-to-peer TCP protocol that eMule clients use regardless of server connectivity, so Nexus interoperates with any eMule/KAD peer.
 
 ## Features
 
-- **File Sharing** — Share folders, auto-index files with BLAKE3 hashes
-- **Distributed Search** — Search across the network via Kademlia DHT
-- **Chunked Transfers** — Resumable file transfers with progress tracking
-- **Chat Channels** — Topic-based chat rooms via Gossipsub
-- **Bandwidth Control** — Token bucket rate limiting for uploads/downloads
-- **Peer Management** — View connected peers, ban/unban
-- **Encrypted** — All connections use Noise protocol encryption
-- **Lightweight** — Tauri produces small binaries with low memory usage
+- **KAD-Only** — Connects exclusively to the eMule KAD network; never contacts centralized eMule/eDonkey servers
+- **eMule Compatible** — Fully interoperates with eMule, aMule, and other KAD-enabled clients
+- **File Sharing** — Share folders, auto-index files with ED2K (MD4) hashes
+- **Distributed Search** — Keyword search across the KAD DHT with source and notes lookup
+- **Multi-Source Downloads** — Download from multiple peers simultaneously with part-level hash verification
+- **Bandwidth Control** — Token bucket rate limiting for uploads and downloads
+- **Peer Management** — View connected peers, ban/unban with network-level enforcement
+- **NAT Traversal** — UPnP port mapping, firewall detection, and buddy relay system
+- **ED2K Links** — Parse and generate `ed2k://` file links
+- **Notes & Ratings** — Publish and search file comments/ratings on the DHT
+- **Desktop-Only** — Runs as a native desktop application (no browser launch, no web interface)
+
+## Security
+
+Nexus implements comprehensive security measures compatible with the eMule/KAD network:
+
+- **Protocol Obfuscation** — RC4 encryption for KAD UDP packets (toggleable in settings)
+- **IP Filter** — eMule-compatible `ipfilter.dat` support to block known-bad IP ranges
+- **Private IP Blocking** — Rejects RFC1918/loopback/link-local addresses in the routing table to prevent poisoning
+- **Flood Protection** — Per-IP rate limiting, DNS port 53 rejection, and unsolicited response validation
+- **Tag Size Limits** — Enforced maximum sizes on all parsed tag fields to prevent memory exhaustion
+- **Decompression Bomb Protection** — Size-limited incremental decompression for KAD and ED2K payloads
+- **TCP Connection Limits** — Per-IP connection cap on the upload server
+- **Path Traversal Protection** — Filename sanitization for all downloaded files
+- **Source IP Verification** — DHT store always overrides publisher source IP with verified packet sender
+- **Content Security Policy** — Restrictive CSP for the Tauri webview
+- **Peer Banning** — Network-level packet rejection for banned peers (O(1) IP lookup)
+- **Routing Table Hardening** — Per-IP and per-subnet contact limits matching eMule's implementation
+- **Download Integrity** — Per-part MD4 hash verification with automatic retry on mismatch
+
+All security features can be configured in Settings > Security.
 
 ## Prerequisites
 
-- [Rust](https://rustup.rs/) (1.75+ required)
-- [Node.js](https://nodejs.org/) (18+ recommended)
-- Windows 10/11 64-bit
-- Visual Studio Build Tools with C++ workload (for Rust compilation on Windows)
+- [Rust](https://rustup.rs/) (1.75+)
+- [Node.js](https://nodejs.org/) (18+)
+- Platform-specific build dependencies:
+  - **Linux**: `libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev`
+  - **Windows**: Visual Studio Build Tools with C++ workload
+  - **macOS**: Xcode Command Line Tools
 
 ## Development
 
@@ -77,7 +101,7 @@ npm install
 npm run tauri dev
 ```
 
-This starts the Vite dev server with hot reload for the frontend and compiles the Rust backend. The first build will take several minutes as it compiles all Rust dependencies.
+This starts the Vite dev server (localhost only) with hot reload for the frontend and compiles the Rust backend. The first build will take several minutes as it compiles all Rust dependencies.
 
 ### Build for Production
 
@@ -97,9 +121,8 @@ src/                        # Svelte frontend
     search/+page.svelte     # Network file search
     transfers/+page.svelte  # Active/completed transfers
     sharing/+page.svelte    # Manage shared folders
-    chat/+page.svelte       # Chat channels
     peers/+page.svelte      # Connected peers
-    settings/+page.svelte   # App settings
+    settings/+page.svelte   # App settings (network, security, bandwidth)
   lib/
     api/                    # Typed Tauri IPC wrappers
     stores/                 # Svelte stores (reactive state)
@@ -108,51 +131,72 @@ src/                        # Svelte frontend
 
 src-tauri/                  # Rust backend
   src/
-    lib.rs                  # App setup, command registration
-    types.rs                # Shared data types
+    lib.rs                  # App setup, plugin + command registration
+    main.rs                 # Entry point
+    types.rs                # Shared data types (FileInfo, PeerInfo, Transfer, etc.)
     app_state.rs            # Global application state
-    network/                # libp2p networking layer
-      behaviour.rs          # Composed NetworkBehaviour
-      protocol.rs           # Request-response codec
-      events.rs             # Swarm event handler
-      discovery.rs          # Bootstrap configuration
-    sharing/                # File sharing engine
-      indexer.rs            # Directory scanner + BLAKE3 hasher
-      transfer.rs           # Chunked file transfer
+    security.rs             # Filename sanitization, path traversal protection
+    network/
+      mod.rs                # Network event loop, UDP/TCP handling, command dispatch
+      upnp.rs               # UPnP port mapping
+      kad/                  # KAD (Kademlia) protocol implementation
+        types.rs            # KadId, KadContact, KadTag, KadUDPKey
+        messages.rs         # KAD message encode/decode (all KAD2 opcodes)
+        routing.rs          # Kademlia routing table with IP/subnet limits
+        search.rs           # Iterative lookup + fetch search engine
+        store.rs            # DHT key/source/notes store with tolerance zone
+        publish.rs          # Keyword and source publishing
+        bootstrap.rs        # nodes.dat read/write, bootstrap contacts
+        buddy.rs            # Buddy relay system for firewalled clients
+        obfuscation.rs      # RC4 packet encryption/decryption
+        protection.rs       # Flood protection, rate limiting, response validation
+        ip_filter.rs        # IP filter (ipfilter.dat + private IP blocking)
+      ed2k/                 # Peer-to-peer file transfer (eMule client-to-client protocol)
+        messages.rs         # Packet format: Hello, EmuleInfo, file requests
+        hash.rs             # ED2K (MD4) file hashing
+        transfer.rs         # Single-source file download with resume
+        multi_source.rs     # Multi-source parallel download
+        part_tracker.rs     # Part completion tracking (.part.met)
+        upload.rs           # TCP upload listener with queue management
+    sharing/
+      indexer.rs            # Directory scanner + ED2K hasher
       manager.rs            # Transfer queue management
-    search/                 # Distributed search
-      index.rs              # Local inverted index
-      query.rs              # Search engine
-    chat/                   # Chat system
-      channel.rs            # Channel management
-      message.rs            # Message history
-    bandwidth/              # Bandwidth control
+    search/
+      index.rs              # Local file index for keyword matching
+    bandwidth/
       limiter.rs            # Token bucket rate limiter
-    storage/                # Persistence
+    storage/
       database.rs           # SQLite schema + operations
-      config.rs             # App configuration
+      config.rs             # App configuration persistence
     commands/               # Tauri command handlers
-      search.rs, transfers.rs, chat.rs,
-      sharing.rs, peers.rs, settings.rs
+      search.rs             # Search, ED2K links, notes
+      transfers.rs          # Download/upload control
+      sharing.rs            # Shared folder management
+      peers.rs              # Peer listing, ban/unban
+      settings.rs           # Settings read/write, nodes.dat download
 ```
 
-## Connecting to Peers
+## Connecting to the Network
 
-### Local Development (mDNS)
+### Bootstrap (nodes.dat)
 
-Peers on the same local network are discovered automatically via mDNS. Run Nexus on two machines on the same LAN and they will find each other.
+Nexus bootstraps into the KAD network using a `nodes.dat` file. On first launch, it uses hardcoded bootstrap nodes. You can download the latest `nodes.dat` from Settings > Network > "Download Latest nodes.dat".
 
-### Remote Peers (Bootstrap Nodes)
+### Ports
 
-Add bootstrap node addresses in Settings > Network > Bootstrap Nodes using multiaddr format:
+| Port | Protocol | Purpose                                      |
+|------|----------|----------------------------------------------|
+| 4662 | TCP      | Peer-to-peer file transfers                    |
+| 4672 | UDP      | KAD DHT communication                         |
 
-```
-/ip4/203.0.113.1/tcp/4001/p2p/12D3KooW...
-```
+These can be changed in Settings > Network. If UPnP is enabled, ports are automatically mapped on your router.
 
-### Manual Connection
+### Firewall / NAT
 
-Peers exchange their multiaddr strings out-of-band and add them as bootstrap nodes.
+If you're behind a firewall or NAT, Nexus will:
+1. Attempt UPnP port mapping (if enabled)
+2. Probe external IP and port via KAD peers
+3. Find a "buddy" relay node to receive incoming connections
 
 ## License
 

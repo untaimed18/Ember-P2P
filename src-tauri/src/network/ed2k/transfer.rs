@@ -21,6 +21,12 @@ const QUEUE_POLL_SECS: u64 = 30;
 const MAX_QUEUE_WAIT_SECS: u64 = 600;
 const READ_TIMEOUT_SECS: u64 = 60;
 
+/// Maximum decompressed part size (PARTSIZE + margin = 10 MiB)
+const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
+
+/// Maximum allowed file size for downloads (4 TiB)
+const MAX_DOWNLOAD_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024 * 1024;
+
 pub struct Ed2kDownload {
     pub transfer_id: String,
     pub file_hash: [u8; 16],
@@ -293,9 +299,23 @@ impl Ed2kDownload {
             }
         }
 
-        // Create or resume output file
+        if self.file_size > MAX_DOWNLOAD_FILE_SIZE {
+            anyhow::bail!(
+                "file size {} exceeds maximum allowed ({})",
+                self.file_size,
+                MAX_DOWNLOAD_FILE_SIZE
+            );
+        }
+
+        // Ensure download directory exists
+        if !self.download_dir.exists() {
+            std::fs::create_dir_all(&self.download_dir)?;
+        }
+
+        // Create or resume output file (sanitize filename to prevent path traversal)
+        let safe_name = crate::security::sanitize_filename(&self.file_name);
         let part_path = self.download_dir.join(format!("{}.part", self.transfer_id));
-        let final_path = self.download_dir.join(&self.file_name);
+        let final_path = self.download_dir.join(&safe_name);
 
         let mut tracker = PartTracker::new(self.file_size, &part_path);
 
@@ -406,7 +426,17 @@ impl Ed2kDownload {
 
                                 let mut decoder = ZlibDecoder::new(compressed);
                                 let mut decompressed = Vec::new();
-                                decoder.read_to_end(&mut decompressed)?;
+                                let mut buf = [0u8; 8192];
+                                loop {
+                                    let n = decoder.read(&mut buf)?;
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    decompressed.extend_from_slice(&buf[..n]);
+                                    if decompressed.len() > MAX_DECOMPRESSED_PART {
+                                        anyhow::bail!("decompressed part exceeds size limit");
+                                    }
+                                }
 
                                 let piece_len = decompressed.len() as u64;
                                 self.acquire_download_bandwidth(piece_len).await;
@@ -455,11 +485,16 @@ impl Ed2kDownload {
                     let actual_hash: [u8; 16] = Md4::digest(&part_data).into();
 
                     if actual_hash != expected_hash {
+                        let aich_hash = super::aich::compute_aich_part(&part_data);
+                        let total_blocks = (part_data.len() + super::aich::AICH_BLOCK_SIZE - 1)
+                            / super::aich::AICH_BLOCK_SIZE;
                         warn!(
-                            "Part {} hash mismatch! expected={} got={}",
+                            "Part {} hash mismatch! expected={} got={}, AICH={} ({} blocks in part)",
                             part_idx,
                             hex::encode(expected_hash),
-                            hex::encode(actual_hash)
+                            hex::encode(actual_hash),
+                            hex::encode(aich_hash),
+                            total_blocks,
                         );
                         tracker.mark_incomplete(part_idx);
                         tracker.save();

@@ -39,7 +39,15 @@ impl AppConfig {
 
     pub fn save(&self) -> anyhow::Result<()> {
         let data = serde_json::to_string_pretty(&self.settings)?;
-        std::fs::write(&self.config_path, data)?;
+        std::fs::write(&self.config_path, &data)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &self.config_path,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
         info!("Config saved");
         Ok(())
     }

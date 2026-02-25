@@ -1,3 +1,9 @@
+// SECURITY NOTE: The ed2k protocol mandates MD4 for file identification hashes.
+// MD4 is cryptographically broken (practical collision attacks since 2004). An
+// attacker can craft a malicious file with the same ed2k hash as a legitimate one.
+// This cannot be changed without breaking eMule/KAD network compatibility.
+// AICH (SHA-1 Merkle tree) provides a secondary verification layer.
+
 use std::io::Read;
 use std::path::Path;
 

@@ -8,6 +8,9 @@ pub struct FileInfo {
     pub path: String,
     pub size: u64,
     pub hash: String,
+    /// AICH root hash (SHA-1 Merkle tree over 180KB blocks), hex-encoded
+    #[serde(default)]
+    pub aich_hash: String,
     pub extension: String,
     pub modified_at: i64,
 }
@@ -115,11 +118,30 @@ pub struct AppSettings {
     pub max_upload_speed: u64,
     pub max_download_speed: u64,
     pub max_concurrent_downloads: u32,
+    #[serde(default = "default_max_uploads")]
+    pub max_concurrent_uploads: u32,
     pub tcp_port: u16,
     pub udp_port: u16,
     pub nodes_dat_path: String,
     pub nat_traversal_enabled: bool,
     pub upnp_enabled: bool,
+    /// Prefer obfuscated (encrypted) KAD communication when the peer supports it
+    #[serde(default = "default_true")]
+    pub obfuscation_enabled: bool,
+    /// Enable IP filter to block known-bad IP ranges (loads ipfilter.dat)
+    #[serde(default = "default_true")]
+    pub ip_filter_enabled: bool,
+    /// Block private/reserved IPs from being added to the routing table
+    #[serde(default = "default_true")]
+    pub block_private_ips: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_max_uploads() -> u32 {
+    5
 }
 
 impl Default for AppSettings {
@@ -135,11 +157,15 @@ impl Default for AppSettings {
             max_upload_speed: 0,
             max_download_speed: 0,
             max_concurrent_downloads: 5,
+            max_concurrent_uploads: 5,
             tcp_port: DEFAULT_TCP_PORT,
             udp_port: DEFAULT_UDP_PORT,
             nodes_dat_path: String::new(),
             nat_traversal_enabled: true,
             upnp_enabled: true,
+            obfuscation_enabled: true,
+            ip_filter_enabled: true,
+            block_private_ips: true,
         }
     }
 }

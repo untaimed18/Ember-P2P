@@ -1,3 +1,9 @@
+// SECURITY NOTE: This module implements eMule-compatible KAD protocol obfuscation
+// using RC4 with MD5-derived keys. RC4 is a cryptographically weak stream cipher
+// and MD5 is a broken hash function. This layer provides only traffic obfuscation
+// (preventing casual deep-packet inspection), NOT meaningful confidentiality.
+// It is retained solely for interoperability with the existing eMule/KAD network.
+
 use rand::Rng;
 
 use super::types::KadId;

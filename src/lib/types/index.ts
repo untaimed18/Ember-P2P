@@ -4,6 +4,7 @@ export interface FileInfo {
   path: string;
   size: number;
   hash: string;
+  aich_hash: string;
   extension: string;
   modified_at: number;
 }
@@ -50,6 +51,9 @@ export interface NetworkStats {
   status: 'connected' | 'connecting' | 'disconnected';
   external_ip: string;
   firewalled: boolean;
+  buddy_status: string;
+  upnp_mapped: boolean;
+  stores_acknowledged: number;
 }
 
 export interface AppSettings {
@@ -59,9 +63,13 @@ export interface AppSettings {
   max_upload_speed: number;
   max_download_speed: number;
   max_concurrent_downloads: number;
+  max_concurrent_uploads: number;
   tcp_port: number;
   udp_port: number;
   nodes_dat_path: string;
   nat_traversal_enabled: boolean;
   upnp_enabled: boolean;
+  obfuscation_enabled: boolean;
+  ip_filter_enabled: boolean;
+  block_private_ips: boolean;
 }

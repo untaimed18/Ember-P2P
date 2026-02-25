@@ -4,11 +4,14 @@ use std::time::Instant;
 
 const MAX_PACKETS_PER_SEC: u32 = 10;
 const TRACKER_EXPIRY_SECS: u64 = 30;
+/// Max outgoing packets per IP per second (eMule uses ~2/sec for KAD)
+const MAX_OUTGOING_PER_IP_PER_SEC: u32 = 3;
 
 pub struct FloodProtection {
     ip_counters: HashMap<IpAddr, (u32, Instant)>,
     outgoing_requests: HashSet<(SocketAddr, u8)>,
     request_times: HashMap<(SocketAddr, u8), Instant>,
+    outgoing_counters: HashMap<IpAddr, (u32, Instant)>,
 }
 
 impl FloodProtection {
@@ -17,6 +20,7 @@ impl FloodProtection {
             ip_counters: HashMap::new(),
             outgoing_requests: HashSet::new(),
             request_times: HashMap::new(),
+            outgoing_counters: HashMap::new(),
         }
     }
 
@@ -38,6 +42,22 @@ impl FloodProtection {
     /// Returns true if a packet from port 53 should be dropped (unencrypted).
     pub fn is_dns_port(addr: &SocketAddr) -> bool {
         addr.port() == 53
+    }
+
+    /// Check if we should throttle an outgoing packet to this IP.
+    /// Returns true if we've sent too many packets to this IP recently.
+    pub fn check_outgoing_rate(&mut self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let entry = self.outgoing_counters.entry(ip).or_insert((0, now));
+
+        if now.duration_since(entry.1).as_secs() >= 1 {
+            entry.0 = 1;
+            entry.1 = now;
+            false
+        } else {
+            entry.0 += 1;
+            entry.0 > MAX_OUTGOING_PER_IP_PER_SEC
+        }
     }
 
     /// Record an outgoing request so we can validate incoming responses.
@@ -95,9 +115,21 @@ impl FloodProtection {
             }
         }
 
-        // Be lenient: allow responses from addresses we've recently communicated with
-        // even if we can't match the exact opcode (due to obfuscation, etc.)
-        true
+        // Allow responses from addresses we've recently communicated with
+        // (within the tracker expiry window), even if the exact opcode
+        // doesn't match -- obfuscation can make opcode matching imprecise.
+        self.has_recent_communication(&addr)
+    }
+
+    /// Check if we've had any tracked communication with this exact address recently.
+    /// Requires full address (IP + port) match to prevent spoofing from the same IP
+    /// with a different port.
+    fn has_recent_communication(&self, addr: &SocketAddr) -> bool {
+        let now = Instant::now();
+        self.request_times.iter().any(|((tracked_addr, _), time)| {
+            *tracked_addr == *addr
+                && now.duration_since(*time).as_secs() < TRACKER_EXPIRY_SECS
+        })
     }
 
     /// Clean up stale tracking entries.
@@ -105,6 +137,10 @@ impl FloodProtection {
         let now = Instant::now();
 
         self.ip_counters.retain(|_, (_, last)| {
+            now.duration_since(*last).as_secs() < 60
+        });
+
+        self.outgoing_counters.retain(|_, (_, last)| {
             now.duration_since(*last).as_secs() < 60
         });
 

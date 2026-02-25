@@ -15,8 +15,13 @@ use crate::sharing::manager::TransferManager;
 
 use super::messages::*;
 
-const MAX_CONCURRENT_UPLOADS: usize = 5;
 const CLIENT_TIMEOUT_SECS: u64 = 120;
+/// Maximum concurrent TCP connections from a single IP address
+const MAX_CONNECTIONS_PER_IP: usize = 3;
+/// Maximum total concurrent TCP connections to the upload server
+const MAX_TOTAL_CONNECTIONS: usize = 100;
+/// Maximum number of peers waiting in the upload queue
+const MAX_UPLOAD_QUEUE_SIZE: usize = 500;
 
 pub struct UploadEvent {
     pub transfer_id: String,
@@ -40,7 +45,9 @@ pub enum UploadEventKind {
     },
 }
 
-struct UploadServer {
+/// Handles incoming TCP connections from other peers requesting file uploads.
+/// This is the peer-to-peer upload listener, NOT an eMule server connection.
+struct UploadHandler {
     local_index: Arc<RwLock<LocalIndex>>,
     transfer_manager: Arc<RwLock<TransferManager>>,
     bandwidth_limiter: Arc<BandwidthLimiter>,
@@ -50,8 +57,11 @@ struct UploadServer {
     tcp_port: u16,
     udp_port: u16,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
+    max_concurrent_uploads: Arc<std::sync::atomic::AtomicUsize>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     upload_queue: Arc<tokio::sync::Mutex<VecDeque<SocketAddr>>>,
+    ip_connection_counts: Arc<tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    total_connections: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub async fn start_upload_server(
@@ -64,15 +74,22 @@ pub async fn start_upload_server(
     transfer_manager: Arc<RwLock<TransferManager>>,
     bandwidth_limiter: Arc<BandwidthLimiter>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
+    max_uploads: u32,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
-    let listener = TcpListener::bind(addr).await?;
-    info!("ED2K TCP upload server listening on port {tcp_port}");
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("TCP port {tcp_port} is already in use: {e}. Peer-to-peer uploads will not work.");
+            anyhow::bail!("TCP port {tcp_port} already in use: {e}");
+        }
+    };
+    info!("Peer-to-peer upload listener started on TCP port {tcp_port} (max {max_uploads} uploads)");
 
     let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let upload_queue = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
 
-    let server = Arc::new(UploadServer {
+    let server = Arc::new(UploadHandler {
         local_index,
         transfer_manager,
         bandwidth_limiter,
@@ -82,18 +99,52 @@ pub async fn start_upload_server(
         tcp_port,
         udp_port,
         active_count,
+        max_concurrent_uploads: Arc::new(std::sync::atomic::AtomicUsize::new(max_uploads as usize)),
         upload_event_tx,
         upload_queue,
+        ip_connection_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        total_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
 
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
-                debug!("Incoming ED2K connection from {peer_addr}");
                 let server = server.clone();
+
+                // Enforce global connection limit
+                let current_total = server.total_connections.load(std::sync::atomic::Ordering::Relaxed);
+                if current_total >= MAX_TOTAL_CONNECTIONS {
+                    debug!("Rejecting connection from {peer_addr}: global connection limit reached ({current_total})");
+                    drop(stream);
+                    continue;
+                }
+
+                // Enforce per-IP connection limit
+                {
+                    let mut counts = server.ip_connection_counts.lock().await;
+                    let count = counts.entry(peer_addr.ip()).or_insert(0);
+                    if *count >= MAX_CONNECTIONS_PER_IP {
+                        debug!("Rejecting connection from {peer_addr}: per-IP limit reached");
+                        drop(stream);
+                        continue;
+                    }
+                    *count += 1;
+                }
+
+                server.total_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                debug!("Incoming ED2K connection from {peer_addr}");
                 tokio::spawn(async move {
-                    if let Err(e) = server.handle_connection(stream, peer_addr).await {
+                    let result = server.handle_connection(stream, peer_addr).await;
+                    if let Err(e) = &result {
                         warn!("Connection from {peer_addr} ended: {e}");
+                    }
+                    server.total_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut counts = server.ip_connection_counts.lock().await;
+                    if let Some(count) = counts.get_mut(&peer_addr.ip()) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            counts.remove(&peer_addr.ip());
+                        }
                     }
                 });
             }
@@ -104,7 +155,7 @@ pub async fn start_upload_server(
     }
 }
 
-impl UploadServer {
+impl UploadHandler {
     async fn handle_connection(
         &self,
         stream: TcpStream,
@@ -125,11 +176,15 @@ impl UploadServer {
         let hello_payload = build_hello(&self.user_hash, 0, self.tcp_port, &self.nickname);
         write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_payload).await?;
 
-        // Handle EmuleInfo exchange
-        let (proto, opcode, _payload) = read_packet_timeout(&mut reader).await?;
-        if proto == OP_EMULEPROT && opcode == OP_EMULEINFO {
+        // Handle EmuleInfo exchange (or the peer may skip straight to file requests)
+        let (proto2, opcode2, payload2) = read_packet_timeout(&mut reader).await?;
+        let mut deferred_packet: Option<(u8, u8, Vec<u8>)> = None;
+        if proto2 == OP_EMULEPROT && opcode2 == OP_EMULEINFO {
             let emule_payload = build_emule_info(self.udp_port);
             write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_payload).await?;
+        } else {
+            // Peer skipped EmuleInfo; this packet is a file request -- defer it
+            deferred_packet = Some((proto2, opcode2, payload2));
         }
 
         // Now handle file requests in a loop
@@ -139,21 +194,25 @@ impl UploadServer {
         let mut total_size: u64 = 0;
 
         loop {
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(CLIENT_TIMEOUT_SECS),
-                read_packet_async_inner(&mut reader),
-            )
-            .await;
+            let (proto, opcode, payload) = if let Some(pkt) = deferred_packet.take() {
+                pkt
+            } else {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(CLIENT_TIMEOUT_SECS),
+                    read_packet_async_inner(&mut reader),
+                )
+                .await;
 
-            let (proto, opcode, payload) = match result {
-                Ok(Ok(p)) => p,
-                Ok(Err(e)) => {
-                    debug!("Client disconnected: {e}");
-                    break;
-                }
-                Err(_) => {
-                    debug!("Client timed out");
-                    break;
+                match result {
+                    Ok(Ok(p)) => p,
+                    Ok(Err(e)) => {
+                        debug!("Client disconnected: {e}");
+                        break;
+                    }
+                    Err(_) => {
+                        debug!("Client timed out");
+                        break;
+                    }
                 }
             };
 
@@ -236,7 +295,8 @@ impl UploadServer {
                         .active_count
                         .load(std::sync::atomic::Ordering::Relaxed);
 
-                    let should_accept = if current_active >= MAX_CONCURRENT_UPLOADS {
+                    let max_uploads = self.max_concurrent_uploads.load(std::sync::atomic::Ordering::Relaxed);
+                    let should_accept = if current_active >= max_uploads {
                         false
                     } else {
                         let mut queue = self.upload_queue.lock().await;
@@ -254,6 +314,10 @@ impl UploadServer {
                         let mut queue = self.upload_queue.lock().await;
                         let rank = if let Some(pos) = queue.iter().position(|a| *a == peer_addr) {
                             (pos + 1) as u16
+                        } else if queue.len() >= MAX_UPLOAD_QUEUE_SIZE {
+                            debug!("Upload queue full ({MAX_UPLOAD_QUEUE_SIZE}), rejecting {peer_addr}");
+                            drop(queue);
+                            break;
                         } else {
                             queue.push_back(peer_addr);
                             queue.len() as u16
@@ -498,7 +562,7 @@ impl UploadServer {
 
                 _ => {
                     debug!(
-                        "Upload server ignoring proto=0x{proto:02X} op=0x{opcode:02X} from {peer_addr}"
+                        "Upload handler ignoring proto=0x{proto:02X} op=0x{opcode:02X} from {peer_addr}"
                     );
                 }
             }

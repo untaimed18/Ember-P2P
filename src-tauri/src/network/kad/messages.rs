@@ -60,6 +60,9 @@ pub const KADEMLIA_FIND_NODE: u8 = 0x0B;
 
 pub const UDP_KAD_MAXFRAGMENT: usize = 1420;
 
+/// Maximum allowed decompressed payload size (512 KiB) to prevent decompression bombs.
+const MAX_DECOMPRESSED_SIZE: usize = 512 * 1024;
+
 #[derive(Debug, Clone)]
 pub enum KadMessage {
     BootstrapReq,
@@ -190,8 +193,6 @@ pub fn decode_packet(data: &[u8]) -> io::Result<KadMessage> {
     let payload = match header {
         OP_KADEMLIAHEADER => data[1..].to_vec(),
         OP_KADEMLIAPACKEDPROT => {
-            // Wire format: [0xE5][opcode][zlib_compressed(body)]
-            // The opcode byte sits between the header and compressed data.
             if data.len() < 3 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -200,16 +201,46 @@ pub fn decode_packet(data: &[u8]) -> io::Result<KadMessage> {
             }
             let opcode = data[1];
             let compressed = &data[2..];
-            let mut decoder = ZlibDecoder::new(compressed);
             let mut decompressed = Vec::new();
-            match decoder.read_to_end(&mut decompressed) {
-                Ok(_) => {}
-                Err(_) => {
-                    let mut decoder2 = DeflateDecoder::new(compressed);
-                    decompressed.clear();
-                    decoder2.read_to_end(&mut decompressed)?;
+
+            let decompress_result = {
+                let mut decoder = ZlibDecoder::new(compressed);
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    let n = match decoder.read(&mut buf) {
+                        Ok(0) => break Ok(()),
+                        Ok(n) => n,
+                        Err(e) => break Err(e),
+                    };
+                    decompressed.extend_from_slice(&buf[..n]);
+                    if decompressed.len() > MAX_DECOMPRESSED_SIZE {
+                        break Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "decompressed KAD packet exceeds size limit",
+                        ));
+                    }
+                }
+            };
+
+            if decompress_result.is_err() {
+                decompressed.clear();
+                let mut decoder2 = DeflateDecoder::new(compressed);
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    let n = decoder2.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    decompressed.extend_from_slice(&buf[..n]);
+                    if decompressed.len() > MAX_DECOMPRESSED_SIZE {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "decompressed KAD packet exceeds size limit",
+                        ));
+                    }
                 }
             }
+
             let mut result = Vec::with_capacity(1 + decompressed.len());
             result.push(opcode);
             result.extend_from_slice(&decompressed);

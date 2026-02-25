@@ -216,6 +216,20 @@ pub fn md4_bytes_to_kad_id(hash: &[u8]) -> KadId {
     KadId(id)
 }
 
+/// Reverse the byte-swap: convert a KadId back to raw MD4 bytes.
+/// This is the inverse of `md4_bytes_to_kad_id`.
+pub fn kad_id_to_md4_bytes(id: &KadId) -> [u8; 16] {
+    let mut raw = [0u8; 16];
+    for i in 0..4 {
+        let base = i * 4;
+        raw[base] = id.0[base + 3];
+        raw[base + 1] = id.0[base + 2];
+        raw[base + 2] = id.0[base + 1];
+        raw[base + 3] = id.0[base];
+    }
+    raw
+}
+
 /// Extract searchable keywords from a filename.
 pub fn extract_keywords(filename: &str) -> Vec<String> {
     let name = filename

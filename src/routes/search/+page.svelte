@@ -1,9 +1,13 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles } from '$lib/api/search';
+  import { searchFiles, parseEd2kLink } from '$lib/api/search';
   import { startDownload } from '$lib/api/transfers';
-  import { searchResults, searchQuery, isSearching } from '$lib/stores/search';
+  import { searchResults, searchQuery, isSearching, searchProgress } from '$lib/stores/search';
   import type { SearchResult } from '$lib/types';
+
+  let ed2kInput = $state('');
+  let ed2kError = $state('');
+  let ed2kSuccess = $state('');
 
   const FILE_TYPES = [
     { value: '', label: 'Any' },
@@ -154,6 +158,23 @@
     return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
   }
 
+  async function handleEd2kLink() {
+    const link = ed2kInput.trim();
+    if (!link) return;
+    ed2kError = '';
+    ed2kSuccess = '';
+    try {
+      const info = await parseEd2kLink(link);
+      await startDownload(info.hash, info.name, info.size, '', 0);
+      ed2kSuccess = `Queued: ${info.name}`;
+      ed2kInput = '';
+      setTimeout(() => (ed2kSuccess = ''), 5000);
+    } catch (e: any) {
+      ed2kError = typeof e === 'string' ? e : e?.message || 'Invalid ed2k link';
+      setTimeout(() => (ed2kError = ''), 5000);
+    }
+  }
+
   function clearFilters() {
     filterType = '';
     filterMinSize = '';
@@ -184,6 +205,22 @@
   <button onclick={() => handleSearch($searchQuery)} disabled={$isSearching}>
     {$isSearching ? 'Searching...' : 'Search'}
   </button>
+</div>
+
+<div class="ed2k-bar">
+  <input
+    type="text"
+    placeholder="Paste ed2k://|file|... link to download"
+    bind:value={ed2kInput}
+    onkeydown={(e) => { if (e.key === 'Enter') handleEd2kLink(); }}
+  />
+  <button onclick={handleEd2kLink} disabled={!ed2kInput.trim()}>Add Link</button>
+  {#if ed2kSuccess}
+    <span class="ed2k-success">{ed2kSuccess}</span>
+  {/if}
+  {#if ed2kError}
+    <span class="ed2k-error">{ed2kError}</span>
+  {/if}
 </div>
 
 <div class="filter-bar">
@@ -273,6 +310,15 @@
   {:else if $isSearching}
     <div class="empty-state">
       <p>Searching the network...</p>
+      {#if $searchProgress}
+        <p class="search-detail">
+          Contacted {$searchProgress.nodes_contacted} nodes
+          {#if $searchProgress.results_so_far > 0}
+            &middot; {$searchProgress.results_so_far} results found
+          {/if}
+          &middot; {$searchProgress.phase}
+        </p>
+      {/if}
     </div>
   {:else}
     <div class="results-info">
@@ -343,6 +389,32 @@
 
   .search-area :global(.search-bar) {
     flex: 1;
+  }
+
+  .ed2k-bar {
+    display: flex;
+    gap: 8px;
+    padding: 0 20px 12px;
+    align-items: center;
+  }
+
+  .ed2k-bar input {
+    flex: 1;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    padding: 5px 8px;
+  }
+
+  .ed2k-success {
+    color: var(--success, #2ecc71);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+
+  .ed2k-error {
+    color: var(--danger, #e74c3c);
+    font-size: 12px;
+    white-space: nowrap;
   }
 
   .filter-bar {
@@ -464,7 +536,7 @@
     color: var(--text-accent);
   }
 
-  .hint {
+  .hint, .search-detail {
     font-size: 13px;
     color: var(--text-muted);
   }

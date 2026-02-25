@@ -432,7 +432,10 @@ impl SearchManager {
         let search_ids: Vec<SearchId> = self.active.keys().cloned().collect();
 
         for sid in search_ids {
-            let state = self.active.get_mut(&sid).unwrap();
+            let state = match self.active.get_mut(&sid) {
+                Some(s) => s,
+                None => continue,
+            };
             if state.completed {
                 continue;
             }

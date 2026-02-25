@@ -7,7 +7,8 @@ use crate::network::kad::bootstrap;
 use crate::network::NetworkCommand;
 use crate::types::AppSettings;
 
-const NODES_DAT_URL: &str = "http://upd.emule-security.org/nodes.dat";
+const NODES_DAT_URL: &str = "https://upd.emule-security.org/nodes.dat";
+const IPFILTER_URL: &str = "https://emuling.gitlab.io/ipfilter.dat";
 
 #[tauri::command]
 pub async fn get_settings(
@@ -17,11 +18,38 @@ pub async fn get_settings(
     Ok(config.settings.clone())
 }
 
+fn validate_settings(settings: &AppSettings) -> Result<(), String> {
+    if settings.tcp_port == 0 {
+        return Err("TCP port must be between 1 and 65535".into());
+    }
+    if settings.udp_port == 0 {
+        return Err("UDP port must be between 1 and 65535".into());
+    }
+    if settings.max_concurrent_downloads == 0 || settings.max_concurrent_downloads > 50 {
+        return Err("Max concurrent downloads must be between 1 and 50".into());
+    }
+    if settings.max_concurrent_uploads == 0 || settings.max_concurrent_uploads > 50 {
+        return Err("Max concurrent uploads must be between 1 and 50".into());
+    }
+    if settings.nickname.len() > 128 {
+        return Err("Nickname must be 128 characters or fewer".into());
+    }
+    if !settings.download_folder.is_empty() {
+        let path = std::path::Path::new(&settings.download_folder);
+        if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Err("Download folder must not contain '..' path components".into());
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn update_settings(
     state: tauri::State<'_, AppState>,
     settings: AppSettings,
 ) -> Result<String, String> {
+    validate_settings(&settings)?;
+
     state
         .bandwidth_limiter
         .set_limits(settings.max_upload_speed, settings.max_download_speed);
@@ -89,6 +117,38 @@ pub async fn download_nodes_dat(
 
     let msg = format!(
         "Downloaded and loaded {contact_count} contacts ({byte_count} bytes) — bootstrapping now",
+    );
+    info!("{msg}");
+    Ok(msg)
+}
+
+#[tauri::command]
+pub async fn download_ipfilter(
+) -> Result<String, String> {
+    info!("Downloading ipfilter.dat from {IPFILTER_URL}");
+
+    let bytes = reqwest::get(IPFILTER_URL)
+        .await
+        .map_err(|e| format!("HTTP request failed: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read response body: {e}"))?;
+
+    let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
+        .map(|d| d.data_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("Failed to create data dir: {e}"))?;
+
+    let filter_path = data_dir.join("ipfilter.dat");
+    std::fs::write(&filter_path, &bytes)
+        .map_err(|e| format!("Failed to write ipfilter.dat: {e}"))?;
+
+    let byte_count = bytes.len();
+    let line_count = bytes.iter().filter(|&&b| b == b'\n').count();
+
+    let msg = format!(
+        "Downloaded ipfilter.dat ({byte_count} bytes, ~{line_count} entries). Restart to apply.",
     );
     info!("{msg}");
     Ok(msg)

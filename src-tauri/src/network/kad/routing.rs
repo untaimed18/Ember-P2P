@@ -1,6 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 
+use super::ip_filter;
 use super::types::*;
 
 const NUM_BUCKETS: usize = 128;
@@ -33,6 +34,7 @@ pub struct RoutingTable {
     pub pending_evictions: Vec<PendingEviction>,
     global_ip_count: HashMap<Ipv4Addr, u32>,
     global_subnet_count: HashMap<u32, u32>,
+    block_private_ips: bool,
 }
 
 #[derive(Debug)]
@@ -64,7 +66,7 @@ impl KBucket {
 }
 
 impl RoutingTable {
-    pub fn new(local_id: KadId) -> Self {
+    pub fn new(local_id: KadId, block_private_ips: bool) -> Self {
         let mut buckets = Vec::with_capacity(NUM_BUCKETS);
         for _ in 0..NUM_BUCKETS {
             buckets.push(KBucket::new());
@@ -75,6 +77,7 @@ impl RoutingTable {
             pending_evictions: Vec::new(),
             global_ip_count: HashMap::new(),
             global_subnet_count: HashMap::new(),
+            block_private_ips,
         }
     }
 
@@ -127,7 +130,7 @@ impl RoutingTable {
         if contact.id == self.local_id {
             return None;
         }
-        if contact.ip == Ipv4Addr::UNSPECIFIED || contact.ip == Ipv4Addr::LOCALHOST {
+        if !ip_filter::is_valid_contact_ip(contact.ip, self.block_private_ips) {
             return None;
         }
 
@@ -215,6 +218,35 @@ impl RoutingTable {
             contact.verified = true;
             contact.update_type();
         }
+    }
+
+    /// Get closest contacts, preferring verified and non-firewalled ones.
+    /// First fills from verified contacts sorted by distance, then tops up
+    /// with unverified contacts. Within each group, non-firewalled contacts
+    /// are preferred.
+    pub fn find_closest_prefer_verified(&self, target: &KadId, count: usize) -> Vec<KadContact> {
+        let mut verified = self.find_closest_verified(target, count);
+        // Sort verified by firewall status (non-firewalled first)
+        verified.sort_by_key(|c| c.is_udp_firewalled() as u8);
+
+        if verified.len() >= count {
+            return verified;
+        }
+
+        let remaining = count - verified.len();
+        let verified_ids: HashSet<KadId> = verified.iter().map(|c| c.id).collect();
+        let mut unverified: Vec<(KadId, &KadContact)> = self
+            .all_contacts()
+            .filter(|c| !c.verified && !verified_ids.contains(&c.id))
+            .map(|c| (target.xor_distance(&c.id), c))
+            .collect();
+        // Sort unverified by: non-firewalled first, then distance
+        unverified.sort_by(|a, b| {
+            a.1.is_udp_firewalled().cmp(&b.1.is_udp_firewalled())
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        verified.extend(unverified.into_iter().take(remaining).map(|(_, c)| c.clone()));
+        verified
     }
 
     /// Get only verified contacts closest to a target.
@@ -372,6 +404,15 @@ impl RoutingTable {
         self.buckets[bucket_idx]
             .contacts
             .iter()
+            .find(|c| c.id == *id)
+    }
+
+    /// Look up a specific contact by ID (mutable).
+    pub fn get_contact_mut(&mut self, id: &KadId) -> Option<&mut KadContact> {
+        let bucket_idx = self.bucket_for(id);
+        self.buckets[bucket_idx]
+            .contacts
+            .iter_mut()
             .find(|c| c.id == *id)
     }
 
