@@ -274,7 +274,6 @@ impl KadContact {
         format!("{}:{}", self.ip, self.udp_port)
     }
 
-    #[allow(dead_code)]
     pub fn is_udp_firewalled(&self) -> bool {
         self.kad_options & 0x01 != 0
     }

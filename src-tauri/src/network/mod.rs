@@ -537,12 +537,12 @@ pub async fn start_network(
 
             // Download progress events
             Some(event) = dl_event_rx.recv() => {
-                handle_download_event(event, &app_handle, &transfer_manager, &db).await;
+                handle_download_event(event, &app_handle, &transfer_manager, &db, &bandwidth_limiter).await;
             }
 
             // Upload events from the peer-to-peer upload listener
             Some(event) = ul_event_rx.recv() => {
-                handle_upload_event(event, &app_handle, &transfer_manager).await;
+                handle_upload_event(event, &app_handle, &transfer_manager, &bandwidth_limiter).await;
             }
 
             // Periodic search polling
@@ -876,7 +876,7 @@ pub async fn start_network(
                     .into_iter().take(MAX_SOURCE_PUBLISHES_PER_CYCLE).cloned().collect::<Vec<_>>();
                 for file in &source_files {
                     let msg = state.publish_manager.build_source_publish(file);
-                    let closest = state.routing_table.find_closest(&file.file_hash, K_BUCKET_SIZE);
+                    let closest = state.routing_table.find_closest_prefer_verified(&file.file_hash, K_BUCKET_SIZE);
                     if !closest.is_empty() {
                         // Use iterative search to find truly closest nodes before publishing
                         let sid = state.search_manager.start_search(
@@ -896,7 +896,7 @@ pub async fn start_network(
                     // Use StoreKeyword search to find truly closest nodes, then publish
                     if !publishes.is_empty() {
                         let first_kw_hash = publishes[0].0;
-                        let closest = state.routing_table.find_closest(&first_kw_hash, K_BUCKET_SIZE);
+                        let closest = state.routing_table.find_closest_prefer_verified(&first_kw_hash, K_BUCKET_SIZE);
                         if !closest.is_empty() {
                             let sid = state.search_manager.start_search(
                                 first_kw_hash,
@@ -2128,7 +2128,7 @@ async fn handle_command(
 
             let closest = state
                 .routing_table
-                .find_closest(&keyword_hash, K_BUCKET_SIZE);
+                .find_closest_prefer_verified(&keyword_hash, K_BUCKET_SIZE);
 
             if closest.is_empty() {
                 let _ = tx.send(local_results);
@@ -2208,7 +2208,7 @@ async fn handle_command(
                 };
                 let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
 
-                let mut closest = state.routing_table.find_closest(&kad_hash, K_BUCKET_SIZE);
+                let mut closest = state.routing_table.find_closest_prefer_verified(&kad_hash, K_BUCKET_SIZE);
                 if closest.is_empty() {
                     warn!("No routing table contacts for source search, download will retry later");
                 }
@@ -2331,7 +2331,7 @@ async fn handle_command(
         NetworkCommand::PublishNote { file_hash, rating, comment } => {
             let closest = state
                 .routing_table
-                .find_closest(&file_hash, K_BUCKET_SIZE);
+                .find_closest_prefer_verified(&file_hash, K_BUCKET_SIZE);
 
             if closest.is_empty() {
                 warn!("No contacts to publish note to");
@@ -2395,7 +2395,7 @@ async fn handle_command(
         NetworkCommand::FindNotes { file_hash, file_size, tx } => {
             let closest = state
                 .routing_table
-                .find_closest(&file_hash, K_BUCKET_SIZE);
+                .find_closest_prefer_verified(&file_hash, K_BUCKET_SIZE);
 
             if closest.is_empty() {
                 let _ = tx.send(Vec::new());
@@ -2413,7 +2413,7 @@ async fn handle_command(
         NetworkCommand::FindSources { file_hash, file_size, tx } => {
             let closest = state
                 .routing_table
-                .find_closest(&file_hash, K_BUCKET_SIZE);
+                .find_closest_prefer_verified(&file_hash, K_BUCKET_SIZE);
 
             if closest.is_empty() {
                 let _ = tx.send(Vec::new());
@@ -2461,6 +2461,7 @@ async fn handle_download_event(
     app_handle: &tauri::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     db: &Arc<Database>,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     match event {
         DownloadEvent::Progress {
@@ -2490,6 +2491,7 @@ async fn handle_download_event(
                     "total": total,
                     "progress": progress,
                     "speed": speed,
+                    "global_download_speed": bandwidth_limiter.download_speed(),
                 }),
             );
         }
@@ -2522,6 +2524,7 @@ async fn handle_upload_event(
     event: UploadEvent,
     app_handle: &tauri::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     match event.kind {
         UploadEventKind::Started {
@@ -2576,6 +2579,7 @@ async fn handle_upload_event(
                     "progress": progress,
                     "speed": speed,
                     "direction": "upload",
+                    "global_upload_speed": bandwidth_limiter.upload_speed(),
                 }),
             );
         }

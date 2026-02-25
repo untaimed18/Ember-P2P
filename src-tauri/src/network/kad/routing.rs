@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 
 use super::ip_filter;
@@ -220,8 +220,36 @@ impl RoutingTable {
         }
     }
 
+    /// Get closest contacts, preferring verified and non-firewalled ones.
+    /// First fills from verified contacts sorted by distance, then tops up
+    /// with unverified contacts. Within each group, non-firewalled contacts
+    /// are preferred.
+    pub fn find_closest_prefer_verified(&self, target: &KadId, count: usize) -> Vec<KadContact> {
+        let mut verified = self.find_closest_verified(target, count);
+        // Sort verified by firewall status (non-firewalled first)
+        verified.sort_by_key(|c| c.is_udp_firewalled() as u8);
+
+        if verified.len() >= count {
+            return verified;
+        }
+
+        let remaining = count - verified.len();
+        let verified_ids: HashSet<KadId> = verified.iter().map(|c| c.id).collect();
+        let mut unverified: Vec<(KadId, &KadContact)> = self
+            .all_contacts()
+            .filter(|c| !c.verified && !verified_ids.contains(&c.id))
+            .map(|c| (target.xor_distance(&c.id), c))
+            .collect();
+        // Sort unverified by: non-firewalled first, then distance
+        unverified.sort_by(|a, b| {
+            a.1.is_udp_firewalled().cmp(&b.1.is_udp_firewalled())
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        verified.extend(unverified.into_iter().take(remaining).map(|(_, c)| c.clone()));
+        verified
+    }
+
     /// Get only verified contacts closest to a target.
-    #[allow(dead_code)]
     pub fn find_closest_verified(&self, target: &KadId, count: usize) -> Vec<KadContact> {
         let mut all: Vec<(KadId, &KadContact)> = self
             .all_contacts()
