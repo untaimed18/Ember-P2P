@@ -17,6 +17,8 @@ use super::messages::*;
 
 const MAX_CONCURRENT_UPLOADS: usize = 5;
 const CLIENT_TIMEOUT_SECS: u64 = 120;
+/// Maximum concurrent TCP connections from a single IP address
+const MAX_CONNECTIONS_PER_IP: usize = 3;
 
 pub struct UploadEvent {
     pub transfer_id: String,
@@ -52,6 +54,7 @@ struct UploadServer {
     active_count: Arc<std::sync::atomic::AtomicUsize>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     upload_queue: Arc<tokio::sync::Mutex<VecDeque<SocketAddr>>>,
+    ip_connection_counts: Arc<tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
 }
 
 pub async fn start_upload_server(
@@ -84,16 +87,39 @@ pub async fn start_upload_server(
         active_count,
         upload_event_tx,
         upload_queue,
+        ip_connection_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
-                debug!("Incoming ED2K connection from {peer_addr}");
                 let server = server.clone();
+
+                // Enforce per-IP connection limit
+                {
+                    let mut counts = server.ip_connection_counts.lock().await;
+                    let count = counts.entry(peer_addr.ip()).or_insert(0);
+                    if *count >= MAX_CONNECTIONS_PER_IP {
+                        debug!("Rejecting connection from {peer_addr}: per-IP limit reached");
+                        drop(stream);
+                        continue;
+                    }
+                    *count += 1;
+                }
+
+                debug!("Incoming ED2K connection from {peer_addr}");
                 tokio::spawn(async move {
-                    if let Err(e) = server.handle_connection(stream, peer_addr).await {
+                    let result = server.handle_connection(stream, peer_addr).await;
+                    if let Err(e) = &result {
                         warn!("Connection from {peer_addr} ended: {e}");
+                    }
+                    // Decrement the per-IP connection count
+                    let mut counts = server.ip_connection_counts.lock().await;
+                    if let Some(count) = counts.get_mut(&peer_addr.ip()) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            counts.remove(&peer_addr.ip());
+                        }
                     }
                 });
             }

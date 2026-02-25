@@ -21,7 +21,12 @@ impl Database {
         let db_path = app_dir.join("nexus.db");
         let conn = Connection::open(db_path)?;
 
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;\
+             PRAGMA foreign_keys=ON;\
+             PRAGMA secure_delete=ON;\
+             PRAGMA auto_vacuum=INCREMENTAL;",
+        )?;
 
         let db = Self {
             conn: Mutex::new(conn),

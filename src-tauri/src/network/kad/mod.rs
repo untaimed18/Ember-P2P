@@ -1,5 +1,6 @@
 pub mod bootstrap;
 pub mod buddy;
+pub mod ip_filter;
 pub mod messages;
 pub mod obfuscation;
 pub mod protection;

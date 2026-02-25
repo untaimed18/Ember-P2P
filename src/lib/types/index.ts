@@ -64,4 +64,7 @@ export interface AppSettings {
   nodes_dat_path: string;
   nat_traversal_enabled: boolean;
   upnp_enabled: boolean;
+  obfuscation_enabled: boolean;
+  ip_filter_enabled: boolean;
+  block_private_ips: boolean;
 }

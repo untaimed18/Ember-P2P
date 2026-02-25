@@ -3,6 +3,7 @@ mod bandwidth;
 mod commands;
 mod network;
 mod search;
+pub mod security;
 mod sharing;
 mod storage;
 mod types;

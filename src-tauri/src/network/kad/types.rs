@@ -337,15 +337,27 @@ pub struct KadTag {
 }
 
 impl KadTag {
+        /// Maximum allowed string length in tags (64 KiB, matching eMule limits)
+    const MAX_TAG_STRING_LEN: usize = 65536;
+    /// Maximum allowed blob size in tags (256 KiB)
+    const MAX_TAG_BLOB_LEN: usize = 262144;
+    /// Maximum allowed tag name length (256 bytes)
+    const MAX_TAG_NAME_LEN: usize = 256;
+
     pub fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
         let tag_type = reader.read_u8()?;
 
         let name = if tag_type & 0x80 != 0 {
-            // Short tag name (single byte ID)
             let name_id = reader.read_u8()?;
             TagName::Id(name_id)
         } else {
             let name_len = reader.read_u16::<LittleEndian>()? as usize;
+            if name_len > Self::MAX_TAG_NAME_LEN {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("tag name too long: {name_len}"),
+                ));
+            }
             if name_len == 1 {
                 let name_id = reader.read_u8()?;
                 TagName::Id(name_id)
@@ -365,6 +377,12 @@ impl KadTag {
             }
             TAGTYPE_STRING => {
                 let len = reader.read_u16::<LittleEndian>()? as usize;
+                if len > Self::MAX_TAG_STRING_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("tag string too long: {len}"),
+                    ));
+                }
                 let mut buf = vec![0u8; len];
                 reader.read_exact(&mut buf)?;
                 TagValue::String(String::from_utf8_lossy(&buf).to_string())
@@ -378,12 +396,24 @@ impl KadTag {
             TAGTYPE_BOOLARRAY => {
                 let len = reader.read_u16::<LittleEndian>()? as usize;
                 let byte_count = (len + 7) / 8;
+                if byte_count > Self::MAX_TAG_BLOB_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("boolarray too large: {byte_count}"),
+                    ));
+                }
                 let mut buf = vec![0u8; byte_count];
                 reader.read_exact(&mut buf)?;
                 TagValue::Blob(buf)
             }
             TAGTYPE_BLOB => {
                 let len = reader.read_u32::<LittleEndian>()? as usize;
+                if len > Self::MAX_TAG_BLOB_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("blob too large: {len}"),
+                    ));
+                }
                 let mut buf = vec![0u8; len];
                 reader.read_exact(&mut buf)?;
                 TagValue::Blob(buf)
@@ -511,8 +541,17 @@ impl KadTag {
     }
 }
 
+/// Maximum tags per tag list (eMule typically sends < 10 tags per message)
+const MAX_TAG_LIST_SIZE: usize = 32;
+
 pub fn read_tag_list<R: Read>(reader: &mut R) -> io::Result<Vec<KadTag>> {
     let count = reader.read_u8()? as usize;
+    if count > MAX_TAG_LIST_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("tag list too large: {count} (max {MAX_TAG_LIST_SIZE})"),
+        ));
+    }
     let mut tags = Vec::with_capacity(count);
     for _ in 0..count {
         tags.push(KadTag::read_from(reader)?);

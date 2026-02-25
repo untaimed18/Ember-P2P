@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 
+use super::ip_filter;
 use super::types::*;
 
 const NUM_BUCKETS: usize = 128;
@@ -127,7 +128,7 @@ impl RoutingTable {
         if contact.id == self.local_id {
             return None;
         }
-        if contact.ip == Ipv4Addr::UNSPECIFIED || contact.ip == Ipv4Addr::LOCALHOST {
+        if !ip_filter::is_valid_contact_ip(contact.ip) {
             return None;
         }
 
