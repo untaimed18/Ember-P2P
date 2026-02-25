@@ -295,8 +295,8 @@ impl MultiSourceDownload {
         };
 
         if all_done {
-            // Rename to final file
-            let final_path = self.download_dir.join(&self.file_name);
+            let safe_name = crate::security::sanitize_filename(&self.file_name);
+            let final_path = self.download_dir.join(&safe_name);
             {
                 let t = tracker.read().await;
                 t.delete_met();

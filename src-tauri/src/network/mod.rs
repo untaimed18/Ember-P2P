@@ -27,7 +27,7 @@ use self::kad::ip_filter::IpFilter;
 use self::kad::messages::{self, KadMessage};
 use self::kad::obfuscation;
 use self::kad::protection::FloodProtection;
-use self::kad::publish::{PublishManager, PublishableFile, md4_bytes_to_kad_id};
+use self::kad::publish::{PublishManager, PublishableFile, md4_bytes_to_kad_id, kad_id_to_md4_bytes};
 use self::kad::routing::RoutingTable;
 use self::kad::search::{SearchId, SearchManager, SearchType};
 use self::kad::store::DhtStore;
@@ -123,6 +123,8 @@ struct NetworkState {
     store_keyword_searches: HashMap<SearchId, (PublishableFile, Vec<(KadId, KadMessage)>)>,
     /// Pending notes searches: search_id -> response sender
     pending_notes_searches: HashMap<SearchId, oneshot::Sender<Vec<SearchResult>>>,
+    /// Pending note publishes: search_id -> (file_hash, rating, comment)
+    pending_note_publishes: HashMap<SearchId, (KadId, u8, String)>,
     flood_protection: FloodProtection,
     buddy_manager: BuddyManager,
     /// Our UDP verification key seed (random, stable for session)
@@ -333,6 +335,7 @@ pub async fn start_network(
         publish_confirmed: 0,
         store_keyword_searches: HashMap::new(),
         pending_notes_searches: HashMap::new(),
+        pending_note_publishes: HashMap::new(),
         flood_protection: FloodProtection::new(),
         buddy_manager,
         udp_key_seed,
@@ -394,6 +397,8 @@ pub async fn start_network(
         let ul_bw = bandwidth_limiter.clone();
         let ul_folders = settings.shared_folders.clone();
         let ul_nickname = settings.nickname.clone();
+        let ul_app = app_handle.clone();
+        let ul_max = settings.max_concurrent_uploads;
         tokio::spawn(async move {
             if let Err(e) = upload_server::start_upload_server(
                 tcp_port,
@@ -405,11 +410,14 @@ pub async fn start_network(
                 ul_transfers,
                 ul_bw,
                 ul_tx,
-                settings.max_concurrent_uploads,
+                ul_max,
             )
             .await
             {
                 error!("Upload listener error: {e}");
+                let _ = ul_app.emit("network-error", serde_json::json!({
+                    "message": format!("TCP port {tcp_port} is already in use. Uploads will not work. Change the port in Settings or close the other application."),
+                }));
             }
         });
     }
@@ -433,8 +441,29 @@ pub async fn start_network(
         if count > 0 {
             info!("Resuming {count} incomplete downloads from previous session");
             let now = chrono::Utc::now().timestamp();
-            for transfer in incomplete {
+            let dl_folder = settings.download_folder.clone();
+            for mut transfer in incomplete {
                 let control = TransferControl::new();
+
+                // Check .part file for actual progress
+                let part_path = PathBuf::from(&dl_folder)
+                    .join(format!("{}.part", transfer.id));
+                if part_path.exists() && transfer.total_size > 0 {
+                    let tracker = crate::network::ed2k::part_tracker::PartTracker::new(
+                        transfer.total_size, &part_path,
+                    );
+                    let completed_bytes: u64 = (0..tracker.part_count)
+                        .filter(|&i| tracker.is_part_complete(i))
+                        .map(|i| {
+                            let (s, e) = tracker.part_range(i);
+                            e - s
+                        })
+                        .sum();
+                    transfer.transferred = completed_bytes;
+                    transfer.progress = (completed_bytes as f64 / transfer.total_size as f64) * 100.0;
+                }
+
+                transfer.status = TransferStatus::Searching;
                 {
                     let mut mgr = transfer_manager.write().await;
                     mgr.enqueue(transfer.clone());
@@ -447,7 +476,7 @@ pub async fn start_network(
                     file_size: transfer.total_size,
                     control,
                     search_count: 0,
-                    last_search_at: now - 60, // trigger immediate source search
+                    last_search_at: now - 60,
                 });
             }
         }
@@ -706,6 +735,41 @@ pub async fn start_network(
                                 info!(
                                     "StoreKeyword search {} completed: published {} keywords to {} closest nodes",
                                     sid.0, kw_publishes.len(), search.closest.len().min(3)
+                                );
+                            }
+                        }
+                    } else if let Some((file_hash, rating, comment)) = state.pending_note_publishes.remove(&sid) {
+                        // StoreNotes search completed - send PublishNotesReq to closest nodes
+                        if let Some(search) = state.search_manager.get(&sid) {
+                            let mut note_tags = vec![
+                                KadTag {
+                                    name: TagName::Id(TAG_FILENAME),
+                                    value: TagValue::String(comment),
+                                },
+                            ];
+                            if rating > 0 {
+                                note_tags.push(KadTag {
+                                    name: TagName::Id(TAG_FILESIZE),
+                                    value: TagValue::Uint8(rating),
+                                });
+                            }
+                            let msg = KadMessage::PublishNotesReq {
+                                target: file_hash,
+                                sender_id: state.local_id,
+                                tags: note_tags,
+                            };
+                            let mut sent = 0;
+                            for contact in search.closest.iter().take(3) {
+                                let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                                if let Ok(packet) = messages::encode_packet(&msg) {
+                                    let _ = udp_socket.send_to(&packet, addr).await;
+                                    sent += 1;
+                                }
+                            }
+                            if sent > 0 {
+                                info!(
+                                    "StoreNotes search {} completed: published note (rating={}) to {} closest nodes",
+                                    sid.0, rating, sent
                                 );
                             }
                         }
@@ -980,9 +1044,19 @@ pub async fn start_network(
                 }
             }
 
-            // Cleanup flood protection tracking
+            // Cleanup flood protection tracking and cap peer nicknames
             _ = flood_cleanup_timer.tick() => {
                 state.flood_protection.cleanup();
+
+                // Prevent unbounded growth of peer_nicknames
+                const MAX_NICKNAME_ENTRIES: usize = 500;
+                if state.peer_nicknames.len() > MAX_NICKNAME_ENTRIES {
+                    let current_contacts: HashSet<KadId> = state.routing_table
+                        .all_contacts()
+                        .map(|c| c.id)
+                        .collect();
+                    state.peer_nicknames.retain(|id, _| current_contacts.contains(id));
+                }
             }
 
             // Retry source search for pending downloads
@@ -1362,7 +1436,8 @@ async fn handle_udp_packet(
             }
 
             // Build our firewall options + UDP verify key for the peer
-            let our_options: u8 = if state.firewalled { 0x01 } else { 0x00 };
+            // Bit 0: UDP firewalled, bit 1: TCP firewalled, bit 2: request ACK
+            let our_options: u8 = if state.firewalled { 0x05 } else { 0x04 };
             let contact_ip_u32_for_key = u32::from(ip);
             let our_key_for_peer = KadUDPKey::generate(state.udp_key_seed, contact_ip_u32_for_key);
             let mut res_tags = vec![
@@ -2228,12 +2303,12 @@ async fn handle_command(
                 return;
             }
 
-            // Use StoreNotes search to find closest nodes, then publish
             let sid = state.search_manager.start_search(
                 file_hash,
                 SearchType::StoreNotes,
                 closest,
             );
+            state.pending_note_publishes.insert(sid, (file_hash, rating, comment.clone()));
             info!(
                 "Started StoreNotes search {} for file {} (rating={}, comment_len={})",
                 sid.0, file_hash, rating, comment.len()
@@ -2242,14 +2317,14 @@ async fn handle_command(
 
         NetworkCommand::BanPeer { peer_id_hex } => {
             if let Some(kad_id) = KadId::from_hex(&peer_id_hex) {
-                // Remove from routing table
+                // Grab the IP before removing from routing table
+                let contact_ip = state.routing_table.get_contact(&kad_id).map(|c| c.ip);
                 if state.routing_table.remove(&kad_id) {
                     info!("Removed banned peer {} from routing table", peer_id_hex);
                     state.stats.connected_peers = state.routing_table.len() as u32;
                 }
-                // Add IP to banned set for network-level rejection
-                if let Some(contact) = state.routing_table.get_contact(&kad_id) {
-                    state.banned_ips.insert(contact.ip);
+                if let Some(ip) = contact_ip {
+                    state.banned_ips.insert(ip);
                 }
                 // Also check peer database for the IP
                 if let Ok(peers) = db.get_peers() {
@@ -2578,8 +2653,11 @@ fn convert_search_results(
                 String::new()
             };
 
+            // entry.id is the KAD ID (byte-swapped MD4). Reverse the swap
+            // to get the raw MD4 hash needed for ED2K file transfers.
+            let raw_md4 = kad_id_to_md4_bytes(&entry.id);
             Some(ParsedEntry {
-                hash: entry.id.to_hex(),
+                hash: hex::encode(raw_md4),
                 name,
                 size,
                 file_type,
