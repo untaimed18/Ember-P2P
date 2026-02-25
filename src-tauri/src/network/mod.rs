@@ -405,6 +405,7 @@ pub async fn start_network(
                 ul_transfers,
                 ul_bw,
                 ul_tx,
+                settings.max_concurrent_uploads,
             )
             .await
             {

@@ -15,7 +15,6 @@ use crate::sharing::manager::TransferManager;
 
 use super::messages::*;
 
-const MAX_CONCURRENT_UPLOADS: usize = 5;
 const CLIENT_TIMEOUT_SECS: u64 = 120;
 /// Maximum concurrent TCP connections from a single IP address
 const MAX_CONNECTIONS_PER_IP: usize = 3;
@@ -54,6 +53,7 @@ struct UploadHandler {
     tcp_port: u16,
     udp_port: u16,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
+    max_concurrent_uploads: Arc<std::sync::atomic::AtomicUsize>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     upload_queue: Arc<tokio::sync::Mutex<VecDeque<SocketAddr>>>,
     ip_connection_counts: Arc<tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
@@ -69,10 +69,11 @@ pub async fn start_upload_server(
     transfer_manager: Arc<RwLock<TransferManager>>,
     bandwidth_limiter: Arc<BandwidthLimiter>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
+    max_uploads: u32,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     let listener = TcpListener::bind(addr).await?;
-    info!("Peer-to-peer upload listener started on TCP port {tcp_port}");
+    info!("Peer-to-peer upload listener started on TCP port {tcp_port} (max {max_uploads} uploads)");
 
     let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let upload_queue = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
@@ -87,6 +88,7 @@ pub async fn start_upload_server(
         tcp_port,
         udp_port,
         active_count,
+        max_concurrent_uploads: Arc::new(std::sync::atomic::AtomicUsize::new(max_uploads as usize)),
         upload_event_tx,
         upload_queue,
         ip_connection_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -264,7 +266,8 @@ impl UploadHandler {
                         .active_count
                         .load(std::sync::atomic::Ordering::Relaxed);
 
-                    let should_accept = if current_active >= MAX_CONCURRENT_UPLOADS {
+                    let max_uploads = self.max_concurrent_uploads.load(std::sync::atomic::Ordering::Relaxed);
+                    let should_accept = if current_active >= max_uploads {
                         false
                     } else {
                         let mut queue = self.upload_queue.lock().await;

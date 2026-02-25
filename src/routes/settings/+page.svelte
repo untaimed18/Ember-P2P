@@ -138,6 +138,21 @@
             bind:value={settings.max_concurrent_downloads}
           />
         </div>
+        <div class="field">
+          <label for="max-uploads">Max Concurrent Uploads</label>
+          <input
+            id="max-uploads"
+            type="number"
+            min="1"
+            max="20"
+            bind:value={settings.max_concurrent_uploads}
+          />
+          <span class="field-hint">
+            Number of simultaneous upload slots for other peers.
+            Higher values share more bandwidth with the network.
+            Requires restart to take effect.
+          </span>
+        </div>
       </section>
 
       <section class="settings-section">
