@@ -121,11 +121,13 @@ impl FloodProtection {
         self.has_recent_communication(&addr)
     }
 
-    /// Check if we've had any tracked communication with this address recently.
+    /// Check if we've had any tracked communication with this exact address recently.
+    /// Requires full address (IP + port) match to prevent spoofing from the same IP
+    /// with a different port.
     fn has_recent_communication(&self, addr: &SocketAddr) -> bool {
         let now = Instant::now();
         self.request_times.iter().any(|((tracked_addr, _), time)| {
-            tracked_addr.ip() == addr.ip()
+            *tracked_addr == *addr
                 && now.duration_since(*time).as_secs() < TRACKER_EXPIRY_SECS
         })
     }

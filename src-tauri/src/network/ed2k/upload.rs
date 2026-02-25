@@ -18,6 +18,10 @@ use super::messages::*;
 const CLIENT_TIMEOUT_SECS: u64 = 120;
 /// Maximum concurrent TCP connections from a single IP address
 const MAX_CONNECTIONS_PER_IP: usize = 3;
+/// Maximum total concurrent TCP connections to the upload server
+const MAX_TOTAL_CONNECTIONS: usize = 100;
+/// Maximum number of peers waiting in the upload queue
+const MAX_UPLOAD_QUEUE_SIZE: usize = 500;
 
 pub struct UploadEvent {
     pub transfer_id: String,
@@ -57,6 +61,7 @@ struct UploadHandler {
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     upload_queue: Arc<tokio::sync::Mutex<VecDeque<SocketAddr>>>,
     ip_connection_counts: Arc<tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    total_connections: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub async fn start_upload_server(
@@ -98,12 +103,21 @@ pub async fn start_upload_server(
         upload_event_tx,
         upload_queue,
         ip_connection_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        total_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     });
 
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
                 let server = server.clone();
+
+                // Enforce global connection limit
+                let current_total = server.total_connections.load(std::sync::atomic::Ordering::Relaxed);
+                if current_total >= MAX_TOTAL_CONNECTIONS {
+                    debug!("Rejecting connection from {peer_addr}: global connection limit reached ({current_total})");
+                    drop(stream);
+                    continue;
+                }
 
                 // Enforce per-IP connection limit
                 {
@@ -117,13 +131,14 @@ pub async fn start_upload_server(
                     *count += 1;
                 }
 
+                server.total_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 debug!("Incoming ED2K connection from {peer_addr}");
                 tokio::spawn(async move {
                     let result = server.handle_connection(stream, peer_addr).await;
                     if let Err(e) = &result {
                         warn!("Connection from {peer_addr} ended: {e}");
                     }
-                    // Decrement the per-IP connection count
+                    server.total_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     let mut counts = server.ip_connection_counts.lock().await;
                     if let Some(count) = counts.get_mut(&peer_addr.ip()) {
                         *count = count.saturating_sub(1);
@@ -299,6 +314,10 @@ impl UploadHandler {
                         let mut queue = self.upload_queue.lock().await;
                         let rank = if let Some(pos) = queue.iter().position(|a| *a == peer_addr) {
                             (pos + 1) as u16
+                        } else if queue.len() >= MAX_UPLOAD_QUEUE_SIZE {
+                            debug!("Upload queue full ({MAX_UPLOAD_QUEUE_SIZE}), rejecting {peer_addr}");
+                            drop(queue);
+                            break;
                         } else {
                             queue.push_back(peer_addr);
                             queue.len() as u16

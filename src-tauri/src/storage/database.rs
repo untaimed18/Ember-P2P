@@ -19,7 +19,13 @@ impl Database {
 
         std::fs::create_dir_all(&app_dir)?;
         let db_path = app_dir.join("nexus.db");
-        let conn = Connection::open(db_path)?;
+        let conn = Connection::open(&db_path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+        }
 
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;\
@@ -94,6 +100,12 @@ impl Database {
     }
 
     fn add_column_if_missing(conn: &Connection, table: &str, column: &str, col_type: &str) {
+        let valid_ident =
+            |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid_ident(table) || !valid_ident(column) {
+            tracing::warn!("Rejecting invalid SQL identifier in migration: {table}.{column}");
+            return;
+        }
         let has_column = conn
             .prepare(&format!("SELECT {column} FROM {table} LIMIT 0"))
             .is_ok();

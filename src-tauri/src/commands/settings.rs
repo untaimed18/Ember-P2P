@@ -18,11 +18,38 @@ pub async fn get_settings(
     Ok(config.settings.clone())
 }
 
+fn validate_settings(settings: &AppSettings) -> Result<(), String> {
+    if settings.tcp_port == 0 {
+        return Err("TCP port must be between 1 and 65535".into());
+    }
+    if settings.udp_port == 0 {
+        return Err("UDP port must be between 1 and 65535".into());
+    }
+    if settings.max_concurrent_downloads == 0 || settings.max_concurrent_downloads > 50 {
+        return Err("Max concurrent downloads must be between 1 and 50".into());
+    }
+    if settings.max_concurrent_uploads == 0 || settings.max_concurrent_uploads > 50 {
+        return Err("Max concurrent uploads must be between 1 and 50".into());
+    }
+    if settings.nickname.len() > 128 {
+        return Err("Nickname must be 128 characters or fewer".into());
+    }
+    if !settings.download_folder.is_empty() {
+        let path = std::path::Path::new(&settings.download_folder);
+        if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Err("Download folder must not contain '..' path components".into());
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn update_settings(
     state: tauri::State<'_, AppState>,
     settings: AppSettings,
 ) -> Result<String, String> {
+    validate_settings(&settings)?;
+
     state
         .bandwidth_limiter
         .set_limits(settings.max_upload_speed, settings.max_download_speed);

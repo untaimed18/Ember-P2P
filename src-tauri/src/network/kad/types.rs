@@ -3,6 +3,7 @@ use std::io::{self, Read, Write};
 use std::net::Ipv4Addr;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use digest::Digest;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -44,8 +45,16 @@ pub struct KadUDPKey {
 }
 
 impl KadUDPKey {
+    /// Generate a UDP verify key for a specific peer IP using a keyed hash.
+    /// Uses MD5(seed || ip) following eMule's approach (each side generates
+    /// independently; the 32-bit result is exchanged as an opaque token via
+    /// TAG_KADUDPKEY in Hello messages).
     pub fn generate(our_udp_key: u32, their_ip: u32) -> Self {
-        let key = our_udp_key ^ their_ip;
+        let mut hasher = md5::Md5::new();
+        hasher.update(our_udp_key.to_le_bytes());
+        hasher.update(their_ip.to_le_bytes());
+        let result = hasher.finalize();
+        let key = u32::from_le_bytes([result[0], result[1], result[2], result[3]]);
         KadUDPKey { key, ip: their_ip }
     }
 

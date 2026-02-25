@@ -164,7 +164,7 @@ pub async fn start_network(
     let identity = crate::storage::identity::NodeIdentity::load_or_create(&data_dir)?;
     let local_id = identity.kad_id();
     let user_hash = identity.user_hash;
-    info!("Local KAD ID: {}", local_id);
+    info!("Local KAD ID: {}…", &local_id.to_hex()[..8]);
 
     let tcp_port = settings.tcp_port;
     let udp_port = settings.udp_port;
@@ -1156,7 +1156,7 @@ pub async fn start_network(
     }
 
     // Save routing table on shutdown
-    info!("Shutting down network for node {}", state.routing_table.local_id());
+    info!("Shutting down network");
     let contacts = state.routing_table.export_contacts();
     let nodes_path = state.data_dir.join("nodes.dat");
     if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {

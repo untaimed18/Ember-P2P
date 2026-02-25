@@ -24,6 +24,9 @@ const READ_TIMEOUT_SECS: u64 = 60;
 /// Maximum decompressed part size (PARTSIZE + margin = 10 MiB)
 const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
 
+/// Maximum allowed file size for downloads (4 TiB)
+const MAX_DOWNLOAD_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024 * 1024;
+
 pub struct Ed2kDownload {
     pub transfer_id: String,
     pub file_hash: [u8; 16],
@@ -294,6 +297,14 @@ impl Ed2kDownload {
             if queue_start.elapsed().as_secs() > MAX_QUEUE_WAIT_SECS {
                 anyhow::bail!("timed out waiting for upload slot after {MAX_QUEUE_WAIT_SECS}s");
             }
+        }
+
+        if self.file_size > MAX_DOWNLOAD_FILE_SIZE {
+            anyhow::bail!(
+                "file size {} exceeds maximum allowed ({})",
+                self.file_size,
+                MAX_DOWNLOAD_FILE_SIZE
+            );
         }
 
         // Ensure download directory exists

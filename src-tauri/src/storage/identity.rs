@@ -26,8 +26,8 @@ impl NodeIdentity {
         rng.fill(&mut kad_id);
         rng.fill(&mut user_hash);
         // eMule convention: first byte of user_hash must not be 0x0E (reserved for "secure ident")
-        if user_hash[5] == 14 {
-            user_hash[5] = 15;
+        if user_hash[0] == 14 {
+            user_hash[0] = 15;
         }
         let udp_key_seed: u32 = rng.gen();
         NodeIdentity {
@@ -49,9 +49,9 @@ impl NodeIdentity {
             match serde_json::from_str::<NodeIdentity>(&data) {
                 Ok(id) => {
                     info!(
-                        "Loaded persistent identity: KAD ID={}, user_hash={}",
-                        hex::encode(id.kad_id),
-                        hex::encode(id.user_hash),
+                        "Loaded persistent identity: KAD ID={}…, user_hash={}…",
+                        &hex::encode(id.kad_id)[..8],
+                        &hex::encode(id.user_hash)[..8],
                     );
                     return Ok(id);
                 }
@@ -64,11 +64,16 @@ impl NodeIdentity {
         let id = Self::generate();
         let data = serde_json::to_string_pretty(&id)?;
         std::fs::create_dir_all(data_dir)?;
-        std::fs::write(&path, data)?;
+        std::fs::write(&path, &data)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         info!(
-            "Generated new identity: KAD ID={}, user_hash={}",
-            hex::encode(id.kad_id),
-            hex::encode(id.user_hash),
+            "Generated new identity: KAD ID={}…, user_hash={}…",
+            &hex::encode(id.kad_id)[..8],
+            &hex::encode(id.user_hash)[..8],
         );
         Ok(id)
     }

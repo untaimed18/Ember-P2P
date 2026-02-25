@@ -12,6 +12,12 @@ use crate::sharing::manager::TransferControl;
 use super::part_tracker::PartTracker;
 use super::transfer::{DownloadEvent, Ed2kDownload};
 
+/// Maximum decompressed part size (PARTSIZE + margin = 10 MiB)
+const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
+
+/// Maximum allowed file size for downloads (4 TiB)
+const MAX_DOWNLOAD_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024 * 1024;
+
 /// A source that can provide parts of a file.
 #[derive(Debug, Clone)]
 pub struct DownloadSource {
@@ -41,6 +47,14 @@ impl MultiSourceDownload {
     pub async fn run(self, event_tx: mpsc::Sender<DownloadEvent>) -> anyhow::Result<()> {
         if self.sources.is_empty() {
             anyhow::bail!("no sources available");
+        }
+
+        if self.file_size > MAX_DOWNLOAD_FILE_SIZE {
+            anyhow::bail!(
+                "file size {} exceeds maximum allowed ({})",
+                self.file_size,
+                MAX_DOWNLOAD_FILE_SIZE
+            );
         }
 
         if self.sources.len() == 1 {
@@ -515,7 +529,17 @@ async fn download_parts_from_source(
 
                         let mut decoder = ZlibDecoder::new(compressed);
                         let mut decompressed = Vec::new();
-                        decoder.read_to_end(&mut decompressed)?;
+                        let mut buf = [0u8; 8192];
+                        loop {
+                            let n = decoder.read(&mut buf)?;
+                            if n == 0 {
+                                break;
+                            }
+                            decompressed.extend_from_slice(&buf[..n]);
+                            if decompressed.len() > MAX_DECOMPRESSED_PART {
+                                anyhow::bail!("decompressed part exceeds size limit");
+                            }
+                        }
 
                         let piece_len = decompressed.len() as u64;
                         loop {
