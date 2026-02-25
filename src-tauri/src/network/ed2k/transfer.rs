@@ -21,6 +21,9 @@ const QUEUE_POLL_SECS: u64 = 30;
 const MAX_QUEUE_WAIT_SECS: u64 = 600;
 const READ_TIMEOUT_SECS: u64 = 60;
 
+/// Maximum decompressed part size (PARTSIZE + margin = 10 MiB)
+const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
+
 pub struct Ed2kDownload {
     pub transfer_id: String,
     pub file_hash: [u8; 16],
@@ -293,9 +296,10 @@ impl Ed2kDownload {
             }
         }
 
-        // Create or resume output file
+        // Create or resume output file (sanitize filename to prevent path traversal)
+        let safe_name = crate::security::sanitize_filename(&self.file_name);
         let part_path = self.download_dir.join(format!("{}.part", self.transfer_id));
-        let final_path = self.download_dir.join(&self.file_name);
+        let final_path = self.download_dir.join(&safe_name);
 
         let mut tracker = PartTracker::new(self.file_size, &part_path);
 
@@ -406,7 +410,17 @@ impl Ed2kDownload {
 
                                 let mut decoder = ZlibDecoder::new(compressed);
                                 let mut decompressed = Vec::new();
-                                decoder.read_to_end(&mut decompressed)?;
+                                let mut buf = [0u8; 8192];
+                                loop {
+                                    let n = decoder.read(&mut buf)?;
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    decompressed.extend_from_slice(&buf[..n]);
+                                    if decompressed.len() > MAX_DECOMPRESSED_PART {
+                                        anyhow::bail!("decompressed part exceeds size limit");
+                                    }
+                                }
 
                                 let piece_len = decompressed.len() as u64;
                                 self.acquire_download_bandwidth(piece_len).await;

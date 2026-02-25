@@ -120,6 +120,19 @@ pub struct AppSettings {
     pub nodes_dat_path: String,
     pub nat_traversal_enabled: bool,
     pub upnp_enabled: bool,
+    /// Prefer obfuscated (encrypted) KAD communication when the peer supports it
+    #[serde(default = "default_true")]
+    pub obfuscation_enabled: bool,
+    /// Enable IP filter to block known-bad IP ranges (loads ipfilter.dat)
+    #[serde(default = "default_true")]
+    pub ip_filter_enabled: bool,
+    /// Block private/reserved IPs from being added to the routing table
+    #[serde(default = "default_true")]
+    pub block_private_ips: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -140,6 +153,9 @@ impl Default for AppSettings {
             nodes_dat_path: String::new(),
             nat_traversal_enabled: true,
             upnp_enabled: true,
+            obfuscation_enabled: true,
+            ip_filter_enabled: true,
+            block_private_ips: true,
         }
     }
 }

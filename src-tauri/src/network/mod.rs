@@ -2,7 +2,7 @@ pub mod ed2k;
 pub mod kad;
 pub mod upnp;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +23,7 @@ use self::ed2k::multi_source::{DownloadSource, MultiSourceDownload};
 use self::ed2k::transfer::{DownloadEvent, Ed2kDownload};
 use self::kad::bootstrap;
 use self::kad::buddy::{BuddyManager, BuddyState};
+use self::kad::ip_filter::IpFilter;
 use self::kad::messages::{self, KadMessage};
 use self::kad::obfuscation;
 use self::kad::protection::FloodProtection;
@@ -130,6 +131,12 @@ struct NetworkState {
     udp_port: u16,
     nat_traversal_enabled: bool,
     upnp_mapped: bool,
+    /// IP filter for blocking known-bad ranges (eMule ipfilter.dat compatible)
+    ip_filter: IpFilter,
+    /// Cached set of banned peer IPs for fast lookup at network level
+    banned_ips: HashSet<Ipv4Addr>,
+    /// Whether to use protocol obfuscation (RC4 encryption) for outgoing KAD packets
+    obfuscation_enabled: bool,
 }
 
 pub async fn start_network(
@@ -165,7 +172,7 @@ pub async fn start_network(
         .unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&data_dir)?;
 
-    let mut routing_table = RoutingTable::new(local_id);
+    let mut routing_table = RoutingTable::new(local_id, settings.block_private_ips);
     let search_manager = SearchManager::new();
     let publish_manager = PublishManager::new(local_id, tcp_port, udp_port);
 
@@ -251,6 +258,35 @@ pub async fn start_network(
     let udp_key_seed: u32 = rand::Rng::gen(&mut rand::thread_rng());
     let buddy_manager = BuddyManager::new(local_id, tcp_port);
 
+    // Initialize IP filter (controlled by user settings)
+    let mut ip_filter = IpFilter::new(settings.ip_filter_enabled, settings.block_private_ips);
+    let ipfilter_path = data_dir.join("ipfilter.dat");
+    if settings.ip_filter_enabled && ipfilter_path.exists() {
+        ip_filter.load_from_file(&ipfilter_path);
+    }
+    info!(
+        "IP filter: enabled={}, block_private={}, ranges={}",
+        ip_filter.is_enabled(),
+        ip_filter.blocks_private(),
+        ip_filter.range_count(),
+    );
+
+    // Load banned peer IPs for fast network-level rejection
+    let banned_ips: HashSet<Ipv4Addr> = db.get_peers()
+        .unwrap_or_default()
+        .iter()
+        .filter(|p| p.banned)
+        .filter_map(|p| {
+            p.addresses.first().and_then(|addr| {
+                addr.rsplit_once(':')
+                    .and_then(|(ip, _)| ip.parse().ok())
+            })
+        })
+        .collect();
+    if !banned_ips.is_empty() {
+        info!("Loaded {} banned peer IPs", banned_ips.len());
+    }
+
     let mut state = NetworkState {
         local_id,
         user_hash,
@@ -285,6 +321,9 @@ pub async fn start_network(
         udp_port,
         nat_traversal_enabled,
         upnp_mapped: upnp_success,
+        ip_filter,
+        banned_ips,
+        obfuscation_enabled: settings.obfuscation_enabled,
     };
 
     // Send bootstrap requests to initial contacts
@@ -988,7 +1027,8 @@ async fn send_eviction_pings(socket: &UdpSocket, state: &mut NetworkState) {
     }
 }
 
-/// Send a KAD packet, optionally using obfuscation if the target supports it.
+/// Send a KAD packet, optionally using obfuscation if the target supports it
+/// and the user has enabled protocol obfuscation in settings.
 async fn send_kad_packet(
     socket: &UdpSocket,
     packet: &[u8],
@@ -996,9 +1036,9 @@ async fn send_kad_packet(
     state: &NetworkState,
     target_id: &KadId,
 ) -> std::io::Result<usize> {
-    // Check if the target contact supports obfuscation (version >= 6)
     let contact = state.routing_table.get_contact(target_id);
-    let use_obfuscation = contact.map_or(false, |c| c.supports_obfuscation());
+    let use_obfuscation = state.obfuscation_enabled
+        && contact.map_or(false, |c| c.supports_obfuscation());
 
     if use_obfuscation {
         let their_ip = match addr.ip() {
@@ -1033,7 +1073,25 @@ async fn handle_udp_packet(
     settings: &AppSettings,
     db: &Arc<Database>,
 ) {
-    // Phase 4: Flood protection - rate limit and port 53 rejection
+    // Reject oversized packets (max 64 KiB for UDP)
+    if data.len() > 65535 {
+        debug!("Dropping oversized packet from {from}: {} bytes", data.len());
+        return;
+    }
+
+    // Security: IP filter and ban check
+    if let std::net::IpAddr::V4(ipv4) = from.ip() {
+        if state.ip_filter.is_blocked(ipv4) {
+            debug!("Dropping packet from blocked IP {from}");
+            return;
+        }
+        if state.banned_ips.contains(&ipv4) {
+            debug!("Dropping packet from banned peer {from}");
+            return;
+        }
+    }
+
+    // Flood protection - rate limit and port 53 rejection
     if FloodProtection::is_dns_port(&from) {
         let header = data.first().copied().unwrap_or(0);
         if header == 0xE4 || header == 0xE5 {
@@ -1229,8 +1287,9 @@ async fn handle_udp_packet(
                 .find(|t| matches!(&t.name, TagName::Id(TAG_FILENAME)))
                 .and_then(|t| t.string_value())
             {
-                if !nick.is_empty() {
-                    state.peer_nicknames.insert(sender_id, nick.to_string());
+                let sanitized = crate::security::sanitize_display_name(nick);
+                if !sanitized.is_empty() {
+                    state.peer_nicknames.insert(sender_id, sanitized);
                 }
             }
 
@@ -1309,8 +1368,8 @@ async fn handle_udp_packet(
             let nick = tags.iter()
                 .find(|t| matches!(&t.name, TagName::Id(TAG_FILENAME)))
                 .and_then(|t| t.string_value())
-                .unwrap_or("")
-                .to_string();
+                .map(|n| crate::security::sanitize_display_name(n))
+                .unwrap_or_default();
 
             if !nick.is_empty() {
                 state.peer_nicknames.insert(sender_id, nick.clone());
@@ -1401,10 +1460,18 @@ async fn handle_udp_packet(
                 if let (Some(search), Some(sender_id)) =
                     (state.search_manager.get_mut(&sid), sender_id)
                 {
-                    info!("  Search {}: processing {} contacts from {}", sid.0, contacts.len(), sender_id);
-                    search.handle_response(&sender_id, contacts.clone());
+                    // Filter out contacts with blocked/banned IPs before processing
+                    let safe_contacts: Vec<KadContact> = contacts.iter()
+                        .filter(|c| {
+                            !state.ip_filter.is_blocked(c.ip)
+                                && !state.banned_ips.contains(&c.ip)
+                        })
+                        .cloned()
+                        .collect();
+                    info!("  Search {}: processing {} contacts from {} ({} filtered)", sid.0, safe_contacts.len(), sender_id, contacts.len() - safe_contacts.len());
+                    search.handle_response(&sender_id, safe_contacts.clone());
 
-                    for c in &contacts {
+                    for c in &safe_contacts {
                         state.routing_table.insert(c.clone());
                     }
                 }
@@ -2063,9 +2130,28 @@ async fn handle_command(
 
         NetworkCommand::BanPeer { peer_id_hex } => {
             if let Some(kad_id) = KadId::from_hex(&peer_id_hex) {
+                // Remove from routing table
                 if state.routing_table.remove(&kad_id) {
                     info!("Removed banned peer {} from routing table", peer_id_hex);
                     state.stats.connected_peers = state.routing_table.len() as u32;
+                }
+                // Add IP to banned set for network-level rejection
+                if let Some(contact) = state.routing_table.get_contact(&kad_id) {
+                    state.banned_ips.insert(contact.ip);
+                }
+                // Also check peer database for the IP
+                if let Ok(peers) = db.get_peers() {
+                    for peer in &peers {
+                        if peer.id == peer_id_hex {
+                            for addr_str in &peer.addresses {
+                                if let Some((ip_str, _)) = addr_str.rsplit_once(':') {
+                                    if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                                        state.banned_ips.insert(ip);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

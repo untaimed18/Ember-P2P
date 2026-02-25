@@ -95,9 +95,19 @@ impl FloodProtection {
             }
         }
 
-        // Be lenient: allow responses from addresses we've recently communicated with
-        // even if we can't match the exact opcode (due to obfuscation, etc.)
-        true
+        // Allow responses from addresses we've recently communicated with
+        // (within the tracker expiry window), even if the exact opcode
+        // doesn't match -- obfuscation can make opcode matching imprecise.
+        self.has_recent_communication(&addr)
+    }
+
+    /// Check if we've had any tracked communication with this address recently.
+    fn has_recent_communication(&self, addr: &SocketAddr) -> bool {
+        let now = Instant::now();
+        self.request_times.iter().any(|((tracked_addr, _), time)| {
+            tracked_addr.ip() == addr.ip()
+                && now.duration_since(*time).as_secs() < TRACKER_EXPIRY_SECS
+        })
     }
 
     /// Clean up stale tracking entries.

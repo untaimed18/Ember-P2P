@@ -198,6 +198,43 @@
           </span>
         </div>
       </section>
+
+      <section class="settings-section">
+        <h3>Security</h3>
+        <div class="field toggle-field">
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={settings.obfuscation_enabled} />
+            <span>Protocol Obfuscation</span>
+          </label>
+          <span class="field-hint">
+            Encrypt KAD UDP packets using RC4 when communicating with peers that support it.
+            Compatible with eMule's protocol obfuscation.
+            Requires restart to take effect.
+          </span>
+        </div>
+        <div class="field toggle-field">
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={settings.ip_filter_enabled} />
+            <span>IP Filter (ipfilter.dat)</span>
+          </label>
+          <span class="field-hint">
+            Block known-bad IP ranges using an ipfilter.dat file (eMule compatible format).
+            Place ipfilter.dat in the application data directory.
+            Requires restart to take effect.
+          </span>
+        </div>
+        <div class="field toggle-field">
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={settings.block_private_ips} />
+            <span>Block Private/Reserved IPs</span>
+          </label>
+          <span class="field-hint">
+            Prevent private network IPs (10.x.x.x, 192.168.x.x, etc.) from being
+            added to the KAD routing table. Protects against routing table poisoning attacks.
+            Requires restart to take effect.
+          </span>
+        </div>
+      </section>
     </div>
   {/if}
 </div>

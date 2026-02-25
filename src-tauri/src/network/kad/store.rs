@@ -98,15 +98,14 @@ impl DhtStore {
         // Remove existing entry from same sender
         bucket.retain(|e| e.id != sender_id);
 
-        // Fill in source IP/port from the packet sender if not present
-        let has_ip = tags.iter().any(|t| matches!(&t.name, TagName::Id(TAG_SOURCEIP)));
-        if !has_ip {
-            let ip_u32 = u32::from_be_bytes(sender_ip.octets());
-            tags.push(KadTag {
-                name: TagName::Id(TAG_SOURCEIP),
-                value: TagValue::Uint32(ip_u32),
-            });
-        }
+        // Always override source IP with the actual packet sender IP to prevent spoofing.
+        // A publisher can specify a port (for TCP connections) but the IP must be verified.
+        let ip_u32 = u32::from_be_bytes(sender_ip.octets());
+        tags.retain(|t| !matches!(&t.name, TagName::Id(TAG_SOURCEIP)));
+        tags.push(KadTag {
+            name: TagName::Id(TAG_SOURCEIP),
+            value: TagValue::Uint32(ip_u32),
+        });
         let has_port = tags.iter().any(|t| matches!(&t.name, TagName::Id(TAG_SOURCEPORT)));
         if !has_port {
             tags.push(KadTag {
