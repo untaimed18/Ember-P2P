@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getSettings, updateSettings, downloadNodesDat } from '$lib/api/settings';
+  import { getSettings, updateSettings, downloadNodesDat, downloadIpfilter } from '$lib/api/settings';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
 
@@ -10,6 +10,9 @@
   let downloadingNodes = $state(false);
   let nodesResult: string | null = $state(null);
   let nodesError: string | null = $state(null);
+  let downloadingFilter = $state(false);
+  let filterResult: string | null = $state(null);
+  let filterError: string | null = $state(null);
 
   onMount(async () => {
     try {
@@ -48,6 +51,21 @@
       }
     } catch (e) {
       console.error('Folder pick failed:', e);
+    }
+  }
+
+  async function handleDownloadFilter() {
+    downloadingFilter = true;
+    filterResult = null;
+    filterError = null;
+    try {
+      filterResult = await downloadIpfilter();
+      setTimeout(() => (filterResult = null), 5000);
+    } catch (e: any) {
+      filterError = typeof e === 'string' ? e : e?.message ?? 'Download failed';
+      setTimeout(() => (filterError = null), 5000);
+    } finally {
+      downloadingFilter = false;
     }
   }
 
@@ -219,9 +237,19 @@
           </label>
           <span class="field-hint">
             Block known-bad IP ranges using an ipfilter.dat file (eMule compatible format).
-            Place ipfilter.dat in the application data directory.
             Requires restart to take effect.
           </span>
+          <div class="nodes-download" style="margin-top: 6px;">
+            <button onclick={handleDownloadFilter} disabled={downloadingFilter}>
+              {downloadingFilter ? 'Downloading...' : 'Download ipfilter.dat'}
+            </button>
+            {#if filterResult}
+              <span class="nodes-success">{filterResult}</span>
+            {/if}
+            {#if filterError}
+              <span class="nodes-error">{filterError}</span>
+            {/if}
+          </div>
         </div>
         <div class="field toggle-field">
           <label class="toggle-label">

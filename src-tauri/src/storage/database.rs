@@ -48,6 +48,7 @@ impl Database {
                 path TEXT NOT NULL UNIQUE,
                 size INTEGER NOT NULL,
                 hash TEXT NOT NULL,
+                aich_hash TEXT NOT NULL DEFAULT '',
                 extension TEXT NOT NULL DEFAULT '',
                 modified_at INTEGER NOT NULL DEFAULT 0
             );
@@ -92,14 +93,15 @@ impl Database {
     pub fn save_shared_file(&self, file: &FileInfo) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO shared_files (id, name, path, size, hash, extension, modified_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO shared_files (id, name, path, size, hash, aich_hash, extension, modified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 file.id,
                 file.name,
                 file.path,
                 file.size,
                 file.hash,
+                file.aich_hash,
                 file.extension,
                 file.modified_at,
             ],
@@ -110,7 +112,7 @@ impl Database {
     pub fn get_shared_files(&self) -> anyhow::Result<Vec<FileInfo>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, name, path, size, hash, extension, modified_at FROM shared_files",
+            "SELECT id, name, path, size, hash, aich_hash, extension, modified_at FROM shared_files",
         )?;
 
         let files = stmt
@@ -121,8 +123,9 @@ impl Database {
                     path: row.get(2)?,
                     size: row.get(3)?,
                     hash: row.get(4)?,
-                    extension: row.get(5)?,
-                    modified_at: row.get(6)?,
+                    aich_hash: row.get::<_, String>(5).unwrap_or_default(),
+                    extension: row.get(6)?,
+                    modified_at: row.get(7)?,
                 })
             })?
             .filter_map(|r| r.ok())

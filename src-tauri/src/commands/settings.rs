@@ -8,6 +8,7 @@ use crate::network::NetworkCommand;
 use crate::types::AppSettings;
 
 const NODES_DAT_URL: &str = "http://upd.emule-security.org/nodes.dat";
+const IPFILTER_URL: &str = "https://emuling.gitlab.io/ipfilter.dat";
 
 #[tauri::command]
 pub async fn get_settings(
@@ -89,6 +90,38 @@ pub async fn download_nodes_dat(
 
     let msg = format!(
         "Downloaded and loaded {contact_count} contacts ({byte_count} bytes) — bootstrapping now",
+    );
+    info!("{msg}");
+    Ok(msg)
+}
+
+#[tauri::command]
+pub async fn download_ipfilter(
+) -> Result<String, String> {
+    info!("Downloading ipfilter.dat from {IPFILTER_URL}");
+
+    let bytes = reqwest::get(IPFILTER_URL)
+        .await
+        .map_err(|e| format!("HTTP request failed: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read response body: {e}"))?;
+
+    let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
+        .map(|d| d.data_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("Failed to create data dir: {e}"))?;
+
+    let filter_path = data_dir.join("ipfilter.dat");
+    std::fs::write(&filter_path, &bytes)
+        .map_err(|e| format!("Failed to write ipfilter.dat: {e}"))?;
+
+    let byte_count = bytes.len();
+    let line_count = bytes.iter().filter(|&&b| b == b'\n').count();
+
+    let msg = format!(
+        "Downloaded ipfilter.dat ({byte_count} bytes, ~{line_count} entries). Restart to apply.",
     );
     info!("{msg}");
     Ok(msg)

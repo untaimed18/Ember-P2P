@@ -2136,8 +2136,8 @@ async fn handle_command(
 
         NetworkCommand::GetStats { tx } => {
             state.stats.connected_peers = state.routing_table.len() as u32;
-            state.stats.upload_speed = bandwidth_limiter.upload_speed();
-            state.stats.download_speed = bandwidth_limiter.download_speed();
+            state.stats.upload_speed = bandwidth_limiter.smoothed_upload_speed();
+            state.stats.download_speed = bandwidth_limiter.smoothed_download_speed();
             state.stats.total_uploaded = bandwidth_limiter.total_uploaded();
             state.stats.total_downloaded = bandwidth_limiter.total_downloaded();
             state.stats.upnp_mapped = state.upnp_mapped;
@@ -2588,6 +2588,7 @@ fn convert_search_results(
                         path: String::new(),
                         size: p.size,
                         hash: p.hash,
+                        aich_hash: String::new(),
                         extension: p.extension,
                         modified_at: 0,
                     },

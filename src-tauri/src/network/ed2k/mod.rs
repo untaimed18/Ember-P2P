@@ -1,3 +1,4 @@
+pub mod aich;
 pub mod hash;
 pub mod messages;
 pub mod multi_source;
