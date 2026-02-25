@@ -34,6 +34,7 @@ pub struct RoutingTable {
     pub pending_evictions: Vec<PendingEviction>,
     global_ip_count: HashMap<Ipv4Addr, u32>,
     global_subnet_count: HashMap<u32, u32>,
+    block_private_ips: bool,
 }
 
 #[derive(Debug)]
@@ -65,7 +66,7 @@ impl KBucket {
 }
 
 impl RoutingTable {
-    pub fn new(local_id: KadId) -> Self {
+    pub fn new(local_id: KadId, block_private_ips: bool) -> Self {
         let mut buckets = Vec::with_capacity(NUM_BUCKETS);
         for _ in 0..NUM_BUCKETS {
             buckets.push(KBucket::new());
@@ -76,6 +77,7 @@ impl RoutingTable {
             pending_evictions: Vec::new(),
             global_ip_count: HashMap::new(),
             global_subnet_count: HashMap::new(),
+            block_private_ips,
         }
     }
 
@@ -128,7 +130,7 @@ impl RoutingTable {
         if contact.id == self.local_id {
             return None;
         }
-        if !ip_filter::is_valid_contact_ip(contact.ip) {
+        if !ip_filter::is_valid_contact_ip(contact.ip, self.block_private_ips) {
             return None;
         }
 

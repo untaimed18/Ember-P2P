@@ -135,6 +135,8 @@ struct NetworkState {
     ip_filter: IpFilter,
     /// Cached set of banned peer IPs for fast lookup at network level
     banned_ips: HashSet<Ipv4Addr>,
+    /// Whether to use protocol obfuscation (RC4 encryption) for outgoing KAD packets
+    obfuscation_enabled: bool,
 }
 
 pub async fn start_network(
@@ -170,7 +172,7 @@ pub async fn start_network(
         .unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&data_dir)?;
 
-    let mut routing_table = RoutingTable::new(local_id);
+    let mut routing_table = RoutingTable::new(local_id, settings.block_private_ips);
     let search_manager = SearchManager::new();
     let publish_manager = PublishManager::new(local_id, tcp_port, udp_port);
 
@@ -256,13 +258,18 @@ pub async fn start_network(
     let udp_key_seed: u32 = rand::Rng::gen(&mut rand::thread_rng());
     let buddy_manager = BuddyManager::new(local_id, tcp_port);
 
-    // Initialize IP filter
-    let mut ip_filter = IpFilter::new();
+    // Initialize IP filter (controlled by user settings)
+    let mut ip_filter = IpFilter::new(settings.ip_filter_enabled, settings.block_private_ips);
     let ipfilter_path = data_dir.join("ipfilter.dat");
-    if ipfilter_path.exists() {
-        let count = ip_filter.load_from_file(&ipfilter_path);
-        info!("Loaded IP filter with {count} ranges");
+    if settings.ip_filter_enabled && ipfilter_path.exists() {
+        ip_filter.load_from_file(&ipfilter_path);
     }
+    info!(
+        "IP filter: enabled={}, block_private={}, ranges={}",
+        ip_filter.is_enabled(),
+        ip_filter.blocks_private(),
+        ip_filter.range_count(),
+    );
 
     // Load banned peer IPs for fast network-level rejection
     let banned_ips: HashSet<Ipv4Addr> = db.get_peers()
@@ -316,6 +323,7 @@ pub async fn start_network(
         upnp_mapped: upnp_success,
         ip_filter,
         banned_ips,
+        obfuscation_enabled: settings.obfuscation_enabled,
     };
 
     // Send bootstrap requests to initial contacts
@@ -1019,7 +1027,8 @@ async fn send_eviction_pings(socket: &UdpSocket, state: &mut NetworkState) {
     }
 }
 
-/// Send a KAD packet, optionally using obfuscation if the target supports it.
+/// Send a KAD packet, optionally using obfuscation if the target supports it
+/// and the user has enabled protocol obfuscation in settings.
 async fn send_kad_packet(
     socket: &UdpSocket,
     packet: &[u8],
@@ -1027,9 +1036,9 @@ async fn send_kad_packet(
     state: &NetworkState,
     target_id: &KadId,
 ) -> std::io::Result<usize> {
-    // Check if the target contact supports obfuscation (version >= 6)
     let contact = state.routing_table.get_contact(target_id);
-    let use_obfuscation = contact.map_or(false, |c| c.supports_obfuscation());
+    let use_obfuscation = state.obfuscation_enabled
+        && contact.map_or(false, |c| c.supports_obfuscation());
 
     if use_obfuscation {
         let their_ip = match addr.ip() {
@@ -1072,7 +1081,7 @@ async fn handle_udp_packet(
 
     // Security: IP filter and ban check
     if let std::net::IpAddr::V4(ipv4) = from.ip() {
-        if state.ip_filter.is_blocked_for_packets(ipv4) {
+        if state.ip_filter.is_blocked(ipv4) {
             debug!("Dropping packet from blocked IP {from}");
             return;
         }
@@ -1454,9 +1463,8 @@ async fn handle_udp_packet(
                     // Filter out contacts with blocked/banned IPs before processing
                     let safe_contacts: Vec<KadContact> = contacts.iter()
                         .filter(|c| {
-                            !state.ip_filter.is_blocked_for_packets(c.ip)
+                            !state.ip_filter.is_blocked(c.ip)
                                 && !state.banned_ips.contains(&c.ip)
-                                && kad::ip_filter::is_valid_contact_ip(c.ip)
                         })
                         .cloned()
                         .collect();

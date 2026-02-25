@@ -4,7 +4,8 @@ use std::path::{Component, Path, PathBuf};
 /// Removes directory separators, parent references (..), and null bytes.
 /// Returns a safe filename that can be used for file creation.
 pub fn sanitize_filename(name: &str) -> String {
-    let name = name.replace('\0', "");
+    // Normalize: strip null bytes and convert Windows separators to Unix
+    let name = name.replace('\0', "").replace('\\', "/");
 
     let path = Path::new(&name);
     let safe_name = path

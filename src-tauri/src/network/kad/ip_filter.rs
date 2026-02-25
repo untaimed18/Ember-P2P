@@ -14,22 +14,27 @@ struct IpRange {
 ///
 /// The ipfilter.dat format is: start_ip - end_ip , access_level , description
 /// Lines with access_level < 128 are blocked.
-#[allow(dead_code)]
 pub struct IpFilter {
     blocked_ranges: Vec<IpRange>,
+    enabled: bool,
     block_private: bool,
 }
 
 impl IpFilter {
-    pub fn new() -> Self {
+    pub fn new(enabled: bool, block_private: bool) -> Self {
         IpFilter {
             blocked_ranges: Vec::new(),
-            block_private: true,
+            enabled,
+            block_private,
         }
     }
 
     /// Load an ipfilter.dat file (eMule format).
     pub fn load_from_file(&mut self, path: &Path) -> usize {
+        if !self.enabled {
+            return 0;
+        }
+
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
@@ -51,64 +56,62 @@ impl IpFilter {
             }
         }
 
-        self.blocked_ranges
-            .sort_by_key(|r| r.start);
+        self.blocked_ranges.sort_by_key(|r| r.start);
 
         info!("Loaded {count} IP filter ranges from {}", path.display());
         count
     }
 
-    /// Check if an IPv4 address is blocked (by ipfilter.dat ranges or private/reserved).
-    #[allow(dead_code)]
+    /// Check if an IPv4 address should be blocked.
+    ///
+    /// When `block_private` is true, private/reserved IPs (RFC1918, loopback,
+    /// link-local, etc.) are blocked. When `enabled` is true, ipfilter.dat
+    /// ranges are also checked. Broadcast, multicast, and unspecified addresses
+    /// are always blocked regardless of settings.
     pub fn is_blocked(&self, ip: Ipv4Addr) -> bool {
-        if self.block_private && is_private_or_reserved(ip) {
-            return true;
-        }
-
-        let ip_u32 = u32::from(ip);
-        self.blocked_ranges
-            .binary_search_by(|range| {
-                if ip_u32 < range.start {
-                    std::cmp::Ordering::Greater
-                } else if ip_u32 > range.end {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .is_ok()
-    }
-
-    /// Check if an IP should be rejected for incoming packets from the network.
-    /// Less strict than routing table insertion (allows some reserved ranges
-    /// that might be legitimate in certain network configurations).
-    pub fn is_blocked_for_packets(&self, ip: Ipv4Addr) -> bool {
         if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
             return true;
         }
 
-        let ip_u32 = u32::from(ip);
-        self.blocked_ranges
-            .binary_search_by(|range| {
-                if ip_u32 < range.start {
-                    std::cmp::Ordering::Greater
-                } else if ip_u32 > range.end {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .is_ok()
+        if self.block_private && is_private_or_reserved(ip) {
+            return true;
+        }
+
+        if self.enabled {
+            let ip_u32 = u32::from(ip);
+            if self.blocked_ranges
+                .binary_search_by(|range| {
+                    if ip_u32 < range.start {
+                        std::cmp::Ordering::Greater
+                    } else if ip_u32 > range.end {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .is_ok()
+            {
+                return true;
+            }
+        }
+
+        false
     }
 
-    #[allow(dead_code)]
     pub fn range_count(&self) -> usize {
         self.blocked_ranges.len()
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn blocks_private(&self) -> bool {
+        self.block_private
     }
 }
 
 /// Returns true if the IP is private (RFC1918), loopback, link-local, or reserved.
-/// Used to prevent routing table pollution.
 pub fn is_private_or_reserved(ip: Ipv4Addr) -> bool {
     let octets = ip.octets();
 
@@ -175,9 +178,16 @@ pub fn is_private_or_reserved(ip: Ipv4Addr) -> bool {
 }
 
 /// Validate an IP address received from a remote peer in contact info.
-/// Returns true if the IP is valid for use in the routing table.
-pub fn is_valid_contact_ip(ip: Ipv4Addr) -> bool {
-    !is_private_or_reserved(ip)
+/// When `block_private` is true, rejects private/reserved IPs.
+/// Always rejects unspecified, broadcast, and multicast.
+pub fn is_valid_contact_ip(ip: Ipv4Addr, block_private: bool) -> bool {
+    if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
+        return false;
+    }
+    if block_private && is_private_or_reserved(ip) {
+        return false;
+    }
+    true
 }
 
 fn parse_ipfilter_line(line: &str) -> Option<IpRange> {
@@ -230,16 +240,49 @@ mod tests {
     }
 
     #[test]
-    fn test_ip_filter() {
-        let mut filter = IpFilter::new();
+    fn test_ip_filter_with_ranges() {
+        let mut filter = IpFilter::new(true, false);
         filter.blocked_ranges.push(IpRange {
             start: u32::from(Ipv4Addr::new(1, 0, 0, 0)),
             end: u32::from(Ipv4Addr::new(1, 0, 0, 255)),
         });
         filter.blocked_ranges.sort_by_key(|r| r.start);
-        filter.block_private = false;
 
         assert!(filter.is_blocked(Ipv4Addr::new(1, 0, 0, 50)));
         assert!(!filter.is_blocked(Ipv4Addr::new(2, 0, 0, 50)));
+    }
+
+    #[test]
+    fn test_ip_filter_disabled() {
+        let mut filter = IpFilter::new(false, false);
+        filter.blocked_ranges.push(IpRange {
+            start: u32::from(Ipv4Addr::new(1, 0, 0, 0)),
+            end: u32::from(Ipv4Addr::new(1, 0, 0, 255)),
+        });
+        filter.blocked_ranges.sort_by_key(|r| r.start);
+
+        // ipfilter ranges should be ignored when disabled
+        assert!(!filter.is_blocked(Ipv4Addr::new(1, 0, 0, 50)));
+        // but broadcast/multicast are always blocked
+        assert!(filter.is_blocked(Ipv4Addr::new(255, 255, 255, 255)));
+    }
+
+    #[test]
+    fn test_ip_filter_block_private() {
+        let filter = IpFilter::new(false, true);
+        assert!(filter.is_blocked(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(!filter.is_blocked(Ipv4Addr::new(8, 8, 8, 8)));
+
+        let filter_no_priv = IpFilter::new(false, false);
+        assert!(!filter_no_priv.is_blocked(Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    #[test]
+    fn test_valid_contact_ip() {
+        assert!(is_valid_contact_ip(Ipv4Addr::new(8, 8, 8, 8), true));
+        assert!(!is_valid_contact_ip(Ipv4Addr::new(192, 168, 1, 1), true));
+        assert!(is_valid_contact_ip(Ipv4Addr::new(192, 168, 1, 1), false));
+        assert!(!is_valid_contact_ip(Ipv4Addr::UNSPECIFIED, false));
+        assert!(!is_valid_contact_ip(Ipv4Addr::LOCALHOST, false));
     }
 }
