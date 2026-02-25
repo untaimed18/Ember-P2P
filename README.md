@@ -1,6 +1,6 @@
 # Nexus — Decentralized P2P File Sharing
 
-Nexus is a decentralized, peer-to-peer file sharing application built with **Tauri v2** (Rust backend) and **SvelteKit** (TypeScript frontend). It implements the **eMule KAD** (Kademlia) protocol and **ED2K** file transfer protocol, providing full compatibility with the existing eMule network — no central servers required.
+Nexus is a **KAD-only** decentralized file sharing client built with **Tauri v2** (Rust backend) and **SvelteKit** (TypeScript frontend). It connects exclusively to the **eMule Kademlia (KAD) network** for peer discovery, search, and source finding — it never connects to centralized eMule/eDonkey servers. File transfers use the standard peer-to-peer protocol, so Nexus is fully compatible with eMule clients that have KAD enabled.
 
 ## Architecture
 
@@ -14,7 +14,7 @@ Nexus is a decentralized, peer-to-peer file sharing application built with **Tau
 │                     Rust Backend                         │
 │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────────┐  │
 │  │ Network  │ │ Sharing  │ │  Search  │ │  Security  │  │
-│  │(KAD+ED2K)│ │ (Files)  │ │  (DHT)   │ │ (Filters)  │  │
+│  │(KAD-only)│ │ (Files)  │ │  (DHT)   │ │ (Filters)  │  │
 │  └──────────┘ └──────────┘ └──────────┘ └────────────┘  │
 │  ┌──────────┐ ┌──────────┐ ┌──────────────────────────┐  │
 │  │Bandwidth │ │ Storage  │ │     Command Handlers     │  │
@@ -30,21 +30,24 @@ Nexus is a decentralized, peer-to-peer file sharing application built with **Tau
 | Frontend    | SvelteKit 5 + TypeScript + Vite               |
 | App Shell   | Tauri v2                                      |
 | Backend     | Rust (2021 edition)                           |
-| Networking  | eMule KAD (Kademlia DHT) + ED2K protocol      |
+| Networking  | eMule KAD (Kademlia DHT), peer-to-peer transfers|
 | Database    | SQLite via rusqlite                           |
 | Hashing     | MD4 (ED2K file hashes), MD5 (obfuscation keys)|
 
 ### Protocols
 
 - **Kademlia DHT (KAD)** — Peer discovery, keyword search, source finding, and DHT publish/store over UDP
-- **ED2K** — Client-to-client file transfers over TCP with multi-source download support
+- **Peer-to-Peer Transfers** — Direct TCP file transfers between peers using the standard eMule client-to-client protocol (Hello, FileRequest, SendingPart, etc.)
 - **Protocol Obfuscation** — RC4-based packet encryption compatible with eMule's obfuscation layer
 - **UPnP** — Automatic router port mapping for NAT traversal
 - **Buddy System** — Relay-based connectivity for firewalled clients
 
+> **No eMule server connections.** Nexus does not implement the eDonkey server protocol — no server login, server search, or server-based source finding. All discovery happens through the KAD DHT. File transfers use the same peer-to-peer TCP protocol that eMule clients use regardless of server connectivity, so Nexus interoperates with any eMule/KAD peer.
+
 ## Features
 
-- **eMule Network Compatible** — Connects to the existing eMule KAD network; interoperates with eMule, aMule, and other compatible clients
+- **KAD-Only** — Connects exclusively to the eMule KAD network; never contacts centralized eMule/eDonkey servers
+- **eMule Compatible** — Fully interoperates with eMule, aMule, and other KAD-enabled clients
 - **File Sharing** — Share folders, auto-index files with ED2K (MD4) hashes
 - **Distributed Search** — Keyword search across the KAD DHT with source and notes lookup
 - **Multi-Source Downloads** — Download from multiple peers simultaneously with part-level hash verification
@@ -148,13 +151,13 @@ src-tauri/                  # Rust backend
         obfuscation.rs      # RC4 packet encryption/decryption
         protection.rs       # Flood protection, rate limiting, response validation
         ip_filter.rs        # IP filter (ipfilter.dat + private IP blocking)
-      ed2k/                 # ED2K file transfer protocol
-        messages.rs         # ED2K packet format, Hello, EmuleInfo, file requests
+      ed2k/                 # Peer-to-peer file transfer (eMule client-to-client protocol)
+        messages.rs         # Packet format: Hello, EmuleInfo, file requests
         hash.rs             # ED2K (MD4) file hashing
         transfer.rs         # Single-source file download with resume
         multi_source.rs     # Multi-source parallel download
         part_tracker.rs     # Part completion tracking (.part.met)
-        server.rs           # TCP upload server with queue management
+        upload.rs           # TCP upload listener with queue management
     sharing/
       indexer.rs            # Directory scanner + ED2K hasher
       manager.rs            # Transfer queue management
@@ -183,7 +186,7 @@ Nexus bootstraps into the KAD network using a `nodes.dat` file. On first launch,
 
 | Port | Protocol | Purpose                                      |
 |------|----------|----------------------------------------------|
-| 4662 | TCP      | ED2K client-to-client file transfers          |
+| 4662 | TCP      | Peer-to-peer file transfers                    |
 | 4672 | UDP      | KAD DHT communication                         |
 
 These can be changed in Settings > Network. If UPnP is enabled, ports are automatically mapped on your router.

@@ -42,7 +42,9 @@ pub enum UploadEventKind {
     },
 }
 
-struct UploadServer {
+/// Handles incoming TCP connections from other peers requesting file uploads.
+/// This is the peer-to-peer upload listener, NOT an eMule server connection.
+struct UploadHandler {
     local_index: Arc<RwLock<LocalIndex>>,
     transfer_manager: Arc<RwLock<TransferManager>>,
     bandwidth_limiter: Arc<BandwidthLimiter>,
@@ -70,12 +72,12 @@ pub async fn start_upload_server(
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     let listener = TcpListener::bind(addr).await?;
-    info!("ED2K TCP upload server listening on port {tcp_port}");
+    info!("Peer-to-peer upload listener started on TCP port {tcp_port}");
 
     let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let upload_queue = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
 
-    let server = Arc::new(UploadServer {
+    let server = Arc::new(UploadHandler {
         local_index,
         transfer_manager,
         bandwidth_limiter,
@@ -130,7 +132,7 @@ pub async fn start_upload_server(
     }
 }
 
-impl UploadServer {
+impl UploadHandler {
     async fn handle_connection(
         &self,
         stream: TcpStream,
@@ -524,7 +526,7 @@ impl UploadServer {
 
                 _ => {
                     debug!(
-                        "Upload server ignoring proto=0x{proto:02X} op=0x{opcode:02X} from {peer_addr}"
+                        "Upload handler ignoring proto=0x{proto:02X} op=0x{opcode:02X} from {peer_addr}"
                     );
                 }
             }
