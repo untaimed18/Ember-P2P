@@ -18,6 +18,8 @@ pub const SEARCH_TOLERANCE: u32 = 0x0100_0000;
 
 /// TAG_KADMISCOPTIONS carries firewall/ACK status bits
 pub const TAG_KADMISCOPTIONS: u8 = 0xF7;
+/// TAG_KADUDPKEY carries the sender's UDP verify key for the receiver
+pub const TAG_KADUDPKEY: u8 = 0xF8;
 
 /// KAD contact types -- matching eMule semantics (lower = better)
 /// In eMule: type 0 = best (2+h proven), type 3 = unknown, type 4 = dead

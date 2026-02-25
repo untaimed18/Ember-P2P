@@ -137,6 +137,8 @@ struct NetworkState {
     banned_ips: HashSet<Ipv4Addr>,
     /// Whether to use protocol obfuscation (RC4 encryption) for outgoing KAD packets
     obfuscation_enabled: bool,
+    /// Shared firewall status that can be updated from spawned tasks
+    firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub async fn start_network(
@@ -148,8 +150,14 @@ pub async fn start_network(
     transfer_manager: Arc<RwLock<TransferManager>>,
     bandwidth_limiter: Arc<BandwidthLimiter>,
 ) -> anyhow::Result<()> {
-    let local_id = KadId::random();
-    let user_hash = local_id.0;
+    let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
+        .map(|d| d.data_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&data_dir)?;
+
+    let identity = crate::storage::identity::NodeIdentity::load_or_create(&data_dir)?;
+    let local_id = identity.kad_id();
+    let user_hash = identity.user_hash;
     info!("Local KAD ID: {}", local_id);
 
     let tcp_port = settings.tcp_port;
@@ -166,11 +174,6 @@ pub async fn start_network(
     sock2.bind(&socket2::SockAddr::from(udp_addr))?;
     let udp_socket = UdpSocket::from_std(std::net::UdpSocket::from(sock2))?;
     info!("KAD UDP socket bound on port {udp_port}");
-
-    let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    std::fs::create_dir_all(&data_dir)?;
 
     let mut routing_table = RoutingTable::new(local_id, settings.block_private_ips);
     let search_manager = SearchManager::new();
@@ -255,7 +258,7 @@ pub async fn start_network(
     let mut dht_store = DhtStore::new();
     dht_store.set_local_id(local_id);
 
-    let udp_key_seed: u32 = rand::Rng::gen(&mut rand::thread_rng());
+    let udp_key_seed = identity.udp_key_seed;
     let buddy_manager = BuddyManager::new(local_id, tcp_port);
 
     // Initialize IP filter (controlled by user settings)
@@ -324,6 +327,7 @@ pub async fn start_network(
         ip_filter,
         banned_ips,
         obfuscation_enabled: settings.obfuscation_enabled,
+        firewalled_shared: Arc::new(std::sync::atomic::AtomicBool::new(!upnp_success)),
     };
 
     // Send bootstrap requests to initial contacts
@@ -1293,12 +1297,25 @@ async fn handle_udp_packet(
                 }
             }
 
-            // Build our firewall options
+            // Extract peer's UDP verify key from tags
+            if let Some(peer_udp_key) = extract_udp_key_from_tags(&tags) {
+                if let Some(contact) = state.routing_table.get_contact_mut(&sender_id) {
+                    contact.udp_key = Some(peer_udp_key);
+                }
+            }
+
+            // Build our firewall options + UDP verify key for the peer
             let our_options: u8 = if state.firewalled { 0x01 } else { 0x00 };
+            let contact_ip_u32_for_key = u32::from(ip);
+            let our_key_for_peer = KadUDPKey::generate(state.udp_key_seed, contact_ip_u32_for_key);
             let mut res_tags = vec![
                 KadTag {
                     name: TagName::Id(TAG_KADMISCOPTIONS),
                     value: TagValue::Uint8(our_options),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_KADUDPKEY),
+                    value: TagValue::Uint32(our_key_for_peer.key),
                 },
             ];
             if !settings.nickname.is_empty() {
@@ -1320,9 +1337,15 @@ async fn handle_udp_packet(
 
             // Send HelloResAck if requested
             if wants_ack {
+                let ack_tags = vec![
+                    KadTag {
+                        name: TagName::Id(TAG_KADUDPKEY),
+                        value: TagValue::Uint32(our_key_for_peer.key),
+                    },
+                ];
                 let ack = KadMessage::HelloResAck {
                     sender_id: state.local_id,
-                    tags: Vec::new(),
+                    tags: ack_tags,
                 };
                 if let Ok(packet) = messages::encode_packet(&ack) {
                     let _ = send_kad_packet(socket, &packet, from, state, &sender_id).await;
@@ -1346,8 +1369,12 @@ async fn handle_udp_packet(
                 .and_then(|t| t.uint8_value().or_else(|| t.uint16_value().map(|v| v as u8)).or_else(|| t.uint32_value().map(|v| v as u8)))
                 .unwrap_or(0);
 
+            // Extract peer's UDP verify key
+            let peer_udp_key = extract_udp_key_from_tags(&tags);
+
             let now = chrono::Utc::now().timestamp();
             let contact_ip_u32 = u32::from(ip);
+            let udp_key = peer_udp_key.unwrap_or_else(|| KadUDPKey::generate(state.udp_key_seed, contact_ip_u32));
             state.routing_table.insert(KadContact {
                 id: sender_id,
                 ip,
@@ -1357,7 +1384,7 @@ async fn handle_udp_packet(
                 last_seen: now,
                 verified: false,
                 contact_type: CONTACT_TYPE_OPEN,
-                udp_key: Some(KadUDPKey::generate(state.udp_key_seed, contact_ip_u32)),
+                udp_key: Some(udp_key),
                 kad_options,
                 created_at: now,
                 expires_at: 0,
@@ -1389,9 +1416,14 @@ async fn handle_udp_packet(
             }
         }
 
-        KadMessage::HelloResAck { sender_id, .. } => {
+        KadMessage::HelloResAck { sender_id, tags } => {
             debug!("HelloResAck from {from} - contact {} verified", sender_id);
             state.routing_table.mark_verified(&sender_id);
+            if let Some(peer_udp_key) = extract_udp_key_from_tags(&tags) {
+                if let Some(contact) = state.routing_table.get_contact_mut(&sender_id) {
+                    contact.udp_key = Some(peer_udp_key);
+                }
+            }
         }
 
         KadMessage::KadReq {
@@ -1745,8 +1777,9 @@ async fn handle_udp_packet(
                     state.external_ip = Some(best_ip);
                     info!("External IP determined: {best_ip}");
 
-                    let test_addr = SocketAddr::new(best_ip.into(), 4662);
+                    let test_addr = SocketAddr::new(best_ip.into(), state.tcp_port);
                     let app = app_handle.clone();
+                    let fw_flag = state.firewalled_shared.clone();
                     tokio::spawn(async move {
                         let result = tokio::time::timeout(
                             std::time::Duration::from_secs(5),
@@ -1756,6 +1789,7 @@ async fn handle_udp_packet(
                         match result {
                             Ok(Ok(_)) => {
                                 info!("TCP port is reachable - NOT firewalled");
+                                fw_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                                 let _ = app.emit("firewall-status", serde_json::json!({
                                     "firewalled": false,
                                     "external_ip": best_ip.to_string(),
@@ -1763,6 +1797,7 @@ async fn handle_udp_packet(
                             }
                             _ => {
                                 info!("TCP port is NOT reachable - firewalled");
+                                fw_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                                 let _ = app.emit("firewall-status", serde_json::json!({
                                     "firewalled": true,
                                     "external_ip": best_ip.to_string(),
@@ -2083,6 +2118,8 @@ async fn handle_command(
                 .external_ip
                 .map(|ip| ip.to_string())
                 .unwrap_or_default();
+            // Sync firewall status from shared atomic (updated by spawned detection tasks)
+            state.firewalled = state.firewalled_shared.load(std::sync::atomic::Ordering::Relaxed);
             state.stats.firewalled = state.firewalled;
             let _ = tx.send(state.stats.clone());
         }
@@ -2551,4 +2588,15 @@ fn extract_sources_from_results(
         }
     }
     sources
+}
+
+/// Extract a UDP verify key from KAD hello tags.
+fn extract_udp_key_from_tags(tags: &[KadTag]) -> Option<KadUDPKey> {
+    let key_val = tags.iter()
+        .find(|t| matches!(&t.name, TagName::Id(TAG_KADUDPKEY)))
+        .and_then(|t| t.uint32_value())?;
+    if key_val == 0 {
+        return None;
+    }
+    Some(KadUDPKey { key: key_val, ip: 0 })
 }
