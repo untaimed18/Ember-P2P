@@ -41,3 +41,5 @@ hex = "0.4"
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
 igd-next = { version = "0.15", features = ["aio_tokio"] }
 socket2 = "0.5"
+tracing-appender = "0.2.4"
+tauri-plugin-single-instance = "2.4.0"

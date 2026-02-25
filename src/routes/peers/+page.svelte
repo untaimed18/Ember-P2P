@@ -23,6 +23,8 @@
   }
 
   async function handleBan(peerId: string) {
+    const confirmed = confirm(`Ban peer ${peerId.slice(0, 16)}...? This will block all communication with this peer.`);
+    if (!confirmed) return;
     try {
       await banPeer(peerId);
       await refresh();

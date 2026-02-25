@@ -1,13 +1,29 @@
 <script lang="ts">
   import type { FileInfo } from '$lib/types';
+  import { formatEd2kLink } from '$lib/api/search';
 
   let {
     files = [],
     onselect,
+    showCopyLink = false,
   }: {
     files: FileInfo[];
     onselect?: (file: FileInfo) => void;
+    showCopyLink?: boolean;
   } = $props();
+
+  let copiedId: string | null = $state(null);
+
+  async function copyLink(file: FileInfo) {
+    try {
+      const link = await formatEd2kLink(file.name, file.size, file.hash);
+      await navigator.clipboard.writeText(link);
+      copiedId = file.id;
+      setTimeout(() => { copiedId = null; }, 2000);
+    } catch (e) {
+      console.error('Failed to copy link:', e);
+    }
+  }
 
   let sortKey: keyof FileInfo = $state('name');
   let sortAsc = $state(true);
@@ -67,6 +83,9 @@
             Size{sortIndicator('size')}
           </th>
           <th>Hash</th>
+          {#if showCopyLink}
+            <th>Link</th>
+          {/if}
         </tr>
       </thead>
       <tbody>
@@ -76,6 +95,13 @@
             <td>{file.extension || '—'}</td>
             <td>{formatSize(file.size)}</td>
             <td class="hash">{file.hash.slice(0, 16)}…</td>
+            {#if showCopyLink}
+              <td>
+                <button class="ghost copy-btn" onclick|stopPropagation={() => copyLink(file)}>
+                  {copiedId === file.id ? 'Copied!' : 'Copy ed2k Link'}
+                </button>
+              </td>
+            {/if}
           </tr>
         {/each}
       </tbody>
@@ -97,5 +123,11 @@
     font-family: var(--font-mono);
     font-size: 12px;
     color: var(--text-muted);
+  }
+
+  .copy-btn {
+    font-size: 11px;
+    padding: 2px 8px;
+    white-space: nowrap;
   }
 </style>

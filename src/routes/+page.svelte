@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { networkStats } from '$lib/stores/network';
+  import { networkStats, networkError } from '$lib/stores/network';
   import { transfers } from '$lib/stores/transfers';
 
   function formatBytes(bytes: number): string {
@@ -83,7 +83,34 @@
           </span>
         </div>
       </div>
+
+      <div class="stat-card">
+        <div class="label">UPnP</div>
+        <div class="value">
+          <span class="badge {$networkStats.upnp_mapped ? 'open' : 'firewalled'}">
+            {$networkStats.upnp_mapped ? 'Mapped' : 'Not Mapped'}
+          </span>
+        </div>
+      </div>
+
+      <div class="stat-card">
+        <div class="label">Buddy</div>
+        <div class="value">{$networkStats.buddy_status === 'none' ? 'None' : $networkStats.buddy_status.startsWith('connected') ? 'Connected' : $networkStats.buddy_status.startsWith('serving') ? 'Serving' : $networkStats.buddy_status}</div>
+      </div>
+
+      <div class="stat-card">
+        <div class="label">DHT Stores</div>
+        <div class="value">{$networkStats.stores_acknowledged}</div>
+      </div>
     </div>
+
+    {#if $networkError}
+      <div class="network-alert">
+        <span class="alert-icon">&#x26A0;</span>
+        <span>{$networkError}</span>
+        <button class="ghost" onclick={() => $networkError = null}>Dismiss</button>
+      </div>
+    {/if}
 
     {#if $transfers.filter((t) => t.status === 'active').length > 0}
       <div class="section">
@@ -134,5 +161,27 @@
     font-weight: 600;
     color: var(--text-secondary);
     margin-bottom: 12px;
+  }
+
+  .network-alert {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--warning, #f0ad4e);
+    border-radius: 6px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    color: var(--text-primary);
+  }
+
+  .alert-icon {
+    font-size: 18px;
+    color: var(--warning, #f0ad4e);
+  }
+
+  .network-alert button {
+    margin-left: auto;
   }
 </style>
