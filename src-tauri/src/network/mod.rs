@@ -409,6 +409,32 @@ pub async fn start_network(
     let mut flood_cleanup_timer = tokio::time::interval(std::time::Duration::from_secs(30));
     let mut source_retry_timer = tokio::time::interval(std::time::Duration::from_secs(60));
 
+    // Resume incomplete downloads from previous session
+    if let Ok(incomplete) = db.get_incomplete_downloads() {
+        let count = incomplete.len();
+        if count > 0 {
+            info!("Resuming {count} incomplete downloads from previous session");
+            let now = chrono::Utc::now().timestamp();
+            for transfer in incomplete {
+                let control = TransferControl::new();
+                {
+                    let mut mgr = transfer_manager.write().await;
+                    mgr.enqueue(transfer.clone());
+                    mgr.register_control(&transfer.id, control.clone());
+                }
+                state.pending_downloads.insert(transfer.id.clone(), PendingDownload {
+                    transfer_id: transfer.id.clone(),
+                    file_hash: transfer.file_hash.clone(),
+                    file_name: transfer.file_name.clone(),
+                    file_size: transfer.total_size,
+                    control,
+                    search_count: 0,
+                    last_search_at: now - 60, // trigger immediate source search
+                });
+            }
+        }
+    }
+
     info!("Network event loop starting");
 
     loop {
@@ -458,7 +484,7 @@ pub async fn start_network(
 
             // Download progress events
             Some(event) = dl_event_rx.recv() => {
-                handle_download_event(event, &app_handle, &transfer_manager).await;
+                handle_download_event(event, &app_handle, &transfer_manager, &db).await;
             }
 
             // Upload events from the peer-to-peer upload listener
@@ -2047,6 +2073,24 @@ async fn handle_command(
                 }
 
                 let now = chrono::Utc::now().timestamp();
+
+                // Persist download to database for resume across restarts
+                let db_transfer = Transfer {
+                    id: transfer_id.clone(),
+                    file_name: file_name.clone(),
+                    file_hash: file_hash.clone(),
+                    peer_id: String::new(),
+                    peer_name: String::new(),
+                    direction: TransferDirection::Download,
+                    status: TransferStatus::Searching,
+                    progress: 0.0,
+                    speed: 0,
+                    total_size: file_size,
+                    transferred: 0,
+                    started_at: now,
+                };
+                let _ = db.save_transfer(&db_transfer);
+
                 state.pending_downloads.insert(transfer_id.clone(), PendingDownload {
                     transfer_id: transfer_id.clone(),
                     file_hash: file_hash.clone(),
@@ -2275,6 +2319,7 @@ async fn handle_download_event(
     event: DownloadEvent,
     app_handle: &tauri::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
+    db: &Arc<Database>,
 ) {
     match event {
         DownloadEvent::Progress {
@@ -2312,6 +2357,7 @@ async fn handle_download_event(
                 let mut mgr = transfer_manager.write().await;
                 mgr.complete(&transfer_id);
             }
+            let _ = db.update_transfer_status(&transfer_id, "\"completed\"");
             let _ = app_handle.emit(
                 "transfer-complete",
                 serde_json::json!({ "id": transfer_id }),
@@ -2322,6 +2368,7 @@ async fn handle_download_event(
                 let mut mgr = transfer_manager.write().await;
                 mgr.fail(&transfer_id, &error);
             }
+            let _ = db.update_transfer_status(&transfer_id, "\"failed\"");
             let _ = app_handle.emit(
                 "transfer-failed",
                 serde_json::json!({ "id": transfer_id, "error": error }),

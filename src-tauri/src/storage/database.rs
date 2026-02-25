@@ -212,4 +212,74 @@ impl Database {
         conn.execute("DELETE FROM shared_files", [])?;
         Ok(())
     }
+
+    pub fn save_transfer(&self, transfer: &Transfer) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO transfers (id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                transfer.id,
+                transfer.file_name,
+                transfer.file_hash,
+                transfer.peer_id,
+                transfer.peer_name,
+                serde_json::to_string(&transfer.direction).unwrap_or_default(),
+                serde_json::to_string(&transfer.status).unwrap_or_default(),
+                transfer.progress,
+                transfer.speed as i64,
+                transfer.total_size as i64,
+                transfer.transferred as i64,
+                transfer.started_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_incomplete_downloads(&self) -> anyhow::Result<Vec<Transfer>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at
+             FROM transfers WHERE status NOT IN ('\"completed\"', '\"failed\"') AND direction = '\"download\"'"
+        )?;
+
+        let transfers = stmt
+            .query_map([], |row| {
+                let direction_str: String = row.get(5)?;
+                let status_str: String = row.get(6)?;
+                Ok(Transfer {
+                    id: row.get(0)?,
+                    file_name: row.get(1)?,
+                    file_hash: row.get(2)?,
+                    peer_id: row.get(3)?,
+                    peer_name: row.get(4)?,
+                    direction: serde_json::from_str(&direction_str).unwrap_or(TransferDirection::Download),
+                    status: serde_json::from_str(&status_str).unwrap_or(TransferStatus::Searching),
+                    progress: row.get(7)?,
+                    speed: row.get::<_, i64>(8)? as u64,
+                    total_size: row.get::<_, i64>(9)? as u64,
+                    transferred: row.get::<_, i64>(10)? as u64,
+                    started_at: row.get(11)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(transfers)
+    }
+
+    pub fn remove_transfer(&self, transfer_id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM transfers WHERE id = ?1", params![transfer_id])?;
+        Ok(())
+    }
+
+    pub fn update_transfer_status(&self, transfer_id: &str, status: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE transfers SET status = ?1 WHERE id = ?2",
+            params![status, transfer_id],
+        )?;
+        Ok(())
+    }
 }
