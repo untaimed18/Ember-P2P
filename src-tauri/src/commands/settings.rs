@@ -7,7 +7,7 @@ use crate::network::kad::bootstrap;
 use crate::network::NetworkCommand;
 use crate::types::AppSettings;
 
-const NODES_DAT_URL: &str = "http://upd.emule-security.org/nodes.dat";
+const NODES_DAT_URL: &str = "https://upd.emule-security.org/nodes.dat";
 const IPFILTER_URL: &str = "https://emuling.gitlab.io/ipfilter.dat";
 
 #[tauri::command]

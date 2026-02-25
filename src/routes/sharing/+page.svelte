@@ -87,7 +87,7 @@
   {:else}
     <div class="files-section">
       <div class="section-title">{files.length} files shared</div>
-      <FileList {files} />
+      <FileList {files} showCopyLink={true} />
     </div>
   {/if}
 </div>

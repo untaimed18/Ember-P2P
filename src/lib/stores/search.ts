@@ -5,6 +5,7 @@ import type { SearchResult } from '$lib/types';
 export const searchResults = writable<SearchResult[]>([]);
 export const searchQuery = writable<string>('');
 export const isSearching = writable<boolean>(false);
+export const searchProgress = writable<{ nodes_contacted: number; results_so_far: number; phase: string } | null>(null);
 
 let initialized = false;
 
@@ -28,5 +29,10 @@ export async function initSearchStore() {
       return merged;
     });
     isSearching.set(false);
+    searchProgress.set(null);
+  });
+
+  listen<{ nodes_contacted: number; results_so_far: number; phase: string }>('search-progress', (event) => {
+    searchProgress.set(event.payload);
   });
 }

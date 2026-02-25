@@ -87,7 +87,23 @@ impl Database {
             ",
         )?;
 
+        // Add columns that may be missing from older schema versions
+        Self::add_column_if_missing(&conn, "shared_files", "aich_hash", "TEXT NOT NULL DEFAULT ''");
+
         Ok(())
+    }
+
+    fn add_column_if_missing(conn: &Connection, table: &str, column: &str, col_type: &str) {
+        let has_column = conn
+            .prepare(&format!("SELECT {column} FROM {table} LIMIT 0"))
+            .is_ok();
+        if !has_column {
+            let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {col_type}");
+            match conn.execute(&sql, []) {
+                Ok(_) => info!("Added column {table}.{column}"),
+                Err(e) => tracing::warn!("Failed to add column {table}.{column}: {e}"),
+            }
+        }
     }
 
     pub fn save_shared_file(&self, file: &FileInfo) -> anyhow::Result<()> {

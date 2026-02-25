@@ -164,14 +164,30 @@ pub async fn start_network(
     let udp_port = settings.udp_port;
 
     let udp_addr: SocketAddr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), udp_port);
-    let sock2 = socket2::Socket::new(
+    let sock2 = match socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
-    )?;
-    sock2.set_recv_buffer_size(1024 * 1024)?; // 1 MiB OS receive buffer
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to create UDP socket: {e}");
+            let _ = app_handle.emit("network-error", serde_json::json!({
+                "message": format!("Failed to create UDP socket: {e}"),
+            }));
+            anyhow::bail!("Failed to create UDP socket: {e}");
+        }
+    };
+    sock2.set_recv_buffer_size(1024 * 1024)?;
     sock2.set_nonblocking(true)?;
-    sock2.bind(&socket2::SockAddr::from(udp_addr))?;
+    if let Err(e) = sock2.bind(&socket2::SockAddr::from(udp_addr)) {
+        let msg = format!("UDP port {udp_port} is already in use. Is another instance running? Change the port in Settings or close the other application.");
+        error!("{msg}: {e}");
+        let _ = app_handle.emit("network-error", serde_json::json!({
+            "message": msg,
+        }));
+        anyhow::bail!("{msg}");
+    }
     let udp_socket = UdpSocket::from_std(std::net::UdpSocket::from(sock2))?;
     info!("KAD UDP socket bound on port {udp_port}");
 
@@ -399,6 +415,7 @@ pub async fn start_network(
 
     let mut udp_buf = vec![0u8; 65535];
     let mut bootstrap_timer = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut bootstrap_attempts: u32 = 0;
     let mut publish_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut search_poll_timer = tokio::time::interval(std::time::Duration::from_millis(500));
     let mut cleanup_timer = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -515,14 +532,16 @@ pub async fn start_network(
                     .map(|(id, _)| *id)
                     .collect();
 
-                // Log active search status
+                // Emit search progress for active keyword searches
                 for (sid, search) in state.search_manager.active.iter() {
                     if !search.completed {
-                        info!(
-                            "  Search {} active: phase={:?} queried={} pending={} closest={} results={}",
-                            sid.0, search.phase, search.queried.len(), search.pending.len(),
-                            search.closest.len(), search.results.len()
-                        );
+                        if state.pending_keyword_searches.contains_key(sid) {
+                            let _ = app_handle.emit("search-progress", serde_json::json!({
+                                "nodes_contacted": search.queried.len(),
+                                "results_so_far": search.results.len(),
+                                "phase": format!("{:?}", search.phase),
+                            }));
+                        }
                     }
                 }
 
@@ -697,6 +716,17 @@ pub async fn start_network(
             // Periodic bootstrap/refresh (eMule BigTimer style: threshold=20, query known nodes too)
             _ = bootstrap_timer.tick() => {
                 let table_size = state.routing_table.len();
+                if table_size == 0 {
+                    bootstrap_attempts += 1;
+                    if bootstrap_attempts == 5 {
+                        warn!("No peers found after {} bootstrap attempts", bootstrap_attempts);
+                        let _ = app_handle.emit("network-error", serde_json::json!({
+                            "message": "Unable to connect to the KAD network. Try downloading the latest nodes.dat from Settings > Network.",
+                        }));
+                    }
+                } else {
+                    bootstrap_attempts = 0;
+                }
                 if table_size < 20 {
                     // Send bootstrap to hardcoded nodes
                     for contact in &bootstrap::default_bootstrap_contacts() {

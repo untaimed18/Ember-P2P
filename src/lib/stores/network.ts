@@ -12,7 +12,12 @@ export const networkStats = writable<NetworkStats>({
   status: 'disconnected',
   external_ip: '',
   firewalled: true,
+  buddy_status: 'none',
+  upnp_mapped: false,
+  stores_acknowledged: 0,
 });
+
+export const networkError = writable<string | null>(null);
 
 let initialized = false;
 
@@ -26,6 +31,18 @@ export async function initNetworkStore() {
 
   listen<string>('network-status', (event) => {
     networkStats.update((s) => ({ ...s, status: event.payload as NetworkStats['status'] }));
+  });
+
+  listen<{ firewalled: boolean; external_ip: string }>('firewall-status', (event) => {
+    networkStats.update((s) => ({
+      ...s,
+      firewalled: event.payload.firewalled,
+      external_ip: event.payload.external_ip,
+    }));
+  });
+
+  listen<{ message: string }>('network-error', (event) => {
+    networkError.set(event.payload.message);
   });
 
   try {
