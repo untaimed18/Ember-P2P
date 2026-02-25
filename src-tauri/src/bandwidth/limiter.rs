@@ -129,12 +129,10 @@ impl BandwidthLimiter {
         self.total_downloaded.load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn upload_speed(&self) -> u64 {
         self.upload_speed.load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn download_speed(&self) -> u64 {
         self.download_speed.load(Ordering::Relaxed)
     }
