@@ -68,6 +68,15 @@ pub fn build_hello(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickname
     tags.push((&[0x11], Ed2kTagValue::Uint32(0x3C))); // CT_VERSION = EDONKEYVERSION
     tags.push((&[0x0F], Ed2kTagValue::Uint32(tcp_port as u32))); // CT_PORT
 
+    // CT_EMULE_VERSION (0xFB): identifies us as an eMule-compatible client
+    // Format: (compat_client << 24) | (major << 17) | (minor << 10) | (update << 7)
+    // We use SO_COMPAT_UNK (0) as the client type with version 0.1.0
+    let emule_version: u32 = (0 << 24) | (0 << 17) | (1 << 10) | (0 << 7);
+    tags.push((&[0xFB], Ed2kTagValue::Uint32(emule_version)));
+
+    // CT_MOD_VERSION (0x55): identifies our client name to other peers
+    tags.push((&[0x55], Ed2kTagValue::String("Nexus 0.1".to_string())));
+
     // Tag count
     buf.write_u32::<LittleEndian>(tags.len() as u32).unwrap();
 

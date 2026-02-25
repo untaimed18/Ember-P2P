@@ -7,6 +7,7 @@ use sha1::Sha1;
 /// AICH block size: 180 KiB (eMule's EMBLOCKSIZE)
 const AICH_BLOCK_SIZE: u64 = 184_320;
 /// eMule part size: 9.28 MB
+#[allow(dead_code)]
 const PARTSIZE: u64 = 9_728_000;
 
 /// Compute the AICH root hash for a file.
@@ -36,6 +37,7 @@ pub fn compute_aich_root(path: &Path) -> anyhow::Result<[u8; 20]> {
 }
 
 /// Compute the AICH hash for a single part (for verification).
+#[allow(dead_code)]
 pub fn compute_aich_part(data: &[u8]) -> [u8; 20] {
     if data.is_empty() {
         return Sha1::digest([]).into();
