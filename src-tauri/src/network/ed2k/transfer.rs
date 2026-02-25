@@ -1,0 +1,549 @@
+use std::io::{Read, Seek, Write};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use flate2::read::ZlibDecoder;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
+
+use crate::bandwidth::limiter::BandwidthLimiter;
+use crate::sharing::manager::TransferControl;
+
+use super::messages::*;
+use super::part_tracker::PartTracker;
+
+const MAX_RETRIES: u32 = 3;
+const RETRY_DELAY_SECS: u64 = 10;
+const QUEUE_POLL_SECS: u64 = 30;
+const MAX_QUEUE_WAIT_SECS: u64 = 600;
+const READ_TIMEOUT_SECS: u64 = 60;
+
+pub struct Ed2kDownload {
+    pub transfer_id: String,
+    pub file_hash: [u8; 16],
+    pub file_name: String,
+    pub file_size: u64,
+    pub source_addr: SocketAddr,
+    pub download_dir: PathBuf,
+    pub user_hash: [u8; 16],
+    pub nickname: String,
+    pub tcp_port: u16,
+    pub udp_port: u16,
+    pub bandwidth_limiter: Arc<BandwidthLimiter>,
+    pub control: Arc<TransferControl>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DownloadEvent {
+    Progress {
+        transfer_id: String,
+        downloaded: u64,
+        total: u64,
+    },
+    Completed {
+        transfer_id: String,
+    },
+    Failed {
+        transfer_id: String,
+        error: String,
+    },
+}
+
+impl Ed2kDownload {
+    async fn check_control(&self) -> anyhow::Result<()> {
+        if self.control.is_cancelled() {
+            anyhow::bail!("cancelled by user");
+        }
+        while self.control.is_paused() {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            if self.control.is_cancelled() {
+                anyhow::bail!("cancelled while paused");
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn run(self, event_tx: mpsc::Sender<DownloadEvent>) -> anyhow::Result<()> {
+        info!(
+            "Starting download {} from {}",
+            hex::encode(self.file_hash),
+            self.source_addr
+        );
+
+        let mut last_err = String::new();
+
+        for attempt in 1..=MAX_RETRIES {
+            self.check_control().await?;
+
+            if attempt > 1 {
+                warn!(
+                    "Retry {}/{} for {} after: {}",
+                    attempt, MAX_RETRIES, self.transfer_id, last_err
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    RETRY_DELAY_SECS * attempt as u64,
+                ))
+                .await;
+            }
+
+            match self.download_inner(&event_tx).await {
+                Ok(_) => {
+                    let _ = event_tx
+                        .send(DownloadEvent::Completed {
+                            transfer_id: self.transfer_id.clone(),
+                        })
+                        .await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    if self.control.is_cancelled() {
+                        let _ = event_tx
+                            .send(DownloadEvent::Failed {
+                                transfer_id: self.transfer_id.clone(),
+                                error: "Cancelled by user".to_string(),
+                            })
+                            .await;
+                        return Ok(());
+                    }
+                    last_err = e.to_string();
+                    warn!("Download attempt {attempt} failed: {last_err}");
+                }
+            }
+        }
+
+        let _ = event_tx
+            .send(DownloadEvent::Failed {
+                transfer_id: self.transfer_id.clone(),
+                error: format!("Failed after {MAX_RETRIES} attempts: {last_err}"),
+            })
+            .await;
+
+        anyhow::bail!("Failed after {MAX_RETRIES} attempts: {last_err}")
+    }
+
+    async fn download_inner(&self, event_tx: &mpsc::Sender<DownloadEvent>) -> anyhow::Result<()> {
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            TcpStream::connect(self.source_addr),
+        )
+        .await??;
+
+        let (reader, writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut writer = tokio::io::BufWriter::new(writer);
+
+        // Send Hello
+        let hello_payload = build_hello(&self.user_hash, 0, self.tcp_port, &self.nickname);
+        write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_HELLO, &hello_payload).await?;
+
+        // Read HelloAnswer
+        let (proto, opcode, _payload) = read_packet_with_timeout(&mut reader).await?;
+        if proto != OP_EDONKEYHEADER || opcode != OP_HELLOANSWER {
+            anyhow::bail!("expected HelloAnswer, got proto=0x{proto:02X} op=0x{opcode:02X}");
+        }
+        debug!("Got HelloAnswer from {}", self.source_addr);
+
+        // Send EmuleInfo
+        let emule_payload = build_emule_info(self.udp_port);
+        write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
+
+        // Read EmuleInfoAnswer (optional, some clients skip it)
+        let (proto, opcode, _payload) = read_packet_with_timeout(&mut reader).await?;
+        if proto == OP_EMULEPROT && opcode == OP_EMULEINFOANSWER {
+            debug!("Got EmuleInfoAnswer");
+        }
+
+        // Send file request
+        let file_req = build_file_request(&self.file_hash);
+        write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_SETREQFILEID, &file_req).await?;
+        write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_REQUESTFILENAME, &file_req).await?;
+
+        // Read FileStatus and FileName responses
+        let mut got_status = false;
+        let mut available_parts: Vec<bool> = Vec::new();
+
+        for _ in 0..5 {
+            let (proto, opcode, payload) = read_packet_with_timeout(&mut reader).await?;
+
+            match (proto, opcode) {
+                (OP_EDONKEYHEADER, OP_FILESTATUS) => {
+                    let (_hash, parts) = parse_file_status(&payload)?;
+                    available_parts = parts;
+                    got_status = true;
+                    debug!("FileStatus: {} parts", available_parts.len());
+                }
+                (OP_EDONKEYHEADER, OP_REQFILENAMEANSWER) => {
+                    debug!("Got filename answer");
+                }
+                (OP_EDONKEYHEADER, OP_FILEREQANSNOFIL) => {
+                    anyhow::bail!("peer does not have the file");
+                }
+                _ => {
+                    debug!("Ignoring packet proto=0x{proto:02X} op=0x{opcode:02X}");
+                }
+            }
+
+            if got_status {
+                break;
+            }
+        }
+
+        if !got_status {
+            anyhow::bail!("never received FileStatus");
+        }
+
+        // Request part hashset for verification
+        let hashset_req = build_hashset_request(&self.file_hash);
+        write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_HASHSETREQ, &hashset_req).await?;
+
+        let mut part_hashes: Vec<[u8; 16]> = Vec::new();
+        // Try to read hashset answer (some peers may not support it)
+        match read_packet_with_timeout(&mut reader).await {
+            Ok((proto, opcode, payload)) => {
+                if proto == OP_EDONKEYHEADER && opcode == OP_HASHSETANSWER {
+                    match parse_hashset_answer(&payload) {
+                        Ok((_hash, hashes)) => {
+                            debug!("Got hashset with {} part hashes", hashes.len());
+                            part_hashes = hashes;
+                        }
+                        Err(e) => debug!("Failed to parse hashset answer: {e}"),
+                    }
+                } else {
+                    debug!("Expected hashset answer, got proto=0x{proto:02X} op=0x{opcode:02X}");
+                }
+            }
+            Err(e) => debug!("No hashset answer (peer may not support it): {e}"),
+        }
+
+        // Request upload slot
+        let upload_req = build_file_request(&self.file_hash);
+        write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_STARTUPLOADREQ, &upload_req).await?;
+
+        // Wait for AcceptUploadReq, handling queue rank
+        let queue_start = std::time::Instant::now();
+
+        loop {
+            self.check_control().await?;
+
+            let (proto, opcode, payload) = read_packet_with_timeout(&mut reader).await?;
+
+            if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
+                debug!("Upload accepted");
+                break;
+            }
+
+            // eMule extended queue ranking (OP_EMULEPROT 0x60)
+            if proto == OP_EMULEPROT && opcode == OP_QUEUERANKING && payload.len() >= 2 {
+                let rank =
+                    u16::from_le_bytes([payload[0], payload[1]]);
+                info!(
+                    "Queued at position {} on peer {}",
+                    rank, self.source_addr
+                );
+
+                if queue_start.elapsed().as_secs() > MAX_QUEUE_WAIT_SECS {
+                    anyhow::bail!(
+                        "gave up waiting in queue (position {rank}) after {MAX_QUEUE_WAIT_SECS}s"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(QUEUE_POLL_SECS)).await;
+                write_packet_async(
+                    &mut writer,
+                    OP_EDONKEYHEADER,
+                    OP_STARTUPLOADREQ,
+                    &upload_req,
+                )
+                .await?;
+                continue;
+            }
+
+            // Legacy queue rank (OP_EDONKEYHEADER 0x5C)
+            if proto == OP_EDONKEYHEADER && opcode == OP_QUEUERANK && payload.len() >= 4 {
+                let rank = u32::from_le_bytes([
+                    payload[0], payload[1], payload[2], payload[3],
+                ]);
+                info!(
+                    "Queued at position {} on peer {} (legacy)",
+                    rank, self.source_addr
+                );
+
+                if queue_start.elapsed().as_secs() > MAX_QUEUE_WAIT_SECS {
+                    anyhow::bail!(
+                        "gave up waiting in queue (position {rank}) after {MAX_QUEUE_WAIT_SECS}s"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(QUEUE_POLL_SECS)).await;
+                write_packet_async(
+                    &mut writer,
+                    OP_EDONKEYHEADER,
+                    OP_STARTUPLOADREQ,
+                    &upload_req,
+                )
+                .await?;
+                continue;
+            }
+
+            debug!("Waiting for accept, got proto=0x{proto:02X} op=0x{opcode:02X}");
+
+            if queue_start.elapsed().as_secs() > MAX_QUEUE_WAIT_SECS {
+                anyhow::bail!("timed out waiting for upload slot after {MAX_QUEUE_WAIT_SECS}s");
+            }
+        }
+
+        // Create or resume output file
+        let part_path = self.download_dir.join(format!("{}.part", self.transfer_id));
+        let final_path = self.download_dir.join(&self.file_name);
+
+        let mut tracker = PartTracker::new(self.file_size, &part_path);
+
+        let mut output = if part_path.exists() && tracker.completed_count() > 0 {
+            info!(
+                "Resuming download: {}/{} parts complete",
+                tracker.completed_count(),
+                tracker.part_count
+            );
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .open(&part_path)?
+        } else {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&part_path)?;
+            if self.file_size > 0 {
+                f.set_len(self.file_size)?;
+            }
+            f
+        };
+
+        // Calculate current downloaded bytes from completed parts
+        let mut downloaded: u64 = (0..tracker.part_count)
+            .filter(|&i| tracker.is_part_complete(i))
+            .map(|i| {
+                let (start, end) = tracker.part_range(i);
+                end - start
+            })
+            .sum();
+
+        // Download needed parts
+        let needed = tracker.needed_parts(&available_parts);
+        for part_idx in needed {
+            self.check_control().await?;
+
+            let (part_start, part_end) = tracker.part_range(part_idx);
+            let mut part_offset = part_start;
+
+            while part_offset < part_end {
+                self.check_control().await?;
+
+                let chunk_end = (part_offset + EMBLOCKSIZE).min(part_end);
+                let offsets = vec![(part_offset, chunk_end)];
+                let req_payload = build_request_parts_i64(&self.file_hash, &offsets);
+                write_packet_async(&mut writer, OP_EMULEPROT, OP_REQUESTPARTS_I64, &req_payload)
+                    .await?;
+
+                let mut chunk_received = 0u64;
+                let expected = chunk_end - part_offset;
+
+                while chunk_received < expected {
+                    let (proto, opcode, payload) = read_packet_with_timeout(&mut reader).await?;
+
+                    match (proto, opcode) {
+                        (OP_EMULEPROT, OP_SENDINGPART_I64) | (OP_EDONKEYHEADER, OP_SENDINGPART) => {
+                            let (_hash, start, end, data) = if opcode == OP_SENDINGPART_I64 {
+                                parse_sending_part_i64(&payload)?
+                            } else {
+                                parse_sending_part_32(&payload)?
+                            };
+
+                            let piece_len = end - start;
+                            self.acquire_download_bandwidth(piece_len).await;
+
+                            output.seek(std::io::SeekFrom::Start(start))?;
+                            output.write_all(data)?;
+
+                            chunk_received += piece_len;
+                            downloaded += piece_len;
+
+                            let _ = event_tx
+                                .send(DownloadEvent::Progress {
+                                    transfer_id: self.transfer_id.clone(),
+                                    downloaded,
+                                    total: self.file_size,
+                                })
+                                .await;
+                        }
+                        (OP_EMULEPROT, OP_COMPRESSEDPART_I64)
+                        | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
+                            let (_hash, start, _packed_len, compressed) =
+                                parse_compressed_part_i64(&payload)?;
+
+                            let mut decoder = ZlibDecoder::new(compressed);
+                            let mut decompressed = Vec::new();
+                            decoder.read_to_end(&mut decompressed)?;
+
+                            let piece_len = decompressed.len() as u64;
+                            self.acquire_download_bandwidth(piece_len).await;
+
+                            output.seek(std::io::SeekFrom::Start(start))?;
+                            output.write_all(&decompressed)?;
+
+                            chunk_received += piece_len;
+                            downloaded += piece_len;
+
+                            let _ = event_tx
+                                .send(DownloadEvent::Progress {
+                                    transfer_id: self.transfer_id.clone(),
+                                    downloaded,
+                                    total: self.file_size,
+                                })
+                                .await;
+                        }
+                        (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
+                            warn!("Peer ran out of part requests");
+                            break;
+                        }
+                        _ => {
+                            debug!("During download, ignoring proto=0x{proto:02X} op=0x{opcode:02X}");
+                        }
+                    }
+                }
+
+                part_offset = chunk_end;
+            }
+
+            // Verify part hash if we have the hashset
+            if part_idx < part_hashes.len() {
+                let expected_hash = part_hashes[part_idx];
+                let (ps, pe) = tracker.part_range(part_idx);
+                let part_len = (pe - ps) as usize;
+
+                // Read the part back from disk for verification
+                output.seek(std::io::SeekFrom::Start(ps))?;
+                let mut part_data = vec![0u8; part_len];
+                output.read_exact(&mut part_data)?;
+
+                use digest::Digest;
+                use md4::Md4;
+                let actual_hash: [u8; 16] = Md4::digest(&part_data).into();
+
+                if actual_hash != expected_hash {
+                    warn!(
+                        "Part {} hash mismatch! expected={} got={}",
+                        part_idx,
+                        hex::encode(expected_hash),
+                        hex::encode(actual_hash)
+                    );
+                    tracker.mark_incomplete(part_idx);
+                    tracker.save();
+                    continue;
+                }
+                debug!("Part {} hash verified OK", part_idx);
+            }
+
+            tracker.mark_complete(part_idx);
+            tracker.save();
+        }
+
+        output.flush()?;
+        drop(output);
+
+        // Clean up part.met and rename to final filename
+        tracker.delete_met();
+        std::fs::rename(&part_path, &final_path)?;
+        // Verify the final file hash
+        let output_path = final_path.clone();
+        let expected_hash = hex::encode(self.file_hash);
+        match tokio::task::spawn_blocking(move || {
+            super::hash::ed2k_hash_file(&output_path)
+        }).await {
+            Ok(Ok(actual_hash)) if actual_hash == expected_hash => {
+                info!("Download complete and verified: {}", self.file_name);
+            }
+            Ok(Ok(actual_hash)) => {
+                warn!(
+                    "Download complete but hash mismatch for {}: expected={}, got={}",
+                    self.file_name, expected_hash, actual_hash
+                );
+            }
+            _ => {
+                info!("Download complete (could not verify hash): {}", self.file_name);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn acquire_download_bandwidth(&self, bytes: u64) {
+        loop {
+            if self.bandwidth_limiter.acquire_download(bytes).await {
+                return;
+            }
+        }
+    }
+}
+
+fn parse_sending_part_32(payload: &[u8]) -> std::io::Result<([u8; 16], u64, u64, &[u8])> {
+    if payload.len() < 24 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sending part 32 too short",
+        ));
+    }
+    let mut hash = [0u8; 16];
+    hash.copy_from_slice(&payload[..16]);
+    let start = u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]) as u64;
+    let end = u32::from_le_bytes([payload[20], payload[21], payload[22], payload[23]]) as u64;
+    Ok((hash, start, end, &payload[24..]))
+}
+
+async fn read_packet_with_timeout<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<(u8, u8, Vec<u8>)> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(READ_TIMEOUT_SECS),
+        read_packet_async(reader),
+    )
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
+}
+
+async fn read_packet_async<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<(u8, u8, Vec<u8>)> {
+    let protocol = reader.read_u8().await?;
+    let length = reader.read_u32_le().await? as usize;
+    if length == 0 || length > 10 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid packet length",
+        ));
+    }
+    let opcode = reader.read_u8().await?;
+    let payload_len = length - 1;
+    let mut payload = vec![0u8; payload_len];
+    if payload_len > 0 {
+        reader.read_exact(&mut payload).await?;
+    }
+    Ok((protocol, opcode, payload))
+}
+
+async fn write_packet_async<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    protocol: u8,
+    opcode: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    writer.write_u8(protocol).await?;
+    writer.write_u32_le((1 + payload.len()) as u32).await?;
+    writer.write_u8(opcode).await?;
+    writer.write_all(payload).await?;
+    writer.flush().await?;
+    Ok(())
+}

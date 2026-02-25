@@ -1,0 +1,95 @@
+use std::path::PathBuf;
+
+use tracing::info;
+
+use crate::app_state::AppState;
+use crate::network::kad::bootstrap;
+use crate::network::NetworkCommand;
+use crate::types::AppSettings;
+
+const NODES_DAT_URL: &str = "http://upd.emule-security.org/nodes.dat";
+
+#[tauri::command]
+pub async fn get_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<AppSettings, String> {
+    let config = state.config.read().await;
+    Ok(config.settings.clone())
+}
+
+#[tauri::command]
+pub async fn update_settings(
+    state: tauri::State<'_, AppState>,
+    settings: AppSettings,
+) -> Result<String, String> {
+    state
+        .bandwidth_limiter
+        .set_limits(settings.max_upload_speed, settings.max_download_speed);
+
+    let old_settings = {
+        let config = state.config.read().await;
+        config.settings.clone()
+    };
+
+    let port_changed = settings.tcp_port != old_settings.tcp_port
+        || settings.udp_port != old_settings.udp_port;
+
+    {
+        let mut manager = state.transfer_manager.write().await;
+        manager.max_concurrent = settings.max_concurrent_downloads;
+    }
+
+    let mut config = state.config.write().await;
+    config
+        .update(settings)
+        .map_err(|e| format!("Failed to save settings: {e}"))?;
+
+    if port_changed {
+        Ok("Settings saved. Port changes require an application restart to take effect.".into())
+    } else {
+        Ok("Settings saved.".into())
+    }
+}
+
+#[tauri::command]
+pub async fn download_nodes_dat(
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    info!("Downloading nodes.dat from {NODES_DAT_URL}");
+
+    let bytes = reqwest::get(NODES_DAT_URL)
+        .await
+        .map_err(|e| format!("HTTP request failed: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read response body: {e}"))?;
+
+    let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
+        .map(|d| d.data_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("Failed to create data dir: {e}"))?;
+
+    let nodes_path = data_dir.join("nodes.dat");
+    std::fs::write(&nodes_path, &bytes)
+        .map_err(|e| format!("Failed to write nodes.dat: {e}"))?;
+
+    let contacts = bootstrap::load_nodes_dat(&nodes_path)
+        .map_err(|e| format!("Failed to parse nodes.dat: {e}"))?;
+
+    let contact_count = contacts.len();
+    let byte_count = bytes.len();
+
+    // Inject contacts into the running network
+    state
+        .network_tx
+        .send(NetworkCommand::BootstrapContacts { contacts })
+        .await
+        .map_err(|e| format!("Failed to send contacts to network: {e}"))?;
+
+    let msg = format!(
+        "Downloaded and loaded {contact_count} contacts ({byte_count} bytes) — bootstrapping now",
+    );
+    info!("{msg}");
+    Ok(msg)
+}

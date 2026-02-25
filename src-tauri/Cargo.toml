@@ -1,0 +1,42 @@
+[package]
+name = "nexus"
+version = "0.1.0"
+description = "A decentralized P2P file sharing application"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "nexus_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+blake3 = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "5"
+futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+walkdir = "2"
+md4 = "0.10"
+md-5 = "0.10"
+digest = "0.10"
+byteorder = "1"
+rand = "0.8"
+flate2 = "1"
+hex = "0.4"
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+igd-next = { version = "0.15", features = ["aio_tokio"] }
+socket2 = "0.5"

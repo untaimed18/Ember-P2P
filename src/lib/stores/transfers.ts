@@ -1,0 +1,100 @@
+import { writable } from 'svelte/store';
+import { listen } from '@tauri-apps/api/event';
+import type { Transfer } from '$lib/types';
+import { getTransfers } from '$lib/api/transfers';
+
+interface ProgressPayload {
+  id: string;
+  downloaded: number;
+  total: number;
+  progress: number;
+  speed: number;
+}
+
+interface TransferEventPayload {
+  id: string;
+  error?: string;
+}
+
+export const transfers = writable<Transfer[]>([]);
+
+let initialized = false;
+
+export async function initTransferStore() {
+  if (initialized) return;
+  initialized = true;
+
+  listen<ProgressPayload>('transfer-progress', (event) => {
+    const p = event.payload;
+    transfers.update((list) => {
+      const idx = list.findIndex((t) => t.id === p.id);
+      if (idx >= 0) {
+        list[idx] = {
+          ...list[idx],
+          transferred: p.downloaded,
+          progress: p.progress,
+          speed: p.speed,
+          status: 'active',
+        };
+      }
+      return [...list];
+    });
+  });
+
+  listen<TransferEventPayload>('transfer-complete', (event) => {
+    const id = event.payload.id;
+    transfers.update((list) =>
+      list.map((t) =>
+        t.id === id ? { ...t, status: 'completed' as const, progress: 100, speed: 0 } : t
+      )
+    );
+  });
+
+  listen<TransferEventPayload>('transfer-failed', (event) => {
+    const id = event.payload.id;
+    transfers.update((list) =>
+      list.map((t) =>
+        t.id === id ? { ...t, status: 'failed' as const, speed: 0 } : t
+      )
+    );
+  });
+
+  listen<TransferEventPayload & { status?: string; peer_id?: string }>(
+    'transfer-status',
+    (event) => {
+      const { id, status, peer_id } = event.payload;
+      transfers.update((list) =>
+        list.map((t) => {
+          if (t.id !== id) return t;
+          const updated = { ...t };
+          if (status) updated.status = status as Transfer['status'];
+          if (peer_id) {
+            updated.peer_id = peer_id;
+            updated.peer_name = peer_id;
+          }
+          return updated;
+        })
+      );
+    }
+  );
+
+  try {
+    const all = await getTransfers();
+    transfers.set(all);
+  } catch {
+    // Backend not ready yet
+  }
+}
+
+export function startTransferPoll() {
+  const interval = setInterval(async () => {
+    try {
+      const all = await getTransfers();
+      transfers.set(all);
+    } catch {
+      // Ignore
+    }
+  }, 2000);
+
+  return () => clearInterval(interval);
+}

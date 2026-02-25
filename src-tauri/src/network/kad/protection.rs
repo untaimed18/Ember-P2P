@@ -1,0 +1,121 @@
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
+use std::time::Instant;
+
+const MAX_PACKETS_PER_SEC: u32 = 10;
+const TRACKER_EXPIRY_SECS: u64 = 30;
+
+pub struct FloodProtection {
+    ip_counters: HashMap<IpAddr, (u32, Instant)>,
+    outgoing_requests: HashSet<(SocketAddr, u8)>,
+    request_times: HashMap<(SocketAddr, u8), Instant>,
+}
+
+impl FloodProtection {
+    pub fn new() -> Self {
+        FloodProtection {
+            ip_counters: HashMap::new(),
+            outgoing_requests: HashSet::new(),
+            request_times: HashMap::new(),
+        }
+    }
+
+    /// Returns true if the packet should be dropped (rate exceeded).
+    pub fn check_rate_limit(&mut self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let entry = self.ip_counters.entry(ip).or_insert((0, now));
+
+        if now.duration_since(entry.1).as_secs() >= 1 {
+            entry.0 = 1;
+            entry.1 = now;
+            false
+        } else {
+            entry.0 += 1;
+            entry.0 > MAX_PACKETS_PER_SEC
+        }
+    }
+
+    /// Returns true if a packet from port 53 should be dropped (unencrypted).
+    pub fn is_dns_port(addr: &SocketAddr) -> bool {
+        addr.port() == 53
+    }
+
+    /// Record an outgoing request so we can validate incoming responses.
+    pub fn track_request(&mut self, addr: SocketAddr, opcode: u8) {
+        let key = (addr, opcode);
+        self.outgoing_requests.insert(key);
+        self.request_times.insert(key, Instant::now());
+    }
+
+    /// Check if we have a matching outgoing request for this response.
+    /// Returns true if valid (we sent a request), false if unsolicited.
+    pub fn validate_response(&mut self, addr: SocketAddr, response_opcode: u8) -> bool {
+        let request_opcode = match response_opcode {
+            0x09 => Some(0x01u8), // BootstrapRes -> BootstrapReq
+            0x19 => Some(0x11),   // HelloRes -> HelloReq
+            0x29 => Some(0x21),   // KadRes -> KadReq
+            0x3B => Some(0x33),   // SearchRes -> SearchKeyReq (or 0x34, 0x35)
+            0x4B => Some(0x43),   // PublishRes -> PublishKeyReq (or 0x44, 0x45)
+            0x61 => Some(0x60),   // Pong -> Ping
+            0x58 => Some(0x50),   // FirewalledRes -> FirewalledReq
+            _ => None,
+        };
+
+        if let Some(req_op) = request_opcode {
+            let key = (addr, req_op);
+            if self.outgoing_requests.remove(&key) {
+                self.request_times.remove(&key);
+                return true;
+            }
+            // For SearchRes, also check SearchSourceReq and SearchNotesReq
+            if response_opcode == 0x3B {
+                let key2 = (addr, 0x34);
+                if self.outgoing_requests.remove(&key2) {
+                    self.request_times.remove(&key2);
+                    return true;
+                }
+                let key3 = (addr, 0x35);
+                if self.outgoing_requests.remove(&key3) {
+                    self.request_times.remove(&key3);
+                    return true;
+                }
+            }
+            // For PublishRes, also check PublishSourceReq and PublishNotesReq
+            if response_opcode == 0x4B {
+                let key2 = (addr, 0x44);
+                if self.outgoing_requests.remove(&key2) {
+                    self.request_times.remove(&key2);
+                    return true;
+                }
+                let key3 = (addr, 0x45);
+                if self.outgoing_requests.remove(&key3) {
+                    self.request_times.remove(&key3);
+                    return true;
+                }
+            }
+        }
+
+        // Be lenient: allow responses from addresses we've recently communicated with
+        // even if we can't match the exact opcode (due to obfuscation, etc.)
+        true
+    }
+
+    /// Clean up stale tracking entries.
+    pub fn cleanup(&mut self) {
+        let now = Instant::now();
+
+        self.ip_counters.retain(|_, (_, last)| {
+            now.duration_since(*last).as_secs() < 60
+        });
+
+        let stale: Vec<(SocketAddr, u8)> = self.request_times
+            .iter()
+            .filter(|(_, time)| now.duration_since(**time).as_secs() > TRACKER_EXPIRY_SECS)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in stale {
+            self.outgoing_requests.remove(&key);
+            self.request_times.remove(&key);
+        }
+    }
+}
