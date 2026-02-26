@@ -15,6 +15,8 @@ pub struct FloodProtection {
     outgoing_requests: HashSet<(SocketAddr, u8)>,
     request_times: HashMap<(SocketAddr, u8), Instant>,
     outgoing_counters: HashMap<IpAddr, (u32, Instant)>,
+    /// O(1) lookup for recently communicated IPs (updated on track_request)
+    recent_ips: HashMap<IpAddr, Instant>,
 }
 
 impl FloodProtection {
@@ -24,6 +26,7 @@ impl FloodProtection {
             outgoing_requests: HashSet::new(),
             request_times: HashMap::new(),
             outgoing_counters: HashMap::new(),
+            recent_ips: HashMap::new(),
         }
     }
 
@@ -71,9 +74,11 @@ impl FloodProtection {
 
     /// Record an outgoing request so we can validate incoming responses.
     pub fn track_request(&mut self, addr: SocketAddr, opcode: u8) {
+        let now = Instant::now();
         let key = (addr, opcode);
         self.outgoing_requests.insert(key);
-        self.request_times.insert(key, Instant::now());
+        self.request_times.insert(key, now);
+        self.recent_ips.insert(addr.ip(), now);
     }
 
     /// Check if we have a matching outgoing request for this response.
@@ -131,24 +136,17 @@ impl FloodProtection {
     }
 
     /// Check if we've had any tracked communication with this address recently.
-    /// For P2P networks, NAT can cause responses to arrive from a different port
-    /// than the one we sent to, so we match on IP alone.
     fn has_recent_communication(&self, addr: &SocketAddr) -> bool {
-        let now = Instant::now();
-        let ip = addr.ip();
-        self.request_times.iter().any(|((tracked_addr, _), time)| {
-            tracked_addr.ip() == ip
-                && now.duration_since(*time).as_secs() < TRACKER_EXPIRY_SECS
-        })
+        self.has_recent_ip(addr.ip())
     }
 
-    /// Check if we've communicated with this IP recently.
+    /// O(1) check if we've communicated with this IP recently.
     pub fn has_recent_ip(&self, ip: IpAddr) -> bool {
-        let now = Instant::now();
-        self.request_times.iter().any(|((tracked_addr, _), time)| {
-            tracked_addr.ip() == ip
-                && now.duration_since(*time).as_secs() < TRACKER_EXPIRY_SECS
-        })
+        if let Some(last) = self.recent_ips.get(&ip) {
+            Instant::now().duration_since(*last).as_secs() < TRACKER_EXPIRY_SECS
+        } else {
+            false
+        }
     }
 
     /// Clean up stale tracking entries.
@@ -172,5 +170,9 @@ impl FloodProtection {
             self.outgoing_requests.remove(&key);
             self.request_times.remove(&key);
         }
+
+        self.recent_ips.retain(|_, last| {
+            now.duration_since(*last).as_secs() < TRACKER_EXPIRY_SECS
+        });
     }
 }

@@ -466,9 +466,9 @@ pub async fn start_network(
     let mut bootstrap_timer = tokio::time::interval(std::time::Duration::from_secs(10));
     let mut bootstrap_attempts: u32 = 0;
     let mut publish_timer = tokio::time::interval(std::time::Duration::from_secs(60));
-    let mut search_poll_timer = tokio::time::interval(std::time::Duration::from_millis(500));
+    let mut search_poll_timer = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut cleanup_timer = tokio::time::interval(std::time::Duration::from_secs(300));
-    let mut bucket_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(10));
+    let mut bucket_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut small_timer = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut eviction_ping_timer = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut buddy_timer = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -584,19 +584,16 @@ pub async fn start_network(
             _ = search_poll_timer.tick() => {
                 let queries = state.search_manager.poll_queries();
                 if !queries.is_empty() {
-                    info!("Search poll: sending {} queries", queries.len());
+                    debug!("Search poll: sending {} queries", queries.len());
                 }
                 for (sid, addr, msg) in &queries {
                     if state.flood_protection.check_outgoing_rate(addr.ip()) {
-                        info!("Throttling outgoing search {} packet to {addr}", sid.0);
+                        debug!("Throttling outgoing search {} packet to {addr}", sid.0);
                         continue;
                     }
                     if let Ok(packet) = messages::encode_packet(msg) {
                         let opcode = packet.get(1).copied().unwrap_or(0);
-                        // Log SearchKeyReq/SearchSourceReq sends at INFO level for diagnostics
-                        if opcode == 0x33 || opcode == 0x34 {
-                            info!("  Search {}: sending 0x{opcode:02X} to {addr}", sid.0);
-                        }
+                        debug!("Search {}: sending 0x{opcode:02X} to {addr}", sid.0);
                         state.flood_protection.track_request(*addr, opcode);
                         let _ = udp_socket.send_to(&packet, addr).await;
                     }
@@ -609,11 +606,10 @@ pub async fn start_network(
                     .map(|(id, _)| *id)
                     .collect();
 
-                // Emit search progress for active keyword searches
-                for (sid, search) in state.search_manager.active.iter() {
-                    if !search.completed {
-                        if state.pending_keyword_searches.contains_key(sid) {
-                            // Report unique file count, not raw entries (which include duplicates)
+                // Emit search progress for active keyword searches (only if there are any)
+                if !state.pending_keyword_searches.is_empty() {
+                    for (sid, search) in state.search_manager.active.iter() {
+                        if !search.completed && state.pending_keyword_searches.contains_key(sid) {
                             let unique_count = {
                                 let unique: std::collections::HashSet<&kad::types::KadId> =
                                     search.results.iter().map(|r| &r.id).collect();
@@ -900,8 +896,8 @@ pub async fn start_network(
                         }
                     }
 
-                    // Query a larger sample of known contacts with BootstrapReq
-                    let bootstrap_sample_size = if table_size < 100 { 30 } else { 10 };
+                    // Query a sample of known contacts with BootstrapReq
+                    let bootstrap_sample_size = if table_size < 50 { 10 } else { 5 };
                     let sample: Vec<KadContact> = {
                         let target = KadId::random();
                         state.routing_table.find_closest(&target, bootstrap_sample_size)
@@ -922,9 +918,11 @@ pub async fn start_network(
                         }
                     }
 
-                    // Also start FindNode lookups for random targets to discover
-                    // contacts in different parts of the ID space
-                    if table_size >= 10 {
+                    // Start a FindNode lookup only if we don't already have too many active
+                    let active_find_nodes = state.search_manager.active.values()
+                        .filter(|s| !s.completed && matches!(s.search_type, SearchType::FindNode))
+                        .count();
+                    if table_size >= 10 && active_find_nodes < 3 {
                         let random_target = KadId::random();
                         let closest = state.routing_table.find_closest(&random_target, SEARCH_INITIAL_CONTACTS);
                         if !closest.is_empty() {
@@ -1023,11 +1021,24 @@ pub async fn start_network(
                 }
             }
 
-            // Bucket refresh: discover new contacts for stale/sparse buckets
+            // Bucket refresh: discover new contacts for stale/sparse buckets.
+            // Only refresh a few buckets per tick to avoid search storms.
             _ = bucket_refresh_timer.tick() => {
+                let active_find_nodes = state.search_manager.active.values()
+                    .filter(|s| !s.completed && matches!(s.search_type, SearchType::FindNode))
+                    .count();
+                const MAX_CONCURRENT_REFRESH_SEARCHES: usize = 3;
+                if active_find_nodes >= MAX_CONCURRENT_REFRESH_SEARCHES {
+                    continue;
+                }
+
+                let budget = MAX_CONCURRENT_REFRESH_SEARCHES - active_find_nodes;
                 let now = chrono::Utc::now().timestamp();
                 let stale = state.routing_table.stale_buckets(now);
+                let mut started = 0usize;
+
                 for bucket_idx in &stale {
+                    if started >= budget { break; }
                     let bucket_idx = *bucket_idx;
                     let target = state.routing_table.random_id_in_bucket(bucket_idx);
                     let closest = state.routing_table.find_closest(&target, SEARCH_INITIAL_CONTACTS);
@@ -1039,25 +1050,27 @@ pub async fn start_network(
                         );
                         state.routing_table.mark_refreshed(bucket_idx);
                         debug!("Refreshing stale bucket {bucket_idx}");
+                        started += 1;
                     }
                 }
 
-                // Also fill sparse buckets
-                let sparse = state.routing_table.buckets_needing_fill();
-                for bucket_idx in sparse {
-                    if stale.contains(&bucket_idx) {
-                        continue;
-                    }
-                    let target = state.routing_table.random_id_in_bucket(bucket_idx);
-                    let closest = state.routing_table.find_closest(&target, SEARCH_INITIAL_CONTACTS);
-                    if !closest.is_empty() {
-                        state.search_manager.start_search(
-                            target,
-                            SearchType::FindNode,
-                            closest,
-                        );
-                        debug!("Filling sparse bucket {bucket_idx} ({} contacts)", 
-                            state.routing_table.get_bucket_contacts(bucket_idx).len());
+                if started < budget {
+                    let sparse = state.routing_table.buckets_needing_fill();
+                    for bucket_idx in sparse {
+                        if started >= budget { break; }
+                        if stale.contains(&bucket_idx) {
+                            continue;
+                        }
+                        let target = state.routing_table.random_id_in_bucket(bucket_idx);
+                        let closest = state.routing_table.find_closest(&target, SEARCH_INITIAL_CONTACTS);
+                        if !closest.is_empty() {
+                            state.search_manager.start_search(
+                                target,
+                                SearchType::FindNode,
+                                closest,
+                            );
+                            started += 1;
+                        }
                     }
                 }
             }
@@ -1081,9 +1094,6 @@ pub async fn start_network(
                 }
 
                 let to_probe = state.routing_table.get_contacts_to_probe();
-                for (_bucket_idx, contact) in &to_probe {
-                    debug!("Probing contact {} at {}", contact.id, contact.addr_string());
-                }
                 for (_bucket_idx, contact) in to_probe {
                     let our_options: u8 = if state.firewalled { 0x05 } else { 0x04 };
                     let mut hello_tags = vec![
@@ -1363,7 +1373,7 @@ async fn handle_udp_packet(
     }
     let known_peer = match from.ip() {
         std::net::IpAddr::V4(v4) => {
-            state.routing_table.all_contacts().any(|c| c.ip == v4)
+            state.routing_table.has_contact_ip(v4)
                 || state.flood_protection.has_recent_ip(from.ip())
         }
         _ => state.flood_protection.has_recent_ip(from.ip()),

@@ -535,6 +535,10 @@ impl SearchManager {
         self.active.get(id)
     }
 
+    pub fn active_count(&self) -> usize {
+        self.active.values().filter(|s| !s.completed).count()
+    }
+
     pub fn poll_queries(&mut self) -> Vec<(SearchId, SocketAddr, KadMessage)> {
         let mut queries = Vec::new();
         let search_ids: Vec<SearchId> = self.active.keys().cloned().collect();

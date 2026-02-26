@@ -67,9 +67,14 @@ impl KBucket {
 
 impl RoutingTable {
     pub fn new(local_id: KadId, block_private_ips: bool) -> Self {
+        let now = chrono::Utc::now().timestamp();
         let mut buckets = Vec::with_capacity(NUM_BUCKETS);
-        for _ in 0..NUM_BUCKETS {
-            buckets.push(KBucket::new());
+        for i in 0..NUM_BUCKETS {
+            let mut b = KBucket::new();
+            // Stagger initial refresh times so buckets don't all become stale at once.
+            // Spread them over the first hour: bucket 0 refreshes first, bucket 127 last.
+            b.last_refresh = now - (i as i64 * BUCKET_REFRESH_INTERVAL_SECS / NUM_BUCKETS as i64);
+            buckets.push(b);
         }
         RoutingTable {
             local_id,
@@ -83,6 +88,11 @@ impl RoutingTable {
 
     pub fn local_id(&self) -> &KadId {
         &self.local_id
+    }
+
+    /// O(1) check if any contact in the table has this IP.
+    pub fn has_contact_ip(&self, ip: Ipv4Addr) -> bool {
+        self.global_ip_count.get(&ip).copied().unwrap_or(0) > 0
     }
 
     fn track_ip_add(&mut self, ip: Ipv4Addr) {
