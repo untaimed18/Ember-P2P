@@ -1344,8 +1344,15 @@ async fn handle_udp_packet(
             return;
         }
     }
-    if state.flood_protection.check_rate_limit(from.ip()) {
-        info!("Rate limit exceeded for {from}, dropping packet");
+    let known_peer = match from.ip() {
+        std::net::IpAddr::V4(v4) => {
+            state.routing_table.all_contacts().any(|c| c.ip == v4)
+                || state.flood_protection.has_recent_ip(from.ip())
+        }
+        _ => state.flood_protection.has_recent_ip(from.ip()),
+    };
+    if state.flood_protection.check_rate_limit(from.ip(), known_peer) {
+        debug!("Rate limit exceeded for {from}, dropping packet");
         return;
     }
 

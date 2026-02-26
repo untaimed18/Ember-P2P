@@ -2,10 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
-const MAX_PACKETS_PER_SEC: u32 = 10;
+// eMule/KAD traffic is bursty (especially during bootstrap/lookups).
+// Keep flood protection, but allow realistic bursts from known peers.
+const MAX_PACKETS_PER_SEC_UNKNOWN: u32 = 60;
+const MAX_PACKETS_PER_SEC_KNOWN: u32 = 180;
 const TRACKER_EXPIRY_SECS: u64 = 30;
 /// Max outgoing packets per IP per second
-const MAX_OUTGOING_PER_IP_PER_SEC: u32 = 10;
+const MAX_OUTGOING_PER_IP_PER_SEC: u32 = 30;
 
 pub struct FloodProtection {
     ip_counters: HashMap<IpAddr, (u32, Instant)>,
@@ -25,9 +28,15 @@ impl FloodProtection {
     }
 
     /// Returns true if the packet should be dropped (rate exceeded).
-    pub fn check_rate_limit(&mut self, ip: IpAddr) -> bool {
+    /// Known/recent peers are allowed a higher burst budget.
+    pub fn check_rate_limit(&mut self, ip: IpAddr, known_peer: bool) -> bool {
         let now = Instant::now();
         let entry = self.ip_counters.entry(ip).or_insert((0, now));
+        let max_packets = if known_peer {
+            MAX_PACKETS_PER_SEC_KNOWN
+        } else {
+            MAX_PACKETS_PER_SEC_UNKNOWN
+        };
 
         if now.duration_since(entry.1).as_secs() >= 1 {
             entry.0 = 1;
@@ -35,7 +44,7 @@ impl FloodProtection {
             false
         } else {
             entry.0 += 1;
-            entry.0 > MAX_PACKETS_PER_SEC
+            entry.0 > max_packets
         }
     }
 
@@ -127,6 +136,15 @@ impl FloodProtection {
     fn has_recent_communication(&self, addr: &SocketAddr) -> bool {
         let now = Instant::now();
         let ip = addr.ip();
+        self.request_times.iter().any(|((tracked_addr, _), time)| {
+            tracked_addr.ip() == ip
+                && now.duration_since(*time).as_secs() < TRACKER_EXPIRY_SECS
+        })
+    }
+
+    /// Check if we've communicated with this IP recently.
+    pub fn has_recent_ip(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
         self.request_times.iter().any(|((tracked_addr, _), time)| {
             tracked_addr.ip() == ip
                 && now.duration_since(*time).as_secs() < TRACKER_EXPIRY_SECS
