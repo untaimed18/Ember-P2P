@@ -1818,9 +1818,32 @@ async fn handle_udp_packet(
             results,
         } => {
             info!(
-                "SearchRes from {} for target {}: {} results",
+                "SearchRes from {} for target {}: {} entries",
                 from, target, results.len()
             );
+            // Log first few entries with their tag details for debugging
+            for (i, entry) in results.iter().take(3).enumerate() {
+                let raw_md4 = kad_id_to_md4_bytes(&entry.id);
+                let mut sources_val = 0u32;
+                let mut has_name = false;
+                let mut src_ip = 0u32;
+                for tag in &entry.tags {
+                    if matches!(&tag.name, TagName::Id(TAG_SOURCES)) {
+                        sources_val = tag.uint32_value().unwrap_or(0);
+                    }
+                    if matches!(&tag.name, TagName::Id(TAG_FILENAME)) {
+                        has_name = true;
+                    }
+                    if matches!(&tag.name, TagName::Id(TAG_SOURCEIP)) {
+                        src_ip = tag.uint32_value().unwrap_or(0);
+                    }
+                }
+                debug!(
+                    "  Entry[{}]: hash={}, tags={}, TAG_SOURCES={}, has_name={}, src_ip={}",
+                    i, hex::encode(raw_md4), entry.tags.len(), sources_val, has_name, src_ip
+                );
+            }
+
             let search_ids: Vec<SearchId> = state
                 .search_manager
                 .active
@@ -1836,9 +1859,11 @@ async fn handle_udp_packet(
             for sid in search_ids {
                 if let Some(search) = state.search_manager.get_mut(&sid) {
                     search.handle_search_results(&sender_id, results.clone());
+                    let unique: std::collections::HashSet<&kad::types::KadId> =
+                        search.results.iter().map(|r| &r.id).collect();
                     info!(
-                        "  Search {} now has {} results total (phase={:?})",
-                        sid.0, search.results.len(), search.phase
+                        "  Search {} now has {} raw / {} unique results (phase={:?})",
+                        sid.0, search.results.len(), unique.len(), search.phase
                     );
                 }
             }
@@ -1972,7 +1997,24 @@ async fn handle_udp_packet(
                     let _ = socket.send_to(&packet, from).await;
                 }
             } else {
-                let load = state.dht_store.store_keyword_entries(&target, entries);
+                // Identify the sender by IP:port from the routing table
+                let sender_kad_id = {
+                    let v4 = match from.ip() {
+                        std::net::IpAddr::V4(v4) => v4,
+                        _ => Ipv4Addr::UNSPECIFIED,
+                    };
+                    state.routing_table.all_contacts()
+                        .find(|c| c.ip == v4 && c.udp_port == from.port())
+                        .map(|c| c.id)
+                        .unwrap_or_else(|| {
+                            let mut id = KadId::zero();
+                            let octets = v4.octets();
+                            id.0[0] = octets[0]; id.0[1] = octets[1];
+                            id.0[2] = octets[2]; id.0[3] = octets[3];
+                            id
+                        })
+                };
+                let load = state.dht_store.store_keyword_entries(&target, entries, &sender_kad_id);
                 let res = KadMessage::PublishRes { target, load };
                 if let Ok(packet) = messages::encode_packet(&res) {
                     let _ = socket.send_to(&packet, from).await;
@@ -2975,7 +3017,19 @@ fn convert_search_results(
         }
     }
 
-    dedup.into_values().collect()
+    let results: Vec<SearchResult> = dedup.into_values().collect();
+
+    // Log availability distribution for debugging
+    let with_multi_sources = results.iter().filter(|r| r.availability > 1).count();
+    if !results.is_empty() {
+        let max_avail = results.iter().map(|r| r.availability).max().unwrap_or(0);
+        info!(
+            "convert_search_results: {} unique files from {} raw entries, {} with >1 source, max availability={}",
+            results.len(), entries.len(), with_multi_sources, max_avail
+        );
+    }
+
+    results
 }
 
 fn extract_sources_from_results(

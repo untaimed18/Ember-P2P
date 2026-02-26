@@ -156,9 +156,13 @@ impl Ed2kDownload {
         write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
 
         // Read EmuleInfoAnswer (optional, some clients skip it)
-        let (proto, opcode, _payload) = read_packet_with_timeout(&mut reader).await?;
-        if proto == OP_EMULEPROT && opcode == OP_EMULEINFOANSWER {
+        let (proto2, opcode2, payload2) = read_packet_with_timeout(&mut reader).await?;
+        let mut deferred_packet: Option<(u8, u8, Vec<u8>)> = None;
+        if proto2 == OP_EMULEPROT && opcode2 == OP_EMULEINFOANSWER {
             debug!("Got EmuleInfoAnswer");
+        } else {
+            debug!("Peer skipped EmuleInfoAnswer (got proto=0x{proto2:02X} op=0x{opcode2:02X}), deferring");
+            deferred_packet = Some((proto2, opcode2, payload2));
         }
 
         // Send file request
@@ -171,7 +175,11 @@ impl Ed2kDownload {
         let mut available_parts: Vec<bool> = Vec::new();
 
         for _ in 0..5 {
-            let (proto, opcode, payload) = read_packet_with_timeout(&mut reader).await?;
+            let (proto, opcode, payload) = if let Some(pkt) = deferred_packet.take() {
+                pkt
+            } else {
+                read_packet_with_timeout(&mut reader).await?
+            };
 
             match (proto, opcode) {
                 (OP_EDONKEYHEADER, OP_FILESTATUS) => {

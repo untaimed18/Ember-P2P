@@ -18,6 +18,8 @@ pub struct StoredEntry {
     pub tags: Vec<KadTag>,
     pub stored_at: i64,
     pub ttl_secs: i64,
+    /// The KAD ID of the node that published this entry (used for dedup).
+    pub source_id: KadId,
 }
 
 impl StoredEntry {
@@ -56,8 +58,14 @@ impl DhtStore {
         d <= SEARCH_TOLERANCE
     }
 
-    pub fn store_keyword_entries(&mut self, target: &KadId, entries: Vec<PublishEntry>) -> u8 {
+    pub fn store_keyword_entries(
+        &mut self,
+        target: &KadId,
+        entries: Vec<PublishEntry>,
+        sender_id: &KadId,
+    ) -> u8 {
         let bucket = self.keyword_entries.entry(*target).or_default();
+        let now = chrono::Utc::now().timestamp();
 
         for entry in entries {
             if self.total_count >= MAX_TOTAL_ENTRIES {
@@ -66,16 +74,22 @@ impl DhtStore {
             if bucket.len() >= MAX_ENTRIES_PER_KEY {
                 break;
             }
-            if bucket.iter().any(|e| e.id == entry.id) {
-                continue;
+            // eMule indexes keyword entries by (fileHash, sourceID). Replace
+            // existing entry from the same source for the same file; keep
+            // entries from different sources (they carry distinct TAG_SOURCEIP).
+            if let Some(pos) = bucket.iter().position(|e| e.id == entry.id && e.source_id == *sender_id) {
+                bucket[pos].tags = entry.tags;
+                bucket[pos].stored_at = now;
+            } else {
+                bucket.push(StoredEntry {
+                    id: entry.id,
+                    tags: entry.tags,
+                    stored_at: now,
+                    ttl_secs: KEYWORD_TTL_SECS,
+                    source_id: *sender_id,
+                });
+                self.total_count += 1;
             }
-            bucket.push(StoredEntry {
-                id: entry.id,
-                tags: entry.tags,
-                stored_at: chrono::Utc::now().timestamp(),
-                ttl_secs: KEYWORD_TTL_SECS,
-            });
-            self.total_count += 1;
         }
 
         self.compute_load()
@@ -130,6 +144,7 @@ impl DhtStore {
             tags,
             stored_at: chrono::Utc::now().timestamp(),
             ttl_secs: SOURCE_TTL_SECS,
+            source_id: sender_id,
         });
         self.total_count += 1;
 
@@ -185,6 +200,7 @@ impl DhtStore {
             tags,
             stored_at: chrono::Utc::now().timestamp(),
             ttl_secs: NOTES_TTL_SECS,
+            source_id: sender_id,
         });
         self.total_count += 1;
 
