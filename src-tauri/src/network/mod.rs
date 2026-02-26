@@ -48,12 +48,6 @@ pub enum NetworkCommand {
         transfer_id: String,
         control: Arc<TransferControl>,
     },
-    GetPeers {
-        tx: oneshot::Sender<Vec<PeerInfo>>,
-    },
-    GetStats {
-        tx: oneshot::Sender<NetworkStats>,
-    },
     AnnounceFiles {
         files: Vec<FileInfo>,
     },
@@ -181,6 +175,8 @@ pub async fn start_network(
     db: Arc<Database>,
     transfer_manager: Arc<RwLock<TransferManager>>,
     bandwidth_limiter: Arc<BandwidthLimiter>,
+    shared_peers: Arc<RwLock<Vec<PeerInfo>>>,
+    shared_stats: Arc<RwLock<NetworkStats>>,
 ) -> anyhow::Result<()> {
     let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
         .map(|d| d.data_dir().to_path_buf())
@@ -475,6 +471,7 @@ pub async fn start_network(
     let mut flood_cleanup_timer = tokio::time::interval(std::time::Duration::from_secs(30));
     let mut source_retry_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut nodes_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
+    let mut cache_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(3));
 
     // Resume incomplete downloads from previous session
     if let Ok(incomplete) = db.get_incomplete_downloads() {
@@ -1259,6 +1256,57 @@ pub async fn start_network(
                 if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
                     error!("Failed periodic nodes.dat save: {e}");
                 }
+            }
+
+            // Refresh shared peer/stats caches for frontend reads (no channel needed)
+            _ = cache_refresh_timer.tick() => {
+                let banned_ids = db.banned_peer_ids().unwrap_or_default();
+                let peers: Vec<PeerInfo> = state
+                    .routing_table
+                    .all_contacts()
+                    .take(200)
+                    .filter(|c| !banned_ids.contains(&c.id.to_hex()))
+                    .map(|c| PeerInfo {
+                        id: c.id.to_hex(),
+                        addresses: vec![format!("{}:{}", c.ip, c.udp_port)],
+                        nickname: state.peer_nicknames.get(&c.id).cloned().unwrap_or_default(),
+                        last_seen: c.last_seen,
+                        files_shared: 0,
+                        banned: false,
+                    })
+                    .collect();
+                *shared_peers.write().await = peers;
+
+                state.stats.connected_peers = state.routing_table.len() as u32;
+                state.stats.upload_speed = bandwidth_limiter.smoothed_upload_speed();
+                state.stats.download_speed = bandwidth_limiter.smoothed_download_speed();
+                state.stats.total_uploaded = bandwidth_limiter.total_uploaded();
+                state.stats.total_downloaded = bandwidth_limiter.total_downloaded();
+                state.stats.upnp_mapped = state.upnp_mapped;
+                state.stats.buddy_status = match state.buddy_manager.state() {
+                    BuddyState::NoBuddy => {
+                        if let Some(bid) = state.buddy_manager.serving_for() {
+                            format!("serving:{}", bid)
+                        } else {
+                            "none".to_string()
+                        }
+                    }
+                    BuddyState::FindingBuddy => "searching".to_string(),
+                    BuddyState::Connected => {
+                        if let Some(bid) = state.buddy_manager.buddy_id() {
+                            format!("connected:{}", bid)
+                        } else {
+                            "connected".to_string()
+                        }
+                    }
+                };
+                state.stats.external_ip = state
+                    .external_ip
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_default();
+                state.firewalled = state.firewalled_shared.load(std::sync::atomic::Ordering::Relaxed);
+                state.stats.firewalled = state.firewalled;
+                *shared_stats.write().await = state.stats.clone();
             }
         }
     }
@@ -2496,59 +2544,6 @@ async fn handle_command(
                     info!("Started source search {} for download {}", sid.0, transfer_id);
                 }
             }
-        }
-
-        NetworkCommand::GetPeers { tx } => {
-            let banned_ids = db.banned_peer_ids().unwrap_or_default();
-            let peers: Vec<PeerInfo> = state
-                .routing_table
-                .all_contacts()
-                .take(200)
-                .filter(|c| !banned_ids.contains(&c.id.to_hex()))
-                .map(|c| PeerInfo {
-                    id: c.id.to_hex(),
-                    addresses: vec![format!("{}:{}", c.ip, c.udp_port)],
-                    nickname: state.peer_nicknames.get(&c.id).cloned().unwrap_or_default(),
-                    last_seen: c.last_seen,
-                    files_shared: 0,
-                    banned: false,
-                })
-                .collect();
-            let _ = tx.send(peers);
-        }
-
-        NetworkCommand::GetStats { tx } => {
-            state.stats.connected_peers = state.routing_table.len() as u32;
-            state.stats.upload_speed = bandwidth_limiter.smoothed_upload_speed();
-            state.stats.download_speed = bandwidth_limiter.smoothed_download_speed();
-            state.stats.total_uploaded = bandwidth_limiter.total_uploaded();
-            state.stats.total_downloaded = bandwidth_limiter.total_downloaded();
-            state.stats.upnp_mapped = state.upnp_mapped;
-            state.stats.buddy_status = match state.buddy_manager.state() {
-                BuddyState::NoBuddy => {
-                    if let Some(bid) = state.buddy_manager.serving_for() {
-                        format!("serving:{}", bid)
-                    } else {
-                        "none".to_string()
-                    }
-                }
-                BuddyState::FindingBuddy => "searching".to_string(),
-                BuddyState::Connected => {
-                    if let Some(bid) = state.buddy_manager.buddy_id() {
-                        format!("connected:{}", bid)
-                    } else {
-                        "connected".to_string()
-                    }
-                }
-            };
-            state.stats.external_ip = state
-                .external_ip
-                .map(|ip| ip.to_string())
-                .unwrap_or_default();
-            // Sync firewall status from shared atomic (updated by spawned detection tasks)
-            state.firewalled = state.firewalled_shared.load(std::sync::atomic::Ordering::Relaxed);
-            state.stats.firewalled = state.firewalled;
-            let _ = tx.send(state.stats.clone());
         }
 
         NetworkCommand::AnnounceFiles { files } => {

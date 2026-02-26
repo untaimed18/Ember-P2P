@@ -255,12 +255,6 @@ impl Database {
         Ok(result)
     }
 
-    pub fn clear_shared_files(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
-        conn.execute("DELETE FROM shared_files", [])?;
-        Ok(())
-    }
-
     pub fn remove_shared_file_by_hash(&self, hash: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         conn.execute("DELETE FROM shared_files WHERE hash = ?1", params![hash])?;

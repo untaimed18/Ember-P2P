@@ -7,6 +7,7 @@ use crate::search::index::LocalIndex;
 use crate::sharing::manager::TransferManager;
 use crate::storage::config::AppConfig;
 use crate::storage::database::Database;
+use crate::types::{NetworkStats, PeerInfo};
 
 pub struct AppState {
     pub network_tx: mpsc::Sender<NetworkCommand>,
@@ -17,4 +18,8 @@ pub struct AppState {
     pub transfer_manager: Arc<RwLock<TransferManager>>,
     /// Signaled by the network task after it finishes saving nodes.dat on shutdown.
     pub shutdown_complete: Arc<std::sync::atomic::AtomicBool>,
+    /// Cached peer list updated by the network loop — read directly by Tauri commands.
+    pub cached_peers: Arc<RwLock<Vec<PeerInfo>>>,
+    /// Cached network stats updated by the network loop — read directly by Tauri commands.
+    pub cached_stats: Arc<RwLock<NetworkStats>>,
 }

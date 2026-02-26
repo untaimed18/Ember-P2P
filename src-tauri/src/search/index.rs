@@ -38,12 +38,6 @@ impl LocalIndex {
         self.files.push(file);
     }
 
-    pub fn clear(&mut self) {
-        self.files.clear();
-        self.hash_map.clear();
-        self.name_tokens.clear();
-    }
-
     pub fn search(&self, query: &str) -> Vec<SearchResult> {
         let query_lower = query.to_lowercase();
         let query_tokens = tokenize(&query_lower);

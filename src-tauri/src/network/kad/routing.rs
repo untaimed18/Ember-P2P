@@ -86,10 +86,6 @@ impl RoutingTable {
         }
     }
 
-    pub fn local_id(&self) -> &KadId {
-        &self.local_id
-    }
-
     /// O(1) check if any contact in the table has this IP.
     pub fn has_contact_ip(&self, ip: Ipv4Addr) -> bool {
         self.global_ip_count.get(&ip).copied().unwrap_or(0) > 0
@@ -394,14 +390,6 @@ impl RoutingTable {
         self.len() == 0
     }
 
-    /// Get contacts from a specific bucket index.
-    pub fn get_bucket_contacts(&self, idx: usize) -> Vec<&KadContact> {
-        if idx >= NUM_BUCKETS {
-            return Vec::new();
-        }
-        self.buckets[idx].contacts.iter().collect()
-    }
-
     /// Return bucket indices that need a refresh (stale > 1h OR nearly empty < 20% full).
     pub fn stale_buckets(&self, now: i64) -> Vec<usize> {
         self.buckets
@@ -432,11 +420,6 @@ impl RoutingTable {
         if idx < NUM_BUCKETS {
             self.buckets[idx].last_refresh = chrono::Utc::now().timestamp();
         }
-    }
-
-    /// Get a flat list of all contacts (for persistence).
-    pub fn export_contacts(&self) -> Vec<KadContact> {
-        self.all_contacts().cloned().collect()
     }
 
     /// Select up to `max_count` contacts for bootstrap persistence, preferring

@@ -75,6 +75,11 @@ pub fn run() {
             let shutdown_complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let shutdown_complete_net = shutdown_complete.clone();
 
+            let cached_peers: Arc<RwLock<Vec<crate::types::PeerInfo>>> = Arc::new(RwLock::new(Vec::new()));
+            let cached_stats: Arc<RwLock<crate::types::NetworkStats>> = Arc::new(RwLock::new(crate::types::NetworkStats::default()));
+            let cached_peers_net = cached_peers.clone();
+            let cached_stats_net = cached_stats.clone();
+
             app.manage(AppState {
                 network_tx,
                 db: db.clone(),
@@ -83,6 +88,8 @@ pub fn run() {
                 bandwidth_limiter: bandwidth_limiter.clone(),
                 transfer_manager: transfer_manager.clone(),
                 shutdown_complete,
+                cached_peers,
+                cached_stats,
             });
 
             let index_clone = local_index.clone();
@@ -136,6 +143,8 @@ pub fn run() {
                     net_db,
                     net_transfers,
                     net_bw,
+                    cached_peers_net,
+                    cached_stats_net,
                 )
                 .await
                 {

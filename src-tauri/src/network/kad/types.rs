@@ -304,10 +304,6 @@ impl KadContact {
         Ok(())
     }
 
-    pub fn addr_string(&self) -> String {
-        format!("{}:{}", self.ip, self.udp_port)
-    }
-
     pub fn is_udp_firewalled(&self) -> bool {
         self.kad_options & 0x01 != 0
     }

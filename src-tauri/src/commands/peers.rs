@@ -1,43 +1,21 @@
-use tokio::sync::oneshot;
-
 use crate::app_state::AppState;
 use crate::network::NetworkCommand;
 use crate::types::*;
-
-const CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[tauri::command]
 pub async fn get_peers(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<PeerInfo>, String> {
-    let (tx, rx) = oneshot::channel();
-
-    state
-        .network_tx
-        .try_send(NetworkCommand::GetPeers { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-
-    tokio::time::timeout(CMD_TIMEOUT, rx)
-        .await
-        .map_err(|_| "Network not responding (timeout)".to_string())?
-        .map_err(|e| format!("Failed to receive peers: {e}"))
+    let peers = state.cached_peers.read().await;
+    Ok(peers.clone())
 }
 
 #[tauri::command]
 pub async fn get_network_stats(
     state: tauri::State<'_, AppState>,
 ) -> Result<NetworkStats, String> {
-    let (tx, rx) = oneshot::channel();
-
-    state
-        .network_tx
-        .try_send(NetworkCommand::GetStats { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-
-    tokio::time::timeout(CMD_TIMEOUT, rx)
-        .await
-        .map_err(|_| "Network not responding (timeout)".to_string())?
-        .map_err(|e| format!("Failed to receive stats: {e}"))
+    let stats = state.cached_stats.read().await;
+    Ok(stats.clone())
 }
 
 #[tauri::command]
@@ -56,10 +34,9 @@ pub async fn ban_peer(
 
     let _ = state
         .network_tx
-        .send(NetworkCommand::BanPeer {
+        .try_send(NetworkCommand::BanPeer {
             peer_id_hex: peer_id,
-        })
-        .await;
+        });
 
     Ok(())
 }
@@ -80,10 +57,9 @@ pub async fn unban_peer(
 
     let _ = state
         .network_tx
-        .send(NetworkCommand::UnbanPeer {
+        .try_send(NetworkCommand::UnbanPeer {
             peer_id_hex: peer_id,
-        })
-        .await;
+        });
 
     Ok(())
 }
