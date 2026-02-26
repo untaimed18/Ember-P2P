@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 pub const KAD_ID_SIZE: usize = 16;
 pub const KADEMLIA_VERSION: u8 = 0x09;
-pub const K_BUCKET_SIZE: usize = 20;
+pub const K_BUCKET_SIZE: usize = 10;
 pub const ALPHA: usize = 3;
 pub const DEFAULT_TCP_PORT: u16 = 4662;
 pub const DEFAULT_UDP_PORT: u16 = 4672;
@@ -245,13 +245,16 @@ impl KadContact {
 
     /// Called when probing an unresponsive contact. Increments type (eMule CheckingType).
     /// Returns true if the contact is now dead (type 4).
+    /// eMule has a 10-second guard: if called within 10s of last type set, or already
+    /// dead, does nothing.
     pub fn checking_type(&mut self) -> bool {
         let now = chrono::Utc::now().timestamp();
-        if self.contact_type < CONTACT_TYPE_DEAD {
-            self.contact_type += 1;
+        if now - self.last_type_set < 10 || self.contact_type >= CONTACT_TYPE_DEAD {
+            return self.contact_type >= CONTACT_TYPE_DEAD;
         }
-        self.expires_at = now + EXPIRE_CHECKING_SECS;
         self.last_type_set = now;
+        self.expires_at = now + EXPIRE_CHECKING_SECS;
+        self.contact_type += 1;
         self.contact_type >= CONTACT_TYPE_DEAD
     }
 

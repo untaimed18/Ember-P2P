@@ -29,7 +29,7 @@ use self::kad::obfuscation;
 use self::kad::protection::FloodProtection;
 use self::kad::publish::{PublishManager, PublishableFile, md4_bytes_to_kad_id, kad_id_to_md4_bytes};
 use self::kad::routing::RoutingTable;
-use self::kad::search::{SearchId, SearchManager, SearchType};
+use self::kad::search::{SearchId, SearchManager, SearchType, SEARCH_INITIAL_CONTACTS};
 use self::kad::store::DhtStore;
 use self::kad::types::*;
 
@@ -857,7 +857,7 @@ pub async fn start_network(
                 // Self-lookup: once we have some contacts, do a FindNode for our own ID
                 // This is the primary mechanism eMule uses to populate the routing table
                 if !state.self_lookup_done && table_size >= 2 {
-                    let closest = state.routing_table.find_closest(&state.local_id, K_BUCKET_SIZE);
+                    let closest = state.routing_table.find_closest(&state.local_id, SEARCH_INITIAL_CONTACTS);
                     if !closest.is_empty() {
                         let sid = state.search_manager.start_search(
                             state.local_id,
@@ -905,7 +905,7 @@ pub async fn start_network(
                     // contacts in different parts of the ID space
                     if table_size >= 10 {
                         let random_target = KadId::random();
-                        let closest = state.routing_table.find_closest(&random_target, K_BUCKET_SIZE);
+                        let closest = state.routing_table.find_closest(&random_target, SEARCH_INITIAL_CONTACTS);
                         if !closest.is_empty() {
                             let _sid = state.search_manager.start_search(
                                 random_target,
@@ -937,7 +937,7 @@ pub async fn start_network(
                     .into_iter().take(MAX_SOURCE_PUBLISHES_PER_CYCLE).cloned().collect::<Vec<_>>();
                 for file in &source_files {
                     let msg = state.publish_manager.build_source_publish(file);
-                    let closest = state.routing_table.find_closest_prefer_verified(&file.file_hash, K_BUCKET_SIZE);
+                    let closest = state.routing_table.find_closest_prefer_verified(&file.file_hash, SEARCH_INITIAL_CONTACTS);
                     if !closest.is_empty() {
                         // Use iterative search to find truly closest nodes before publishing
                         let sid = state.search_manager.start_search(
@@ -957,7 +957,7 @@ pub async fn start_network(
                     // Use StoreKeyword search to find truly closest nodes, then publish
                     if !publishes.is_empty() {
                         let first_kw_hash = publishes[0].0;
-                        let closest = state.routing_table.find_closest_prefer_verified(&first_kw_hash, K_BUCKET_SIZE);
+                        let closest = state.routing_table.find_closest_prefer_verified(&first_kw_hash, SEARCH_INITIAL_CONTACTS);
                         if !closest.is_empty() {
                             let sid = state.search_manager.start_search(
                                 first_kw_hash,
@@ -1008,7 +1008,7 @@ pub async fn start_network(
                 for bucket_idx in &stale {
                     let bucket_idx = *bucket_idx;
                     let target = state.routing_table.random_id_in_bucket(bucket_idx);
-                    let closest = state.routing_table.find_closest(&target, K_BUCKET_SIZE);
+                    let closest = state.routing_table.find_closest(&target, SEARCH_INITIAL_CONTACTS);
                     if !closest.is_empty() {
                         state.search_manager.start_search(
                             target,
@@ -1027,7 +1027,7 @@ pub async fn start_network(
                         continue;
                     }
                     let target = state.routing_table.random_id_in_bucket(bucket_idx);
-                    let closest = state.routing_table.find_closest(&target, K_BUCKET_SIZE);
+                    let closest = state.routing_table.find_closest(&target, SEARCH_INITIAL_CONTACTS);
                     if !closest.is_empty() {
                         state.search_manager.start_search(
                             target,
@@ -1113,7 +1113,7 @@ pub async fn start_network(
                     let target = state.buddy_manager.find_buddy_target();
                     let local = *state.buddy_manager.local_id();
                     let local_tcp = state.buddy_manager.tcp_port();
-                    let closest = state.routing_table.find_closest(&target, K_BUCKET_SIZE);
+                    let closest = state.routing_table.find_closest(&target, SEARCH_INITIAL_CONTACTS);
                     if !closest.is_empty() {
                         let _sid = state.search_manager.start_search(
                             target,
@@ -1198,7 +1198,7 @@ pub async fn start_network(
                             _ => continue,
                         };
                         let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
-                        let closest = state.routing_table.find_closest(&kad_hash, K_BUCKET_SIZE);
+                        let closest = state.routing_table.find_closest(&kad_hash, SEARCH_INITIAL_CONTACTS);
                         if closest.is_empty() {
                             continue;
                         }
@@ -1489,7 +1489,7 @@ async fn handle_udp_packet(
 
             // Trigger self-lookup as soon as we have contacts from first bootstrap
             if !state.self_lookup_done && table_size >= 2 {
-                let closest = state.routing_table.find_closest(&state.local_id, K_BUCKET_SIZE);
+                let closest = state.routing_table.find_closest(&state.local_id, SEARCH_INITIAL_CONTACTS);
                 if !closest.is_empty() {
                     let sid = state.search_manager.start_search(
                         state.local_id,
@@ -1680,18 +1680,27 @@ async fn handle_udp_packet(
         }
 
         KadMessage::KadReq {
-            search_type: _,
+            search_type,
             target,
             receiver: _,
         } => {
-            // Respond with our closest contacts to the target
-            let closest = state.routing_table.find_closest(&target, K_BUCKET_SIZE);
-            let res = KadMessage::KadRes {
-                target,
-                contacts: closest,
-            };
-            if let Ok(packet) = messages::encode_packet(&res) {
-                let _ = socket.send_to(&packet, from).await;
+            // eMule Process_KADEMLIA2_REQ: the search_type byte (masked 0x1F) doubles
+            // as the number of contacts to return. GetClosestTo(maxType=2, ..., count=byType)
+            // only returns verified contacts with type <= 2 (ACTIVE/VERIFIED/OPEN).
+            let requested_count = (search_type & 0x1F) as usize;
+            if requested_count == 0 {
+                debug!("KadReq from {from}: search_type 0 is invalid, ignoring");
+            } else {
+                let closest = state
+                    .routing_table
+                    .find_closest_verified_by_type(&target, requested_count, 2);
+                let res = KadMessage::KadRes {
+                    target,
+                    contacts: closest,
+                };
+                if let Ok(packet) = messages::encode_packet(&res) {
+                    let _ = socket.send_to(&packet, from).await;
+                }
             }
         }
 
@@ -1745,11 +1754,43 @@ async fn handle_udp_packet(
                 if let (Some(search), Some(sender_id)) =
                     (state.search_manager.get_mut(&sid), sender_id)
                 {
-                    // Filter out contacts with blocked/banned IPs before processing
+                    // eMule ProcessResponse: validate contacts
+                    // - No blocked/banned IPs
+                    // - No duplicate IPs (including sender IP)
+                    // - No more than 2 IPs from same /24 subnet
+                    let sender_ip = match from.ip() {
+                        std::net::IpAddr::V4(v4) => v4,
+                        _ => Ipv4Addr::UNSPECIFIED,
+                    };
+                    let mut seen_ips: HashSet<Ipv4Addr> = HashSet::new();
+                    seen_ips.insert(sender_ip);
+                    let mut subnet_counts: HashMap<u32, u32> = HashMap::new();
+                    let sender_subnet = {
+                        let o = sender_ip.octets();
+                        u32::from_be_bytes([o[0], o[1], o[2], 0])
+                    };
+                    *subnet_counts.entry(sender_subnet).or_insert(0) += 1;
+
                     let safe_contacts: Vec<KadContact> = contacts.iter()
                         .filter(|c| {
-                            !state.ip_filter.is_blocked_readonly(c.ip)
-                                && !state.banned_ips.contains(&c.ip)
+                            if state.ip_filter.is_blocked_readonly(c.ip)
+                                || state.banned_ips.contains(&c.ip)
+                            {
+                                return false;
+                            }
+                            if !seen_ips.insert(c.ip) {
+                                debug!("KadRes: duplicate IP {} in response, ignoring", c.ip);
+                                return false;
+                            }
+                            let o = c.ip.octets();
+                            let subnet = u32::from_be_bytes([o[0], o[1], o[2], 0]);
+                            let count = subnet_counts.entry(subnet).or_insert(0);
+                            *count += 1;
+                            if *count > 2 {
+                                debug!("KadRes: >2 contacts from subnet {}.{}.{}.0, ignoring {}", o[0], o[1], o[2], c.ip);
+                                return false;
+                            }
+                            true
                         })
                         .cloned()
                         .collect();
@@ -2220,7 +2261,7 @@ async fn handle_command(
 
             let closest = state
                 .routing_table
-                .find_closest_prefer_verified(&keyword_hash, K_BUCKET_SIZE);
+                .find_closest_prefer_verified(&keyword_hash, SEARCH_INITIAL_CONTACTS);
 
             if closest.is_empty() {
                 let _ = tx.send(local_results);
@@ -2300,7 +2341,7 @@ async fn handle_command(
                 };
                 let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
 
-                let mut closest = state.routing_table.find_closest_prefer_verified(&kad_hash, K_BUCKET_SIZE);
+                let mut closest = state.routing_table.find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
                 if closest.is_empty() {
                     warn!("No routing table contacts for source search, download will retry later");
                 }
@@ -2424,7 +2465,7 @@ async fn handle_command(
         NetworkCommand::PublishNote { file_hash, rating, comment } => {
             let closest = state
                 .routing_table
-                .find_closest_prefer_verified(&file_hash, K_BUCKET_SIZE);
+                .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
 
             if closest.is_empty() {
                 warn!("No contacts to publish note to");
@@ -2510,7 +2551,7 @@ async fn handle_command(
         NetworkCommand::FindNotes { file_hash, file_size, tx } => {
             let closest = state
                 .routing_table
-                .find_closest_prefer_verified(&file_hash, K_BUCKET_SIZE);
+                .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
 
             if closest.is_empty() {
                 let _ = tx.send(Vec::new());
@@ -2528,7 +2569,7 @@ async fn handle_command(
         NetworkCommand::FindSources { file_hash, file_size, tx } => {
             let closest = state
                 .routing_table
-                .find_closest_prefer_verified(&file_hash, K_BUCKET_SIZE);
+                .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
 
             if closest.is_empty() {
                 let _ = tx.send(Vec::new());

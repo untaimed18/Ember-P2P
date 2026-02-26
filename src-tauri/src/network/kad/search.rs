@@ -11,8 +11,11 @@ const PENDING_TIMEOUT_SECS: i64 = 5;
 const LOOKUP_CONVERGE_COUNT: usize = 2;
 const LOOKUP_MIN_QUERIES: usize = 10;
 
+/// eMule seeds searches with 50 contacts (Search.cpp Go() -> GetClosestTo(..., 50, ...))
+pub const SEARCH_INITIAL_CONTACTS: usize = 50;
+
 // Per-type timeouts matching eMule
-const TIMEOUT_FIND_NODE: i64 = 60;
+const TIMEOUT_FIND_NODE: i64 = 45;
 const TIMEOUT_KEYWORD: i64 = 45;
 const TIMEOUT_SOURCE: i64 = 45;
 const TIMEOUT_NOTES: i64 = 45;
@@ -266,7 +269,7 @@ impl SearchState {
         let enough_queried = self.queried.len() >= LOOKUP_MIN_QUERIES
             && self.lookup_stale_rounds >= LOOKUP_CONVERGE_COUNT;
 
-        let max_lookup_reached = self.queried.len() >= K_BUCKET_SIZE;
+        let max_lookup_reached = self.queried.len() >= SEARCH_INITIAL_CONTACTS;
 
         if all_queried || enough_queried || max_lookup_reached {
             info!(
@@ -288,7 +291,7 @@ impl SearchState {
             let db = target.xor_distance(&b.id);
             da.cmp(&db)
         });
-        self.closest.truncate(K_BUCKET_SIZE);
+        self.closest.truncate(SEARCH_INITIAL_CONTACTS);
 
         // Update prev_closest_distance for convergence tracking
         self.prev_closest_distance = self

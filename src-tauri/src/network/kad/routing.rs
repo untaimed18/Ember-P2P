@@ -252,6 +252,28 @@ impl RoutingTable {
         verified
     }
 
+    /// Get only verified contacts with type <= max_type, closest to a target.
+    /// This matches eMule's GetClosestTo(uMaxType, target, distance, count, ...) which
+    /// requires IsIpVerified() && GetType() <= uMaxType.
+    pub fn find_closest_verified_by_type(
+        &self,
+        target: &KadId,
+        count: usize,
+        max_type: u8,
+    ) -> Vec<KadContact> {
+        let mut all: Vec<(KadId, &KadContact)> = self
+            .all_contacts()
+            .filter(|c| c.verified && c.contact_type <= max_type)
+            .map(|c| (target.xor_distance(&c.id), c))
+            .collect();
+
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        all.into_iter()
+            .take(count)
+            .map(|(_, c)| c.clone())
+            .collect()
+    }
+
     /// Get only verified contacts closest to a target.
     pub fn find_closest_verified(&self, target: &KadId, count: usize) -> Vec<KadContact> {
         let mut all: Vec<(KadId, &KadContact)> = self
@@ -465,9 +487,12 @@ impl RoutingTable {
         removed
     }
 
-    /// SmallTimer: for each bucket, find the oldest contact (front) whose expires_at
-    /// has passed. Returns a list of (bucket_idx, contact) pairs to probe with HELLO_REQ.
-    /// Contacts that are dead (type 4) and expired are auto-removed.
+    /// SmallTimer (matching eMule OnSmallTimer):
+    /// 1. Remove dead+expired contacts from all entries
+    /// 2. Set expires_at = now for contacts with expires_at == 0 (eMule behavior)
+    /// 3. Check oldest contact in each bucket:
+    ///    - If expired >= now or type == 4: push to bottom (rotate)
+    ///    - Otherwise: call checking_type() and return for HELLO_REQ probing
     pub fn get_contacts_to_probe(&mut self) -> Vec<(usize, KadContact)> {
         let now = chrono::Utc::now().timestamp();
         let mut to_probe = Vec::new();
@@ -478,37 +503,38 @@ impl RoutingTable {
                 continue;
             }
 
-            // Check the oldest contact (front of deque)
-            let should_probe = if let Some(oldest) = bucket.contacts.front() {
-                if oldest.is_dead() && oldest.expires_at > 0 && now > oldest.expires_at {
-                    // Dead and expired -- remove it
-                    None
-                } else if oldest.expires_at > 0 && now > oldest.expires_at {
-                    // Expired but not yet dead -- probe it
-                    Some(oldest.clone())
-                } else {
-                    // Not expired -- push to bottom (rotate)
-                    None
+            // Step 1+2: Remove dead+expired, set expires_at for contacts with 0
+            let mut dead_ips = Vec::new();
+            bucket.contacts.retain_mut(|c| {
+                if c.is_dead() && c.expires_at > 0 && now > c.expires_at {
+                    dead_ips.push(c.ip);
+                    return false;
+                }
+                if c.expires_at == 0 {
+                    c.expires_at = now;
+                }
+                true
+            });
+            ips_removed.extend(dead_ips);
+
+            if bucket.contacts.is_empty() {
+                continue;
+            }
+
+            // Step 3: Check the oldest contact (front of deque)
+            let oldest = bucket.contacts.front().unwrap();
+            if oldest.expires_at >= now || oldest.contact_type >= CONTACT_TYPE_DEAD {
+                // Not expired yet or dead — push to bottom (rotate)
+                if let Some(c) = bucket.contacts.pop_front() {
+                    bucket.contacts.push_back(c);
                 }
             } else {
-                None
-            };
-
-            if let Some(contact) = should_probe {
-                // Call checking_type on the contact
+                // Expired but not dead — probe it
+                let contact_clone = oldest.clone();
                 if let Some(front) = bucket.contacts.front_mut() {
-                    let is_dead = front.checking_type();
-                    if is_dead {
-                        // Will be cleaned up by remove_dead_contacts
-                    }
+                    front.checking_type();
                 }
-                to_probe.push((bucket_idx, contact));
-            } else if let Some(front) = bucket.contacts.front() {
-                if front.is_dead() && front.expires_at > 0 && now > front.expires_at {
-                    let removed_ip = front.ip;
-                    bucket.contacts.pop_front();
-                    ips_removed.push(removed_ip);
-                }
+                to_probe.push((bucket_idx, contact_clone));
             }
         }
 

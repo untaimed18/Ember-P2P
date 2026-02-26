@@ -334,7 +334,7 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
         KADEMLIA2_RES => {
             let target = KadId::read_from(cursor)?;
             let count = cursor.read_u8()? as usize;
-            let capped = count.min(K_BUCKET_SIZE + 1); // eMule caps at K+1=11
+            let capped = count.min(0x1F); // eMule: byType & 0x1F, max 31 contacts
             let mut contacts = Vec::with_capacity(capped);
             for _ in 0..capped {
                 match KadContact::read_from(cursor) {
@@ -533,8 +533,9 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
         KADEMLIA_RES_OLD => {
             let target = KadId::read_from(cursor)?;
             let count = cursor.read_u8()? as usize;
-            let mut contacts = Vec::with_capacity(count.min(K_BUCKET_SIZE));
-            for _ in 0..count.min(K_BUCKET_SIZE) {
+            let capped = count.min(0x1F);
+            let mut contacts = Vec::with_capacity(capped);
+            for _ in 0..capped {
                 match KadContact::read_from(cursor) {
                     Ok(c) => contacts.push(c),
                     Err(_) => break,
