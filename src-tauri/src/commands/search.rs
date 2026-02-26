@@ -79,6 +79,10 @@ pub async fn publish_note(
     rating: u8,
     comment: String,
 ) -> Result<(), String> {
+    if rating > 5 {
+        return Err("Rating must be between 0 and 5".into());
+    }
+
     let raw_bytes = hex::decode(&file_hash)
         .map_err(|e| format!("Invalid hash: {e}"))?;
     let kad_hash = md4_bytes_to_kad_id(&raw_bytes);
@@ -98,8 +102,11 @@ pub async fn publish_note(
 
 /// Compute the ed2k hash of raw bytes (for in-memory content)
 #[tauri::command]
-pub fn compute_ed2k_hash(data: Vec<u8>) -> String {
-    hash::ed2k_hash_bytes(&data)
+pub fn compute_ed2k_hash(data: Vec<u8>) -> Result<String, String> {
+    if data.len() > 100 * 1024 * 1024 {
+        return Err("Input too large (max 100MB)".into());
+    }
+    Ok(hash::ed2k_hash_bytes(&data))
 }
 
 #[tauri::command]

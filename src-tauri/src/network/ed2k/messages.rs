@@ -298,6 +298,77 @@ pub fn parse_hashset_answer(payload: &[u8]) -> io::Result<([u8; 16], Vec<[u8; 16
     Ok((hash, hashes))
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PeerCapabilities {
+    pub user_hash: [u8; 16],
+    pub client_id: u32,
+    pub tcp_port: u16,
+    pub nickname: String,
+    pub version: u32,
+    pub udp_port: u16,
+    pub supports_compression: bool,
+    pub supports_large_files: bool,
+    pub supports_source_exchange2: bool,
+}
+
+pub fn parse_hello_answer(payload: &[u8]) -> io::Result<PeerCapabilities> {
+    if payload.len() < 27 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "HelloAnswer too short"));
+    }
+    let mut cursor = Cursor::new(payload);
+    let mut caps = PeerCapabilities::default();
+
+    let hash_size = cursor.read_u8()?;
+    if hash_size != 16 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected hash size"));
+    }
+    cursor.read_exact(&mut caps.user_hash)?;
+    caps.client_id = cursor.read_u32::<LittleEndian>()?;
+    caps.tcp_port = cursor.read_u16::<LittleEndian>()?;
+
+    let tag_count = cursor.read_u32::<LittleEndian>()?;
+    for _ in 0..tag_count.min(50) {
+        if cursor.position() as usize >= payload.len() {
+            break;
+        }
+        match parse_single_tag(&mut cursor) {
+            Ok((name_byte, value)) => {
+                match name_byte {
+                    0x01 => { if let Ed2kTagValue::String(s) = value { caps.nickname = s; } }
+                    0x11 => { if let Ed2kTagValue::Uint32(v) = value { caps.version = v; } }
+                    _ => {}
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    Ok(caps)
+}
+
+fn parse_single_tag(cursor: &mut Cursor<&[u8]>) -> io::Result<(u8, Ed2kTagValue)> {
+    let tag_type = cursor.read_u8()?;
+    let name_len = cursor.read_u16::<LittleEndian>()? as usize;
+    let mut name_buf = vec![0u8; name_len];
+    cursor.read_exact(&mut name_buf)?;
+    let name_byte = if name_len == 1 { name_buf[0] } else { 0 };
+
+    let value = match tag_type {
+        0x02 => {
+            let str_len = cursor.read_u16::<LittleEndian>()? as usize;
+            let mut str_buf = vec![0u8; str_len];
+            cursor.read_exact(&mut str_buf)?;
+            Ed2kTagValue::String(String::from_utf8_lossy(&str_buf).to_string())
+        }
+        0x03 => Ed2kTagValue::Uint32(cursor.read_u32::<LittleEndian>()?),
+        0x08 => Ed2kTagValue::Uint16(cursor.read_u16::<LittleEndian>()?),
+        0x09 => Ed2kTagValue::Uint8(cursor.read_u8()?),
+        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unknown tag type: {tag_type}"))),
+    };
+
+    Ok((name_byte, value))
+}
+
 /// Parse a FileStatus response.
 pub fn parse_file_status(payload: &[u8]) -> io::Result<([u8; 16], Vec<bool>)> {
     if payload.len() < 18 {

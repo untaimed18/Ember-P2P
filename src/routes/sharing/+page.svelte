@@ -28,7 +28,10 @@
     }
   }
 
+  let error: string | null = $state(null);
+
   async function handleAddFolder() {
+    error = null;
     try {
       const { open } = await import('@tauri-apps/plugin-dialog');
       const selected = await open({ directory: true, multiple: false });
@@ -37,18 +40,27 @@
         await addSharedFolder(selected as string);
         await refresh();
       }
-    } catch (e) {
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to add folder';
+      error = msg;
       console.error('Failed to add folder:', e);
+    } finally {
+      loading = false;
     }
   }
 
   async function handleRemoveFolder(path: string) {
+    error = null;
     try {
       loading = true;
       await removeSharedFolder(path);
       await refresh();
-    } catch (e) {
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to remove folder';
+      error = msg;
       console.error('Failed to remove folder:', e);
+    } finally {
+      loading = false;
     }
   }
 </script>
@@ -59,6 +71,12 @@
 </div>
 
 <div class="page-content">
+  {#if error}
+    <div class="error-banner">
+      <span>{error}</span>
+      <button class="ghost" onclick={() => error = null}>Dismiss</button>
+    </div>
+  {/if}
   {#if folders.length > 0}
     <div class="folders-section">
       <div class="section-title">Shared Folders</div>
@@ -141,5 +159,16 @@
   .sub {
     font-size: 13px;
     color: var(--text-muted);
+  }
+
+  .error-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 20px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--danger, #e74c3c);
+    color: var(--danger, #e74c3c);
+    font-size: 13px;
   }
 </style>

@@ -27,23 +27,23 @@ impl TransferControl {
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+        self.cancelled.store(true, Ordering::Release);
     }
 
     pub fn pause(&self) {
-        self.paused.store(true, Ordering::Relaxed);
+        self.paused.store(true, Ordering::Release);
     }
 
     pub fn resume(&self) {
-        self.paused.store(false, Ordering::Relaxed);
+        self.paused.store(false, Ordering::Release);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+        self.cancelled.load(Ordering::Acquire)
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed)
+        self.paused.load(Ordering::Acquire)
     }
 }
 
@@ -103,27 +103,36 @@ impl TransferManager {
         }
     }
 
-    pub fn complete(&mut self, id: &str) {
+    pub fn complete(&mut self, id: &str) -> Vec<Transfer> {
         if let Some(mut transfer) = self.active.remove(id) {
             transfer.status = TransferStatus::Completed;
             transfer.progress = 100.0;
             transfer.speed = 0;
             self.completed.push(transfer);
+            if self.completed.len() > 1000 {
+                self.completed.drain(..self.completed.len() - 1000);
+            }
             self.last_progress.remove(id);
             self.controls.remove(id);
-            self.promote_next();
+            return self.promote_next();
         }
+        Vec::new()
     }
 
-    pub fn fail(&mut self, id: &str, _reason: &str) {
+    pub fn fail(&mut self, id: &str, reason: &str) -> Vec<Transfer> {
         if let Some(mut transfer) = self.active.remove(id) {
             transfer.status = TransferStatus::Failed;
             transfer.speed = 0;
+            transfer.failure_reason = Some(reason.to_string());
             self.completed.push(transfer);
+            if self.completed.len() > 1000 {
+                self.completed.drain(..self.completed.len() - 1000);
+            }
             self.last_progress.remove(id);
             self.controls.remove(id);
-            self.promote_next();
+            return self.promote_next();
         }
+        Vec::new()
     }
 
     pub fn update_status(&mut self, id: &str, status: TransferStatus) {
@@ -153,7 +162,7 @@ impl TransferManager {
         }
     }
 
-    pub fn cancel(&mut self, id: &str) {
+    pub fn cancel(&mut self, id: &str) -> Vec<Transfer> {
         if let Some(control) = self.controls.get(id) {
             control.cancel();
         }
@@ -161,7 +170,7 @@ impl TransferManager {
         self.queue.retain(|t| t.id != id);
         self.controls.remove(id);
         self.last_progress.remove(id);
-        self.promote_next();
+        self.promote_next()
     }
 
     pub fn get_all(&self) -> Vec<Transfer> {
@@ -171,14 +180,18 @@ impl TransferManager {
         all
     }
 
-    fn promote_next(&mut self) {
+    fn promote_next(&mut self) -> Vec<Transfer> {
+        let mut promoted = Vec::new();
         while self.active.len() < self.max_concurrent as usize {
             if let Some(mut transfer) = self.queue.pop_front() {
                 transfer.status = TransferStatus::Active;
+                let t = transfer.clone();
                 self.active.insert(transfer.id.clone(), transfer);
+                promoted.push(t);
             } else {
                 break;
             }
         }
+        promoted
     }
 }

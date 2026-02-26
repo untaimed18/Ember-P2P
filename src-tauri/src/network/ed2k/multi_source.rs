@@ -40,6 +40,7 @@ pub struct MultiSourceDownload {
     pub tcp_port: u16,
     pub udp_port: u16,
     pub bandwidth_limiter: Arc<BandwidthLimiter>,
+    pub control: Arc<TransferControl>,
 }
 
 impl MultiSourceDownload {
@@ -55,6 +56,10 @@ impl MultiSourceDownload {
                 self.file_size,
                 MAX_DOWNLOAD_FILE_SIZE
             );
+        }
+
+        if self.control.is_cancelled() {
+            anyhow::bail!("cancelled by user");
         }
 
         if self.sources.len() == 1 {
@@ -113,6 +118,10 @@ impl MultiSourceDownload {
         let mut part_idx = 0;
 
         for p in 0..part_count {
+            if self.control.is_cancelled() {
+                anyhow::bail!("cancelled by user");
+            }
+
             let t = tracker.read().await;
             if t.is_part_complete(p) {
                 continue;
@@ -225,6 +234,10 @@ impl MultiSourceDownload {
         // Retry incomplete parts (from failed sources or hash mismatches)
         const MAX_RETRY_ROUNDS: usize = 3;
         for retry_round in 1..=MAX_RETRY_ROUNDS {
+            if self.control.is_cancelled() {
+                anyhow::bail!("cancelled by user");
+            }
+
             let incomplete: Vec<usize> = {
                 let t = tracker.read().await;
                 (0..t.part_count)

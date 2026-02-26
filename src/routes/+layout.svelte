@@ -2,9 +2,9 @@
   import '../app.css';
   import Sidebar from '$lib/components/Sidebar.svelte';
   import StatusBar from '$lib/components/StatusBar.svelte';
-  import { initNetworkStore, startStatsPoll } from '$lib/stores/network';
-  import { initTransferStore } from '$lib/stores/transfers';
-  import { initSearchStore } from '$lib/stores/search';
+  import { initNetworkStore, cleanupNetworkStore, startStatsPoll } from '$lib/stores/network';
+  import { initTransferStore, cleanupTransferStore } from '$lib/stores/transfers';
+  import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { onMount } from 'svelte';
 
   let { children } = $props();
@@ -15,7 +15,12 @@
     initSearchStore();
 
     const stopPoll = startStatsPoll();
-    return () => stopPoll();
+    return () => {
+      stopPoll();
+      cleanupNetworkStore();
+      cleanupTransferStore();
+      cleanupSearchStore();
+    };
   });
 </script>
 

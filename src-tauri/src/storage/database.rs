@@ -44,8 +44,17 @@ impl Database {
     }
 
     fn run_migrations(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
 
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL DEFAULT 0);")?;
+        let version: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+        if version < 1 {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS shared_files (
@@ -96,6 +105,9 @@ impl Database {
         // Add columns that may be missing from older schema versions
         Self::add_column_if_missing(&conn, "shared_files", "aich_hash", "TEXT NOT NULL DEFAULT ''");
 
+        conn.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (?1)", params![1i64])?;
+        }
+
         Ok(())
     }
 
@@ -119,7 +131,7 @@ impl Database {
     }
 
     pub fn save_shared_file(&self, file: &FileInfo) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         conn.execute(
             "INSERT OR REPLACE INTO shared_files (id, name, path, size, hash, aich_hash, extension, modified_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -138,7 +150,7 @@ impl Database {
     }
 
     pub fn get_shared_files(&self) -> anyhow::Result<Vec<FileInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
             "SELECT id, name, path, size, hash, aich_hash, extension, modified_at FROM shared_files",
         )?;
@@ -156,14 +168,17 @@ impl Database {
                     modified_at: row.get(7)?,
                 })
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => { tracing::warn!("Failed to read DB row: {e}"); None }
+            })
             .collect();
 
         Ok(files)
     }
 
     pub fn save_peer(&self, peer: &PeerInfo) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         let addresses = serde_json::to_string(&peer.addresses)?;
         conn.execute(
             "INSERT OR REPLACE INTO peers (id, addresses, nickname, last_seen, files_shared, banned)
@@ -181,7 +196,7 @@ impl Database {
     }
 
     pub fn get_peers(&self) -> anyhow::Result<Vec<PeerInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
             "SELECT id, addresses, nickname, last_seen, files_shared, banned FROM peers",
         )?;
@@ -200,14 +215,17 @@ impl Database {
                     banned: row.get::<_, i32>(5)? != 0,
                 })
             })?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => { tracing::warn!("Failed to read DB row: {e}"); None }
+            })
             .collect();
 
         Ok(peers)
     }
 
     pub fn ban_peer(&self, peer_id: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         conn.execute(
             "INSERT INTO peers (id, banned) VALUES (?1, 1)
              ON CONFLICT(id) DO UPDATE SET banned = 1",
@@ -217,7 +235,7 @@ impl Database {
     }
 
     pub fn unban_peer(&self, peer_id: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         conn.execute(
             "UPDATE peers SET banned = 0 WHERE id = ?1",
             params![peer_id],
@@ -225,27 +243,32 @@ impl Database {
         Ok(())
     }
 
-    pub fn banned_peer_ids(&self) -> Vec<String> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare("SELECT id FROM peers WHERE banned = 1") {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let result: Vec<String> = match stmt.query_map([], |row| row.get(0)) {
-            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
-            Err(_) => Vec::new(),
-        };
-        result
+    pub fn banned_peer_ids(&self) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare("SELECT id FROM peers WHERE banned = 1")?;
+        let result: Vec<String> = stmt.query_map([], |row| row.get(0))?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => { tracing::warn!("Failed to read banned peer row: {e}"); None }
+            })
+            .collect();
+        Ok(result)
     }
 
     pub fn clear_shared_files(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         conn.execute("DELETE FROM shared_files", [])?;
         Ok(())
     }
 
+    pub fn remove_shared_file_by_hash(&self, hash: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        conn.execute("DELETE FROM shared_files WHERE hash = ?1", params![hash])?;
+        Ok(())
+    }
+
     pub fn save_transfer(&self, transfer: &Transfer) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         conn.execute(
             "INSERT OR REPLACE INTO transfers (id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -255,8 +278,15 @@ impl Database {
                 transfer.file_hash,
                 transfer.peer_id,
                 transfer.peer_name,
-                serde_json::to_string(&transfer.direction).unwrap_or_default(),
-                serde_json::to_string(&transfer.status).unwrap_or_default(),
+                match transfer.direction { TransferDirection::Upload => "upload", TransferDirection::Download => "download" }.to_string(),
+                match transfer.status {
+                    TransferStatus::Searching => "searching",
+                    TransferStatus::Queued => "queued",
+                    TransferStatus::Active => "active",
+                    TransferStatus::Paused => "paused",
+                    TransferStatus::Completed => "completed",
+                    TransferStatus::Failed => "failed",
+                }.to_string(),
                 transfer.progress,
                 transfer.speed as i64,
                 transfer.total_size as i64,
@@ -268,10 +298,10 @@ impl Database {
     }
 
     pub fn get_incomplete_downloads(&self) -> anyhow::Result<Vec<Transfer>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
             "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at
-             FROM transfers WHERE status NOT IN ('\"completed\"', '\"failed\"') AND direction = '\"download\"'"
+             FROM transfers WHERE status NOT IN ('\"completed\"', '\"failed\"', 'completed', 'failed') AND direction IN ('\"download\"', 'download')"
         )?;
 
         let transfers = stmt
@@ -291,6 +321,7 @@ impl Database {
                     total_size: row.get::<_, i64>(9)? as u64,
                     transferred: row.get::<_, i64>(10)? as u64,
                     started_at: row.get(11)?,
+                    failure_reason: None,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -300,13 +331,13 @@ impl Database {
     }
 
     pub fn remove_transfer(&self, transfer_id: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         conn.execute("DELETE FROM transfers WHERE id = ?1", params![transfer_id])?;
         Ok(())
     }
 
     pub fn update_transfer_status(&self, transfer_id: &str, status: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         conn.execute(
             "UPDATE transfers SET status = ?1 WHERE id = ?2",
             params![status, transfer_id],

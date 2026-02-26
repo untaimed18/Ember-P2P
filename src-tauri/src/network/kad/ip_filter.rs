@@ -58,6 +58,21 @@ impl IpFilter {
 
         self.blocked_ranges.sort_by_key(|r| r.start);
 
+        // Merge overlapping ranges
+        if self.blocked_ranges.len() > 1 {
+            let mut merged = Vec::with_capacity(self.blocked_ranges.len());
+            merged.push(self.blocked_ranges[0].clone());
+            for range in &self.blocked_ranges[1..] {
+                let last = merged.last_mut().unwrap();
+                if range.start <= last.end + 1 {
+                    last.end = last.end.max(range.end);
+                } else {
+                    merged.push(range.clone());
+                }
+            }
+            self.blocked_ranges = merged;
+        }
+
         info!("Loaded {count} IP filter ranges from {}", path.display());
         count
     }

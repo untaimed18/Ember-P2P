@@ -203,6 +203,9 @@ impl RoutingTable {
                 replacement: contact,
                 pinged_at: chrono::Utc::now().timestamp(),
             };
+            if self.pending_evictions.len() >= 100 {
+                self.pending_evictions.remove(0);
+            }
             self.pending_evictions.push(eviction.clone());
             return Some(eviction);
         }
@@ -524,28 +527,25 @@ impl RoutingTable {
         self.buckets[bucket_idx].contacts.front()
     }
 
-    /// Get a random contact from a specific bucket (for refresh lookups).
+    /// Generate a random KAD ID whose XOR distance from local_id falls in the given bucket.
     pub fn random_id_in_bucket(&self, bucket_idx: usize) -> KadId {
-        let mut id = KadId::random();
-        // Set the distance bit pattern so it falls in the target bucket
-        let distance = self.local_id.xor_distance(&id);
-        let target_bit = if bucket_idx < NUM_BUCKETS - 1 {
-            bucket_idx
-        } else {
-            NUM_BUCKETS - 1
-        };
-        // XOR back to get an ID at roughly the right distance
-        let mut result = distance.0;
-        let byte_idx = (127 - target_bit) / 8;
-        let bit_idx = target_bit % 8;
-        // Clear higher bits and set the target bit
-        for i in 0..byte_idx {
-            result[i] = 0;
+        let mut rng = rand::thread_rng();
+        let mut distance = [0u8; KAD_ID_SIZE];
+        rand::Rng::fill(&mut rng, &mut distance);
+
+        let target_bit = bucket_idx.min(NUM_BUCKETS - 1);
+        let byte_idx = target_bit / 8;
+        let bit_in_byte = 7 - (target_bit % 8);
+
+        for b in distance.iter_mut().take(byte_idx) {
+            *b = 0;
         }
-        result[byte_idx] = 1 << bit_idx;
-        // XOR with local ID to get the target ID
+        let mask = (1u8 << bit_in_byte) - 1;
+        distance[byte_idx] = (1u8 << bit_in_byte) | (distance[byte_idx] & mask);
+
+        let mut id = KadId([0u8; KAD_ID_SIZE]);
         for i in 0..KAD_ID_SIZE {
-            id.0[i] = self.local_id.0[i] ^ result[i];
+            id.0[i] = self.local_id.0[i] ^ distance[i];
         }
         id
     }

@@ -1,10 +1,16 @@
 <script lang="ts">
   let { value = 0, max = 100, color = 'var(--accent)' }: { value?: number; max?: number; color?: string } = $props();
 
-  let percentage = $derived(Math.min(100, (value / max) * 100));
+  let percentage = $derived(Math.min(100, max > 0 ? (value / max) * 100 : 0));
 </script>
 
-<div class="progress-bar">
+<div
+  class="progress-bar"
+  role="progressbar"
+  aria-valuenow={Math.round(percentage)}
+  aria-valuemin={0}
+  aria-valuemax={100}
+>
   <div
     class="progress-fill"
     style="width: {percentage}%; background: {color};"

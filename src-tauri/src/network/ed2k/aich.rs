@@ -50,7 +50,8 @@ pub fn compute_aich_part(data: &[u8]) -> [u8; 20] {
     merkle_root(&leaf_hashes)
 }
 
-/// Build a Merkle tree root from leaf hashes.
+/// Build a Merkle tree root using eMule's top-down recursive split algorithm.
+/// This matches eMule's CAICHHashTree::ReCalculateHash.
 fn merkle_root(leaves: &[[u8; 20]]) -> [u8; 20] {
     if leaves.is_empty() {
         return Sha1::digest([]).into();
@@ -58,24 +59,21 @@ fn merkle_root(leaves: &[[u8; 20]]) -> [u8; 20] {
     if leaves.len() == 1 {
         return leaves[0];
     }
+    build_tree_recursive(leaves, true)
+}
 
-    let mut current_level = leaves.to_vec();
-    while current_level.len() > 1 {
-        let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
-        for pair in current_level.chunks(2) {
-            if pair.len() == 2 {
-                let mut hasher = Sha1::new();
-                hasher.update(pair[0]);
-                hasher.update(pair[1]);
-                next_level.push(hasher.finalize().into());
-            } else {
-                next_level.push(pair[0]);
-            }
-        }
-        current_level = next_level;
+fn build_tree_recursive(leaves: &[[u8; 20]], is_left_branch: bool) -> [u8; 20] {
+    if leaves.len() <= 1 {
+        return leaves.first().copied().unwrap_or_else(|| Sha1::digest([]).into());
     }
-
-    current_level[0]
+    // eMule: nLeft = (nBlocks + bIsLeftBranch) / 2
+    let n_left = (leaves.len() + if is_left_branch { 1 } else { 0 }) / 2;
+    let left_hash = build_tree_recursive(&leaves[..n_left], true);
+    let right_hash = build_tree_recursive(&leaves[n_left..], false);
+    let mut hasher = Sha1::new();
+    hasher.update(left_hash);
+    hasher.update(right_hash);
+    hasher.finalize().into()
 }
 
 #[cfg(test)]

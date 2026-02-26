@@ -61,8 +61,8 @@
     try {
       filterResult = await downloadIpfilter();
       setTimeout(() => (filterResult = null), 5000);
-    } catch (e: any) {
-      filterError = typeof e === 'string' ? e : e?.message ?? 'Download failed';
+    } catch (e: unknown) {
+      filterError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Download failed';
       setTimeout(() => (filterError = null), 5000);
     } finally {
       downloadingFilter = false;
@@ -76,20 +76,15 @@
     try {
       nodesResult = await downloadNodesDat();
       setTimeout(() => (nodesResult = null), 5000);
-    } catch (e: any) {
-      nodesError = typeof e === 'string' ? e : e?.message ?? 'Download failed';
+    } catch (e: unknown) {
+      nodesError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Download failed';
       setTimeout(() => (nodesError = null), 5000);
     } finally {
       downloadingNodes = false;
     }
   }
 
-  function formatSpeed(bytesPerSec: number): string {
-    if (bytesPerSec === 0) return 'Unlimited';
-    if (bytesPerSec < 1024) return `${bytesPerSec} B/s`;
-    if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(0)} KB/s`;
-    return `${(bytesPerSec / 1024 / 1024).toFixed(1)} MB/s`;
-  }
+  import { formatSpeedSetting } from '$lib/utils';
 </script>
 
 <div class="page-header">
@@ -122,9 +117,9 @@
       <section class="settings-section">
         <h3>Downloads</h3>
         <div class="field">
-          <label>Download Folder</label>
+          <label for="download-folder">Download Folder</label>
           <div class="folder-pick">
-            <input value={settings.download_folder} readonly />
+            <input id="download-folder" value={settings.download_folder} readonly />
             <button onclick={pickDownloadFolder}>Browse</button>
           </div>
         </div>
@@ -160,7 +155,7 @@
         <div class="field">
           <label for="max-upload">Max Upload Speed (bytes/sec, 0 = unlimited)</label>
           <input id="max-upload" type="number" min="0" bind:value={settings.max_upload_speed} />
-          <span class="field-hint">{formatSpeed(settings.max_upload_speed)}</span>
+          <span class="field-hint">{formatSpeedSetting(settings.max_upload_speed)}</span>
         </div>
         <div class="field">
           <label for="max-download">Max Download Speed (bytes/sec, 0 = unlimited)</label>
@@ -170,7 +165,7 @@
             min="0"
             bind:value={settings.max_download_speed}
           />
-          <span class="field-hint">{formatSpeed(settings.max_download_speed)}</span>
+          <span class="field-hint">{formatSpeedSetting(settings.max_download_speed)}</span>
         </div>
       </section>
 

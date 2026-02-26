@@ -127,15 +127,22 @@ impl BuddyManager {
     }
 
     /// Check if the buddy connection is still alive.
-    pub fn check_buddy_alive(&mut self) {
+    pub async fn check_buddy_alive(&mut self) {
         if self.state == BuddyState::Connected {
             if let Some(ref stream) = self.buddy_stream {
-                if stream.peer_addr().is_err() {
-                    info!("Buddy connection lost");
-                    self.buddy_stream = None;
-                    self.buddy_id = None;
-                    self.buddy_addr = None;
-                    self.state = BuddyState::NoBuddy;
+                match stream.peer_addr() {
+                    Ok(_) => {
+                        // peer_addr succeeds even on closed connections,
+                        // but without splitting/wrapping the stream we can't
+                        // do a cheap zero-cost liveness probe here.
+                    }
+                    Err(_) => {
+                        info!("Buddy connection lost");
+                        self.buddy_stream = None;
+                        self.buddy_id = None;
+                        self.buddy_addr = None;
+                        self.state = BuddyState::NoBuddy;
+                    }
                 }
             } else {
                 self.state = BuddyState::NoBuddy;
@@ -160,8 +167,19 @@ impl BuddyManager {
     }
 
     /// Forward a callback request to our buddy (we're acting as relay).
+    /// Uses length-prefix framing so the receiver can delimit messages.
     pub async fn relay_callback(&mut self, data: &[u8]) -> bool {
         if let Some(ref mut stream) = self.serving_stream {
+            let len = data.len() as u32;
+            match stream.write_all(&len.to_le_bytes()).await {
+                Ok(()) => {}
+                Err(e) => {
+                    warn!("Failed to write relay frame length: {}", e);
+                    self.serving_buddy_for = None;
+                    self.serving_stream = None;
+                    return false;
+                }
+            }
             match stream.write_all(data).await {
                 Ok(()) => true,
                 Err(e) => {

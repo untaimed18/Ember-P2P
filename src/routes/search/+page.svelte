@@ -1,6 +1,6 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles, parseEd2kLink } from '$lib/api/search';
+  import { searchFiles, parseEd2kLink, findNotes, publishNote } from '$lib/api/search';
   import { startDownload } from '$lib/api/transfers';
   import { searchResults, searchQuery, isSearching, searchProgress } from '$lib/stores/search';
   import type { SearchResult } from '$lib/types';
@@ -8,6 +8,14 @@
   let ed2kInput = $state('');
   let ed2kError = $state('');
   let ed2kSuccess = $state('');
+  let searchError: string | null = $state(null);
+
+  let selectedResult: SearchResult | null = $state(null);
+  let notes: SearchResult[] = $state([]);
+  let loadingNotes = $state(false);
+  let noteRating = $state(0);
+  let noteComment = $state('');
+  let publishSuccess = $state(false);
 
   const FILE_TYPES = [
     { value: '', label: 'Any' },
@@ -114,13 +122,43 @@
     $searchQuery = query;
     $isSearching = true;
     $searchResults = [];
+    searchError = null;
     try {
       const results = await searchFiles(query);
       $searchResults = results;
-    } catch (e) {
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Search failed';
+      searchError = msg;
       console.error('Search failed:', e);
-    } finally {
       $isSearching = false;
+    }
+  }
+
+  async function showFileDetails(result: SearchResult) {
+    selectedResult = result;
+    loadingNotes = true;
+    notes = [];
+    try {
+      notes = await findNotes(result.file.hash, result.file.size);
+    } catch (e: unknown) {
+      console.error('Failed to load notes:', e);
+    } finally {
+      loadingNotes = false;
+    }
+  }
+
+  async function handlePublishNote() {
+    if (!selectedResult) return;
+    publishSuccess = false;
+    try {
+      await publishNote(selectedResult.file.hash, noteRating, noteComment);
+      publishSuccess = true;
+      noteComment = '';
+      noteRating = 0;
+      setTimeout(() => publishSuccess = false, 3000);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Publish failed';
+      searchError = msg;
     }
   }
 
@@ -145,18 +183,13 @@
       );
       downloadStarted[key] = true;
       setTimeout(() => (downloadStarted[key] = false), 3000);
-    } catch (e: any) {
+    } catch (e: unknown) {
       console.error('Download failed:', e);
-      downloadErrors[key] = typeof e === 'string' ? e : e?.message || 'Download failed';
+      downloadErrors[key] = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Download failed';
     }
   }
 
-  function formatSize(bytes: number): string {
-    if (bytes === 0) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
-  }
+  import { formatSize } from '$lib/utils';
 
   async function handleEd2kLink() {
     const link = ed2kInput.trim();
@@ -169,8 +202,8 @@
       ed2kSuccess = `Queued: ${info.name}`;
       ed2kInput = '';
       setTimeout(() => (ed2kSuccess = ''), 5000);
-    } catch (e: any) {
-      ed2kError = typeof e === 'string' ? e : e?.message || 'Invalid ed2k link';
+    } catch (e: unknown) {
+      ed2kError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Invalid ed2k link';
       setTimeout(() => (ed2kError = ''), 5000);
     }
   }
@@ -213,6 +246,7 @@
     placeholder="Paste ed2k://|file|... link to download"
     bind:value={ed2kInput}
     onkeydown={(e) => { if (e.key === 'Enter') handleEd2kLink(); }}
+    aria-label="ed2k link input"
   />
   <button onclick={handleEd2kLink} disabled={!ed2kInput.trim()}>Add Link</button>
   {#if ed2kSuccess}
@@ -301,6 +335,12 @@
 </div>
 
 <div class="page-content">
+  {#if searchError}
+    <div class="search-error-banner">
+      <span>Search failed: {searchError}</span>
+      <button class="ghost" onclick={() => searchError = null}>Dismiss</button>
+    </div>
+  {/if}
   {#if $searchResults.length === 0 && !$isSearching}
     <div class="empty-state">
       <div class="icon">&#x2315;</div>
@@ -349,7 +389,9 @@
       <tbody>
         {#each filteredResults as result (result.file.hash)}
           <tr>
-            <td class="col-name" title={result.file.name}>{result.file.name}</td>
+            <td class="col-name" title={result.file.name}>
+              <button class="ghost link-btn" onclick={() => showFileDetails(result)}>{result.file.name}</button>
+            </td>
             <td class="col-size">{formatSize(result.file.size)}</td>
             <td class="col-type">{result.file_type || result.file.extension || '\u2014'}</td>
             <td class="col-sources">
@@ -374,6 +416,49 @@
       <div class="empty-state">
         <p>No results match the current filters</p>
         <button class="ghost" onclick={clearFilters}>Clear Filters</button>
+      </div>
+    {/if}
+    {#if selectedResult}
+      <div class="file-details-panel">
+        <div class="panel-header">
+          <h3>File Details</h3>
+          <button class="ghost" onclick={() => selectedResult = null}>✕</button>
+        </div>
+        <div class="panel-body">
+          <div class="detail-row"><strong>Name:</strong> {selectedResult.file.name}</div>
+          <div class="detail-row"><strong>Size:</strong> {formatSize(selectedResult.file.size)}</div>
+          <div class="detail-row"><strong>Hash:</strong> <code>{selectedResult.file.hash}</code></div>
+          <div class="detail-row"><strong>Sources:</strong> {selectedResult.availability}</div>
+          
+          <h4>Notes & Comments</h4>
+          {#if loadingNotes}
+            <p class="hint">Loading notes...</p>
+          {:else if notes.length === 0}
+            <p class="hint">No notes found for this file</p>
+          {:else}
+            <div class="notes-list">
+              {#each notes as note}
+                <div class="note-item">
+                  <span class="note-peer">{note.peer_name || 'Anonymous'}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+          
+          <div class="publish-note">
+            <h4>Add Note</h4>
+            <div class="note-form">
+              <label for="note-rating">Rating (0-5)</label>
+              <input id="note-rating" type="number" min="0" max="5" bind:value={noteRating} />
+              <label for="note-comment">Comment</label>
+              <input id="note-comment" type="text" bind:value={noteComment} placeholder="Optional comment..." />
+              <button onclick={handlePublishNote}>Publish Note</button>
+              {#if publishSuccess}
+                <span class="success-msg">Published!</span>
+              {/if}
+            </div>
+          </div>
+        </div>
       </div>
     {/if}
   {/if}
@@ -551,5 +636,104 @@
     color: var(--success, #2ecc71);
     font-size: 11px;
     margin-left: 8px;
+  }
+
+  .search-error-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 20px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--danger, #e74c3c);
+    color: var(--danger, #e74c3c);
+    font-size: 13px;
+  }
+
+  .file-details-panel {
+    border-top: 2px solid var(--border);
+    background: var(--bg-secondary);
+    max-height: 300px;
+    overflow-y: auto;
+  }
+
+  .panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .panel-header h3 {
+    margin: 0;
+    font-size: 14px;
+  }
+
+  .panel-body {
+    padding: 12px 20px;
+  }
+
+  .detail-row {
+    font-size: 13px;
+    margin-bottom: 6px;
+  }
+
+  .detail-row code {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .notes-list {
+    margin: 8px 0;
+  }
+
+  .note-item {
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+
+  .publish-note {
+    margin-top: 12px;
+  }
+
+  .publish-note h4 {
+    font-size: 13px;
+    margin-bottom: 8px;
+  }
+
+  .note-form {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .note-form label {
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .note-form input[type="number"] {
+    width: 60px;
+  }
+
+  .note-form input[type="text"] {
+    flex: 1;
+    min-width: 200px;
+  }
+
+  .link-btn {
+    text-align: left;
+    font-size: inherit;
+    color: inherit;
+    padding: 0;
+    text-decoration: none;
+  }
+
+  .link-btn:hover {
+    color: var(--accent);
+    text-decoration: underline;
   }
 </style>

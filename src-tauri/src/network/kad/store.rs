@@ -98,6 +98,17 @@ impl DhtStore {
         // Remove existing entry from same sender
         bucket.retain(|e| e.id != sender_id);
 
+        const MAX_SOURCES_PER_IP: usize = 3;
+        let ip_u32 = u32::from_be_bytes(sender_ip.octets());
+        let ip_count = bucket.iter()
+            .filter(|e| {
+                e.tags.iter().any(|t| matches!(&t.name, TagName::Id(TAG_SOURCEIP)) && matches!(&t.value, TagValue::Uint32(v) if *v == ip_u32))
+            })
+            .count();
+        if ip_count >= MAX_SOURCES_PER_IP {
+            return self.compute_load();
+        }
+
         // Always override source IP with the actual packet sender IP to prevent spoofing.
         // A publisher can specify a port (for TCP connections) but the IP must be verified.
         let ip_u32 = u32::from_be_bytes(sender_ip.octets());

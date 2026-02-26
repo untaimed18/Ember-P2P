@@ -39,6 +39,8 @@ pub struct Transfer {
     pub total_size: u64,
     pub transferred: u64,
     pub started_at: i64,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -148,7 +150,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         let download_dir = directories::UserDirs::new()
             .and_then(|d| d.download_dir().map(|p| p.to_string_lossy().to_string()))
-            .unwrap_or_else(|| ".".into());
+            .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
 
         Self {
             nickname: format!("Nexus-{}", &uuid::Uuid::new_v4().to_string()[..8]),

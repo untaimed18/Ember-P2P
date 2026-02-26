@@ -140,8 +140,9 @@ pub fn run() {
             });
 
             let bw_limiter = bandwidth_limiter.clone();
+            let bw_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             tauri::async_runtime::spawn(async move {
-                bandwidth::limiter::start_token_refill(bw_limiter).await;
+                bandwidth::limiter::start_token_refill(bw_limiter, bw_shutdown).await;
             });
 
             info!("Nexus P2P application started");

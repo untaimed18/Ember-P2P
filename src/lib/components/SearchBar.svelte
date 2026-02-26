@@ -17,15 +17,16 @@
 </script>
 
 <div class="search-bar">
-  <span class="search-icon">⌕</span>
+  <span class="search-icon" aria-hidden="true">⌕</span>
   <input
     type="text"
     bind:value
     {placeholder}
     onkeydown={handleKeydown}
+    aria-label="Search files"
   />
   {#if value}
-    <button class="clear-btn" onclick={() => (value = '')}>✕</button>
+    <button class="clear-btn" onclick={() => (value = '')} aria-label="Clear search">✕</button>
   {/if}
 </div>
 

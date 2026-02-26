@@ -96,6 +96,19 @@ impl LocalIndex {
     pub fn all_files(&self) -> &[FileInfo] {
         &self.files
     }
+
+    pub fn remove_files_by_path_prefix(&mut self, prefix: &str) {
+        self.files.retain(|f| !f.path.starts_with(prefix));
+        self.hash_map.clear();
+        self.name_tokens.clear();
+        for (idx, file) in self.files.iter().enumerate() {
+            self.hash_map.insert(file.hash.clone(), idx);
+            let name_lower = file.name.to_lowercase();
+            for token in tokenize(&name_lower) {
+                self.name_tokens.entry(token).or_default().push(idx);
+            }
+        }
+    }
 }
 
 fn tokenize(s: &str) -> Vec<String> {

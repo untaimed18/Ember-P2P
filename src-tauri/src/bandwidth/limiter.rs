@@ -39,15 +39,15 @@ impl BandwidthLimiter {
             return true;
         }
 
-        loop {
-            let current = self.upload_tokens.load(Ordering::Relaxed);
+        for _ in 0..100 {
+            let current = self.upload_tokens.load(Ordering::Acquire);
             if current >= bytes {
                 if self
                     .upload_tokens
-                    .compare_exchange(
+                    .compare_exchange_weak(
                         current,
                         current - bytes,
-                        Ordering::SeqCst,
+                        Ordering::AcqRel,
                         Ordering::Relaxed,
                     )
                     .is_ok()
@@ -57,9 +57,9 @@ impl BandwidthLimiter {
                 }
             } else {
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                return false;
             }
         }
+        false
     }
 
     pub async fn acquire_download(&self, bytes: u64) -> bool {
@@ -69,15 +69,15 @@ impl BandwidthLimiter {
             return true;
         }
 
-        loop {
-            let current = self.download_tokens.load(Ordering::Relaxed);
+        for _ in 0..100 {
+            let current = self.download_tokens.load(Ordering::Acquire);
             if current >= bytes {
                 if self
                     .download_tokens
-                    .compare_exchange(
+                    .compare_exchange_weak(
                         current,
                         current - bytes,
-                        Ordering::SeqCst,
+                        Ordering::AcqRel,
                         Ordering::Relaxed,
                     )
                     .is_ok()
@@ -87,9 +87,9 @@ impl BandwidthLimiter {
                 }
             } else {
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                return false;
             }
         }
+        false
     }
 
     /// Add a fraction of the rate limit worth of tokens (called at sub-second intervals).
@@ -100,18 +100,30 @@ impl BandwidthLimiter {
 
         if max_up > 0 {
             let add = (max_up * fraction / divisor).max(1);
-            let prev = self.upload_tokens.fetch_add(add, Ordering::Relaxed);
-            let new_val = prev + add;
-            if new_val > max_up {
-                self.upload_tokens.store(max_up, Ordering::Relaxed);
+            loop {
+                let current = self.upload_tokens.load(Ordering::Relaxed);
+                let new_val = (current + add).min(max_up);
+                if self
+                    .upload_tokens
+                    .compare_exchange_weak(current, new_val, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
             }
         }
         if max_down > 0 {
             let add = (max_down * fraction / divisor).max(1);
-            let prev = self.download_tokens.fetch_add(add, Ordering::Relaxed);
-            let new_val = prev + add;
-            if new_val > max_down {
-                self.download_tokens.store(max_down, Ordering::Relaxed);
+            loop {
+                let current = self.download_tokens.load(Ordering::Relaxed);
+                let new_val = (current + add).min(max_down);
+                if self
+                    .download_tokens
+                    .compare_exchange_weak(current, new_val, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
             }
         }
     }
@@ -161,7 +173,10 @@ impl BandwidthLimiter {
     }
 }
 
-pub async fn start_token_refill(limiter: std::sync::Arc<BandwidthLimiter>) {
+pub async fn start_token_refill(
+    limiter: std::sync::Arc<BandwidthLimiter>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     const REFILL_INTERVAL_MS: u64 = 100;
     const TICKS_PER_SECOND: u64 = 1000 / REFILL_INTERVAL_MS;
 
@@ -172,6 +187,9 @@ pub async fn start_token_refill(limiter: std::sync::Arc<BandwidthLimiter>) {
 
     loop {
         interval.tick().await;
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
         limiter.refill_tokens_incremental(1, TICKS_PER_SECOND);
 
         speed_tick_count += 1;

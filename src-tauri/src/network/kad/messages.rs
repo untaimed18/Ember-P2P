@@ -804,12 +804,11 @@ pub fn build_hello_req(
     tcp_port: u16,
     version: u8,
     tags: &[KadTag],
-) -> Vec<u8> {
+) -> io::Result<Vec<u8>> {
     encode_packet(&KadMessage::HelloReq {
         sender_id: *sender_id,
         tcp_port,
         version,
         tags: tags.to_vec(),
     })
-    .unwrap_or_default()
 }

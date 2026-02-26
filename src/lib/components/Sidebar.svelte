@@ -23,8 +23,9 @@
         <a
           href={item.href}
           class:active={$page.url.pathname === item.href}
+          aria-current={$page.url.pathname === item.href ? 'page' : undefined}
         >
-          <span class="nav-icon">{item.icon}</span>
+          <span class="nav-icon" aria-hidden="true">{item.icon}</span>
           <span class="nav-label">{item.label}</span>
         </a>
       </li>

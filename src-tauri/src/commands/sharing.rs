@@ -48,7 +48,6 @@ pub async fn remove_shared_folder(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
-    // Collect hashes of files being removed so we can unannounce them
     let removed_hashes: Vec<String> = {
         let index = state.local_index.read().await;
         index
@@ -63,24 +62,15 @@ pub async fn remove_shared_folder(
     config.settings.shared_folders.retain(|f| f != &path);
     config.save().map_err(|e| format!("Config save error: {e}"))?;
 
-    let mut index = state.local_index.write().await;
-    index.clear();
-
-    state
-        .db
-        .clear_shared_files()
-        .map_err(|e| format!("DB error: {e}"))?;
-
-    for folder in &config.settings.shared_folders {
-        let folder = folder.clone();
-        let files =
-            tokio::task::spawn_blocking(move || FileIndexer::scan_directory(&folder))
-                .await
-                .map_err(|e| format!("Scan failed: {e}"))?;
-        index.add_files(files);
+    {
+        let mut index = state.local_index.write().await;
+        index.remove_files_by_path_prefix(&path);
     }
 
-    // Unannounce removed files from the KAD network
+    for hash in &removed_hashes {
+        let _ = state.db.remove_shared_file_by_hash(hash);
+    }
+
     if !removed_hashes.is_empty() {
         let _ = state
             .network_tx

@@ -51,7 +51,8 @@ export interface NetworkStats {
   status: 'connected' | 'connecting' | 'disconnected';
   external_ip: string;
   firewalled: boolean;
-  buddy_status: string;
+  /** Backend sends: 'none', 'connecting_...', 'connected_...', 'serving_...' */
+  buddy_status: 'none' | 'connecting' | 'connected' | 'serving' | string;
   upnp_mapped: boolean;
   stores_acknowledged: number;
 }

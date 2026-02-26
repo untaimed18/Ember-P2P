@@ -76,8 +76,7 @@ pub fn load_nodes_dat(path: &Path) -> anyhow::Result<Vec<KadContact>> {
     } else {
         // Version 0/1 format: first_u32 is the contact count
         let count = first_u32 as usize;
-        let version = cursor.read_u32::<LittleEndian>().unwrap_or(0);
-        info!("Loading {count} contacts from nodes.dat v{version}");
+        info!("Loading {count} contacts from nodes.dat v0");
 
         for _ in 0..count {
             match read_contact_v0(&mut cursor) {

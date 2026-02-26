@@ -1,5 +1,6 @@
 import { writable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
+import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { NetworkStats } from '$lib/types';
 import { getNetworkStats } from '$lib/api/peers';
 
@@ -20,30 +21,43 @@ export const networkStats = writable<NetworkStats>({
 export const networkError = writable<string | null>(null);
 
 let initialized = false;
+let unlisteners: UnlistenFn[] = [];
+let lastEventUpdate = 0;
 
 export async function initNetworkStore() {
   if (initialized) return;
   initialized = true;
 
-  listen<NetworkStats>('network-stats', (event) => {
-    networkStats.set(event.payload);
-  });
+  unlisteners.push(
+    await listen<NetworkStats>('network-stats', (event) => {
+      lastEventUpdate = Date.now();
+      networkStats.set(event.payload);
+    })
+  );
 
-  listen<string>('network-status', (event) => {
-    networkStats.update((s) => ({ ...s, status: event.payload as NetworkStats['status'] }));
-  });
+  unlisteners.push(
+    await listen<string>('network-status', (event) => {
+      lastEventUpdate = Date.now();
+      networkStats.update((s) => ({ ...s, status: event.payload as NetworkStats['status'] }));
+    })
+  );
 
-  listen<{ firewalled: boolean; external_ip: string }>('firewall-status', (event) => {
-    networkStats.update((s) => ({
-      ...s,
-      firewalled: event.payload.firewalled,
-      external_ip: event.payload.external_ip,
-    }));
-  });
+  unlisteners.push(
+    await listen<{ firewalled: boolean; external_ip: string }>('firewall-status', (event) => {
+      lastEventUpdate = Date.now();
+      networkStats.update((s) => ({
+        ...s,
+        firewalled: event.payload.firewalled,
+        external_ip: event.payload.external_ip,
+      }));
+    })
+  );
 
-  listen<{ message: string }>('network-error', (event) => {
-    networkError.set(event.payload.message);
-  });
+  unlisteners.push(
+    await listen<{ message: string }>('network-error', (event) => {
+      networkError.set(event.payload.message);
+    })
+  );
 
   try {
     const stats = await getNetworkStats();
@@ -53,8 +67,15 @@ export async function initNetworkStore() {
   }
 }
 
+export function cleanupNetworkStore() {
+  for (const unlisten of unlisteners) unlisten();
+  unlisteners = [];
+  initialized = false;
+}
+
 export function startStatsPoll() {
   const interval = setInterval(async () => {
+    if (Date.now() - lastEventUpdate < 2000) return;
     try {
       const stats = await getNetworkStats();
       networkStats.set(stats);

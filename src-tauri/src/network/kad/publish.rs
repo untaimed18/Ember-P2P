@@ -230,15 +230,29 @@ pub fn kad_id_to_md4_bytes(id: &KadId) -> [u8; 16] {
     raw
 }
 
-/// Extract searchable keywords from a filename.
+/// Extract searchable keywords from a filename using eMule's tokenization rules.
+/// Does not strip extension before tokenizing; uses eMule's separator set.
+/// After tokenizing, removes the last word if it's exactly 3 chars/3 bytes
+/// and there are >1 words (strips common file extensions like "mp3", "avi").
 pub fn extract_keywords(filename: &str) -> Vec<String> {
-    let name = filename
-        .rsplit_once('.')
-        .map(|(n, _)| n)
-        .unwrap_or(filename);
+    let separator_chars = |c: char| -> bool {
+        matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | '.' | '_' | '-' | '!' | '?' | ':' | ';' | '\\' | '/' | '"')
+        || c.is_whitespace()
+    };
 
-    name.split(|c: char| !c.is_alphanumeric())
+    let mut result: Vec<String> = filename
+        .split(separator_chars)
         .filter(|w| w.len() >= 3)
         .map(|w| w.to_lowercase())
-        .collect()
+        .collect();
+
+    if result.len() > 1 {
+        if let Some(last) = result.last() {
+            if last.len() == 3 && last.chars().count() == 3 {
+                result.pop();
+            }
+        }
+    }
+
+    result
 }

@@ -5,6 +5,7 @@
 
   let peers: PeerInfo[] = $state([]);
   let loading = $state(true);
+  let peerError: string | null = $state(null);
 
   onMount(() => {
     refresh();
@@ -25,19 +26,25 @@
   async function handleBan(peerId: string) {
     const confirmed = confirm(`Ban peer ${peerId.slice(0, 16)}...? This will block all communication with this peer.`);
     if (!confirmed) return;
+    peerError = null;
     try {
       await banPeer(peerId);
       await refresh();
-    } catch (e) {
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Ban failed';
+      peerError = msg;
       console.error('Ban failed:', e);
     }
   }
 
   async function handleUnban(peerId: string) {
+    peerError = null;
     try {
       await unbanPeer(peerId);
       await refresh();
-    } catch (e) {
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Unban failed';
+      peerError = msg;
       console.error('Unban failed:', e);
     }
   }
@@ -54,6 +61,12 @@
 </div>
 
 <div class="page-content">
+  {#if peerError}
+    <div class="error-banner">
+      <span>{peerError}</span>
+      <button class="ghost" onclick={() => peerError = null}>Dismiss</button>
+    </div>
+  {/if}
   {#if loading}
     <div class="empty-state">
       <p>Loading peers...</p>
@@ -141,5 +154,16 @@
   .sub {
     font-size: 13px;
     color: var(--text-muted);
+  }
+
+  .error-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 20px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--danger, #e74c3c);
+    color: var(--danger, #e74c3c);
+    font-size: 13px;
   }
 </style>

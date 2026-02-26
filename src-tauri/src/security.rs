@@ -42,6 +42,12 @@ pub fn sanitize_filename(name: &str) -> String {
         return format!("_{safe}");
     }
 
+    let safe = if safe.len() > 255 {
+        safe[..255].to_string()
+    } else {
+        safe
+    };
+
     safe
 }
 
@@ -54,7 +60,7 @@ pub fn validate_path_within(base: &Path, relative: &str) -> Option<PathBuf> {
     let canonical_base = std::fs::canonicalize(base).ok()?;
     // Since the file might not exist yet, we canonicalize the parent
     let parent = full.parent()?;
-    let canonical_parent = std::fs::canonicalize(parent).ok().unwrap_or_else(|| parent.to_path_buf());
+    let canonical_parent = std::fs::canonicalize(parent).ok()?;
 
     if canonical_parent.starts_with(&canonical_base) {
         Some(full)

@@ -64,7 +64,9 @@ impl NodeIdentity {
         let id = Self::generate();
         let data = serde_json::to_string_pretty(&id)?;
         std::fs::create_dir_all(data_dir)?;
-        std::fs::write(&path, &data)?;
+        let tmp_path = path.with_extension("json.tmp");
+        std::fs::write(&tmp_path, &data)?;
+        std::fs::rename(&tmp_path, &path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

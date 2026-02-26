@@ -12,6 +12,22 @@ pub async fn start_download(
     peer_ip: String,
     peer_port: u16,
 ) -> Result<String, String> {
+    let file_name = crate::security::sanitize_filename(&file_name);
+
+    if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
+        return Err("Invalid file hash".into());
+    }
+
+    if !peer_ip.is_empty() {
+        peer_ip
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| "Invalid peer IP")?;
+    }
+
+    if file_size == 0 {
+        return Err("File size must be greater than 0".into());
+    }
+
     let transfer_id = uuid::Uuid::new_v4().to_string();
 
     let has_source = !peer_ip.is_empty() && peer_ip != "0.0.0.0" && peer_port > 0;
@@ -39,6 +55,7 @@ pub async fn start_download(
         total_size: file_size,
         transferred: 0,
         started_at: chrono::Utc::now().timestamp(),
+        failure_reason: None,
     };
 
     {
@@ -89,8 +106,24 @@ pub async fn cancel_transfer(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
-    let mut manager = state.transfer_manager.write().await;
-    manager.cancel(&transfer_id);
+    let promoted = {
+        let mut manager = state.transfer_manager.write().await;
+        manager.cancel(&transfer_id)
+    };
+    for t in &promoted {
+        let _ = state
+            .network_tx
+            .send(NetworkCommand::StartDownload {
+                file_hash: t.file_hash.clone(),
+                file_name: t.file_name.clone(),
+                file_size: t.total_size,
+                peer_ip: t.peer_id.split(':').next().unwrap_or("").to_string(),
+                peer_port: t.peer_id.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(0),
+                transfer_id: t.id.clone(),
+                control: crate::sharing::manager::TransferControl::new(),
+            })
+            .await;
+    }
     Ok(())
 }
 

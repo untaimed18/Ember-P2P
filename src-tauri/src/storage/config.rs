@@ -22,7 +22,15 @@ impl AppConfig {
 
         let settings = if config_path.exists() {
             let data = std::fs::read_to_string(&config_path)?;
-            serde_json::from_str(&data).unwrap_or_default()
+            match serde_json::from_str(&data) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Config file corrupt, using defaults: {e}");
+                    let bak = config_path.with_extension("json.bak");
+                    let _ = std::fs::rename(&config_path, &bak);
+                    AppSettings::default()
+                }
+            }
         } else {
             let defaults = AppSettings::default();
             let data = serde_json::to_string_pretty(&defaults)?;
@@ -39,7 +47,9 @@ impl AppConfig {
 
     pub fn save(&self) -> anyhow::Result<()> {
         let data = serde_json::to_string_pretty(&self.settings)?;
-        std::fs::write(&self.config_path, &data)?;
+        let tmp_path = self.config_path.with_extension("json.tmp");
+        std::fs::write(&tmp_path, &data)?;
+        std::fs::rename(&tmp_path, &self.config_path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

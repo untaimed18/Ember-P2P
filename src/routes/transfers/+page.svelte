@@ -2,6 +2,8 @@
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import { transfers, startTransferPoll } from '$lib/stores/transfers';
   import { pauseTransfer, resumeTransfer, cancelTransfer, clearCompleted } from '$lib/api/transfers';
+  import { findSources } from '$lib/api/search';
+  import { formatSize, formatSpeed } from '$lib/utils';
   import { onMount } from 'svelte';
 
   onMount(() => {
@@ -9,15 +11,10 @@
     return () => stop();
   });
 
-  function formatSize(bytes: number): string {
-    if (bytes === 0) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
-  }
+  let transferError: string | null = $state(null);
 
-  function formatSpeed(bytesPerSec: number): string {
-    return `${formatSize(bytesPerSec)}/s`;
+  function toErrorMsg(e: unknown): string {
+    return e instanceof Error ? e.message : typeof e === 'string' ? e : 'Operation failed';
   }
 
   let activeTransfers = $derived(
@@ -33,7 +30,7 @@
   <div class="header-actions">
     <span class="count">{activeTransfers.length} active</span>
     {#if completedTransfers.length > 0}
-      <button class="ghost" onclick={async () => { await clearCompleted(); }}>
+      <button class="ghost" onclick={async () => { try { await clearCompleted(); } catch (e) { transferError = toErrorMsg(e); } }}>
         Clear Completed ({completedTransfers.length})
       </button>
     {/if}
@@ -41,6 +38,12 @@
 </div>
 
 <div class="page-content">
+  {#if transferError}
+    <div class="error-banner">
+      <span>{transferError}</span>
+      <button class="ghost" onclick={() => transferError = null}>Dismiss</button>
+    </div>
+  {/if}
   {#if $transfers.length === 0}
     <div class="empty-state">
       <div class="icon">⇅</div>
@@ -80,11 +83,14 @@
               <td>{formatSize(t.transferred)} / {formatSize(t.total_size)}</td>
               <td class="actions">
                 {#if t.status === 'active'}
-                  <button class="ghost" onclick={() => pauseTransfer(t.id)}>⏸</button>
+                  <button class="ghost" onclick={async () => { try { await pauseTransfer(t.id); } catch (e) { transferError = toErrorMsg(e); } }}>⏸</button>
                 {:else if t.status === 'paused'}
-                  <button class="ghost" onclick={() => resumeTransfer(t.id)}>▶</button>
+                  <button class="ghost" onclick={async () => { try { await resumeTransfer(t.id); } catch (e) { transferError = toErrorMsg(e); } }}>▶</button>
                 {/if}
-                <button class="ghost danger" onclick={() => cancelTransfer(t.id)}>✕</button>
+                {#if t.direction === 'download' && (t.status === 'searching' || t.status === 'queued')}
+                  <button class="ghost" onclick={async () => { try { await findSources(t.file_hash, t.total_size); } catch (e) { transferError = toErrorMsg(e); } }} title="Find more sources">🔍</button>
+                {/if}
+                <button class="ghost danger" onclick={async () => { try { await cancelTransfer(t.id); } catch (e) { transferError = toErrorMsg(e); } }}>✕</button>
               </td>
             </tr>
           {/each}
@@ -147,6 +153,17 @@
   .sub {
     font-size: 13px;
     color: var(--text-muted);
+  }
+
+  .error-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 20px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--danger, #e74c3c);
+    color: var(--danger, #e74c3c);
+    font-size: 13px;
   }
 
   .searching-label {

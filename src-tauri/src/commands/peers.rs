@@ -40,6 +40,10 @@ pub async fn ban_peer(
     state: tauri::State<'_, AppState>,
     peer_id: String,
 ) -> Result<(), String> {
+    if peer_id.is_empty() || hex::decode(&peer_id).is_err() {
+        return Err("Invalid peer ID".into());
+    }
+
     state
         .db
         .ban_peer(&peer_id)
@@ -60,8 +64,21 @@ pub async fn unban_peer(
     state: tauri::State<'_, AppState>,
     peer_id: String,
 ) -> Result<(), String> {
+    if peer_id.is_empty() || hex::decode(&peer_id).is_err() {
+        return Err("Invalid peer ID".into());
+    }
+
     state
         .db
         .unban_peer(&peer_id)
-        .map_err(|e| format!("Failed to unban peer: {e}"))
+        .map_err(|e| format!("Failed to unban peer: {e}"))?;
+
+    let _ = state
+        .network_tx
+        .send(NetworkCommand::UnbanPeer {
+            peer_id_hex: peer_id,
+        })
+        .await;
+
+    Ok(())
 }

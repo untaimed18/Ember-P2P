@@ -83,6 +83,55 @@ impl UpnpMappings {
         success
     }
 
+    pub async fn renew(&mut self) -> bool {
+        if !self.mapped {
+            return false;
+        }
+        let Some(ref gateway) = self.gateway else {
+            return false;
+        };
+
+        let local_ip = match local_ipv4() {
+            Some(ip) => ip,
+            None => return false,
+        };
+
+        let tcp_local = SocketAddr::V4(SocketAddrV4::new(local_ip, self.tcp_port));
+        let udp_local = SocketAddr::V4(SocketAddrV4::new(local_ip, self.udp_port));
+
+        let mut ok = true;
+        if let Err(e) = gateway
+            .add_port(
+                igd_next::PortMappingProtocol::TCP,
+                self.tcp_port,
+                tcp_local,
+                3600,
+                "Nexus P2P TCP",
+            )
+            .await
+        {
+            warn!("UPnP: TCP renewal failed: {e}");
+            ok = false;
+        }
+        if let Err(e) = gateway
+            .add_port(
+                igd_next::PortMappingProtocol::UDP,
+                self.udp_port,
+                udp_local,
+                3600,
+                "Nexus P2P UDP",
+            )
+            .await
+        {
+            warn!("UPnP: UDP renewal failed: {e}");
+            ok = false;
+        }
+        if ok {
+            info!("UPnP: renewed port mappings");
+        }
+        ok
+    }
+
     pub async fn teardown(&mut self) {
         if let Some(ref gateway) = self.gateway {
             if self.mapped {

@@ -1,6 +1,6 @@
-use std::path::PathBuf;
-
 use tracing::info;
+
+use tauri::Manager;
 
 use crate::app_state::AppState;
 use crate::network::kad::bootstrap;
@@ -81,6 +81,7 @@ pub async fn update_settings(
 
 #[tauri::command]
 pub async fn download_nodes_dat(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     info!("Downloading nodes.dat from {NODES_DAT_URL}");
@@ -92,9 +93,8 @@ pub async fn download_nodes_dat(
         .await
         .map_err(|e| format!("Failed to read response body: {e}"))?;
 
-    let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+    let data_dir = app.path().app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {e}"))?;
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("Failed to create data dir: {e}"))?;
 
@@ -124,6 +124,8 @@ pub async fn download_nodes_dat(
 
 #[tauri::command]
 pub async fn download_ipfilter(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     info!("Downloading ipfilter.dat from {IPFILTER_URL}");
 
@@ -134,9 +136,8 @@ pub async fn download_ipfilter(
         .await
         .map_err(|e| format!("Failed to read response body: {e}"))?;
 
-    let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+    let data_dir = app.path().app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {e}"))?;
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("Failed to create data dir: {e}"))?;
 
@@ -147,8 +148,15 @@ pub async fn download_ipfilter(
     let byte_count = bytes.len();
     let line_count = bytes.iter().filter(|&&b| b == b'\n').count();
 
+    let _ = state
+        .network_tx
+        .send(NetworkCommand::ReloadIpFilter {
+            path: filter_path,
+        })
+        .await;
+
     let msg = format!(
-        "Downloaded ipfilter.dat ({byte_count} bytes, ~{line_count} entries). Restart to apply.",
+        "Downloaded ipfilter.dat ({byte_count} bytes, ~{line_count} entries) — reloading filter now",
     );
     info!("{msg}");
     Ok(msg)

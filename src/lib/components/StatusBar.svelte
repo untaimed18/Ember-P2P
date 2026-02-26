@@ -1,21 +1,11 @@
 <script lang="ts">
   import { networkStats } from '$lib/stores/network';
-
-  function formatBytes(bytes: number): string {
-    if (bytes === 0) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
-  }
-
-  function formatSpeed(bytesPerSec: number): string {
-    return `${formatBytes(bytesPerSec)}/s`;
-  }
+  import { formatBytes, formatSpeed } from '$lib/utils';
 </script>
 
 <footer class="statusbar">
   <div class="status-left">
-    <span class="status-indicator badge {$networkStats.status}">
+    <span class="status-indicator badge {$networkStats.status}" aria-label="Network status: {$networkStats.status}">
       {$networkStats.status}
     </span>
     <span class="status-item">

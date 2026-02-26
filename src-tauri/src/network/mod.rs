@@ -68,6 +68,9 @@ pub enum NetworkCommand {
     BanPeer {
         peer_id_hex: String,
     },
+    UnbanPeer {
+        peer_id_hex: String,
+    },
     FindNotes {
         file_hash: KadId,
         file_size: u64,
@@ -80,6 +83,9 @@ pub enum NetworkCommand {
     },
     BootstrapContacts {
         contacts: Vec<kad::types::KadContact>,
+    },
+    ReloadIpFilter {
+        path: PathBuf,
     },
     Shutdown,
 }
@@ -598,6 +604,7 @@ pub async fn start_network(
                         local_results.sort_by(|a, b| b.availability.cmp(&a.availability));
                         local_results.truncate(300);
                         let _ = tx.send(local_results);
+                        app_handle.emit("search-complete", ()).ok();
                     } else if let Some(tx) = state.pending_source_searches.remove(&sid) {
                         let sources = if let Some(search) = state.search_manager.get(&sid) {
                             extract_sources_from_results(&search.results)
@@ -703,6 +710,7 @@ pub async fn start_network(
                                         tcp_port: settings.tcp_port,
                                         udp_port: settings.udp_port,
                                         bandwidth_limiter: bandwidth_limiter.clone(),
+                                        control: pending.control,
                                     };
                                     let tx = dl_event_tx.clone();
                                     tokio::spawn(async move {
@@ -1015,12 +1023,18 @@ pub async fn start_network(
                             value: TagValue::String(settings.nickname.clone()),
                         });
                     }
-                    let msg = messages::build_hello_req(
+                    let msg = match messages::build_hello_req(
                         &state.local_id,
                         settings.tcp_port,
                         KADEMLIA_VERSION,
                         &hello_tags,
-                    );
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            error!("Failed to encode hello req: {e}");
+                            continue;
+                        }
+                    };
                     let dest = std::net::SocketAddr::new(
                         std::net::IpAddr::V4(contact.ip),
                         contact.udp_port,
@@ -1040,7 +1054,7 @@ pub async fn start_network(
             // Buddy system: find a relay buddy if firewalled (only when NAT traversal is enabled)
             _ = buddy_timer.tick() => {
                 if !state.nat_traversal_enabled { continue; }
-                state.buddy_manager.check_buddy_alive();
+                state.buddy_manager.check_buddy_alive().await;
                 if state.buddy_manager.should_find_buddy(state.firewalled) {
                     state.buddy_manager.start_finding();
                     let target = state.buddy_manager.find_buddy_target();
@@ -1271,7 +1285,11 @@ async fn handle_udp_packet(
     let msg = match messages::decode_packet(data) {
         Ok(m) => m,
         Err(_first_err) => {
-            if let Some(decrypted) = kad::obfuscation::try_decrypt_kad_packet(data, &state.local_id) {
+            let receiver_vk = match from.ip() {
+                std::net::IpAddr::V4(ip) => KadUDPKey::generate(state.udp_key_seed, u32::from(ip)).key,
+                _ => 0,
+            };
+            if let Some(decrypted) = kad::obfuscation::try_decrypt_kad_packet(data, &state.local_id, &state.user_hash, receiver_vk) {
                 match messages::decode_packet(&decrypted) {
                     Ok(m) => {
                         debug!("Decrypted obfuscated KAD packet from {from} ({} bytes)", data.len());
@@ -2229,6 +2247,7 @@ async fn handle_command(
                     total_size: file_size,
                     transferred: 0,
                     started_at: now,
+                    failure_reason: None,
                 };
                 let _ = db.save_transfer(&db_transfer);
 
@@ -2257,7 +2276,7 @@ async fn handle_command(
         }
 
         NetworkCommand::GetPeers { tx } => {
-            let banned_ids = db.banned_peer_ids();
+            let banned_ids = db.banned_peer_ids().unwrap_or_default();
             let peers: Vec<PeerInfo> = state
                 .routing_table
                 .all_contacts()
@@ -2378,6 +2397,28 @@ async fn handle_command(
             }
         }
 
+        NetworkCommand::UnbanPeer { peer_id_hex } => {
+            if let Some(kad_id) = KadId::from_hex(&peer_id_hex) {
+                if let Some(contact) = state.routing_table.get_contact(&kad_id) {
+                    state.banned_ips.remove(&contact.ip);
+                }
+            }
+            if let Ok(peers) = db.get_peers() {
+                for peer in &peers {
+                    if peer.id == peer_id_hex {
+                        for addr_str in &peer.addresses {
+                            if let Some((ip_str, _)) = addr_str.rsplit_once(':') {
+                                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                                    state.banned_ips.remove(&ip);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            info!("Unbanned peer {peer_id_hex}");
+        }
+
         NetworkCommand::UnannounceFiles { file_hashes } => {
             for hash_hex in &file_hashes {
                 if let Ok(raw_bytes) = hex::decode(hash_hex) {
@@ -2452,6 +2493,15 @@ async fn handle_command(
             info!("Sent bootstrap requests to {sample_size} new contacts");
         }
 
+        NetworkCommand::ReloadIpFilter { path } => {
+            state.ip_filter.load_from_file(&path);
+            info!(
+                "Reloaded IP filter from {}: {} ranges",
+                path.display(),
+                state.ip_filter.range_count(),
+            );
+        }
+
         NetworkCommand::Shutdown => {}
     }
 }
@@ -2496,9 +2546,12 @@ async fn handle_download_event(
             );
         }
         DownloadEvent::Completed { transfer_id } => {
-            {
+            let promoted = {
                 let mut mgr = transfer_manager.write().await;
-                mgr.complete(&transfer_id);
+                mgr.complete(&transfer_id)
+            };
+            for t in &promoted {
+                info!("Promoted queued transfer {} ({}) to active", t.id, t.file_name);
             }
             let _ = db.update_transfer_status(&transfer_id, "\"completed\"");
             let _ = app_handle.emit(
@@ -2507,9 +2560,12 @@ async fn handle_download_event(
             );
         }
         DownloadEvent::Failed { transfer_id, error } => {
-            {
+            let promoted = {
                 let mut mgr = transfer_manager.write().await;
-                mgr.fail(&transfer_id, &error);
+                mgr.fail(&transfer_id, &error)
+            };
+            for t in &promoted {
+                info!("Promoted queued transfer {} ({}) to active", t.id, t.file_name);
             }
             let _ = db.update_transfer_status(&transfer_id, "\"failed\"");
             let _ = app_handle.emit(
@@ -2546,6 +2602,7 @@ async fn handle_upload_event(
                 total_size,
                 transferred: 0,
                 started_at: chrono::Utc::now().timestamp(),
+                failure_reason: None,
             };
             {
                 let mut mgr = transfer_manager.write().await;
@@ -2584,9 +2641,12 @@ async fn handle_upload_event(
             );
         }
         UploadEventKind::Completed => {
-            {
+            let promoted = {
                 let mut mgr = transfer_manager.write().await;
-                mgr.complete(&event.transfer_id);
+                mgr.complete(&event.transfer_id)
+            };
+            for t in &promoted {
+                info!("Promoted queued transfer {} ({}) to active", t.id, t.file_name);
             }
             let _ = app_handle.emit(
                 "transfer-complete",
@@ -2594,9 +2654,12 @@ async fn handle_upload_event(
             );
         }
         UploadEventKind::Failed { error } => {
-            {
+            let promoted = {
                 let mut mgr = transfer_manager.write().await;
-                mgr.fail(&event.transfer_id, &error);
+                mgr.fail(&event.transfer_id, &error)
+            };
+            for t in &promoted {
+                info!("Promoted queued transfer {} ({}) to active", t.id, t.file_name);
             }
             let _ = app_handle.emit(
                 "transfer-failed",

@@ -1,5 +1,6 @@
 import { writable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
+import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { Transfer } from '$lib/types';
 import { getTransfers } from '$lib/api/transfers';
 
@@ -19,12 +20,13 @@ interface TransferEventPayload {
 export const transfers = writable<Transfer[]>([]);
 
 let initialized = false;
+let unlisteners: UnlistenFn[] = [];
 
 export async function initTransferStore() {
   if (initialized) return;
   initialized = true;
 
-  listen<ProgressPayload>('transfer-progress', (event) => {
+  unlisteners.push(await listen<ProgressPayload>('transfer-progress', (event) => {
     const p = event.payload;
     transfers.update((list) => {
       const idx = list.findIndex((t) => t.id === p.id);
@@ -39,27 +41,27 @@ export async function initTransferStore() {
       }
       return [...list];
     });
-  });
+  }));
 
-  listen<TransferEventPayload>('transfer-complete', (event) => {
+  unlisteners.push(await listen<TransferEventPayload>('transfer-complete', (event) => {
     const id = event.payload.id;
     transfers.update((list) =>
       list.map((t) =>
         t.id === id ? { ...t, status: 'completed' as const, progress: 100, speed: 0 } : t
       )
     );
-  });
+  }));
 
-  listen<TransferEventPayload>('transfer-failed', (event) => {
+  unlisteners.push(await listen<TransferEventPayload>('transfer-failed', (event) => {
     const id = event.payload.id;
     transfers.update((list) =>
       list.map((t) =>
         t.id === id ? { ...t, status: 'failed' as const, speed: 0 } : t
       )
     );
-  });
+  }));
 
-  listen<TransferEventPayload & { status?: string; peer_id?: string }>(
+  unlisteners.push(await listen<TransferEventPayload & { status?: string; peer_id?: string }>(
     'transfer-status',
     (event) => {
       const { id, status, peer_id } = event.payload;
@@ -76,7 +78,7 @@ export async function initTransferStore() {
         })
       );
     }
-  );
+  ));
 
   try {
     const all = await getTransfers();
@@ -84,6 +86,12 @@ export async function initTransferStore() {
   } catch {
     // Backend not ready yet
   }
+}
+
+export function cleanupTransferStore() {
+  for (const unlisten of unlisteners) unlisten();
+  unlisteners = [];
+  initialized = false;
 }
 
 export function startTransferPoll() {

@@ -24,7 +24,10 @@ impl FileIndexer {
         for entry in WalkDir::new(path)
             .follow_links(false)
             .into_iter()
-            .filter_map(|e| e.ok())
+            .filter_map(|e| match e {
+                Ok(entry) => Some(entry),
+                Err(e) => { warn!("WalkDir error: {e}"); None }
+            })
         {
             if entry.file_type().is_file() {
                 match Self::index_file(entry.path()) {
@@ -66,7 +69,7 @@ impl FileIndexer {
             .unwrap_or_default();
 
         Ok(FileInfo {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: hash.clone(),
             name,
             path: path.to_string_lossy().to_string(),
             size: metadata.len(),

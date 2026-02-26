@@ -90,6 +90,27 @@ pub fn format_ed2k_link(name: &str, size: u64, hash: &str) -> String {
     format!("ed2k://|file|{}|{}|{}|/", name, size, hash.to_uppercase())
 }
 
+fn percent_decode_str(s: &str) -> String {
+    let mut result = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                16,
+            ) {
+                result.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(result).unwrap_or_else(|_| s.to_string())
+}
+
 /// Parse an ed2k link, returning (name, size, hash)
 pub fn parse_ed2k_link(link: &str) -> Option<(String, u64, String)> {
     let trimmed = link.trim();
@@ -103,7 +124,7 @@ pub fn parse_ed2k_link(link: &str) -> Option<(String, u64, String)> {
     if parts.len() < 3 {
         return None;
     }
-    let name = parts[0].to_string();
+    let name = percent_decode_str(parts[0]);
     let size = parts[1].parse::<u64>().ok()?;
     let hash = parts[2].to_lowercase();
     if hash.len() != 32 {

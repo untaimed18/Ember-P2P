@@ -192,6 +192,7 @@ impl UploadHandler {
         let mut uploaded: u64 = 0;
         let mut transfer_id: Option<String> = None;
         let mut total_size: u64 = 0;
+        let mut upload_slot_active = false;
 
         loop {
             let (proto, opcode, payload) = if let Some(pkt) = deferred_packet.take() {
@@ -347,6 +348,7 @@ impl UploadHandler {
 
                     self.active_count
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    upload_slot_active = true;
 
                     if let Some(hash) = current_file_hash {
                         let tid = uuid::Uuid::new_v4().to_string();
@@ -382,6 +384,20 @@ impl UploadHandler {
                     } else {
                         parse_request_parts_32(&payload)?
                     };
+
+                    let offsets: Vec<(u64, u64)> = offsets
+                        .into_iter()
+                        .filter(|&(start, end)| {
+                            if end > total_size {
+                                warn!("Peer requested range past file end: {end} > {total_size}");
+                                false
+                            } else if start >= end {
+                                false
+                            } else {
+                                true
+                            }
+                        })
+                        .collect();
 
                     let hash_hex = hex::encode(hash);
                     let file_path = {
@@ -501,8 +517,11 @@ impl UploadHandler {
                             kind: UploadEventKind::Completed,
                         }).await;
                     }
-                    self.active_count
-                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    if upload_slot_active {
+                        self.active_count
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        upload_slot_active = false;
+                    }
                     break;
                 }
 
@@ -576,8 +595,6 @@ impl UploadHandler {
 
         // Cleanup: emit completion/failure for any tracked upload
         if let Some(tid) = &transfer_id {
-            // If we got here without an explicit cancel/end, treat it as completed
-            // (the peer may have disconnected after getting what it needed)
             let _ = self.upload_event_tx.send(UploadEvent {
                 transfer_id: tid.clone(),
                 kind: if uploaded > 0 {
@@ -589,10 +606,7 @@ impl UploadHandler {
                 },
             }).await;
 
-            let prev = self
-                .active_count
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if prev > 0 {
+            if upload_slot_active {
                 self.active_count
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -658,9 +672,6 @@ fn parse_request_parts_32(payload: &[u8]) -> anyhow::Result<Vec<(u64, u64)>> {
     }
     Ok(offsets)
 }
-
-const OP_HASHSETREQ: u8 = 0x51;
-const OP_HASHSETANSWER: u8 = 0x52;
 
 fn compute_part_hashes(path: &std::path::Path) -> anyhow::Result<Vec<[u8; 16]>> {
     use digest::Digest;
