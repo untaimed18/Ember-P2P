@@ -173,6 +173,17 @@ impl TransferManager {
         self.promote_next()
     }
 
+    pub fn remove(&mut self, id: &str) {
+        if let Some(control) = self.controls.get(id) {
+            control.cancel();
+        }
+        self.active.remove(id);
+        self.queue.retain(|t| t.id != id);
+        self.completed.retain(|t| t.id != id);
+        self.controls.remove(id);
+        self.last_progress.remove(id);
+    }
+
     pub fn get_all(&self) -> Vec<Transfer> {
         let mut all: Vec<Transfer> = self.active.values().cloned().collect();
         all.extend(self.queue.iter().cloned());

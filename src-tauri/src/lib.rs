@@ -160,6 +160,7 @@ pub fn run() {
             commands::transfers::pause_transfer,
             commands::transfers::resume_transfer,
             commands::transfers::cancel_transfer,
+            commands::transfers::remove_transfer,
             commands::transfers::get_transfers,
             commands::transfers::clear_completed,
             commands::sharing::add_shared_folder,

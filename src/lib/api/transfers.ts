@@ -29,6 +29,10 @@ export async function cancelTransfer(transferId: string): Promise<void> {
   return invoke('cancel_transfer', { transferId });
 }
 
+export async function removeTransfer(transferId: string): Promise<void> {
+  return invoke('remove_transfer', { transferId });
+}
+
 export async function getTransfers(): Promise<Transfer[]> {
   return invoke('get_transfers');
 }

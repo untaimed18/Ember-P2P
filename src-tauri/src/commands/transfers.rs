@@ -110,6 +110,9 @@ pub async fn cancel_transfer(
         let mut manager = state.transfer_manager.write().await;
         manager.cancel(&transfer_id)
     };
+
+    let _ = state.db.remove_transfer(&transfer_id);
+
     for t in &promoted {
         let _ = state
             .network_tx
@@ -124,6 +127,19 @@ pub async fn cancel_transfer(
             })
             .await;
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remove_transfer(
+    state: tauri::State<'_, AppState>,
+    transfer_id: String,
+) -> Result<(), String> {
+    {
+        let mut manager = state.transfer_manager.write().await;
+        manager.remove(&transfer_id);
+    }
+    let _ = state.db.remove_transfer(&transfer_id);
     Ok(())
 }
 
