@@ -1491,7 +1491,8 @@ async fn handle_udp_packet(
     match msg {
         KadMessage::BootstrapReq => {
             debug!("BootstrapReq from {from}");
-            let contacts = state.routing_table.find_closest(&state.local_id, 20);
+            // eMule: GetBootstrapContacts returns 20 contacts from top buckets
+            let contacts = state.routing_table.export_bootstrap_contacts(20);
             let res = KadMessage::BootstrapRes {
                 sender_id: state.local_id,
                 tcp_port: state.tcp_port,
@@ -1534,10 +1535,17 @@ async fn handle_udp_packet(
                 last_type_set: 0,
             });
 
+            // eMule: if routing table was empty before bootstrap, assume all contacts
+            // are verified to speed up the connecting process.
+            let assume_verified = state.routing_table.len() <= 1;
+
             let mut contact_addrs = Vec::new();
-            for c in contacts {
+            for mut c in contacts {
                 let addr = SocketAddr::new(c.ip.into(), c.udp_port);
                 contact_addrs.push(addr);
+                if assume_verified {
+                    c.verified = true;
+                }
                 state.routing_table.insert(c);
             }
 

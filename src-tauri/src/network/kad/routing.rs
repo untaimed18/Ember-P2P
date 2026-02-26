@@ -191,22 +191,27 @@ impl RoutingTable {
             return None;
         }
 
-        // Global /24 subnet limit (eMule: max 10 contacts per subnet)
+        // Global /24 subnet limit (eMule: max 10 contacts per subnet, except LAN IPs)
         let snet = subnet_key(contact.ip);
-        let subnet_count = self.global_subnet_count.get(&snet).copied().unwrap_or(0);
-        if subnet_count >= MAX_CONTACTS_SUBNET {
-            return None;
+        let is_lan = ip_filter::is_lan_ip(contact.ip);
+        if !is_lan {
+            let subnet_count = self.global_subnet_count.get(&snet).copied().unwrap_or(0);
+            if subnet_count >= MAX_CONTACTS_SUBNET {
+                return None;
+            }
         }
 
-        // Per-bin subnet limit (eMule: max 2 per bin from same /24)
-        let bucket = &self.buckets[bucket_idx];
-        let bin_subnet_count = bucket
-            .contacts
-            .iter()
-            .filter(|c| subnet_key(c.ip) == snet)
-            .count();
-        if bin_subnet_count >= MAX_CONTACTS_SUBNET_PER_BIN {
-            return None;
+        // Per-bin subnet limit (eMule: max 2 per bin from same /24, except LAN IPs)
+        if !is_lan {
+            let bucket = &self.buckets[bucket_idx];
+            let bin_subnet_count = bucket
+                .contacts
+                .iter()
+                .filter(|c| subnet_key(c.ip) == snet)
+                .count();
+            if bin_subnet_count >= MAX_CONTACTS_SUBNET_PER_BIN {
+                return None;
+            }
         }
 
         // Set created_at for new contacts
