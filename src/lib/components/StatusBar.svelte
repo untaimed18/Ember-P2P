@@ -9,7 +9,7 @@
       {$networkStats.status}
     </span>
     <span class="status-item">
-      {$networkStats.connected_peers} peers
+      {$networkStats.connected_peers} contacts
     </span>
   </div>
 

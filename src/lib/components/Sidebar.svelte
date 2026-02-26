@@ -6,7 +6,7 @@
     { href: '/search', label: 'Search', icon: '⌕' },
     { href: '/transfers', label: 'Transfers', icon: '⇅' },
     { href: '/sharing', label: 'Sharing', icon: '⊕' },
-    { href: '/peers', label: 'Peers', icon: '⊛' },
+    { href: '/kad-network', label: 'KAD Network', icon: '⊛' },
     { href: '/security', label: 'Security', icon: '🛡' },
     { href: '/settings', label: 'Settings', icon: '⚙' },
   ];

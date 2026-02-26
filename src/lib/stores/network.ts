@@ -2,7 +2,7 @@ import { writable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { NetworkStats } from '$lib/types';
-import { getNetworkStats } from '$lib/api/peers';
+import { getNetworkStats } from '$lib/api/kad';
 
 export const networkStats = writable<NetworkStats>({
   connected_peers: 0,

@@ -18,6 +18,29 @@ export interface PeerInfo {
   banned: boolean;
 }
 
+export interface KadContact {
+  id: string;
+  type: number;
+  version: number;
+  distance: string;
+  ip_verified: boolean;
+  bootstrap: boolean;
+}
+
+export interface KadSearchEntry {
+  id: number;
+  target: string;
+  type: string;
+  name: string;
+  status: 'active' | 'stopping';
+  load: number;
+  load_response: number;
+  load_total: number;
+  packets_sent: number;
+  request_answer: number;
+  responses: number;
+}
+
 export interface Transfer {
   id: string;
   file_name: string;

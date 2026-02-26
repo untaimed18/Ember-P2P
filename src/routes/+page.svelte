@@ -29,7 +29,7 @@
       </div>
 
       <div class="stat-card">
-        <div class="label">Connected Peers</div>
+        <div class="label">KAD Contacts</div>
         <div class="value">{$networkStats.connected_peers}</div>
       </div>
 
