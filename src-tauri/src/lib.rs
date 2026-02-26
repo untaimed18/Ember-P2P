@@ -72,6 +72,9 @@ pub fn run() {
 
             let transfer_manager = Arc::new(RwLock::new(TransferManager::new(settings.max_concurrent_downloads)));
 
+            let shutdown_complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let shutdown_complete_net = shutdown_complete.clone();
+
             app.manage(AppState {
                 network_tx,
                 db: db.clone(),
@@ -79,6 +82,7 @@ pub fn run() {
                 local_index: local_index.clone(),
                 bandwidth_limiter: bandwidth_limiter.clone(),
                 transfer_manager: transfer_manager.clone(),
+                shutdown_complete,
             });
 
             let index_clone = local_index.clone();
@@ -137,6 +141,7 @@ pub fn run() {
                 {
                     tracing::error!("Network error: {e}");
                 }
+                shutdown_complete_net.store(true, std::sync::atomic::Ordering::Release);
             });
 
             let bw_limiter = bandwidth_limiter.clone();
@@ -190,7 +195,18 @@ pub fn run() {
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     let tx = state.network_tx.clone();
                     let _ = tx.try_send(network::NetworkCommand::Shutdown);
-                    info!("Sent shutdown command to network");
+                    info!("Sent shutdown command to network, waiting for save...");
+
+                    let flag = state.shutdown_complete.clone();
+                    let start = std::time::Instant::now();
+                    while !flag.load(std::sync::atomic::Ordering::Acquire) {
+                        if start.elapsed() > std::time::Duration::from_secs(5) {
+                            tracing::warn!("Network shutdown timed out after 5s");
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    info!("Network shutdown complete");
                 }
             }
         });

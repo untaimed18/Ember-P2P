@@ -15,4 +15,6 @@ pub struct AppState {
     pub local_index: Arc<RwLock<LocalIndex>>,
     pub bandwidth_limiter: Arc<BandwidthLimiter>,
     pub transfer_manager: Arc<RwLock<TransferManager>>,
+    /// Signaled by the network task after it finishes saving nodes.dat on shutdown.
+    pub shutdown_complete: Arc<std::sync::atomic::AtomicBool>,
 }

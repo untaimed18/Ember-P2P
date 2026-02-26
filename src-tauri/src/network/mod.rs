@@ -467,6 +467,7 @@ pub async fn start_network(
     let mut buddy_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut flood_cleanup_timer = tokio::time::interval(std::time::Duration::from_secs(30));
     let mut source_retry_timer = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut nodes_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
 
     // Resume incomplete downloads from previous session
     if let Ok(incomplete) = db.get_incomplete_downloads() {
@@ -1233,12 +1234,21 @@ pub async fn start_network(
                     }
                 }
             }
+
+            // Periodic nodes.dat save to protect against crashes
+            _ = nodes_save_timer.tick() => {
+                let contacts = state.routing_table.export_bootstrap_contacts(200);
+                let nodes_path = state.data_dir.join("nodes.dat");
+                if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
+                    error!("Failed periodic nodes.dat save: {e}");
+                }
+            }
         }
     }
 
-    // Save routing table on shutdown
+    // Save routing table on shutdown (eMule saves ~200 bootstrap contacts)
     info!("Shutting down network");
-    let contacts = state.routing_table.export_contacts();
+    let contacts = state.routing_table.export_bootstrap_contacts(200);
     let nodes_path = state.data_dir.join("nodes.dat");
     if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
         error!("Failed to save nodes.dat: {e}");

@@ -156,7 +156,18 @@ fn read_contact_v2(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<KadContact> {
 }
 
 /// Save contacts to a nodes.dat file (v2 format).
+/// Uses atomic write (temp file + rename) to prevent corruption on crash.
+/// Skips saving if contacts is empty and a valid nodes.dat already exists
+/// (matching eMule's protection against overwriting good data with nothing).
 pub fn save_nodes_dat(path: &Path, contacts: &[KadContact]) -> anyhow::Result<()> {
+    if contacts.is_empty() && path.exists() {
+        info!("Skipping nodes.dat save: routing table empty but existing file present");
+        return Ok(());
+    }
+    if contacts.is_empty() {
+        return Ok(());
+    }
+
     let mut buf = Vec::with_capacity(contacts.len() * 35 + 12);
 
     // v2 header
@@ -180,7 +191,11 @@ pub fn save_nodes_dat(path: &Path, contacts: &[KadContact]) -> anyhow::Result<()
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, &buf)?;
+
+    // Atomic write: write to temporary file, then rename over the target.
+    let tmp_path = path.with_extension("dat.tmp");
+    std::fs::write(&tmp_path, &buf)?;
+    std::fs::rename(&tmp_path, path)?;
     info!("Saved {} contacts to nodes.dat", contacts.len());
     Ok(())
 }

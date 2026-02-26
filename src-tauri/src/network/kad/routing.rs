@@ -139,6 +139,7 @@ impl RoutingTable {
 
         if let Some(pos) = bucket.contacts.iter().position(|c| c.id == contact.id) {
             let mut existing = bucket.contacts.remove(pos).unwrap();
+            let old_ip = existing.ip;
             existing.ip = contact.ip;
             existing.udp_port = contact.udp_port;
             existing.tcp_port = contact.tcp_port;
@@ -152,6 +153,11 @@ impl RoutingTable {
             existing.kad_options = contact.kad_options;
             existing.update_type();
             bucket.contacts.push_back(existing);
+            // Fix IP tracking if the contact's IP changed
+            if old_ip != contact.ip {
+                self.track_ip_remove(old_ip);
+                self.track_ip_add(contact.ip);
+            }
             return None;
         }
 
@@ -421,6 +427,42 @@ impl RoutingTable {
     /// Get a flat list of all contacts (for persistence).
     pub fn export_contacts(&self) -> Vec<KadContact> {
         self.all_contacts().cloned().collect()
+    }
+
+    /// Select up to `max_count` contacts for bootstrap persistence, preferring
+    /// verified contacts spread across buckets (matching eMule's GetBootstrapContacts).
+    pub fn export_bootstrap_contacts(&self, max_count: usize) -> Vec<KadContact> {
+        let mut result = Vec::new();
+
+        // First pass: take verified contacts from each bucket (good distribution)
+        for bucket in &self.buckets {
+            for c in &bucket.contacts {
+                if c.verified && !c.is_dead() {
+                    result.push(c.clone());
+                }
+            }
+        }
+        // Sort verified contacts by type (best first), then by last_seen (most recent first)
+        result.sort_by(|a, b| {
+            a.contact_type.cmp(&b.contact_type)
+                .then(b.last_seen.cmp(&a.last_seen))
+        });
+        result.truncate(max_count);
+
+        // If not enough verified, fill with unverified (non-dead) contacts
+        if result.len() < max_count {
+            let verified_ids: std::collections::HashSet<KadId> =
+                result.iter().map(|c| c.id).collect();
+            let mut unverified: Vec<KadContact> = self.all_contacts()
+                .filter(|c| !c.is_dead() && !verified_ids.contains(&c.id))
+                .cloned()
+                .collect();
+            unverified.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+            let remaining = max_count - result.len();
+            result.extend(unverified.into_iter().take(remaining));
+        }
+
+        result
     }
 
     /// Look up a specific contact by ID.
