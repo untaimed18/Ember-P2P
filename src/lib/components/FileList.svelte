@@ -97,7 +97,7 @@
             <td class="hash">{file.hash.slice(0, 16)}…</td>
             {#if showCopyLink}
               <td>
-                <button class="ghost copy-btn" onclick|stopPropagation={() => copyLink(file)}>
+                <button class="ghost copy-btn" onclick={(e: MouseEvent) => { e.stopPropagation(); copyLink(file); }}>
                   {copiedId === file.id ? 'Copied!' : 'Copy ed2k Link'}
                 </button>
               </td>
