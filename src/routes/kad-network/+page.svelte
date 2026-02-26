@@ -183,11 +183,13 @@
   }
 
   let isConnected = $derived($networkStats.status === 'connected');
-  let isBootstrapDisabled = $derived(
-    isConnected || bootstrapping ||
-    (bootstrapMode === 'ip' && !bootstrapIp.trim()) ||
-    (bootstrapMode === 'url' && !bootstrapUrl.trim())
-  );
+  let isBootstrapDisabled = $derived.by(() => {
+    if (isConnected || bootstrapping) return true;
+    const mode: string = bootstrapMode;
+    if (mode === 'ip' && !bootstrapIp.trim()) return true;
+    if (mode === 'url' && !bootstrapUrl.trim()) return true;
+    return false;
+  });
 
   async function handleBan(peerId: string) {
     const confirmed = confirm(`Ban peer ${peerId.slice(0, 16)}...?`);

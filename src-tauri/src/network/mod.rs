@@ -99,6 +99,23 @@ pub enum NetworkCommand {
     SetBlockPrivateIps {
         block_private: bool,
     },
+    KadConnect,
+    KadDisconnect,
+    KadBootstrapIp {
+        ip: String,
+        port: u16,
+    },
+    KadBootstrapUrl {
+        url: String,
+    },
+    KadBootstrapClients,
+    RecheckFirewall,
+    GetKadContacts {
+        tx: oneshot::Sender<Vec<KadContactInfo>>,
+    },
+    GetKadSearches {
+        tx: oneshot::Sender<Vec<KadSearchInfo>>,
+    },
     Shutdown,
 }
 
@@ -2843,6 +2860,257 @@ async fn handle_command(
         NetworkCommand::SetBlockPrivateIps { block_private } => {
             state.ip_filter.set_block_private(block_private);
             info!("Block private IPs: {block_private}");
+        }
+
+        NetworkCommand::KadConnect => {
+            info!("KAD connect requested");
+            state.stats.status = NetworkStatus::Connecting;
+
+            let contacts: Vec<KadContact> = state.routing_table.all_contacts().cloned().collect();
+            if contacts.is_empty() {
+                let default_contacts = bootstrap::default_bootstrap_contacts();
+                for c in &default_contacts {
+                    state.routing_table.insert(c.clone());
+                }
+                for contact in &default_contacts {
+                    let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                    let msg = KadMessage::BootstrapReq;
+                    if let Ok(packet) = messages::encode_packet(&msg) {
+                        let _ = socket.send_to(&packet, addr).await;
+                    }
+                }
+                info!("Bootstrapped from {} default contacts", default_contacts.len());
+            } else {
+                for contact in contacts.iter().take(20) {
+                    let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                    let msg = KadMessage::BootstrapReq;
+                    if let Ok(packet) = messages::encode_packet(&msg) {
+                        let _ = socket.send_to(&packet, addr).await;
+                    }
+                }
+                info!("Sent bootstrap requests to {} existing contacts", contacts.len().min(20));
+            }
+
+            if state.nat_traversal_enabled {
+                let fw_contacts: Vec<KadContact> = state.routing_table.all_contacts().take(3).cloned().collect();
+                for contact in &fw_contacts {
+                    let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                    let msg = KadMessage::FirewalledReq { tcp_port: state.tcp_port };
+                    if let Ok(packet) = messages::encode_packet(&msg) {
+                        let _ = socket.send_to(&packet, addr).await;
+                        state.firewall_checks_sent += 1;
+                    }
+                }
+            }
+        }
+
+        NetworkCommand::KadDisconnect => {
+            info!("KAD disconnect requested");
+            state.stats.status = NetworkStatus::Disconnected;
+            state.search_manager = SearchManager::new();
+            state.pending_keyword_searches.clear();
+            state.pending_source_searches.clear();
+            state.external_ip = None;
+            state.firewall_checks_sent = 0;
+            state.firewall_responses.clear();
+            state.self_lookup_done = false;
+        }
+
+        NetworkCommand::KadBootstrapIp { ip, port } => {
+            info!("KAD bootstrap from IP {ip}:{port}");
+            if let Ok(addr_ip) = ip.parse::<Ipv4Addr>() {
+                let contact = KadContact {
+                    id: KadId::zero(),
+                    ip: addr_ip,
+                    udp_port: port,
+                    tcp_port: port.saturating_sub(10),
+                    version: KADEMLIA_VERSION,
+                    last_seen: chrono::Utc::now().timestamp(),
+                    verified: false,
+                    contact_type: CONTACT_TYPE_NEW,
+                    udp_key: None,
+                    kad_options: 0,
+                    created_at: chrono::Utc::now().timestamp(),
+                    expires_at: 0,
+                    last_type_set: 0,
+                };
+                state.routing_table.insert(contact);
+
+                let addr = SocketAddr::new(addr_ip.into(), port);
+                let msg = KadMessage::BootstrapReq;
+                if let Ok(packet) = messages::encode_packet(&msg) {
+                    let _ = socket.send_to(&packet, addr).await;
+                    info!("Sent bootstrap request to {addr}");
+                }
+
+                if state.stats.status == NetworkStatus::Disconnected {
+                    state.stats.status = NetworkStatus::Connecting;
+                }
+            } else {
+                warn!("Invalid bootstrap IP: {ip}");
+            }
+        }
+
+        NetworkCommand::KadBootstrapUrl { url } => {
+            info!("KAD bootstrap from URL: {url}");
+            match reqwest::get(&url).await {
+                Ok(resp) => {
+                    match resp.bytes().await {
+                        Ok(bytes) => {
+                            let tmp_dir = std::env::temp_dir();
+                            let tmp_path = tmp_dir.join(format!("nexus-nodes-{}.dat", chrono::Utc::now().timestamp()));
+                            if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+                                warn!("Failed to write temp nodes.dat: {e}");
+                            } else {
+                                match bootstrap::load_nodes_dat(&tmp_path) {
+                                    Ok(contacts) => {
+                                        let count = contacts.len();
+                                        for c in &contacts {
+                                            state.routing_table.insert(c.clone());
+                                        }
+                                        for contact in contacts.iter().take(20) {
+                                            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                                            let msg = KadMessage::BootstrapReq;
+                                            if let Ok(packet) = messages::encode_packet(&msg) {
+                                                let _ = socket.send_to(&packet, addr).await;
+                                            }
+                                        }
+                                        info!("Loaded {count} contacts from URL, bootstrapping");
+                                        if state.stats.status == NetworkStatus::Disconnected {
+                                            state.stats.status = NetworkStatus::Connecting;
+                                        }
+                                    }
+                                    Err(e) => warn!("Failed to parse nodes.dat from URL: {e}"),
+                                }
+                                let _ = std::fs::remove_file(&tmp_path);
+                            }
+                        }
+                        Err(e) => warn!("Failed to read response from {url}: {e}"),
+                    }
+                }
+                Err(e) => warn!("Failed to download from {url}: {e}"),
+            }
+        }
+
+        NetworkCommand::KadBootstrapClients => {
+            info!("KAD bootstrap from connected clients");
+            let contacts: Vec<KadContact> = state.routing_table.all_contacts().cloned().collect();
+            let send_count = contacts.len().min(20);
+            for contact in contacts.iter().take(send_count) {
+                let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                let msg = KadMessage::BootstrapReq;
+                if let Ok(packet) = messages::encode_packet(&msg) {
+                    let _ = socket.send_to(&packet, addr).await;
+                }
+            }
+            info!("Sent bootstrap requests to {send_count} connected contacts");
+            if state.stats.status == NetworkStatus::Disconnected && !contacts.is_empty() {
+                state.stats.status = NetworkStatus::Connecting;
+            }
+        }
+
+        NetworkCommand::RecheckFirewall => {
+            info!("Rechecking firewall status");
+            state.firewall_checks_sent = 0;
+            state.firewall_responses.clear();
+            state.udp_port_responses.clear();
+
+            let contacts: Vec<KadContact> = state
+                .routing_table
+                .all_contacts()
+                .filter(|c| c.verified && c.contact_type <= CONTACT_TYPE_OPEN)
+                .take(3)
+                .cloned()
+                .collect();
+
+            for contact in &contacts {
+                let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                let msg = KadMessage::FirewalledReq { tcp_port: state.tcp_port };
+                if let Ok(packet) = messages::encode_packet(&msg) {
+                    let _ = socket.send_to(&packet, addr).await;
+                    state.firewall_checks_sent += 1;
+                }
+            }
+
+            for contact in state.routing_table.all_contacts().skip(3).take(3) {
+                let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                let msg = KadMessage::Ping;
+                if let Ok(packet) = messages::encode_packet(&msg) {
+                    let _ = socket.send_to(&packet, addr).await;
+                }
+            }
+
+            info!("Sent {} firewall checks and 3 ping probes", state.firewall_checks_sent);
+        }
+
+        NetworkCommand::GetKadContacts { tx } => {
+            let local_id = state.local_id;
+            let contacts: Vec<KadContactInfo> = state
+                .routing_table
+                .all_contacts()
+                .map(|c| {
+                    let distance = c.id.xor_distance(&local_id);
+                    KadContactInfo {
+                        id: c.id.to_hex(),
+                        contact_type: c.contact_type,
+                        version: c.version,
+                        distance: distance.to_hex(),
+                        ip_verified: c.verified,
+                        bootstrap: c.contact_type == CONTACT_TYPE_NEW && c.version == 0,
+                    }
+                })
+                .collect();
+            let _ = tx.send(contacts);
+        }
+
+        NetworkCommand::GetKadSearches { tx } => {
+            let searches: Vec<KadSearchInfo> = state
+                .search_manager
+                .active
+                .iter()
+                .map(|(sid, search)| {
+                    let type_name = match search.search_type {
+                        SearchType::FindNode => "Node",
+                        SearchType::FindKeyword => "Keyword",
+                        SearchType::FindSource { .. } => "File",
+                        SearchType::FindNotes { .. } => "Notes",
+                        SearchType::FindBuddy => "Buddy",
+                        SearchType::StoreFile => "Store File",
+                        SearchType::StoreKeyword => "Store Keyword",
+                        SearchType::StoreNotes => "Store Notes",
+                        SearchType::NodeComplete => "Node Complete",
+                    };
+                    let name = match search.search_type {
+                        SearchType::FindKeyword => {
+                            state.pending_keyword_searches.get(sid)
+                                .map(|_| "Keyword Search".to_string())
+                                .unwrap_or_default()
+                        }
+                        SearchType::FindSource { .. } => {
+                            state.download_source_searches.get(sid)
+                                .and_then(|tid| state.pending_downloads.get(tid))
+                                .map(|pd| pd.file_name.clone())
+                                .unwrap_or_else(|| "Source Search".to_string())
+                        }
+                        SearchType::FindBuddy => "Find Buddy".to_string(),
+                        _ => String::new(),
+                    };
+                    KadSearchInfo {
+                        id: sid.0,
+                        target: search.target.to_hex(),
+                        search_type: type_name.to_string(),
+                        name,
+                        status: if search.completed { "stopping".to_string() } else { "active".to_string() },
+                        load: 0,
+                        load_response: 0,
+                        load_total: 0,
+                        packets_sent: search.queried.len() as u32,
+                        request_answer: search.pending.len() as u32,
+                        responses: search.results.len() as u32,
+                    }
+                })
+                .collect();
+            let _ = tx.send(searches);
         }
 
         NetworkCommand::Shutdown => {}

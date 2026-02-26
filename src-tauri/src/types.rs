@@ -86,6 +86,35 @@ pub struct NetworkStats {
     pub stores_acknowledged: u32,
 }
 
+/// Serializable KAD contact info for the frontend (mirrors eMule KadContactListCtrl columns)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KadContactInfo {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub contact_type: u8,
+    pub version: u8,
+    pub distance: String,
+    pub ip_verified: bool,
+    pub bootstrap: bool,
+}
+
+/// Serializable KAD search entry for the frontend (mirrors eMule KadSearchListCtrl columns)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KadSearchInfo {
+    pub id: u64,
+    pub target: String,
+    #[serde(rename = "type")]
+    pub search_type: String,
+    pub name: String,
+    pub status: String,
+    pub load: u32,
+    pub load_response: u32,
+    pub load_total: u32,
+    pub packets_sent: u32,
+    pub request_answer: u32,
+    pub responses: u32,
+}
+
 impl Default for NetworkStats {
     fn default() -> Self {
         Self {
