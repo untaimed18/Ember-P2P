@@ -169,6 +169,8 @@ struct NetworkState {
     obfuscation_enabled: bool,
     /// Shared firewall status that can be updated from spawned tasks
     firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether we've done the initial self-lookup (FindNode for own ID)
+    self_lookup_done: bool,
 }
 
 pub async fn start_network(
@@ -377,6 +379,7 @@ pub async fn start_network(
         banned_ips,
         obfuscation_enabled: settings.obfuscation_enabled,
         firewalled_shared: Arc::new(std::sync::atomic::AtomicBool::new(!upnp_success)),
+        self_lookup_done: false,
     };
 
     // Send bootstrap requests to initial contacts
@@ -453,7 +456,7 @@ pub async fn start_network(
     }
 
     let mut udp_buf = vec![0u8; 65535];
-    let mut bootstrap_timer = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut bootstrap_timer = tokio::time::interval(std::time::Duration::from_secs(10));
     let mut bootstrap_attempts: u32 = 0;
     let mut publish_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut search_poll_timer = tokio::time::interval(std::time::Duration::from_millis(500));
@@ -835,9 +838,10 @@ pub async fn start_network(
                 }
             }
 
-            // Periodic bootstrap/refresh (eMule BigTimer style: threshold=20, query known nodes too)
+            // Periodic bootstrap (eMule BigTimer style)
             _ = bootstrap_timer.tick() => {
                 let table_size = state.routing_table.len();
+
                 if table_size == 0 {
                     bootstrap_attempts += 1;
                     if bootstrap_attempts == 5 {
@@ -849,7 +853,24 @@ pub async fn start_network(
                 } else {
                     bootstrap_attempts = 0;
                 }
-                if table_size < 20 {
+
+                // Self-lookup: once we have some contacts, do a FindNode for our own ID
+                // This is the primary mechanism eMule uses to populate the routing table
+                if !state.self_lookup_done && table_size >= 2 {
+                    let closest = state.routing_table.find_closest(&state.local_id, K_BUCKET_SIZE);
+                    if !closest.is_empty() {
+                        let sid = state.search_manager.start_search(
+                            state.local_id,
+                            SearchType::FindNode,
+                            closest,
+                        );
+                        info!("Started self-lookup (FindNode for own ID), search {}, table has {table_size} contacts", sid.0);
+                        state.self_lookup_done = true;
+                    }
+                }
+
+                // Keep bootstrapping until we have a healthy routing table (~200 contacts)
+                if table_size < 200 {
                     // Send bootstrap to hardcoded nodes
                     for contact in &bootstrap::default_bootstrap_contacts() {
                         let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
@@ -859,12 +880,12 @@ pub async fn start_network(
                         }
                     }
 
-                    // Also query random known contacts (eMule bootstraps from existing contacts)
+                    // Query a larger sample of known contacts with BootstrapReq
                     let sample: Vec<KadContact> = {
                         let target = KadId::random();
-                        state.routing_table.find_closest(&target, 3)
+                        state.routing_table.find_closest(&target, 10)
                     };
-                    for contact in sample {
+                    for contact in &sample {
                         let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                         let msg = KadMessage::BootstrapReq;
                         if let Ok(packet) = messages::encode_packet(&msg) {
@@ -877,6 +898,20 @@ pub async fn start_network(
                                 &contact.id,
                             )
                             .await;
+                        }
+                    }
+
+                    // Also start FindNode lookups for random targets to discover
+                    // contacts in different parts of the ID space
+                    if table_size >= 10 {
+                        let random_target = KadId::random();
+                        let closest = state.routing_table.find_closest(&random_target, K_BUCKET_SIZE);
+                        if !closest.is_empty() {
+                            let _sid = state.search_manager.start_search(
+                                random_target,
+                                SearchType::FindNode,
+                                closest,
+                            );
                         }
                     }
                 }
@@ -1428,21 +1463,42 @@ async fn handle_udp_packet(
             };
             if let Ok(packet) = messages::encode_packet(&hello) {
                 let _ = socket.send_to(&packet, from).await;
-                // Also send HelloReq to all returned contacts to verify them
                 for addr in &contact_addrs {
                     let _ = socket.send_to(&packet, addr).await;
                 }
                 debug!("Sent HelloReq to bootstrap node + {} returned contacts", contact_addrs.len());
             }
 
-            info!(
-                "Routing table now has {} contacts",
-                state.routing_table.len()
-            );
-            state.stats.connected_peers = state.routing_table.len() as u32;
+            // Chain-bootstrap: send BootstrapReq to a subset of returned contacts
+            // so they return even more contacts (progressive discovery)
+            let bootstrap_msg = KadMessage::BootstrapReq;
+            if let Ok(bootstrap_pkt) = messages::encode_packet(&bootstrap_msg) {
+                for addr in contact_addrs.iter().take(5) {
+                    state.flood_protection.track_request(*addr, 0x01);
+                    let _ = socket.send_to(&bootstrap_pkt, addr).await;
+                }
+            }
+
+            let table_size = state.routing_table.len();
+            info!("Routing table now has {table_size} contacts");
+            state.stats.connected_peers = table_size as u32;
             if state.stats.status != NetworkStatus::Connected {
                 state.stats.status = NetworkStatus::Connected;
                 let _ = app_handle.emit("network-status", NetworkStatus::Connected);
+            }
+
+            // Trigger self-lookup as soon as we have contacts from first bootstrap
+            if !state.self_lookup_done && table_size >= 2 {
+                let closest = state.routing_table.find_closest(&state.local_id, K_BUCKET_SIZE);
+                if !closest.is_empty() {
+                    let sid = state.search_manager.start_search(
+                        state.local_id,
+                        SearchType::FindNode,
+                        closest,
+                    );
+                    info!("Started self-lookup from BootstrapRes, search {}, {table_size} contacts", sid.0);
+                    state.self_lookup_done = true;
+                }
             }
         }
 
