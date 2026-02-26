@@ -6,8 +6,8 @@ use tracing::{debug, info};
 use super::messages::*;
 use super::types::*;
 
-const KEYWORD_SEARCH_MAX_RESULTS: usize = 300;
-const PENDING_TIMEOUT_SECS: i64 = 5;
+const KEYWORD_SEARCH_MAX_RESULTS: usize = 500;
+const PENDING_TIMEOUT_SECS: i64 = 10;
 const LOOKUP_CONVERGE_COUNT: usize = 2;
 const LOOKUP_MIN_QUERIES: usize = 10;
 
@@ -22,7 +22,7 @@ const TIMEOUT_NOTES: i64 = 45;
 const TIMEOUT_STORE_KEYWORD: i64 = 140;
 const TIMEOUT_STORE_NOTES: i64 = 100;
 const TIMEOUT_FIND_BUDDY: i64 = 100;
-const FETCH_TIMEOUT_SECS: i64 = 30;
+const FETCH_TIMEOUT_SECS: i64 = 45;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchType {
@@ -197,15 +197,16 @@ impl SearchState {
     }
 
     /// Process search results (keyword/source results) during fetch phase.
+    /// In eMule, when the same file hash arrives from multiple KAD nodes,
+    /// the source counts are accumulated. We keep all entries so that
+    /// `convert_search_results()` can properly sum TAG_SOURCES across nodes.
     pub fn handle_search_results(&mut self, from: &KadId, entries: Vec<SearchResultEntry>) {
         self.fetched.insert(*from);
         self.pending.remove(from);
         self.pending_times.remove(from);
 
         for entry in entries {
-            if !self.results.iter().any(|r| r.id == entry.id) {
-                self.results.push(entry);
-            }
+            self.results.push(entry);
         }
         self.check_completion();
     }
@@ -251,8 +252,13 @@ impl SearchState {
     }
 
     pub fn has_enough_results(&self) -> bool {
-        matches!(self.search_type, SearchType::FindKeyword)
-            && self.results.len() >= KEYWORD_SEARCH_MAX_RESULTS
+        if !matches!(self.search_type, SearchType::FindKeyword) {
+            return false;
+        }
+        // Count unique file hashes, not raw entries (duplicates carry
+        // TAG_SOURCES from different KAD nodes and must be kept).
+        let unique: HashSet<&KadId> = self.results.iter().map(|r| &r.id).collect();
+        unique.len() >= KEYWORD_SEARCH_MAX_RESULTS
     }
 
     fn check_phase_transition(&mut self) {

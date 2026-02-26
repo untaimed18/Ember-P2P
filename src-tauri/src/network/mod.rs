@@ -601,9 +601,15 @@ pub async fn start_network(
                 for (sid, search) in state.search_manager.active.iter() {
                     if !search.completed {
                         if state.pending_keyword_searches.contains_key(sid) {
+                            // Report unique file count, not raw entries (which include duplicates)
+                            let unique_count = {
+                                let unique: std::collections::HashSet<&kad::types::KadId> =
+                                    search.results.iter().map(|r| &r.id).collect();
+                                unique.len()
+                            };
                             let _ = app_handle.emit("search-progress", serde_json::json!({
                                 "nodes_contacted": search.queried.len(),
-                                "results_so_far": search.results.len(),
+                                "results_so_far": unique_count,
                                 "phase": format!("{:?}", search.phase),
                             }));
                         }
@@ -613,9 +619,11 @@ pub async fn start_network(
                 for sid in completed_ids {
                     if let Some((tx, mut local_results)) = state.pending_keyword_searches.remove(&sid) {
                         let network_results = if let Some(search) = state.search_manager.get(&sid) {
+                            let unique: std::collections::HashSet<&kad::types::KadId> =
+                                search.results.iter().map(|r| &r.id).collect();
                             info!(
-                                "Keyword search {} completed: {} network results, {} local results",
-                                sid.0, search.results.len(), local_results.len()
+                                "Keyword search {} completed: {} unique files ({} raw entries from KAD), {} local results",
+                                sid.0, unique.len(), search.results.len(), local_results.len()
                             );
                             convert_search_results(&search.results)
                         } else {
@@ -623,7 +631,7 @@ pub async fn start_network(
                         };
                         local_results.extend(network_results);
                         local_results.sort_by(|a, b| b.availability.cmp(&a.availability));
-                        local_results.truncate(300);
+                        local_results.truncate(500);
                         let _ = tx.send(local_results);
                         app_handle.emit("search-complete", ()).ok();
                     } else if let Some(tx) = state.pending_source_searches.remove(&sid) {
@@ -2912,14 +2920,25 @@ fn convert_search_results(
         })
         .collect();
 
+    // Deduplicate by file hash, accumulating source counts across KAD nodes.
+    // In eMule, each responding node independently tracks sources for a file.
+    // When the same file appears from multiple nodes, eMule sums the
+    // TAG_SOURCES values (CSearch::ProcessResult → AddSources).
     let mut dedup: HashMap<String, SearchResult> = HashMap::new();
+    // Track which KAD nodes have already contributed TAG_SOURCES for each
+    // file hash, so we don't double-count from the same node.
+    let mut sources_accum: HashMap<String, u32> = HashMap::new();
 
     for p in parsed {
         if let Some(existing) = dedup.get_mut(&p.hash) {
             if !p.source_addr.is_empty() && !existing.source_addresses.contains(&p.source_addr) {
                 existing.source_addresses.push(p.source_addr);
             }
-            existing.availability = existing.availability.max(p.sources_tag).max(existing.source_addresses.len() as u32);
+            // Accumulate TAG_SOURCES from each responding node
+            let acc = sources_accum.entry(p.hash.clone()).or_insert(0);
+            *acc += p.sources_tag;
+            existing.availability = (*acc).max(existing.source_addresses.len() as u32).max(1);
+
             if existing.file.name.len() < p.name.len() {
                 existing.file.name = p.name;
             }
@@ -2932,6 +2951,7 @@ fn convert_search_results(
                 source_addresses.push(p.source_addr.clone());
             }
             let availability = p.sources_tag.max(source_addresses.len() as u32).max(1);
+            sources_accum.insert(p.hash.clone(), p.sources_tag);
             dedup.insert(
                 p.hash.clone(),
                 SearchResult {
