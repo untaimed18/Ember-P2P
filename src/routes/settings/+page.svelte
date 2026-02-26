@@ -85,6 +85,12 @@
   }
 
   import { formatSpeedSetting } from '$lib/utils';
+  import { theme, applyTheme, type Theme } from '$lib/stores/theme';
+
+  function setTheme(t: Theme) {
+    theme.set(t);
+    applyTheme(t);
+  }
 </script>
 
 <div class="page-header">
@@ -106,6 +112,31 @@
     </div>
   {:else}
     <div class="settings-grid">
+      <section class="settings-section">
+        <h3>Appearance</h3>
+        <div class="field">
+          <label>Theme</label>
+          <div class="theme-picker">
+            <button
+              class="theme-option"
+              class:selected={$theme === 'light'}
+              onclick={() => setTheme('light')}
+            >
+              <span class="theme-preview light-preview"></span>
+              <span>Light</span>
+            </button>
+            <button
+              class="theme-option"
+              class:selected={$theme === 'dark'}
+              onclick={() => setTheme('dark')}
+            >
+              <span class="theme-preview dark-preview"></span>
+              <span>Dark</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
       <section class="settings-section">
         <h3>Identity</h3>
         <div class="field">
@@ -380,5 +411,54 @@
     color: var(--error, #e74c3c);
     font-size: 12px;
     font-weight: 500;
+  }
+
+  .theme-picker {
+    display: flex;
+    gap: 10px;
+  }
+
+  .theme-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    border: 2px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  .theme-option:hover {
+    border-color: var(--border-light);
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .theme-option.selected {
+    border-color: var(--accent);
+    background: var(--bg-hover);
+  }
+
+  .theme-preview {
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    border: 2px solid var(--border);
+  }
+
+  .light-preview {
+    background: #f5f6fa;
+    border-color: #dadce0;
+  }
+
+  .dark-preview {
+    background: #1a1a2e;
+    border-color: #3a4576;
   }
 </style>

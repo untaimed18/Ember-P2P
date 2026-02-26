@@ -5,11 +5,13 @@
   import { initNetworkStore, cleanupNetworkStore, startStatsPoll } from '$lib/stores/network';
   import { initTransferStore, cleanupTransferStore } from '$lib/stores/transfers';
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
+  import { initTheme } from '$lib/stores/theme';
   import { onMount } from 'svelte';
 
   let { children } = $props();
 
   onMount(() => {
+    initTheme();
     initNetworkStore();
     initTransferStore();
     initSearchStore();

@@ -1,4 +1,49 @@
 :root {
+  --bg-primary: #f5f6fa;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #e8ecf4;
+  --bg-surface: #f0f2f8;
+  --bg-hover: #eceef5;
+  --bg-input: #ffffff;
+
+  --text-primary: #1a1c24;
+  --text-secondary: #4a5068;
+  --text-muted: #8890a8;
+  --text-accent: #1a73e8;
+
+  --accent: #1a73e8;
+  --accent-hover: #1565d8;
+  --accent-dim: #d2e3fc;
+  --success: #34a853;
+  --warning: #ea8600;
+  --danger: #d93025;
+
+  --border: #dadce0;
+  --border-light: #c4c9d4;
+
+  --sidebar-width: 220px;
+  --statusbar-height: 32px;
+
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+
+  --font-mono: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.06);
+  --shadow-md: 0 2px 6px rgba(0,0,0,0.08);
+
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  background-color: var(--bg-primary);
+
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+[data-theme="dark"] {
   --bg-primary: #1a1a2e;
   --bg-secondary: #16213e;
   --bg-tertiary: #0f3460;
@@ -21,23 +66,8 @@
   --border: #2a3456;
   --border-light: #3a4576;
 
-  --sidebar-width: 220px;
-  --statusbar-height: 32px;
-
-  --radius-sm: 4px;
-  --radius-md: 6px;
-  --radius-lg: 8px;
-
-  --font-mono: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
-
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  font-size: 14px;
-  line-height: 1.5;
-  color: var(--text-primary);
-  background-color: var(--bg-primary);
-
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
+  --shadow-md: 0 2px 6px rgba(0,0,0,0.4);
 }
 
 *, *::before, *::after {
@@ -86,14 +116,19 @@ button {
   border: none;
   border-radius: var(--radius-sm);
   padding: 6px 14px;
-  background: var(--accent-dim);
-  color: var(--text-primary);
+  background: var(--accent);
+  color: #fff;
   transition: background-color 0.15s;
 }
 
+[data-theme="dark"] button {
+  background: var(--accent-dim);
+  color: var(--text-primary);
+}
+
 button:hover {
-  background: var(--accent);
-  color: #000;
+  background: var(--accent-hover);
+  color: #fff;
 }
 
 button:active {
@@ -102,6 +137,7 @@ button:active {
 
 button.danger {
   background: var(--danger);
+  color: #fff;
 }
 
 button.danger:hover {
@@ -184,16 +220,17 @@ tr:hover td {
   text-transform: uppercase;
 }
 
-.badge.connected { background: var(--success); color: #000; }
-.badge.connecting { background: var(--warning); color: #000; }
+.badge.connected { background: var(--success); color: #fff; }
+.badge.connecting { background: var(--warning); color: #fff; }
 .badge.disconnected { background: var(--danger); color: #fff; }
-.badge.active { background: var(--accent); color: #000; }
+.badge.active { background: var(--accent); color: #fff; }
 .badge.queued { background: var(--text-muted); color: #fff; }
-.badge.paused { background: var(--warning); color: #000; }
-.badge.completed { background: var(--success); color: #000; }
+.badge.paused { background: var(--warning); color: #fff; }
+.badge.completed { background: var(--success); color: #fff; }
 .badge.failed { background: var(--danger); color: #fff; }
-.badge.upload { background: var(--warning); color: #000; }
-.badge.download { background: var(--accent); color: #000; }
+.badge.upload { background: var(--warning); color: #fff; }
+.badge.download { background: var(--accent); color: #fff; }
+.badge.searching { background: var(--text-muted); color: #fff; }
 
 .empty-state {
   display: flex;
@@ -236,6 +273,7 @@ tr:hover td {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   padding: 16px;
+  box-shadow: var(--shadow-sm);
 }
 
 .stat-card .label {
