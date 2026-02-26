@@ -409,21 +409,40 @@ async fn download_parts_from_source(
     let hello_payload = build_hello(user_hash, 0, tcp_port, nickname);
     write_packet_async_ms(&mut writer, OP_EDONKEYHEADER, OP_HELLO, &hello_payload).await?;
 
-    let (_proto, _opcode, _payload) = read_packet_timeout_ms(&mut reader).await?;
+    let (h_proto, h_opcode, _payload) = read_packet_timeout_ms(&mut reader).await?;
+    if h_proto != OP_EDONKEYHEADER || h_opcode != OP_HELLOANSWER {
+        anyhow::bail!("source {}: expected HelloAnswer, got proto=0x{h_proto:02X} op=0x{h_opcode:02X}", _src_idx);
+    }
 
     let emule_payload = build_emule_info(udp_port);
     write_packet_async_ms(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
 
-    let _ = read_packet_timeout_ms(&mut reader).await;
+    let mut deferred_packet: Option<(u8, u8, Vec<u8>)> = None;
+    match read_packet_timeout_ms(&mut reader).await {
+        Ok((proto, opcode, payload)) => {
+            if proto == OP_EMULEPROT && opcode == OP_EMULEINFOANSWER {
+                debug!("Got EmuleInfoAnswer from source {}", _src_idx);
+            } else {
+                deferred_packet = Some((proto, opcode, payload));
+            }
+        }
+        Err(e) => {
+            debug!("EmuleInfo exchange failed for source {}: {e}", _src_idx);
+        }
+    }
 
     // File request
     let file_req = build_file_request(file_hash);
     write_packet_async_ms(&mut writer, OP_EDONKEYHEADER, OP_SETREQFILEID, &file_req).await?;
     write_packet_async_ms(&mut writer, OP_EDONKEYHEADER, OP_REQUESTFILENAME, &file_req).await?;
 
-    // Read responses
+    // Read responses (consume deferred packet first)
     for _ in 0..5 {
-        let (proto, opcode, _payload) = read_packet_timeout_ms(&mut reader).await?;
+        let (proto, opcode, _payload) = if let Some(pkt) = deferred_packet.take() {
+            pkt
+        } else {
+            read_packet_timeout_ms(&mut reader).await?
+        };
         if proto == OP_EDONKEYHEADER && opcode == OP_FILEREQANSNOFIL {
             anyhow::bail!("peer does not have the file");
         }
@@ -609,7 +628,9 @@ async fn download_parts_from_source(
                 }
             }
 
-            part_offset = cursor;
+            // Only advance by what was actually received (handles early
+            // OP_OUTOFPARTREQS mid-batch without skipping undelivered blocks)
+            part_offset += total_received;
         }
 
         // Verify part hash before marking complete

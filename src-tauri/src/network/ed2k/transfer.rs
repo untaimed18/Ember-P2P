@@ -490,8 +490,9 @@ impl Ed2kDownload {
                         }
                     }
 
-                    // Advance part_offset by however many blocks we requested
-                    part_offset = cursor;
+                    // Only advance by what was actually received (handles early
+                    // OP_OUTOFPARTREQS mid-batch without skipping undelivered blocks)
+                    part_offset += total_received;
                 }
 
                 // Verify part hash if we have the hashset

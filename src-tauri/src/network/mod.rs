@@ -2963,23 +2963,23 @@ fn convert_search_results(
         .collect();
 
     // Deduplicate by file hash, accumulating source counts across KAD nodes.
-    // In eMule, each responding node independently tracks sources for a file.
-    // When the same file appears from multiple nodes, eMule sums the
-    // TAG_SOURCES values (CSearch::ProcessResult → AddSources).
+    // In eMule (CSearch::ProcessResult), each search result entry with the
+    // same file hash adds to the source count. If TAG_SOURCES is 0 or absent,
+    // the entry still counts as 1 source (the publishing node itself).
     let mut dedup: HashMap<String, SearchResult> = HashMap::new();
-    // Track which KAD nodes have already contributed TAG_SOURCES for each
-    // file hash, so we don't double-count from the same node.
     let mut sources_accum: HashMap<String, u32> = HashMap::new();
 
     for p in parsed {
+        // eMule treats each entry as at least 1 source even if TAG_SOURCES=0
+        let effective_sources = if p.sources_tag > 0 { p.sources_tag } else { 1 };
+
         if let Some(existing) = dedup.get_mut(&p.hash) {
             if !p.source_addr.is_empty() && !existing.source_addresses.contains(&p.source_addr) {
                 existing.source_addresses.push(p.source_addr);
             }
-            // Accumulate TAG_SOURCES from each responding node
             let acc = sources_accum.entry(p.hash.clone()).or_insert(0);
-            *acc += p.sources_tag;
-            existing.availability = (*acc).max(existing.source_addresses.len() as u32).max(1);
+            *acc += effective_sources;
+            existing.availability = (*acc).max(existing.source_addresses.len() as u32);
 
             if existing.file.name.len() < p.name.len() {
                 existing.file.name = p.name;
@@ -2992,8 +2992,8 @@ fn convert_search_results(
             if !p.source_addr.is_empty() {
                 source_addresses.push(p.source_addr.clone());
             }
-            let availability = p.sources_tag.max(source_addresses.len() as u32).max(1);
-            sources_accum.insert(p.hash.clone(), p.sources_tag);
+            let availability = effective_sources.max(source_addresses.len() as u32);
+            sources_accum.insert(p.hash.clone(), effective_sources);
             dedup.insert(
                 p.hash.clone(),
                 SearchResult {
