@@ -22,6 +22,11 @@ const MAX_CONNECTIONS_PER_IP: usize = 3;
 const MAX_TOTAL_CONNECTIONS: usize = 100;
 /// Maximum number of peers waiting in the upload queue
 const MAX_UPLOAD_QUEUE_SIZE: usize = 500;
+/// eMule SESSIONMAXTRANS: max bytes uploaded per session before rotating slots.
+/// "Try to send complete chunks" — PARTSIZE + 20 KB.
+const SESSIONMAXTRANS: u64 = PARTSIZE + 20 * 1024;
+/// eMule SESSIONMAXTIME: max duration of a single upload session (1 hour).
+const SESSIONMAXTIME_SECS: u64 = 3600;
 
 pub struct UploadEvent {
     pub transfer_id: String,
@@ -193,6 +198,7 @@ impl UploadHandler {
         let mut transfer_id: Option<String> = None;
         let mut total_size: u64 = 0;
         let mut upload_slot_active = false;
+        let mut session_start: Option<std::time::Instant> = None;
 
         loop {
             let (proto, opcode, payload) = if let Some(pkt) = deferred_packet.take() {
@@ -349,6 +355,8 @@ impl UploadHandler {
                     self.active_count
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     upload_slot_active = true;
+                    uploaded = 0;
+                    session_start = Some(std::time::Instant::now());
 
                     if let Some(hash) = current_file_hash {
                         let tid = uuid::Uuid::new_v4().to_string();
@@ -505,6 +513,48 @@ impl UploadHandler {
                                     total: total_size,
                                 },
                             }).await;
+                        }
+                    }
+
+                    // Enforce eMule session limits: rotate the upload slot after
+                    // SESSIONMAXTRANS bytes or SESSIONMAXTIME seconds.
+                    let session_expired = uploaded >= SESSIONMAXTRANS
+                        || session_start
+                            .map(|t| t.elapsed().as_secs() >= SESSIONMAXTIME_SECS)
+                            .unwrap_or(false);
+
+                    if session_expired && upload_slot_active {
+                        debug!(
+                            "Upload session limit reached for {peer_addr} ({}B / {}s), sending OutOfPartReqs",
+                            uploaded,
+                            session_start.map(|t| t.elapsed().as_secs()).unwrap_or(0)
+                        );
+                        write_packet_async(
+                            &mut writer,
+                            OP_EDONKEYHEADER,
+                            OP_OUTOFPARTREQS,
+                            &[],
+                        )
+                        .await?;
+
+                        if let Some(tid) = &transfer_id {
+                            let _ = self.upload_event_tx.send(UploadEvent {
+                                transfer_id: tid.clone(),
+                                kind: UploadEventKind::Completed,
+                            }).await;
+                        }
+
+                        self.active_count
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        upload_slot_active = false;
+                        session_start = None;
+
+                        // Re-add to back of upload queue so they can get another turn
+                        {
+                            let mut queue = self.upload_queue.lock().await;
+                            if !queue.contains(&peer_addr) && queue.len() < MAX_UPLOAD_QUEUE_SIZE {
+                                queue.push_back(peer_addr);
+                            }
                         }
                     }
                 }

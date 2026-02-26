@@ -17,7 +17,6 @@ use super::part_tracker::PartTracker;
 
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY_SECS: u64 = 10;
-const QUEUE_POLL_SECS: u64 = 30;
 const MAX_QUEUE_WAIT_SECS: u64 = 600;
 const READ_TIMEOUT_SECS: u64 = 60;
 
@@ -228,45 +227,52 @@ impl Ed2kDownload {
         let upload_req = build_file_request(&self.file_hash);
         write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_STARTUPLOADREQ, &upload_req).await?;
 
-        // Wait for AcceptUploadReq, handling queue rank
+        // Wait for AcceptUploadReq. The uploader decides when to grant a slot;
+        // we simply keep the connection open and listen. Re-requesting too
+        // aggressively gets clients penalised by eMule servers.
         let queue_start = std::time::Instant::now();
 
         loop {
             self.check_control().await?;
 
-            let (proto, opcode, payload) = read_packet_with_timeout(&mut reader).await?;
+            if queue_start.elapsed().as_secs() > MAX_QUEUE_WAIT_SECS {
+                anyhow::bail!("timed out waiting for upload slot after {MAX_QUEUE_WAIT_SECS}s");
+            }
+
+            // Use a longer timeout while queued — the uploader will push
+            // OP_ACCEPTUPLOADREQ when a slot opens. We use the full queue
+            // wait budget as the read timeout so we don't time out early.
+            let remaining = MAX_QUEUE_WAIT_SECS - queue_start.elapsed().as_secs().min(MAX_QUEUE_WAIT_SECS);
+            let read_timeout = remaining.max(READ_TIMEOUT_SECS);
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(read_timeout),
+                read_packet_async(&mut reader),
+            )
+            .await;
+
+            let (proto, opcode, payload) = match result {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => anyhow::bail!("connection lost while queued: {e}"),
+                Err(_) => {
+                    anyhow::bail!("timed out waiting for upload slot after {MAX_QUEUE_WAIT_SECS}s");
+                }
+            };
 
             if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
                 debug!("Upload accepted");
                 break;
             }
 
-            // eMule extended queue ranking (OP_EMULEPROT 0x60)
             if proto == OP_EMULEPROT && opcode == OP_QUEUERANKING && payload.len() >= 2 {
-                let rank =
-                    u16::from_le_bytes([payload[0], payload[1]]);
+                let rank = u16::from_le_bytes([payload[0], payload[1]]);
                 info!(
                     "Queued at position {} on peer {}",
                     rank, self.source_addr
                 );
-
-                if queue_start.elapsed().as_secs() > MAX_QUEUE_WAIT_SECS {
-                    anyhow::bail!(
-                        "gave up waiting in queue (position {rank}) after {MAX_QUEUE_WAIT_SECS}s"
-                    );
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(QUEUE_POLL_SECS)).await;
-                write_packet_async(
-                    &mut writer,
-                    OP_EDONKEYHEADER,
-                    OP_STARTUPLOADREQ,
-                    &upload_req,
-                )
-                .await?;
                 continue;
             }
 
-            // Legacy queue rank (OP_EDONKEYHEADER 0x5C)
             if proto == OP_EDONKEYHEADER && opcode == OP_QUEUERANK && payload.len() >= 4 {
                 let rank = u32::from_le_bytes([
                     payload[0], payload[1], payload[2], payload[3],
@@ -275,28 +281,15 @@ impl Ed2kDownload {
                     "Queued at position {} on peer {} (legacy)",
                     rank, self.source_addr
                 );
-
-                if queue_start.elapsed().as_secs() > MAX_QUEUE_WAIT_SECS {
-                    anyhow::bail!(
-                        "gave up waiting in queue (position {rank}) after {MAX_QUEUE_WAIT_SECS}s"
-                    );
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(QUEUE_POLL_SECS)).await;
-                write_packet_async(
-                    &mut writer,
-                    OP_EDONKEYHEADER,
-                    OP_STARTUPLOADREQ,
-                    &upload_req,
-                )
-                .await?;
                 continue;
             }
 
-            debug!("Waiting for accept, got proto=0x{proto:02X} op=0x{opcode:02X}");
-
-            if queue_start.elapsed().as_secs() > MAX_QUEUE_WAIT_SECS {
-                anyhow::bail!("timed out waiting for upload slot after {MAX_QUEUE_WAIT_SECS}s");
+            if proto == OP_EDONKEYHEADER && opcode == OP_OUTOFPARTREQS {
+                info!("Peer rejected with OutOfPartReqs, will retry later");
+                anyhow::bail!("peer has no free upload slots (OutOfPartReqs)");
             }
+
+            debug!("Waiting for accept, got proto=0x{proto:02X} op=0x{opcode:02X}");
         }
 
         if self.file_size > MAX_DOWNLOAD_FILE_SIZE {
@@ -351,8 +344,12 @@ impl Ed2kDownload {
             })
             .sum();
 
-        // Download needed parts with retry for hash-failed parts
+        // Download needed parts with retry for hash-failed parts.
+        // eMule always requests 3 blocks per OP_REQUESTPARTS packet for pipelining.
         const MAX_PART_RETRIES: usize = 3;
+        const BLOCKS_PER_REQUEST: usize = 3;
+        let mut peer_out_of_parts = false;
+
         for retry_round in 0..=MAX_PART_RETRIES {
             let needed = tracker.needed_parts(&available_parts);
             if needed.is_empty() {
@@ -366,16 +363,34 @@ impl Ed2kDownload {
             }
 
             for part_idx in needed {
+                if peer_out_of_parts {
+                    break;
+                }
                 self.check_control().await?;
 
                 let (part_start, part_end) = tracker.part_range(part_idx);
                 let mut part_offset = part_start;
 
                 while part_offset < part_end {
+                    if peer_out_of_parts {
+                        break;
+                    }
                     self.check_control().await?;
 
-                    let chunk_end = (part_offset + EMBLOCKSIZE).min(part_end);
-                    let offsets = vec![(part_offset, chunk_end)];
+                    // Build up to 3 block ranges for a single request (eMule pipelining)
+                    let mut offsets: Vec<(u64, u64)> = Vec::with_capacity(BLOCKS_PER_REQUEST);
+                    let mut cursor = part_offset;
+                    for _ in 0..BLOCKS_PER_REQUEST {
+                        if cursor >= part_end {
+                            break;
+                        }
+                        let chunk_end = (cursor + EMBLOCKSIZE).min(part_end);
+                        offsets.push((cursor, chunk_end));
+                        cursor = chunk_end;
+                    }
+
+                    let total_expected: u64 = offsets.iter().map(|(s, e)| e - s).sum();
+
                     let req_payload = build_request_parts_i64(&self.file_hash, &offsets);
                     write_packet_async(
                         &mut writer,
@@ -385,10 +400,9 @@ impl Ed2kDownload {
                     )
                     .await?;
 
-                    let mut chunk_received = 0u64;
-                    let expected = chunk_end - part_offset;
+                    let mut total_received = 0u64;
 
-                    while chunk_received < expected {
+                    while total_received < total_expected {
                         let (proto, opcode, payload) =
                             read_packet_with_timeout(&mut reader).await?;
 
@@ -408,7 +422,7 @@ impl Ed2kDownload {
                                 output.seek(std::io::SeekFrom::Start(start))?;
                                 output.write_all(data)?;
 
-                                chunk_received += piece_len;
+                                total_received += piece_len;
                                 downloaded += piece_len;
 
                                 let _ = event_tx
@@ -444,7 +458,7 @@ impl Ed2kDownload {
                                 output.seek(std::io::SeekFrom::Start(start))?;
                                 output.write_all(&decompressed)?;
 
-                                chunk_received += piece_len;
+                                total_received += piece_len;
                                 downloaded += piece_len;
 
                                 let _ = event_tx
@@ -456,7 +470,8 @@ impl Ed2kDownload {
                                     .await;
                             }
                             (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
-                                warn!("Peer ran out of part requests");
+                                info!("Peer session limit reached (OutOfPartReqs), will re-queue");
+                                peer_out_of_parts = true;
                                 break;
                             }
                             _ => {
@@ -467,7 +482,8 @@ impl Ed2kDownload {
                         }
                     }
 
-                    part_offset = chunk_end;
+                    // Advance part_offset by however many blocks we requested
+                    part_offset = cursor;
                 }
 
                 // Verify part hash if we have the hashset
@@ -506,7 +522,20 @@ impl Ed2kDownload {
                 tracker.mark_complete(part_idx);
                 tracker.save();
             }
+
+            // If peer ended the session, reset flag for next retry round
+            peer_out_of_parts = false;
         }
+
+        // Signal the uploader that we're done downloading from them
+        write_packet_async(
+            &mut writer,
+            OP_EDONKEYHEADER,
+            OP_END_OF_DOWNLOAD,
+            &[],
+        )
+        .await
+        .ok();
 
         if !tracker.all_complete() {
             let remaining = tracker.part_count - tracker.completed_count();

@@ -468,17 +468,31 @@ async fn download_parts_from_source(
     let upload_req = build_file_request(file_hash);
     write_packet_async_ms(&mut writer, OP_EDONKEYHEADER, OP_STARTUPLOADREQ, &upload_req).await?;
 
-    // Wait for accept
+    // Wait for the uploader to grant a slot. Don't re-request; eMule
+    // uploaders push OP_ACCEPTUPLOADREQ when a slot opens.
     let queue_start = std::time::Instant::now();
     loop {
-        let (proto, opcode, _payload) = read_packet_timeout_ms(&mut reader).await?;
-        if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
-            break;
-        }
         if queue_start.elapsed().as_secs() > 600 {
             anyhow::bail!("timed out waiting for upload slot");
         }
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let remaining = 600u64.saturating_sub(queue_start.elapsed().as_secs()).max(60);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(remaining),
+            read_packet_async_ms(&mut reader),
+        )
+        .await;
+        let (proto, opcode, _payload) = match result {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => anyhow::bail!("connection lost while queued: {e}"),
+            Err(_) => anyhow::bail!("timed out waiting for upload slot"),
+        };
+        if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
+            break;
+        }
+        if proto == OP_EDONKEYHEADER && opcode == OP_OUTOFPARTREQS {
+            anyhow::bail!("peer has no free upload slots (OutOfPartReqs)");
+        }
+        // OP_QUEUERANKING or OP_QUEUERANK — just keep waiting
     }
 
     // Open the shared .part file
@@ -487,8 +501,14 @@ async fn download_parts_from_source(
         .read(true)
         .open(part_path)?;
 
-    // Download assigned parts
+    // Download assigned parts, requesting 3 blocks per packet (eMule pipelining)
+    const BLOCKS_PER_REQUEST: usize = 3;
+    let mut peer_out_of_parts = false;
+
     for &part_idx in parts {
+        if peer_out_of_parts {
+            break;
+        }
         {
             let t = tracker.read().await;
             if t.is_part_complete(part_idx) {
@@ -503,16 +523,30 @@ async fn download_parts_from_source(
 
         let mut part_offset = part_start;
         while part_offset < part_end {
-            let chunk_end = (part_offset + EMBLOCKSIZE).min(part_end);
-            let offsets = vec![(part_offset, chunk_end)];
+            if peer_out_of_parts {
+                break;
+            }
+
+            // Build up to 3 block ranges for a single request
+            let mut offsets: Vec<(u64, u64)> = Vec::with_capacity(BLOCKS_PER_REQUEST);
+            let mut cursor = part_offset;
+            for _ in 0..BLOCKS_PER_REQUEST {
+                if cursor >= part_end {
+                    break;
+                }
+                let chunk_end = (cursor + EMBLOCKSIZE).min(part_end);
+                offsets.push((cursor, chunk_end));
+                cursor = chunk_end;
+            }
+
+            let total_expected: u64 = offsets.iter().map(|(s, e)| e - s).sum();
             let req_payload = build_request_parts_i64(file_hash, &offsets);
             write_packet_async_ms(&mut writer, OP_EMULEPROT, OP_REQUESTPARTS_I64, &req_payload)
                 .await?;
 
-            let mut chunk_received = 0u64;
-            let expected = chunk_end - part_offset;
+            let mut total_received = 0u64;
 
-            while chunk_received < expected {
+            while total_received < total_expected {
                 let (proto, opcode, payload) = read_packet_timeout_ms(&mut reader).await?;
 
                 match (proto, opcode) {
@@ -533,7 +567,7 @@ async fn download_parts_from_source(
                         output.seek(std::io::SeekFrom::Start(start))?;
                         output.write_all(data)?;
 
-                        chunk_received += piece_len;
+                        total_received += piece_len;
                         let _ = progress_tx.send((_src_idx, piece_len)).await;
                     }
                     (OP_EMULEPROT, OP_COMPRESSEDPART_I64) | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
@@ -564,15 +598,18 @@ async fn download_parts_from_source(
                         output.seek(std::io::SeekFrom::Start(start))?;
                         output.write_all(&decompressed)?;
 
-                        chunk_received += piece_len;
+                        total_received += piece_len;
                         let _ = progress_tx.send((_src_idx, piece_len)).await;
                     }
-                    (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => break,
+                    (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
+                        peer_out_of_parts = true;
+                        break;
+                    }
                     _ => {}
                 }
             }
 
-            part_offset = chunk_end;
+            part_offset = cursor;
         }
 
         // Verify part hash before marking complete
@@ -620,6 +657,16 @@ async fn download_parts_from_source(
             t.save();
         }
     }
+
+    // Signal the uploader that we're done
+    write_packet_async_ms(
+        &mut writer,
+        OP_EDONKEYHEADER,
+        OP_END_OF_DOWNLOAD,
+        &[],
+    )
+    .await
+    .ok();
 
     Ok(())
 }
