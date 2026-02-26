@@ -516,6 +516,28 @@ impl SearchManager {
             }
         }
 
+        // Prevent search storms: if too many active searches, evict oldest completed ones
+        // and reject low-priority new searches.
+        const MAX_ACTIVE_SEARCHES: usize = 20;
+        let active = self.active_count();
+        if active >= MAX_ACTIVE_SEARCHES {
+            // Evict completed searches first
+            let completed: Vec<SearchId> = self.active.iter()
+                .filter(|(_, s)| s.completed)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in completed {
+                if let Some(s) = self.active.remove(&id) {
+                    self.target_map.remove(&s.target);
+                }
+            }
+            // If still too many, reject non-essential searches (FindNode)
+            if self.active_count() >= MAX_ACTIVE_SEARCHES && matches!(search_type, SearchType::FindNode) {
+                debug!("Rejecting FindNode search: {} active searches at cap", self.active_count());
+                return SearchId(0);
+            }
+        }
+
         let id = SearchId(self.next_id);
         self.next_id += 1;
 

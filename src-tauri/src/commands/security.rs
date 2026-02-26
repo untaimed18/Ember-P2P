@@ -8,6 +8,8 @@ use crate::app_state::AppState;
 use crate::network::kad::ip_filter::IpFilterStats;
 use crate::network::NetworkCommand;
 
+const CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[tauri::command]
 pub async fn get_ip_filter_stats(
     state: tauri::State<'_, AppState>,
@@ -16,11 +18,12 @@ pub async fn get_ip_filter_stats(
 
     state
         .network_tx
-        .send(NetworkCommand::GetIpFilterStats { tx })
-        .await
-        .map_err(|e| format!("Failed to query IP filter: {e}"))?;
+        .try_send(NetworkCommand::GetIpFilterStats { tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
 
-    rx.await
+    tokio::time::timeout(CMD_TIMEOUT, rx)
+        .await
+        .map_err(|_| "Network not responding (timeout)".to_string())?
         .map_err(|e| format!("Failed to receive IP filter stats: {e}"))
 }
 

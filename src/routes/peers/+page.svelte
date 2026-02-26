@@ -16,8 +16,13 @@
   async function refresh() {
     try {
       peers = await getPeers();
+      peerError = null;
     } catch (e) {
+      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to load peers';
       console.error('Failed to get peers:', e);
+      if (peers.length === 0) {
+        peerError = msg;
+      }
     } finally {
       loading = false;
     }

@@ -6,6 +6,8 @@ use crate::network::ed2k::hash;
 use crate::network::kad::publish::md4_bytes_to_kad_id;
 use crate::types::SearchResult;
 
+const SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[tauri::command]
 pub async fn search_files(
     state: tauri::State<'_, AppState>,
@@ -15,11 +17,13 @@ pub async fn search_files(
 
     state
         .network_tx
-        .send(NetworkCommand::SearchFiles { query, tx })
-        .await
-        .map_err(|e| format!("Failed to send search command: {e}"))?;
+        .try_send(NetworkCommand::SearchFiles { query, tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
 
-    rx.await.map_err(|e| format!("Search failed: {e}"))
+    tokio::time::timeout(SEARCH_TIMEOUT, rx)
+        .await
+        .map_err(|_| "Search timed out".to_string())?
+        .map_err(|e| format!("Search failed: {e}"))
 }
 
 #[tauri::command]
@@ -36,15 +40,17 @@ pub async fn find_notes(
 
     state
         .network_tx
-        .send(NetworkCommand::FindNotes {
+        .try_send(NetworkCommand::FindNotes {
             file_hash: kad_hash,
             file_size,
             tx,
         })
-        .await
-        .map_err(|e| format!("Failed to send find_notes command: {e}"))?;
+        .map_err(|e| format!("Network busy: {e}"))?;
 
-    rx.await.map_err(|e| format!("Notes search failed: {e}"))
+    tokio::time::timeout(SEARCH_TIMEOUT, rx)
+        .await
+        .map_err(|_| "Notes search timed out".to_string())?
+        .map_err(|e| format!("Notes search failed: {e}"))
 }
 
 #[tauri::command]
@@ -61,15 +67,17 @@ pub async fn find_sources(
 
     state
         .network_tx
-        .send(NetworkCommand::FindSources {
+        .try_send(NetworkCommand::FindSources {
             file_hash: kad_hash,
             file_size,
             tx,
         })
-        .await
-        .map_err(|e| format!("Failed to send find_sources command: {e}"))?;
+        .map_err(|e| format!("Network busy: {e}"))?;
 
-    rx.await.map_err(|e| format!("Source search failed: {e}"))
+    tokio::time::timeout(SEARCH_TIMEOUT, rx)
+        .await
+        .map_err(|_| "Source search timed out".to_string())?
+        .map_err(|e| format!("Source search failed: {e}"))
 }
 
 #[tauri::command]

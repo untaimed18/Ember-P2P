@@ -4,6 +4,8 @@ use crate::app_state::AppState;
 use crate::network::NetworkCommand;
 use crate::types::*;
 
+const CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[tauri::command]
 pub async fn get_peers(
     state: tauri::State<'_, AppState>,
@@ -12,11 +14,13 @@ pub async fn get_peers(
 
     state
         .network_tx
-        .send(NetworkCommand::GetPeers { tx })
-        .await
-        .map_err(|e| format!("Failed to get peers: {e}"))?;
+        .try_send(NetworkCommand::GetPeers { tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
 
-    rx.await.map_err(|e| format!("Failed to receive peers: {e}"))
+    tokio::time::timeout(CMD_TIMEOUT, rx)
+        .await
+        .map_err(|_| "Network not responding (timeout)".to_string())?
+        .map_err(|e| format!("Failed to receive peers: {e}"))
 }
 
 #[tauri::command]
@@ -27,11 +31,12 @@ pub async fn get_network_stats(
 
     state
         .network_tx
-        .send(NetworkCommand::GetStats { tx })
-        .await
-        .map_err(|e| format!("Failed to get stats: {e}"))?;
+        .try_send(NetworkCommand::GetStats { tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
 
-    rx.await
+    tokio::time::timeout(CMD_TIMEOUT, rx)
+        .await
+        .map_err(|_| "Network not responding (timeout)".to_string())?
         .map_err(|e| format!("Failed to receive stats: {e}"))
 }
 
