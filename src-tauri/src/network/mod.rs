@@ -276,8 +276,15 @@ pub async fn start_network(
         boot_contacts = bootstrap::default_bootstrap_contacts();
     }
 
+    let now = chrono::Utc::now().timestamp();
     for c in &boot_contacts {
-        routing_table.insert(c.clone());
+        let mut contact = c.clone();
+        // Give loaded contacts a recent last_seen so remove_stale() doesn't
+        // immediately discard them before they have a chance to respond.
+        if contact.last_seen == 0 {
+            contact.last_seen = now;
+        }
+        routing_table.insert(contact);
     }
     info!(
         "Routing table initialized with {} contacts",
