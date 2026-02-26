@@ -1777,10 +1777,9 @@ async fn handle_udp_packet(
             }
 
             for sid in search_ids {
-                let sender_id = sender_id_lookup.or_else(|| {
-                    state.search_manager.get(&sid)
-                        .and_then(|s| s.pending.iter().next().copied())
-                });
+                // eMule ProcessResponse: sender must be identifiable in m_mapTried
+                // (matched by IP+port). Never fall back to guessing — ignore unknown.
+                let sender_id = sender_id_lookup;
 
                 if let (Some(search), Some(sender_id)) =
                     (state.search_manager.get_mut(&sid), sender_id)
@@ -1986,13 +1985,16 @@ async fn handle_udp_packet(
             let end = results.len().min(start + 200);
             let page = if start < results.len() { results[start..end].to_vec() } else { Vec::new() };
 
-            let res = KadMessage::SearchRes {
-                sender_id: state.local_id,
-                target,
-                results: page,
-            };
-            if let Ok(packet) = messages::encode_packet(&res) {
-                let _ = socket.send_to(&packet, from).await;
+            // eMule behavior: do not send SearchRes when there are no results.
+            if !page.is_empty() {
+                let res = KadMessage::SearchRes {
+                    sender_id: state.local_id,
+                    target,
+                    results: page,
+                };
+                if let Ok(packet) = messages::encode_packet(&res) {
+                    let _ = socket.send_to(&packet, from).await;
+                }
             }
         }
 
@@ -2002,13 +2004,16 @@ async fn handle_udp_packet(
             let end = results.len().min(start + 200);
             let page = if start < results.len() { results[start..end].to_vec() } else { Vec::new() };
 
-            let res = KadMessage::SearchRes {
-                sender_id: state.local_id,
-                target,
-                results: page,
-            };
-            if let Ok(packet) = messages::encode_packet(&res) {
-                let _ = socket.send_to(&packet, from).await;
+            // eMule behavior: do not send SearchRes when there are no results.
+            if !page.is_empty() {
+                let res = KadMessage::SearchRes {
+                    sender_id: state.local_id,
+                    target,
+                    results: page,
+                };
+                if let Ok(packet) = messages::encode_packet(&res) {
+                    let _ = socket.send_to(&packet, from).await;
+                }
             }
         }
 
@@ -2084,13 +2089,16 @@ async fn handle_udp_packet(
 
         KadMessage::SearchNotesReq { target, .. } => {
             let results = state.dht_store.search_notes(&target);
-            let res = KadMessage::SearchRes {
-                sender_id: state.local_id,
-                target,
-                results,
-            };
-            if let Ok(packet) = messages::encode_packet(&res) {
-                let _ = socket.send_to(&packet, from).await;
+            // eMule behavior: do not send SearchRes when there are no results.
+            if !results.is_empty() {
+                let res = KadMessage::SearchRes {
+                    sender_id: state.local_id,
+                    target,
+                    results,
+                };
+                if let Ok(packet) = messages::encode_packet(&res) {
+                    let _ = socket.send_to(&packet, from).await;
+                }
             }
         }
 

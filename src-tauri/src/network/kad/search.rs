@@ -6,25 +6,27 @@ use tracing::{debug, info};
 use super::messages::*;
 use super::types::*;
 
-const KEYWORD_SEARCH_MAX_RESULTS: usize = 500;
+/// eMule Defines.h SEARCHKEYWORD_TOTAL
+const KEYWORD_SEARCH_MAX_RESULTS: usize = 300;
 const PENDING_TIMEOUT_SECS: i64 = 10;
-const LOOKUP_CONVERGE_COUNT: usize = 5;
-const LOOKUP_MIN_QUERIES: usize = 60;
+const LOOKUP_CONVERGE_COUNT: usize = 3;
+const LOOKUP_MIN_QUERIES: usize = 10;
 const LOOKUP_MAX_QUERIES: usize = 200;
 const LOOKUP_CONTACT_POOL: usize = 200;
 
 /// eMule seeds searches with 50 contacts (Search.cpp Go() -> GetClosestTo(..., 50, ...))
 pub const SEARCH_INITIAL_CONTACTS: usize = 50;
 
-// Per-type timeouts matching eMule
-const TIMEOUT_FIND_NODE: i64 = 45;
-const TIMEOUT_KEYWORD: i64 = 90;
-const TIMEOUT_SOURCE: i64 = 45;
-const TIMEOUT_NOTES: i64 = 45;
-const TIMEOUT_STORE_KEYWORD: i64 = 140;
-const TIMEOUT_STORE_NOTES: i64 = 100;
-const TIMEOUT_FIND_BUDDY: i64 = 100;
-const FETCH_TIMEOUT_SECS: i64 = 45;
+/// eMule Defines.h search lifetime values (in seconds)
+const TIMEOUT_FIND_NODE: i64 = 45;    // SEARCHNODE_LIFETIME
+const TIMEOUT_KEYWORD: i64 = 45;      // SEARCHKEYWORD_LIFETIME
+const TIMEOUT_SOURCE: i64 = 45;       // SEARCHFINDSOURCE_LIFETIME
+const TIMEOUT_NOTES: i64 = 45;        // SEARCHNOTES_LIFETIME
+const TIMEOUT_STORE_KEYWORD: i64 = 140; // SEARCHSTOREKEYWORD_LIFETIME
+const TIMEOUT_STORE_NOTES: i64 = 100; // SEARCHSTORENOTES_LIFETIME
+const TIMEOUT_FIND_BUDDY: i64 = 100;  // SEARCHFINDBUDDY_LIFETIME
+/// Grace period after entering fetch phase for late results (eMule PrepareToStop gives 15s)
+const FETCH_TIMEOUT_SECS: i64 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchType {
@@ -71,6 +73,14 @@ pub struct SearchState {
     prev_closest_distance: Option<KadId>,
     /// Contacts that responded during the lookup phase (verified alive).
     pub responded_during_lookup: HashSet<KadId>,
+    /// eMule JumpStart behavior: one-time re-ask for "more contacts" (11)
+    /// to a previously responding node when FIND_VALUE lookup stalls.
+    lookup_reask_more_target: Option<KadId>,
+    lookup_reask_more_done: bool,
+    /// eMule m_mapBest: contacts that should be queried with high priority
+    /// because they are closer to target than their referring contact and
+    /// made it into the top ALPHA closest. Set during handle_response().
+    priority_queries: Vec<KadContact>,
 }
 
 impl SearchState {
@@ -93,6 +103,9 @@ impl SearchState {
             lookup_stale_rounds: 0,
             prev_closest_distance: None,
             responded_during_lookup: HashSet::new(),
+            lookup_reask_more_target: None,
+            lookup_reask_more_done: false,
+            priority_queries: Vec::new(),
         }
     }
 
@@ -112,6 +125,15 @@ impl SearchState {
 
         match self.phase {
             SearchPhase::Lookup => {
+                // eMule m_mapBest: drain priority contacts first (discovered in
+                // ProcessResponse as closer-than-responder top-ALPHA contacts).
+                while !self.priority_queries.is_empty() && batch.len() < ALPHA {
+                    let c = self.priority_queries.remove(0);
+                    if !self.queried.contains(&c.id) && !self.pending.contains(&c.id) {
+                        batch.push(c);
+                    }
+                }
+
                 for contact in &self.closest {
                     if batch.len() >= ALPHA {
                         break;
@@ -120,32 +142,43 @@ impl SearchState {
                         batch.push(contact.clone());
                     }
                 }
+
+                // eMule JumpStart: if FIND_VALUE lookup stalls and we already have at least
+                // one responder, re-ask one responder for a larger contact set (11).
+                if batch.is_empty()
+                    && !self.lookup_reask_more_done
+                    && self.lookup_stale_rounds >= 3
+                    && matches!(
+                        self.search_type,
+                        SearchType::FindKeyword
+                            | SearchType::FindSource { .. }
+                            | SearchType::FindNotes { .. }
+                    )
+                {
+                    if let Some(contact) = self.closest.iter().find(|c| {
+                        self.responded_during_lookup.contains(&c.id)
+                            && self.queried.contains(&c.id)
+                            && !self.pending.contains(&c.id)
+                    }) {
+                        self.lookup_reask_more_target = Some(contact.id);
+                        self.lookup_reask_more_done = true;
+                        batch.push(contact.clone());
+                    }
+                }
             }
             SearchPhase::Fetch => {
-                // First, query contacts that responded during lookup (verified alive)
+                // eMule-like fetch eligibility:
+                // - node must have responded during lookup (verified alive)
+                // - node must be in SEARCH_TOLERANCE zone (or LAN)
                 for contact in &self.closest {
                     if batch.len() >= ALPHA {
                         break;
                     }
                     if !self.fetched.contains(&contact.id)
                         && !self.pending.contains(&contact.id)
-                        && self.responded_during_lookup.contains(&contact.id)
+                        && self.is_fetch_candidate(contact)
                     {
                         batch.push(contact.clone());
-                    }
-                }
-                // Then fall back to unverified contacts
-                if batch.len() < ALPHA {
-                    for contact in &self.closest {
-                        if batch.len() >= ALPHA {
-                            break;
-                        }
-                        if !self.fetched.contains(&contact.id)
-                            && !self.pending.contains(&contact.id)
-                            && !self.responded_during_lookup.contains(&contact.id)
-                        {
-                            batch.push(contact.clone());
-                        }
                     }
                 }
             }
@@ -162,24 +195,53 @@ impl SearchState {
     }
 
     /// Process a KadRes (node lookup response) during lookup phase.
+    /// Implements eMule's ProcessResponse m_mapBest behavior: contacts closer
+    /// to target than the responder that make it into the top ALPHA closest
+    /// are flagged for immediate priority query.
     pub fn handle_response(&mut self, from: &KadId, contacts: Vec<KadContact>) {
         self.queried.insert(*from);
         self.pending.remove(from);
         self.pending_times.remove(from);
+        if self.lookup_reask_more_target == Some(*from) {
+            self.lookup_reask_more_target = None;
+        }
         if self.phase == SearchPhase::Lookup {
             self.responded_during_lookup.insert(*from);
         }
 
+        let from_distance = self.target.xor_distance(from);
         let old_best = self.closest.first().map(|c| self.target.xor_distance(&c.id));
 
+        let mut new_contacts = Vec::new();
         for c in contacts {
             if c.id != self.target && !self.queried.contains(&c.id) {
                 if !self.closest.iter().any(|existing| existing.id == c.id) {
+                    new_contacts.push(c.clone());
                     self.closest.push(c);
                 }
             }
         }
         self.sort_closest();
+
+        // eMule m_mapBest: for each new contact closer than the responder,
+        // check if it's in the top ALPHA closest overall. If so, immediately
+        // queue it for priority query (matching eMule's SendFindValue in ProcessResponse).
+        if self.phase == SearchPhase::Lookup {
+            for nc in &new_contacts {
+                let nc_distance = self.target.xor_distance(&nc.id);
+                if nc_distance >= from_distance {
+                    continue;
+                }
+                let rank = self.closest.iter()
+                    .position(|c| c.id == nc.id)
+                    .unwrap_or(usize::MAX);
+                if rank < ALPHA && !self.queried.contains(&nc.id) && !self.pending.contains(&nc.id) {
+                    if !self.priority_queries.iter().any(|p| p.id == nc.id) {
+                        self.priority_queries.push(nc.clone());
+                    }
+                }
+            }
+        }
 
         let new_best = self.closest.first().map(|c| self.target.xor_distance(&c.id));
         let improved = match (&old_best, &new_best) {
@@ -217,6 +279,9 @@ impl SearchState {
         self.queried.insert(*id);
         self.pending.remove(id);
         self.pending_times.remove(id);
+        if self.lookup_reask_more_target == Some(*id) {
+            self.lookup_reask_more_target = None;
+        }
         self.lookup_stale_rounds += 1;
         self.check_phase_transition();
         self.check_completion();
@@ -238,10 +303,7 @@ impl SearchState {
 
     pub fn is_expired(&self) -> bool {
         let now = chrono::Utc::now().timestamp();
-        if let Some(fetch_start) = self.fetch_started_at {
-            return now - fetch_start >= FETCH_TIMEOUT_SECS;
-        }
-        let timeout = match self.search_type {
+        let lifetime = match self.search_type {
             SearchType::FindNode => TIMEOUT_FIND_NODE,
             SearchType::FindKeyword => TIMEOUT_KEYWORD,
             SearchType::FindSource { .. } => TIMEOUT_SOURCE,
@@ -250,7 +312,13 @@ impl SearchState {
             SearchType::StoreNotes => TIMEOUT_STORE_NOTES,
             SearchType::FindBuddy => TIMEOUT_FIND_BUDDY,
         };
-        now - self.started_at >= timeout
+        // eMule: PrepareToStop fires at lifetime, then 15s grace for late results.
+        // Overall cap: search lifetime + grace period.
+        let overall_expired = now - self.started_at >= lifetime + FETCH_TIMEOUT_SECS;
+        // Fetch phase also has its own timeout (grace period for results).
+        let fetch_expired = self.fetch_started_at
+            .map_or(false, |fs| now - fs >= FETCH_TIMEOUT_SECS);
+        overall_expired || fetch_expired
     }
 
     pub fn has_enough_results(&self) -> bool {
@@ -274,9 +342,11 @@ impl SearchState {
         let all_queried = self.pending.is_empty()
             && !self.closest.iter().any(|c| !self.queried.contains(&c.id));
 
+        // eMule converges when m_mapPossible is exhausted or closest responded contacts
+        // are encountered in JumpStart. We approximate this: converge when we've done
+        // at least LOOKUP_MIN_QUERIES and had LOOKUP_CONVERGE_COUNT consecutive stale rounds.
         let enough_queried = self.queried.len() >= LOOKUP_MIN_QUERIES
-            && self.lookup_stale_rounds >= LOOKUP_CONVERGE_COUNT
-            && self.responded_during_lookup.len() >= 8;
+            && self.lookup_stale_rounds >= LOOKUP_CONVERGE_COUNT;
 
         let max_lookup_reached = self.queried.len() >= LOOKUP_MAX_QUERIES;
 
@@ -334,7 +404,7 @@ impl SearchState {
                     let has_unfetched = self
                         .closest
                         .iter()
-                        .any(|c| !self.fetched.contains(&c.id));
+                        .any(|c| self.is_fetch_candidate(c) && !self.fetched.contains(&c.id));
                     if !has_unfetched {
                         self.completed = true;
                     }
@@ -343,12 +413,29 @@ impl SearchState {
         }
     }
 
+    fn is_fetch_candidate(&self, contact: &KadContact) -> bool {
+        self.responded_during_lookup.contains(&contact.id)
+            && (is_lan_ip(contact.ip) || within_search_tolerance(&self.target, &contact.id))
+    }
+
     pub fn build_query_message(&self, receiver: &KadContact) -> KadMessage {
         match self.phase {
             SearchPhase::Lookup => {
                 let search_type = match self.search_type {
-                    SearchType::StoreKeyword | SearchType::StoreNotes => KADEMLIA_STORE,
-                    _ => KADEMLIA_FIND_NODE,
+                    SearchType::StoreKeyword | SearchType::StoreNotes | SearchType::FindBuddy => {
+                        KADEMLIA_STORE
+                    }
+                    SearchType::FindNode => KADEMLIA_FIND_NODE,
+                    SearchType::FindKeyword
+                    | SearchType::FindSource { .. }
+                    | SearchType::FindNotes { .. } => {
+                        if self.lookup_reask_more_target == Some(receiver.id) {
+                            // Re-ask for more contacts (11), matching eMule JumpStart behavior.
+                            KADEMLIA_FIND_NODE
+                        } else {
+                            KADEMLIA_FIND_VALUE
+                        }
+                    }
                 };
                 KadMessage::KadReq {
                     search_type,
@@ -386,6 +473,16 @@ impl SearchState {
             },
         }
     }
+}
+
+fn within_search_tolerance(target: &KadId, contact_id: &KadId) -> bool {
+    let distance = target.xor_distance(contact_id);
+    let d = u32::from_le_bytes([distance.0[0], distance.0[1], distance.0[2], distance.0[3]]);
+    d <= SEARCH_TOLERANCE
+}
+
+fn is_lan_ip(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_private() || ip.is_loopback() || ip.is_link_local()
 }
 
 /// Manages all active searches.
@@ -460,13 +557,13 @@ impl SearchManager {
                 );
             }
 
-            // If lookup appears stuck for a long time, force transition to fetch.
-            // Guard this with minimum progress so we do not switch too early.
+            // eMule's total search lifetime is 45s for keyword searches. Force
+            // transition to fetch after 30s so there's still time for fetch results.
             let elapsed = chrono::Utc::now().timestamp() - state.started_at;
             if state.phase == SearchPhase::Lookup
-                && state.search_type != SearchType::FindNode
-                && elapsed >= 60
-                && state.queried.len() >= LOOKUP_MIN_QUERIES
+                && !matches!(state.search_type, SearchType::FindNode | SearchType::FindBuddy)
+                && elapsed >= 30
+                && state.queried.len() >= ALPHA
             {
                 info!(
                     "Search {}: forcing transition to fetch after {}s in lookup (queried={}, verified={})",
