@@ -554,20 +554,30 @@ impl RoutingTable {
     }
 
     /// Generate a random KAD ID whose XOR distance from local_id falls in the given bucket.
+    /// Uses eMule's CUInt128 bit ordering: each 4-byte chunk is LE, MSB at byte offset +3.
     pub fn random_id_in_bucket(&self, bucket_idx: usize) -> KadId {
         let mut rng = rand::thread_rng();
         let mut distance = [0u8; KAD_ID_SIZE];
         rand::Rng::fill(&mut rng, &mut distance);
 
         let target_bit = bucket_idx.min(NUM_BUCKETS - 1);
-        let byte_idx = target_bit / 8;
-        let bit_in_byte = 7 - (target_bit % 8);
+        // eMule bit position (0 = MSB of first chunk)
+        let emu_bit = 127 - target_bit;
 
-        for b in distance.iter_mut().take(byte_idx) {
-            *b = 0;
+        // Clear all bits more significant than emu_bit, then set emu_bit
+        for b in 0..emu_bit {
+            let chunk = b / 32;
+            let bit_in_chunk = 31 - (b % 32);
+            let wire_byte = chunk * 4 + bit_in_chunk / 8;
+            let bit_in_byte = bit_in_chunk % 8;
+            distance[wire_byte] &= !(1u8 << bit_in_byte);
         }
-        let mask = (1u8 << bit_in_byte) - 1;
-        distance[byte_idx] = (1u8 << bit_in_byte) | (distance[byte_idx] & mask);
+        // Set the target bit
+        let chunk = emu_bit / 32;
+        let bit_in_chunk = 31 - (emu_bit % 32);
+        let wire_byte = chunk * 4 + bit_in_chunk / 8;
+        let bit_in_byte = bit_in_chunk % 8;
+        distance[wire_byte] |= 1u8 << bit_in_byte;
 
         let mut id = KadId([0u8; KAD_ID_SIZE]);
         for i in 0..KAD_ID_SIZE {

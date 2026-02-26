@@ -4,8 +4,8 @@ use std::time::Instant;
 
 const MAX_PACKETS_PER_SEC: u32 = 10;
 const TRACKER_EXPIRY_SECS: u64 = 30;
-/// Max outgoing packets per IP per second (eMule uses ~2/sec for KAD)
-const MAX_OUTGOING_PER_IP_PER_SEC: u32 = 3;
+/// Max outgoing packets per IP per second
+const MAX_OUTGOING_PER_IP_PER_SEC: u32 = 10;
 
 pub struct FloodProtection {
     ip_counters: HashMap<IpAddr, (u32, Instant)>,
@@ -121,13 +121,14 @@ impl FloodProtection {
         self.has_recent_communication(&addr)
     }
 
-    /// Check if we've had any tracked communication with this exact address recently.
-    /// Requires full address (IP + port) match to prevent spoofing from the same IP
-    /// with a different port.
+    /// Check if we've had any tracked communication with this address recently.
+    /// For P2P networks, NAT can cause responses to arrive from a different port
+    /// than the one we sent to, so we match on IP alone.
     fn has_recent_communication(&self, addr: &SocketAddr) -> bool {
         let now = Instant::now();
+        let ip = addr.ip();
         self.request_times.iter().any(|((tracked_addr, _), time)| {
-            *tracked_addr == *addr
+            tracked_addr.ip() == ip
                 && now.duration_since(*time).as_secs() < TRACKER_EXPIRY_SECS
         })
     }

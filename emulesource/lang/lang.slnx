@@ -1,0 +1,51 @@
+<Solution>
+  <Configurations>
+    <BuildType Name="Dynamic" />
+    <Platform Name="ARM64" />
+    <Platform Name="Win32" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="ar_AE.vcxproj" Id="a710033c-f75a-4431-96aa-876a9867a2f8" />
+  <Project Path="ba_BA.vcxproj" Id="eaeeb94b-aa03-4e8d-8135-d02d22fbd422" />
+  <Project Path="bg_BG.vcxproj" Id="44716561-6ba7-40da-ae7f-f3ffb422e86d" />
+  <Project Path="ca_ES.vcxproj" Id="0c96ef73-186d-4888-bb53-eece60b55647" />
+  <Project Path="cz_CZ.vcxproj" Id="e5ef62c7-377d-4b61-8244-cc4f8555f733" />
+  <Project Path="da_DK.vcxproj" Id="0c42d310-84eb-462f-944b-7166c0d071e9" />
+  <Project Path="de_DE.vcxproj" Id="8104e8d8-7343-4be7-8955-80a1f2d26ec1" />
+  <Project Path="el_GR.vcxproj" Id="8da8a9e2-9987-4b68-9825-45c445c52730" />
+  <Project Path="es_AS.vcxproj" Id="e32658c1-cd24-40dc-8912-c7d3fe803fc1" />
+  <Project Path="es_ES_T.vcxproj" Id="b0daee35-fd0f-4faf-a7c1-3d52103b3e81" />
+  <Project Path="et_EE.vcxproj" Id="14ab1b79-6f57-43eb-a5ea-b9b117b659b4" />
+  <Project Path="fa_IR.vcxproj" Id="f2ed1274-6da7-4f08-b9c8-1915409eaec1" />
+  <Project Path="fi_FI.vcxproj" Id="745d6455-7389-4c76-8275-d91f7451e0fa" />
+  <Project Path="fr_BR.vcxproj" Id="5e420537-e1a9-4004-bbdc-f2853aad5485" />
+  <Project Path="fr_FR.vcxproj" Id="a7e4e792-aa76-4977-a725-1c428aade381" />
+  <Project Path="gl_ES.vcxproj" Id="583840c9-525a-4417-866c-6197ebc12214" />
+  <Project Path="he_IL.vcxproj" Id="6191aa5f-75c1-4448-9ce1-e5ded284501b" />
+  <Project Path="hu_HU.vcxproj" Id="3c9b64a2-6676-4a60-a805-15301a18c550" />
+  <Project Path="it_IT.vcxproj" Id="fef2fd72-388b-42f6-b5da-b9a663acf557" />
+  <Project Path="jp_JP.vcxproj" Id="76fa1ca3-fc3d-45d2-86a8-b068f551652f" />
+  <Project Path="ko_KR.vcxproj" Id="aa2ea361-4793-4ff7-a042-40e271030cc4" />
+  <Project Path="lt_LT.vcxproj" Id="9b6f843f-a792-466d-98e3-a3921525aff5" />
+  <Project Path="lv_LV.vcxproj" Id="2885b86d-9dda-460c-9fb8-41b005f15349" />
+  <Project Path="mt_MT.vcxproj" Id="d0cfb304-1b97-4c5e-af66-35a223ddb14b" />
+  <Project Path="nb_NO.vcxproj" Id="de470764-a818-4780-b590-78eb8d560e89" />
+  <Project Path="nl_NL.vcxproj" Id="a989b752-28a2-44e7-8c19-f49c7ecd61dc" />
+  <Project Path="nn_NO.vcxproj" Id="67e3da3b-6da6-4948-ba97-3c2519f4dcc6" />
+  <Project Path="pl_PL.vcxproj" Id="57e9c9ff-e57f-46e0-823a-38dd76feebc6" />
+  <Project Path="pt_BR.vcxproj" Id="c7f4cb73-7d57-4077-9c04-931a6cb0677d" />
+  <Project Path="pt_PT.vcxproj" Id="64dffe85-14e0-41d7-adfa-7d53ee81d1b2" />
+  <Project Path="ro_RO.vcxproj" Id="3dca40ee-0c42-4d51-996f-ef2d3e599738" />
+  <Project Path="ru_RU.vcxproj" Id="4ae4ab3a-fd80-4dfe-bf9b-ac845dcf2449" />
+  <Project Path="sl_SI.vcxproj" Id="f8a9b7bc-3cbb-4dec-a04e-5224a65a6632" />
+  <Project Path="sq_AL.vcxproj" Id="8104e8d8-7343-4be7-8955-80a1f2d26ec2" />
+  <Project Path="sv_SE.vcxproj" Id="2aecaa37-18c5-4c04-8e34-3e6edcd926ae" />
+  <Project Path="tr_TR.vcxproj" Id="efe9605d-bf5c-4339-9a5a-32184d4bd03c" />
+  <Project Path="ua_UA.vcxproj" Id="7db64944-4784-4f40-9f87-98b8bc623854" />
+  <Project Path="ug_CN.vcxproj" Id="246a71d1-8ad2-46a1-b04d-8eef78036f27" />
+  <Project Path="va_ES.vcxproj" Id="631b7b35-df4b-480a-a61e-f6693403fe5e" />
+  <Project Path="va_ES_RACV.vcxproj" Id="506a62dc-bb66-4686-bcbe-e1bbb0b1e27a" />
+  <Project Path="vi_VN.vcxproj" Id="2a1aeddb-5ed3-4ca7-8e2d-b0178131397f" />
+  <Project Path="zh_CN.vcxproj" Id="bfcee1be-5dc9-4cdf-b55e-6dedfc4ff782" />
+  <Project Path="zh_TW.vcxproj" Id="db748474-ada6-4aeb-8694-f02088d88ad7" />
+</Solution>

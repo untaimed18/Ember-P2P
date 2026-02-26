@@ -8,15 +8,15 @@ use super::types::*;
 
 const KEYWORD_SEARCH_MAX_RESULTS: usize = 500;
 const PENDING_TIMEOUT_SECS: i64 = 10;
-const LOOKUP_CONVERGE_COUNT: usize = 2;
-const LOOKUP_MIN_QUERIES: usize = 10;
+const LOOKUP_CONVERGE_COUNT: usize = 5;
+const LOOKUP_MIN_QUERIES: usize = 20;
 
 /// eMule seeds searches with 50 contacts (Search.cpp Go() -> GetClosestTo(..., 50, ...))
 pub const SEARCH_INITIAL_CONTACTS: usize = 50;
 
 // Per-type timeouts matching eMule
 const TIMEOUT_FIND_NODE: i64 = 45;
-const TIMEOUT_KEYWORD: i64 = 45;
+const TIMEOUT_KEYWORD: i64 = 90;
 const TIMEOUT_SOURCE: i64 = 45;
 const TIMEOUT_NOTES: i64 = 45;
 const TIMEOUT_STORE_KEYWORD: i64 = 140;
@@ -458,11 +458,11 @@ impl SearchManager {
                 );
             }
 
-            // If search is still in lookup phase after 20s, force transition to fetch
+            // If search is still in lookup phase after 30s, force transition to fetch
             let elapsed = chrono::Utc::now().timestamp() - state.started_at;
             if state.phase == SearchPhase::Lookup
                 && state.search_type != SearchType::FindNode
-                && elapsed >= 20
+                && elapsed >= 30
             {
                 info!(
                     "Search {}: forcing transition to fetch after {}s in lookup (queried={}, verified={})",

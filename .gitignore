@@ -19,6 +19,7 @@ src-tauri/gen/schemas
 # IDE
 .vscode/
 .idea/
+.emulesource/
 *.swp
 *.swo
 *.sublime-project

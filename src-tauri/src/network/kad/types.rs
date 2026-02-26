@@ -100,14 +100,20 @@ impl KadId {
 
     /// Returns the index of the highest set bit (0-127), or None if zero.
     /// Used to determine which k-bucket a contact belongs to.
+    /// Count leading zeros matching eMule's CUInt128 bit ordering.
+    /// Each 4-byte chunk is LE, so within a chunk the MSB is at offset +3.
     pub fn leading_zeros(&self) -> u32 {
         let mut total = 0u32;
-        for byte in &self.0 {
-            if *byte == 0 {
-                total += 8;
-            } else {
-                total += byte.leading_zeros();
-                break;
+        for chunk in 0..4 {
+            let base = chunk * 4;
+            for offset in (0..4).rev() {
+                let byte = self.0[base + offset];
+                if byte == 0 {
+                    total += 8;
+                } else {
+                    total += byte.leading_zeros();
+                    return total;
+                }
             }
         }
         total
@@ -163,8 +169,24 @@ impl PartialOrd for KadId {
 }
 
 impl Ord for KadId {
+    /// Match eMule's CUInt128 comparison: compare 4 little-endian u32 chunks
+    /// from most significant (chunk 0 = bytes 0..3) to least significant.
+    /// Each 4-byte group is interpreted as a LE u32 for the comparison.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
+        for i in 0..4 {
+            let base = i * 4;
+            let a = u32::from_le_bytes([
+                self.0[base], self.0[base + 1], self.0[base + 2], self.0[base + 3],
+            ]);
+            let b = u32::from_le_bytes([
+                other.0[base], other.0[base + 1], other.0[base + 2], other.0[base + 3],
+            ]);
+            match a.cmp(&b) {
+                std::cmp::Ordering::Equal => continue,
+                ord => return ord,
+            }
+        }
+        std::cmp::Ordering::Equal
     }
 }
 

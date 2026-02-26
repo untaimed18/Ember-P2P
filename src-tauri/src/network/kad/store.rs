@@ -54,7 +54,7 @@ impl DhtStore {
     /// Check if the target is within our tolerance zone for accepting publishes.
     pub fn is_within_tolerance(&self, target: &KadId) -> bool {
         let distance = self.local_id.xor_distance(target);
-        let d = u32::from_be_bytes([distance.0[0], distance.0[1], distance.0[2], distance.0[3]]);
+        let d = u32::from_le_bytes([distance.0[0], distance.0[1], distance.0[2], distance.0[3]]);
         d <= SEARCH_TOLERANCE
     }
 

@@ -578,13 +578,17 @@ pub async fn start_network(
                 if !queries.is_empty() {
                     info!("Search poll: sending {} queries", queries.len());
                 }
-                for (_sid, addr, msg) in &queries {
+                for (sid, addr, msg) in &queries {
                     if state.flood_protection.check_outgoing_rate(addr.ip()) {
-                        debug!("Throttling outgoing packet to {addr}");
+                        info!("Throttling outgoing search {} packet to {addr}", sid.0);
                         continue;
                     }
                     if let Ok(packet) = messages::encode_packet(msg) {
                         let opcode = packet.get(1).copied().unwrap_or(0);
+                        // Log SearchKeyReq/SearchSourceReq sends at INFO level for diagnostics
+                        if opcode == 0x33 || opcode == 0x34 {
+                            info!("  Search {}: sending 0x{opcode:02X} to {addr}", sid.0);
+                        }
                         state.flood_protection.track_request(*addr, opcode);
                         let _ = udp_socket.send_to(&packet, addr).await;
                     }
@@ -1339,7 +1343,7 @@ async fn handle_udp_packet(
         }
     }
     if state.flood_protection.check_rate_limit(from.ip()) {
-        debug!("Rate limit exceeded for {from}, dropping packet");
+        info!("Rate limit exceeded for {from}, dropping packet");
         return;
     }
 
@@ -1386,7 +1390,11 @@ async fn handle_udp_packet(
     };
     if let Some(opcode) = response_opcode {
         if !state.flood_protection.validate_response(from, opcode) {
-            debug!("Dropping unsolicited response 0x{:02X} from {from}", opcode);
+            if opcode == 0x3B {
+                warn!("Dropping unsolicited SearchRes from {from} (no matching outgoing SearchKeyReq)");
+            } else {
+                debug!("Dropping unsolicited response 0x{:02X} from {from}", opcode);
+            }
             return;
         }
     }
