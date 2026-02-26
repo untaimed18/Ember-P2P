@@ -24,7 +24,7 @@ use self::ed2k::transfer::{DownloadEvent, Ed2kDownload};
 use self::kad::bootstrap;
 use self::kad::buddy::{BuddyManager, BuddyState};
 use self::kad::ip_filter::{IpFilter, IpFilterStats};
-use self::kad::messages::{self, KadMessage};
+use self::kad::messages::{self, KadMessage, KADEMLIA_FIND_NODE};
 use self::kad::obfuscation;
 use self::kad::protection::FloodProtection;
 use self::kad::publish::{PublishManager, PublishableFile, md4_bytes_to_kad_id, kad_id_to_md4_bytes};
@@ -1619,6 +1619,12 @@ async fn handle_udp_packet(
                 _ => return,
             };
 
+            // eMule: reject Kad1 contacts
+            if version <= 1 {
+                debug!("HelloReq from {from}: rejecting Kad1 contact (version={version})");
+                return;
+            }
+
             // Parse TAG_KADMISCOPTIONS
             let kad_options = tags.iter()
                 .find(|t| matches!(&t.name, TagName::Id(TAG_KADMISCOPTIONS)))
@@ -1626,6 +1632,15 @@ async fn handle_udp_packet(
                 .unwrap_or(0);
 
             let wants_ack = kad_options & 0x04 != 0;
+
+            // Check if the sender provided a valid UDP receiver key (our key for them)
+            let peer_udp_key = extract_udp_key_from_tags(&tags);
+            let valid_receiver_key = if let Some(ref puk) = peer_udp_key {
+                let expected = KadUDPKey::generate(state.udp_key_seed, u32::from(ip));
+                puk.key != 0 && puk.key == expected.key
+            } else {
+                false
+            };
 
             let now = chrono::Utc::now().timestamp();
             let contact_ip_u32 = u32::from(ip);
@@ -1636,7 +1651,7 @@ async fn handle_udp_packet(
                 tcp_port,
                 version,
                 last_seen: now,
-                verified: false,
+                verified: valid_receiver_key,
                 contact_type: CONTACT_TYPE_OPEN,
                 udp_key: Some(KadUDPKey::generate(state.udp_key_seed, contact_ip_u32)),
                 kad_options,
@@ -1655,16 +1670,20 @@ async fn handle_udp_packet(
                 }
             }
 
-            // Extract peer's UDP verify key from tags
-            if let Some(peer_udp_key) = extract_udp_key_from_tags(&tags) {
-                if let Some(contact) = state.routing_table.get_contact_mut(&sender_id) {
-                    contact.udp_key = Some(peer_udp_key);
-                }
+            // If valid receiver key, also explicitly verify in routing table
+            if valid_receiver_key {
+                state.routing_table.mark_verified(&sender_id);
             }
 
             // Build our firewall options + UDP verify key for the peer
             // Bit 0: UDP firewalled, bit 1: TCP firewalled, bit 2: request ACK
-            let our_options: u8 = if state.firewalled { 0x05 } else { 0x04 };
+            // eMule: only request ACK if the contact was added and not yet verified
+            let needs_ack = !valid_receiver_key;
+            let our_options: u8 = if state.firewalled {
+                if needs_ack { 0x05 } else { 0x01 }
+            } else {
+                if needs_ack { 0x04 } else { 0x00 }
+            };
             let contact_ip_u32_for_key = u32::from(ip);
             let our_key_for_peer = KadUDPKey::generate(state.udp_key_seed, contact_ip_u32_for_key);
             let mut res_tags = vec![
@@ -1723,6 +1742,12 @@ async fn handle_udp_packet(
                 _ => return,
             };
 
+            // eMule: reject Kad1 contacts
+            if version <= 1 {
+                debug!("HelloRes from {from}: rejecting Kad1 contact (version={version})");
+                return;
+            }
+
             let kad_options = tags.iter()
                 .find(|t| matches!(&t.name, TagName::Id(TAG_KADMISCOPTIONS)))
                 .and_then(|t| t.uint8_value().or_else(|| t.uint16_value().map(|v| v as u8)).or_else(|| t.uint32_value().map(|v| v as u8)))
@@ -1730,6 +1755,14 @@ async fn handle_udp_packet(
 
             // Extract peer's UDP verify key
             let peer_udp_key = extract_udp_key_from_tags(&tags);
+
+            // eMule: verify contact if the response contains a valid receiver key
+            let valid_receiver_key = if let Some(ref puk) = peer_udp_key {
+                let expected = KadUDPKey::generate(state.udp_key_seed, u32::from(ip));
+                puk.key != 0 && puk.key == expected.key
+            } else {
+                false
+            };
 
             let now = chrono::Utc::now().timestamp();
             let contact_ip_u32 = u32::from(ip);
@@ -1741,7 +1774,7 @@ async fn handle_udp_packet(
                 tcp_port,
                 version,
                 last_seen: now,
-                verified: false,
+                verified: valid_receiver_key,
                 contact_type: CONTACT_TYPE_OPEN,
                 udp_key: Some(udp_key),
                 kad_options,
@@ -1749,6 +1782,11 @@ async fn handle_udp_packet(
                 expires_at: 0,
                 last_type_set: 0,
             });
+
+            // If valid receiver key, also verify the contact in the routing table
+            if valid_receiver_key {
+                state.routing_table.mark_verified(&sender_id);
+            }
             state.stats.connected_peers = state.routing_table.len() as u32;
 
             let nick = tags.iter()
@@ -1759,6 +1797,26 @@ async fn handle_udp_packet(
 
             if !nick.is_empty() {
                 state.peer_nicknames.insert(sender_id, nick.clone());
+            }
+
+            // eMule: if the remote requested an ACK (bit 2 of kad_options), send HelloResAck
+            let wants_ack = kad_options & 0x04 != 0;
+            if wants_ack {
+                let contact_ip_u32_for_key = u32::from(ip);
+                let our_key_for_peer = KadUDPKey::generate(state.udp_key_seed, contact_ip_u32_for_key);
+                let ack_tags = vec![
+                    KadTag {
+                        name: TagName::Id(TAG_KADUDPKEY),
+                        value: TagValue::Uint32(our_key_for_peer.key),
+                    },
+                ];
+                let ack = KadMessage::HelloResAck {
+                    sender_id: state.local_id,
+                    tags: ack_tags,
+                };
+                if let Ok(packet) = messages::encode_packet(&ack) {
+                    let _ = send_kad_packet(socket, &packet, from, state, &sender_id).await;
+                }
             }
 
             // Persist peer to database
@@ -1812,6 +1870,21 @@ async fn handle_udp_packet(
 
         KadMessage::KadRes { target, contacts } => {
             info!("KadRes from {from}: {} contacts for target {target}", contacts.len());
+
+            // eMule Process_KADEMLIA2_RES: validate contact count against what we requested.
+            let expected = state.search_manager.get_expected_response_count(&target);
+            if expected == 0 {
+                info!("  No active search for target {target}, ignoring response");
+                return;
+            }
+            if contacts.len() > expected as usize {
+                // eMule allows KADEMLIA_FIND_VALUE_MORE (11) for re-ask contacts
+                if contacts.len() > KADEMLIA_FIND_NODE as usize {
+                    warn!("KadRes from {from}: contact count {} exceeds max {}, ignoring", contacts.len(), KADEMLIA_FIND_NODE);
+                    return;
+                }
+            }
+
             let search_ids: Vec<SearchId> = state
                 .search_manager
                 .active

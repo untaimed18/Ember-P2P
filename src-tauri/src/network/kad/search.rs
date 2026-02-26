@@ -6,6 +6,9 @@ use tracing::{debug, info};
 use super::messages::*;
 use super::types::*;
 
+/// eMule GetRequestContactCount values — how many contacts we ask for
+pub const KADEMLIA_FIND_VALUE_MORE: u8 = KADEMLIA_FIND_NODE;
+
 /// eMule Defines.h SEARCHKEYWORD_TOTAL
 const KEYWORD_SEARCH_MAX_RESULTS: usize = 300;
 const PENDING_TIMEOUT_SECS: i64 = 10;
@@ -423,6 +426,16 @@ impl SearchState {
             && (is_lan_ip(contact.ip) || within_search_tolerance(&self.target, &contact.id))
     }
 
+    /// Returns the expected number of contacts in a response.
+    /// Matches eMule's GetRequestContactCount for validating KADEMLIA2_RES.
+    pub fn get_expected_response_count(&self) -> u8 {
+        match self.search_type {
+            SearchType::FindNode | SearchType::NodeComplete => KADEMLIA_FIND_NODE,
+            SearchType::FindKeyword | SearchType::FindSource { .. } | SearchType::FindNotes { .. } => KADEMLIA_FIND_VALUE,
+            SearchType::FindBuddy | SearchType::StoreFile | SearchType::StoreKeyword | SearchType::StoreNotes => KADEMLIA_STORE,
+        }
+    }
+
     /// Build the wire message for this search phase.
     /// Matches eMule's GetRequestContactCount:
     /// - NODE/NODECOMPLETE → KADEMLIA_FIND_NODE (11)
@@ -573,6 +586,19 @@ impl SearchManager {
 
     pub fn get(&self, id: &SearchId) -> Option<&SearchState> {
         self.active.get(id)
+    }
+
+    /// Get the expected response contact count for a target (eMule GetExpectedResponseContactCount).
+    /// Returns 0 if no active search for this target (meaning the response should be rejected).
+    pub fn get_expected_response_count(&self, target: &KadId) -> u8 {
+        if let Some(search_id) = self.target_map.get(target) {
+            if let Some(search) = self.active.get(search_id) {
+                if !search.completed {
+                    return search.get_expected_response_count();
+                }
+            }
+        }
+        0
     }
 
     pub fn active_count(&self) -> usize {
