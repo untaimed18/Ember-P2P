@@ -1496,7 +1496,7 @@ async fn handle_udp_packet(
             }
 
             let table_size = state.routing_table.len();
-            info!("Routing table now has {table_size} contacts");
+            debug!("Routing table now has {table_size} contacts");
             state.stats.connected_peers = table_size as u32;
             if state.stats.status != NetworkStatus::Connected {
                 state.stats.status = NetworkStatus::Connected;

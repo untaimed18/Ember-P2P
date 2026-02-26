@@ -346,7 +346,17 @@ impl SearchState {
                 let search_type = match self.search_type {
                     SearchType::FindNode | SearchType::FindBuddy => KADEMLIA_FIND_NODE,
                     SearchType::StoreKeyword | SearchType::StoreNotes => KADEMLIA_STORE,
-                    _ => KADEMLIA_FIND_VALUE,
+                    _ => {
+                        // eMule JumpStart behavior: when the lookup is stalling
+                        // (many stale rounds), switch from FIND_VALUE (returns 2
+                        // contacts) to FIND_NODE (returns 11) to discover more peers
+                        // and converge faster in sparse routing tables.
+                        if self.lookup_stale_rounds >= 3 {
+                            KADEMLIA_FIND_NODE
+                        } else {
+                            KADEMLIA_FIND_VALUE
+                        }
+                    }
                 };
                 KadMessage::KadReq {
                     search_type,
