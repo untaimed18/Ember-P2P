@@ -7,6 +7,7 @@
     { href: '/transfers', label: 'Transfers', icon: '⇅' },
     { href: '/sharing', label: 'Sharing', icon: '⊕' },
     { href: '/peers', label: 'Peers', icon: '⊛' },
+    { href: '/security', label: 'Security', icon: '🛡' },
     { href: '/settings', label: 'Settings', icon: '⚙' },
   ];
 </script>

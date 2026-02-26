@@ -1,13 +1,32 @@
 use std::net::Ipv4Addr;
 use std::path::Path;
 
+use serde::Serialize;
 use tracing::{info, warn};
 
-/// An IP range that should be blocked.
 #[derive(Debug, Clone)]
 struct IpRange {
     start: u32,
     end: u32,
+    description: String,
+    hits: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IpFilterEntry {
+    pub start_ip: String,
+    pub end_ip: String,
+    pub description: String,
+    pub hits: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IpFilterStats {
+    pub enabled: bool,
+    pub block_private: bool,
+    pub range_count: usize,
+    pub total_hits: u64,
+    pub entries: Vec<IpFilterEntry>,
 }
 
 /// IP filter supporting eMule's ipfilter.dat format and private/reserved IP blocking.
@@ -29,12 +48,8 @@ impl IpFilter {
         }
     }
 
-    /// Load an ipfilter.dat file (eMule format).
+    /// Load an ipfilter.dat file (eMule format). Replaces existing ranges.
     pub fn load_from_file(&mut self, path: &Path) -> usize {
-        if !self.enabled {
-            return 0;
-        }
-
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
@@ -42,6 +57,8 @@ impl IpFilter {
                 return 0;
             }
         };
+
+        self.blocked_ranges.clear();
 
         let mut count = 0;
         for line in content.lines() {
@@ -57,33 +74,64 @@ impl IpFilter {
         }
 
         self.blocked_ranges.sort_by_key(|r| r.start);
-
-        // Merge overlapping ranges
-        if self.blocked_ranges.len() > 1 {
-            let mut merged = Vec::with_capacity(self.blocked_ranges.len());
-            merged.push(self.blocked_ranges[0].clone());
-            for range in &self.blocked_ranges[1..] {
-                let last = merged.last_mut().unwrap();
-                if range.start <= last.end + 1 {
-                    last.end = last.end.max(range.end);
-                } else {
-                    merged.push(range.clone());
-                }
-            }
-            self.blocked_ranges = merged;
-        }
+        self.merge_overlapping();
 
         info!("Loaded {count} IP filter ranges from {}", path.display());
         count
     }
 
-    /// Check if an IPv4 address should be blocked.
-    ///
-    /// When `block_private` is true, private/reserved IPs (RFC1918, loopback,
-    /// link-local, etc.) are blocked. When `enabled` is true, ipfilter.dat
-    /// ranges are also checked. Broadcast, multicast, and unspecified addresses
-    /// are always blocked regardless of settings.
-    pub fn is_blocked(&self, ip: Ipv4Addr) -> bool {
+    fn merge_overlapping(&mut self) {
+        if self.blocked_ranges.len() <= 1 {
+            return;
+        }
+        let mut merged = Vec::with_capacity(self.blocked_ranges.len());
+        merged.push(self.blocked_ranges[0].clone());
+        for range in &self.blocked_ranges[1..] {
+            let last = merged.last_mut().unwrap();
+            if range.start <= last.end.saturating_add(1) {
+                last.end = last.end.max(range.end);
+                if last.description.is_empty() && !range.description.is_empty() {
+                    last.description = range.description.clone();
+                }
+                last.hits += range.hits;
+            } else {
+                merged.push(range.clone());
+            }
+        }
+        self.blocked_ranges = merged;
+    }
+
+    /// Check if an IPv4 address should be blocked, incrementing hit count if so.
+    pub fn is_blocked(&mut self, ip: Ipv4Addr) -> bool {
+        if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
+            return true;
+        }
+
+        if self.block_private && is_private_or_reserved(ip) {
+            return true;
+        }
+
+        if self.enabled {
+            let ip_u32 = u32::from(ip);
+            if let Ok(idx) = self.blocked_ranges.binary_search_by(|range| {
+                if ip_u32 < range.start {
+                    std::cmp::Ordering::Greater
+                } else if ip_u32 > range.end {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            }) {
+                self.blocked_ranges[idx].hits += 1;
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Check if an IPv4 address is blocked without modifying hit counts.
+    pub fn is_blocked_readonly(&self, ip: Ipv4Addr) -> bool {
         if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
             return true;
         }
@@ -123,6 +171,69 @@ impl IpFilter {
 
     pub fn blocks_private(&self) -> bool {
         self.block_private
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    pub fn set_block_private(&mut self, block_private: bool) {
+        self.block_private = block_private;
+    }
+
+    pub fn get_stats(&self) -> IpFilterStats {
+        let total_hits: u64 = self.blocked_ranges.iter().map(|r| r.hits).sum();
+        let entries: Vec<IpFilterEntry> = self
+            .blocked_ranges
+            .iter()
+            .map(|r| IpFilterEntry {
+                start_ip: Ipv4Addr::from(r.start).to_string(),
+                end_ip: Ipv4Addr::from(r.end).to_string(),
+                description: r.description.clone(),
+                hits: r.hits,
+            })
+            .collect();
+
+        IpFilterStats {
+            enabled: self.enabled,
+            block_private: self.block_private,
+            range_count: self.blocked_ranges.len(),
+            total_hits,
+            entries,
+        }
+    }
+
+    pub fn add_range(&mut self, start: Ipv4Addr, end: Ipv4Addr, description: String) -> bool {
+        let s = u32::from(start);
+        let e = u32::from(end);
+        if s > e {
+            return false;
+        }
+        self.blocked_ranges.push(IpRange {
+            start: s,
+            end: e,
+            description,
+            hits: 0,
+        });
+        self.blocked_ranges.sort_by_key(|r| r.start);
+        self.merge_overlapping();
+        true
+    }
+
+    pub fn remove_range(&mut self, start_ip: &str, end_ip: &str) -> bool {
+        let start: Ipv4Addr = match start_ip.parse() {
+            Ok(ip) => ip,
+            Err(_) => return false,
+        };
+        let end: Ipv4Addr = match end_ip.parse() {
+            Ok(ip) => ip,
+            Err(_) => return false,
+        };
+        let s = u32::from(start);
+        let e = u32::from(end);
+        let before = self.blocked_ranges.len();
+        self.blocked_ranges.retain(|r| r.start != s || r.end != e);
+        self.blocked_ranges.len() < before
     }
 }
 
@@ -193,8 +304,6 @@ pub fn is_private_or_reserved(ip: Ipv4Addr) -> bool {
 }
 
 /// Validate an IP address received from a remote peer in contact info.
-/// When `block_private` is true, rejects private/reserved IPs.
-/// Always rejects unspecified, broadcast, and multicast.
 pub fn is_valid_contact_ip(ip: Ipv4Addr, block_private: bool) -> bool {
     if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
         return false;
@@ -217,6 +326,12 @@ fn parse_ipfilter_line(line: &str) -> Option<IpRange> {
         return None;
     }
 
+    let description = if parts.len() >= 3 {
+        parts[2].trim().to_string()
+    } else {
+        String::new()
+    };
+
     let ip_range_part = parts[0].trim();
     let ip_parts: Vec<&str> = ip_range_part.splitn(2, '-').collect();
     if ip_parts.len() != 2 {
@@ -233,7 +348,12 @@ fn parse_ipfilter_line(line: &str) -> Option<IpRange> {
         return None;
     }
 
-    Some(IpRange { start, end })
+    Some(IpRange {
+        start,
+        end,
+        description,
+        hits: 0,
+    })
 }
 
 #[cfg(test)]
@@ -257,11 +377,11 @@ mod tests {
     #[test]
     fn test_ip_filter_with_ranges() {
         let mut filter = IpFilter::new(true, false);
-        filter.blocked_ranges.push(IpRange {
-            start: u32::from(Ipv4Addr::new(1, 0, 0, 0)),
-            end: u32::from(Ipv4Addr::new(1, 0, 0, 255)),
-        });
-        filter.blocked_ranges.sort_by_key(|r| r.start);
+        filter.add_range(
+            Ipv4Addr::new(1, 0, 0, 0),
+            Ipv4Addr::new(1, 0, 0, 255),
+            "test".to_string(),
+        );
 
         assert!(filter.is_blocked(Ipv4Addr::new(1, 0, 0, 50)));
         assert!(!filter.is_blocked(Ipv4Addr::new(2, 0, 0, 50)));
@@ -270,25 +390,23 @@ mod tests {
     #[test]
     fn test_ip_filter_disabled() {
         let mut filter = IpFilter::new(false, false);
-        filter.blocked_ranges.push(IpRange {
-            start: u32::from(Ipv4Addr::new(1, 0, 0, 0)),
-            end: u32::from(Ipv4Addr::new(1, 0, 0, 255)),
-        });
-        filter.blocked_ranges.sort_by_key(|r| r.start);
+        filter.add_range(
+            Ipv4Addr::new(1, 0, 0, 0),
+            Ipv4Addr::new(1, 0, 0, 255),
+            String::new(),
+        );
 
-        // ipfilter ranges should be ignored when disabled
         assert!(!filter.is_blocked(Ipv4Addr::new(1, 0, 0, 50)));
-        // but broadcast/multicast are always blocked
         assert!(filter.is_blocked(Ipv4Addr::new(255, 255, 255, 255)));
     }
 
     #[test]
     fn test_ip_filter_block_private() {
-        let filter = IpFilter::new(false, true);
+        let mut filter = IpFilter::new(false, true);
         assert!(filter.is_blocked(Ipv4Addr::new(192, 168, 1, 1)));
         assert!(!filter.is_blocked(Ipv4Addr::new(8, 8, 8, 8)));
 
-        let filter_no_priv = IpFilter::new(false, false);
+        let mut filter_no_priv = IpFilter::new(false, false);
         assert!(!filter_no_priv.is_blocked(Ipv4Addr::new(192, 168, 1, 1)));
     }
 
@@ -299,5 +417,37 @@ mod tests {
         assert!(is_valid_contact_ip(Ipv4Addr::new(192, 168, 1, 1), false));
         assert!(!is_valid_contact_ip(Ipv4Addr::UNSPECIFIED, false));
         assert!(!is_valid_contact_ip(Ipv4Addr::LOCALHOST, false));
+    }
+
+    #[test]
+    fn test_hit_counting() {
+        let mut filter = IpFilter::new(true, false);
+        filter.add_range(
+            Ipv4Addr::new(1, 0, 0, 0),
+            Ipv4Addr::new(1, 0, 0, 255),
+            "test range".to_string(),
+        );
+
+        filter.is_blocked(Ipv4Addr::new(1, 0, 0, 1));
+        filter.is_blocked(Ipv4Addr::new(1, 0, 0, 2));
+        filter.is_blocked(Ipv4Addr::new(1, 0, 0, 3));
+
+        let stats = filter.get_stats();
+        assert_eq!(stats.total_hits, 3);
+        assert_eq!(stats.entries[0].hits, 3);
+        assert_eq!(stats.entries[0].description, "test range");
+    }
+
+    #[test]
+    fn test_remove_range() {
+        let mut filter = IpFilter::new(true, false);
+        filter.add_range(
+            Ipv4Addr::new(1, 0, 0, 0),
+            Ipv4Addr::new(1, 0, 0, 255),
+            String::new(),
+        );
+        assert_eq!(filter.range_count(), 1);
+        assert!(filter.remove_range("1.0.0.0", "1.0.0.255"));
+        assert_eq!(filter.range_count(), 0);
     }
 }

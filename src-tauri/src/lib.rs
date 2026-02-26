@@ -175,6 +175,13 @@ pub fn run() {
             commands::settings::update_settings,
             commands::settings::download_nodes_dat,
             commands::settings::download_ipfilter,
+            commands::security::get_ip_filter_stats,
+            commands::security::add_ip_filter_range,
+            commands::security::remove_ip_filter_range,
+            commands::security::set_ip_filter_enabled,
+            commands::security::set_block_private_ips,
+            commands::security::download_and_load_ipfilter,
+            commands::security::import_ipfilter_file,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

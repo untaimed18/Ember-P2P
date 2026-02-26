@@ -23,7 +23,7 @@ use self::ed2k::multi_source::{DownloadSource, MultiSourceDownload};
 use self::ed2k::transfer::{DownloadEvent, Ed2kDownload};
 use self::kad::bootstrap;
 use self::kad::buddy::{BuddyManager, BuddyState};
-use self::kad::ip_filter::IpFilter;
+use self::kad::ip_filter::{IpFilter, IpFilterStats};
 use self::kad::messages::{self, KadMessage};
 use self::kad::obfuscation;
 use self::kad::protection::FloodProtection;
@@ -86,6 +86,24 @@ pub enum NetworkCommand {
     },
     ReloadIpFilter {
         path: PathBuf,
+    },
+    GetIpFilterStats {
+        tx: oneshot::Sender<IpFilterStats>,
+    },
+    AddIpRange {
+        start_ip: String,
+        end_ip: String,
+        description: String,
+    },
+    RemoveIpRange {
+        start_ip: String,
+        end_ip: String,
+    },
+    SetIpFilterEnabled {
+        enabled: bool,
+    },
+    SetBlockPrivateIps {
+        block_private: bool,
     },
     Shutdown,
 }
@@ -1674,7 +1692,7 @@ async fn handle_udp_packet(
                     // Filter out contacts with blocked/banned IPs before processing
                     let safe_contacts: Vec<KadContact> = contacts.iter()
                         .filter(|c| {
-                            !state.ip_filter.is_blocked(c.ip)
+                            !state.ip_filter.is_blocked_readonly(c.ip)
                                 && !state.banned_ips.contains(&c.ip)
                         })
                         .cloned()
@@ -2500,6 +2518,33 @@ async fn handle_command(
                 path.display(),
                 state.ip_filter.range_count(),
             );
+        }
+
+        NetworkCommand::GetIpFilterStats { tx } => {
+            let _ = tx.send(state.ip_filter.get_stats());
+        }
+
+        NetworkCommand::AddIpRange { start_ip, end_ip, description } => {
+            if let (Ok(start), Ok(end)) = (start_ip.parse::<Ipv4Addr>(), end_ip.parse::<Ipv4Addr>()) {
+                state.ip_filter.add_range(start, end, description);
+                info!("Added IP filter range {start_ip} - {end_ip}, total ranges: {}", state.ip_filter.range_count());
+            }
+        }
+
+        NetworkCommand::RemoveIpRange { start_ip, end_ip } => {
+            if state.ip_filter.remove_range(&start_ip, &end_ip) {
+                info!("Removed IP filter range {start_ip} - {end_ip}, total ranges: {}", state.ip_filter.range_count());
+            }
+        }
+
+        NetworkCommand::SetIpFilterEnabled { enabled } => {
+            state.ip_filter.set_enabled(enabled);
+            info!("IP filter enabled: {enabled}");
+        }
+
+        NetworkCommand::SetBlockPrivateIps { block_private } => {
+            state.ip_filter.set_block_private(block_private);
+            info!("Block private IPs: {block_private}");
         }
 
         NetworkCommand::Shutdown => {}
