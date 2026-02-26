@@ -231,27 +231,38 @@ pub fn kad_id_to_md4_bytes(id: &KadId) -> [u8; 16] {
 }
 
 /// Extract searchable keywords from a filename using eMule's tokenization rules.
-/// Does not strip extension before tokenizing; uses eMule's separator set.
-/// After tokenizing, removes the last word if it's exactly 3 chars/3 bytes
-/// and there are >1 words (strips common file extensions like "mp3", "avi").
+/// Matches eMule SearchManager::GetWords:
+/// - Split on INV_KAD_KEYWORD_CHARS: ` ()[]{}<>,._-!?:;\\/"`
+/// - Keep words where UTF-8 byte length >= 3
+/// - Deduplicate (case-insensitive), keeping order of first occurrence
+/// - Remove last word if it's exactly 3 chars and 3 bytes (strips file extensions)
 pub fn extract_keywords(filename: &str) -> Vec<String> {
     let separator_chars = |c: char| -> bool {
         matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | '.' | '_' | '-' | '!' | '?' | ':' | ';' | '\\' | '/' | '"')
         || c.is_whitespace()
     };
 
-    let mut result: Vec<String> = filename
-        .split(separator_chars)
-        .filter(|w| w.len() >= 3)
-        .map(|w| w.to_lowercase())
-        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut result: Vec<String> = Vec::new();
+    let mut last_chars = 0usize;
+    let mut last_bytes = 0usize;
 
-    if result.len() > 1 {
-        if let Some(last) = result.last() {
-            if last.len() == 3 && last.chars().count() == 3 {
-                result.pop();
-            }
+    for word in filename.split(separator_chars) {
+        let bytes = word.len();
+        if bytes < 3 {
+            continue;
         }
+        let lower = word.to_lowercase();
+        if seen.insert(lower.clone()) {
+            last_chars = word.chars().count();
+            last_bytes = bytes;
+            result.push(lower);
+        }
+    }
+
+    // eMule: if last word is 3 chars and 3 bytes and there are >1 words, pop it (extension)
+    if result.len() > 1 && last_chars == 3 && last_bytes == 3 {
+        result.pop();
     }
 
     result

@@ -959,7 +959,7 @@ pub async fn start_network(
                         // Use iterative search to find truly closest nodes before publishing
                         let sid = state.search_manager.start_search(
                             file.file_hash,
-                            SearchType::StoreKeyword, // reuse STORE type for source publish lookup
+                            SearchType::StoreFile,
                             closest,
                         );
                         state.store_source_searches.insert(sid, (file.file_hash, msg));
@@ -2506,8 +2506,9 @@ async fn handle_command(
                 return;
             }
 
-            // Use the longest keyword as the primary search term (most selective)
-            let primary_keyword = keywords.iter().max_by_key(|k| k.len()).unwrap();
+            // eMule PrepareFindKeywords: use the FIRST keyword as the primary search target.
+            // The remaining keywords are used for filtering results on the searcher side.
+            let primary_keyword = &keywords[0];
             let keyword_hash = kad::publish::keyword_to_kad_id(primary_keyword);
             info!("Searching KAD for keyword '{}' -> hash {}", primary_keyword, keyword_hash);
 
