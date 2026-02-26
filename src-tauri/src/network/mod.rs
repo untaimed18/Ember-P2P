@@ -1878,22 +1878,37 @@ async fn handle_udp_packet(
 
                     let safe_contacts: Vec<KadContact> = contacts.iter()
                         .filter(|c| {
+                            // eMule: reject Kad1 contacts (version <= 1)
+                            if !c.is_kad2() {
+                                return false;
+                            }
+                            // eMule: reject DNS port 53 for old versions
+                            if c.udp_port == 53 && c.version <= KADEMLIA_VERSION5_48A {
+                                return false;
+                            }
                             if state.ip_filter.is_blocked_readonly(c.ip)
                                 || state.banned_ips.contains(&c.ip)
                             {
+                                return false;
+                            }
+                            // eMule IsAcceptableContact: check routing table constraints
+                            if !state.routing_table.is_acceptable_contact(c) {
                                 return false;
                             }
                             if !seen_ips.insert(c.ip) {
                                 debug!("KadRes: duplicate IP {} in response, ignoring", c.ip);
                                 return false;
                             }
-                            let o = c.ip.octets();
-                            let subnet = u32::from_be_bytes([o[0], o[1], o[2], 0]);
-                            let count = subnet_counts.entry(subnet).or_insert(0);
-                            *count += 1;
-                            if *count > 2 {
-                                debug!("KadRes: >2 contacts from subnet {}.{}.{}.0, ignoring {}", o[0], o[1], o[2], c.ip);
-                                return false;
+                            // eMule: LAN IPs are exempt from per-response subnet limits
+                            if !kad::ip_filter::is_lan_ip(c.ip) {
+                                let o = c.ip.octets();
+                                let subnet = u32::from_be_bytes([o[0], o[1], o[2], 0]);
+                                let count = subnet_counts.entry(subnet).or_insert(0);
+                                *count += 1;
+                                if *count > 2 {
+                                    debug!("KadRes: >2 contacts from subnet {}.{}.{}.0, ignoring {}", o[0], o[1], o[2], c.ip);
+                                    return false;
+                                }
                             }
                             true
                         })

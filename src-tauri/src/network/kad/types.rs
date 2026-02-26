@@ -17,6 +17,21 @@ pub const DEFAULT_UDP_PORT: u16 = 4672;
 /// SEARCHTOLERANCE: max XOR distance (first 4 bytes as u32) for accepting publishes
 pub const SEARCH_TOLERANCE: u32 = 0x0100_0000;
 
+/// eMule KAD version constants (from opcodes.h)
+pub const KADEMLIA_VERSION1_46C: u8 = 0x01;
+pub const KADEMLIA_VERSION2_47A: u8 = 0x02;
+pub const KADEMLIA_VERSION3_47B: u8 = 0x03;
+pub const KADEMLIA_VERSION5_48A: u8 = 0x05;
+pub const KADEMLIA_VERSION6_49ABETA: u8 = 0x06;
+pub const KADEMLIA_VERSION7_49A: u8 = 0x07;
+pub const KADEMLIA_VERSION8_49B: u8 = 0x08;
+pub const KADEMLIA_VERSION9_50A: u8 = 0x09;
+
+/// eMule Defines.h: KBASE=4, KK=5, LOG_BASE_EXPONENT=5
+pub const KBASE: usize = 4;
+pub const KK: usize = 5;
+pub const LOG_BASE_EXPONENT: usize = 5;
+
 /// TAG_KADMISCOPTIONS carries firewall/ACK status bits
 pub const TAG_KADMISCOPTIONS: u8 = 0xF7;
 /// TAG_KADUDPKEY carries the sender's UDP verify key for the receiver
@@ -304,6 +319,16 @@ impl KadContact {
         Ok(())
     }
 
+    /// Set IP address with eMule-compatible verified flag clearing.
+    /// In eMule Contact.cpp SetIPAddress(), when a contact's IP changes,
+    /// SetIpVerified(false) is called to invalidate the old verification.
+    pub fn set_ip(&mut self, new_ip: Ipv4Addr) {
+        if self.ip != new_ip {
+            self.verified = false;
+            self.ip = new_ip;
+        }
+    }
+
     pub fn is_udp_firewalled(&self) -> bool {
         self.kad_options & 0x01 != 0
     }
@@ -313,7 +338,12 @@ impl KadContact {
     }
 
     pub fn supports_obfuscation(&self) -> bool {
-        self.version >= 6
+        self.version >= KADEMLIA_VERSION6_49ABETA
+    }
+
+    /// Whether this is a Kad2+ contact (version >= 2). eMule rejects Kad1 contacts.
+    pub fn is_kad2(&self) -> bool {
+        self.version >= KADEMLIA_VERSION2_47A
     }
 }
 

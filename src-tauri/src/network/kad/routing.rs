@@ -132,11 +132,25 @@ impl RoutingTable {
     /// Insert or update a contact. Returns `Some(PendingEviction)` if the bucket
     /// is full and we need to ping the oldest contact first before evicting.
     /// Returns `None` if the contact was inserted/updated normally.
+    ///
+    /// Matches eMule RoutingZone::AddUnfiltered behavior:
+    /// - Rejects contacts with version <= 1 (Kad1 only)
+    /// - Rejects our own ID
+    /// - Rejects invalid IPs
+    /// - Rejects DNS port 53 for versions <= KADEMLIA_VERSION5_48a
+    /// - On update: clears verified flag when IP changes (eMule SetIPAddress)
+    /// - On update: does not downgrade version (eMule: pContact->GetVersion() >= pContactUpdate->GetVersion())
     pub fn insert(&mut self, mut contact: KadContact) -> Option<PendingEviction> {
         if contact.id == self.local_id {
             return None;
         }
+        if !contact.is_kad2() {
+            return None;
+        }
         if !ip_filter::is_valid_contact_ip(contact.ip, self.block_private_ips) {
+            return None;
+        }
+        if contact.udp_port == 53 && contact.version <= KADEMLIA_VERSION5_48A {
             return None;
         }
 
@@ -146,11 +160,16 @@ impl RoutingTable {
         if let Some(pos) = bucket.contacts.iter().position(|c| c.id == contact.id) {
             let mut existing = bucket.contacts.remove(pos).unwrap();
             let old_ip = existing.ip;
-            existing.ip = contact.ip;
+            // eMule SetIPAddress: clears verified flag when IP changes
+            existing.set_ip(contact.ip);
             existing.udp_port = contact.udp_port;
             existing.tcp_port = contact.tcp_port;
-            existing.version = contact.version;
-            if contact.verified {
+            // eMule: do not let Kad1 responses overwrite Kad2 ones
+            if contact.version >= existing.version {
+                existing.version = contact.version;
+            }
+            // eMule: don't unset the verified flag (will clear itself on ip change)
+            if contact.verified && !existing.verified {
                 existing.verified = true;
             }
             if contact.udp_key.is_some() {
@@ -159,7 +178,6 @@ impl RoutingTable {
             existing.kad_options = contact.kad_options;
             existing.update_type();
             bucket.contacts.push_back(existing);
-            // Fix IP tracking if the contact's IP changed
             if old_ip != contact.ip {
                 self.track_ip_remove(old_ip);
                 self.track_ip_add(contact.ip);
@@ -391,15 +409,27 @@ impl RoutingTable {
     }
 
     /// Return bucket indices that need a refresh (stale > 1h OR nearly empty < 20% full).
+    /// Matches eMule OnBigTimer: a zone gets a RandomLookup if it is a leaf zone and
+    /// (zone_index < KK || level < KBASE || bin_remaining >= K*0.8).
+    /// In our flat-bucket model: bucket needs refresh if it's close to home (high index),
+    /// or has significant remaining capacity, and hasn't been refreshed recently.
     pub fn stale_buckets(&self, now: i64) -> Vec<usize> {
         self.buckets
             .iter()
             .enumerate()
-            .filter(|(_, b)| {
+            .filter(|(i, b)| {
                 if b.contacts.is_empty() {
                     return false;
                 }
-                b.needs_refresh(now) || b.needs_fill()
+                if !b.needs_refresh(now) && !b.needs_fill() {
+                    return false;
+                }
+                // eMule OnBigTimer: zone_index < KK || level < KBASE || remaining >= K*0.8
+                let remaining = K_BUCKET_SIZE.saturating_sub(b.contacts.len());
+                let is_close = *i >= NUM_BUCKETS.saturating_sub(KK);
+                let is_deep = *i < KBASE;
+                let has_space = remaining as f64 >= K_BUCKET_SIZE as f64 * 0.8;
+                is_close || is_deep || has_space
             })
             .map(|(i, _)| i)
             .collect()
@@ -422,40 +452,85 @@ impl RoutingTable {
         }
     }
 
-    /// Select up to `max_count` contacts for bootstrap persistence, preferring
-    /// verified contacts spread across buckets (matching eMule's GetBootstrapContacts).
+    /// Select up to `max_count` contacts for bootstrap persistence.
+    /// Matches eMule's GetBootstrapContacts which calls TopDepth(LOG_BASE_EXPONENT=5).
+    /// TopDepth traverses the routing tree to depth 5 (covering the top 2^5=32 buckets)
+    /// and returns all contacts from those buckets. For our flat bucket array, this means
+    /// contacts from buckets [max-31 .. max] (the closest buckets to our ID).
     pub fn export_bootstrap_contacts(&self, max_count: usize) -> Vec<KadContact> {
         let mut result = Vec::new();
 
-        // First pass: take verified contacts from each bucket (good distribution)
-        for bucket in &self.buckets {
-            for c in &bucket.contacts {
-                if c.verified && !c.is_dead() {
+        // eMule TopDepth(LOG_BASE_EXPONENT=5): collect from the top 2^5=32 buckets
+        let top_depth = 1usize << LOG_BASE_EXPONENT; // 32
+        let start_bucket = NUM_BUCKETS.saturating_sub(top_depth);
+        for bucket_idx in start_bucket..NUM_BUCKETS {
+            for c in &self.buckets[bucket_idx].contacts {
+                if !c.is_dead() {
                     result.push(c.clone());
                 }
             }
         }
-        // Sort verified contacts by type (best first), then by last_seen (most recent first)
-        result.sort_by(|a, b| {
-            a.contact_type.cmp(&b.contact_type)
-                .then(b.last_seen.cmp(&a.last_seen))
-        });
-        result.truncate(max_count);
 
-        // If not enough verified, fill with unverified (non-dead) contacts
+        // If not enough from the top buckets, expand to lower buckets
         if result.len() < max_count {
-            let verified_ids: std::collections::HashSet<KadId> =
-                result.iter().map(|c| c.id).collect();
-            let mut unverified: Vec<KadContact> = self.all_contacts()
-                .filter(|c| !c.is_dead() && !verified_ids.contains(&c.id))
-                .cloned()
-                .collect();
-            unverified.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
-            let remaining = max_count - result.len();
-            result.extend(unverified.into_iter().take(remaining));
+            let existing_ids: HashSet<KadId> = result.iter().map(|c| c.id).collect();
+            for bucket_idx in (0..start_bucket).rev() {
+                for c in &self.buckets[bucket_idx].contacts {
+                    if !c.is_dead() && !existing_ids.contains(&c.id) {
+                        result.push(c.clone());
+                        if result.len() >= max_count {
+                            break;
+                        }
+                    }
+                }
+                if result.len() >= max_count {
+                    break;
+                }
+            }
         }
 
+        result.truncate(max_count);
         result
+    }
+
+    /// Check if a contact is acceptable for insertion into search results.
+    /// Matches eMule's RoutingZone::IsAcceptableContact:
+    /// - Version must be >= Kad2 (version >= 2)
+    /// - If we already have a verified contact with the same ID but different IP, reject
+    /// - If IP/subnet limits would be hit, reject
+    pub fn is_acceptable_contact(&self, contact: &KadContact) -> bool {
+        if !contact.is_kad2() {
+            return false;
+        }
+        if let Some(existing) = self.get_contact(&contact.id) {
+            // A verified node with different IP exists → reject
+            if existing.verified && (existing.ip != contact.ip || existing.udp_port != contact.udp_port) {
+                return false;
+            }
+            return true;
+        }
+        // Check global IP limits
+        let ip_count = self.global_ip_count.get(&contact.ip).copied().unwrap_or(0);
+        if ip_count >= MAX_CONTACTS_IP {
+            return false;
+        }
+        let snet = subnet_key(contact.ip);
+        let subnet_count = self.global_subnet_count.get(&snet).copied().unwrap_or(0);
+        if subnet_count >= MAX_CONTACTS_SUBNET {
+            return false;
+        }
+        true
+    }
+
+    /// Set all contacts as verified (eMule SetAllContactsVerified).
+    /// Used when loading an old nodes.dat that has no verified contacts,
+    /// to speed up Kad bootstrapping.
+    pub fn set_all_contacts_verified(&mut self) {
+        for bucket in &mut self.buckets {
+            for contact in &mut bucket.contacts {
+                contact.verified = true;
+            }
+        }
     }
 
     /// Look up a specific contact by ID.

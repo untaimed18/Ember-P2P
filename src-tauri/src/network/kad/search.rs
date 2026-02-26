@@ -35,8 +35,11 @@ pub enum SearchType {
     FindSource { file_size: u64 },
     FindNotes { file_size: u64 },
     FindBuddy,
+    StoreFile,
     StoreKeyword,
     StoreNotes,
+    /// Complete node search (eMule NODECOMPLETE) — collects all responses
+    NodeComplete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +156,7 @@ impl SearchState {
                         SearchType::FindKeyword
                             | SearchType::FindSource { .. }
                             | SearchType::FindNotes { .. }
+                            | SearchType::StoreFile
                     )
                 {
                     if let Some(contact) = self.closest.iter().find(|c| {
@@ -304,10 +308,11 @@ impl SearchState {
     pub fn is_expired(&self) -> bool {
         let now = chrono::Utc::now().timestamp();
         let lifetime = match self.search_type {
-            SearchType::FindNode => TIMEOUT_FIND_NODE,
+            SearchType::FindNode | SearchType::NodeComplete => TIMEOUT_FIND_NODE,
             SearchType::FindKeyword => TIMEOUT_KEYWORD,
             SearchType::FindSource { .. } => TIMEOUT_SOURCE,
             SearchType::FindNotes { .. } => TIMEOUT_NOTES,
+            SearchType::StoreFile => TIMEOUT_STORE_KEYWORD, // eMule SEARCHSTOREFILE_LIFETIME = 140
             SearchType::StoreKeyword => TIMEOUT_STORE_KEYWORD,
             SearchType::StoreNotes => TIMEOUT_STORE_NOTES,
             SearchType::FindBuddy => TIMEOUT_FIND_BUDDY,
@@ -335,7 +340,7 @@ impl SearchState {
         if self.phase != SearchPhase::Lookup {
             return;
         }
-        if matches!(self.search_type, SearchType::FindNode | SearchType::FindBuddy) {
+        if matches!(self.search_type, SearchType::FindNode | SearchType::FindBuddy | SearchType::NodeComplete) {
             return;
         }
 
@@ -387,7 +392,7 @@ impl SearchState {
 
         match self.phase {
             SearchPhase::Lookup => {
-                if matches!(self.search_type, SearchType::FindNode | SearchType::FindBuddy) {
+                if matches!(self.search_type, SearchType::FindNode | SearchType::FindBuddy | SearchType::NodeComplete) {
                     if self.pending.is_empty() {
                         let has_unqueried = self
                             .closest
@@ -418,19 +423,23 @@ impl SearchState {
             && (is_lan_ip(contact.ip) || within_search_tolerance(&self.target, &contact.id))
     }
 
+    /// Build the wire message for this search phase.
+    /// Matches eMule's GetRequestContactCount:
+    /// - NODE/NODECOMPLETE → KADEMLIA_FIND_NODE (11)
+    /// - FILE/KEYWORD/FINDSOURCE/NOTES → KADEMLIA_FIND_VALUE (2)
+    /// - FINDBUDDY/STOREFILE/STOREKEYWORD/STORENOTES → KADEMLIA_STORE (4)
     pub fn build_query_message(&self, receiver: &KadContact) -> KadMessage {
         match self.phase {
             SearchPhase::Lookup => {
                 let search_type = match self.search_type {
-                    SearchType::StoreKeyword | SearchType::StoreNotes | SearchType::FindBuddy => {
+                    SearchType::StoreFile | SearchType::StoreKeyword | SearchType::StoreNotes | SearchType::FindBuddy => {
                         KADEMLIA_STORE
                     }
-                    SearchType::FindNode => KADEMLIA_FIND_NODE,
+                    SearchType::FindNode | SearchType::NodeComplete => KADEMLIA_FIND_NODE,
                     SearchType::FindKeyword
                     | SearchType::FindSource { .. }
                     | SearchType::FindNotes { .. } => {
                         if self.lookup_reask_more_target == Some(receiver.id) {
-                            // Re-ask for more contacts (11), matching eMule JumpStart behavior.
                             KADEMLIA_FIND_NODE
                         } else {
                             KADEMLIA_FIND_VALUE
@@ -448,11 +457,20 @@ impl SearchState {
                     target: self.target,
                     start_position: 0,
                 },
-                SearchType::FindSource { file_size } => KadMessage::SearchSourceReq {
-                    target: self.target,
-                    start_position: 0,
-                    file_size,
-                },
+                SearchType::FindSource { file_size } => {
+                    KadMessage::SearchSourceReq {
+                        target: self.target,
+                        start_position: 0,
+                        file_size,
+                    }
+                }
+                SearchType::StoreFile => {
+                    KadMessage::SearchSourceReq {
+                        target: self.target,
+                        start_position: 0,
+                        file_size: 0,
+                    }
+                }
                 SearchType::FindNotes { file_size } => {
                     KadMessage::SearchNotesReq {
                         target: self.target,
@@ -465,7 +483,7 @@ impl SearchState {
                         file_size: 0,
                     }
                 }
-                SearchType::FindNode | SearchType::FindBuddy => KadMessage::KadReq {
+                SearchType::FindNode | SearchType::FindBuddy | SearchType::NodeComplete => KadMessage::KadReq {
                     search_type: KADEMLIA_FIND_NODE,
                     target: self.target,
                     receiver: receiver.id,
@@ -587,7 +605,7 @@ impl SearchManager {
             // transition to fetch after 30s so there's still time for fetch results.
             let elapsed = chrono::Utc::now().timestamp() - state.started_at;
             if state.phase == SearchPhase::Lookup
-                && !matches!(state.search_type, SearchType::FindNode | SearchType::FindBuddy)
+                && !matches!(state.search_type, SearchType::FindNode | SearchType::FindBuddy | SearchType::NodeComplete)
                 && elapsed >= 30
                 && state.queried.len() >= ALPHA
             {

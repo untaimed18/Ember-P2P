@@ -53,23 +53,78 @@ pub fn load_nodes_dat(path: &Path) -> anyhow::Result<Vec<KadContact>> {
     let mut cursor = Cursor::new(data_slice);
     let mut contacts = Vec::new();
 
-    // Check for v2 header: first 4 bytes == 0
+    // Check for v2/v3 header: first 4 bytes == 0
     let first_u32 = cursor.read_u32::<LittleEndian>()?;
     if first_u32 == 0 {
-        // Version 2 format
         let version = cursor.read_u32::<LittleEndian>()?;
-        if version != 2 && version != 3 {
-            warn!("Unknown nodes.dat version: {version}, trying anyway");
-        }
-        let count = cursor.read_u32::<LittleEndian>()? as usize;
-        info!("Loading {count} contacts from nodes.dat v{version}");
-
-        for _ in 0..count {
-            match read_contact_v2(&mut cursor) {
-                Ok(c) => contacts.push(c),
-                Err(e) => {
-                    debug!("Failed to read contact: {e}");
-                    break;
+        if version == 3 {
+            // eMule v3: check bootstrap edition flag
+            let bootstrap_edition = cursor.read_u32::<LittleEndian>()?;
+            if bootstrap_edition == 1 {
+                // Bootstrap-only nodes.dat: contacts are v1-format (no UDP key/verified)
+                let count = cursor.read_u32::<LittleEndian>()? as usize;
+                info!("Loading {count} contacts from bootstrap nodes.dat v3");
+                for _ in 0..count {
+                    match read_contact_v0(&mut cursor) {
+                        Ok(c) => {
+                            if c.version > 1 {
+                                contacts.push(c);
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Failed to read v3 bootstrap contact: {e}");
+                            break;
+                        }
+                    }
+                }
+                info!("Loaded {} valid contacts from bootstrap nodes.dat", contacts.len());
+                return Ok(contacts);
+            }
+            // v3 with bootstrap_edition != 1: treat as normal (count follows)
+            let count = bootstrap_edition as usize; // re-interpret as count
+            info!("Loading {count} contacts from nodes.dat v3");
+            for _ in 0..count {
+                match read_contact_v2(&mut cursor) {
+                    Ok(c) => contacts.push(c),
+                    Err(e) => {
+                        debug!("Failed to read contact: {e}");
+                        break;
+                    }
+                }
+            }
+        } else if version == 2 || version == 1 {
+            let count = cursor.read_u32::<LittleEndian>()? as usize;
+            info!("Loading {count} contacts from nodes.dat v{version}");
+            for _ in 0..count {
+                if version >= 2 {
+                    match read_contact_v2(&mut cursor) {
+                        Ok(c) => contacts.push(c),
+                        Err(e) => {
+                            debug!("Failed to read contact: {e}");
+                            break;
+                        }
+                    }
+                } else {
+                    match read_contact_v0(&mut cursor) {
+                        Ok(c) => contacts.push(c),
+                        Err(e) => {
+                            debug!("Failed to read v1 contact: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            warn!("Unknown nodes.dat version: {version}, trying as v2");
+            let count = cursor.read_u32::<LittleEndian>()? as usize;
+            info!("Loading {count} contacts from nodes.dat v{version}");
+            for _ in 0..count {
+                match read_contact_v2(&mut cursor) {
+                    Ok(c) => contacts.push(c),
+                    Err(e) => {
+                        debug!("Failed to read contact: {e}");
+                        break;
+                    }
                 }
             }
         }

@@ -303,6 +303,12 @@ pub fn is_private_or_reserved(ip: Ipv4Addr) -> bool {
     false
 }
 
+/// Check if an IP address is a LAN IP (private, loopback, or link-local).
+/// Used for exempting LAN contacts from certain limits (eMule IsLANIP).
+pub fn is_lan_ip(ip: Ipv4Addr) -> bool {
+    ip.is_private() || ip.is_loopback() || ip.is_link_local()
+}
+
 /// Validate an IP address received from a remote peer in contact info.
 pub fn is_valid_contact_ip(ip: Ipv4Addr, block_private: bool) -> bool {
     if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
