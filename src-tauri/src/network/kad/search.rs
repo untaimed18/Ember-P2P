@@ -9,7 +9,9 @@ use super::types::*;
 const KEYWORD_SEARCH_MAX_RESULTS: usize = 500;
 const PENDING_TIMEOUT_SECS: i64 = 10;
 const LOOKUP_CONVERGE_COUNT: usize = 5;
-const LOOKUP_MIN_QUERIES: usize = 20;
+const LOOKUP_MIN_QUERIES: usize = 60;
+const LOOKUP_MAX_QUERIES: usize = 200;
+const LOOKUP_CONTACT_POOL: usize = 200;
 
 /// eMule seeds searches with 50 contacts (Search.cpp Go() -> GetClosestTo(..., 50, ...))
 pub const SEARCH_INITIAL_CONTACTS: usize = 50;
@@ -273,9 +275,10 @@ impl SearchState {
             && !self.closest.iter().any(|c| !self.queried.contains(&c.id));
 
         let enough_queried = self.queried.len() >= LOOKUP_MIN_QUERIES
-            && self.lookup_stale_rounds >= LOOKUP_CONVERGE_COUNT;
+            && self.lookup_stale_rounds >= LOOKUP_CONVERGE_COUNT
+            && self.responded_during_lookup.len() >= 8;
 
-        let max_lookup_reached = self.queried.len() >= SEARCH_INITIAL_CONTACTS;
+        let max_lookup_reached = self.queried.len() >= LOOKUP_MAX_QUERIES;
 
         if all_queried || enough_queried || max_lookup_reached {
             info!(
@@ -297,7 +300,7 @@ impl SearchState {
             let db = target.xor_distance(&b.id);
             da.cmp(&db)
         });
-        self.closest.truncate(SEARCH_INITIAL_CONTACTS);
+        self.closest.truncate(LOOKUP_CONTACT_POOL);
 
         // Update prev_closest_distance for convergence tracking
         self.prev_closest_distance = self
@@ -344,19 +347,8 @@ impl SearchState {
         match self.phase {
             SearchPhase::Lookup => {
                 let search_type = match self.search_type {
-                    SearchType::FindNode | SearchType::FindBuddy => KADEMLIA_FIND_NODE,
                     SearchType::StoreKeyword | SearchType::StoreNotes => KADEMLIA_STORE,
-                    _ => {
-                        // eMule JumpStart behavior: when the lookup is stalling
-                        // (many stale rounds), switch from FIND_VALUE (returns 2
-                        // contacts) to FIND_NODE (returns 11) to discover more peers
-                        // and converge faster in sparse routing tables.
-                        if self.lookup_stale_rounds >= 3 {
-                            KADEMLIA_FIND_NODE
-                        } else {
-                            KADEMLIA_FIND_VALUE
-                        }
-                    }
+                    _ => KADEMLIA_FIND_NODE,
                 };
                 KadMessage::KadReq {
                     search_type,
@@ -468,11 +460,13 @@ impl SearchManager {
                 );
             }
 
-            // If search is still in lookup phase after 30s, force transition to fetch
+            // If lookup appears stuck for a long time, force transition to fetch.
+            // Guard this with minimum progress so we do not switch too early.
             let elapsed = chrono::Utc::now().timestamp() - state.started_at;
             if state.phase == SearchPhase::Lookup
                 && state.search_type != SearchType::FindNode
-                && elapsed >= 30
+                && elapsed >= 60
+                && state.queried.len() >= LOOKUP_MIN_QUERIES
             {
                 info!(
                     "Search {}: forcing transition to fetch after {}s in lookup (queried={}, verified={})",

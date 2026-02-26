@@ -893,9 +893,10 @@ pub async fn start_network(
                     }
 
                     // Query a larger sample of known contacts with BootstrapReq
+                    let bootstrap_sample_size = if table_size < 100 { 30 } else { 10 };
                     let sample: Vec<KadContact> = {
                         let target = KadId::random();
-                        state.routing_table.find_closest(&target, 10)
+                        state.routing_table.find_closest(&target, bootstrap_sample_size)
                     };
                     for contact in &sample {
                         let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
@@ -929,6 +930,7 @@ pub async fn start_network(
                 }
 
                 let count = state.routing_table.len() as u32;
+                info!("Routing table: {count} contacts");
                 if count > 0 && state.stats.status != NetworkStatus::Connected {
                     state.stats.status = NetworkStatus::Connected;
                     let _ = app_handle.emit("network-status", NetworkStatus::Connected);
@@ -1485,11 +1487,17 @@ async fn handle_udp_packet(
                 debug!("Sent HelloReq to bootstrap node + {} returned contacts", contact_addrs.len());
             }
 
-            // Chain-bootstrap: send BootstrapReq to a subset of returned contacts
-            // so they return even more contacts (progressive discovery)
+            // Chain-bootstrap: send BootstrapReq to returned contacts so they
+            // return even more contacts (progressive discovery). Send to all
+            // of them when our table is sparse, otherwise limit to 10.
             let bootstrap_msg = KadMessage::BootstrapReq;
             if let Ok(bootstrap_pkt) = messages::encode_packet(&bootstrap_msg) {
-                for addr in contact_addrs.iter().take(5) {
+                let chain_limit = if state.routing_table.len() < 200 {
+                    contact_addrs.len()
+                } else {
+                    10
+                };
+                for addr in contact_addrs.iter().take(chain_limit) {
                     state.flood_protection.track_request(*addr, 0x01);
                     let _ = socket.send_to(&bootstrap_pkt, addr).await;
                 }
@@ -2654,8 +2662,9 @@ async fn handle_command(
                 state.routing_table.len()
             );
 
-            // Send bootstrap requests to a sample of the new contacts
-            let sample_size = count.min(20);
+            // Send bootstrap requests to all contacts when table is sparse
+            let table_size = state.routing_table.len();
+            let sample_size = if table_size < 200 { count } else { count.min(20) };
             for contact in contacts.iter().take(sample_size) {
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                 let msg = KadMessage::BootstrapReq;
@@ -2663,7 +2672,7 @@ async fn handle_command(
                     let _ = socket.send_to(&packet, addr).await;
                 }
             }
-            info!("Sent bootstrap requests to {sample_size} new contacts");
+            info!("Sent bootstrap requests to {sample_size} new contacts (table has {table_size})");
         }
 
         NetworkCommand::ReloadIpFilter { path } => {
