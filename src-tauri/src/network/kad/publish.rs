@@ -59,6 +59,22 @@ impl PublishManager {
         self.records.remove(file_hash);
     }
 
+    /// Clear all records and re-add files (for re-indexing).
+    pub fn clear_all(&mut self) {
+        self.records.clear();
+    }
+
+    /// Add a batch of files for publishing.
+    pub fn add_files_batch(&mut self, files: Vec<PublishableFile>) {
+        for file in files {
+            self.add_file(file);
+        }
+    }
+
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
     /// Get files that need keyword republishing.
     pub fn files_needing_keyword_publish(&self) -> Vec<&PublishableFile> {
         let now = chrono::Utc::now().timestamp();

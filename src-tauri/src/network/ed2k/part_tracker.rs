@@ -10,6 +10,7 @@ pub struct PartTracker {
     pub file_size: u64,
     pub part_count: usize,
     completed: Vec<bool>,
+    pub in_progress: Vec<bool>,
     met_path: PathBuf,
 }
 
@@ -27,6 +28,7 @@ impl PartTracker {
             file_size,
             part_count,
             completed: vec![false; part_count],
+            in_progress: vec![false; part_count],
             met_path,
         };
 
@@ -100,9 +102,9 @@ impl PartTracker {
 
     fn load(&mut self) {
         if let Err(_) = self.load_inner() {
-            // No existing met file or corrupt -- start fresh
             self.completed = vec![false; self.part_count];
         }
+        self.in_progress = vec![false; self.part_count];
     }
 
     fn load_inner(&mut self) -> anyhow::Result<()> {
@@ -137,6 +139,20 @@ impl PartTracker {
         }
 
         Ok(())
+    }
+
+    pub fn remaining_count(&self) -> usize {
+        self.part_count - self.completed_count()
+    }
+
+    pub fn set_in_progress(&mut self, part_idx: usize, value: bool) {
+        if part_idx < self.part_count {
+            self.in_progress[part_idx] = value;
+        }
+    }
+
+    pub fn completed_parts(&self) -> &[bool] {
+        &self.completed
     }
 
     pub fn delete_met(&self) {

@@ -170,6 +170,8 @@ pub async fn reload_shared_files(
         })
         .await;
 
+    let _ = state.network_tx.send(NetworkCommand::SharedFilesChanged).await;
+
     let index = state.local_index.read().await;
     Ok(index.all_files().to_vec())
 }

@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::io::{Read as _, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -10,6 +9,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::bandwidth::limiter::BandwidthLimiter;
+use crate::network::ed2k::credits::CreditManager;
+use crate::network::ed2k::sources::SourceManager;
 use crate::search::index::LocalIndex;
 use crate::sharing::manager::TransferManager;
 
@@ -27,6 +28,13 @@ const MAX_UPLOAD_QUEUE_SIZE: usize = 500;
 const SESSIONMAXTRANS: u64 = PARTSIZE + 20 * 1024;
 /// eMule SESSIONMAXTIME: max duration of a single upload session (1 hour).
 const SESSIONMAXTIME_SECS: u64 = 3600;
+
+#[derive(Debug, Clone)]
+struct QueueEntry {
+    addr: SocketAddr,
+    user_hash: [u8; 16],
+    join_time: std::time::Instant,
+}
 
 pub struct UploadEvent {
     pub transfer_id: String,
@@ -64,9 +72,11 @@ struct UploadHandler {
     active_count: Arc<std::sync::atomic::AtomicUsize>,
     max_concurrent_uploads: Arc<std::sync::atomic::AtomicUsize>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
-    upload_queue: Arc<tokio::sync::Mutex<VecDeque<SocketAddr>>>,
+    upload_queue: Arc<tokio::sync::Mutex<Vec<QueueEntry>>>,
     ip_connection_counts: Arc<tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
     total_connections: Arc<std::sync::atomic::AtomicUsize>,
+    source_manager: Arc<RwLock<SourceManager>>,
+    credit_manager: Arc<RwLock<CreditManager>>,
 }
 
 pub async fn start_upload_server(
@@ -80,6 +90,8 @@ pub async fn start_upload_server(
     bandwidth_limiter: Arc<BandwidthLimiter>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     max_uploads: u32,
+    source_manager: Arc<RwLock<SourceManager>>,
+    credit_manager: Arc<RwLock<CreditManager>>,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     let listener = match TcpListener::bind(addr).await {
@@ -92,7 +104,7 @@ pub async fn start_upload_server(
     info!("Peer-to-peer upload listener started on TCP port {tcp_port} (max {max_uploads} uploads)");
 
     let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let upload_queue = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
+    let upload_queue = Arc::new(tokio::sync::Mutex::new(Vec::<QueueEntry>::new()));
 
     let server = Arc::new(UploadHandler {
         local_index,
@@ -109,6 +121,8 @@ pub async fn start_upload_server(
         upload_queue,
         ip_connection_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         total_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        source_manager,
+        credit_manager,
     });
 
     loop {
@@ -170,10 +184,14 @@ impl UploadHandler {
         let mut reader = tokio::io::BufReader::new(reader);
         let mut writer = tokio::io::BufWriter::new(writer);
 
-        // Read Hello from peer
-        let (proto, opcode, _payload) = read_packet_timeout(&mut reader).await?;
+        // Read Hello from peer and extract their user_hash
+        let (proto, opcode, hello_data) = read_packet_timeout(&mut reader).await?;
         if proto != OP_EDONKEYHEADER || opcode != OP_HELLO {
             anyhow::bail!("expected Hello, got proto=0x{proto:02X} op=0x{opcode:02X}");
+        }
+        let mut peer_user_hash = [0u8; 16];
+        if hello_data.len() >= 17 {
+            peer_user_hash.copy_from_slice(&hello_data[1..17]);
         }
         debug!("Got Hello from {peer_addr}");
 
@@ -309,24 +327,43 @@ impl UploadHandler {
                         let mut queue = self.upload_queue.lock().await;
                         if queue.is_empty() {
                             true
-                        } else if queue.front() == Some(&peer_addr) {
-                            queue.pop_front();
-                            true
                         } else {
-                            false
+                            // Credit-weighted selection: find the best-scoring peer
+                            let cm = self.credit_manager.read().await;
+                            let mut best_idx = 0;
+                            let mut best_score = f64::MIN;
+                            for (i, entry) in queue.iter().enumerate() {
+                                let wait = entry.join_time.elapsed().as_secs();
+                                let score = cm.get_queue_score(&entry.user_hash, wait, 1.0);
+                                if score > best_score {
+                                    best_score = score;
+                                    best_idx = i;
+                                }
+                            }
+                            drop(cm);
+                            if queue[best_idx].addr == peer_addr {
+                                queue.remove(best_idx);
+                                true
+                            } else {
+                                false
+                            }
                         }
                     };
 
                     if !should_accept {
                         let mut queue = self.upload_queue.lock().await;
-                        let rank = if let Some(pos) = queue.iter().position(|a| *a == peer_addr) {
+                        let rank = if let Some(pos) = queue.iter().position(|e| e.addr == peer_addr) {
                             (pos + 1) as u16
                         } else if queue.len() >= MAX_UPLOAD_QUEUE_SIZE {
                             debug!("Upload queue full ({MAX_UPLOAD_QUEUE_SIZE}), rejecting {peer_addr}");
                             drop(queue);
                             break;
                         } else {
-                            queue.push_back(peer_addr);
+                            queue.push(QueueEntry {
+                                addr: peer_addr,
+                                user_hash: peer_user_hash,
+                                join_time: std::time::Instant::now(),
+                            });
                             queue.len() as u16
                         };
                         drop(queue);
@@ -504,6 +541,10 @@ impl UploadHandler {
                         .await?;
 
                         uploaded += data.len() as u64;
+                        {
+                            let mut cm = self.credit_manager.write().await;
+                            cm.add_uploaded(peer_user_hash, data.len() as u64);
+                        }
 
                         if let Some(tid) = &transfer_id {
                             let _ = self.upload_event_tx.send(UploadEvent {
@@ -549,11 +590,15 @@ impl UploadHandler {
                         upload_slot_active = false;
                         session_start = None;
 
-                        // Re-add to back of upload queue so they can get another turn
+                        // Re-add to upload queue so they can get another turn
                         {
                             let mut queue = self.upload_queue.lock().await;
-                            if !queue.contains(&peer_addr) && queue.len() < MAX_UPLOAD_QUEUE_SIZE {
-                                queue.push_back(peer_addr);
+                            if !queue.iter().any(|e| e.addr == peer_addr) && queue.len() < MAX_UPLOAD_QUEUE_SIZE {
+                                queue.push(QueueEntry {
+                                    addr: peer_addr,
+                                    user_hash: peer_user_hash,
+                                    join_time: std::time::Instant::now(),
+                                });
                             }
                         }
                     }
@@ -616,9 +661,14 @@ impl UploadHandler {
 
                 (OP_EMULEPROT, OP_REQUESTSOURCES) => {
                     if let Some(hash) = current_file_hash {
-                        let mut resp = Vec::with_capacity(18);
-                        resp.extend_from_slice(&hash);
-                        resp.extend_from_slice(&0u16.to_le_bytes()); // 0 sources
+                        let exclude_ip = match peer_addr.ip() {
+                            std::net::IpAddr::V4(v4) => v4,
+                            _ => std::net::Ipv4Addr::UNSPECIFIED,
+                        };
+                        let resp = {
+                            let sm = self.source_manager.read().await;
+                            sm.build_answer_sources2(&hash, exclude_ip)
+                        };
                         write_packet_async(
                             &mut writer,
                             OP_EMULEPROT,
@@ -640,7 +690,7 @@ impl UploadHandler {
         // Remove from upload queue on disconnect
         {
             let mut queue = self.upload_queue.lock().await;
-            queue.retain(|a| *a != peer_addr);
+            queue.retain(|e| e.addr != peer_addr);
         }
 
         // Cleanup: emit completion/failure for any tracked upload

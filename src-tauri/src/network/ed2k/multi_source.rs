@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 use crate::bandwidth::limiter::BandwidthLimiter;
 use crate::sharing::manager::TransferControl;
 
+use super::chunk_selection::ChunkSelector;
 use super::part_tracker::PartTracker;
 use super::transfer::{DownloadEvent, Ed2kDownload};
 
@@ -117,44 +118,82 @@ impl MultiSourceDownload {
             }
         }
 
-        // Assign parts to sources using round-robin across available parts
+        // Assign parts to sources using rarest-first chunk selection
         let part_count = {
             let t = tracker.read().await;
             t.part_count
         };
 
-        // Build per-source part assignments
-        let mut source_parts: Vec<Vec<usize>> = vec![Vec::new(); self.sources.len()];
-        let mut part_idx = 0;
+        let mut chunk_selector = ChunkSelector::new(part_count);
+        chunk_selector.update_frequencies(&self.sources);
 
-        for p in 0..part_count {
+        // Build per-source part assignments via rarest-first
+        let mut source_parts: Vec<Vec<usize>> = vec![Vec::new(); self.sources.len()];
+        let mut assigned_parts: Vec<bool> = vec![false; part_count];
+        let mut active_parts: Vec<usize> = Vec::new();
+
+        {
+            let t = tracker.read().await;
+            for p in 0..part_count {
+                if t.is_part_complete(p) {
+                    assigned_parts[p] = true;
+                }
+            }
+        }
+
+        for src_idx in 0..self.sources.len() {
             if self.control.is_cancelled() {
                 anyhow::bail!("cancelled by user");
             }
 
-            let t = tracker.read().await;
-            if t.is_part_complete(p) {
+            let src = &self.sources[src_idx];
+            let src_available: Vec<bool> = if src.available_parts.is_empty() {
+                vec![true; part_count]
+            } else {
+                src.available_parts.clone()
+            };
+
+            loop {
+                let pick = chunk_selector.select_part(
+                    &assigned_parts,
+                    &vec![false; part_count], // no in_progress for initial assignment
+                    &src_available,
+                    &active_parts,
+                );
+                match pick {
+                    Some(p) => {
+                        source_parts[src_idx].push(p);
+                        assigned_parts[p] = true;
+                        active_parts.push(p);
+                        // Limit parts per source to roughly equal distribution
+                        let target_per_source = (part_count / self.sources.len()).max(1) + 1;
+                        if source_parts[src_idx].len() >= target_per_source {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        // Assign any remaining unassigned parts to sources that can handle them
+        for p in 0..part_count {
+            if assigned_parts[p] {
                 continue;
             }
-
-            // Find a source that has this part (round-robin)
-            let mut assigned = false;
-            for attempt in 0..self.sources.len() {
-                let src_idx = (part_idx + attempt) % self.sources.len();
+            for src_idx in 0..self.sources.len() {
                 let src = &self.sources[src_idx];
                 if src.available_parts.is_empty()
                     || src.available_parts.get(p).copied().unwrap_or(false)
                 {
                     source_parts[src_idx].push(p);
-                    assigned = true;
+                    assigned_parts[p] = true;
                     break;
                 }
             }
-            if !assigned {
-                // No source has this part; assign to first source anyway (it may fail)
+            if !assigned_parts[p] {
                 source_parts[0].push(p);
             }
-            part_idx += 1;
         }
 
         // Shared part hashes for per-part verification (populated by first source)
@@ -374,6 +413,97 @@ impl MultiSourceDownload {
                 let _ = h.await;
             }
             retry_agg.await?;
+        }
+
+        // End Game Mode: when <= 3 parts remain, duplicate-assign to ALL sources
+        {
+            let remaining: Vec<usize> = {
+                let t = tracker.read().await;
+                (0..t.part_count)
+                    .filter(|&i| !t.is_part_complete(i))
+                    .collect()
+            };
+            if !remaining.is_empty() && remaining.len() <= 3 && self.sources.len() > 1 {
+                info!(
+                    "Entering end game mode: {} parts remaining, assigning to all {} sources",
+                    remaining.len(),
+                    self.sources.len()
+                );
+
+                let received_parts: Arc<RwLock<std::collections::HashSet<usize>>> =
+                    Arc::new(RwLock::new(std::collections::HashSet::new()));
+
+                let (eg_tx, mut eg_rx) = mpsc::channel::<(usize, u64)>(256);
+                let tid = self.transfer_id.clone();
+                let fs = self.file_size;
+                let etx = event_tx.clone();
+                let eg_agg = tokio::spawn(async move {
+                    let mut total: u64 = 0;
+                    while let Some((_, bytes)) = eg_rx.recv().await {
+                        total += bytes;
+                        let _ = etx
+                            .send(DownloadEvent::Progress {
+                                transfer_id: tid.clone(),
+                                downloaded: total,
+                                total: fs,
+                            })
+                            .await;
+                    }
+                });
+
+                let mut eg_handles = Vec::new();
+                for (src_idx, source) in self.sources.iter().enumerate() {
+                    let source = source.clone();
+                    let parts = remaining.clone();
+                    let tracker = tracker.clone();
+                    let part_path = part_path.clone();
+                    let file_hash = self.file_hash;
+                    let file_size = self.file_size;
+                    let user_hash = self.user_hash;
+                    let nickname = self.nickname.clone();
+                    let tcp_port = self.tcp_port;
+                    let udp_port = self.udp_port;
+                    let bw = self.bandwidth_limiter.clone();
+                    let eg_tx = eg_tx.clone();
+                    let ph = part_hashes.clone();
+                    let ra = active_count.clone();
+                    let rq = queued_count.clone();
+                    let received = received_parts.clone();
+
+                    eg_handles.push(tokio::spawn(async move {
+                        // Filter to only parts not yet received by another source
+                        let parts_to_try: Vec<usize> = {
+                            let r = received.read().await;
+                            parts.iter().copied().filter(|p| !r.contains(p)).collect()
+                        };
+                        if parts_to_try.is_empty() {
+                            return;
+                        }
+                        let result = download_parts_from_source(
+                            src_idx, &source, &parts_to_try, tracker.clone(), &part_path,
+                            &file_hash, file_size, &user_hash, &nickname,
+                            tcp_port, udp_port, bw, eg_tx, ph,
+                            ra, rq,
+                        )
+                        .await;
+                        if result.is_ok() {
+                            let mut r = received.write().await;
+                            for &p in &parts_to_try {
+                                let t = tracker.read().await;
+                                if t.is_part_complete(p) {
+                                    r.insert(p);
+                                }
+                            }
+                        }
+                    }));
+                }
+
+                drop(eg_tx);
+                for h in eg_handles {
+                    let _ = h.await;
+                }
+                eg_agg.await?;
+            }
         }
 
         // Check if all parts are complete

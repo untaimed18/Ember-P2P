@@ -43,3 +43,6 @@ igd-next = { version = "0.15", features = ["aio_tokio"] }
 socket2 = "0.5"
 tracing-appender = "0.2.4"
 tauri-plugin-single-instance = "2.4.0"
+rsa = "0.9"
+pkcs8 = { version = "0.10", features = ["std"] }
+signature = "2"

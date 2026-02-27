@@ -108,6 +108,21 @@ impl Database {
         conn.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (?1)", params![1i64])?;
         }
 
+        if version < 2 {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS credits (
+                    user_hash BLOB PRIMARY KEY,
+                    uploaded INTEGER NOT NULL DEFAULT 0,
+                    downloaded INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0,
+                    public_key BLOB NOT NULL DEFAULT x''
+                );
+                ",
+            )?;
+            conn.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (?1)", params![2i64])?;
+        }
+
         Ok(())
     }
 
@@ -352,6 +367,53 @@ impl Database {
             "UPDATE transfers SET status = ?1 WHERE id = ?2",
             params![status, transfer_id],
         )?;
+        Ok(())
+    }
+
+    pub fn save_credit(&self, user_hash: &[u8; 16], uploaded: u64, downloaded: u64, last_seen: i64, public_key: &[u8]) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO credits (user_hash, uploaded, downloaded, last_seen, public_key) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![&user_hash[..], uploaded as i64, downloaded as i64, last_seen, public_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_credits(&self) -> anyhow::Result<Vec<([u8; 16], u64, u64, i64, Vec<u8>)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare("SELECT user_hash, uploaded, downloaded, last_seen, public_key FROM credits")?;
+        let records = stmt
+            .query_map([], |row| {
+                let hash_blob: Vec<u8> = row.get(0)?;
+                let mut hash = [0u8; 16];
+                if hash_blob.len() >= 16 {
+                    hash.copy_from_slice(&hash_blob[..16]);
+                }
+                Ok((
+                    hash,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, i64>(2)? as u64,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(records)
+    }
+
+    pub fn save_all_credits(&self, credits: &[(&[u8; 16], u64, u64, i64, &[u8])]) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO credits (user_hash, uploaded, downloaded, last_seen, public_key) VALUES (?1, ?2, ?3, ?4, ?5)"
+            )?;
+            for (hash, uploaded, downloaded, last_seen, public_key) in credits {
+                stmt.execute(params![&hash[..], *uploaded as i64, *downloaded as i64, *last_seen, *public_key])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 }

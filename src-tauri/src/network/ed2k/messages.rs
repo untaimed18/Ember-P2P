@@ -42,6 +42,11 @@ pub const OP_QUEUERANK: u8 = 0x5C;
 pub const OP_REQUESTSOURCES: u8 = 0x81;
 pub const OP_ANSWERSOURCES2: u8 = 0x83;
 
+// Secure identification opcodes (OP_EMULEPROT)
+pub const OP_PUBLICKEY: u8 = 0x85;
+pub const OP_SIGNATURE: u8 = 0x86;
+pub const OP_SECIDENTSTATE: u8 = 0x87;
+
 // Constants
 pub const EMBLOCKSIZE: u64 = 184_320;
 pub const PARTSIZE: u64 = 9_728_000;
@@ -124,7 +129,7 @@ pub fn build_hello(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickname
 ///   bit  4:     Unicode support (1)
 ///   bits 5-7:   UDP version (4)
 ///   bits 8-11:  Data compression version (1)
-///   bit  12:    Secure ident support (0 - not implemented)
+///   bit  12:    Secure ident support (1)
 ///   bits 13-15: Source exchange version (4)
 ///   bits 16-19: Extended requests version (2)
 ///   bits 20-23: Comments version (1)
@@ -155,7 +160,7 @@ pub fn build_emule_info(udp_port: u16) -> Vec<u8> {
         | (1 << 4)      // Unicode
         | (4 << 5)      // UDP ver 4
         | (1 << 8)      // Compression ver 1
-        | (0 << 12)     // No secure ident
+        | (1 << 12)     // Secure ident supported
         | (4 << 13)     // Source exchange ver 4
         | (2 << 16)     // Extended requests ver 2
         | (1 << 20)     // Comments ver 1

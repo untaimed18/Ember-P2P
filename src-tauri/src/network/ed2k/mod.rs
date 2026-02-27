@@ -1,7 +1,13 @@
+pub mod a4af;
 pub mod aich;
+pub mod chunk_selection;
+pub mod credits;
 pub mod hash;
 pub mod messages;
 pub mod multi_source;
 pub mod part_tracker;
+pub mod server;
+pub mod server_list;
+pub mod sources;
 pub mod transfer;
 pub mod upload;

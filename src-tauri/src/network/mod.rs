@@ -18,6 +18,11 @@ use crate::sharing::manager::{TransferControl, TransferManager};
 use crate::storage::database::Database;
 use crate::types::*;
 
+use self::ed2k::a4af::A4AFManager;
+use self::ed2k::credits::CreditManager;
+use self::ed2k::server::Ed2kServerConnection;
+use self::ed2k::server_list::{ServerEntry, ServerList};
+use self::ed2k::sources::SourceManager;
 use self::ed2k::upload::{self as upload_server, UploadEvent, UploadEventKind};
 use self::ed2k::multi_source::{DownloadSource, MultiSourceDownload};
 use self::ed2k::transfer::{DownloadEvent, Ed2kDownload};
@@ -110,6 +115,21 @@ pub enum NetworkCommand {
     },
     KadBootstrapClients,
     RecheckFirewall,
+    SharedFilesChanged,
+    ConnectToServer {
+        ip: String,
+        port: u16,
+    },
+    DisconnectServer,
+    AddServer {
+        ip: String,
+        port: u16,
+        name: String,
+    },
+    RemoveServer {
+        ip: String,
+        port: u16,
+    },
     UpdateSettings {
         settings: AppSettings,
     },
@@ -186,6 +206,14 @@ struct NetworkState {
     udp_firewalled: bool,
     /// Whether UDP firewall status has been verified
     udp_fw_verified: bool,
+    /// Whether the initial post-bootstrap publish has been done
+    first_publish_done: bool,
+    /// ed2k server list
+    server_list: ServerList,
+    /// Whether we're connected to an ed2k server
+    server_connected: bool,
+    /// A4AF source management
+    a4af_manager: A4AFManager,
 }
 
 pub async fn start_network(
@@ -408,6 +436,13 @@ pub async fn start_network(
         last_firewall_check: chrono::Utc::now().timestamp(),
         udp_firewalled: true,
         udp_fw_verified: false,
+        first_publish_done: false,
+        server_list: {
+            let met_path = data_dir.join("server.met");
+            ServerList::load_server_met(&met_path).unwrap_or_else(|_| ServerList::new())
+        },
+        server_connected: false,
+        a4af_manager: A4AFManager::new(),
     };
 
     // Send bootstrap requests to initial contacts
@@ -446,6 +481,24 @@ pub async fn start_network(
     // Upload event channel
     let (ul_event_tx, mut ul_event_rx) = mpsc::channel::<UploadEvent>(128);
 
+    let source_manager: Arc<RwLock<SourceManager>> = Arc::new(RwLock::new(SourceManager::new()));
+
+    // Load credits from DB
+    let credit_manager: Arc<RwLock<CreditManager>> = {
+        let mut cm = CreditManager::new();
+        if let Ok(records) = db.load_credits() {
+            for (hash, uploaded, downloaded, last_seen, public_key) in records {
+                let record = cm.get_or_create(hash);
+                record.uploaded = uploaded;
+                record.downloaded = downloaded;
+                record.last_seen = last_seen;
+                record.public_key = public_key;
+            }
+            info!("Loaded {} credit records from database", cm.all_records().len());
+        }
+        Arc::new(RwLock::new(cm))
+    };
+
     // Start the peer-to-peer upload listener (accepts incoming file requests from other KAD peers)
     {
         let ul_tx = ul_event_tx.clone();
@@ -456,6 +509,8 @@ pub async fn start_network(
         let ul_nickname = settings.nickname.clone();
         let ul_app = app_handle.clone();
         let ul_max = settings.max_concurrent_uploads;
+        let ul_sm = source_manager.clone();
+        let ul_cm = credit_manager.clone();
         tokio::spawn(async move {
             if let Err(e) = upload_server::start_upload_server(
                 tcp_port,
@@ -468,6 +523,8 @@ pub async fn start_network(
                 ul_bw,
                 ul_tx,
                 ul_max,
+                ul_sm,
+                ul_cm,
             )
             .await
             {
@@ -493,6 +550,8 @@ pub async fn start_network(
     let mut source_retry_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut nodes_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
     let mut cache_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut credit_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
+    let mut a4af_timer = tokio::time::interval(std::time::Duration::from_secs(480));
 
     // Resume incomplete downloads from previous session
     if let Ok(incomplete) = db.get_incomplete_downloads() {
@@ -819,6 +878,14 @@ pub async fn start_network(
                                             available_parts: Vec::new(),
                                         })
                                         .collect();
+                                    {
+                                        let mut sm = source_manager.write().await;
+                                        for (ip, port) in &sources {
+                                            if let Ok(v4) = ip.parse::<Ipv4Addr>() {
+                                                sm.register_source(hash_bytes, v4, *port);
+                                            }
+                                        }
+                                    }
                                     let ms_download = MultiSourceDownload {
                                         transfer_id: pending.transfer_id,
                                         file_hash: hash_bytes,
@@ -1081,6 +1148,28 @@ pub async fn start_network(
                 if count > 0 && state.stats.status != NetworkStatus::Connected {
                     state.stats.status = NetworkStatus::Connected;
                     let _ = app_handle.emit("network-status", NetworkStatus::Connected);
+
+                    // Populate publish manager with all shared files on first connect
+                    if !state.first_publish_done {
+                        state.first_publish_done = true;
+                        let index = local_index.read().await;
+                        let files: Vec<PublishableFile> = index.all_files()
+                            .iter()
+                            .filter_map(|f| {
+                                let hash_bytes = hex::decode(&f.hash).ok()?;
+                                if hash_bytes.len() < 16 { return None; }
+                                Some(PublishableFile {
+                                    file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
+                                    file_name: f.name.clone(),
+                                    file_size: f.size,
+                                    file_type: f.extension.clone(),
+                                })
+                            })
+                            .collect();
+                        let count = files.len();
+                        state.publish_manager.add_files_batch(files);
+                        info!("Populated publish manager with {count} shared files after bootstrap");
+                    }
                 }
                 state.stats.connected_peers = count;
             }
@@ -1406,6 +1495,53 @@ pub async fn start_network(
                         }
                     }
                 }
+            }
+
+            // Periodic credit save to database
+            _ = credit_save_timer.tick() => {
+                let cm = credit_manager.read().await;
+                let records: Vec<(&[u8; 16], u64, u64, i64, &[u8])> = cm.all_records()
+                    .iter()
+                    .map(|r| (&r.user_hash, r.uploaded, r.downloaded, r.last_seen, r.public_key.as_slice()))
+                    .collect();
+                let db_ref = db.clone();
+                let owned: Vec<([u8; 16], u64, u64, i64, Vec<u8>)> = records.iter()
+                    .map(|(h, u, d, l, p)| (**h, *u, *d, *l, p.to_vec()))
+                    .collect();
+                drop(cm);
+                tokio::task::spawn_blocking(move || {
+                    let refs: Vec<(&[u8; 16], u64, u64, i64, &[u8])> = owned.iter()
+                        .map(|(h, u, d, l, p)| (h, *u, *d, *l, p.as_slice()))
+                        .collect();
+                    if let Err(e) = db_ref.save_all_credits(&refs) {
+                        error!("Failed to save credits: {e}");
+                    }
+                });
+            }
+
+            // A4AF swap evaluation every 8 minutes
+            _ = a4af_timer.tick() => {
+                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                // Build file priority map from pending downloads
+                let mut file_priorities: HashMap<[u8; 16], (u32, usize)> = HashMap::new();
+                for (_tid, pd) in &state.pending_downloads {
+                    let hash_hex = &pd.file_hash;
+                    if let Ok(raw) = hex::decode(hash_hex) {
+                        if raw.len() >= 16 {
+                            let mut hash = [0u8; 16];
+                            hash.copy_from_slice(&raw[..16]);
+                            let priority = match pd.file_name.as_str() {
+                                _ => 1u32, // default priority
+                            };
+                            file_priorities.insert(hash, (priority, 0));
+                        }
+                    }
+                }
+                let swaps = state.a4af_manager.process_swaps(&file_priorities);
+                if !swaps.is_empty() {
+                    info!("A4AF: {} swap actions evaluated", swaps.len());
+                }
+                state.a4af_manager.cleanup_stale(3600);
             }
 
             // Periodic nodes.dat save to protect against crashes
@@ -3338,6 +3474,84 @@ async fn handle_command(
                 settings.obfuscation_enabled,
                 settings.nickname,
             );
+        }
+
+        NetworkCommand::ConnectToServer { ip, port } => {
+            let addr: SocketAddr = match format!("{ip}:{port}").parse() {
+                Ok(a) => a,
+                Err(e) => {
+                    warn!("Invalid server address {ip}:{port}: {e}");
+                    return;
+                }
+            };
+            info!("Connecting to ed2k server {addr}...");
+            match Ed2kServerConnection::connect(addr).await {
+                Ok(mut conn) => {
+                    match conn.login(&state.user_hash, &settings.nickname, state.tcp_port).await {
+                        Ok(session) => {
+                            info!(
+                                "Connected to ed2k server {addr}: client_id={}, users={}, files={}",
+                                session.client_id, session.user_count, session.file_count
+                            );
+                            state.server_connected = true;
+                            state.server_list.record_success(&ip, port);
+                        }
+                        Err(e) => {
+                            warn!("Server login failed: {e}");
+                            state.server_list.record_failure(&ip, port);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to connect to server {addr}: {e}");
+                    state.server_list.record_failure(&ip, port);
+                }
+            }
+        }
+
+        NetworkCommand::DisconnectServer => {
+            info!("Disconnecting from ed2k server");
+            state.server_connected = false;
+        }
+
+        NetworkCommand::AddServer { ip, port, name } => {
+            let mut entry = ServerEntry::new(ip, port);
+            entry.name = name;
+            state.server_list.add(entry);
+            let met_path = state.data_dir.join("server.met");
+            if let Err(e) = state.server_list.save_server_met(&met_path) {
+                warn!("Failed to save server.met: {e}");
+            }
+            info!("Added server, total: {}", state.server_list.len());
+        }
+
+        NetworkCommand::RemoveServer { ip, port } => {
+            state.server_list.remove(&ip, port);
+            let met_path = state.data_dir.join("server.met");
+            if let Err(e) = state.server_list.save_server_met(&met_path) {
+                warn!("Failed to save server.met: {e}");
+            }
+        }
+
+        NetworkCommand::SharedFilesChanged => {
+            let index = local_index.read().await;
+            let files: Vec<PublishableFile> = index.all_files()
+                .iter()
+                .filter_map(|f| {
+                    let hash_bytes = hex::decode(&f.hash).ok()?;
+                    if hash_bytes.len() < 16 { return None; }
+                    Some(PublishableFile {
+                        file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
+                        file_name: f.name.clone(),
+                        file_size: f.size,
+                        file_type: f.extension.clone(),
+                    })
+                })
+                .collect();
+            let count = files.len();
+            state.publish_manager.clear_all();
+            state.publish_manager.add_files_batch(files);
+            info!("Re-populated publish manager with {count} shared files after change");
         }
 
         NetworkCommand::Shutdown => {}
