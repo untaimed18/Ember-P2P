@@ -232,10 +232,12 @@ impl UploadHandler {
         // We use an enum to avoid dyn dispatch issues with AsyncReadExt.
         enum StreamReader {
             Plain(tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>),
+            #[allow(dead_code)]
             Obfuscated(tokio::io::BufReader<Rc4Reader<tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>>>),
         }
         enum StreamWriter {
             Plain(tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>),
+            #[allow(dead_code)]
             Obfuscated(tokio::io::BufWriter<Rc4Writer<tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>>>),
         }
 
@@ -269,56 +271,58 @@ impl UploadHandler {
             }
         }
 
-        let (mut reader, mut writer, first_byte) = match negotiation {
-            NegotiationResult::Plain { first_byte } => {
-                (StreamReader::Plain(raw_reader), StreamWriter::Plain(raw_writer), Some(first_byte))
-            }
-            NegotiationResult::Obfuscated { recv_key, send_key } => {
+        // For obfuscated connections, handle the port test directly using manual
+        // encryption to avoid Rc4Writer keystream desync issues.
+        let first_byte = match negotiation {
+            NegotiationResult::Obfuscated { recv_key, mut send_key } => {
                 info!("Obfuscated connection from {peer_addr}");
-                (
-                    StreamReader::Obfuscated(tokio::io::BufReader::new(Rc4Reader::new(raw_reader, recv_key))),
-                    StreamWriter::Obfuscated(tokio::io::BufWriter::new(Rc4Writer::new(raw_writer, send_key))),
-                    None,
-                )
+                let mut obf_reader = tokio::io::BufReader::new(Rc4Reader::new(raw_reader, recv_key));
+
+                // Wait for the first packet (Hello from server port test, or disconnect)
+                let probe_timeout = std::time::Duration::from_secs(3);
+                let first_pkt = tokio::time::timeout(probe_timeout, read_packet_async_inner(&mut obf_reader)).await;
+
+                match first_pkt {
+                    Ok(Ok((proto, opcode, payload))) => {
+                        info!("Obfuscated data from {peer_addr}: proto=0x{proto:02X} op=0x{opcode:02X} len={}", payload.len());
+
+                        if proto == OP_EDONKEYHEADER && opcode == OP_HELLO {
+                            // Server sent Hello -- build HelloAnswer and encrypt manually
+                            let hello_payload = build_hello(&self.user_hash, 0, self.tcp_port, &self.nickname);
+                            let mut pkt = Vec::with_capacity(6 + hello_payload.len());
+                            pkt.push(OP_EDONKEYHEADER);
+                            pkt.extend_from_slice(&((1 + hello_payload.len()) as u32).to_le_bytes());
+                            pkt.push(OP_HELLOANSWER);
+                            pkt.extend_from_slice(&hello_payload);
+
+                            let mut encrypted_pkt = vec![0u8; pkt.len()];
+                            send_key.process(&pkt, &mut encrypted_pkt);
+                            raw_writer.write_all(&encrypted_pkt).await?;
+                            raw_writer.flush().await?;
+
+                            info!("Obfuscated Hello exchange complete with {peer_addr} ({} bytes encrypted)", encrypted_pkt.len());
+                        } else {
+                            info!("Non-Hello on obfuscated probe: proto=0x{proto:02X} op=0x{opcode:02X}");
+                        }
+                    }
+                    Ok(Err(e)) if is_connection_closed(&e) => {
+                        info!("Obfuscated probe from {peer_addr} (disconnected after handshake)");
+                    }
+                    _ => {
+                        info!("Obfuscated probe from {peer_addr} (no data, port test)");
+                    }
+                }
+                // Hold the connection alive so the server can process the port test
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                return Ok(());
             }
+            NegotiationResult::Plain { first_byte } => first_byte,
         };
 
-        // Read the first eMule packet. For plain connections, we already have
-        // the first byte (protocol header) from negotiation.
-        // For obfuscated connections (where we haven't sent the response yet),
-        // hold the connection briefly for server port tests, then close.
-        // If actual eMule data arrives, it's a real peer -- send the obfuscation
-        // response and continue normally.
-        let (proto, opcode, hello_data) = if let Some(fb) = first_byte {
-            read_packet_with_first_byte(&mut reader, fb).await?
-        } else {
-            // For obfuscated connections, wait briefly for eMule data.
-            // Server port tests just disconnect; real peers send OP_HELLO.
-            let probe_timeout = std::time::Duration::from_secs(3);
-            match tokio::time::timeout(probe_timeout, read_packet_async_inner(&mut reader)).await {
-                Ok(Ok(pkt)) => {
-                    // Real peer sent data -- send our obfuscation response now
-                    // (we need to send it through the raw writer, not the RC4 writer,
-                    // since the RC4 writer's send_key state needs to produce the response)
-                    // Actually the send_key is inside the StreamWriter::Obfuscated variant
-                    // and write_packet_async will encrypt through it. But we skipped
-                    // the handshake response. For now, just proceed with the packet.
-                    // The peer may or may not tolerate the missing response.
-                    info!("Obfuscated peer from {peer_addr} sent data after handshake");
-                    pkt
-                }
-                Ok(Err(e)) if is_connection_closed(&e) => {
-                    info!("Obfuscated probe from {peer_addr} (disconnected after handshake)");
-                    return Ok(());
-                }
-                Ok(Err(_)) | Err(_) => {
-                    // No data or timeout -- server port test probe. Hold briefly then close.
-                    info!("Obfuscated probe from {peer_addr} (port test, holding 3s)");
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    return Ok(());
-                }
-            }
-        };
+        // --- Plain text path (normal peer connections) ---
+        let mut reader = StreamReader::Plain(raw_reader);
+        let mut writer = StreamWriter::Plain(raw_writer);
+        let (proto, opcode, hello_data) = read_packet_with_first_byte(&mut reader, first_byte).await?;
 
         // Handle Port Test (Server connection check)
         if (proto == OP_EDONKEYHEADER || proto == OP_EMULEPROT) && opcode == OP_PORTTEST {
@@ -344,7 +348,9 @@ impl UploadHandler {
         }
 
         if proto != OP_EDONKEYHEADER || opcode != OP_HELLO {
-            anyhow::bail!("expected Hello, got proto=0x{proto:02X} op=0x{opcode:02X}");
+            info!("Non-Hello packet from {peer_addr}: proto=0x{proto:02X} op=0x{opcode:02X}, treating as probe");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            return Ok(());
         }
         let mut peer_user_hash = [0u8; 16];
         if hello_data.len() >= 17 {

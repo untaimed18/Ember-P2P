@@ -180,6 +180,7 @@ pub struct Rc4Writer<W> {
 }
 
 impl<W> Rc4Writer<W> {
+    #[allow(dead_code)]
     pub fn new(inner: W, rc4: Rc4State) -> Self {
         Self { inner, rc4 }
     }
