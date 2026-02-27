@@ -12,8 +12,10 @@ use tracing::{debug, info, warn};
 use crate::bandwidth::limiter::BandwidthLimiter;
 use crate::sharing::manager::TransferControl;
 
+use super::credits::CreditManager;
 use super::messages::*;
 use super::part_tracker::PartTracker;
+use super::sources::SourceManager;
 
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY_SECS: u64 = 10;
@@ -39,6 +41,8 @@ pub struct Ed2kDownload {
     pub udp_port: u16,
     pub bandwidth_limiter: Arc<BandwidthLimiter>,
     pub control: Arc<TransferControl>,
+    pub source_manager: Option<Arc<tokio::sync::RwLock<SourceManager>>>,
+    pub credit_manager: Option<Arc<tokio::sync::RwLock<CreditManager>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +146,14 @@ impl Ed2kDownload {
         )
         .await??;
 
+        // Register this source with the source manager
+        if let Some(sm) = &self.source_manager {
+            if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
+                let mut sm = sm.write().await;
+                sm.register_source(self.file_hash, v4, self.source_addr.port());
+            }
+        }
+
         let (reader, writer) = stream.into_split();
         let mut reader = tokio::io::BufReader::new(reader);
         let mut writer = tokio::io::BufWriter::new(writer);
@@ -150,10 +162,14 @@ impl Ed2kDownload {
         let hello_payload = build_hello(&self.user_hash, 0, self.tcp_port, &self.nickname);
         write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_HELLO, &hello_payload).await?;
 
-        // Read HelloAnswer
-        let (proto, opcode, _payload) = read_packet_with_timeout(&mut reader).await?;
+        // Read HelloAnswer and extract peer's user hash
+        let (proto, opcode, hello_ans_data) = read_packet_with_timeout(&mut reader).await?;
         if proto != OP_EDONKEYHEADER || opcode != OP_HELLOANSWER {
             anyhow::bail!("expected HelloAnswer, got proto=0x{proto:02X} op=0x{opcode:02X}");
+        }
+        let mut peer_user_hash = [0u8; 16];
+        if hello_ans_data.len() >= 16 {
+            peer_user_hash.copy_from_slice(&hello_ans_data[..16]);
         }
         debug!("Got HelloAnswer from {}", self.source_addr);
 
@@ -170,6 +186,62 @@ impl Ed2kDownload {
             debug!("Peer skipped EmuleInfoAnswer (got proto=0x{proto2:02X} op=0x{opcode2:02X}), deferring");
             deferred_packet = Some((proto2, opcode2, payload2));
         }
+
+        // Handle secure identification packets that may arrive before file requests
+        for _ in 0..3 {
+            let (p, o, pl) = if let Some(pkt) = deferred_packet.take() {
+                pkt
+            } else {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    read_packet_async(&mut reader),
+                ).await {
+                    Ok(Ok(pkt)) => pkt,
+                    _ => break,
+                }
+            };
+
+            match (p, o) {
+                (OP_EMULEPROT, OP_PUBLICKEY) if !pl.is_empty() => {
+                    if let Some(cm) = &self.credit_manager {
+                        let mut cm = cm.write().await;
+                        cm.set_public_key(peer_user_hash, pl);
+                    }
+                    debug!("Received peer's public key");
+                }
+                (OP_EMULEPROT, OP_SECIDENTSTATE) if pl.len() >= 5 => {
+                    let challenge = u32::from_le_bytes([pl[0], pl[1], pl[2], pl[3]]);
+                    let peer_ip_u32 = match self.source_addr.ip() {
+                        std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
+                        _ => 0,
+                    };
+
+                    // Send our public key
+                    if let Some(cm) = &self.credit_manager {
+                        let cm_r = cm.read().await;
+                        let pub_key = cm_r.our_public_key().to_vec();
+                        if !pub_key.is_empty() {
+                            write_packet_async(&mut writer, OP_EMULEPROT, OP_PUBLICKEY, &pub_key).await?;
+                        }
+                        // Sign the challenge and send signature
+                        let sig = cm_r.create_signature(challenge, peer_ip_u32);
+                        if !sig.is_empty() {
+                            write_packet_async(&mut writer, OP_EMULEPROT, OP_SIGNATURE, &sig).await?;
+                        }
+                    }
+                    debug!("Responded to SecIdent challenge");
+                }
+                _ => {
+                    deferred_packet = Some((p, o, pl));
+                    break;
+                }
+            }
+        }
+
+        // Handle secure identification exchange if the peer requests it.
+        // The uploader may send OP_PUBLICKEY, OP_SECIDENTSTATE before file responses.
+        // We respond with our public key and a signed challenge.
+        // This is done non-blocking: we peek at the next packet.
 
         // Send file request
         let file_req = build_file_request(&self.file_hash);
@@ -482,6 +554,11 @@ impl Ed2kDownload {
                             blocks_received_in_current_req += 1;
                             speed_measure_bytes += piece_len;
 
+                            if let Some(cm) = &self.credit_manager {
+                                let mut cm = cm.write().await;
+                                cm.add_downloaded(peer_user_hash, piece_len);
+                            }
+
                             let _ = event_tx
                                 .send(DownloadEvent::Progress {
                                     transfer_id: self.transfer_id.clone(),
@@ -519,6 +596,11 @@ impl Ed2kDownload {
                             downloaded += piece_len;
                             blocks_received_in_current_req += 1;
                             speed_measure_bytes += piece_len;
+
+                            if let Some(cm) = &self.credit_manager {
+                                let mut cm = cm.write().await;
+                                cm.add_downloaded(peer_user_hash, piece_len);
+                            }
 
                             let _ = event_tx
                                 .send(DownloadEvent::Progress {

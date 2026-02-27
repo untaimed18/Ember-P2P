@@ -40,6 +40,8 @@ pub async fn add_shared_folder(
         .await
         .map_err(|e| format!("Failed to announce files: {e}"))?;
 
+    let _ = state.network_tx.send(NetworkCommand::SharedFilesChanged).await;
+
     {
         let mut config = state.config.write().await;
         if !config.settings.shared_folders.contains(&path) {
@@ -95,6 +97,7 @@ pub async fn remove_shared_folder(
                 file_hashes: removed_hashes,
             })
             .await;
+        let _ = state.network_tx.send(NetworkCommand::SharedFilesChanged).await;
     }
 
     Ok(())
@@ -201,6 +204,7 @@ pub async fn unshare_file(
                 file_hashes: vec![file_hash],
             })
             .await;
+        let _ = state.network_tx.send(NetworkCommand::SharedFilesChanged).await;
     }
 
     Ok(())

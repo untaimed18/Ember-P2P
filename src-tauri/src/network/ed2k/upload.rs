@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::bandwidth::limiter::BandwidthLimiter;
+use crate::network::ed2k::a4af::A4AFManager;
 use crate::network::ed2k::credits::CreditManager;
 use crate::network::ed2k::sources::SourceManager;
 use crate::search::index::LocalIndex;
@@ -77,6 +78,9 @@ struct UploadHandler {
     total_connections: Arc<std::sync::atomic::AtomicUsize>,
     source_manager: Arc<RwLock<SourceManager>>,
     credit_manager: Arc<RwLock<CreditManager>>,
+    a4af_manager: Arc<RwLock<A4AFManager>>,
+    /// File hashes we're currently downloading (for A4AF registration)
+    pending_download_hashes: Arc<RwLock<Vec<[u8; 16]>>>,
 }
 
 pub async fn start_upload_server(
@@ -92,6 +96,8 @@ pub async fn start_upload_server(
     max_uploads: u32,
     source_manager: Arc<RwLock<SourceManager>>,
     credit_manager: Arc<RwLock<CreditManager>>,
+    a4af_manager: Arc<RwLock<A4AFManager>>,
+    pending_download_hashes: Arc<RwLock<Vec<[u8; 16]>>>,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     let listener = match TcpListener::bind(addr).await {
@@ -123,6 +129,8 @@ pub async fn start_upload_server(
         total_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         source_manager,
         credit_manager,
+        a4af_manager,
+        pending_download_hashes,
     });
 
     loop {
@@ -210,6 +218,94 @@ impl UploadHandler {
             deferred_packet = Some((proto2, opcode2, payload2));
         }
 
+        // Secure identification exchange (eMule SecIdent)
+        // Send our public key to the peer
+        {
+            let cm = self.credit_manager.read().await;
+            let pub_key = cm.our_public_key().to_vec();
+            if !pub_key.is_empty() {
+                write_packet_async(
+                    &mut writer,
+                    OP_EMULEPROT,
+                    OP_PUBLICKEY,
+                    &pub_key,
+                )
+                .await?;
+
+                // Generate and send a challenge for the peer to sign
+                let challenge: u32 = rand::random();
+                let peer_ip_u32 = match peer_addr.ip() {
+                    std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
+                    _ => 0,
+                };
+
+                // SecIdentState: challenge(4) + state(1)
+                // state: 1 = we require their public key, 2 = we have their key and need signature
+                let has_peer_key = {
+                    let record = cm.all_records();
+                    record.iter().any(|r| r.user_hash == peer_user_hash && !r.public_key.is_empty())
+                };
+                let state_byte: u8 = if has_peer_key { 2 } else { 1 };
+                let mut secident_payload = Vec::with_capacity(5);
+                secident_payload.extend_from_slice(&challenge.to_le_bytes());
+                secident_payload.push(state_byte);
+                write_packet_async(
+                    &mut writer,
+                    OP_EMULEPROT,
+                    OP_SECIDENTSTATE,
+                    &secident_payload,
+                )
+                .await?;
+                drop(cm);
+
+                // Try to read the peer's response (public key and/or signature)
+                // but don't block file requests - use a short timeout
+                for _ in 0..3 {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        read_packet_async_inner(&mut reader),
+                    ).await {
+                        Ok(Ok((proto, opcode, payload))) => {
+                            match (proto, opcode) {
+                                (OP_EMULEPROT, OP_PUBLICKEY) if !payload.is_empty() => {
+                                    let mut cm = self.credit_manager.write().await;
+                                    cm.set_public_key(peer_user_hash, payload);
+                                    debug!("Received public key from {peer_addr}");
+                                }
+                                (OP_EMULEPROT, OP_SIGNATURE) if payload.len() >= 4 => {
+                                    let cm = self.credit_manager.read().await;
+                                    let verified = cm.verify_signature(
+                                        &peer_user_hash,
+                                        challenge,
+                                        peer_ip_u32,
+                                        &payload,
+                                    );
+                                    drop(cm);
+                                    if verified {
+                                        let mut cm = self.credit_manager.write().await;
+                                        cm.set_ident_state(peer_user_hash, super::credits::IdentState::Verified);
+                                        debug!("SecIdent verified for {peer_addr}");
+                                    } else {
+                                        let mut cm = self.credit_manager.write().await;
+                                        cm.set_ident_state(peer_user_hash, super::credits::IdentState::Failed);
+                                        debug!("SecIdent verification failed for {peer_addr}");
+                                    }
+                                }
+                                _ => {
+                                    // Not a secident packet; defer it for the file request loop
+                                    deferred_packet = Some((proto, opcode, payload));
+                                    break;
+                                }
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            } else {
+                drop(cm);
+            }
+        }
+
         // Now handle file requests in a loop
         let mut current_file_hash: Option<[u8; 16]> = None;
         let mut uploaded: u64 = 0;
@@ -275,6 +371,17 @@ impl UploadHandler {
                             .await?;
 
                             total_size = file.size;
+
+                            // Register this peer as potential A4AF source for our pending downloads
+                            let download_hashes = self.pending_download_hashes.read().await;
+                            if !download_hashes.is_empty() {
+                                let mut a4af = self.a4af_manager.write().await;
+                                for &dl_hash in download_hashes.iter() {
+                                    if dl_hash != hash {
+                                        a4af.add_a4af_source(dl_hash, peer_addr, hash);
+                                    }
+                                }
+                            }
                         } else {
                             write_packet_async(
                                 &mut writer,

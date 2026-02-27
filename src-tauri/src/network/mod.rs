@@ -212,8 +212,12 @@ struct NetworkState {
     server_list: ServerList,
     /// Whether we're connected to an ed2k server
     server_connected: bool,
-    /// A4AF source management
-    a4af_manager: A4AFManager,
+    /// Active ed2k server connection (kept for keep-alive and source requests)
+    server_connection: Option<Ed2kServerConnection>,
+    /// Address of the currently connected server
+    server_addr: Option<SocketAddr>,
+    /// A4AF source management (shared with upload handler via a4af_shared Arc)
+    _a4af_placeholder: (),
 }
 
 pub async fn start_network(
@@ -442,7 +446,9 @@ pub async fn start_network(
             ServerList::load_server_met(&met_path).unwrap_or_else(|_| ServerList::new())
         },
         server_connected: false,
-        a4af_manager: A4AFManager::new(),
+        server_connection: None,
+        server_addr: None,
+        _a4af_placeholder: (),
     };
 
     // Send bootstrap requests to initial contacts
@@ -499,6 +505,9 @@ pub async fn start_network(
         Arc::new(RwLock::new(cm))
     };
 
+    let a4af_shared: Arc<RwLock<A4AFManager>> = Arc::new(RwLock::new(A4AFManager::new()));
+    let pending_dl_hashes: Arc<RwLock<Vec<[u8; 16]>>> = Arc::new(RwLock::new(Vec::new()));
+
     // Start the peer-to-peer upload listener (accepts incoming file requests from other KAD peers)
     {
         let ul_tx = ul_event_tx.clone();
@@ -511,6 +520,8 @@ pub async fn start_network(
         let ul_max = settings.max_concurrent_uploads;
         let ul_sm = source_manager.clone();
         let ul_cm = credit_manager.clone();
+        let ul_a4af = a4af_shared.clone();
+        let ul_pdh = pending_dl_hashes.clone();
         tokio::spawn(async move {
             if let Err(e) = upload_server::start_upload_server(
                 tcp_port,
@@ -525,6 +536,8 @@ pub async fn start_network(
                 ul_max,
                 ul_sm,
                 ul_cm,
+                ul_a4af,
+                ul_pdh,
             )
             .await
             {
@@ -552,6 +565,7 @@ pub async fn start_network(
     let mut cache_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut credit_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
     let mut a4af_timer = tokio::time::interval(std::time::Duration::from_secs(480));
+    let mut server_timer = tokio::time::interval(std::time::Duration::from_secs(60));
 
     // Resume incomplete downloads from previous session
     if let Ok(incomplete) = db.get_incomplete_downloads() {
@@ -648,6 +662,8 @@ pub async fn start_network(
                             &db,
                             &app_handle,
                             &transfer_manager,
+                            &source_manager,
+                            &credit_manager,
                         ).await;
                     }
                 }
@@ -682,6 +698,8 @@ pub async fn start_network(
                         &db,
                         &app_handle,
                         &transfer_manager,
+                        &source_manager,
+                        &credit_manager,
                     ).await;
                 }
             }
@@ -715,6 +733,8 @@ pub async fn start_network(
                         &db,
                         &app_handle,
                         &transfer_manager,
+                        &source_manager,
+                        &credit_manager,
                     ).await;
                 }
             }
@@ -858,6 +878,8 @@ pub async fn start_network(
                                         udp_port: settings.udp_port,
                                         bandwidth_limiter: bandwidth_limiter.clone(),
                                         control: pending.control,
+                                        source_manager: Some(source_manager.clone()),
+                                        credit_manager: Some(credit_manager.clone()),
                                     };
                                     let tx = dl_event_tx.clone();
                                     tokio::spawn(async move {
@@ -899,6 +921,8 @@ pub async fn start_network(
                                         udp_port: settings.udp_port,
                                         bandwidth_limiter: bandwidth_limiter.clone(),
                                         control: pending.control,
+                                        source_manager: Some(source_manager.clone()),
+                                        credit_manager: Some(credit_manager.clone()),
                                     };
                                     let tx = dl_event_tx.clone();
                                     tokio::spawn(async move {
@@ -1180,12 +1204,12 @@ pub async fn start_network(
                 if state.routing_table.is_empty() {
                     debug!("Skipping publish cycle: routing table is empty");
                 } else {
-                // Limit publishes per cycle to avoid flooding peers
-                const MAX_SOURCE_PUBLISHES_PER_CYCLE: usize = 3;
-                const MAX_KEYWORD_PUBLISHES_PER_CYCLE: usize = 2;
+                // Limit publishes per cycle; use higher limits for the first burst after connect
+                let max_source_per_cycle: usize = if state.first_publish_done && state.publish_confirmed == 0 { 10 } else { 3 };
+                let max_keyword_per_cycle: usize = if state.first_publish_done && state.publish_confirmed == 0 { 5 } else { 2 };
 
                 let source_files = state.publish_manager.files_needing_source_publish()
-                    .into_iter().take(MAX_SOURCE_PUBLISHES_PER_CYCLE).cloned().collect::<Vec<_>>();
+                    .into_iter().take(max_source_per_cycle).cloned().collect::<Vec<_>>();
                 for file in &source_files {
                     let msg = state.publish_manager.build_source_publish(file);
                     let closest = state.routing_table.find_closest_prefer_verified(&file.file_hash, SEARCH_INITIAL_CONTACTS);
@@ -1204,7 +1228,7 @@ pub async fn start_network(
                 }
 
                 let keyword_files = state.publish_manager.files_needing_keyword_publish()
-                    .into_iter().take(MAX_KEYWORD_PUBLISHES_PER_CYCLE).cloned().collect::<Vec<_>>();
+                    .into_iter().take(max_keyword_per_cycle).cloned().collect::<Vec<_>>();
                 for file in &keyword_files {
                     let publishes = state.publish_manager.build_keyword_publishes(&file);
                     if publishes.is_empty() { continue; }
@@ -1233,6 +1257,12 @@ pub async fn start_network(
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
                 state.search_manager.cleanup(120);
                 state.dht_store.cleanup_expired();
+
+                // Prune expired sources (older than 1 hour)
+                {
+                    let mut sm = source_manager.write().await;
+                    sm.cleanup_expired();
+                }
 
                 // Remove contacts not seen in 2 hours
                 let stale_removed = state.routing_table.remove_stale(7200);
@@ -1524,24 +1554,66 @@ pub async fn start_network(
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
                 // Build file priority map from pending downloads
                 let mut file_priorities: HashMap<[u8; 16], (u32, usize)> = HashMap::new();
+                let mut dl_hashes_vec: Vec<[u8; 16]> = Vec::new();
                 for (_tid, pd) in &state.pending_downloads {
                     let hash_hex = &pd.file_hash;
                     if let Ok(raw) = hex::decode(hash_hex) {
                         if raw.len() >= 16 {
                             let mut hash = [0u8; 16];
                             hash.copy_from_slice(&raw[..16]);
-                            let priority = match pd.file_name.as_str() {
-                                _ => 1u32, // default priority
-                            };
-                            file_priorities.insert(hash, (priority, 0));
+                            file_priorities.insert(hash, (1u32, 0));
+                            dl_hashes_vec.push(hash);
                         }
                     }
                 }
-                let swaps = state.a4af_manager.process_swaps(&file_priorities);
-                if !swaps.is_empty() {
-                    info!("A4AF: {} swap actions evaluated", swaps.len());
+
+                // Update shared pending download hashes for upload handler A4AF registration
+                {
+                    let mut pdh = pending_dl_hashes.write().await;
+                    *pdh = dl_hashes_vec;
                 }
-                state.a4af_manager.cleanup_stale(3600);
+
+                let swaps = {
+                    let a4af = a4af_shared.read().await;
+                    a4af.process_swaps(&file_priorities)
+                };
+                if !swaps.is_empty() {
+                    info!("A4AF: {} swap actions to execute", swaps.len());
+                    for swap in &swaps {
+                        let mut sm = source_manager.write().await;
+                        if let std::net::IpAddr::V4(v4) = swap.peer_addr.ip() {
+                            sm.register_source(swap.to_file, v4, swap.peer_addr.port());
+                        }
+                        info!(
+                            "A4AF swap: {} from {} -> {}",
+                            swap.peer_addr,
+                            hex::encode(swap.from_file),
+                            hex::encode(swap.to_file)
+                        );
+                    }
+                    let mut a4af = a4af_shared.write().await;
+                    for swap in &swaps {
+                        a4af.remove_source(swap.peer_addr);
+                    }
+                }
+                {
+                    let mut a4af = a4af_shared.write().await;
+                    a4af.cleanup_stale(3600);
+                }
+            }
+
+            // ed2k server keep-alive and reconnection
+            _ = server_timer.tick() => {
+                if state.server_connected {
+                    if let Some(conn) = &mut state.server_connection {
+                        if let Err(e) = conn.keep_alive().await {
+                            warn!("Server keep-alive failed: {e}");
+                            state.server_connected = false;
+                            state.server_connection = None;
+                            state.server_addr = None;
+                        }
+                    }
+                }
             }
 
             // Periodic nodes.dat save to protect against crashes
@@ -2839,11 +2911,59 @@ async fn handle_command(
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
+    source_manager: &Arc<RwLock<SourceManager>>,
+    credit_manager: &Arc<RwLock<CreditManager>>,
 ) {
     match cmd {
         NetworkCommand::SearchFiles { query, tx } => {
             let index = local_index.read().await;
-            let local_results = index.search(&query);
+            let mut local_results = index.search(&query);
+
+            // Also search connected ed2k server for additional results
+            if state.server_connected {
+                if let Some(conn) = &mut state.server_connection {
+                    match conn.search(&query).await {
+                        Ok(server_results) => {
+                            let count = server_results.len();
+                            for sr in server_results {
+                                let hash_hex = hex::encode(sr.file_hash);
+                                if !local_results.iter().any(|r| r.file.hash == hash_hex) {
+                                    local_results.push(SearchResult {
+                                        file: FileInfo {
+                                            id: hash_hex.clone(),
+                                            name: sr.file_name.clone(),
+                                            path: String::new(),
+                                            size: sr.file_size,
+                                            hash: hash_hex,
+                                            aich_hash: String::new(),
+                                            extension: String::new(),
+                                            modified_at: 0,
+                                            priority: "normal".to_string(),
+                                            requests: 0,
+                                            accepted: 0,
+                                            bytes_transferred: 0,
+                                            complete_sources: sr.complete_source_count,
+                                            folder: String::new(),
+                                            shared_kad: false,
+                                        },
+                                        peer_id: String::new(),
+                                        peer_name: String::new(),
+                                        availability: sr.source_count,
+                                        file_type: String::new(),
+                                        source_addresses: Vec::new(),
+                                        rating: None,
+                                        comment: None,
+                                    });
+                                }
+                            }
+                            info!("Merged {count} server search results");
+                        }
+                        Err(e) => {
+                            debug!("Server search failed: {e}");
+                        }
+                    }
+                }
+            }
 
             let keywords = kad::publish::extract_keywords(&query);
             if keywords.is_empty() {
@@ -2923,6 +3043,8 @@ async fn handle_command(
                     udp_port: settings.udp_port,
                     bandwidth_limiter: bandwidth_limiter.clone(),
                     control,
+                    source_manager: Some(source_manager.clone()),
+                    credit_manager: Some(credit_manager.clone()),
                 };
 
                 let tx = dl_event_tx.clone();
@@ -2992,6 +3114,30 @@ async fn handle_command(
                     if sid != SearchId(0) {
                         state.download_source_searches.insert(sid, transfer_id.clone());
                         info!("Started source search {} for download {}", sid.0, transfer_id);
+                    }
+                }
+
+                // Also request sources from the connected ed2k server
+                if state.server_connected {
+                    if let Some(conn) = &mut state.server_connection {
+                        let mut file_hash_arr = [0u8; 16];
+                        file_hash_arr.copy_from_slice(&hash_bytes);
+                        match conn.get_sources(&file_hash_arr).await {
+                            Ok(server_sources) => {
+                                if !server_sources.is_empty() {
+                                    info!("Server returned {} sources for {}", server_sources.len(), file_hash);
+                                    let mut sm = source_manager.write().await;
+                                    for src in &server_sources {
+                                        if let Ok(v4) = src.ip.parse::<Ipv4Addr>() {
+                                            sm.register_source(file_hash_arr, v4, src.port);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                debug!("Server source request failed: {e}");
+                            }
+                        }
                     }
                 }
             }
@@ -3494,6 +3640,8 @@ async fn handle_command(
                                 session.client_id, session.user_count, session.file_count
                             );
                             state.server_connected = true;
+                            state.server_connection = Some(conn);
+                            state.server_addr = Some(addr);
                             state.server_list.record_success(&ip, port);
                         }
                         Err(e) => {
@@ -3511,7 +3659,11 @@ async fn handle_command(
 
         NetworkCommand::DisconnectServer => {
             info!("Disconnecting from ed2k server");
+            if let Some(conn) = state.server_connection.take() {
+                conn.disconnect().await;
+            }
             state.server_connected = false;
+            state.server_addr = None;
         }
 
         NetworkCommand::AddServer { ip, port, name } => {

@@ -11,7 +11,9 @@ use crate::bandwidth::limiter::BandwidthLimiter;
 use crate::sharing::manager::TransferControl;
 
 use super::chunk_selection::ChunkSelector;
+use super::credits::CreditManager;
 use super::part_tracker::PartTracker;
+use super::sources::SourceManager;
 use super::transfer::{DownloadEvent, Ed2kDownload};
 
 /// Maximum decompressed part size (PARTSIZE + margin = 10 MiB)
@@ -43,6 +45,8 @@ pub struct MultiSourceDownload {
     pub udp_port: u16,
     pub bandwidth_limiter: Arc<BandwidthLimiter>,
     pub control: Arc<TransferControl>,
+    pub source_manager: Option<Arc<RwLock<SourceManager>>>,
+    pub credit_manager: Option<Arc<RwLock<CreditManager>>>,
 }
 
 impl MultiSourceDownload {
@@ -81,6 +85,8 @@ impl MultiSourceDownload {
                 udp_port: self.udp_port,
                 bandwidth_limiter: self.bandwidth_limiter.clone(),
                 control: TransferControl::new(),
+                source_manager: self.source_manager.clone(),
+                credit_manager: self.credit_manager.clone(),
             };
             return download.run(event_tx).await;
         }
@@ -118,81 +124,50 @@ impl MultiSourceDownload {
             }
         }
 
-        // Assign parts to sources using rarest-first chunk selection
+        // Shared rarest-first chunk selector for dynamic part assignment
         let part_count = {
             let t = tracker.read().await;
             t.part_count
         };
 
-        let mut chunk_selector = ChunkSelector::new(part_count);
-        chunk_selector.update_frequencies(&self.sources);
+        let chunk_selector = {
+            let mut cs = ChunkSelector::new(part_count);
+            cs.update_frequencies(&self.sources);
+            Arc::new(RwLock::new(cs))
+        };
 
-        // Build per-source part assignments via rarest-first
+        // Pre-assign initial parts to each source using rarest-first,
+        // but each source also dynamically selects more parts as it finishes.
         let mut source_parts: Vec<Vec<usize>> = vec![Vec::new(); self.sources.len()];
-        let mut assigned_parts: Vec<bool> = vec![false; part_count];
-        let mut active_parts: Vec<usize> = Vec::new();
-
         {
-            let t = tracker.read().await;
-            for p in 0..part_count {
-                if t.is_part_complete(p) {
-                    assigned_parts[p] = true;
-                }
-            }
-        }
+            let cs = chunk_selector.read().await;
+            let mut assigned: Vec<bool> = vec![false; part_count];
+            let mut active: Vec<usize> = Vec::new();
 
-        for src_idx in 0..self.sources.len() {
-            if self.control.is_cancelled() {
-                anyhow::bail!("cancelled by user");
-            }
-
-            let src = &self.sources[src_idx];
-            let src_available: Vec<bool> = if src.available_parts.is_empty() {
-                vec![true; part_count]
-            } else {
-                src.available_parts.clone()
-            };
-
-            loop {
-                let pick = chunk_selector.select_part(
-                    &assigned_parts,
-                    &vec![false; part_count], // no in_progress for initial assignment
-                    &src_available,
-                    &active_parts,
-                );
-                match pick {
-                    Some(p) => {
-                        source_parts[src_idx].push(p);
-                        assigned_parts[p] = true;
-                        active_parts.push(p);
-                        // Limit parts per source to roughly equal distribution
-                        let target_per_source = (part_count / self.sources.len()).max(1) + 1;
-                        if source_parts[src_idx].len() >= target_per_source {
-                            break;
-                        }
+            {
+                let t = tracker.read().await;
+                for p in 0..part_count {
+                    if t.is_part_complete(p) {
+                        assigned[p] = true;
                     }
-                    None => break,
                 }
             }
-        }
 
-        // Assign any remaining unassigned parts to sources that can handle them
-        for p in 0..part_count {
-            if assigned_parts[p] {
-                continue;
-            }
+            // Give each source one initial part via rarest-first
             for src_idx in 0..self.sources.len() {
                 let src = &self.sources[src_idx];
-                if src.available_parts.is_empty()
-                    || src.available_parts.get(p).copied().unwrap_or(false)
-                {
+                let src_available: Vec<bool> = if src.available_parts.is_empty() {
+                    vec![true; part_count]
+                } else {
+                    src.available_parts.clone()
+                };
+
+                let in_progress = vec![false; part_count];
+                if let Some(p) = cs.select_part(&assigned, &in_progress, &src_available, &active) {
                     source_parts[src_idx].push(p);
-                    assigned_parts[p] = true;
-                    break;
+                    assigned[p] = true;
+                    active.push(p);
                 }
-            }
-            if !assigned_parts[p] {
-                source_parts[0].push(p);
             }
         }
 
@@ -274,6 +249,10 @@ impl MultiSourceDownload {
             let ph = part_hashes.clone();
             let src_active = active_count.clone();
             let src_queued = queued_count.clone();
+            let sm_clone = self.source_manager.clone();
+            let cm_clone = self.credit_manager.clone();
+            let cs_clone = chunk_selector.clone();
+            let src_avail = self.sources[src_idx].available_parts.clone();
 
             let handle = tokio::spawn(async move {
                 let result = download_parts_from_source(
@@ -293,6 +272,11 @@ impl MultiSourceDownload {
                     ph,
                     src_active.clone(),
                     src_queued.clone(),
+                    sm_clone,
+                    cm_clone,
+                    Some(cs_clone),
+                    src_avail,
+                    None,
                 )
                 .await;
 
@@ -396,13 +380,17 @@ impl MultiSourceDownload {
                 let ph = part_hashes.clone();
                 let ra = active_count.clone();
                 let rq = queued_count.clone();
+                let rsm = self.source_manager.clone();
+                let rcm = self.credit_manager.clone();
 
+                let rcs = chunk_selector.clone();
+                let ravail = self.sources[src_idx].available_parts.clone();
                 retry_handles.push(tokio::spawn(async move {
                     let _ = download_parts_from_source(
                         src_idx, &source, &parts, tracker, &part_path,
                         &file_hash, file_size, &user_hash, &nickname,
                         tcp_port, udp_port, bw, retry_tx, ph,
-                        ra, rq,
+                        ra, rq, rsm, rcm, Some(rcs), ravail, None,
                     )
                     .await;
                 }));
@@ -469,6 +457,8 @@ impl MultiSourceDownload {
                     let ra = active_count.clone();
                     let rq = queued_count.clone();
                     let received = received_parts.clone();
+                    let egsm = self.source_manager.clone();
+                    let egcm = self.credit_manager.clone();
 
                     eg_handles.push(tokio::spawn(async move {
                         // Filter to only parts not yet received by another source
@@ -479,11 +469,13 @@ impl MultiSourceDownload {
                         if parts_to_try.is_empty() {
                             return;
                         }
+                        let eg_received = received.clone();
                         let result = download_parts_from_source(
                             src_idx, &source, &parts_to_try, tracker.clone(), &part_path,
                             &file_hash, file_size, &user_hash, &nickname,
                             tcp_port, udp_port, bw, eg_tx, ph,
-                            ra, rq,
+                            ra, rq, egsm, egcm, None, Vec::new(),
+                            Some(eg_received),
                         )
                         .await;
                         if result.is_ok() {
@@ -580,6 +572,11 @@ async fn download_parts_from_source(
     shared_part_hashes: Arc<RwLock<Vec<[u8; 16]>>>,
     active_count: Arc<AtomicU32>,
     queued_count: Arc<AtomicU32>,
+    source_mgr: Option<Arc<RwLock<SourceManager>>>,
+    credit_mgr: Option<Arc<RwLock<CreditManager>>>,
+    chunk_sel: Option<Arc<RwLock<ChunkSelector>>>,
+    source_available: Vec<bool>,
+    endgame_received: Option<Arc<RwLock<std::collections::HashSet<usize>>>>,
 ) -> anyhow::Result<()> {
     use super::messages::*;
     use flate2::read::ZlibDecoder;
@@ -594,6 +591,14 @@ async fn download_parts_from_source(
     )
     .await??;
 
+    // Register this source with the source manager
+    if let Some(sm) = &source_mgr {
+        if let std::net::IpAddr::V4(v4) = addr.ip() {
+            let mut sm = sm.write().await;
+            sm.register_source(*file_hash, v4, addr.port());
+        }
+    }
+
     let (reader, writer) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
     let mut writer = tokio::io::BufWriter::new(writer);
@@ -602,9 +607,13 @@ async fn download_parts_from_source(
     let hello_payload = build_hello(user_hash, 0, tcp_port, nickname);
     write_packet_async_ms(&mut writer, OP_EDONKEYHEADER, OP_HELLO, &hello_payload).await?;
 
-    let (h_proto, h_opcode, _payload) = read_packet_timeout_ms(&mut reader).await?;
+    let (h_proto, h_opcode, hello_ans_data) = read_packet_timeout_ms(&mut reader).await?;
     if h_proto != OP_EDONKEYHEADER || h_opcode != OP_HELLOANSWER {
         anyhow::bail!("source {}: expected HelloAnswer, got proto=0x{h_proto:02X} op=0x{h_opcode:02X}", _src_idx);
+    }
+    let mut peer_user_hash = [0u8; 16];
+    if hello_ans_data.len() >= 16 {
+        peer_user_hash.copy_from_slice(&hello_ans_data[..16]);
     }
 
     let emule_payload = build_emule_info(udp_port);
@@ -741,15 +750,29 @@ async fn download_parts_from_source(
     let mut speed_start = std::time::Instant::now();
     let mut speed_bytes: u64 = 0;
 
-    for &part_idx in parts {
+    // Build dynamic part queue: start with pre-assigned parts, add more dynamically
+    let mut part_queue: Vec<usize> = parts.to_vec();
+    let mut queue_idx = 0;
+
+    while queue_idx < part_queue.len() {
+        let part_idx = part_queue[queue_idx];
+        queue_idx += 1;
         if peer_out_of_parts {
             break;
         }
+        // End-game cancellation: skip parts already received by another source
+        if let Some(eg) = &endgame_received {
+            let r = eg.read().await;
+            if r.contains(&part_idx) {
+                continue;
+            }
+        }
         {
-            let t = tracker.read().await;
+            let mut t = tracker.write().await;
             if t.is_part_complete(part_idx) {
                 continue;
             }
+            t.set_in_progress(part_idx, true);
         }
 
         let (part_start, part_end) = {
@@ -815,6 +838,10 @@ async fn download_parts_from_source(
                     total_received += piece_len;
                     blocks_received_in_current_req += 1;
                     speed_bytes += piece_len;
+                    if let Some(cm) = &credit_mgr {
+                        let mut cm = cm.write().await;
+                        cm.add_downloaded(peer_user_hash, piece_len);
+                    }
                     let _ = progress_tx.send((_src_idx, piece_len)).await;
                 }
                 (OP_EMULEPROT, OP_COMPRESSEDPART_I64) | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
@@ -844,6 +871,10 @@ async fn download_parts_from_source(
                     total_received += piece_len;
                     blocks_received_in_current_req += 1;
                     speed_bytes += piece_len;
+                    if let Some(cm) = &credit_mgr {
+                        let mut cm = cm.write().await;
+                        cm.add_downloaded(peer_user_hash, piece_len);
+                    }
                     let _ = progress_tx.send((_src_idx, piece_len)).await;
                 }
                 (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
@@ -925,10 +956,33 @@ async fn download_parts_from_source(
             let mut t = tracker.write().await;
             if hash_ok {
                 t.mark_complete(part_idx);
+                t.set_in_progress(part_idx, false);
             } else {
                 t.mark_incomplete(part_idx);
+                t.set_in_progress(part_idx, false);
             }
             t.save();
+        }
+
+        // Dynamically select the next part if we have a shared chunk selector
+        if let Some(cs) = &chunk_sel {
+            let cs = cs.read().await;
+            let t = tracker.read().await;
+            let completed: Vec<bool> = (0..t.part_count).map(|i| t.is_part_complete(i)).collect();
+            let in_prog = t.in_progress.clone();
+            let avail = if source_available.is_empty() {
+                vec![true; t.part_count]
+            } else {
+                source_available.clone()
+            };
+            drop(t);
+            if let Some(next) = cs.select_part(&completed, &in_prog, &avail, &[]) {
+                if !part_queue.contains(&next) {
+                    part_queue.push(next);
+                    let mut t = tracker.write().await;
+                    t.set_in_progress(next, true);
+                }
+            }
         }
     }
 

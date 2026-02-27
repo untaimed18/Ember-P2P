@@ -205,6 +205,21 @@ pub struct AppSettings {
     /// Block private/reserved IPs from being added to the routing table
     #[serde(default = "default_true")]
     pub block_private_ips: bool,
+    /// Path to server.met file for ed2k server list
+    #[serde(default)]
+    pub server_list_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerInfo {
+    pub ip: String,
+    pub port: u16,
+    pub name: String,
+    pub description: String,
+    pub user_count: u32,
+    pub file_count: u32,
+    pub is_static: bool,
+    pub fail_count: u32,
 }
 
 fn default_true() -> bool {
@@ -241,6 +256,7 @@ impl Default for AppSettings {
             obfuscation_enabled: true,
             ip_filter_enabled: true,
             block_private_ips: true,
+            server_list_path: String::new(),
         }
     }
 }
