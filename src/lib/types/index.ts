@@ -94,6 +94,17 @@ export interface NetworkStats {
   stores_acknowledged: number;
 }
 
+export interface ServerInfo {
+  ip: string;
+  port: number;
+  name: string;
+  description: string;
+  user_count: number;
+  file_count: number;
+  is_static: boolean;
+  fail_count: number;
+}
+
 export interface AppSettings {
   nickname: string;
   shared_folders: string[];

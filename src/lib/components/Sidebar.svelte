@@ -4,6 +4,7 @@
 
   const navItems = [
     { href: '/', label: 'KAD Network', icon: '⊛' },
+    { href: '/servers', label: 'Servers', icon: '⊞' },
     { href: '/search', label: 'Search', icon: '⌕' },
     { href: '/transfers', label: 'Transfers', icon: '⇅' },
     { href: '/sharing', label: 'Sharing', icon: '⊕' },
