@@ -90,7 +90,16 @@ impl MultiSourceDownload {
             self.sources.len()
         );
 
-        let part_path = self.download_dir.join(format!("{}.part", self.transfer_id));
+        // Part files go in Temp/, completed files go in download_dir
+        let temp_dir = self.download_dir.join("Temp");
+        if !self.download_dir.exists() {
+            std::fs::create_dir_all(&self.download_dir)?;
+        }
+        if !temp_dir.exists() {
+            std::fs::create_dir_all(&temp_dir)?;
+        }
+
+        let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
         let tracker = Arc::new(RwLock::new(PartTracker::new(self.file_size, &part_path)));
 
         // Pre-create the output file

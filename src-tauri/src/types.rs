@@ -218,8 +218,13 @@ fn default_max_uploads() -> u32 {
 impl Default for AppSettings {
     fn default() -> Self {
         let download_dir = directories::UserDirs::new()
-            .and_then(|d| d.download_dir().map(|p| p.to_string_lossy().to_string()))
-            .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
+            .and_then(|d| d.download_dir().map(|p| p.join("Nexus").to_string_lossy().to_string()))
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(std::env::temp_dir())
+                    .join("Nexus")
+                    .to_string_lossy()
+                    .to_string()
+            });
 
         Self {
             nickname: format!("Nexus-{}", &uuid::Uuid::new_v4().to_string()[..8]),

@@ -331,14 +331,18 @@ impl Ed2kDownload {
             );
         }
 
-        // Ensure download directory exists
+        // Ensure download and temp directories exist
+        let temp_dir = self.download_dir.join("Temp");
         if !self.download_dir.exists() {
             std::fs::create_dir_all(&self.download_dir)?;
         }
+        if !temp_dir.exists() {
+            std::fs::create_dir_all(&temp_dir)?;
+        }
 
-        // Create or resume output file (sanitize filename to prevent path traversal)
+        // Part files go in Temp/, completed files go in download_dir
         let safe_name = crate::security::sanitize_filename(&self.file_name);
-        let part_path = self.download_dir.join(format!("{}.part", self.transfer_id));
+        let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
         let final_path = self.download_dir.join(&safe_name);
 
         let mut tracker = PartTracker::new(self.file_size, &part_path);

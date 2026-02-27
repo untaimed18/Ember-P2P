@@ -504,8 +504,9 @@ pub async fn start_network(
             for mut transfer in incomplete {
                 let control = TransferControl::new();
 
-                // Check .part file for actual progress
+                // Check .part file for actual progress (part files live in Temp subdir)
                 let part_path = PathBuf::from(&dl_folder)
+                    .join("Temp")
                     .join(format!("{}.part", transfer.id));
                 if part_path.exists() && transfer.total_size > 0 {
                     let tracker = crate::network::ed2k::part_tracker::PartTracker::new(
