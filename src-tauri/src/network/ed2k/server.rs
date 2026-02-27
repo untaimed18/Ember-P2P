@@ -83,7 +83,7 @@ impl Ed2kServerConnection {
         tcp_port: u16,
     ) -> anyhow::Result<ServerSession> {
         let flags: u32 = SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_UNICODE | SRVCAP_LARGEFILES
-            | SRVCAP_SUPPORTCRYPT | SRVCAP_REQUESTCRYPT;
+            | SRVCAP_SUPPORTCRYPT;
         let payload = build_login_request(user_hash, tcp_port, nickname);
         info!("Sending OP_LOGINREQUEST ({} bytes): port={}, nick={}, flags=0x{:04X}, emule_ver=0x{:X}",
             payload.len(), tcp_port, nickname,
@@ -317,9 +317,10 @@ fn build_login_request(user_hash: &[u8; 16], tcp_port: u16, nickname: &str) -> V
     write_uint32_tag(&mut buf, CT_VERSION, 0x3C);
 
     // Tag 3: CT_SERVER_FLAGS (0x20) - capability flags
-    // Matches eMule: SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_LARGEFILES | SRVCAP_UNICODE | crypt flags
+    // SUPPORTCRYPT without REQUESTCRYPT: tells the server we CAN handle encryption
+    // but don't PREFER it, so the server's port-test probe arrives in plain text.
     let flags: u32 = SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_UNICODE | SRVCAP_LARGEFILES
-        | SRVCAP_SUPPORTCRYPT | SRVCAP_REQUESTCRYPT;
+        | SRVCAP_SUPPORTCRYPT;
     write_uint32_tag(&mut buf, CT_SERVER_FLAGS, flags);
 
     // Tag 4: CT_EMULE_VERSION (0xFB) - (major << 17) | (minor << 10) | (update << 7)
