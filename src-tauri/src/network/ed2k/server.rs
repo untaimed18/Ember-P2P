@@ -177,13 +177,19 @@ impl Ed2kServerConnection {
     }
 
     pub async fn keep_alive(&mut self) -> anyhow::Result<()> {
-        write_server_packet(&mut self.writer, OP_GETSERVERLIST, &[]).await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            write_server_packet(&mut self.writer, OP_GETSERVERLIST, &[]),
+        ).await.map_err(|_| anyhow::anyhow!("keep_alive write timed out"))??;
         Ok(())
     }
 
     /// Explicitly request the server's list of known servers (OP_GETSERVERLIST).
     pub async fn request_server_list(&mut self) -> anyhow::Result<()> {
-        write_server_packet(&mut self.writer, OP_GETSERVERLIST, &[]).await?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            write_server_packet(&mut self.writer, OP_GETSERVERLIST, &[]),
+        ).await.map_err(|_| anyhow::anyhow!("request_server_list write timed out"))??;
         debug!("Sent OP_GETSERVERLIST request to server");
         Ok(())
     }
@@ -260,7 +266,10 @@ impl Ed2kServerConnection {
     }
 
     pub async fn disconnect(mut self) {
-        let _ = self.writer.shutdown().await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.writer.shutdown(),
+        ).await;
     }
 }
 

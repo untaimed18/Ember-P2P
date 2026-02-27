@@ -1874,20 +1874,14 @@ pub async fn start_network(
                 state.dead_sources.cleanup();
             }
 
-            // Refresh shared peer/stats caches for frontend reads (no channel needed)
+            // Refresh shared peer/stats caches for frontend reads (non-blocking)
             _ = cache_refresh_timer.tick() => {
-                let db_ref = db.clone();
-                let banned_ids = tokio::task::spawn_blocking(move || {
-                    db_ref.banned_peer_ids().unwrap_or_default()
-                }).await.unwrap_or_default();
-
-                // Single pass over all_contacts to build both peer list and contact cache
                 let local_id = state.local_id;
                 let mut peers: Vec<PeerInfo> = Vec::new();
                 let mut cached_c: Vec<KadContactInfo> = Vec::new();
                 for c in state.routing_table.all_contacts().take(500) {
                     let hex_id = c.id.to_hex();
-                    if peers.len() < 200 && !banned_ids.contains(&hex_id) {
+                    if peers.len() < 200 {
                         peers.push(PeerInfo {
                             id: hex_id.clone(),
                             addresses: vec![format!("{}:{}", c.ip, c.udp_port)],
@@ -1980,11 +1974,30 @@ pub async fn start_network(
                     })
                     .collect();
 
-                // Batch all cache writes together to minimize lock contention
-                *shared_peers.write().await = peers;
-                *shared_stats.write().await = state.stats.clone();
-                *shared_contacts.write().await = cached_c;
-                *shared_searches.write().await = cached_s;
+                let stats_snapshot = state.stats.clone();
+
+                // Spawn cache writes as a background task so the event loop isn't blocked
+                let sp = shared_peers.clone();
+                let ss = shared_stats.clone();
+                let sc = shared_contacts.clone();
+                let ssrch = shared_searches.clone();
+                let db_ref = db.clone();
+                tokio::spawn(async move {
+                    let banned_ids = tokio::task::spawn_blocking(move || {
+                        db_ref.banned_peer_ids().unwrap_or_default()
+                    }).await.unwrap_or_default();
+                    if !banned_ids.is_empty() {
+                        let banned = &banned_ids;
+                        let mut filtered_peers = peers;
+                        filtered_peers.retain(|p| !banned.contains(&p.id));
+                        *sp.write().await = filtered_peers;
+                    } else {
+                        *sp.write().await = peers;
+                    }
+                    *ss.write().await = stats_snapshot;
+                    *sc.write().await = cached_c;
+                    *ssrch.write().await = cached_s;
+                });
             }
         }
     }
