@@ -489,7 +489,7 @@ pub async fn start_network(
     let mut flood_cleanup_timer = tokio::time::interval(std::time::Duration::from_secs(30));
     let mut source_retry_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut nodes_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
-    let mut cache_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(3));
+    let mut cache_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(5));
 
     // Resume incomplete downloads from previous session
     if let Ok(incomplete) = db.get_incomplete_downloads() {
@@ -1398,22 +1398,37 @@ pub async fn start_network(
 
             // Refresh shared peer/stats caches for frontend reads (no channel needed)
             _ = cache_refresh_timer.tick() => {
-                let banned_ids = db.banned_peer_ids().unwrap_or_default();
-                let peers: Vec<PeerInfo> = state
-                    .routing_table
-                    .all_contacts()
-                    .filter(|c| !banned_ids.contains(&c.id.to_hex()))
-                    .take(200)
-                    .map(|c| PeerInfo {
-                        id: c.id.to_hex(),
-                        addresses: vec![format!("{}:{}", c.ip, c.udp_port)],
-                        nickname: state.peer_nicknames.get(&c.id).cloned().unwrap_or_default(),
-                        last_seen: c.last_seen,
-                        files_shared: 0,
-                        banned: false,
-                    })
-                    .collect();
-                *shared_peers.write().await = peers;
+                let db_ref = db.clone();
+                let banned_ids = tokio::task::spawn_blocking(move || {
+                    db_ref.banned_peer_ids().unwrap_or_default()
+                }).await.unwrap_or_default();
+
+                // Single pass over all_contacts to build both peer list and contact cache
+                let local_id = state.local_id;
+                let mut peers: Vec<PeerInfo> = Vec::new();
+                let mut cached_c: Vec<KadContactInfo> = Vec::new();
+                for c in state.routing_table.all_contacts().take(500) {
+                    let hex_id = c.id.to_hex();
+                    if peers.len() < 200 && !banned_ids.contains(&hex_id) {
+                        peers.push(PeerInfo {
+                            id: hex_id.clone(),
+                            addresses: vec![format!("{}:{}", c.ip, c.udp_port)],
+                            nickname: state.peer_nicknames.get(&c.id).cloned().unwrap_or_default(),
+                            last_seen: c.last_seen,
+                            files_shared: 0,
+                            banned: false,
+                        });
+                    }
+                    let distance = c.id.xor_distance(&local_id);
+                    cached_c.push(KadContactInfo {
+                        id: hex_id,
+                        contact_type: c.contact_type,
+                        version: c.version,
+                        distance: distance.to_hex(),
+                        ip_verified: c.verified,
+                        bootstrap: c.contact_type == CONTACT_TYPE_NEW && c.version == 0,
+                    });
+                }
 
                 state.stats.connected_peers = state.routing_table.len() as u32;
                 state.stats.upload_speed = bandwidth_limiter.smoothed_upload_speed();
@@ -1444,27 +1459,6 @@ pub async fn start_network(
                     .unwrap_or_default();
                 state.firewalled = state.firewalled_shared.load(std::sync::atomic::Ordering::Relaxed);
                 state.stats.firewalled = state.firewalled;
-                *shared_stats.write().await = state.stats.clone();
-
-                // Cache contacts and searches so frontend reads don't block the event loop
-                let local_id = state.local_id;
-                let cached_c: Vec<KadContactInfo> = state
-                    .routing_table
-                    .all_contacts()
-                    .take(500)
-                    .map(|c| {
-                        let distance = c.id.xor_distance(&local_id);
-                        KadContactInfo {
-                            id: c.id.to_hex(),
-                            contact_type: c.contact_type,
-                            version: c.version,
-                            distance: distance.to_hex(),
-                            ip_verified: c.verified,
-                            bootstrap: c.contact_type == CONTACT_TYPE_NEW && c.version == 0,
-                        }
-                    })
-                    .collect();
-                *shared_contacts.write().await = cached_c;
 
                 let cached_s: Vec<KadSearchInfo> = state
                     .search_manager
@@ -1508,6 +1502,11 @@ pub async fn start_network(
                         }
                     })
                     .collect();
+
+                // Batch all cache writes together to minimize lock contention
+                *shared_peers.write().await = peers;
+                *shared_stats.write().await = state.stats.clone();
+                *shared_contacts.write().await = cached_c;
                 *shared_searches.write().await = cached_s;
             }
         }

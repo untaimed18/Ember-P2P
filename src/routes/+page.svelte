@@ -29,24 +29,48 @@
   let searchSortCol: string = $state('id');
   let searchSortAsc = $state(true);
 
+  let contactPage = $state(0);
+  const CONTACTS_PER_PAGE = 200;
+
   let refreshInProgress = false;
+  let mounted = true;
 
   onMount(() => {
     refresh();
     const interval = setInterval(refresh, 5000);
-    return () => clearInterval(interval);
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
   });
 
+  function arraysEqual(a: KadContact[], b: KadContact[]): boolean {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i].id !== b[i].id || a[i].type !== b[i].type) return false;
+    }
+    return true;
+  }
+
   async function refresh() {
-    if (refreshInProgress) return;
+    if (refreshInProgress || !mounted) return;
     refreshInProgress = true;
     try {
       const [c, s] = await Promise.allSettled([
         getKadContacts(),
         getKadSearches(),
       ]);
-      if (c.status === 'fulfilled') contacts = c.value;
-      if (s.status === 'fulfilled') searches = s.value;
+      if (!mounted) return;
+
+      if (c.status === 'fulfilled' && !arraysEqual(contacts, c.value)) {
+        contacts = c.value;
+      }
+      if (s.status === 'fulfilled') {
+        if (searches.length !== s.value.length ||
+            searches.some((v, i) => v.id !== s.value[i].id || v.responses !== s.value[i].responses)) {
+          searches = s.value;
+        }
+      }
 
       if (c.status === 'rejected' || s.status === 'rejected') {
         const reason = c.status === 'rejected' ? c.reason : s.reason;
@@ -152,8 +176,11 @@
       else if (contactSortCol === 'distance') cmp = a.distance.localeCompare(b.distance);
       return contactSortAsc ? cmp : -cmp;
     });
-    return sorted;
+    const start = contactPage * CONTACTS_PER_PAGE;
+    return sorted.slice(start, start + CONTACTS_PER_PAGE);
   });
+
+  let totalContactPages = $derived(Math.max(1, Math.ceil(contacts.length / CONTACTS_PER_PAGE)));
 
   let sortedSearches = $derived.by(() => {
     const sorted = [...searches];
@@ -230,6 +257,13 @@
     <div class="kad-upper-left">
       <div class="panel-toolbar">
         <span class="toolbar-label">Contacts ({contacts.length})</span>
+        {#if totalContactPages > 1}
+          <div class="pager">
+            <button class="pager-btn" disabled={contactPage === 0} onclick={() => contactPage--}>&lt;</button>
+            <span class="pager-info">{contactPage + 1}/{totalContactPages}</span>
+            <button class="pager-btn" disabled={contactPage >= totalContactPages - 1} onclick={() => contactPage++}>&gt;</button>
+          </div>
+        {/if}
       </div>
 
       <div class="panel-content scrollable">
@@ -507,6 +541,26 @@
     font-size: 13px;
     font-weight: 600;
     color: var(--text-secondary);
+  }
+
+  .pager {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    padding-right: 8px;
+  }
+
+  .pager-btn {
+    padding: 2px 6px;
+    font-size: 11px;
+    min-width: 0;
+    line-height: 1;
+  }
+
+  .pager-info {
+    font-size: 11px;
+    color: var(--text-muted);
   }
 
   .panel-content {
