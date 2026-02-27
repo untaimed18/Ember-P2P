@@ -73,8 +73,8 @@
       }
 
       if (c.status === 'rejected' || s.status === 'rejected') {
-        const reason = c.status === 'rejected' ? c.reason : s.reason;
-        const msg = reason instanceof Error ? reason.message : String(reason);
+        const raw = c.status === 'rejected' ? (c as PromiseRejectedResult).reason : (s as PromiseRejectedResult).reason;
+        const msg = raw instanceof Error ? raw.message : String(raw);
         if (contacts.length === 0) {
           kadError = msg;
         }

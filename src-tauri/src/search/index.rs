@@ -95,6 +95,37 @@ impl LocalIndex {
 
     pub fn remove_files_by_path_prefix(&mut self, prefix: &str) {
         self.files.retain(|f| !f.path.starts_with(prefix));
+        self.rebuild_indices();
+    }
+
+    pub fn remove_file_by_hash(&mut self, hash: &str) -> Option<FileInfo> {
+        if let Some(&idx) = self.hash_map.get(hash) {
+            if idx < self.files.len() {
+                let removed = self.files.remove(idx);
+                self.rebuild_indices();
+                return Some(removed);
+            }
+        }
+        None
+    }
+
+    pub fn set_file_priority(&mut self, hash: &str, priority: &str) -> bool {
+        if let Some(&idx) = self.hash_map.get(hash) {
+            if let Some(file) = self.files.get_mut(idx) {
+                file.priority = priority.to_string();
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn get_by_hash_mut(&mut self, hash: &str) -> Option<&mut FileInfo> {
+        self.hash_map
+            .get(hash)
+            .and_then(|&idx| self.files.get_mut(idx))
+    }
+
+    fn rebuild_indices(&mut self) {
         self.hash_map.clear();
         self.name_tokens.clear();
         for (idx, file) in self.files.iter().enumerate() {

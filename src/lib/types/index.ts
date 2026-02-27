@@ -7,6 +7,13 @@ export interface FileInfo {
   aich_hash: string;
   extension: string;
   modified_at: number;
+  priority: 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto';
+  requests: number;
+  accepted: number;
+  bytes_transferred: number;
+  complete_sources: number;
+  folder: string;
+  shared_kad: boolean;
 }
 
 export interface PeerInfo {

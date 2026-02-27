@@ -13,6 +13,31 @@ pub struct FileInfo {
     pub aich_hash: String,
     pub extension: String,
     pub modified_at: i64,
+    /// Upload priority: "verylow", "low", "normal", "high", "release", "auto"
+    #[serde(default = "default_file_priority")]
+    pub priority: String,
+    /// Requests received this session
+    #[serde(default)]
+    pub requests: u32,
+    /// Requests accepted this session
+    #[serde(default)]
+    pub accepted: u32,
+    /// Bytes uploaded for this file this session
+    #[serde(default)]
+    pub bytes_transferred: u64,
+    /// Number of known complete sources
+    #[serde(default)]
+    pub complete_sources: u32,
+    /// Folder path (directory containing the file)
+    #[serde(default)]
+    pub folder: String,
+    /// Whether this file is shared on KAD
+    #[serde(default)]
+    pub shared_kad: bool,
+}
+
+fn default_file_priority() -> String {
+    "normal".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

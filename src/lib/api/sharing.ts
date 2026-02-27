@@ -16,3 +16,23 @@ export async function getSharedFiles(): Promise<FileInfo[]> {
 export async function getSharedFolders(): Promise<string[]> {
   return invoke('get_shared_folders');
 }
+
+export async function setFilePriority(fileHash: string, priority: string): Promise<void> {
+  return invoke('set_file_priority', { fileHash, priority });
+}
+
+export async function reloadSharedFiles(): Promise<FileInfo[]> {
+  return invoke('reload_shared_files');
+}
+
+export async function unshareFile(fileHash: string): Promise<void> {
+  return invoke('unshare_file', { fileHash });
+}
+
+export async function openSharedFile(filePath: string): Promise<void> {
+  return invoke('open_shared_file', { filePath });
+}
+
+export async function openSharedFolder(filePath: string): Promise<void> {
+  return invoke('open_shared_folder', { filePath });
+}

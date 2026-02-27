@@ -157,15 +157,27 @@ impl Database {
 
         let files = stmt
             .query_map([], |row| {
+                let path_str: String = row.get(2)?;
+                let folder = std::path::Path::new(&path_str)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
                 Ok(FileInfo {
                     id: row.get(0)?,
                     name: row.get(1)?,
-                    path: row.get(2)?,
+                    path: path_str,
                     size: row.get(3)?,
                     hash: row.get(4)?,
                     aich_hash: row.get::<_, String>(5).unwrap_or_default(),
                     extension: row.get(6)?,
                     modified_at: row.get(7)?,
+                    priority: "normal".to_string(),
+                    requests: 0,
+                    accepted: 0,
+                    bytes_transferred: 0,
+                    complete_sources: 0,
+                    folder,
+                    shared_kad: false,
                 })
             })?
             .filter_map(|r| match r {

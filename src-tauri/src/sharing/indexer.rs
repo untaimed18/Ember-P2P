@@ -68,6 +68,10 @@ impl FileIndexer {
             .map(|h| hex::encode(h))
             .unwrap_or_default();
 
+        let folder = path.parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
         Ok(FileInfo {
             id: hash.clone(),
             name,
@@ -77,6 +81,13 @@ impl FileIndexer {
             aich_hash,
             extension,
             modified_at,
+            priority: "normal".to_string(),
+            requests: 0,
+            accepted: 0,
+            bytes_transferred: 0,
+            complete_sources: 0,
+            folder,
+            shared_kad: false,
         })
     }
 }
