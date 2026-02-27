@@ -1,6 +1,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// eMule-style bandwidth limiter with token bucket and partial acquisition.
+///
+/// Key differences from a naive token bucket:
+/// - Handles pieces larger than max_rate via partial (chunked) acquisition
+/// - Token bucket cap = 2 * max_rate to allow short bursts (eMule saves unused bandwidth)
+/// - Tracks per-second and smoothed speeds for display
 pub struct BandwidthLimiter {
     max_upload_rate: AtomicU64,
     max_download_rate: AtomicU64,
@@ -10,9 +16,7 @@ pub struct BandwidthLimiter {
     total_downloaded: AtomicU64,
     upload_speed: AtomicU64,
     download_speed: AtomicU64,
-    /// Smoothed upload speed (exponential moving average, stored as speed * 100 for precision)
     smoothed_upload: AtomicU64,
-    /// Smoothed download speed (exponential moving average, stored as speed * 100 for precision)
     smoothed_download: AtomicU64,
 }
 
@@ -32,77 +36,74 @@ impl BandwidthLimiter {
         }
     }
 
-    pub async fn acquire_upload(&self, bytes: u64) -> bool {
+    /// Acquire upload bandwidth. Drains tokens in chunks if the piece is larger
+    /// than the current bucket, waiting for refills between chunks.
+    pub async fn acquire_upload(&self, bytes: u64) {
         let max = self.max_upload_rate.load(Ordering::Relaxed);
         if max == 0 {
             self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
-            return true;
+            return;
         }
-
-        for _ in 0..100 {
-            let current = self.upload_tokens.load(Ordering::Acquire);
-            if current >= bytes {
-                if self
-                    .upload_tokens
-                    .compare_exchange_weak(
-                        current,
-                        current - bytes,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
-                    return true;
-                }
-            } else {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-        false
+        self.drain_tokens(&self.upload_tokens, bytes, max).await;
+        self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub async fn acquire_download(&self, bytes: u64) -> bool {
+    /// Acquire download bandwidth. Drains tokens in chunks if the piece is larger
+    /// than the current bucket, waiting for refills between chunks.
+    pub async fn acquire_download(&self, bytes: u64) {
         let max = self.max_download_rate.load(Ordering::Relaxed);
         if max == 0 {
             self.total_downloaded.fetch_add(bytes, Ordering::Relaxed);
-            return true;
+            return;
         }
+        self.drain_tokens(&self.download_tokens, bytes, max).await;
+        self.total_downloaded.fetch_add(bytes, Ordering::Relaxed);
+    }
 
-        for _ in 0..100 {
-            let current = self.download_tokens.load(Ordering::Acquire);
-            if current >= bytes {
-                if self
-                    .download_tokens
-                    .compare_exchange_weak(
-                        current,
-                        current - bytes,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    self.total_downloaded.fetch_add(bytes, Ordering::Relaxed);
-                    return true;
-                }
-            } else {
+    /// Core token drain: takes as many tokens as available per iteration,
+    /// sleeping when the bucket is empty. Handles pieces of any size.
+    async fn drain_tokens(&self, tokens: &AtomicU64, mut remaining: u64, max: u64) {
+        while remaining > 0 {
+            let current = tokens.load(Ordering::Acquire);
+            if current == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+            let take = remaining.min(current);
+            match tokens.compare_exchange_weak(
+                current,
+                current - take,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    remaining -= take;
+                }
+                Err(_) => {
+                    // CAS failed, retry immediately
+                    continue;
+                }
+            }
+            // Yield if we still need more to let the refill task run
+            if remaining > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }
-        false
+        let _ = max;
     }
 
     /// Add a fraction of the rate limit worth of tokens (called at sub-second intervals).
-    /// Tokens are capped at the max rate to prevent bursting after idle periods.
+    /// Tokens are capped at 2x the max rate to allow short bursts (eMule behavior).
     pub fn refill_tokens_incremental(&self, fraction: u64, divisor: u64) {
         let max_up = self.max_upload_rate.load(Ordering::Relaxed);
         let max_down = self.max_download_rate.load(Ordering::Relaxed);
 
         if max_up > 0 {
             let add = (max_up * fraction / divisor).max(1);
+            let cap = max_up * 2;
             loop {
                 let current = self.upload_tokens.load(Ordering::Relaxed);
-                let new_val = (current + add).min(max_up);
+                let new_val = (current + add).min(cap);
                 if self
                     .upload_tokens
                     .compare_exchange_weak(current, new_val, Ordering::Relaxed, Ordering::Relaxed)
@@ -114,9 +115,10 @@ impl BandwidthLimiter {
         }
         if max_down > 0 {
             let add = (max_down * fraction / divisor).max(1);
+            let cap = max_down * 2;
             loop {
                 let current = self.download_tokens.load(Ordering::Relaxed);
-                let new_val = (current + add).min(max_down);
+                let new_val = (current + add).min(cap);
                 if self
                     .download_tokens
                     .compare_exchange_weak(current, new_val, Ordering::Relaxed, Ordering::Relaxed)
@@ -153,8 +155,6 @@ impl BandwidthLimiter {
         self.upload_speed.store(uploaded_delta, Ordering::Relaxed);
         self.download_speed.store(downloaded_delta, Ordering::Relaxed);
 
-        // Exponential moving average: smoothed = alpha * current + (1-alpha) * prev
-        // Using alpha = 0.3 (30% weight on new sample), scaled by 100 for integer math
         let prev_up = self.smoothed_upload.load(Ordering::Relaxed);
         let smoothed_up = (uploaded_delta * 30 + prev_up * 70) / 100;
         self.smoothed_upload.store(smoothed_up, Ordering::Relaxed);

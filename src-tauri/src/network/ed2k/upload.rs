@@ -666,11 +666,7 @@ impl UploadHandler {
     }
 
     async fn acquire_upload_bandwidth(&self, bytes: u64) {
-        loop {
-            if self.bandwidth_limiter.acquire_upload(bytes).await {
-                return;
-            }
-        }
+        self.bandwidth_limiter.acquire_upload(bytes).await;
     }
 }
 

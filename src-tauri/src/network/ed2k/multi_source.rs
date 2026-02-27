@@ -520,9 +520,12 @@ async fn download_parts_from_source(
         .read(true)
         .open(part_path)?;
 
-    // Download assigned parts, requesting 3 blocks per packet (eMule pipelining)
-    const BLOCKS_PER_REQUEST: usize = 3;
+    // eMule-style adaptive pipelining: keeps 1-3 request packets outstanding
+    const MAX_BLOCKS_PER_REQUEST: usize = 3;
     let mut peer_out_of_parts = false;
+    let mut measured_speed: u64 = 0;
+    let mut speed_start = std::time::Instant::now();
+    let mut speed_bytes: u64 = 0;
 
     for &part_idx in parts {
         if peer_out_of_parts {
@@ -540,97 +543,133 @@ async fn download_parts_from_source(
             t.part_range(part_idx)
         };
 
-        let mut part_offset = part_start;
-        while part_offset < part_end {
+        // Pre-compute all block offsets for this part
+        let mut all_blocks: Vec<(u64, u64)> = Vec::new();
+        {
+            let mut cursor = part_start;
+            while cursor < part_end {
+                let chunk_end = (cursor + EMBLOCKSIZE).min(part_end);
+                all_blocks.push((cursor, chunk_end));
+                cursor = chunk_end;
+            }
+        }
+
+        let batches: Vec<Vec<(u64, u64)>> = all_blocks
+            .chunks(MAX_BLOCKS_PER_REQUEST)
+            .map(|c| c.to_vec())
+            .collect();
+
+        let max_outstanding = outstanding_requests_for_speed_ms(measured_speed);
+        let mut sent_idx: usize = 0;
+        let mut total_sent_bytes: u64 = 0;
+        let mut total_received: u64 = 0;
+
+        // Send initial batch of requests
+        while sent_idx < batches.len() && sent_idx < max_outstanding {
+            let batch = &batches[sent_idx];
+            let req_payload = build_request_parts_i64(file_hash, batch);
+            write_packet_async_ms(&mut writer, OP_EMULEPROT, OP_REQUESTPARTS_I64, &req_payload)
+                .await?;
+            total_sent_bytes += batch.iter().map(|(s, e)| e - s).sum::<u64>();
+            sent_idx += 1;
+        }
+
+        let mut blocks_received_in_current_req: usize = 0;
+        let mut completed_reqs: usize = 0;
+
+        while total_received < total_sent_bytes {
             if peer_out_of_parts {
                 break;
             }
 
-            // Build up to 3 block ranges for a single request
-            let mut offsets: Vec<(u64, u64)> = Vec::with_capacity(BLOCKS_PER_REQUEST);
-            let mut cursor = part_offset;
-            for _ in 0..BLOCKS_PER_REQUEST {
-                if cursor >= part_end {
+            let (proto, opcode, payload) = read_packet_timeout_ms(&mut reader).await?;
+
+            match (proto, opcode) {
+                (OP_EMULEPROT, OP_SENDINGPART_I64) | (OP_EDONKEYHEADER, OP_SENDINGPART) => {
+                    let (_hash, start, end, data) = if opcode == OP_SENDINGPART_I64 {
+                        parse_sending_part_i64(&payload)?
+                    } else {
+                        parse_sending_part_32(&payload)?
+                    };
+
+                    let piece_len = end - start;
+                    bw.acquire_download(piece_len).await;
+
+                    output.seek(std::io::SeekFrom::Start(start))?;
+                    output.write_all(data)?;
+
+                    total_received += piece_len;
+                    blocks_received_in_current_req += 1;
+                    speed_bytes += piece_len;
+                    let _ = progress_tx.send((_src_idx, piece_len)).await;
+                }
+                (OP_EMULEPROT, OP_COMPRESSEDPART_I64) | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
+                    let (_hash, start, _packed_len, compressed) =
+                        parse_compressed_part_i64(&payload)?;
+
+                    let mut decoder = ZlibDecoder::new(compressed);
+                    let mut decompressed = Vec::new();
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        let n = decoder.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        decompressed.extend_from_slice(&buf[..n]);
+                        if decompressed.len() > MAX_DECOMPRESSED_PART {
+                            anyhow::bail!("decompressed part exceeds size limit");
+                        }
+                    }
+
+                    let piece_len = decompressed.len() as u64;
+                    bw.acquire_download(piece_len).await;
+
+                    output.seek(std::io::SeekFrom::Start(start))?;
+                    output.write_all(&decompressed)?;
+
+                    total_received += piece_len;
+                    blocks_received_in_current_req += 1;
+                    speed_bytes += piece_len;
+                    let _ = progress_tx.send((_src_idx, piece_len)).await;
+                }
+                (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
+                    peer_out_of_parts = true;
                     break;
                 }
-                let chunk_end = (cursor + EMBLOCKSIZE).min(part_end);
-                offsets.push((cursor, chunk_end));
-                cursor = chunk_end;
+                _ => {}
             }
 
-            let total_expected: u64 = offsets.iter().map(|(s, e)| e - s).sum();
-            let req_payload = build_request_parts_i64(file_hash, &offsets);
-            write_packet_async_ms(&mut writer, OP_EMULEPROT, OP_REQUESTPARTS_I64, &req_payload)
-                .await?;
-
-            let mut total_received = 0u64;
-
-            while total_received < total_expected {
-                let (proto, opcode, payload) = read_packet_timeout_ms(&mut reader).await?;
-
-                match (proto, opcode) {
-                    (OP_EMULEPROT, OP_SENDINGPART_I64) | (OP_EDONKEYHEADER, OP_SENDINGPART) => {
-                        let (_hash, start, end, data) = if opcode == OP_SENDINGPART_I64 {
-                            parse_sending_part_i64(&payload)?
-                        } else {
-                            parse_sending_part_32(&payload)?
-                        };
-
-                        let piece_len = end - start;
-                        loop {
-                            if bw.acquire_download(piece_len).await {
-                                break;
-                            }
-                        }
-
-                        output.seek(std::io::SeekFrom::Start(start))?;
-                        output.write_all(data)?;
-
-                        total_received += piece_len;
-                        let _ = progress_tx.send((_src_idx, piece_len)).await;
-                    }
-                    (OP_EMULEPROT, OP_COMPRESSEDPART_I64) | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
-                        let (_hash, start, _packed_len, compressed) =
-                            parse_compressed_part_i64(&payload)?;
-
-                        let mut decoder = ZlibDecoder::new(compressed);
-                        let mut decompressed = Vec::new();
-                        let mut buf = [0u8; 8192];
-                        loop {
-                            let n = decoder.read(&mut buf)?;
-                            if n == 0 {
-                                break;
-                            }
-                            decompressed.extend_from_slice(&buf[..n]);
-                            if decompressed.len() > MAX_DECOMPRESSED_PART {
-                                anyhow::bail!("decompressed part exceeds size limit");
-                            }
-                        }
-
-                        let piece_len = decompressed.len() as u64;
-                        loop {
-                            if bw.acquire_download(piece_len).await {
-                                break;
-                            }
-                        }
-
-                        output.seek(std::io::SeekFrom::Start(start))?;
-                        output.write_all(&decompressed)?;
-
-                        total_received += piece_len;
-                        let _ = progress_tx.send((_src_idx, piece_len)).await;
-                    }
-                    (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
-                        peer_out_of_parts = true;
-                        break;
-                    }
-                    _ => {}
+            // Pipeline refill when a request's worth of blocks completes
+            let blocks_in_batch = if completed_reqs < batches.len() {
+                batches[completed_reqs].len()
+            } else {
+                MAX_BLOCKS_PER_REQUEST
+            };
+            if blocks_received_in_current_req >= blocks_in_batch {
+                blocks_received_in_current_req = 0;
+                completed_reqs += 1;
+                if sent_idx < batches.len() {
+                    let batch = &batches[sent_idx];
+                    let req_payload = build_request_parts_i64(file_hash, batch);
+                    write_packet_async_ms(
+                        &mut writer,
+                        OP_EMULEPROT,
+                        OP_REQUESTPARTS_I64,
+                        &req_payload,
+                    )
+                    .await?;
+                    total_sent_bytes += batch.iter().map(|(s, e)| e - s).sum::<u64>();
+                    sent_idx += 1;
                 }
             }
 
-            // Only advance by what was actually received (handles early
-            // OP_OUTOFPARTREQS mid-batch without skipping undelivered blocks)
-            part_offset += total_received;
+            let elapsed = speed_start.elapsed();
+            if elapsed.as_millis() >= 2000 {
+                measured_speed =
+                    (speed_bytes as u128 * 1000 / elapsed.as_millis().max(1)) as u64;
+                speed_bytes = 0;
+                speed_start = std::time::Instant::now();
+            }
         }
 
         // Verify part hash before marking complete
@@ -690,6 +729,16 @@ async fn download_parts_from_source(
     .ok();
 
     Ok(())
+}
+
+fn outstanding_requests_for_speed_ms(speed: u64) -> usize {
+    if speed < 4 * 1024 {
+        1
+    } else if speed < 36 * 1024 {
+        2
+    } else {
+        3
+    }
 }
 
 fn parse_sending_part_32(payload: &[u8]) -> std::io::Result<([u8; 16], u64, u64, &[u8])> {

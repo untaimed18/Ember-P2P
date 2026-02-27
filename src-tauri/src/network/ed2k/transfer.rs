@@ -353,10 +353,14 @@ impl Ed2kDownload {
             .sum();
 
         // Download needed parts with retry for hash-failed parts.
-        // eMule always requests 3 blocks per OP_REQUESTPARTS packet for pipelining.
+        // eMule-style adaptive pipelining: sends 1-3 OP_REQUESTPARTS_I64 packets
+        // simultaneously based on connection speed, keeping the peer's upload pipe full.
         const MAX_PART_RETRIES: usize = 3;
-        const BLOCKS_PER_REQUEST: usize = 3;
+        const MAX_BLOCKS_PER_REQUEST: usize = 3;
         let mut peer_out_of_parts = false;
+        let mut measured_speed: u64 = 0;
+        let mut speed_measure_start = std::time::Instant::now();
+        let mut speed_measure_bytes: u64 = 0;
 
         for retry_round in 0..=MAX_PART_RETRIES {
             let needed = tracker.needed_parts(&available_parts);
@@ -377,29 +381,34 @@ impl Ed2kDownload {
                 self.check_control().await?;
 
                 let (part_start, part_end) = tracker.part_range(part_idx);
-                let mut part_offset = part_start;
 
-                while part_offset < part_end {
-                    if peer_out_of_parts {
-                        break;
-                    }
-                    self.check_control().await?;
-
-                    // Build up to 3 block ranges for a single request (eMule pipelining)
-                    let mut offsets: Vec<(u64, u64)> = Vec::with_capacity(BLOCKS_PER_REQUEST);
-                    let mut cursor = part_offset;
-                    for _ in 0..BLOCKS_PER_REQUEST {
-                        if cursor >= part_end {
-                            break;
-                        }
+                // Pre-compute all block offsets for this part
+                let mut all_blocks: Vec<(u64, u64)> = Vec::new();
+                {
+                    let mut cursor = part_start;
+                    while cursor < part_end {
                         let chunk_end = (cursor + EMBLOCKSIZE).min(part_end);
-                        offsets.push((cursor, chunk_end));
+                        all_blocks.push((cursor, chunk_end));
                         cursor = chunk_end;
                     }
+                }
 
-                    let total_expected: u64 = offsets.iter().map(|(s, e)| e - s).sum();
+                // Group blocks into request batches of 3 (OP_REQUESTPARTS_I64 limit)
+                let batches: Vec<Vec<(u64, u64)>> = all_blocks
+                    .chunks(MAX_BLOCKS_PER_REQUEST)
+                    .map(|c| c.to_vec())
+                    .collect();
 
-                    let req_payload = build_request_parts_i64(&self.file_hash, &offsets);
+                // Adaptive outstanding requests based on observed speed (like eMule)
+                let max_outstanding = outstanding_requests_for_speed(measured_speed);
+                let mut sent_idx: usize = 0;
+                let mut total_sent_bytes: u64 = 0;
+                let mut total_received: u64 = 0;
+
+                // Send initial batch of requests to fill the pipeline
+                while sent_idx < batches.len() && sent_idx < max_outstanding {
+                    let batch = &batches[sent_idx];
+                    let req_payload = build_request_parts_i64(&self.file_hash, batch);
                     write_packet_async(
                         &mut writer,
                         OP_EMULEPROT,
@@ -407,92 +416,136 @@ impl Ed2kDownload {
                         &req_payload,
                     )
                     .await?;
+                    total_sent_bytes += batch.iter().map(|(s, e)| e - s).sum::<u64>();
+                    sent_idx += 1;
+                }
 
-                    let mut total_received = 0u64;
+                // Track how many blocks received per request for pipeline refill
+                let mut blocks_received_in_current_req: usize = 0;
+                let mut completed_reqs: usize = 0;
 
-                    while total_received < total_expected {
-                        let (proto, opcode, payload) =
-                            read_packet_with_timeout(&mut reader).await?;
+                // Receive loop: process blocks and refill pipeline as requests complete
+                while total_received < total_sent_bytes {
+                    if peer_out_of_parts {
+                        break;
+                    }
+                    self.check_control().await?;
 
-                        match (proto, opcode) {
-                            (OP_EMULEPROT, OP_SENDINGPART_I64)
-                            | (OP_EDONKEYHEADER, OP_SENDINGPART) => {
-                                let (_hash, start, end, data) =
-                                    if opcode == OP_SENDINGPART_I64 {
-                                        parse_sending_part_i64(&payload)?
-                                    } else {
-                                        parse_sending_part_32(&payload)?
-                                    };
+                    let (proto, opcode, payload) =
+                        read_packet_with_timeout(&mut reader).await?;
 
-                                let piece_len = end - start;
-                                self.acquire_download_bandwidth(piece_len).await;
+                    match (proto, opcode) {
+                        (OP_EMULEPROT, OP_SENDINGPART_I64)
+                        | (OP_EDONKEYHEADER, OP_SENDINGPART) => {
+                            let (_hash, start, end, data) =
+                                if opcode == OP_SENDINGPART_I64 {
+                                    parse_sending_part_i64(&payload)?
+                                } else {
+                                    parse_sending_part_32(&payload)?
+                                };
 
-                                output.seek(std::io::SeekFrom::Start(start))?;
-                                output.write_all(data)?;
+                            let piece_len = end - start;
+                            self.acquire_download_bandwidth(piece_len).await;
 
-                                total_received += piece_len;
-                                downloaded += piece_len;
+                            output.seek(std::io::SeekFrom::Start(start))?;
+                            output.write_all(data)?;
 
-                                let _ = event_tx
-                                    .send(DownloadEvent::Progress {
-                                        transfer_id: self.transfer_id.clone(),
-                                        downloaded,
-                                        total: self.file_size,
-                                    })
-                                    .await;
-                            }
-                            (OP_EMULEPROT, OP_COMPRESSEDPART_I64)
-                            | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
-                                let (_hash, start, _packed_len, compressed) =
-                                    parse_compressed_part_i64(&payload)?;
+                            total_received += piece_len;
+                            downloaded += piece_len;
+                            blocks_received_in_current_req += 1;
+                            speed_measure_bytes += piece_len;
 
-                                let mut decoder = ZlibDecoder::new(compressed);
-                                let mut decompressed = Vec::new();
-                                let mut buf = [0u8; 8192];
-                                loop {
-                                    let n = decoder.read(&mut buf)?;
-                                    if n == 0 {
-                                        break;
-                                    }
-                                    decompressed.extend_from_slice(&buf[..n]);
-                                    if decompressed.len() > MAX_DECOMPRESSED_PART {
-                                        anyhow::bail!("decompressed part exceeds size limit");
-                                    }
+                            let _ = event_tx
+                                .send(DownloadEvent::Progress {
+                                    transfer_id: self.transfer_id.clone(),
+                                    downloaded,
+                                    total: self.file_size,
+                                })
+                                .await;
+                        }
+                        (OP_EMULEPROT, OP_COMPRESSEDPART_I64)
+                        | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
+                            let (_hash, start, _packed_len, compressed) =
+                                parse_compressed_part_i64(&payload)?;
+
+                            let mut decoder = ZlibDecoder::new(compressed);
+                            let mut decompressed = Vec::new();
+                            let mut buf = [0u8; 8192];
+                            loop {
+                                let n = decoder.read(&mut buf)?;
+                                if n == 0 {
+                                    break;
                                 }
-
-                                let piece_len = decompressed.len() as u64;
-                                self.acquire_download_bandwidth(piece_len).await;
-
-                                output.seek(std::io::SeekFrom::Start(start))?;
-                                output.write_all(&decompressed)?;
-
-                                total_received += piece_len;
-                                downloaded += piece_len;
-
-                                let _ = event_tx
-                                    .send(DownloadEvent::Progress {
-                                        transfer_id: self.transfer_id.clone(),
-                                        downloaded,
-                                        total: self.file_size,
-                                    })
-                                    .await;
+                                decompressed.extend_from_slice(&buf[..n]);
+                                if decompressed.len() > MAX_DECOMPRESSED_PART {
+                                    anyhow::bail!("decompressed part exceeds size limit");
+                                }
                             }
-                            (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
-                                info!("Peer session limit reached (OutOfPartReqs), will re-queue");
-                                peer_out_of_parts = true;
-                                break;
-                            }
-                            _ => {
-                                debug!(
-                                    "During download, ignoring proto=0x{proto:02X} op=0x{opcode:02X}"
-                                );
-                            }
+
+                            let piece_len = decompressed.len() as u64;
+                            self.acquire_download_bandwidth(piece_len).await;
+
+                            output.seek(std::io::SeekFrom::Start(start))?;
+                            output.write_all(&decompressed)?;
+
+                            total_received += piece_len;
+                            downloaded += piece_len;
+                            blocks_received_in_current_req += 1;
+                            speed_measure_bytes += piece_len;
+
+                            let _ = event_tx
+                                .send(DownloadEvent::Progress {
+                                    transfer_id: self.transfer_id.clone(),
+                                    downloaded,
+                                    total: self.file_size,
+                                })
+                                .await;
+                        }
+                        (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
+                            info!("Peer session limit reached (OutOfPartReqs), will re-queue");
+                            peer_out_of_parts = true;
+                            break;
+                        }
+                        _ => {
+                            debug!(
+                                "During download, ignoring proto=0x{proto:02X} op=0x{opcode:02X}"
+                            );
                         }
                     }
 
-                    // Only advance by what was actually received (handles early
-                    // OP_OUTOFPARTREQS mid-batch without skipping undelivered blocks)
-                    part_offset += total_received;
+                    // When a request's worth of blocks is complete, send the next one
+                    let blocks_in_current_batch = if completed_reqs < batches.len() {
+                        batches[completed_reqs].len()
+                    } else {
+                        MAX_BLOCKS_PER_REQUEST
+                    };
+                    if blocks_received_in_current_req >= blocks_in_current_batch {
+                        blocks_received_in_current_req = 0;
+                        completed_reqs += 1;
+                        // Pipeline refill: send next request if available
+                        if sent_idx < batches.len() {
+                            let batch = &batches[sent_idx];
+                            let req_payload = build_request_parts_i64(&self.file_hash, batch);
+                            write_packet_async(
+                                &mut writer,
+                                OP_EMULEPROT,
+                                OP_REQUESTPARTS_I64,
+                                &req_payload,
+                            )
+                            .await?;
+                            total_sent_bytes += batch.iter().map(|(s, e)| e - s).sum::<u64>();
+                            sent_idx += 1;
+                        }
+                    }
+
+                    // Update speed measurement every 2 seconds
+                    let elapsed = speed_measure_start.elapsed();
+                    if elapsed.as_millis() >= 2000 {
+                        measured_speed = (speed_measure_bytes as u128 * 1000
+                            / elapsed.as_millis().max(1)) as u64;
+                        speed_measure_bytes = 0;
+                        speed_measure_start = std::time::Instant::now();
+                    }
                 }
 
                 // Verify part hash if we have the hashset
@@ -583,11 +636,21 @@ impl Ed2kDownload {
     }
 
     async fn acquire_download_bandwidth(&self, bytes: u64) {
-        loop {
-            if self.bandwidth_limiter.acquire_download(bytes).await {
-                return;
-            }
-        }
+        self.bandwidth_limiter.acquire_download(bytes).await;
+    }
+}
+
+/// eMule-style adaptive pipelining: number of OP_REQUESTPARTS packets to
+/// keep in flight simultaneously based on observed connection speed.
+/// Ref: eMule DownloadClient.cpp — slow connections get 1 request (3 blocks),
+/// medium get 2 (6 blocks), fast get 3 (9 blocks).
+fn outstanding_requests_for_speed(speed: u64) -> usize {
+    if speed < 4 * 1024 {
+        1
+    } else if speed < 36 * 1024 {
+        2
+    } else {
+        3
     }
 }
 

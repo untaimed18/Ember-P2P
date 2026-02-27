@@ -1,8 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::types::*;
+
+/// eMule-style rolling window speed measurement.
+/// Stores (cumulative_bytes, timestamp) pairs over a sliding window.
+const SPEED_WINDOW_MS: u128 = 10_000;
+const MAX_SPEED_SAMPLES: usize = 500;
 
 pub struct TransferControl {
     cancelled: AtomicBool,
@@ -52,7 +58,8 @@ pub struct TransferManager {
     pub queue: VecDeque<Transfer>,
     pub completed: Vec<Transfer>,
     pub max_concurrent: u32,
-    last_progress: HashMap<String, (u64, i64)>,
+    /// Rolling speed history per transfer: VecDeque of (cumulative_bytes, Instant)
+    speed_history: HashMap<String, VecDeque<(u64, Instant)>>,
     controls: HashMap<String, Arc<TransferControl>>,
 }
 
@@ -63,7 +70,7 @@ impl TransferManager {
             queue: VecDeque::new(),
             completed: Vec::new(),
             max_concurrent,
-            last_progress: HashMap::new(),
+            speed_history: HashMap::new(),
             controls: HashMap::new(),
         }
     }
@@ -82,18 +89,46 @@ impl TransferManager {
         id
     }
 
+    /// eMule-style rolling window speed calculation.
+    /// Maintains a history of (cumulative_bytes, timestamp) samples and computes
+    /// speed as bytes_delta * 1000 / time_delta_ms over the window.
     pub fn update_progress(&mut self, id: &str, transferred: u64, _speed_hint: u64) {
         if let Some(transfer) = self.active.get_mut(id) {
-            let now = chrono::Utc::now().timestamp();
-            let speed = if let Some(&(prev_bytes, prev_time)) = self.last_progress.get(id) {
-                let dt = (now - prev_time).max(1) as u64;
-                let db = transferred.saturating_sub(prev_bytes);
-                db / dt
+            let now = Instant::now();
+
+            let history = self.speed_history
+                .entry(id.to_string())
+                .or_insert_with(VecDeque::new);
+
+            history.push_back((transferred, now));
+
+            // Prune samples older than the rolling window
+            while history.len() > MAX_SPEED_SAMPLES {
+                history.pop_front();
+            }
+            while history.len() > 1 {
+                let elapsed = now.duration_since(history.front().unwrap().1).as_millis();
+                if elapsed > SPEED_WINDOW_MS {
+                    history.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            // Calculate speed from the rolling window
+            let speed = if history.len() >= 2 {
+                let (oldest_bytes, oldest_time) = history.front().unwrap();
+                let elapsed_ms = now.duration_since(*oldest_time).as_millis();
+                if elapsed_ms > 0 {
+                    let bytes_delta = transferred.saturating_sub(*oldest_bytes);
+                    (bytes_delta as u128 * 1000 / elapsed_ms) as u64
+                } else {
+                    transfer.speed
+                }
             } else {
                 0
             };
 
-            self.last_progress.insert(id.to_string(), (transferred, now));
             transfer.transferred = transferred;
             transfer.speed = speed;
             if transfer.total_size > 0 {
@@ -112,7 +147,7 @@ impl TransferManager {
             if self.completed.len() > 1000 {
                 self.completed.drain(..self.completed.len() - 1000);
             }
-            self.last_progress.remove(id);
+            self.speed_history.remove(id);
             self.controls.remove(id);
             return self.promote_next();
         }
@@ -128,7 +163,7 @@ impl TransferManager {
             if self.completed.len() > 1000 {
                 self.completed.drain(..self.completed.len() - 1000);
             }
-            self.last_progress.remove(id);
+            self.speed_history.remove(id);
             self.controls.remove(id);
             return self.promote_next();
         }
@@ -169,7 +204,7 @@ impl TransferManager {
         self.active.remove(id);
         self.queue.retain(|t| t.id != id);
         self.controls.remove(id);
-        self.last_progress.remove(id);
+        self.speed_history.remove(id);
         self.promote_next()
     }
 
@@ -181,7 +216,7 @@ impl TransferManager {
         self.queue.retain(|t| t.id != id);
         self.completed.retain(|t| t.id != id);
         self.controls.remove(id);
-        self.last_progress.remove(id);
+        self.speed_history.remove(id);
     }
 
     pub fn set_priority(&mut self, id: &str, priority: &str) {
@@ -211,7 +246,7 @@ impl TransferManager {
                 self.completed.push(t);
             }
             self.controls.remove(id);
-            self.last_progress.remove(id);
+            self.speed_history.remove(id);
         }
         ids
     }
