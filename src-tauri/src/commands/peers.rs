@@ -1,11 +1,6 @@
-use tokio::sync::oneshot;
-use std::time::Duration;
-
 use crate::app_state::AppState;
 use crate::network::NetworkCommand;
 use crate::types::*;
-
-const CMD_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tauri::command]
 pub async fn get_peers(
@@ -153,30 +148,14 @@ pub async fn kad_recheck_firewall(
 pub async fn get_kad_contacts(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<KadContactInfo>, String> {
-    let (tx, rx) = oneshot::channel();
-    state
-        .network_tx
-        .try_send(NetworkCommand::GetKadContacts { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    match tokio::time::timeout(CMD_TIMEOUT, rx).await {
-        Ok(Ok(contacts)) => Ok(contacts),
-        Ok(Err(e)) => Err(format!("Failed to receive KAD contacts: {e}")),
-        Err(_) => Err("KAD contacts request timed out (network busy)".into()),
-    }
+    let contacts = state.cached_contacts.read().await;
+    Ok(contacts.clone())
 }
 
 #[tauri::command]
 pub async fn get_kad_searches(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<KadSearchInfo>, String> {
-    let (tx, rx) = oneshot::channel();
-    state
-        .network_tx
-        .try_send(NetworkCommand::GetKadSearches { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    match tokio::time::timeout(CMD_TIMEOUT, rx).await {
-        Ok(Ok(searches)) => Ok(searches),
-        Ok(Err(e)) => Err(format!("Failed to receive KAD searches: {e}")),
-        Err(_) => Err("KAD searches request timed out (network busy)".into()),
-    }
+    let searches = state.cached_searches.read().await;
+    Ok(searches.clone())
 }

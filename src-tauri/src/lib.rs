@@ -77,8 +77,12 @@ pub fn run() {
 
             let cached_peers: Arc<RwLock<Vec<crate::types::PeerInfo>>> = Arc::new(RwLock::new(Vec::new()));
             let cached_stats: Arc<RwLock<crate::types::NetworkStats>> = Arc::new(RwLock::new(crate::types::NetworkStats::default()));
+            let cached_contacts: Arc<RwLock<Vec<crate::types::KadContactInfo>>> = Arc::new(RwLock::new(Vec::new()));
+            let cached_searches: Arc<RwLock<Vec<crate::types::KadSearchInfo>>> = Arc::new(RwLock::new(Vec::new()));
             let cached_peers_net = cached_peers.clone();
             let cached_stats_net = cached_stats.clone();
+            let cached_contacts_net = cached_contacts.clone();
+            let cached_searches_net = cached_searches.clone();
 
             app.manage(AppState {
                 network_tx,
@@ -90,6 +94,8 @@ pub fn run() {
                 shutdown_complete,
                 cached_peers,
                 cached_stats,
+                cached_contacts,
+                cached_searches,
             });
 
             let index_clone = local_index.clone();
@@ -145,6 +151,8 @@ pub fn run() {
                     net_bw,
                     cached_peers_net,
                     cached_stats_net,
+                    cached_contacts_net,
+                    cached_searches_net,
                 )
                 .await
                 {

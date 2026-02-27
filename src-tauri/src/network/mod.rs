@@ -110,12 +110,6 @@ pub enum NetworkCommand {
     },
     KadBootstrapClients,
     RecheckFirewall,
-    GetKadContacts {
-        tx: oneshot::Sender<Vec<KadContactInfo>>,
-    },
-    GetKadSearches {
-        tx: oneshot::Sender<Vec<KadSearchInfo>>,
-    },
     Shutdown,
 }
 
@@ -199,6 +193,8 @@ pub async fn start_network(
     bandwidth_limiter: Arc<BandwidthLimiter>,
     shared_peers: Arc<RwLock<Vec<PeerInfo>>>,
     shared_stats: Arc<RwLock<NetworkStats>>,
+    shared_contacts: Arc<RwLock<Vec<KadContactInfo>>>,
+    shared_searches: Arc<RwLock<Vec<KadSearchInfo>>>,
 ) -> anyhow::Result<()> {
     let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
         .map(|d| d.data_dir().to_path_buf())
@@ -1382,6 +1378,69 @@ pub async fn start_network(
                 state.firewalled = state.firewalled_shared.load(std::sync::atomic::Ordering::Relaxed);
                 state.stats.firewalled = state.firewalled;
                 *shared_stats.write().await = state.stats.clone();
+
+                // Cache contacts and searches so frontend reads don't block the event loop
+                let local_id = state.local_id;
+                let cached_c: Vec<KadContactInfo> = state
+                    .routing_table
+                    .all_contacts()
+                    .map(|c| {
+                        let distance = c.id.xor_distance(&local_id);
+                        KadContactInfo {
+                            id: c.id.to_hex(),
+                            contact_type: c.contact_type,
+                            version: c.version,
+                            distance: distance.to_hex(),
+                            ip_verified: c.verified,
+                            bootstrap: c.contact_type == CONTACT_TYPE_NEW && c.version == 0,
+                        }
+                    })
+                    .collect();
+                *shared_contacts.write().await = cached_c;
+
+                let cached_s: Vec<KadSearchInfo> = state
+                    .search_manager
+                    .active
+                    .iter()
+                    .map(|(sid, search)| {
+                        let type_name = match search.search_type {
+                            SearchType::FindNode => "Node",
+                            SearchType::FindKeyword => "Keyword",
+                            SearchType::FindSource { .. } => "File",
+                            SearchType::FindNotes { .. } => "Notes",
+                            SearchType::FindBuddy => "Buddy",
+                            SearchType::StoreFile => "Store File",
+                            SearchType::StoreKeyword => "Store Keyword",
+                            SearchType::StoreNotes => "Store Notes",
+                            SearchType::NodeComplete => "Node Complete",
+                        };
+                        let name = match search.search_type {
+                            SearchType::FindKeyword => "Keyword Search".to_string(),
+                            SearchType::FindSource { .. } => {
+                                state.download_source_searches.get(sid)
+                                    .and_then(|tid| state.pending_downloads.get(tid))
+                                    .map(|pd| pd.file_name.clone())
+                                    .unwrap_or_else(|| "Source Search".to_string())
+                            }
+                            SearchType::FindBuddy => "Find Buddy".to_string(),
+                            _ => String::new(),
+                        };
+                        KadSearchInfo {
+                            id: sid.0,
+                            target: search.target.to_hex(),
+                            search_type: type_name.to_string(),
+                            name,
+                            status: if search.completed { "stopping".to_string() } else { "active".to_string() },
+                            load: 0,
+                            load_response: 0,
+                            load_total: 0,
+                            packets_sent: search.queried.len() as u32,
+                            request_answer: search.pending.len() as u32,
+                            responses: search.results.len() as u32,
+                        }
+                    })
+                    .collect();
+                *shared_searches.write().await = cached_s;
             }
         }
     }
@@ -3149,76 +3208,6 @@ async fn handle_command(
             }
 
             info!("Sent {} firewall checks and 3 ping probes", state.firewall_checks_sent);
-        }
-
-        NetworkCommand::GetKadContacts { tx } => {
-            let local_id = state.local_id;
-            let contacts: Vec<KadContactInfo> = state
-                .routing_table
-                .all_contacts()
-                .map(|c| {
-                    let distance = c.id.xor_distance(&local_id);
-                    KadContactInfo {
-                        id: c.id.to_hex(),
-                        contact_type: c.contact_type,
-                        version: c.version,
-                        distance: distance.to_hex(),
-                        ip_verified: c.verified,
-                        bootstrap: c.contact_type == CONTACT_TYPE_NEW && c.version == 0,
-                    }
-                })
-                .collect();
-            let _ = tx.send(contacts);
-        }
-
-        NetworkCommand::GetKadSearches { tx } => {
-            let searches: Vec<KadSearchInfo> = state
-                .search_manager
-                .active
-                .iter()
-                .map(|(sid, search)| {
-                    let type_name = match search.search_type {
-                        SearchType::FindNode => "Node",
-                        SearchType::FindKeyword => "Keyword",
-                        SearchType::FindSource { .. } => "File",
-                        SearchType::FindNotes { .. } => "Notes",
-                        SearchType::FindBuddy => "Buddy",
-                        SearchType::StoreFile => "Store File",
-                        SearchType::StoreKeyword => "Store Keyword",
-                        SearchType::StoreNotes => "Store Notes",
-                        SearchType::NodeComplete => "Node Complete",
-                    };
-                    let name = match search.search_type {
-                        SearchType::FindKeyword => {
-                            state.pending_keyword_searches.get(sid)
-                                .map(|_| "Keyword Search".to_string())
-                                .unwrap_or_default()
-                        }
-                        SearchType::FindSource { .. } => {
-                            state.download_source_searches.get(sid)
-                                .and_then(|tid| state.pending_downloads.get(tid))
-                                .map(|pd| pd.file_name.clone())
-                                .unwrap_or_else(|| "Source Search".to_string())
-                        }
-                        SearchType::FindBuddy => "Find Buddy".to_string(),
-                        _ => String::new(),
-                    };
-                    KadSearchInfo {
-                        id: sid.0,
-                        target: search.target.to_hex(),
-                        search_type: type_name.to_string(),
-                        name,
-                        status: if search.completed { "stopping".to_string() } else { "active".to_string() },
-                        load: 0,
-                        load_response: 0,
-                        load_total: 0,
-                        packets_sent: search.queried.len() as u32,
-                        request_answer: search.pending.len() as u32,
-                        responses: search.results.len() as u32,
-                    }
-                })
-                .collect();
-            let _ = tx.send(searches);
         }
 
         NetworkCommand::Shutdown => {}

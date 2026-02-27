@@ -2,11 +2,10 @@
   import { page } from '$app/stores';
 
   const navItems = [
-    { href: '/', label: 'Dashboard', icon: '⊞' },
+    { href: '/', label: 'KAD Network', icon: '⊛' },
     { href: '/search', label: 'Search', icon: '⌕' },
     { href: '/transfers', label: 'Transfers', icon: '⇅' },
     { href: '/sharing', label: 'Sharing', icon: '⊕' },
-    { href: '/kad-network', label: 'KAD Network', icon: '⊛' },
     { href: '/security', label: 'Security', icon: '🛡' },
     { href: '/settings', label: 'Settings', icon: '⚙' },
   ];
