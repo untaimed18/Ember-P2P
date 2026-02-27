@@ -30,6 +30,7 @@ pub const OP_QUEUERANKING: u8 = 0x60;
 pub const OP_REQUESTPARTS_I64: u8 = 0xA3;
 pub const OP_SENDINGPART_I64: u8 = 0xA2;
 pub const OP_COMPRESSEDPART_I64: u8 = 0xA1;
+pub const OP_PORTTEST: u8 = 0xFE;
 
 // Hashset opcodes (OP_EDONKEYHEADER)
 pub const OP_HASHSETREQ: u8 = 0x51;

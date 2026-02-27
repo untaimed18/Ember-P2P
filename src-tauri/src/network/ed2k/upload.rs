@@ -81,6 +81,8 @@ struct UploadHandler {
     a4af_manager: Arc<RwLock<A4AFManager>>,
     /// File hashes we're currently downloading (for A4AF registration)
     pending_download_hashes: Arc<RwLock<Vec<[u8; 16]>>>,
+    /// Active port test waiters (IP -> Sender)
+    active_port_tests: Arc<tokio::sync::Mutex<HashMap<IpAddr, tokio::sync::mpsc::Sender<()>>>>,
 }
 
 pub async fn start_upload_server(
@@ -98,6 +100,7 @@ pub async fn start_upload_server(
     credit_manager: Arc<RwLock<CreditManager>>,
     a4af_manager: Arc<RwLock<A4AFManager>>,
     pending_download_hashes: Arc<RwLock<Vec<[u8; 16]>>>,
+    active_port_tests: Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, tokio::sync::mpsc::Sender<()>>>>,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     let listener = match TcpListener::bind(addr).await {
@@ -131,6 +134,7 @@ pub async fn start_upload_server(
         credit_manager,
         a4af_manager,
         pending_download_hashes,
+        active_port_tests,
     });
 
     loop {
@@ -194,6 +198,43 @@ impl UploadHandler {
 
         // Read Hello from peer and extract their user_hash
         let (proto, opcode, hello_data) = read_packet_timeout(&mut reader).await?;
+
+        // Handle Port Test (Server connection check)
+        if (proto == OP_EDONKEYHEADER || proto == OP_EMULEPROT) && opcode == OP_PORTTEST {
+            debug!("Received TCP Port Test from {peer_addr}");
+            // Send reply
+            let mut reply = Vec::with_capacity(1);
+            reply.push(0x12); // eMule uses 0x12 as payload for port test reply
+            write_packet_async(&mut writer, proto, OP_PORTTEST, &reply).await?;
+
+            // Register for UDP confirmation
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            {
+                let mut waiters = self.active_port_tests.lock().await;
+                waiters.insert(peer_addr.ip(), tx);
+            }
+
+            // Wait for UDP confirmation signal (or timeout)
+            // eMule waits for UDP packet, then sends TCP confirmation.
+            // Here we wait for handle_udp_packet to signal us.
+            let signal = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await;
+
+            {
+                let mut waiters = self.active_port_tests.lock().await;
+                waiters.remove(&peer_addr.ip());
+            }
+
+            if let Ok(Some(_)) = signal {
+                debug!("Received UDP Port Test confirmation for {peer_addr}, sending TCP confirmation");
+                // Send TCP confirmation (OP_PORTTEST with payload 0x12 again)
+                write_packet_async(&mut writer, proto, OP_PORTTEST, &reply).await?;
+            } else {
+                debug!("Timed out waiting for UDP Port Test from {peer_addr}");
+            }
+
+            return Ok(());
+        }
+
         if proto != OP_EDONKEYHEADER || opcode != OP_HELLO {
             anyhow::bail!("expected Hello, got proto=0x{proto:02X} op=0x{opcode:02X}");
         }

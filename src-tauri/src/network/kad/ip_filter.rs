@@ -64,6 +64,9 @@ impl IpFilter {
             if let Some(range) = parse_ipfilter_line(line) {
                 self.blocked_ranges.push(range);
                 count += 1;
+            } else if let Some(range) = parse_p2p_line(line) {
+                self.blocked_ranges.push(range);
+                count += 1;
             }
         }
 

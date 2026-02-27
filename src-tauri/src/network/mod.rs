@@ -34,6 +34,7 @@ use self::kad::buddy::{BuddyManager, BuddyState};
 use self::kad::firewall::FirewallChecker;
 use self::kad::ip_filter::{IpFilter, IpFilterStats};
 use self::kad::messages::{self, KadMessage, KADEMLIA_FIND_NODE};
+use self::ed2k::messages::{OP_EDONKEYHEADER, OP_EMULEPROT, OP_PORTTEST};
 use self::kad::obfuscation;
 use self::kad::protection::FloodProtection;
 use self::kad::publish::{PublishManager, PublishableFile, md4_bytes_to_kad_id, kad_id_to_md4_bytes};
@@ -584,6 +585,7 @@ pub async fn start_network(
 
     let a4af_shared: Arc<RwLock<A4AFManager>> = Arc::new(RwLock::new(A4AFManager::new()));
     let pending_dl_hashes: Arc<RwLock<Vec<[u8; 16]>>> = Arc::new(RwLock::new(Vec::new()));
+    let active_port_tests: Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, mpsc::Sender<()>>>> = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     // Start the peer-to-peer upload listener (accepts incoming file requests from other KAD peers)
     {
@@ -599,6 +601,7 @@ pub async fn start_network(
         let ul_cm = credit_manager.clone();
         let ul_a4af = a4af_shared.clone();
         let ul_pdh = pending_dl_hashes.clone();
+        let ul_apt = active_port_tests.clone();
         tokio::spawn(async move {
             if let Err(e) = upload_server::start_upload_server(
                 tcp_port,
@@ -615,6 +618,7 @@ pub async fn start_network(
                 ul_cm,
                 ul_a4af,
                 ul_pdh,
+                ul_apt,
             )
             .await
             {
@@ -798,6 +802,7 @@ pub async fn start_network(
                             &local_index,
                             &settings,
                             &db,
+                            &active_port_tests,
                         ).await;
                     }
                     Err(e) => {
@@ -815,10 +820,11 @@ pub async fn start_network(
                                     from,
                                     &mut state,
                                     &app_handle,
-                                    &local_index,
-                                    &settings,
-                                    &db,
-                                ).await;
+                            &local_index,
+                            &settings,
+                            &db,
+                            &active_port_tests,
+                        ).await;
                             }
                         }
                         Err(_) => break,
@@ -2465,10 +2471,38 @@ async fn handle_udp_packet(
     local_index: &Arc<RwLock<LocalIndex>>,
     settings: &AppSettings,
     db: &Arc<Database>,
+    active_port_tests: &Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, mpsc::Sender<()>>>>,
 ) {
     // Reject oversized packets (max 64 KiB for UDP)
     if data.len() > 65535 {
         debug!("Dropping oversized packet from {from}: {} bytes", data.len());
+        return;
+    }
+
+    // Handle Server UDP packets (e.g. Port Test)
+    // eMule servers use OP_EDONKEYHEADER (0xE3) or OP_EMULEPROT (0xC5)
+    let header = data.first().copied().unwrap_or(0);
+    if header == OP_EDONKEYHEADER || header == OP_EMULEPROT {
+        if data.len() >= 2 {
+            let opcode = data[1]; // UDP header is [protocol, opcode, payload...]
+            if opcode == OP_PORTTEST {
+                // OP_PORTTEST payload is usually 1 byte (0x12)
+                debug!("Received UDP Port Test from {from}");
+                // Notify TCP handler if waiting
+                let mut waiters = active_port_tests.lock().await;
+                if let Some(tx) = waiters.get(&from.ip()) {
+                    let _ = tx.send(()).await;
+                    debug!("Signaled TCP handler for UDP Port Test from {from}");
+                } else {
+                    debug!("No TCP handler waiting for UDP Port Test from {from}");
+                }
+                return;
+            }
+        }
+        // If we want to handle other server UDP packets (like status responses) here, we can.
+        // But ServerUdpSocket handles them on a separate socket usually.
+        // However, if the server sends to our KAD port, we should probably handle them or at least not error.
+        // For now, we just ignore non-PortTest server packets on KAD port to avoid "Unreadable packet" logs.
         return;
     }
 
@@ -3963,10 +3997,19 @@ async fn handle_command(
         }
 
         NetworkCommand::ReloadIpFilter { path } => {
-            state.ip_filter.load_from_file(&path);
+            // Persist the imported filter to ipfilter.dat so it loads on next startup
+            let default_path = state.data_dir.join("ipfilter.dat");
+            if path != default_path {
+                if let Err(e) = std::fs::copy(&path, &default_path) {
+                    warn!("Failed to persist IP filter to {:?}: {}", default_path, e);
+                } else {
+                    info!("Persisted imported IP filter to {:?}", default_path);
+                }
+            }
+            // Load from the (now updated) default path
+            state.ip_filter.load_from_file(&default_path);
             info!(
-                "Reloaded IP filter from {}: {} ranges",
-                path.display(),
+                "Reloaded IP filter: {} ranges",
                 state.ip_filter.range_count(),
             );
         }
@@ -4474,10 +4517,11 @@ async fn handle_command(
                 } else {
                     bytes.to_vec()
                 };
-                let temp_path = state.data_dir.join("ipfilter_download.tmp");
-                std::fs::write(&temp_path, &data).map_err(|e| format!("Write error: {e}"))?;
-                let count = state.ip_filter.append_from_file(&temp_path);
-                let _ = std::fs::remove_file(&temp_path);
+                // Save to ipfilter.dat to persist across restarts
+                let ipfilter_path = state.data_dir.join("ipfilter.dat");
+                std::fs::write(&ipfilter_path, &data).map_err(|e| format!("Write error: {e}"))?;
+                // Load the new filter (replacing current rules)
+                let count = state.ip_filter.load_from_file(&ipfilter_path);
                 Ok(count)
             }.await;
             let _ = tx.send(result);
