@@ -49,18 +49,6 @@ impl CreditManager {
         }
     }
 
-    pub fn from_records(records: Vec<CreditRecord>, public_key: Vec<u8>, private_key: Vec<u8>) -> Self {
-        let mut credits = HashMap::new();
-        for r in records {
-            credits.insert(r.user_hash, r);
-        }
-        Self {
-            credits,
-            our_public_key: public_key,
-            our_private_key: private_key,
-        }
-    }
-
     pub fn get_or_create(&mut self, user_hash: [u8; 16]) -> &mut CreditRecord {
         self.credits.entry(user_hash).or_insert_with(|| CreditRecord::new(user_hash))
     }
@@ -109,10 +97,6 @@ impl CreditManager {
 
     pub fn our_public_key(&self) -> &[u8] {
         &self.our_public_key
-    }
-
-    pub fn our_private_key(&self) -> &[u8] {
-        &self.our_private_key
     }
 
     pub fn create_signature(&self, challenge: u32, ip_for_sign: u32) -> Vec<u8> {

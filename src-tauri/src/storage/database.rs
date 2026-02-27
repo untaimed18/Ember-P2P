@@ -370,15 +370,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn save_credit(&self, user_hash: &[u8; 16], uploaded: u64, downloaded: u64, last_seen: i64, public_key: &[u8]) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO credits (user_hash, uploaded, downloaded, last_seen, public_key) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![&user_hash[..], uploaded as i64, downloaded as i64, last_seen, public_key],
-        )?;
-        Ok(())
-    }
-
     pub fn load_credits(&self) -> anyhow::Result<Vec<([u8; 16], u64, u64, i64, Vec<u8>)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         let mut stmt = conn.prepare("SELECT user_hash, uploaded, downloaded, last_seen, public_key FROM credits")?;

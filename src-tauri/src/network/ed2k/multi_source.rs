@@ -146,8 +146,9 @@ impl MultiSourceDownload {
 
             {
                 let t = tracker.read().await;
-                for p in 0..part_count {
-                    if t.is_part_complete(p) {
+                let completed = t.completed_parts();
+                for (p, &done) in completed.iter().enumerate() {
+                    if done {
                         assigned[p] = true;
                     }
                 }
@@ -968,14 +969,19 @@ async fn download_parts_from_source(
         if let Some(cs) = &chunk_sel {
             let cs = cs.read().await;
             let t = tracker.read().await;
-            let completed: Vec<bool> = (0..t.part_count).map(|i| t.is_part_complete(i)).collect();
+            let completed = t.completed_parts().to_vec();
             let in_prog = t.in_progress.clone();
+            let remaining = t.remaining_count();
+            let part_count = t.part_count;
+            drop(t);
+            if remaining == 0 {
+                break;
+            }
             let avail = if source_available.is_empty() {
-                vec![true; t.part_count]
+                vec![true; part_count]
             } else {
                 source_available.clone()
             };
-            drop(t);
             if let Some(next) = cs.select_part(&completed, &in_prog, &avail, &[]) {
                 if !part_queue.contains(&next) {
                     part_queue.push(next);

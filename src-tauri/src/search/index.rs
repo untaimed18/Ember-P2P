@@ -119,12 +119,6 @@ impl LocalIndex {
         false
     }
 
-    pub fn get_by_hash_mut(&mut self, hash: &str) -> Option<&mut FileInfo> {
-        self.hash_map
-            .get(hash)
-            .and_then(|&idx| self.files.get_mut(idx))
-    }
-
     fn rebuild_indices(&mut self) {
         self.hash_map.clear();
         self.name_tokens.clear();

@@ -223,6 +223,12 @@ pub fn run() {
             commands::security::set_block_private_ips,
             commands::security::download_and_load_ipfilter,
             commands::security::import_ipfilter_file,
+            commands::server::connect_to_server,
+            commands::server::disconnect_server,
+            commands::server::add_server,
+            commands::server::remove_server,
+            commands::server::get_server_list,
+            commands::server::get_connected_server,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

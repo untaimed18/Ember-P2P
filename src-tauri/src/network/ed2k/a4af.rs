@@ -58,13 +58,6 @@ impl A4AFManager {
         self.a4af_sources.retain(|_, v| !v.is_empty());
     }
 
-    pub fn get_a4af_sources(&self, file_hash: &[u8; 16]) -> &[A4AFEntry] {
-        self.a4af_sources
-            .get(file_hash)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
     /// Evaluate swap decisions every 8 minutes.
     /// Returns list of sources that should be swapped to higher-priority files.
     ///

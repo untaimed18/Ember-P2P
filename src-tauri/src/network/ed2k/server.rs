@@ -19,7 +19,6 @@ pub const OP_SEARCHREQUEST: u8 = 0x16;
 pub const OP_SEARCHRESULT: u8 = 0x33;
 pub const OP_GETSOURCES: u8 = 0x19;
 pub const OP_FOUNDSOURCES: u8 = 0x42;
-pub const OP_CALLBACKREQUEST: u8 = 0x1C;
 pub const OP_GETSERVERLIST: u8 = 0x14;
 pub const OP_REJECT: u8 = 0x05;
 

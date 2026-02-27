@@ -239,10 +239,6 @@ impl TransferManager {
         }
     }
 
-    pub fn all_controls(&self) -> Vec<Arc<TransferControl>> {
-        self.controls.values().cloned().collect()
-    }
-
     /// Cancel all active transfers and move them to completed with a failure reason.
     /// Returns the IDs of transfers that were cancelled.
     pub fn cancel_all_active(&mut self, reason: &str) -> Vec<String> {

@@ -1,5 +1,4 @@
 use std::io::{self, Cursor, Read, Write};
-use std::net::SocketAddr;
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -42,9 +41,6 @@ impl ServerEntry {
         }
     }
 
-    pub fn socket_addr(&self) -> Option<SocketAddr> {
-        format!("{}:{}", self.ip, self.port).parse().ok()
-    }
 }
 
 pub struct ServerList {

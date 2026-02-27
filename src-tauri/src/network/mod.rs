@@ -130,6 +130,12 @@ pub enum NetworkCommand {
         ip: String,
         port: u16,
     },
+    GetServerList {
+        tx: oneshot::Sender<Vec<ServerInfo>>,
+    },
+    GetConnectedServer {
+        tx: oneshot::Sender<Option<ServerInfo>>,
+    },
     UpdateSettings {
         settings: AppSettings,
     },
@@ -337,6 +343,14 @@ pub async fn start_network(
         }
         routing_table.insert(contact);
     }
+
+    // eMule: if no contacts are verified (v0/v1 nodes.dat), mark all verified
+    // to speed up KAD bootstrapping.
+    if !boot_contacts.is_empty() && !boot_contacts.iter().any(|c| c.verified) {
+        routing_table.set_all_contacts_verified();
+        info!("Marked all loaded contacts as verified (old nodes.dat format)");
+    }
+
     info!(
         "Routing table initialized with {} contacts",
         routing_table.len()
@@ -838,7 +852,11 @@ pub async fn start_network(
                                     }
                                 };
 
-                                let source_count = sources.len() as u32;
+                                let sm_known = {
+                                    let sm = source_manager.read().await;
+                                    sm.source_count(&hash_bytes) as u32
+                                };
+                                let source_count = (sources.len() as u32).max(sm_known);
                                 {
                                     let mut mgr = transfer_manager.write().await;
                                     mgr.update_status(&transfer_id, TransferStatus::Active);
@@ -1264,6 +1282,12 @@ pub async fn start_network(
                     sm.cleanup_expired();
                 }
 
+                // Prune stale credit records (older than 90 days)
+                {
+                    let mut cm = credit_manager.write().await;
+                    cm.cleanup_stale(90);
+                }
+
                 // Remove contacts not seen in 2 hours
                 let stale_removed = state.routing_table.remove_stale(7200);
                 if stale_removed > 0 {
@@ -1613,6 +1637,36 @@ pub async fn start_network(
                             state.server_addr = None;
                         }
                     }
+                } else if !state.server_list.is_empty() && state.server_connection.is_none() {
+                    if let Some(server) = state.server_list.get_next_server() {
+                        let addr_str = format!("{}:{}", server.ip, server.port);
+                        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                            info!("Auto-connecting to ed2k server {addr_str}");
+                            match Ed2kServerConnection::connect(addr).await {
+                                Ok(mut conn) => {
+                                    let nickname = settings.nickname.clone();
+                                    match conn.login(&state.user_hash, &nickname, state.tcp_port).await {
+                                        Ok(session) => {
+                                            info!("Connected to ed2k server: {} ({} users, {} files)",
+                                                session.server_name, session.user_count, session.file_count);
+                                            state.server_list.record_success(&addr.ip().to_string(), addr.port());
+                                            state.server_connected = true;
+                                            state.server_addr = Some(addr);
+                                            state.server_connection = Some(conn);
+                                        }
+                                        Err(e) => {
+                                            warn!("Server login failed: {e}");
+                                            state.server_list.record_failure(&addr.ip().to_string(), addr.port());
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("Server connect failed: {e}");
+                                    state.server_list.record_failure(&addr.ip().to_string(), addr.port());
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1703,7 +1757,6 @@ pub async fn start_network(
                             SearchType::StoreFile => "Store File",
                             SearchType::StoreKeyword => "Store Keyword",
                             SearchType::StoreNotes => "Store Notes",
-                            SearchType::NodeComplete => "Node Complete",
                         };
                         let name = match search.search_type {
                             SearchType::FindKeyword => "Keyword Search".to_string(),
@@ -3368,8 +3421,12 @@ async fn handle_command(
                 if nodes_path.exists() {
                     match bootstrap::load_nodes_dat(&nodes_path) {
                         Ok(saved) => {
+                            let any_verified = saved.iter().any(|c| c.verified);
                             for c in &saved {
                                 state.routing_table.insert(c.clone());
+                            }
+                            if !saved.is_empty() && !any_verified {
+                                state.routing_table.set_all_contacts_verified();
                             }
                             info!("Loaded {} contacts from nodes.dat on connect", saved.len());
                         }
@@ -3683,6 +3740,38 @@ async fn handle_command(
             if let Err(e) = state.server_list.save_server_met(&met_path) {
                 warn!("Failed to save server.met: {e}");
             }
+        }
+
+        NetworkCommand::GetServerList { tx } => {
+            let servers: Vec<ServerInfo> = state.server_list.servers().iter().map(|s| ServerInfo {
+                ip: s.ip.clone(),
+                port: s.port,
+                name: s.name.clone(),
+                description: s.description.clone(),
+                user_count: s.user_count,
+                file_count: s.file_count,
+                is_static: s.is_static,
+                fail_count: s.fail_count,
+            }).collect();
+            let _ = tx.send(servers);
+        }
+
+        NetworkCommand::GetConnectedServer { tx } => {
+            let info = state.server_connection.as_ref().and_then(|conn| {
+                let session = conn.session.as_ref()?;
+                let addr = state.server_addr?;
+                Some(ServerInfo {
+                    ip: addr.ip().to_string(),
+                    port: addr.port(),
+                    name: session.server_name.clone(),
+                    description: String::new(),
+                    user_count: session.user_count,
+                    file_count: session.file_count,
+                    is_static: false,
+                    fail_count: 0,
+                })
+            });
+            let _ = tx.send(info);
         }
 
         NetworkCommand::SharedFilesChanged => {

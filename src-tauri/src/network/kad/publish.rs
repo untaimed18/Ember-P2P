@@ -71,10 +71,6 @@ impl PublishManager {
         }
     }
 
-    pub fn record_count(&self) -> usize {
-        self.records.len()
-    }
-
     /// Get files that need keyword republishing.
     pub fn files_needing_keyword_publish(&self) -> Vec<&PublishableFile> {
         let now = chrono::Utc::now().timestamp();
