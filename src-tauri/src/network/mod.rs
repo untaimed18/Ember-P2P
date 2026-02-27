@@ -1451,6 +1451,7 @@ pub async fn start_network(
                 let cached_c: Vec<KadContactInfo> = state
                     .routing_table
                     .all_contacts()
+                    .take(500)
                     .map(|c| {
                         let distance = c.id.xor_distance(&local_id);
                         KadContactInfo {
