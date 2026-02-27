@@ -81,26 +81,16 @@ pub async fn remove_server(
 pub async fn get_server_list(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<ServerInfo>, String> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state
-        .network_tx
-        .try_send(NetworkCommand::GetServerList { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-
-    rx.await.map_err(|_| "Failed to get server list".to_string())
+    let servers = state.cached_servers.read().await;
+    Ok(servers.clone())
 }
 
 #[tauri::command]
 pub async fn get_connected_server(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<ServerInfo>, String> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state
-        .network_tx
-        .try_send(NetworkCommand::GetConnectedServer { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-
-    rx.await.map_err(|_| "Failed to get connected server".to_string())
+    let server = state.cached_connected_server.read().await;
+    Ok(server.clone())
 }
 
 #[tauri::command]

@@ -46,17 +46,24 @@
     };
   });
 
+  function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
+    ]);
+  }
+
   async function refresh() {
     if (refreshInProgress || !mounted) return;
     refreshInProgress = true;
     try {
-      const [list, connected] = await Promise.all([
-        getServerList(),
-        getConnectedServer(),
+      const [list, connected] = await Promise.allSettled([
+        withTimeout(getServerList(), 4000),
+        withTimeout(getConnectedServer(), 4000),
       ]);
       if (!mounted) return;
-      servers = list;
-      connectedServer = connected;
+      if (list.status === 'fulfilled') servers = list.value;
+      if (connected.status === 'fulfilled') connectedServer = connected.value;
     } catch (e: unknown) {
       if (servers.length === 0) {
         error = toErrorMsg(e);

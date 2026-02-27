@@ -81,10 +81,16 @@ pub fn run() {
             let cached_stats: Arc<RwLock<crate::types::NetworkStats>> = Arc::new(RwLock::new(crate::types::NetworkStats::default()));
             let cached_contacts: Arc<RwLock<Vec<crate::types::KadContactInfo>>> = Arc::new(RwLock::new(Vec::new()));
             let cached_searches: Arc<RwLock<Vec<crate::types::KadSearchInfo>>> = Arc::new(RwLock::new(Vec::new()));
+            let cached_servers: Arc<RwLock<Vec<crate::types::ServerInfo>>> = Arc::new(RwLock::new(Vec::new()));
+            let cached_connected_server: Arc<RwLock<Option<crate::types::ServerInfo>>> = Arc::new(RwLock::new(None));
+            let cached_transfer_stats: Arc<RwLock<crate::storage::statistics::TransferStats>> = Arc::new(RwLock::new(Default::default()));
             let cached_peers_net = cached_peers.clone();
             let cached_stats_net = cached_stats.clone();
             let cached_contacts_net = cached_contacts.clone();
             let cached_searches_net = cached_searches.clone();
+            let cached_servers_net = cached_servers.clone();
+            let cached_connected_server_net = cached_connected_server.clone();
+            let cached_transfer_stats_net = cached_transfer_stats.clone();
 
             app.manage(AppState {
                 network_tx,
@@ -99,6 +105,9 @@ pub fn run() {
                 cached_stats,
                 cached_contacts,
                 cached_searches,
+                cached_servers,
+                cached_connected_server,
+                cached_transfer_stats,
             });
 
             let index_clone = local_index.clone();
@@ -156,6 +165,9 @@ pub fn run() {
                     cached_stats_net,
                     cached_contacts_net,
                     cached_searches_net,
+                    cached_servers_net,
+                    cached_connected_server_net,
+                    cached_transfer_stats_net,
                 )
                 .await
                 {

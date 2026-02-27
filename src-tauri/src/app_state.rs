@@ -7,7 +7,8 @@ use crate::search::index::LocalIndex;
 use crate::sharing::manager::TransferManager;
 use crate::storage::config::AppConfig;
 use crate::storage::database::Database;
-use crate::types::{KadContactInfo, KadSearchInfo, NetworkStats, PeerInfo};
+use crate::storage::statistics::TransferStats;
+use crate::types::{KadContactInfo, KadSearchInfo, NetworkStats, PeerInfo, ServerInfo};
 
 pub struct AppState {
     pub network_tx: mpsc::Sender<NetworkCommand>,
@@ -27,4 +28,10 @@ pub struct AppState {
     pub cached_contacts: Arc<RwLock<Vec<KadContactInfo>>>,
     /// Cached KAD searches updated by the network loop — avoids blocking the event loop.
     pub cached_searches: Arc<RwLock<Vec<KadSearchInfo>>>,
+    /// Cached server list — updated by the network loop, read directly by Tauri commands.
+    pub cached_servers: Arc<RwLock<Vec<ServerInfo>>>,
+    /// Cached connected server info — updated by the network loop.
+    pub cached_connected_server: Arc<RwLock<Option<ServerInfo>>>,
+    /// Cached transfer statistics — updated by the network loop.
+    pub cached_transfer_stats: Arc<RwLock<TransferStats>>,
 }

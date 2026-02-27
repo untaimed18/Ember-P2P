@@ -34,10 +34,13 @@
 
   async function loadStats() {
     try {
-      stats = await getStatistics();
+      stats = await Promise.race([
+        getStatistics(),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 4000)),
+      ]);
       error = null;
     } catch (e) {
-      error = String(e);
+      if (stats === null) error = String(e);
     } finally {
       loading = false;
     }

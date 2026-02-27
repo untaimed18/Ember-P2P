@@ -42,7 +42,7 @@ use self::kad::store::DhtStore;
 use self::kad::types::*;
 
 use crate::storage::known_files::KnownFileList;
-use crate::storage::statistics::StatsManager;
+use crate::storage::statistics::{StatsManager, TransferStats};
 
 struct ServerConnectResult {
     addr: SocketAddr,
@@ -143,12 +143,6 @@ pub enum NetworkCommand {
         ip: String,
         port: u16,
     },
-    GetServerList {
-        tx: oneshot::Sender<Vec<ServerInfo>>,
-    },
-    GetConnectedServer {
-        tx: oneshot::Sender<Option<ServerInfo>>,
-    },
     UpdateSettings {
         settings: AppSettings,
     },
@@ -160,9 +154,6 @@ pub enum NetworkCommand {
     GetFileComments {
         file_hash: String,
         tx: oneshot::Sender<Option<ed2k::comments::FileCommentInfo>>,
-    },
-    GetStatistics {
-        tx: oneshot::Sender<crate::storage::statistics::TransferStats>,
     },
     MergeServerMet {
         data: Vec<u8>,
@@ -289,6 +280,9 @@ pub async fn start_network(
     shared_stats: Arc<RwLock<NetworkStats>>,
     shared_contacts: Arc<RwLock<Vec<KadContactInfo>>>,
     shared_searches: Arc<RwLock<Vec<KadSearchInfo>>>,
+    shared_servers: Arc<RwLock<Vec<ServerInfo>>>,
+    shared_connected_server: Arc<RwLock<Option<ServerInfo>>>,
+    shared_transfer_stats: Arc<RwLock<TransferStats>>,
 ) -> anyhow::Result<()> {
     let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
         .map(|d| d.data_dir().to_path_buf())
@@ -635,26 +629,51 @@ pub async fn start_network(
     }
 
     let mut udp_buf = vec![0u8; 65535];
+
+    // Use MissedTickBehavior::Skip on ALL timers so that slow loop iterations
+    // (common in debug builds) never cause burst catch-up that starves other
+    // tokio tasks (including Tauri IPC handlers → UI navigation freezes).
+    use tokio::time::MissedTickBehavior;
+
     let mut bootstrap_timer = tokio::time::interval(std::time::Duration::from_secs(10));
+    bootstrap_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut bootstrap_attempts: u32 = 0;
     let mut publish_timer = tokio::time::interval(std::time::Duration::from_secs(60));
+    publish_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut search_poll_timer = tokio::time::interval(std::time::Duration::from_secs(1));
+    search_poll_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut cleanup_timer = tokio::time::interval(std::time::Duration::from_secs(300));
+    cleanup_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut bucket_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(10));
+    bucket_refresh_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut small_timer = tokio::time::interval(std::time::Duration::from_secs(1));
+    small_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut eviction_ping_timer = tokio::time::interval(std::time::Duration::from_secs(5));
+    eviction_ping_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut buddy_timer = tokio::time::interval(std::time::Duration::from_secs(60));
+    buddy_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut flood_cleanup_timer = tokio::time::interval(std::time::Duration::from_secs(30));
+    flood_cleanup_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut source_retry_timer = tokio::time::interval(std::time::Duration::from_secs(60));
+    source_retry_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut nodes_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
+    nodes_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut cache_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(5));
+    cache_refresh_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut credit_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
+    credit_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut a4af_timer = tokio::time::interval(std::time::Duration::from_secs(480));
+    a4af_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut server_timer = tokio::time::interval(std::time::Duration::from_secs(60));
+    server_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut stats_timer = tokio::time::interval(std::time::Duration::from_secs(1));
+    stats_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut stats_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
+    stats_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut known_met_save_timer = tokio::time::interval(std::time::Duration::from_secs(660));
+    known_met_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut dead_source_timer = tokio::time::interval(std::time::Duration::from_secs(300));
+    dead_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // Resume incomplete downloads from previous session
     if let Ok(incomplete) = db.get_incomplete_downloads() {
@@ -2031,11 +2050,42 @@ pub async fn start_network(
 
                 let stats_snapshot = state.stats.clone();
 
+                let cached_srv: Vec<ServerInfo> = state.server_list.servers().iter().map(|s| ServerInfo {
+                    ip: s.ip.clone(),
+                    port: s.port,
+                    name: s.name.clone(),
+                    description: s.description.clone(),
+                    user_count: s.user_count,
+                    file_count: s.file_count,
+                    is_static: s.is_static,
+                    fail_count: s.fail_count,
+                }).collect();
+
+                let cached_conn_srv: Option<ServerInfo> = state.server_connection.as_ref().and_then(|conn| {
+                    let session = conn.session.as_ref()?;
+                    let addr = state.server_addr?;
+                    Some(ServerInfo {
+                        ip: addr.ip().to_string(),
+                        port: addr.port(),
+                        name: session.server_name.clone(),
+                        description: String::new(),
+                        user_count: session.user_count,
+                        file_count: session.file_count,
+                        is_static: false,
+                        fail_count: 0,
+                    })
+                });
+
+                let cached_tstats = stats_manager.get_stats();
+
                 // Spawn cache writes as a background task so the event loop isn't blocked
                 let sp = shared_peers.clone();
                 let ss = shared_stats.clone();
                 let sc = shared_contacts.clone();
                 let ssrch = shared_searches.clone();
+                let s_srv = shared_servers.clone();
+                let s_conn = shared_connected_server.clone();
+                let s_tstats = shared_transfer_stats.clone();
                 let db_ref = db.clone();
                 tokio::spawn(async move {
                     let banned_ids = tokio::task::spawn_blocking(move || {
@@ -2052,9 +2102,18 @@ pub async fn start_network(
                     *ss.write().await = stats_snapshot;
                     *sc.write().await = cached_c;
                     *ssrch.write().await = cached_s;
+                    *s_srv.write().await = cached_srv;
+                    *s_conn.write().await = cached_conn_srv;
+                    *s_tstats.write().await = cached_tstats;
                 });
             }
         }
+
+        // Yield to the tokio scheduler so other tasks (Tauri IPC command handlers,
+        // background cache writers, etc.) can make progress. Without this, the
+        // select loop can monopolize the worker thread in debug builds where
+        // synchronous timer handlers consume enough CPU to starve other tasks.
+        tokio::task::yield_now().await;
     }
 
     // Abort pending server connection if any
@@ -3245,7 +3304,7 @@ async fn handle_command(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,
-    stats_manager: &mut StatsManager,
+    #[allow(unused)] _stats_manager: &mut StatsManager,
     #[allow(unused)] known_files: &mut KnownFileList,
 ) {
     match cmd {
@@ -4021,38 +4080,6 @@ async fn handle_command(
             }
         }
 
-        NetworkCommand::GetServerList { tx } => {
-            let servers: Vec<ServerInfo> = state.server_list.servers().iter().map(|s| ServerInfo {
-                ip: s.ip.clone(),
-                port: s.port,
-                name: s.name.clone(),
-                description: s.description.clone(),
-                user_count: s.user_count,
-                file_count: s.file_count,
-                is_static: s.is_static,
-                fail_count: s.fail_count,
-            }).collect();
-            let _ = tx.send(servers);
-        }
-
-        NetworkCommand::GetConnectedServer { tx } => {
-            let info = state.server_connection.as_ref().and_then(|conn| {
-                let session = conn.session.as_ref()?;
-                let addr = state.server_addr?;
-                Some(ServerInfo {
-                    ip: addr.ip().to_string(),
-                    port: addr.port(),
-                    name: session.server_name.clone(),
-                    description: String::new(),
-                    user_count: session.user_count,
-                    file_count: session.file_count,
-                    is_static: false,
-                    fail_count: 0,
-                })
-            });
-            let _ = tx.send(info);
-        }
-
         NetworkCommand::SharedFilesChanged => {
             let index = local_index.read().await;
             let files: Vec<PublishableFile> = index.all_files()
@@ -4084,11 +4111,6 @@ async fn handle_command(
         NetworkCommand::GetFileComments { file_hash, tx } => {
             let info = state.comment_manager.get_comments(&file_hash).cloned();
             let _ = tx.send(info);
-        }
-
-        NetworkCommand::GetStatistics { tx } => {
-            let stats = stats_manager.get_stats();
-            let _ = tx.send(stats);
         }
 
         NetworkCommand::MergeServerMet { data, tx } => {
