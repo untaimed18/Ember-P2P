@@ -2489,7 +2489,7 @@ async fn handle_udp_packet(
                 // OP_PORTTEST payload is usually 1 byte (0x12)
                 debug!("Received UDP Port Test from {from}");
                 // Notify TCP handler if waiting
-                let mut waiters = active_port_tests.lock().await;
+                let waiters = active_port_tests.lock().await;
                 if let Some(tx) = waiters.get(&from.ip()) {
                     let _ = tx.send(()).await;
                     debug!("Signaled TCP handler for UDP Port Test from {from}");

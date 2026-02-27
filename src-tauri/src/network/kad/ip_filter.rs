@@ -45,35 +45,45 @@ impl IpFilter {
     }
 
     pub fn load_from_file(&mut self, path: &Path) -> usize {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to read ipfilter.dat: {e}");
-                return 0;
-            }
-        };
-
         self.blocked_ranges.clear();
 
-        let mut count = 0;
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some(range) = parse_ipfilter_line(line) {
-                self.blocked_ranges.push(range);
-                count += 1;
-            } else if let Some(range) = parse_p2p_line(line) {
-                self.blocked_ranges.push(range);
-                count += 1;
+        let ext = path.extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        match ext.as_str() {
+            "p2b" => self.load_p2b_file(path),
+            "p2p" => self.load_p2p_file(path),
+            _ => {
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("Failed to read ipfilter.dat: {e}");
+                        return 0;
+                    }
+                };
+
+                let mut count = 0;
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Some(range) = parse_ipfilter_line(line) {
+                        self.blocked_ranges.push(range);
+                        count += 1;
+                    } else if let Some(range) = parse_p2p_line(line) {
+                        self.blocked_ranges.push(range);
+                        count += 1;
+                    }
+                }
+
+                self.blocked_ranges.sort_by_key(|r| r.start);
+                self.merge_overlapping();
+                info!("Loaded {count} IP filter ranges from {}", path.display());
+                count
             }
         }
-
-        self.blocked_ranges.sort_by_key(|r| r.start);
-        self.merge_overlapping();
-        info!("Loaded {count} IP filter ranges from {}", path.display());
-        count
     }
 
     fn merge_overlapping(&mut self) {
@@ -316,44 +326,6 @@ impl IpFilter {
         count
     }
 
-    /// Append ranges from a file without clearing existing ranges.
-    pub fn append_from_file(&mut self, path: &Path) -> usize {
-        let ext = path.extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-
-        match ext.as_str() {
-            "p2b" => self.load_p2b_file(path),
-            "p2p" => self.load_p2p_file(path),
-            _ => {
-                let content = match std::fs::read_to_string(path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!("Failed to read filter file: {e}");
-                        return 0;
-                    }
-                };
-                let mut count = 0;
-                for line in content.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    if let Some(range) = parse_ipfilter_line(line) {
-                        self.blocked_ranges.push(range);
-                        count += 1;
-                    } else if let Some(range) = parse_p2p_line(line) {
-                        self.blocked_ranges.push(range);
-                        count += 1;
-                    }
-                }
-                self.blocked_ranges.sort_by_key(|r| r.start);
-                self.merge_overlapping();
-                info!("Appended {count} ranges from {}", path.display());
-                count
-            }
-        }
-    }
 }
 
 /// Returns true if the IP is private (RFC1918), loopback, link-local, or reserved.
