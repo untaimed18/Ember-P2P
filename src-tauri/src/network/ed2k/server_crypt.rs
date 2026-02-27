@@ -65,10 +65,6 @@ impl ObfuscatedServerStream {
     /// This matches eMule's delayed-sending behavior: the handshake response and the
     /// first payload go out as a single TCP frame.
     pub async fn write_login(&mut self, login_payload: &[u8]) -> io::Result<()> {
-        info!("write_login: msg3_len={}, login_len={}, login_first16={:02X?}",
-            self.pending_handshake.len(), login_payload.len(),
-            &login_payload[..login_payload.len().min(16)]);
-
         let mut encrypted_payload = vec![0u8; login_payload.len()];
         self.send_key.process(login_payload, &mut encrypted_payload);
 
@@ -77,7 +73,6 @@ impl ObfuscatedServerStream {
         combined.extend_from_slice(&encrypted_payload);
         self.pending_handshake.clear();
 
-        info!("write_login: sending {} bytes total (msg3+login)", combined.len());
         self.writer.write_all(&combined).await?;
         self.writer.flush().await?;
         Ok(())
@@ -91,7 +86,6 @@ impl ObfuscatedServerStream {
         self.recv_key.process(&enc_header, &mut dec_header);
 
         let protocol = dec_header[0];
-        info!("Encrypted read_packet: dec_header={:02X?}", dec_header);
         if protocol != 0xE3 && protocol != 0xD4 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
