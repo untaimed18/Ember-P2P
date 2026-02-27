@@ -76,7 +76,6 @@ fn build_tree_recursive(leaves: &[[u8; 20]], is_left_branch: bool) -> [u8; 20] {
     hasher.finalize().into()
 }
 
-#[allow(dead_code)]
 /// AICH Recovery HashSet: stores the full Merkle tree for a file.
 /// Used to identify which 180KB blocks within a part are corrupt.
 pub struct AICHRecoveryHashSet {
@@ -87,12 +86,9 @@ pub struct AICHRecoveryHashSet {
     pub trust_votes: std::collections::HashMap<[u8; 20], Vec<std::net::Ipv4Addr>>,
 }
 
-#[allow(dead_code)]
 const AICH_TRUST_THRESHOLD: usize = 10;
-#[allow(dead_code)]
 const AICH_TRUST_PERCENTAGE: f64 = 0.92;
 
-#[allow(dead_code)]
 impl AICHRecoveryHashSet {
     pub fn new(root_hash: [u8; 20]) -> Self {
         Self {

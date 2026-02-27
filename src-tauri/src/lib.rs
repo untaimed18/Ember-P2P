@@ -234,6 +234,7 @@ pub fn run() {
             commands::security::set_ip_filter_enabled,
             commands::security::set_block_private_ips,
             commands::security::download_and_load_ipfilter,
+            commands::security::update_ipfilter_from_url,
             commands::security::import_ipfilter_file,
             commands::server::connect_to_server,
             commands::server::disconnect_server,

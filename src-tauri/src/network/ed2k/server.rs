@@ -21,11 +21,8 @@ pub const OP_GETSOURCES: u8 = 0x19;
 pub const OP_FOUNDSOURCES: u8 = 0x42;
 pub const OP_GETSERVERLIST: u8 = 0x14;
 pub const OP_REJECT: u8 = 0x05;
-#[allow(dead_code)]
 pub const OP_CALLBACKREQUEST: u8 = 0x1C;
-#[allow(dead_code)]
 pub const OP_CALLBACKREQUESTED: u8 = 0x35;
-#[allow(dead_code)]
 pub const OP_CALLBACK_FAIL: u8 = 0x36;
 
 /// LowID threshold: client_id < this means LowID
@@ -198,7 +195,6 @@ impl Ed2kServerConnection {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub async fn request_callback(&mut self, client_id: u32) -> anyhow::Result<()> {
         let payload = client_id.to_le_bytes().to_vec();
         write_server_packet(&mut self.writer, OP_CALLBACKREQUEST, &payload).await?;
@@ -256,7 +252,6 @@ impl Ed2kServerConnection {
         events
     }
 
-    #[allow(dead_code)]
     pub fn is_low_id(&self) -> bool {
         self.session
             .as_ref()
@@ -264,7 +259,6 @@ impl Ed2kServerConnection {
             .unwrap_or(false)
     }
 
-    #[allow(dead_code)]
     pub fn our_client_id(&self) -> Option<u32> {
         self.session.as_ref().map(|s| s.client_id)
     }
@@ -278,7 +272,6 @@ impl Ed2kServerConnection {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum ServerEvent {
     CallbackRequested { ip: String, port: u16 },
     CallbackFailed,

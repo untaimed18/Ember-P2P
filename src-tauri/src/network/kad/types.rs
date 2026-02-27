@@ -18,18 +18,13 @@ pub const DEFAULT_UDP_PORT: u16 = 4672;
 pub const SEARCH_TOLERANCE: u32 = 0x0100_0000;
 
 /// eMule KAD version constants (from opcodes.h)
-#[allow(dead_code)]
 pub const KADEMLIA_VERSION1_46C: u8 = 0x01;
 pub const KADEMLIA_VERSION2_47A: u8 = 0x02;
-#[allow(dead_code)]
 pub const KADEMLIA_VERSION3_47B: u8 = 0x03;
 pub const KADEMLIA_VERSION5_48A: u8 = 0x05;
 pub const KADEMLIA_VERSION6_49ABETA: u8 = 0x06;
-#[allow(dead_code)]
 pub const KADEMLIA_VERSION7_49A: u8 = 0x07;
-#[allow(dead_code)]
 pub const KADEMLIA_VERSION8_49B: u8 = 0x08;
-#[allow(dead_code)]
 pub const KADEMLIA_VERSION9_50A: u8 = 0x09;
 
 /// eMule Defines.h: KBASE=4, KK=5, LOG_BASE_EXPONENT=5

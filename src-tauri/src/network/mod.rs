@@ -24,6 +24,7 @@ use self::ed2k::credits::CreditManager;
 use self::ed2k::dead_sources::DeadSourceList;
 use self::ed2k::server::{Ed2kServerConnection, ServerSession};
 use self::ed2k::server_list::{ServerEntry, ServerList};
+use self::ed2k::server_udp::{ServerUdpSocket, ServerUdpResponse};
 use self::ed2k::sources::SourceManager;
 use self::ed2k::upload::{self as upload_server, UploadEvent, UploadEventKind};
 use self::ed2k::multi_source::{DownloadSource, MultiSourceDownload};
@@ -163,7 +164,6 @@ pub enum NetworkCommand {
         transfer_id: String,
         tx: oneshot::Sender<Result<String, String>>,
     },
-    #[allow(dead_code)]
     UpdateIpFilterFromUrl {
         url: String,
         tx: oneshot::Sender<Result<usize, String>>,
@@ -257,8 +257,6 @@ struct NetworkState {
     dead_sources: DeadSourceList,
     /// Comment/rating manager
     comment_manager: CommentManager,
-    /// Firewall checker for systematic NAT/firewall detection
-    #[allow(dead_code)]
     firewall_checker: FirewallChecker,
     /// Whether we have LowID from the server
     low_id: bool,
@@ -630,6 +628,13 @@ pub async fn start_network(
 
     let mut udp_buf = vec![0u8; 65535];
 
+    // Bind a separate UDP socket for ed2k server status pings.
+    // Servers respond on their TCP port + 4; we can use any local port.
+    let mut server_udp = ServerUdpSocket::from_socket(
+        tokio::net::UdpSocket::bind("0.0.0.0:0").await?,
+    );
+    let mut server_udp_ping_idx: usize = 0;
+
     // Use MissedTickBehavior::Skip on ALL timers so that slow loop iterations
     // (common in debug builds) never cause burst catch-up that starves other
     // tokio tasks (including Tauri IPC handlers → UI navigation freezes).
@@ -666,6 +671,8 @@ pub async fn start_network(
     a4af_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut server_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     server_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut server_udp_ping_timer = tokio::time::interval(std::time::Duration::from_secs(15));
+    server_udp_ping_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut stats_timer = tokio::time::interval(std::time::Duration::from_secs(1));
     stats_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut stats_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -725,6 +732,11 @@ pub async fn start_network(
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        crate::security::firewall::ensure_firewall_rules(tcp_port, udp_port);
+    }
+
     info!("Network event loop starting");
 
     loop {
@@ -753,6 +765,7 @@ pub async fn start_network(
                         &credit_manager,
                         &mut stats_manager,
                         &mut known_files,
+                        &server_udp,
                     ).await;
                 }
             }
@@ -831,6 +844,7 @@ pub async fn start_network(
                             &credit_manager,
                             &mut stats_manager,
                             &mut known_files,
+                            &server_udp,
                         ).await;
                     }
                 }
@@ -869,6 +883,7 @@ pub async fn start_network(
                         &credit_manager,
                         &mut stats_manager,
                         &mut known_files,
+                        &server_udp,
                     ).await;
                 }
             }
@@ -906,6 +921,7 @@ pub async fn start_network(
                         &credit_manager,
                         &mut stats_manager,
                         &mut known_files,
+                        &server_udp,
                     ).await;
                 }
             }
@@ -1304,19 +1320,16 @@ pub async fn start_network(
 
                 tokio::task::yield_now().await;
 
-                // Periodic firewall recheck (eMule: every 1 hour)
-                let now_ts = chrono::Utc::now().timestamp();
-                if now_ts - state.last_firewall_check >= 3600 && table_size >= 10 {
-                    state.last_firewall_check = now_ts;
-                    state.firewall_checks_sent = 0;
-                    state.firewall_responses.clear();
-                    state.udp_port_responses.clear();
+                // Firewall detection using FirewallChecker
+                if state.firewall_checker.should_recheck() && table_size >= 10 {
+                    state.firewall_checker.start_check();
+                    let checks = state.firewall_checker.checks_to_send() as usize;
 
                     let fw_contacts: Vec<KadContact> = state
                         .routing_table
                         .all_contacts()
                         .filter(|c| c.verified && c.contact_type <= CONTACT_TYPE_OPEN)
-                        .take(3)
+                        .take(checks)
                         .cloned()
                         .collect();
                     for contact in &fw_contacts {
@@ -1324,17 +1337,33 @@ pub async fn start_network(
                         let msg = KadMessage::FirewalledReq { tcp_port: state.tcp_port };
                         if let Ok(packet) = messages::encode_packet(&msg) {
                             let _ = udp_socket.send_to(&packet, addr).await;
-                            state.firewall_checks_sent += 1;
+                            state.firewall_checker.record_tcp_request_sent();
                         }
                     }
-                    for contact in state.routing_table.all_contacts().skip(3).take(3) {
+                    for contact in state.routing_table.all_contacts().skip(checks).take(checks) {
                         let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                         let msg = KadMessage::Ping;
                         if let Ok(packet) = messages::encode_packet(&msg) {
                             let _ = udp_socket.send_to(&packet, addr).await;
+                            state.firewall_checker.record_udp_request_sent();
                         }
                     }
-                    info!("Periodic firewall recheck: sent {} checks + ping probes", state.firewall_checks_sent);
+                }
+
+                if state.firewall_checker.evaluate() {
+                    let was_firewalled = state.firewalled;
+                    state.firewalled = state.firewall_checker.tcp_firewalled();
+                    state.stats.firewalled = state.firewalled;
+                    if let Some(ip) = state.firewall_checker.external_ip() {
+                        state.external_ip = Some(ip);
+                        state.stats.external_ip = ip.to_string();
+                    }
+                    if was_firewalled != state.firewalled {
+                        let _ = app_handle.emit("firewall-status", serde_json::json!({
+                            "firewalled": state.firewalled,
+                            "external_ip": state.stats.external_ip,
+                        }));
+                    }
                 }
 
                 tokio::task::yield_now().await;
@@ -1712,6 +1741,13 @@ pub async fn start_network(
                         if sid != SearchId(0) {
                             state.download_source_searches.insert(sid, tid);
                         }
+
+                        // Also send UDP source requests to all servers
+                        let mut fh = [0u8; 16];
+                        fh.copy_from_slice(&hash_bytes);
+                        for srv in state.server_list.servers() {
+                            let _ = server_udp.send_get_sources(srv, &fh, pd.file_size).await;
+                        }
                     }
                 }
             }
@@ -1822,7 +1858,26 @@ pub async fn start_network(
                                 ed2k::server::ServerEvent::Message(msg) => {
                                     info!("Server message: {msg}");
                                 }
-                                _ => {}
+                                ed2k::server::ServerEvent::CallbackRequested { ip, port } => {
+                                    info!("Server callback requested: peer at {ip}:{port}");
+                                    if let Ok(peer_ip) = ip.parse::<std::net::Ipv4Addr>() {
+                                        let mut sm = source_manager.write().await;
+                                        for (_hash, pd) in &state.pending_downloads {
+                                            if let Ok(hash_bytes) = hex::decode(&pd.file_hash) {
+                                                if hash_bytes.len() >= 16 {
+                                                    let mut fh = [0u8; 16];
+                                                    fh.copy_from_slice(&hash_bytes[..16]);
+                                                    sm.register_source(fh, peer_ip, port);
+                                                }
+                                            }
+                                        }
+                                        drop(sm);
+                                        info!("Registered callback peer {ip}:{port} as potential source for {} pending downloads", state.pending_downloads.len());
+                                    }
+                                }
+                                ed2k::server::ServerEvent::CallbackFailed => {
+                                    debug!("Server reported callback failure");
+                                }
                             }
                         }
 
@@ -1856,6 +1911,75 @@ pub async fn start_network(
                                 }.await;
                                 ServerConnectResult { addr, ip, port, result }
                             }));
+                        }
+                    }
+                }
+            }
+
+            // Ping the next server in the list via UDP to get user/file counts
+            _ = server_udp_ping_timer.tick() => {
+                let server_count = state.server_list.len();
+                if server_count > 0 {
+                    let idx = server_udp_ping_idx % server_count;
+                    server_udp_ping_idx = server_udp_ping_idx.wrapping_add(1);
+                    let server = state.server_list.servers()[idx].clone();
+                    if let Err(e) = server_udp.send_status_ping(&server).await {
+                        debug!("Server UDP ping to {}:{} failed: {e}", server.ip, server.port);
+                    }
+                }
+                // Drain all pending UDP responses
+                while let Some(resp) = server_udp.try_recv().await {
+                    match resp {
+                        ServerUdpResponse::StatusResponse { addr, user_count, file_count } => {
+                            let tcp_port = addr.port().saturating_sub(4);
+                            state.server_list.update_server_stats(
+                                &addr.ip().to_string(), tcp_port, user_count, file_count,
+                            );
+                        }
+                        ServerUdpResponse::FoundSources { file_hash, sources } => {
+                            if !sources.is_empty() {
+                                let hash_hex = hex::encode(file_hash);
+                                debug!("UDP found {} sources for {}", sources.len(), hash_hex);
+                                let mut sm = source_manager.write().await;
+                                for (ip, port) in &sources {
+                                    sm.register_source(file_hash, *ip, *port);
+                                }
+                            }
+                        }
+                        ServerUdpResponse::SearchResult { results } => {
+                            if !results.is_empty() {
+                                debug!("UDP search returned {} results", results.len());
+                                let search_results: Vec<SearchResult> = results.iter().map(|sr| {
+                                    let hash_hex = hex::encode(sr.file_hash);
+                                    SearchResult {
+                                        file: FileInfo {
+                                            id: hash_hex.clone(),
+                                            name: sr.file_name.clone(),
+                                            path: String::new(),
+                                            size: sr.file_size,
+                                            hash: hash_hex,
+                                            aich_hash: String::new(),
+                                            extension: String::new(),
+                                            modified_at: 0,
+                                            priority: "normal".to_string(),
+                                            requests: 0,
+                                            accepted: 0,
+                                            bytes_transferred: 0,
+                                            complete_sources: 0,
+                                            folder: String::new(),
+                                            shared_kad: false,
+                                        },
+                                        peer_id: format!("{}:{}", sr.client_id, sr.client_port),
+                                        peer_name: String::new(),
+                                        availability: 1,
+                                        file_type: String::new(),
+                                        source_addresses: Vec::new(),
+                                        rating: None,
+                                        comment: None,
+                                    }
+                                }).collect();
+                                let _ = app_handle.emit("search-results", &search_results);
+                            }
                         }
                     }
                 }
@@ -2078,6 +2202,9 @@ pub async fn start_network(
                     description: s.description.clone(),
                     user_count: s.user_count,
                     file_count: s.file_count,
+                    max_users: s.max_users,
+                    soft_files: s.soft_files,
+                    hard_files: s.hard_files,
                     is_static: s.is_static,
                     fail_count: s.fail_count,
                 }).collect();
@@ -2092,6 +2219,9 @@ pub async fn start_network(
                         description: String::new(),
                         user_count: session.user_count,
                         file_count: session.file_count,
+                        max_users: 0,
+                        soft_files: 0,
+                        hard_files: 0,
                         is_static: false,
                         fail_count: 0,
                     })
@@ -2927,20 +3057,9 @@ async fn handle_udp_packet(
                 state.routing_table.handle_pong(&id);
             }
             if udp_port > 0 {
-                state.udp_port_responses.push(udp_port);
-                if state.udp_port_responses.len() >= 2 {
-                    let mut counts: HashMap<u16, usize> = HashMap::new();
-                    for &p in &state.udp_port_responses {
-                        *counts.entry(p).or_insert(0) += 1;
-                    }
-                    if let Some((&best_port, _)) = counts.iter().max_by_key(|(_, &c)| c) {
-                        if Some(best_port) != state.external_udp_port {
-                            state.external_udp_port = Some(best_port);
-                            if best_port != state.udp_port {
-                                info!("External UDP port detected: {} (configured: {})", best_port, state.udp_port);
-                            }
-                        }
-                    }
+                state.firewall_checker.handle_pong(udp_port);
+                if let Some(ext_port) = state.firewall_checker.external_udp_port() {
+                    state.external_udp_port = Some(ext_port);
                 }
             }
         }
@@ -3142,50 +3261,11 @@ async fn handle_udp_packet(
 
         KadMessage::FirewalledRes { ip } => {
             let external_ip = Ipv4Addr::from(ip.to_be_bytes());
-            info!("FirewalledRes: our external IP is {external_ip}");
-            state.firewall_responses.push(external_ip);
-
-            // Use majority vote from multiple responses
-            if state.firewall_responses.len() >= 2 {
-                let mut counts: HashMap<Ipv4Addr, usize> = HashMap::new();
-                for ip in &state.firewall_responses {
-                    *counts.entry(*ip).or_insert(0) += 1;
-                }
-                if let Some((&best_ip, _)) = counts.iter().max_by_key(|(_, &c)| c) {
-                    state.external_ip = Some(best_ip);
-                    info!("External IP determined: {best_ip}");
-
-                    let test_addr = SocketAddr::new(best_ip.into(), state.tcp_port);
-                    let app = app_handle.clone();
-                    let fw_flag = state.firewalled_shared.clone();
-                    tokio::spawn(async move {
-                        let result = tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            tokio::net::TcpStream::connect(test_addr),
-                        )
-                        .await;
-                        match result {
-                            Ok(Ok(_)) => {
-                                info!("TCP port is reachable - NOT firewalled");
-                                fw_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-                                let _ = app.emit("firewall-status", serde_json::json!({
-                                    "firewalled": false,
-                                    "external_ip": best_ip.to_string(),
-                                }));
-                            }
-                            _ => {
-                                info!("TCP port is NOT reachable - firewalled");
-                                fw_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                                let _ = app.emit("firewall-status", serde_json::json!({
-                                    "firewalled": true,
-                                    "external_ip": best_ip.to_string(),
-                                }));
-                            }
-                        }
-                    });
-                }
-            } else {
-                state.external_ip = Some(external_ip);
+            debug!("FirewalledRes: our external IP is {external_ip}");
+            state.firewall_checker.handle_firewalled_response(external_ip);
+            if let Some(confirmed) = state.firewall_checker.external_ip() {
+                state.external_ip = Some(confirmed);
+                state.stats.external_ip = confirmed.to_string();
             }
         }
 
@@ -3327,6 +3407,7 @@ async fn handle_command(
     credit_manager: &Arc<RwLock<CreditManager>>,
     #[allow(unused)] _stats_manager: &mut StatsManager,
     #[allow(unused)] known_files: &mut KnownFileList,
+    server_udp: &ServerUdpSocket,
 ) {
     match cmd {
         NetworkCommand::SearchFiles { query, tx } => {
@@ -3376,6 +3457,17 @@ async fn handle_command(
                             debug!("Server search failed: {e}");
                         }
                     }
+                }
+            }
+
+            // Send UDP global search to all servers in the list for broader results
+            {
+                let mut search_expr = Vec::new();
+                search_expr.push(0x01u8); // string search type
+                search_expr.extend_from_slice(&(query.len() as u16).to_le_bytes());
+                search_expr.extend_from_slice(query.as_bytes());
+                for srv in state.server_list.servers() {
+                    let _ = server_udp.send_global_search(srv, &search_expr).await;
                 }
             }
 
@@ -3553,6 +3645,13 @@ async fn handle_command(
                             }
                         }
                     }
+                }
+
+                // Send UDP source requests to all servers in the list
+                let mut file_hash_arr = [0u8; 16];
+                file_hash_arr.copy_from_slice(&hash_bytes);
+                for srv in state.server_list.servers() {
+                    let _ = server_udp.send_get_sources(srv, &file_hash_arr, file_size).await;
                 }
             }
         }
@@ -4146,23 +4245,48 @@ async fn handle_command(
         }
 
         NetworkCommand::PreviewFile { transfer_id, tx } => {
-            let result = {
-                let mgr = transfer_manager.read().await;
-                if let Some(transfer) = mgr.get_transfer(&transfer_id) {
-                    let ext = std::path::Path::new(&transfer.file_name)
-                        .extension()
-                        .map(|e| e.to_string_lossy().to_string())
-                        .unwrap_or_default();
-                    if ed2k::preview::is_previewable_extension(&ext) {
-                        Ok(transfer.file_name.clone())
-                    } else {
-                        Err("File type is not previewable".to_string())
-                    }
-                } else {
-                    Err("Transfer not found".to_string())
+            let result = (|| -> Result<String, String> {
+                let mgr_guard = futures::executor::block_on(transfer_manager.read());
+                let transfer = mgr_guard.get_transfer(&transfer_id)
+                    .ok_or_else(|| "Transfer not found".to_string())?;
+
+                let file_name = transfer.file_name.clone();
+                let file_size = transfer.total_size;
+                let tid = transfer.id.clone();
+                drop(mgr_guard);
+
+                let part_path = PathBuf::from(&settings.download_folder)
+                    .join("Temp")
+                    .join(format!("{tid}.part"));
+
+                if !part_path.exists() {
+                    return Err("Part file not found — download may not have started".to_string());
                 }
-            };
-            let _ = tx.send(result.map(|name| format!("Preview ready for: {name}")));
+
+                let tracker = ed2k::part_tracker::PartTracker::new(file_size, &part_path);
+                let filled_ranges: Vec<ed2k::preview::FilledRange> = (0..tracker.part_count)
+                    .filter(|&i| tracker.is_part_complete(i))
+                    .map(|i| {
+                        let (s, e) = tracker.part_range(i);
+                        ed2k::preview::FilledRange { start: s, end: e }
+                    })
+                    .collect();
+
+                let completed_bytes: u64 = filled_ranges.iter().map(|r| r.end - r.start).sum();
+
+                if !ed2k::preview::can_preview(&file_name, file_size, &filled_ranges, completed_bytes) {
+                    return Err("File is not ready for preview (need at least the first 256KB downloaded and a previewable file type)".to_string());
+                }
+
+                let preview_path = ed2k::preview::create_preview_file(&part_path, &filled_ranges, &file_name)
+                    .map_err(|e| format!("Failed to create preview file: {e}"))?;
+
+                ed2k::preview::launch_preview(&preview_path)
+                    .map_err(|e| format!("Failed to launch preview: {e}"))?;
+
+                Ok(format!("Preview launched: {}", preview_path.display()))
+            })();
+            let _ = tx.send(result);
         }
 
         NetworkCommand::UpdateIpFilterFromUrl { url, tx } => {

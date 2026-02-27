@@ -672,16 +672,20 @@ impl Ed2kDownload {
                     let actual_hash: [u8; 16] = Md4::digest(&part_data).into();
 
                     if actual_hash != expected_hash {
-                        let aich_hash = super::aich::compute_aich_part(&part_data);
-                        let total_blocks = (part_data.len() + super::aich::AICH_BLOCK_SIZE - 1)
-                            / super::aich::AICH_BLOCK_SIZE;
+                        let aich_hs = super::aich::AICHRecoveryHashSet::build_from_data(&part_data);
+                        let corrupt_blocks = aich_hs.find_corrupt_blocks(
+                            part_idx,
+                            &part_data,
+                            super::aich::AICH_BLOCK_SIZE * ((part_data.len() + super::aich::AICH_BLOCK_SIZE - 1) / super::aich::AICH_BLOCK_SIZE),
+                        );
                         warn!(
-                            "Part {} hash mismatch! expected={} got={}, AICH={} ({} blocks in part)",
+                            "Part {} hash mismatch! expected={} got={}, AICH root={}, {} of {} blocks may be corrupt — re-downloading full part",
                             part_idx,
                             hex::encode(expected_hash),
                             hex::encode(actual_hash),
-                            hex::encode(aich_hash),
-                            total_blocks,
+                            hex::encode(aich_hs.root_hash),
+                            corrupt_blocks.len(),
+                            aich_hs.leaf_count(),
                         );
                         tracker.mark_incomplete(part_idx);
                         tracker.save();

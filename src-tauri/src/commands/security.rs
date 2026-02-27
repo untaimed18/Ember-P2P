@@ -168,6 +168,46 @@ pub async fn download_and_load_ipfilter(
 }
 
 #[tauri::command]
+pub async fn update_ipfilter_from_url(
+    state: tauri::State<'_, AppState>,
+    url: String,
+) -> Result<String, String> {
+    if url.is_empty() || !url.contains("://") {
+        return Err("Invalid URL".into());
+    }
+
+    info!("Updating IP filter from URL: {url}");
+
+    let (tx, rx) = oneshot::channel();
+    state
+        .network_tx
+        .send(NetworkCommand::UpdateIpFilterFromUrl { url: url.clone(), tx })
+        .await
+        .map_err(|e| format!("Network busy: {e}"))?;
+
+    let count = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+        .await
+        .map_err(|_| "Download timed out".to_string())?
+        .map_err(|_| "Failed to update IP filter".to_string())?
+        .map_err(|e| format!("IP filter update failed: {e}"))?;
+
+    state
+        .network_tx
+        .send(NetworkCommand::SetIpFilterEnabled { enabled: true })
+        .await
+        .map_err(|e| format!("Failed to enable filter: {e}"))?;
+
+    {
+        let mut config = state.config.write().await;
+        config.settings.ip_filter_enabled = true;
+        let updated = config.settings.clone();
+        let _ = config.update(updated);
+    }
+
+    Ok(format!("Loaded {count} IP filter entries from {url}"))
+}
+
+#[tauri::command]
 pub async fn import_ipfilter_file(
     state: tauri::State<'_, AppState>,
     file_path: String,

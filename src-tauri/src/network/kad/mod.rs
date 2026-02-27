@@ -1,6 +1,5 @@
 pub mod bootstrap;
 pub mod buddy;
-#[allow(dead_code)]
 pub mod firewall;
 pub mod ip_filter;
 pub mod messages;

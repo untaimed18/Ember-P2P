@@ -16,6 +16,9 @@ pub struct ServerEntry {
     pub fail_count: u32,
     pub user_count: u32,
     pub file_count: u32,
+    pub max_users: u32,
+    pub soft_files: u32,
+    pub hard_files: u32,
     pub last_ping: i64,
     /// Timestamp of last failed connection attempt (for cooldown)
     pub last_failed_at: i64,
@@ -40,9 +43,30 @@ impl ServerEntry {
             fail_count: 0,
             user_count: 0,
             file_count: 0,
+            max_users: 0,
+            soft_files: 0,
+            hard_files: 0,
             last_ping: 0,
             last_failed_at: 0,
         }
+    }
+}
+
+fn apply_server_int_tag(entry: &mut ServerEntry, name_id: u8, v: u32) {
+    match name_id {
+        0x0D | 0x85 => entry.fail_count = v,
+        0x0E => entry.priority = match v {
+            0 => ServerPriority::Low,
+            2 => ServerPriority::High,
+            _ => ServerPriority::Normal,
+        },
+        0x83 => entry.user_count = v,
+        0x84 => entry.file_count = v,
+        0x86 => entry.last_ping = v as i64,
+        0x87 => entry.max_users = v,
+        0x88 => entry.soft_files = v,
+        0x89 => entry.hard_files = v,
+        _ => {}
     }
 }
 
@@ -244,11 +268,7 @@ impl ServerList {
                     }
                     0x03 => {
                         let v = cursor.read_u32::<LittleEndian>()?;
-                        match name_id {
-                            0x85 => entry.fail_count = v,
-                            0x87 => entry.priority = match v { 0 => ServerPriority::Low, 2 => ServerPriority::High, _ => ServerPriority::Normal },
-                            _ => {}
-                        }
+                        apply_server_int_tag(&mut entry, name_id, v);
                     }
                     0x08 => { let _ = cursor.read_u16::<LittleEndian>(); }
                     0x09 => { let _ = cursor.read_u8(); }
@@ -322,7 +342,8 @@ impl ServerList {
                         }
                     }
                     0x03 => {
-                        let _ = cursor.read_u32::<LittleEndian>();
+                        let v = cursor.read_u32::<LittleEndian>().unwrap_or(0);
+                        apply_server_int_tag(&mut entry, name_id, v);
                     }
                     0x08 => { let _ = cursor.read_u16::<LittleEndian>(); }
                     0x09 => { let _ = cursor.read_u8(); }
@@ -352,7 +373,6 @@ impl ServerList {
     }
 
     /// Merge servers from raw server.met bytes without IP filtering.
-    #[allow(dead_code)]
     pub fn merge_from_bytes(&mut self, data: &[u8]) -> anyhow::Result<usize> {
         self.merge_from_bytes_filtered(data, false, None)
     }

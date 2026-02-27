@@ -227,6 +227,9 @@ pub struct ServerInfo {
     pub description: String,
     pub user_count: u32,
     pub file_count: u32,
+    pub max_users: u32,
+    pub soft_files: u32,
+    pub hard_files: u32,
     pub is_static: bool,
     pub fail_count: u32,
 }

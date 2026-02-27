@@ -180,6 +180,12 @@ pub async fn start_token_refill(
     const REFILL_INTERVAL_MS: u64 = 100;
     const TICKS_PER_SECOND: u64 = 1000 / REFILL_INTERVAL_MS;
 
+    let max_up = limiter.max_upload_rate.load(Ordering::Relaxed);
+    let mut uss = super::uss::UploadSpeedSense::new(1024, max_up);
+    if max_up > 0 {
+        uss.enable();
+    }
+
     let mut interval = tokio::time::interval(Duration::from_millis(REFILL_INTERVAL_MS));
     let mut last_uploaded = limiter.total_uploaded();
     let mut last_downloaded = limiter.total_downloaded();
@@ -197,12 +203,25 @@ pub async fn start_token_refill(
             speed_tick_count = 0;
             let current_up = limiter.total_uploaded();
             let current_down = limiter.total_downloaded();
-            limiter.update_speeds(
-                current_up.saturating_sub(last_uploaded),
-                current_down.saturating_sub(last_downloaded),
-            );
+            let up_speed = current_up.saturating_sub(last_uploaded);
+            let down_speed = current_down.saturating_sub(last_downloaded);
+            limiter.update_speeds(up_speed, down_speed);
             last_uploaded = current_up;
             last_downloaded = current_down;
+
+            // USS: use download speed as a latency proxy (higher download = connection
+            // not saturated). When upload speed approaches the limit and download drops,
+            // it suggests the upload is saturating the connection.
+            if uss.is_enabled() && up_speed > 0 {
+                let max_rate = limiter.max_upload_rate.load(Ordering::Relaxed);
+                if max_rate > 0 {
+                    let utilization = (up_speed as f64 / max_rate as f64) * 100.0;
+                    uss.record_ping(utilization);
+                    if let Some(new_limit) = uss.compute_limit() {
+                        limiter.set_limits(new_limit, limiter.max_download_rate.load(Ordering::Relaxed));
+                    }
+                }
+            }
         }
     }
 }

@@ -192,7 +192,6 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
         _ => None,
     }
 }
-
 fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
     let mut cursor = Cursor::new(payload);
     let mut results = Vec::new();
@@ -252,3 +251,4 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
         Some(ServerUdpResponse::SearchResult { results })
     }
 }
+

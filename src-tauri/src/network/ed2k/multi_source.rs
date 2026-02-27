@@ -937,11 +937,14 @@ async fn download_parts_from_source(
                 let actual_hash: [u8; 16] = Md4::digest(&part_data).into();
 
                 if actual_hash != expected_hash {
+                    let aich_hs = super::aich::AICHRecoveryHashSet::build_from_data(&part_data);
                     warn!(
-                        "Multi-source part {} hash mismatch from source {}! expected={} got={}",
+                        "Multi-source part {} hash mismatch from source {}! expected={} got={}, AICH root={}, {} blocks",
                         part_idx, _src_idx,
                         hex::encode(expected_hash),
-                        hex::encode(actual_hash)
+                        hex::encode(actual_hash),
+                        hex::encode(aich_hs.root_hash),
+                        aich_hs.leaf_count(),
                     );
                     false
                 } else {

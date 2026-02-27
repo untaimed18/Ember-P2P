@@ -1,3 +1,6 @@
+#[cfg(target_os = "windows")]
+pub mod firewall;
+
 use std::path::{Component, Path, PathBuf};
 
 /// Sanitize a filename received from the network to prevent path traversal attacks.

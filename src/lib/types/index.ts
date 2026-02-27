@@ -101,6 +101,9 @@ export interface ServerInfo {
   description: string;
   user_count: number;
   file_count: number;
+  max_users: number;
+  soft_files: number;
+  hard_files: number;
   is_static: boolean;
   fail_count: number;
 }
