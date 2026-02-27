@@ -67,11 +67,23 @@ pub enum Ed2kTagValue {
     Uint8(u8),
 }
 
-/// Build a Hello packet payload.
+/// Build a Hello/HelloAnswer payload.
+/// OP_HELLO includes a hash-size marker byte (16); OP_HELLOANSWER does not.
 pub fn build_hello(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickname: &str) -> Vec<u8> {
+    build_hello_inner(user_hash, client_id, tcp_port, nickname, true)
+}
+
+/// Build a HelloAnswer payload (no hash-size marker byte).
+pub fn build_hello_answer(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickname: &str) -> Vec<u8> {
+    build_hello_inner(user_hash, client_id, tcp_port, nickname, false)
+}
+
+fn build_hello_inner(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickname: &str, include_hash_size: bool) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
 
-    buf.write_u8(16).unwrap(); // hash size marker
+    if include_hash_size {
+        buf.write_u8(16).unwrap();
+    }
     buf.write_all(user_hash).unwrap();
     buf.write_u32::<LittleEndian>(client_id).unwrap();
     buf.write_u16::<LittleEndian>(tcp_port).unwrap();

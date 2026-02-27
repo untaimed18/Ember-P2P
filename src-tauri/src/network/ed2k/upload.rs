@@ -292,8 +292,8 @@ impl UploadHandler {
                             // 2. Send EmuleInfo
                             // 3. Read EmuleInfoAnswer (or whatever the peer sends next)
 
-                            // Step 1: HelloAnswer
-                            let hello_payload = build_hello(&self.user_hash, 0, self.tcp_port, &self.nickname);
+                            // Step 1: HelloAnswer (no hash-size marker, per eMule protocol)
+                            let hello_payload = build_hello_answer(&self.user_hash, 0, self.tcp_port, &self.nickname);
                             let mut pkt = Vec::with_capacity(6 + hello_payload.len());
                             pkt.push(OP_EDONKEYHEADER);
                             pkt.extend_from_slice(&((1 + hello_payload.len()) as u32).to_le_bytes());
@@ -407,8 +407,8 @@ impl UploadHandler {
         }
         debug!("Got Hello from {peer_addr}");
 
-        // Send HelloAnswer
-        let hello_payload = build_hello(&self.user_hash, 0, self.tcp_port, &self.nickname);
+        // Send HelloAnswer (no hash-size marker, per eMule protocol)
+        let hello_payload = build_hello_answer(&self.user_hash, 0, self.tcp_port, &self.nickname);
         write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_payload).await?;
 
         // Handle EmuleInfo exchange (or the peer may skip straight to file requests)

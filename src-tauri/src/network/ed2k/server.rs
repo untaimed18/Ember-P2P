@@ -102,10 +102,9 @@ impl Ed2kServerConnection {
         let flags: u32 = SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_UNICODE | SRVCAP_LARGEFILES
             | SRVCAP_SUPPORTCRYPT | SRVCAP_REQUESTCRYPT;
         let payload = build_login_request(user_hash, tcp_port, nickname);
-        info!("Sending OP_LOGINREQUEST ({} bytes, encrypted={}): port={}, nick={}, flags=0x{:04X}, emule_ver=0x{:X}",
-            payload.len(), matches!(self.transport, ServerTransport::Encrypted(_)),
-            tcp_port, nickname, flags,
-            (0u32 << 17) | (50u32 << 10) | (0u32 << 7));
+        let is_encrypted = matches!(self.transport, ServerTransport::Encrypted(_));
+        info!("Sending OP_LOGINREQUEST ({} bytes, encrypted={}): port={}, nick={}, flags=0x{:04X}",
+            payload.len(), is_encrypted, tcp_port, nickname, flags);
 
         // Build the full wire packet: [protocol(1)][length(4)][opcode(1)][payload]
         let mut wire_packet = Vec::with_capacity(6 + payload.len());
@@ -137,7 +136,7 @@ impl Ed2kServerConnection {
             let (opcode, payload) = match self.read_packet().await {
                 Ok(p) => p,
                 Err(e) => {
-                    info!("Server read error on packet {i}: {e}");
+                    info!("Server read error on packet {i}: kind={:?} msg={e}", e.kind());
                     break;
                 }
             };

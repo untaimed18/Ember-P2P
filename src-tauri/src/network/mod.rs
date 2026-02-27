@@ -60,7 +60,6 @@ struct ServerConnectResult {
 /// detects the mode from the first byte). If no dedicated obfuscation port is known,
 /// we try DH on the regular port first.
 async fn try_connect_server(ip: &str, port: u16, obf_port: u16) -> anyhow::Result<Ed2kServerConnection> {
-    // Determine which port to try for encrypted connection
     let encrypt_port = if obf_port != 0 { obf_port } else { port };
     let obf_addr: SocketAddr = format!("{ip}:{encrypt_port}").parse()?;
     info!("Trying encrypted DH connection to server {ip}:{encrypt_port}");
