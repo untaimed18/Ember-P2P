@@ -61,9 +61,10 @@ pub struct KadUDPKey {
 
 impl KadUDPKey {
     /// Generate a UDP verify key for a specific peer IP using a keyed hash.
-    /// Uses MD5(seed || ip) following eMule's approach (each side generates
-    /// independently; the 32-bit result is exchanged as an opaque token via
-    /// TAG_KADUDPKEY in Hello messages).
+    /// Uses MD5(seed || ip) following eMule's approach.
+    /// eMule hashes the raw bytes of the IP struct. On Little-Endian (x86) Windows,
+    /// the IP (stored in network byte order / BE) is in memory as [d, c, b, a].
+    /// So we must use to_le_bytes() on the BE integer to get that byte sequence.
     pub fn generate(our_udp_key: u32, their_ip: u32) -> Self {
         let mut hasher = md5::Md5::new();
         hasher.update(our_udp_key.to_le_bytes());

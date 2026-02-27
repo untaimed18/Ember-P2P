@@ -2661,7 +2661,12 @@ async fn handle_udp_packet(
             // The periodic bootstrap timer and self-lookup handle further discovery.
 
             // Send HelloReq only to the bootstrap node itself (not all returned contacts)
-            let our_options: u8 = if state.firewalled { 0x05 } else { 0x04 };
+            let mut our_options: u8 = 0;
+            if state.udp_firewalled { our_options |= 0x01; }
+            if state.firewalled { our_options |= 0x02; }
+            // Always request ACK from bootstrap node to verify connectivity
+            our_options |= 0x04;
+
             let mut hello_tags = vec![
                 KadTag {
                     name: TagName::Id(TAG_KADMISCOPTIONS),
@@ -2780,11 +2785,11 @@ async fn handle_udp_packet(
             // Bit 0: UDP firewalled, bit 1: TCP firewalled, bit 2: request ACK
             // eMule: only request ACK if the contact was added and not yet verified
             let needs_ack = !valid_receiver_key;
-            let our_options: u8 = if state.firewalled {
-                if needs_ack { 0x05 } else { 0x01 }
-            } else {
-                if needs_ack { 0x04 } else { 0x00 }
-            };
+            let mut our_options: u8 = 0;
+            if state.udp_firewalled { our_options |= 0x01; }
+            if state.firewalled { our_options |= 0x02; }
+            if needs_ack { our_options |= 0x04; }
+
             let contact_ip_u32_for_key = u32::from(ip);
             let our_key_for_peer = KadUDPKey::generate(state.udp_key_seed, contact_ip_u32_for_key);
             let mut res_tags = vec![

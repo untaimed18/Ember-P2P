@@ -27,9 +27,16 @@ pub const OP_EMULEINFO: u8 = 0x01;
 pub const OP_EMULEINFOANSWER: u8 = 0x02;
 pub const OP_COMPRESSEDPART: u8 = 0x40;
 pub const OP_QUEUERANKING: u8 = 0x60;
-pub const OP_REQUESTPARTS_I64: u8 = 0xA3;
-pub const OP_SENDINGPART_I64: u8 = 0xA2;
+pub const OP_MULTIPACKET: u8 = 0x92;
+pub const OP_MULTIPACKETANSWER: u8 = 0x93;
+pub const OP_AICHREQUEST: u8 = 0x9B;
+pub const OP_AICHANSWER: u8 = 0x9C;
 pub const OP_COMPRESSEDPART_I64: u8 = 0xA1;
+pub const OP_SENDINGPART_I64: u8 = 0xA2;
+pub const OP_REQUESTPARTS_I64: u8 = 0xA3;
+pub const OP_MULTIPACKET_EXT: u8 = 0xA4;
+pub const OP_MULTIPACKET_EXT2: u8 = 0xA9;
+pub const OP_MULTIPACKETANSWER_EXT2: u8 = 0xB0;
 pub const OP_PORTTEST: u8 = 0xFE;
 
 // Hashset opcodes (OP_EDONKEYHEADER)
@@ -155,7 +162,7 @@ pub fn build_emule_info(udp_port: u16) -> Vec<u8> {
 
     buf.write_u8(1).unwrap(); // version
 
-    // MiscOptions1: AICH=1 | Unicode=1 | UDPver=4 | Compress=1 | SrcExch=4 | ExtReq=2 | Comments=1 | NoViewShared=1 | MultiPacket=1
+    // MiscOptions1: AICH=1 | Unicode=1 | UDPver=4 | Compress=1 | SrcExch=4 | ExtReq=2 | Comments=1 | NoViewShared=1 | MultiPacket=0
     let misc_options1: u32 =
           1              // AICH ver 1
         | (1 << 4)      // Unicode
@@ -167,13 +174,13 @@ pub fn build_emule_info(udp_port: u16) -> Vec<u8> {
         | (1 << 20)     // Comments ver 1
         | (0 << 24)     // No peer cache
         | (1 << 25)     // No view shared files
-        | (1 << 26);    // Multi-packet support
+        | (0 << 26);    // No Multi-packet support (we don't handle OP_MULTIPACKET unpacking yet)
 
-    // MiscOptions2: KAD=1 | LargeFiles=1 | ExtMultiPacket=1 | SrcExch2=1 | CryptSupport=1
+    // MiscOptions2: KAD=1 | LargeFiles=1 | ExtMultiPacket=0 | SrcExch2=1 | CryptSupport=1
     let misc_options2: u32 =
           1              // KAD version
         | (1 << 4)      // Large files (>4GB)
-        | (1 << 5)      // Extended multi-packet
+        | (0 << 5)      // No Extended multi-packet
         | (1 << 14)     // Source exchange 2
         | (1 << 17);    // Supports crypt layer
 
