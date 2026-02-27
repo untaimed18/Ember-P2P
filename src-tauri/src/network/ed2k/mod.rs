@@ -11,6 +11,7 @@ pub mod multi_source;
 pub mod part_tracker;
 pub mod preview;
 pub mod server;
+pub mod server_crypt;
 pub mod server_list;
 pub mod server_udp;
 pub mod sources;

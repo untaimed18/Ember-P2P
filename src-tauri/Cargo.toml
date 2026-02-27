@@ -46,3 +46,5 @@ tauri-plugin-single-instance = "2.4.0"
 rsa = "0.9"
 pkcs8 = { version = "0.10", features = ["std"] }
 signature = "2"
+num-bigint-dig = "0.8"
+num-traits = "0.2"

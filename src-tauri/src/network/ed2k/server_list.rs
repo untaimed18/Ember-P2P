@@ -22,6 +22,7 @@ pub struct ServerEntry {
     pub last_ping: i64,
     /// Timestamp of last failed connection attempt (for cooldown)
     pub last_failed_at: i64,
+    pub obfuscation_port_tcp: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,7 @@ impl ServerEntry {
             hard_files: 0,
             last_ping: 0,
             last_failed_at: 0,
+            obfuscation_port_tcp: 0,
         }
     }
 }
@@ -66,6 +68,7 @@ fn apply_server_int_tag(entry: &mut ServerEntry, name_id: u8, v: u32) {
         0x87 => entry.max_users = v,
         0x88 => entry.soft_files = v,
         0x89 => entry.hard_files = v,
+        0x97 => entry.obfuscation_port_tcp = v as u16,
         _ => {}
     }
 }

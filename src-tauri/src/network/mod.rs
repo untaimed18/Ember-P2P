@@ -53,6 +53,26 @@ struct ServerConnectResult {
     result: Result<(Ed2kServerConnection, ServerSession), String>,
 }
 
+/// Try to connect to a server, attempting the obfuscation port first (for HighID),
+/// then falling back to the regular port (for LowID).
+async fn try_connect_server(ip: &str, port: u16, obf_port: u16) -> anyhow::Result<Ed2kServerConnection> {
+    if obf_port != 0 {
+        let obf_addr: SocketAddr = format!("{ip}:{obf_port}").parse()?;
+        info!("Trying encrypted connection to server {ip}:{obf_port}");
+        match Ed2kServerConnection::connect_encrypted(obf_addr).await {
+            Ok(conn) => {
+                info!("Encrypted connection to server {ip}:{obf_port} established");
+                return Ok(conn);
+            }
+            Err(e) => {
+                warn!("Encrypted connection to server {ip}:{obf_port} failed: {e}, falling back to plain");
+            }
+        }
+    }
+    let addr: SocketAddr = format!("{ip}:{port}").parse()?;
+    Ed2kServerConnection::connect(addr).await
+}
+
 #[derive(Debug)]
 pub enum NetworkCommand {
     SearchFiles {
@@ -1994,13 +2014,14 @@ pub async fn start_network(
                         if let Ok(addr) = addr_str.parse::<SocketAddr>() {
                             let ip = server.ip.clone();
                             let port = server.port;
+                            let obf_port = server.obfuscation_port_tcp;
                             let user_hash = state.user_hash;
                             let nickname = settings.nickname.clone();
                             let tcp_port = state.tcp_port;
                             info!("Auto-connecting to ed2k server {addr_str} (background)");
                             state.pending_server_connect = Some(tokio::spawn(async move {
                                 let result = async {
-                                    let mut conn = Ed2kServerConnection::connect(addr).await
+                                    let mut conn = try_connect_server(&ip, port, obf_port).await
                                         .map_err(|e| format!("Connect failed: {e}"))?;
                                     let session = conn.login(&user_hash, &nickname, tcp_port).await
                                         .map_err(|e| format!("Login failed: {e}"))?;
@@ -4331,10 +4352,15 @@ async fn handle_command(
             let user_hash = state.user_hash;
             let nickname = settings.nickname.clone();
             let tcp_port = state.tcp_port;
+            let obf_port = state.server_list.servers().iter()
+                .find(|s| s.ip == ip && s.port == port)
+                .map(|s| s.obfuscation_port_tcp)
+                .unwrap_or(0);
+            let ip_clone = ip.clone();
             info!("Connecting to ed2k server {addr} (background)...");
             state.pending_server_connect = Some(tokio::spawn(async move {
                 let result = async {
-                    let mut conn = Ed2kServerConnection::connect(addr).await
+                    let mut conn = try_connect_server(&ip_clone, port, obf_port).await
                         .map_err(|e| format!("Connect failed: {e}"))?;
                     let session = conn.login(&user_hash, &nickname, tcp_port).await
                         .map_err(|e| format!("Login failed: {e}"))?;

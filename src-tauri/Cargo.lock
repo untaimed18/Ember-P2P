@@ -2329,6 +2329,8 @@ dependencies = [
  "igd-next",
  "md-5",
  "md4",
+ "num-bigint-dig",
+ "num-traits",
  "pkcs8",
  "rand 0.8.5",
  "reqwest 0.12.28",
@@ -2378,6 +2380,7 @@ dependencies = [
  "num-iter",
  "num-traits",
  "rand 0.8.5",
+ "serde",
  "smallvec",
  "zeroize",
 ]

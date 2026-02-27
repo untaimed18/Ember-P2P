@@ -54,9 +54,16 @@ pub struct ServerSession {
     pub server_list_data: Option<Vec<u8>>,
 }
 
+enum ServerTransport {
+    Plain {
+        reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>,
+    },
+    Encrypted(super::server_crypt::ObfuscatedServerStream),
+}
+
 pub struct Ed2kServerConnection {
-    reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
-    writer: tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>,
+    transport: ServerTransport,
     pub session: Option<ServerSession>,
 }
 
@@ -70,8 +77,18 @@ impl Ed2kServerConnection {
 
         let (reader, writer) = stream.into_split();
         Ok(Self {
-            reader: tokio::io::BufReader::new(reader),
-            writer: tokio::io::BufWriter::new(writer),
+            transport: ServerTransport::Plain {
+                reader: tokio::io::BufReader::new(reader),
+                writer: tokio::io::BufWriter::new(writer),
+            },
+            session: None,
+        })
+    }
+
+    pub async fn connect_encrypted(addr: SocketAddr) -> anyhow::Result<Self> {
+        let stream = super::server_crypt::connect_obfuscated(addr).await?;
+        Ok(Self {
+            transport: ServerTransport::Encrypted(stream),
             session: None,
         })
     }
@@ -85,11 +102,27 @@ impl Ed2kServerConnection {
         let flags: u32 = SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_UNICODE | SRVCAP_LARGEFILES
             | SRVCAP_SUPPORTCRYPT | SRVCAP_REQUESTCRYPT;
         let payload = build_login_request(user_hash, tcp_port, nickname);
-        info!("Sending OP_LOGINREQUEST ({} bytes): port={}, nick={}, flags=0x{:04X}, emule_ver=0x{:X}",
-            payload.len(), tcp_port, nickname,
-            flags,
+        info!("Sending OP_LOGINREQUEST ({} bytes, encrypted={}): port={}, nick={}, flags=0x{:04X}, emule_ver=0x{:X}",
+            payload.len(), matches!(self.transport, ServerTransport::Encrypted(_)),
+            tcp_port, nickname, flags,
             (0u32 << 17) | (50u32 << 10) | (0u32 << 7));
-        write_server_packet(&mut self.writer, OP_LOGINREQUEST, &payload).await?;
+
+        // Build the full wire packet: [protocol(1)][length(4)][opcode(1)][payload]
+        let mut wire_packet = Vec::with_capacity(6 + payload.len());
+        wire_packet.push(OP_EDONKEYHEADER);
+        wire_packet.extend_from_slice(&((1 + payload.len()) as u32).to_le_bytes());
+        wire_packet.push(OP_LOGINREQUEST);
+        wire_packet.extend_from_slice(&payload);
+
+        match &mut self.transport {
+            ServerTransport::Plain { writer, .. } => {
+                writer.write_all(&wire_packet).await?;
+                writer.flush().await?;
+            }
+            ServerTransport::Encrypted(stream) => {
+                stream.write_login(&wire_packet).await?;
+            }
+        }
 
         let mut session = ServerSession {
             client_id: 0,
@@ -100,12 +133,11 @@ impl Ed2kServerConnection {
             server_list_data: None,
         };
 
-        // Process login response sequence (may receive SERVERMESSAGE, IDCHANGE, SERVERLIST, SERVERSTATUS)
         for i in 0..10 {
-            let (opcode, payload) = match read_server_packet_timeout(&mut self.reader).await {
+            let (opcode, payload) = match self.read_packet().await {
                 Ok(p) => p,
                 Err(e) => {
-                    info!("Server read error on packet {i}: {e} (kind={:?})", e.kind());
+                    info!("Server read error on packet {i}: {e}");
                     break;
                 }
             };
@@ -158,12 +190,66 @@ impl Ed2kServerConnection {
         anyhow::bail!("Login sequence did not complete (no IDCHANGE received)");
     }
 
+    async fn read_packet(&mut self) -> io::Result<(u8, Vec<u8>)> {
+        match &mut self.transport {
+            ServerTransport::Plain { reader, .. } => {
+                read_server_packet_timeout(reader).await
+            }
+            ServerTransport::Encrypted(stream) => {
+                stream.read_packet().await
+            }
+        }
+    }
+
+    async fn write_packet(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
+        match &mut self.transport {
+            ServerTransport::Plain { writer, .. } => {
+                write_server_packet(writer, opcode, payload).await
+            }
+            ServerTransport::Encrypted(stream) => {
+                let mut wire = Vec::with_capacity(6 + payload.len());
+                wire.push(OP_EDONKEYHEADER);
+                wire.extend_from_slice(&((1 + payload.len()) as u32).to_le_bytes());
+                wire.push(opcode);
+                wire.extend_from_slice(payload);
+                let mut encrypted = vec![0u8; wire.len()];
+                stream.send_key.process(&wire, &mut encrypted);
+                stream.writer.write_all(&encrypted).await?;
+                stream.writer.flush().await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn poll_read_packet(&mut self) -> Option<(u8, Vec<u8>)> {
+        match &mut self.transport {
+            ServerTransport::Plain { reader, .. } => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    read_server_packet(reader),
+                ).await {
+                    Ok(Ok(pkt)) => Some(pkt),
+                    _ => None,
+                }
+            }
+            ServerTransport::Encrypted(stream) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    stream.read_packet(),
+                ).await {
+                    Ok(Ok(pkt)) => Some(pkt),
+                    _ => None,
+                }
+            }
+        }
+    }
+
     pub async fn search(&mut self, query: &str) -> anyhow::Result<Vec<ServerSearchResult>> {
         let payload = build_search_request(query);
-        write_server_packet(&mut self.writer, OP_SEARCHREQUEST, &payload).await?;
+        self.write_packet(OP_SEARCHREQUEST, &payload).await?;
 
         let mut results = Vec::new();
-        let (opcode, payload) = read_server_packet_timeout(&mut self.reader).await?;
+        let (opcode, payload) = self.read_packet().await?;
         if opcode == OP_SEARCHRESULT {
             results = parse_search_result(&payload)?;
         }
@@ -173,9 +259,9 @@ impl Ed2kServerConnection {
     pub async fn get_sources(&mut self, file_hash: &[u8; 16]) -> anyhow::Result<Vec<ServerSource>> {
         let mut payload = Vec::with_capacity(16);
         payload.extend_from_slice(file_hash);
-        write_server_packet(&mut self.writer, OP_GETSOURCES, &payload).await?;
+        self.write_packet(OP_GETSOURCES, &payload).await?;
 
-        let (opcode, resp) = read_server_packet_timeout(&mut self.reader).await?;
+        let (opcode, resp) = self.read_packet().await?;
         if opcode == OP_FOUNDSOURCES {
             return parse_found_sources(&resp);
         }
@@ -183,37 +269,27 @@ impl Ed2kServerConnection {
     }
 
     pub async fn keep_alive(&mut self) -> anyhow::Result<()> {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            write_server_packet(&mut self.writer, OP_GETSERVERLIST, &[]),
-        ).await.map_err(|_| anyhow::anyhow!("keep_alive write timed out"))??;
+        self.write_packet(OP_GETSERVERLIST, &[]).await?;
         Ok(())
     }
 
-    /// Explicitly request the server's list of known servers (OP_GETSERVERLIST).
     pub async fn request_server_list(&mut self) -> anyhow::Result<()> {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            write_server_packet(&mut self.writer, OP_GETSERVERLIST, &[]),
-        ).await.map_err(|_| anyhow::anyhow!("request_server_list write timed out"))??;
+        self.write_packet(OP_GETSERVERLIST, &[]).await?;
         debug!("Sent OP_GETSERVERLIST request to server");
         Ok(())
     }
 
     pub async fn request_callback(&mut self, client_id: u32) -> anyhow::Result<()> {
         let payload = client_id.to_le_bytes().to_vec();
-        write_server_packet(&mut self.writer, OP_CALLBACKREQUEST, &payload).await?;
+        self.write_packet(OP_CALLBACKREQUEST, &payload).await?;
         info!("Sent callback request for LowID client {client_id}");
         Ok(())
     }
 
     pub async fn poll_messages(&mut self) -> Vec<ServerEvent> {
         let mut events = Vec::new();
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            read_server_packet(&mut self.reader),
-        ).await {
-            Ok(Ok((opcode, payload))) => {
+        match self.poll_read_packet().await {
+            Some((opcode, payload)) => {
                 match opcode {
                     OP_CALLBACKREQUESTED => {
                         if payload.len() >= 6 {
@@ -252,7 +328,7 @@ impl Ed2kServerConnection {
                     _ => {}
                 }
             }
-            _ => {}
+            None => {}
         }
         events
     }
@@ -268,11 +344,21 @@ impl Ed2kServerConnection {
         self.session.as_ref().map(|s| s.client_id)
     }
 
-    pub async fn disconnect(mut self) {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.writer.shutdown(),
-        ).await;
+    pub async fn disconnect(self) {
+        match self.transport {
+            ServerTransport::Plain { mut writer, .. } => {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    writer.shutdown(),
+                ).await;
+            }
+            ServerTransport::Encrypted(mut stream) => {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    stream.writer.shutdown(),
+                ).await;
+            }
+        }
     }
 }
 
