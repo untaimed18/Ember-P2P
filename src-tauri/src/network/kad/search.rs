@@ -11,9 +11,9 @@ pub const KADEMLIA_FIND_VALUE_MORE: u8 = KADEMLIA_FIND_NODE;
 
 /// eMule Defines.h SEARCHKEYWORD_TOTAL
 const KEYWORD_SEARCH_MAX_RESULTS: usize = 300;
-const PENDING_TIMEOUT_SECS: i64 = 15;
-const LOOKUP_CONVERGE_COUNT: usize = 3;
-const LOOKUP_MIN_QUERIES: usize = 6;
+const PENDING_TIMEOUT_SECS: i64 = 10;
+const LOOKUP_CONVERGE_COUNT: usize = 5;
+const LOOKUP_MIN_QUERIES: usize = 10;
 const LOOKUP_MAX_QUERIES: usize = 200;
 const LOOKUP_CONTACT_POOL: usize = 200;
 
@@ -289,7 +289,6 @@ impl SearchState {
         if self.lookup_reask_more_target == Some(*id) {
             self.lookup_reask_more_target = None;
         }
-        self.lookup_stale_rounds += 1;
         self.check_phase_transition();
         self.check_completion();
     }
@@ -359,10 +358,18 @@ impl SearchState {
         let max_lookup_reached = self.queried.len() >= LOOKUP_MAX_QUERIES;
 
         if all_queried || enough_queried || max_lookup_reached {
+            let tolerance_candidates: Vec<&KadContact> = self.closest.iter()
+                .filter(|c| self.responded_during_lookup.contains(&c.id)
+                    && within_search_tolerance(&self.target, &c.id))
+                .collect();
+            let responded_candidates: Vec<&KadContact> = self.closest.iter()
+                .filter(|c| self.responded_during_lookup.contains(&c.id))
+                .collect();
             info!(
-                "Search {}: lookup converged (queried={}, stale_rounds={}, closest={}, verified={}), switching to fetch",
+                "Search {}: lookup converged (queried={}, stale_rounds={}, closest={}, verified={}, \
+                within_tolerance={}, responded_in_closest={}), switching to fetch",
                 self.id.0, self.queried.len(), self.lookup_stale_rounds, self.closest.len(),
-                self.responded_during_lookup.len()
+                self.responded_during_lookup.len(), tolerance_candidates.len(), responded_candidates.len()
             );
             self.phase = SearchPhase::Fetch;
             self.pending.clear();
@@ -408,6 +415,12 @@ impl SearchState {
                 }
             }
             SearchPhase::Fetch => {
+                // Don't complete if we haven't sent any fetch queries yet.
+                // The poll loop needs at least one cycle to dispatch queries
+                // after transitioning from Lookup to Fetch.
+                if self.fetched.is_empty() && self.pending.is_empty() {
+                    return;
+                }
                 if self.pending.is_empty() {
                     let has_unfetched = self
                         .closest
@@ -422,8 +435,27 @@ impl SearchState {
     }
 
     fn is_fetch_candidate(&self, contact: &KadContact) -> bool {
-        self.responded_during_lookup.contains(&contact.id)
-            && (is_lan_ip(contact.ip) || within_search_tolerance(&self.target, &contact.id))
+        if is_lan_ip(contact.ip) {
+            return true;
+        }
+        if within_search_tolerance(&self.target, &contact.id) {
+            return self.responded_during_lookup.contains(&contact.id);
+        }
+        // Fallback: if no contacts are within strict tolerance, allow the
+        // closest contacts that responded during lookup. This handles the
+        // common case where the routing table is small and the iterative
+        // lookup couldn't walk close enough to the target.
+        if !self.has_any_tolerance_candidates() {
+            return self.responded_during_lookup.contains(&contact.id);
+        }
+        false
+    }
+
+    fn has_any_tolerance_candidates(&self) -> bool {
+        self.closest.iter().any(|c| {
+            self.responded_during_lookup.contains(&c.id)
+                && within_search_tolerance(&self.target, &c.id)
+        })
     }
 
     /// Returns the expected number of contacts in a response.
