@@ -150,7 +150,7 @@ impl ServerList {
                 Ok(v) => v,
                 Err(_) => break,
             };
-            let ip = Ipv4Addr::from(ip_raw.to_be_bytes());
+            let ip = Ipv4Addr::from(ip_raw.to_le_bytes());
             if ip.is_unspecified() || port == 0 {
                 continue;
             }
@@ -245,7 +245,7 @@ impl ServerList {
 
         for _ in 0..count.min(500) {
             let ip_raw = cursor.read_u32::<LittleEndian>()?;
-            let ip = std::net::Ipv4Addr::from(ip_raw.to_be_bytes());
+            let ip = std::net::Ipv4Addr::from(ip_raw.to_le_bytes());
             let port = cursor.read_u16::<LittleEndian>()?;
             let tag_count = cursor.read_u32::<LittleEndian>()? as usize;
 
@@ -311,7 +311,7 @@ impl ServerList {
                 Ok(v) => v,
                 Err(_) => break,
             };
-            let ip = Ipv4Addr::from(ip_raw.to_be_bytes());
+            let ip = Ipv4Addr::from(ip_raw.to_le_bytes());
             let port = match cursor.read_u16::<LittleEndian>() {
                 Ok(v) => v,
                 Err(_) => break,
@@ -396,7 +396,7 @@ impl ServerList {
 
         for entry in &self.servers {
             let ip: std::net::Ipv4Addr = entry.ip.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
-            buf.write_u32::<LittleEndian>(u32::from_be_bytes(ip.octets()))?;
+            buf.write_u32::<LittleEndian>(u32::from_le_bytes(ip.octets()))?;
             buf.write_u16::<LittleEndian>(entry.port)?;
 
             // Tags: name + priority

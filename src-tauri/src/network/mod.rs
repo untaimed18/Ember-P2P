@@ -53,20 +53,24 @@ struct ServerConnectResult {
     result: Result<(Ed2kServerConnection, ServerSession), String>,
 }
 
-/// Try to connect to a server, attempting the obfuscation port first (for HighID),
-/// then falling back to the regular port (for LowID).
+/// Try to connect to a server, attempting the DH-encrypted connection first (for HighID),
+/// then falling back to plain text (for LowID).
+///
+/// Many servers use the same port for both plain and obfuscated connections (the server
+/// detects the mode from the first byte). If no dedicated obfuscation port is known,
+/// we try DH on the regular port first.
 async fn try_connect_server(ip: &str, port: u16, obf_port: u16) -> anyhow::Result<Ed2kServerConnection> {
-    if obf_port != 0 {
-        let obf_addr: SocketAddr = format!("{ip}:{obf_port}").parse()?;
-        info!("Trying encrypted connection to server {ip}:{obf_port}");
-        match Ed2kServerConnection::connect_encrypted(obf_addr).await {
-            Ok(conn) => {
-                info!("Encrypted connection to server {ip}:{obf_port} established");
-                return Ok(conn);
-            }
-            Err(e) => {
-                warn!("Encrypted connection to server {ip}:{obf_port} failed: {e}, falling back to plain");
-            }
+    // Determine which port to try for encrypted connection
+    let encrypt_port = if obf_port != 0 { obf_port } else { port };
+    let obf_addr: SocketAddr = format!("{ip}:{encrypt_port}").parse()?;
+    info!("Trying encrypted DH connection to server {ip}:{encrypt_port}");
+    match Ed2kServerConnection::connect_encrypted(obf_addr).await {
+        Ok(conn) => {
+            info!("Encrypted DH connection to server {ip}:{encrypt_port} established");
+            return Ok(conn);
+        }
+        Err(e) => {
+            warn!("Encrypted DH connection to server {ip}:{encrypt_port} failed: {e}, falling back to plain");
         }
     }
     let addr: SocketAddr = format!("{ip}:{port}").parse()?;
