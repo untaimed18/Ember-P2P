@@ -52,13 +52,20 @@
     return true;
   }
 
+  function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
+    ]);
+  }
+
   async function refresh() {
     if (refreshInProgress || !mounted) return;
     refreshInProgress = true;
     try {
       const [c, s] = await Promise.allSettled([
-        getKadContacts(),
-        getKadSearches(),
+        withTimeout(getKadContacts(), 4000),
+        withTimeout(getKadSearches(), 4000),
       ]);
       if (!mounted) return;
 
@@ -75,7 +82,7 @@
       if (c.status === 'rejected' || s.status === 'rejected') {
         const raw = c.status === 'rejected' ? (c as PromiseRejectedResult).reason : (s as PromiseRejectedResult).reason;
         const msg = raw instanceof Error ? raw.message : String(raw);
-        if (contacts.length === 0) {
+        if (msg !== 'timeout' && contacts.length === 0) {
           kadError = msg;
         }
       } else {

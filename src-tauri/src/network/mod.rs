@@ -758,9 +758,11 @@ pub async fn start_network(
                                     }
                                 };
 
+                                let source_count = sources.len() as u32;
                                 {
                                     let mut mgr = transfer_manager.write().await;
                                     mgr.update_status(&transfer_id, TransferStatus::Active);
+                                    mgr.update_sources(&transfer_id, source_count, 0, 0);
                                 }
                                 let peer_desc = sources.iter()
                                     .map(|(ip, port)| format!("{ip}:{port}"))
@@ -770,6 +772,7 @@ pub async fn start_network(
                                     "id": transfer_id,
                                     "status": "active",
                                     "peer_id": peer_desc,
+                                    "sources": source_count,
                                 }));
 
                                 if sources.len() == 1 {
@@ -2827,6 +2830,8 @@ async fn handle_command(
                     failure_reason: None,
                     priority: "normal".to_string(),
                     sources: 0,
+                    active_sources: 0,
+                    queued_sources: 0,
                 };
                 let _ = db.save_transfer(&db_transfer);
 
@@ -3378,6 +3383,26 @@ async fn handle_download_event(
                 }),
             );
         }
+        DownloadEvent::SourcesUpdate {
+            transfer_id,
+            total,
+            active,
+            queued,
+        } => {
+            {
+                let mut mgr = transfer_manager.write().await;
+                mgr.update_sources(&transfer_id, total, active, queued);
+            }
+            let _ = app_handle.emit(
+                "transfer-sources",
+                serde_json::json!({
+                    "id": transfer_id,
+                    "sources": total,
+                    "active_sources": active,
+                    "queued_sources": queued,
+                }),
+            );
+        }
         DownloadEvent::Completed { transfer_id } => {
             let promoted = {
                 let mut mgr = transfer_manager.write().await;
@@ -3441,6 +3466,8 @@ async fn handle_upload_event(
                 failure_reason: None,
                 priority: "normal".to_string(),
                 sources: 0,
+                active_sources: 0,
+                queued_sources: 0,
             };
             {
                 let mut mgr = transfer_manager.write().await;

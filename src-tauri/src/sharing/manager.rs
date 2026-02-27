@@ -178,6 +178,18 @@ impl TransferManager {
         }
     }
 
+    pub fn update_sources(&mut self, id: &str, total: u32, active: u32, queued: u32) {
+        if let Some(transfer) = self.active.get_mut(id) {
+            transfer.sources = total;
+            transfer.active_sources = active;
+            transfer.queued_sources = queued;
+        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
+            transfer.sources = total;
+            transfer.active_sources = active;
+            transfer.queued_sources = queued;
+        }
+    }
+
     pub fn pause(&mut self, id: &str) {
         if let Some(transfer) = self.active.get_mut(id) {
             transfer.status = TransferStatus::Paused;

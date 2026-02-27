@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -150,15 +151,34 @@ impl MultiSourceDownload {
         // Shared part hashes for per-part verification (populated by first source)
         let part_hashes: Arc<RwLock<Vec<[u8; 16]>>> = Arc::new(RwLock::new(Vec::new()));
 
+        // Source status counters (shared by all per-source tasks)
+        let total_sources = self.sources.len() as u32;
+        let active_count = Arc::new(AtomicU32::new(0));
+        let queued_count = Arc::new(AtomicU32::new(0));
+
+        let _ = event_tx
+            .send(DownloadEvent::SourcesUpdate {
+                transfer_id: self.transfer_id.clone(),
+                total: total_sources,
+                active: 0,
+                queued: 0,
+            })
+            .await;
+
         // Progress aggregator channel
         let (progress_tx, mut progress_rx) = mpsc::channel::<(usize, u64)>(256);
         let transfer_id = self.transfer_id.clone();
         let file_size = self.file_size;
         let event_tx_clone = event_tx.clone();
+        let agg_active = active_count.clone();
+        let agg_queued = queued_count.clone();
 
-        // Aggregator task that merges progress from all sources
+        // Aggregator task that merges progress from all sources and periodically emits source counts
         let aggregator = tokio::spawn(async move {
             let mut total_downloaded: u64 = 0;
+            let mut last_active: u32 = 0;
+            let mut last_queued: u32 = 0;
+
             while let Some((_source_idx, bytes)) = progress_rx.recv().await {
                 total_downloaded += bytes;
                 let _ = event_tx_clone
@@ -168,6 +188,21 @@ impl MultiSourceDownload {
                         total: file_size,
                     })
                     .await;
+
+                let cur_active = agg_active.load(Ordering::Relaxed);
+                let cur_queued = agg_queued.load(Ordering::Relaxed);
+                if cur_active != last_active || cur_queued != last_queued {
+                    last_active = cur_active;
+                    last_queued = cur_queued;
+                    let _ = event_tx_clone
+                        .send(DownloadEvent::SourcesUpdate {
+                            transfer_id: transfer_id.clone(),
+                            total: total_sources,
+                            active: cur_active,
+                            queued: cur_queued,
+                        })
+                        .await;
+                }
             }
         });
 
@@ -189,6 +224,8 @@ impl MultiSourceDownload {
             let bw = self.bandwidth_limiter.clone();
             let progress_tx = progress_tx.clone();
             let ph = part_hashes.clone();
+            let src_active = active_count.clone();
+            let src_queued = queued_count.clone();
 
             let handle = tokio::spawn(async move {
                 let result = download_parts_from_source(
@@ -206,6 +243,8 @@ impl MultiSourceDownload {
                     bw,
                     progress_tx,
                     ph,
+                    src_active.clone(),
+                    src_queued.clone(),
                 )
                 .await;
 
@@ -230,6 +269,16 @@ impl MultiSourceDownload {
         }
 
         aggregator.await?;
+
+        // Emit final source counts after all tasks complete
+        let _ = event_tx
+            .send(DownloadEvent::SourcesUpdate {
+                transfer_id: self.transfer_id.clone(),
+                total: total_sources,
+                active: active_count.load(Ordering::Relaxed),
+                queued: queued_count.load(Ordering::Relaxed),
+            })
+            .await;
 
         // Retry incomplete parts (from failed sources or hash mismatches)
         const MAX_RETRY_ROUNDS: usize = 3;
@@ -297,12 +346,15 @@ impl MultiSourceDownload {
                 let bw = self.bandwidth_limiter.clone();
                 let retry_tx = retry_tx.clone();
                 let ph = part_hashes.clone();
+                let ra = active_count.clone();
+                let rq = queued_count.clone();
 
                 retry_handles.push(tokio::spawn(async move {
                     let _ = download_parts_from_source(
                         src_idx, &source, &parts, tracker, &part_path,
                         &file_hash, file_size, &user_hash, &nickname,
                         tcp_port, udp_port, bw, retry_tx, ph,
+                        ra, rq,
                     )
                     .await;
                 }));
@@ -387,6 +439,8 @@ async fn download_parts_from_source(
     bw: Arc<BandwidthLimiter>,
     progress_tx: mpsc::Sender<(usize, u64)>,
     shared_part_hashes: Arc<RwLock<Vec<[u8; 16]>>>,
+    active_count: Arc<AtomicU32>,
+    queued_count: Arc<AtomicU32>,
 ) -> anyhow::Result<()> {
     use super::messages::*;
     use flate2::read::ZlibDecoder;
@@ -487,6 +541,23 @@ async fn download_parts_from_source(
     let upload_req = build_file_request(file_hash);
     write_packet_async_ms(&mut writer, OP_EDONKEYHEADER, OP_STARTUPLOADREQ, &upload_req).await?;
 
+    queued_count.fetch_add(1, Ordering::Relaxed);
+
+    struct CountGuard {
+        counter: Arc<AtomicU32>,
+        armed: bool,
+    }
+    impl Drop for CountGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                self.counter.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let mut queued_guard = CountGuard { counter: queued_count.clone(), armed: true };
+    let mut _active_guard = CountGuard { counter: active_count.clone(), armed: false };
+
     // Wait for the uploader to grant a slot. Don't re-request; eMule
     // uploaders push OP_ACCEPTUPLOADREQ when a slot opens.
     let queue_start = std::time::Instant::now();
@@ -506,6 +577,10 @@ async fn download_parts_from_source(
             Err(_) => anyhow::bail!("timed out waiting for upload slot"),
         };
         if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
+            queued_guard.armed = false;
+            queued_count.fetch_sub(1, Ordering::Relaxed);
+            active_count.fetch_add(1, Ordering::Relaxed);
+            _active_guard.armed = true;
             break;
         }
         if proto == OP_EDONKEYHEADER && opcode == OP_OUTOFPARTREQS {

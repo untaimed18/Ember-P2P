@@ -330,6 +330,8 @@ impl Database {
                     failure_reason: None,
                     priority: "normal".to_string(),
                     sources: 0,
+                    active_sources: 0,
+                    queued_sources: 0,
                 })
             })?
             .filter_map(|r| r.ok())

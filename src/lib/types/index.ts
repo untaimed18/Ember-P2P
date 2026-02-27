@@ -64,6 +64,8 @@ export interface Transfer {
   failure_reason?: string;
   priority: 'low' | 'normal' | 'high' | 'auto';
   sources: number;
+  active_sources: number;
+  queued_sources: number;
 }
 
 export interface SearchResult {

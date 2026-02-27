@@ -1,5 +1,6 @@
 <script lang="ts">
   import { page } from '$app/stores';
+  import { goto } from '$app/navigation';
 
   const navItems = [
     { href: '/', label: 'KAD Network', icon: '⊛' },
@@ -9,6 +10,11 @@
     { href: '/security', label: 'Security', icon: '🛡' },
     { href: '/settings', label: 'Settings', icon: '⚙' },
   ];
+
+  function navigate(e: MouseEvent, href: string) {
+    e.preventDefault();
+    goto(href);
+  }
 </script>
 
 <nav class="sidebar">
@@ -24,6 +30,7 @@
           href={item.href}
           class:active={$page.url.pathname === item.href}
           aria-current={$page.url.pathname === item.href ? 'page' : undefined}
+          onclick={(e: MouseEvent) => navigate(e, item.href)}
         >
           <span class="nav-icon" aria-hidden="true">{item.icon}</span>
           <span class="nav-label">{item.label}</span>

@@ -58,11 +58,6 @@ impl KBucket {
     fn needs_refresh(&self, now: i64) -> bool {
         now - self.last_refresh > BUCKET_REFRESH_INTERVAL_SECS
     }
-
-    /// A bucket needs filling if it has contacts but is below 20% capacity.
-    fn needs_fill(&self) -> bool {
-        !self.contacts.is_empty() && self.contacts.len() < K_BUCKET_SIZE / 5
-    }
 }
 
 impl RoutingTable {
@@ -422,16 +417,19 @@ impl RoutingTable {
         self.global_subnet_count.clear();
     }
 
-    /// Return bucket indices that need a refresh (stale > 1h OR nearly empty/empty).
+    /// Return bucket indices that need a refresh.
     /// Matches eMule OnBigTimer: a zone gets a RandomLookup if it is a leaf zone and
     /// (zone_index < KK || level < KBASE || bin_remaining >= K*0.8).
-    /// Empty buckets qualify because remaining == K >= K*0.8 in eMule.
+    /// Empty buckets qualify (remaining == K >= K*0.8), but must still respect the
+    /// refresh interval so `mark_refreshed` prevents re-searching every tick.
     pub fn stale_buckets(&self, now: i64) -> Vec<usize> {
         self.buckets
             .iter()
             .enumerate()
             .filter(|(i, b)| {
-                if !b.needs_refresh(now) && !b.needs_fill() && !b.contacts.is_empty() {
+                // All buckets (empty or not) must be past their refresh interval.
+                // This ensures mark_refreshed() is respected.
+                if !b.needs_refresh(now) {
                     return false;
                 }
                 // eMule OnBigTimer: zone_index < KK || level < KBASE || remaining >= K*0.8
@@ -446,11 +444,15 @@ impl RoutingTable {
     }
 
     /// Return bucket indices that are nearly empty or empty and need filling.
+    /// Only returns buckets that haven't been recently refreshed.
     pub fn buckets_needing_fill(&self) -> Vec<usize> {
+        let now = chrono::Utc::now().timestamp();
         self.buckets
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.contacts.len() < K_BUCKET_SIZE / 5)
+            .filter(|(_, b)| {
+                b.contacts.len() < K_BUCKET_SIZE / 5 && b.needs_refresh(now)
+            })
             .map(|(i, _)| i)
             .collect()
     }

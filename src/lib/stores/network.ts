@@ -77,10 +77,13 @@ export function startStatsPoll() {
   const interval = setInterval(async () => {
     if (Date.now() - lastEventUpdate < 2000) return;
     try {
-      const stats = await getNetworkStats();
+      const stats = await Promise.race([
+        getNetworkStats(),
+        new Promise<never>((_, reject) => setTimeout(() => reject('timeout'), 4000)),
+      ]);
       networkStats.set(stats);
     } catch {
-      // Ignore polling errors
+      // Ignore polling errors and timeouts
     }
   }, 3000);
 

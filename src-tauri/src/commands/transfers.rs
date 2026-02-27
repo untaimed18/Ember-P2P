@@ -58,6 +58,8 @@ pub async fn start_download(
         failure_reason: None,
         priority: "normal".to_string(),
         sources: if has_source { 1 } else { 0 },
+        active_sources: 0,
+        queued_sources: 0,
     };
 
     {

@@ -30,12 +30,23 @@
     return () => { if (pollInterval) clearInterval(pollInterval); };
   });
 
+  function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
+    ]);
+  }
+
   async function refresh() {
     loading = true;
     try {
-      [folders, files] = await Promise.all([getSharedFolders(), getSharedFiles()]);
+      [folders, files] = await withTimeout(
+        Promise.all([getSharedFolders(), getSharedFiles()]),
+        4000,
+      );
     } catch (e) {
-      console.error('Failed to load shared files:', e);
+      if (e instanceof Error && e.message !== 'timeout')
+        console.error('Failed to load shared files:', e);
     } finally {
       loading = false;
     }
@@ -43,7 +54,7 @@
 
   async function refreshFiles() {
     try {
-      files = await getSharedFiles();
+      files = await withTimeout(getSharedFiles(), 4000);
     } catch { /* ignore */ }
   }
 

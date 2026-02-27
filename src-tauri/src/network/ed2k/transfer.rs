@@ -48,6 +48,12 @@ pub enum DownloadEvent {
         downloaded: u64,
         total: u64,
     },
+    SourcesUpdate {
+        transfer_id: String,
+        total: u32,
+        active: u32,
+        queued: u32,
+    },
     Completed {
         transfer_id: String,
     },
@@ -235,6 +241,15 @@ impl Ed2kDownload {
         let upload_req = build_file_request(&self.file_hash);
         write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_STARTUPLOADREQ, &upload_req).await?;
 
+        let _ = event_tx
+            .send(DownloadEvent::SourcesUpdate {
+                transfer_id: self.transfer_id.clone(),
+                total: 1,
+                active: 0,
+                queued: 1,
+            })
+            .await;
+
         // Wait for AcceptUploadReq. The uploader decides when to grant a slot;
         // we simply keep the connection open and listen. Re-requesting too
         // aggressively gets clients penalised by eMule servers.
@@ -269,6 +284,14 @@ impl Ed2kDownload {
 
             if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
                 debug!("Upload accepted");
+                let _ = event_tx
+                    .send(DownloadEvent::SourcesUpdate {
+                        transfer_id: self.transfer_id.clone(),
+                        total: 1,
+                        active: 1,
+                        queued: 0,
+                    })
+                    .await;
                 break;
             }
 

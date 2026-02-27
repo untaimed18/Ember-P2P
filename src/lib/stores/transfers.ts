@@ -69,11 +69,11 @@ export async function initTransferStore() {
     );
   }));
 
-  unlisteners.push(await listen<TransferEventPayload & { status?: string; peer_id?: string }>(
+  unlisteners.push(await listen<TransferEventPayload & { status?: string; peer_id?: string; sources?: number }>(
     'transfer-status',
     (event) => {
       markEventUpdate();
-      const { id, status, peer_id } = event.payload;
+      const { id, status, peer_id, sources } = event.payload;
       transfers.update((list) =>
         list.map((t) => {
           if (t.id !== id) return t;
@@ -83,7 +83,22 @@ export async function initTransferStore() {
             updated.peer_id = peer_id;
             updated.peer_name = peer_id;
           }
+          if (sources !== undefined) updated.sources = sources;
           return updated;
+        })
+      );
+    }
+  ));
+
+  unlisteners.push(await listen<{ id: string; sources: number; active_sources: number; queued_sources: number }>(
+    'transfer-sources',
+    (event) => {
+      markEventUpdate();
+      const { id, sources, active_sources, queued_sources } = event.payload;
+      transfers.update((list) =>
+        list.map((t) => {
+          if (t.id !== id) return t;
+          return { ...t, sources, active_sources, queued_sources };
         })
       );
     }
@@ -112,10 +127,13 @@ function markEventUpdate() {
 export function startTransferPoll() {
   const interval = setInterval(async () => {
     try {
-      const all = await getTransfers();
+      const all = await Promise.race([
+        getTransfers(),
+        new Promise<never>((_, reject) => setTimeout(() => reject('timeout'), 4000)),
+      ]);
       transfers.set(all);
     } catch {
-      // Ignore
+      // Ignore timeouts and errors
     }
   }, 3000);
 

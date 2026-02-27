@@ -110,6 +110,15 @@
       default: return t.status;
     }
   }
+  function sourcesLabel(t: Transfer): string {
+    if (!t.sources) return '\u2014';
+    const active = t.active_sources || 0;
+    const queued = t.queued_sources || 0;
+    const current = active + queued;
+    if (current > 0 && current !== t.sources) return `${current}/${t.sources}`;
+    return `${t.sources}`;
+  }
+
   function ulStatusLabel(t: Transfer): string {
     switch (t.status) {
       case 'active': return 'Transferring';
@@ -252,7 +261,7 @@
                   />
                 {/if}
               </td>
-              <td class="num-cell">{t.sources || '\u2014'}</td>
+              <td class="num-cell" title={t.sources ? `${t.active_sources || 0} active, ${t.queued_sources || 0} queued of ${t.sources} total` : ''}>{sourcesLabel(t)}</td>
               <td class="prio-cell">
                 <span class="prio-badge prio-{t.priority}">{t.priority.charAt(0).toUpperCase() + t.priority.slice(1)}</span>
               </td>

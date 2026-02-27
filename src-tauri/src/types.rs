@@ -70,6 +70,10 @@ pub struct Transfer {
     pub priority: String,
     #[serde(default)]
     pub sources: u32,
+    #[serde(default)]
+    pub active_sources: u32,
+    #[serde(default)]
+    pub queued_sources: u32,
 }
 
 fn default_priority() -> String {
