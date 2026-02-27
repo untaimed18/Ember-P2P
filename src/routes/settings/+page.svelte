@@ -228,17 +228,6 @@
             Requires restart to take effect.
           </span>
         </div>
-        <div class="field toggle-field">
-          <label class="toggle-label">
-            <input type="checkbox" bind:checked={settings.nat_traversal_enabled} />
-            <span>NAT Traversal (Firewall Detection, Buddy System)</span>
-          </label>
-          <span class="field-hint">
-            Enable firewall probing and the buddy relay system for firewalled clients.
-            Disable if you don't need NAT traversal assistance.
-            Requires restart to take effect.
-          </span>
-        </div>
         <div class="field">
           <label>Update Bootstrap Nodes</label>
           <div class="nodes-download">

@@ -91,7 +91,6 @@ export interface AppSettings {
   tcp_port: number;
   udp_port: number;
   nodes_dat_path: string;
-  nat_traversal_enabled: boolean;
   upnp_enabled: boolean;
   obfuscation_enabled: boolean;
   ip_filter_enabled: boolean;

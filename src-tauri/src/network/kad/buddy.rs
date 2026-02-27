@@ -87,7 +87,7 @@ impl BuddyManager {
             return false;
         }
         let now = chrono::Utc::now().timestamp();
-        now - self.last_find_attempt > 300 // Every 5 minutes
+        now - self.last_find_attempt > 1200 // Every 20 minutes (eMule: MIN2S(20))
     }
 
     pub fn start_finding(&mut self) {

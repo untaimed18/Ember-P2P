@@ -154,7 +154,6 @@ pub struct AppSettings {
     pub tcp_port: u16,
     pub udp_port: u16,
     pub nodes_dat_path: String,
-    pub nat_traversal_enabled: bool,
     pub upnp_enabled: bool,
     /// Prefer obfuscated (encrypted) KAD communication when the peer supports it
     #[serde(default = "default_true")]
@@ -192,7 +191,6 @@ impl Default for AppSettings {
             tcp_port: DEFAULT_TCP_PORT,
             udp_port: DEFAULT_UDP_PORT,
             nodes_dat_path: String::new(),
-            nat_traversal_enabled: true,
             upnp_enabled: true,
             obfuscation_enabled: true,
             ip_filter_enabled: true,

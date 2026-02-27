@@ -170,7 +170,6 @@ struct NetworkState {
     udp_key_seed: u32,
     tcp_port: u16,
     udp_port: u16,
-    nat_traversal_enabled: bool,
     upnp_mapped: bool,
     /// IP filter for blocking known-bad ranges (eMule ipfilter.dat compatible)
     ip_filter: IpFilter,
@@ -182,6 +181,12 @@ struct NetworkState {
     firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
     /// Whether we've done the initial self-lookup (FindNode for own ID)
     self_lookup_done: bool,
+    /// Timestamp of last firewall recheck (eMule rechecks every hour)
+    last_firewall_check: i64,
+    /// Whether UDP is firewalled (separate from TCP, like eMule)
+    udp_firewalled: bool,
+    /// Whether UDP firewall status has been verified
+    udp_fw_verified: bool,
 }
 
 pub async fn start_network(
@@ -306,7 +311,6 @@ pub async fn start_network(
 
     let _ = app_handle.emit("network-status", NetworkStatus::Connecting);
 
-    let nat_traversal_enabled = settings.nat_traversal_enabled;
     let upnp_enabled = settings.upnp_enabled;
 
     // Attempt UPnP port mapping (only if UPnP is enabled)
@@ -393,13 +397,15 @@ pub async fn start_network(
         udp_key_seed,
         tcp_port,
         udp_port,
-        nat_traversal_enabled,
         upnp_mapped: upnp_success,
         ip_filter,
         banned_ips,
         obfuscation_enabled: settings.obfuscation_enabled,
         firewalled_shared: Arc::new(std::sync::atomic::AtomicBool::new(!upnp_success)),
         self_lookup_done: false,
+        last_firewall_check: chrono::Utc::now().timestamp(),
+        udp_firewalled: true,
+        udp_fw_verified: false,
     };
 
     // Send bootstrap requests to initial contacts
@@ -412,28 +418,24 @@ pub async fn start_network(
         }
     }
 
-    if nat_traversal_enabled {
-        // Send FirewalledReq to a few contacts to detect our external IP
-        for contact in boot_contacts.iter().take(3) {
-            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-            let msg = KadMessage::FirewalledReq { tcp_port };
-            if let Ok(packet) = messages::encode_packet(&msg) {
-                let _ = udp_socket.send_to(&packet, addr).await;
-                state.firewall_checks_sent += 1;
-            }
+    // Send FirewalledReq to a few contacts to detect our external IP (always-on, like eMule)
+    for contact in boot_contacts.iter().take(3) {
+        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+        let msg = KadMessage::FirewalledReq { tcp_port };
+        if let Ok(packet) = messages::encode_packet(&msg) {
+            let _ = udp_socket.send_to(&packet, addr).await;
+            state.firewall_checks_sent += 1;
         }
-        debug!("Sent {} firewall check requests", state.firewall_checks_sent);
+    }
+    debug!("Sent {} firewall check requests", state.firewall_checks_sent);
 
-        // Send Ping to detect our external UDP port
-        for contact in boot_contacts.iter().skip(3).take(3) {
-            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-            let msg = KadMessage::Ping;
-            if let Ok(packet) = messages::encode_packet(&msg) {
-                let _ = udp_socket.send_to(&packet, addr).await;
-            }
+    // Send Ping to detect our external UDP port
+    for contact in boot_contacts.iter().skip(3).take(3) {
+        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+        let msg = KadMessage::Ping;
+        if let Ok(packet) = messages::encode_packet(&msg) {
+            let _ = udp_socket.send_to(&packet, addr).await;
         }
-    } else {
-        info!("NAT traversal disabled -- skipping firewall/port detection probes");
     }
 
     // Download event channel
@@ -955,6 +957,50 @@ pub async fn start_network(
                     }
                 }
 
+                // Periodic firewall recheck (eMule: every 1 hour)
+                let now_ts = chrono::Utc::now().timestamp();
+                if now_ts - state.last_firewall_check >= 3600 && table_size >= 10 {
+                    state.last_firewall_check = now_ts;
+                    state.firewall_checks_sent = 0;
+                    state.firewall_responses.clear();
+                    state.udp_port_responses.clear();
+
+                    let fw_contacts: Vec<KadContact> = state
+                        .routing_table
+                        .all_contacts()
+                        .filter(|c| c.verified && c.contact_type <= CONTACT_TYPE_OPEN)
+                        .take(3)
+                        .cloned()
+                        .collect();
+                    for contact in &fw_contacts {
+                        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                        let msg = KadMessage::FirewalledReq { tcp_port: state.tcp_port };
+                        if let Ok(packet) = messages::encode_packet(&msg) {
+                            let _ = udp_socket.send_to(&packet, addr).await;
+                            state.firewall_checks_sent += 1;
+                        }
+                    }
+                    for contact in state.routing_table.all_contacts().skip(3).take(3) {
+                        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                        let msg = KadMessage::Ping;
+                        if let Ok(packet) = messages::encode_packet(&msg) {
+                            let _ = udp_socket.send_to(&packet, addr).await;
+                        }
+                    }
+                    info!("Periodic firewall recheck: sent {} checks + ping probes", state.firewall_checks_sent);
+                }
+
+                // Sync firewalled status from async tasks (spawned TCP probes update the atomic)
+                let fw_from_shared = state.firewalled_shared.load(std::sync::atomic::Ordering::Relaxed);
+                if state.firewalled != fw_from_shared {
+                    state.firewalled = fw_from_shared;
+                    state.stats.firewalled = fw_from_shared;
+                    if let Some(ip) = state.external_ip {
+                        state.stats.external_ip = ip.to_string();
+                    }
+                    state.stats.upnp_mapped = state.upnp_mapped;
+                }
+
                 let count = state.routing_table.len() as u32;
                 info!("Routing table: {count} contacts");
                 if count > 0 && state.stats.status != NetworkStatus::Connected {
@@ -1161,10 +1207,9 @@ pub async fn start_network(
                 }
             }
 
-            // Buddy system: find a relay buddy if firewalled (only when NAT traversal is enabled)
+            // Buddy system: find a relay buddy if firewalled (always-on, like eMule)
             _ = buddy_timer.tick() => {
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
-                if !state.nat_traversal_enabled { continue; }
                 state.buddy_manager.check_buddy_alive().await;
                 if state.buddy_manager.should_find_buddy(state.firewalled) {
                     state.buddy_manager.start_finding();
@@ -2113,8 +2158,7 @@ async fn handle_udp_packet(
             if let Some(id) = sender_id {
                 state.routing_table.handle_pong(&id);
             }
-            // External UDP port detection (only when NAT traversal is enabled)
-            if udp_port > 0 && state.nat_traversal_enabled {
+            if udp_port > 0 {
                 state.udp_port_responses.push(udp_port);
                 if state.udp_port_responses.len() >= 2 {
                     let mut counts: HashMap<u16, usize> = HashMap::new();
@@ -2329,7 +2373,6 @@ async fn handle_udp_packet(
         }
 
         KadMessage::FirewalledRes { ip } => {
-            if !state.nat_traversal_enabled { return; }
             let external_ip = Ipv4Addr::from(ip.to_be_bytes());
             info!("FirewalledRes: our external IP is {external_ip}");
             state.firewall_responses.push(external_ip);
@@ -2379,7 +2422,6 @@ async fn handle_udp_packet(
         }
 
         KadMessage::Firewalled2Req { tcp_port: peer_tcp_port, user_hash: _, connect_options: _ } => {
-            if !state.nat_traversal_enabled { return; }
             let ip_raw = match from.ip() {
                 std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
                 _ => return,
@@ -2408,15 +2450,18 @@ async fn handle_udp_packet(
         }
 
         KadMessage::FirewallUdp { error_code, udp_port } => {
-            if !state.nat_traversal_enabled { return; }
             debug!("FirewallUdp from {from}: error={error_code}, port={udp_port}");
             if error_code == 0 {
-                info!("UDP firewall test passed - UDP port {udp_port} is reachable");
+                // UDP port is reachable (like eMule SetUDPFWCheckResult success)
+                state.udp_firewalled = false;
+                state.udp_fw_verified = true;
+                info!("UDP firewall test passed - UDP port {udp_port} is reachable, not UDP-firewalled");
+            } else {
+                info!("UDP firewall test failed from {from} (error={error_code})");
             }
         }
 
         KadMessage::FindBuddyReq { buddy_id, user_id, tcp_port: peer_tcp_port } => {
-            if !state.nat_traversal_enabled { return; }
             debug!("FindBuddyReq from {from}: buddy_id={buddy_id}, user_id={user_id}");
             if !state.firewalled && !state.buddy_manager.is_serving() {
                 let res = KadMessage::FindBuddyRes {
@@ -2457,7 +2502,6 @@ async fn handle_udp_packet(
         }
 
         KadMessage::FindBuddyRes { buddy_id, user_hash: _, tcp_port: peer_tcp_port, .. } => {
-            if !state.nat_traversal_enabled { return; }
             debug!("FindBuddyRes from {from}: buddy_id={buddy_id}, tcp_port={peer_tcp_port}");
             if state.buddy_manager.state() == BuddyState::FindingBuddy {
                 let buddy_ip = match from.ip() {
@@ -2910,15 +2954,14 @@ async fn handle_command(
                 info!("Sent bootstrap requests to {} existing contacts", contacts.len().min(20));
             }
 
-            if state.nat_traversal_enabled {
-                let fw_contacts: Vec<KadContact> = state.routing_table.all_contacts().take(3).cloned().collect();
-                for contact in &fw_contacts {
-                    let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-                    let msg = KadMessage::FirewalledReq { tcp_port: state.tcp_port };
-                    if let Ok(packet) = messages::encode_packet(&msg) {
-                        let _ = socket.send_to(&packet, addr).await;
-                        state.firewall_checks_sent += 1;
-                    }
+            // Always send firewall check probes on connect (like eMule)
+            let fw_contacts: Vec<KadContact> = state.routing_table.all_contacts().take(3).cloned().collect();
+            for contact in &fw_contacts {
+                let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                let msg = KadMessage::FirewalledReq { tcp_port: state.tcp_port };
+                if let Ok(packet) = messages::encode_packet(&msg) {
+                    let _ = socket.send_to(&packet, addr).await;
+                    state.firewall_checks_sent += 1;
                 }
             }
         }
@@ -2962,6 +3005,9 @@ async fn handle_command(
             state.firewall_responses.clear();
             state.udp_port_responses.clear();
             state.self_lookup_done = false;
+            state.last_firewall_check = 0;
+            state.udp_firewalled = true;
+            state.udp_fw_verified = false;
             state.overloaded_nodes.clear();
             state.buddy_manager.reset();
             state.peer_nicknames.clear();
