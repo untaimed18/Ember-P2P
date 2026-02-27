@@ -17,6 +17,27 @@ export function formatSpeed(bytesPerSec: number): string {
   return `${formatBytes(bytesPerSec)}/s`;
 }
 
+/** Format remaining time given total size, transferred bytes, and current speed. */
+export function formatEta(totalSize: number, transferred: number, speed: number): string {
+  if (speed <= 0 || transferred >= totalSize) return '\u2014';
+  const remaining = totalSize - transferred;
+  const secs = Math.round(remaining / speed);
+  if (secs < 60) return '< 1m';
+  const days = Math.floor(secs / 86400);
+  const hrs = Math.floor((secs % 86400) / 3600);
+  const mins = Math.floor((secs % 3600) / 60);
+  if (days > 0) return `${days}d ${hrs}h`;
+  if (hrs > 0) return `${hrs}h ${mins}m`;
+  return `${mins}m`;
+}
+
+/** Format a unix timestamp as a short date string. */
+export function formatDate(ts: number): string {
+  if (!ts || ts <= 0) return '\u2014';
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
 /**
  * Format a speed for the settings page where 0 means "Unlimited".
  */

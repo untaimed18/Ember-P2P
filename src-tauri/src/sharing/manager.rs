@@ -184,6 +184,14 @@ impl TransferManager {
         self.last_progress.remove(id);
     }
 
+    pub fn set_priority(&mut self, id: &str, priority: &str) {
+        if let Some(transfer) = self.active.get_mut(id) {
+            transfer.priority = priority.to_string();
+        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
+            transfer.priority = priority.to_string();
+        }
+    }
+
     pub fn all_controls(&self) -> Vec<Arc<TransferControl>> {
         self.controls.values().cloned().collect()
     }

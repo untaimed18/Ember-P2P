@@ -55,6 +55,8 @@ export interface Transfer {
   transferred: number;
   started_at: number;
   failure_reason?: string;
+  priority: 'low' | 'normal' | 'high' | 'auto';
+  sources: number;
 }
 
 export interface SearchResult {

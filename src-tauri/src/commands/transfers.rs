@@ -56,6 +56,8 @@ pub async fn start_download(
         transferred: 0,
         started_at: chrono::Utc::now().timestamp(),
         failure_reason: None,
+        priority: "normal".to_string(),
+        sources: if has_source { 1 } else { 0 },
     };
 
     {
@@ -154,6 +156,45 @@ pub async fn get_transfers(
 ) -> Result<Vec<Transfer>, String> {
     let manager = state.transfer_manager.read().await;
     Ok(manager.get_all())
+}
+
+#[tauri::command]
+pub async fn set_transfer_priority(
+    state: tauri::State<'_, AppState>,
+    transfer_id: String,
+    priority: String,
+) -> Result<(), String> {
+    let valid = ["low", "normal", "high", "auto"];
+    if !valid.contains(&priority.as_str()) {
+        return Err(format!("Invalid priority: {priority}. Must be one of: {valid:?}"));
+    }
+    let mut manager = state.transfer_manager.write().await;
+    manager.set_priority(&transfer_id, &priority);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn pause_all_transfers(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let mut manager = state.transfer_manager.write().await;
+    let ids: Vec<String> = manager.active.keys().cloned().collect();
+    for id in ids {
+        manager.pause(&id);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn resume_all_transfers(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let mut manager = state.transfer_manager.write().await;
+    let ids: Vec<String> = manager.active.keys().cloned().collect();
+    for id in ids {
+        manager.resume(&id);
+    }
+    Ok(())
 }
 
 #[tauri::command]

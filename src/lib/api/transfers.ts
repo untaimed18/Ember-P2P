@@ -40,3 +40,15 @@ export async function getTransfers(): Promise<Transfer[]> {
 export async function clearCompleted(): Promise<number> {
   return invoke('clear_completed');
 }
+
+export async function setTransferPriority(transferId: string, priority: string): Promise<void> {
+  return invoke('set_transfer_priority', { transferId, priority });
+}
+
+export async function pauseAllTransfers(): Promise<void> {
+  return invoke('pause_all_transfers');
+}
+
+export async function resumeAllTransfers(): Promise<void> {
+  return invoke('resume_all_transfers');
+}

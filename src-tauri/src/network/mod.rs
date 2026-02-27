@@ -2807,6 +2807,8 @@ async fn handle_command(
                     transferred: 0,
                     started_at: now,
                     failure_reason: None,
+                    priority: "normal".to_string(),
+                    sources: 0,
                 };
                 let _ = db.save_transfer(&db_transfer);
 
@@ -3417,6 +3419,8 @@ async fn handle_upload_event(
                 transferred: 0,
                 started_at: chrono::Utc::now().timestamp(),
                 failure_reason: None,
+                priority: "normal".to_string(),
+                sources: 0,
             };
             {
                 let mut mgr = transfer_manager.write().await;

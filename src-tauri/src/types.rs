@@ -41,6 +41,14 @@ pub struct Transfer {
     pub started_at: i64,
     #[serde(default)]
     pub failure_reason: Option<String>,
+    #[serde(default = "default_priority")]
+    pub priority: String,
+    #[serde(default)]
+    pub sources: u32,
+}
+
+fn default_priority() -> String {
+    "normal".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

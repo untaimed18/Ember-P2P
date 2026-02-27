@@ -316,6 +316,8 @@ impl Database {
                     transferred: row.get::<_, i64>(10)? as u64,
                     started_at: row.get(11)?,
                     failure_reason: None,
+                    priority: "normal".to_string(),
+                    sources: 0,
                 })
             })?
             .filter_map(|r| r.ok())
