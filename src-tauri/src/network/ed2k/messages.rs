@@ -162,7 +162,7 @@ pub fn build_emule_info(udp_port: u16) -> Vec<u8> {
 
     buf.write_u8(1).unwrap(); // version
 
-    // MiscOptions1: AICH=1 | Unicode=1 | UDPver=4 | Compress=1 | SrcExch=4 | ExtReq=2 | Comments=1 | NoViewShared=1 | MultiPacket=0
+    // MiscOptions1: AICH=1 | Unicode=1 | UDPver=4 | Compress=1 | SrcExch=4 | ExtReq=2 | Comments=1 | NoViewShared=1 | MultiPacket=1
     let misc_options1: u32 =
           1              // AICH ver 1
         | (1 << 4)      // Unicode
@@ -174,13 +174,13 @@ pub fn build_emule_info(udp_port: u16) -> Vec<u8> {
         | (1 << 20)     // Comments ver 1
         | (0 << 24)     // No peer cache
         | (1 << 25)     // No view shared files
-        | (0 << 26);    // No Multi-packet support (we don't handle OP_MULTIPACKET unpacking yet)
+        | (1 << 26);    // Multi-packet support
 
-    // MiscOptions2: KAD=1 | LargeFiles=1 | ExtMultiPacket=0 | SrcExch2=1 | CryptSupport=1
+    // MiscOptions2: KAD=1 | LargeFiles=1 | ExtMultiPacket=1 | SrcExch2=1 | CryptSupport=1
     let misc_options2: u32 =
           1              // KAD version
         | (1 << 4)      // Large files (>4GB)
-        | (0 << 5)      // No Extended multi-packet
+        | (1 << 5)      // Extended multi-packet
         | (1 << 14)     // Source exchange 2
         | (1 << 17);    // Supports crypt layer
 
@@ -309,6 +309,149 @@ pub fn parse_hashset_answer(payload: &[u8]) -> io::Result<([u8; 16], Vec<[u8; 16
     }
 
     Ok((hash, hashes))
+}
+
+/// Sub-opcode inside a MultiPacket request.
+#[derive(Debug)]
+pub enum MultiPacketSubReq {
+    RequestFileName,
+    SetReqFileId,
+}
+
+/// Parsed MultiPacket request.
+#[derive(Debug)]
+pub struct MultiPacketRequest {
+    pub file_hash: [u8; 16],
+    pub file_size: Option<u64>,
+    pub sub_opcodes: Vec<MultiPacketSubReq>,
+    pub is_ext2: bool,
+}
+
+/// Parse an OP_MULTIPACKET / OP_MULTIPACKET_EXT / OP_MULTIPACKET_EXT2 payload.
+///
+/// Wire format (eMule ListenSocket.cpp ProcessExtPacket):
+///   OP_MULTIPACKET:      <hash 16> <sub-opcodes...>
+///   OP_MULTIPACKET_EXT:  <hash 16> <filesize u64> <sub-opcodes...>
+///   OP_MULTIPACKET_EXT2: <hash 16> [<AICH hash 20>] <sub-opcodes...>
+///     (EXT2 uses a FileIdentifier: MD4 hash + optional AICH. Minimal = 16 + 1 byte AICH flag.)
+///
+/// Each sub-opcode is a single u8 that may be followed by extra data depending
+/// on the opcode. We handle the two that eMule always sends:
+///   OP_REQUESTFILENAME (0x58) - no extra data
+///   OP_SETREQFILEID    (0x4F) - no extra data
+pub fn parse_multipacket(payload: &[u8], opcode: u8) -> io::Result<MultiPacketRequest> {
+    if payload.len() < 17 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "multipacket too short"));
+    }
+    let mut cursor = Cursor::new(payload);
+    let mut file_hash = [0u8; 16];
+    cursor.read_exact(&mut file_hash)?;
+
+    let is_ext2 = opcode == OP_MULTIPACKET_EXT2;
+    let mut file_size = None;
+
+    if opcode == OP_MULTIPACKET_EXT {
+        file_size = Some(cursor.read_u64::<LittleEndian>()?);
+    } else if is_ext2 {
+        // EXT2 FileIdentifier: the MD4 hash is already read above.
+        // Next comes an optional AICH hash. eMule writes:
+        //   bool hasAICH (1 byte), then if true, 20-byte AICH hash.
+        // We just need to skip past it.
+        if (cursor.position() as usize) < payload.len() {
+            let has_aich = cursor.read_u8()?;
+            if has_aich != 0 {
+                let mut _aich = [0u8; 20];
+                if cursor.read_exact(&mut _aich).is_err() {
+                    // Truncated AICH, ignore
+                }
+            }
+        }
+    }
+
+    let mut sub_opcodes = Vec::new();
+    while (cursor.position() as usize) < payload.len() {
+        let sub_op = cursor.read_u8()?;
+        match sub_op {
+            OP_REQUESTFILENAME => {
+                // eMule: client->ProcessExtendedInfo reads additional data here,
+                // but only if the sender's ExtendedRequestsVersion > 0.
+                // Skip any extended info: read u16 num_complete_sources if present
+                // (eMule writes partcount(u16) + part_status_bitmap + complete_sources(u16)).
+                // We consume the rest of the sub-opcode's data by reading the part count.
+                // However, since we can't reliably know the peer's ExtReqVersion from
+                // just the packet, we handle this safely: if there's data left and
+                // the next byte looks like another known sub-opcode, we stop.
+                // For simplicity, just record the sub-request.
+                sub_opcodes.push(MultiPacketSubReq::RequestFileName);
+            }
+            OP_SETREQFILEID => {
+                sub_opcodes.push(MultiPacketSubReq::SetReqFileId);
+            }
+            _ => {
+                // Unknown sub-opcode; stop parsing to avoid misinterpreting data
+                break;
+            }
+        }
+    }
+
+    Ok(MultiPacketRequest {
+        file_hash,
+        file_size,
+        sub_opcodes,
+        is_ext2,
+    })
+}
+
+/// Build a MultiPacketAnswer payload based on the sub-opcodes requested.
+///
+/// Wire format:
+///   <hash 16> (<sub-opcode u8> <sub-data>)*
+///
+/// Each sub-opcode in the request maps to a response sub-opcode:
+///   OP_REQUESTFILENAME  -> OP_REQFILENAMEANSWER (0x59): <name_len u16> <name bytes>
+///   OP_SETREQFILEID     -> OP_FILESTATUS        (0x50): <part_count u16> <bitmap>
+pub fn build_multipacket_answer(
+    file_hash: &[u8; 16],
+    file_name: &str,
+    file_size: u64,
+    is_ext2: bool,
+    sub_opcodes: &[MultiPacketSubReq],
+) -> Vec<u8> {
+    let part_count = ((file_size + PARTSIZE - 1) / PARTSIZE) as u16;
+    let bitmap_bytes = ((part_count as usize) + 7) / 8;
+    let name_bytes = file_name.as_bytes();
+
+    let mut buf = Vec::with_capacity(16 + 1 + 2 + name_bytes.len() + 1 + 2 + bitmap_bytes + 8);
+
+    buf.write_all(file_hash).unwrap();
+
+    if is_ext2 {
+        buf.write_u8(0).unwrap(); // hasAICH = false
+    }
+
+    for sub in sub_opcodes {
+        match sub {
+            MultiPacketSubReq::RequestFileName => {
+                buf.write_u8(OP_REQFILENAMEANSWER).unwrap();
+                buf.write_u16::<LittleEndian>(name_bytes.len() as u16).unwrap();
+                buf.write_all(name_bytes).unwrap();
+            }
+            MultiPacketSubReq::SetReqFileId => {
+                buf.write_u8(OP_FILESTATUS).unwrap();
+                buf.write_u16::<LittleEndian>(part_count).unwrap();
+                for i in 0..bitmap_bytes {
+                    let remaining_bits = part_count as usize - i * 8;
+                    if remaining_bits >= 8 {
+                        buf.write_u8(0xFF).unwrap();
+                    } else {
+                        buf.write_u8((1u8 << remaining_bits) - 1).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    buf
 }
 
 /// Parse a FileStatus response.

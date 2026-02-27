@@ -853,6 +853,72 @@ impl UploadHandler {
                     }
                 }
 
+                (OP_EMULEPROT, OP_MULTIPACKET)
+                | (OP_EMULEPROT, OP_MULTIPACKET_EXT)
+                | (OP_EMULEPROT, OP_MULTIPACKET_EXT2) => {
+                    match parse_multipacket(&payload, opcode) {
+                        Ok(mpreq) => {
+                            let hash_hex = hex::encode(mpreq.file_hash);
+                            let file_info = {
+                                let index = self.local_index.read().await;
+                                index.get_by_hash(&hash_hex).cloned()
+                            };
+
+                            if let Some(file) = file_info {
+                                current_file_hash = Some(mpreq.file_hash);
+                                total_size = file.size;
+
+                                if let Some(req_size) = mpreq.file_size {
+                                    if req_size != 0 && req_size != file.size {
+                                        debug!("MultiPacket size mismatch for {hash_hex}, sending FNF");
+                                        write_packet_async(
+                                            &mut writer,
+                                            OP_EDONKEYHEADER,
+                                            OP_FILEREQANSNOFIL,
+                                            &mpreq.file_hash,
+                                        )
+                                        .await?;
+                                        continue;
+                                    }
+                                }
+
+                                let answer = build_multipacket_answer(
+                                    &mpreq.file_hash,
+                                    &file.name,
+                                    file.size,
+                                    mpreq.is_ext2,
+                                    &mpreq.sub_opcodes,
+                                );
+
+                                let resp_opcode = if mpreq.is_ext2 {
+                                    OP_MULTIPACKETANSWER_EXT2
+                                } else {
+                                    OP_MULTIPACKETANSWER
+                                };
+                                write_packet_async(
+                                    &mut writer,
+                                    OP_EMULEPROT,
+                                    resp_opcode,
+                                    &answer,
+                                )
+                                .await?;
+                                debug!("Sent MultiPacketAnswer for {hash_hex} to {peer_addr}");
+                            } else {
+                                write_packet_async(
+                                    &mut writer,
+                                    OP_EDONKEYHEADER,
+                                    OP_FILEREQANSNOFIL,
+                                    &mpreq.file_hash,
+                                )
+                                .await?;
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Failed to parse MultiPacket from {peer_addr}: {e}");
+                        }
+                    }
+                }
+
                 (OP_EMULEPROT, OP_REQUESTSOURCES) => {
                     if let Some(hash) = current_file_hash {
                         let exclude_ip = match peer_addr.ip() {
