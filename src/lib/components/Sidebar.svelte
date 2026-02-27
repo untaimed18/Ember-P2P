@@ -15,7 +15,10 @@
 
   function navigate(e: MouseEvent, href: string) {
     e.preventDefault();
-    goto(href);
+    if ($page.url.pathname === href) return;
+    goto(href).catch(() => {
+      window.location.href = href;
+    });
   }
 </script>
 

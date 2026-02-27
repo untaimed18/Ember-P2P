@@ -675,6 +675,8 @@ pub async fn start_network(
     let mut dead_source_timer = tokio::time::interval(std::time::Duration::from_secs(300));
     dead_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    let mut cache_write_handle: Option<tokio::task::JoinHandle<()>> = None;
+
     // Resume incomplete downloads from previous session
     if let Ok(incomplete) = db.get_incomplete_downloads() {
         let count = incomplete.len();
@@ -1237,6 +1239,10 @@ pub async fn start_network(
                     }
                 }
 
+                // Yield between major bootstrap sections so Tauri IPC handlers
+                // aren't starved in debug builds where this work is slow.
+                tokio::task::yield_now().await;
+
                 // Keep bootstrapping until we have a healthy routing table (~200 contacts)
                 if table_size < 200 {
                     // eMule: only send BootstrapReq to hardcoded nodes while NOT connected.
@@ -1296,6 +1302,8 @@ pub async fn start_network(
                     }
                 }
 
+                tokio::task::yield_now().await;
+
                 // Periodic firewall recheck (eMule: every 1 hour)
                 let now_ts = chrono::Utc::now().timestamp();
                 if now_ts - state.last_firewall_check >= 3600 && table_size >= 10 {
@@ -1328,6 +1336,8 @@ pub async fn start_network(
                     }
                     info!("Periodic firewall recheck: sent {} checks + ping probes", state.firewall_checks_sent);
                 }
+
+                tokio::task::yield_now().await;
 
                 // Sync firewalled status from async tasks (spawned TCP probes update the atomic)
                 let fw_from_shared = state.firewalled_shared.load(std::sync::atomic::Ordering::Relaxed);
@@ -1950,6 +1960,13 @@ pub async fn start_network(
 
             // Refresh shared peer/stats caches for frontend reads (non-blocking)
             _ = cache_refresh_timer.tick() => {
+                // Skip if previous write task hasn't finished yet — avoids
+                // accumulating queued writers on the RwLocks which would starve
+                // Tauri IPC read handlers and freeze the UI.
+                if cache_write_handle.as_ref().is_some_and(|h| !h.is_finished()) {
+                    continue;
+                }
+
                 let local_id = state.local_id;
                 let mut peers: Vec<PeerInfo> = Vec::new();
                 let mut cached_c: Vec<KadContactInfo> = Vec::new();
@@ -1975,6 +1992,10 @@ pub async fn start_network(
                         bootstrap: c.contact_type == CONTACT_TYPE_NEW && c.version == 0,
                     });
                 }
+
+                // Yield so Tauri IPC handlers can make progress between the
+                // heavy vector-building above and the stats/search snapshot below.
+                tokio::task::yield_now().await;
 
                 state.stats.connected_peers = state.routing_table.len() as u32;
                 state.stats.upload_speed = bandwidth_limiter.smoothed_upload_speed();
@@ -2087,7 +2108,7 @@ pub async fn start_network(
                 let s_conn = shared_connected_server.clone();
                 let s_tstats = shared_transfer_stats.clone();
                 let db_ref = db.clone();
-                tokio::spawn(async move {
+                cache_write_handle = Some(tokio::spawn(async move {
                     let banned_ids = tokio::task::spawn_blocking(move || {
                         db_ref.banned_peer_ids().unwrap_or_default()
                     }).await.unwrap_or_default();
@@ -2105,7 +2126,7 @@ pub async fn start_network(
                     *s_srv.write().await = cached_srv;
                     *s_conn.write().await = cached_conn_srv;
                     *s_tstats.write().await = cached_tstats;
-                });
+                }));
             }
         }
 

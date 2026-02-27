@@ -36,12 +36,21 @@
   let mounted = true;
 
   onMount(() => {
+    mounted = true;
+    refreshInProgress = false;
+    loading = true;
     refresh();
     const interval = setInterval(refresh, 5000);
     return () => {
       mounted = false;
       clearInterval(interval);
     };
+  });
+
+  $effect(() => {
+    if (!loading) return;
+    const safety = setTimeout(() => { loading = false; }, 6000);
+    return () => clearTimeout(safety);
   });
 
   function arraysEqual(a: KadContact[], b: KadContact[]): boolean {
