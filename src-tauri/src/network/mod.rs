@@ -2187,35 +2187,16 @@ pub async fn start_network(
                     continue;
                 }
 
+                // Collect raw contact data quickly (no hex/distance computation).
+                // The expensive conversions happen in the spawned background task.
                 let local_id = state.local_id;
-                let mut peers: Vec<PeerInfo> = Vec::new();
-                let mut cached_c: Vec<KadContactInfo> = Vec::new();
-                for c in state.routing_table.all_contacts().take(500) {
-                    let hex_id = c.id.to_hex();
-                    if peers.len() < 200 {
-                        peers.push(PeerInfo {
-                            id: hex_id.clone(),
-                            addresses: vec![format!("{}:{}", c.ip, c.udp_port)],
-                            nickname: state.peer_nicknames.get(&c.id).cloned().unwrap_or_default(),
-                            last_seen: c.last_seen,
-                            files_shared: 0,
-                            banned: false,
-                        });
-                    }
-                    let distance = c.id.xor_distance(&local_id);
-                    cached_c.push(KadContactInfo {
-                        id: hex_id,
-                        contact_type: c.contact_type,
-                        version: c.version,
-                        distance: distance.to_hex(),
-                        ip_verified: c.verified,
-                        bootstrap: c.contact_type == CONTACT_TYPE_NEW && c.version == 0,
-                    });
-                }
-
-                // Yield so Tauri IPC handlers can make progress between the
-                // heavy vector-building above and the stats/search snapshot below.
-                tokio::task::yield_now().await;
+                let raw_contacts: Vec<_> = state.routing_table.all_contacts()
+                    .take(500)
+                    .map(|c| {
+                        let nick = state.peer_nicknames.get(&c.id).cloned().unwrap_or_default();
+                        (c.clone(), nick)
+                    })
+                    .collect();
 
                 state.stats.connected_peers = state.routing_table.len() as u32;
                 state.stats.upload_speed = bandwidth_limiter.smoothed_upload_speed();
@@ -2325,7 +2306,8 @@ pub async fn start_network(
 
                 let cached_tstats = stats_manager.get_stats();
 
-                // Spawn cache writes as a background task so the event loop isn't blocked
+                // Spawn ALL heavy work (hex conversion, distance computation, writes)
+                // as a background task so the event loop isn't blocked.
                 let sp = shared_peers.clone();
                 let ss = shared_stats.clone();
                 let sc = shared_contacts.clone();
@@ -2335,17 +2317,40 @@ pub async fn start_network(
                 let s_tstats = shared_transfer_stats.clone();
                 let db_ref = db.clone();
                 cache_write_handle = Some(tokio::spawn(async move {
+                    // Do the expensive hex/distance conversions here, off the event loop
+                    let mut peers: Vec<PeerInfo> = Vec::new();
+                    let mut cached_c: Vec<KadContactInfo> = Vec::new();
+                    for (c, nick) in &raw_contacts {
+                        let hex_id = c.id.to_hex();
+                        if peers.len() < 200 {
+                            peers.push(PeerInfo {
+                                id: hex_id.clone(),
+                                addresses: vec![format!("{}:{}", c.ip, c.udp_port)],
+                                nickname: nick.clone(),
+                                last_seen: c.last_seen,
+                                files_shared: 0,
+                                banned: false,
+                            });
+                        }
+                        let distance = c.id.xor_distance(&local_id);
+                        cached_c.push(KadContactInfo {
+                            id: hex_id,
+                            contact_type: c.contact_type,
+                            version: c.version,
+                            distance: distance.to_hex(),
+                            ip_verified: c.verified,
+                            bootstrap: c.contact_type == CONTACT_TYPE_NEW && c.version == 0,
+                        });
+                    }
+
                     let banned_ids = tokio::task::spawn_blocking(move || {
                         db_ref.banned_peer_ids().unwrap_or_default()
                     }).await.unwrap_or_default();
                     if !banned_ids.is_empty() {
                         let banned = &banned_ids;
-                        let mut filtered_peers = peers;
-                        filtered_peers.retain(|p| !banned.contains(&p.id));
-                        *sp.write().await = filtered_peers;
-                    } else {
-                        *sp.write().await = peers;
+                        peers.retain(|p| !banned.contains(&p.id));
                     }
+                    *sp.write().await = peers;
                     *ss.write().await = stats_snapshot;
                     *sc.write().await = cached_c;
                     *ssrch.write().await = cached_s;
