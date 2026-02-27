@@ -72,6 +72,8 @@ impl LocalIndex {
                     availability: score,
                     file_type: infer_file_type(&file.extension),
                     source_addresses: vec!["local".to_string()],
+                    rating: None,
+                    comment: None,
                 })
             })
             .collect()

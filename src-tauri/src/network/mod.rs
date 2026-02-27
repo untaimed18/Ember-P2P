@@ -110,6 +110,9 @@ pub enum NetworkCommand {
     },
     KadBootstrapClients,
     RecheckFirewall,
+    UpdateSettings {
+        settings: AppSettings,
+    },
     Shutdown,
 }
 
@@ -581,6 +584,7 @@ pub async fn start_network(
                             &bandwidth_limiter,
                             &db,
                             &app_handle,
+                            &transfer_manager,
                         ).await;
                     }
                 }
@@ -588,12 +592,68 @@ pub async fn start_network(
 
             // Download progress events
             Some(event) = dl_event_rx.recv() => {
-                handle_download_event(event, &app_handle, &transfer_manager, &db, &bandwidth_limiter).await;
+                let mut promoted = Vec::new();
+                handle_download_event(event, &app_handle, &transfer_manager, &db, &bandwidth_limiter, &mut promoted).await;
+                for t in promoted {
+                    let control = TransferControl::new();
+                    {
+                        let mut mgr = transfer_manager.write().await;
+                        mgr.register_control(&t.id, control.clone());
+                    }
+                    handle_command(
+                        &udp_socket,
+                        NetworkCommand::StartDownload {
+                            file_hash: t.file_hash.clone(),
+                            file_name: t.file_name.clone(),
+                            file_size: t.total_size,
+                            peer_ip: t.peer_id.split(':').next().unwrap_or("").to_string(),
+                            peer_port: t.peer_id.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(0),
+                            transfer_id: t.id.clone(),
+                            control,
+                        },
+                        &mut state,
+                        &local_index,
+                        &settings,
+                        &dl_event_tx,
+                        &bandwidth_limiter,
+                        &db,
+                        &app_handle,
+                        &transfer_manager,
+                    ).await;
+                }
             }
 
             // Upload events from the peer-to-peer upload listener
             Some(event) = ul_event_rx.recv() => {
-                handle_upload_event(event, &app_handle, &transfer_manager, &bandwidth_limiter).await;
+                let mut promoted = Vec::new();
+                handle_upload_event(event, &app_handle, &transfer_manager, &bandwidth_limiter, &mut promoted).await;
+                for t in promoted {
+                    let control = TransferControl::new();
+                    {
+                        let mut mgr = transfer_manager.write().await;
+                        mgr.register_control(&t.id, control.clone());
+                    }
+                    handle_command(
+                        &udp_socket,
+                        NetworkCommand::StartDownload {
+                            file_hash: t.file_hash.clone(),
+                            file_name: t.file_name.clone(),
+                            file_size: t.total_size,
+                            peer_ip: t.peer_id.split(':').next().unwrap_or("").to_string(),
+                            peer_port: t.peer_id.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(0),
+                            transfer_id: t.id.clone(),
+                            control,
+                        },
+                        &mut state,
+                        &local_index,
+                        &settings,
+                        &dl_event_tx,
+                        &bandwidth_limiter,
+                        &db,
+                        &app_handle,
+                        &transfer_manager,
+                    ).await;
+                }
             }
 
             // Periodic search polling
@@ -1028,8 +1088,10 @@ pub async fn start_network(
                             SearchType::StoreFile,
                             closest,
                         );
-                        state.store_source_searches.insert(sid, (file.file_hash, msg));
-                        state.publish_manager.mark_source_published(&file.file_hash);
+                        if sid != SearchId(0) {
+                            state.store_source_searches.insert(sid, (file.file_hash, msg));
+                            state.publish_manager.mark_source_published(&file.file_hash);
+                        }
                     }
                 }
 
@@ -1037,19 +1099,22 @@ pub async fn start_network(
                     .into_iter().take(MAX_KEYWORD_PUBLISHES_PER_CYCLE).cloned().collect::<Vec<_>>();
                 for file in &keyword_files {
                     let publishes = state.publish_manager.build_keyword_publishes(&file);
-                    // Use StoreKeyword search to find truly closest nodes, then publish
-                    if !publishes.is_empty() {
-                        let first_kw_hash = publishes[0].0;
-                        let closest = state.routing_table.find_closest_prefer_verified(&first_kw_hash, SEARCH_INITIAL_CONTACTS);
-                        if !closest.is_empty() {
-                            let sid = state.search_manager.start_search(
-                                first_kw_hash,
-                                SearchType::StoreKeyword,
-                                closest,
-                            );
-                            state.store_keyword_searches.insert(sid, (file.clone(), publishes));
-                            state.publish_manager.mark_keyword_published(&file.file_hash);
-                        }
+                    if publishes.is_empty() { continue; }
+                    let mut any_started = false;
+                    for (kw_hash, msg) in publishes {
+                        let closest = state.routing_table.find_closest_prefer_verified(&kw_hash, SEARCH_INITIAL_CONTACTS);
+                        if closest.is_empty() { continue; }
+                        let sid = state.search_manager.start_search(
+                            kw_hash,
+                            SearchType::StoreKeyword,
+                            closest,
+                        );
+                        if sid == SearchId(0) { continue; }
+                        state.store_keyword_searches.insert(sid, (file.clone(), vec![(kw_hash, msg)]));
+                        any_started = true;
+                    }
+                    if any_started {
+                        state.publish_manager.mark_keyword_published(&file.file_hash);
                     }
                 }
                 } // end is_empty guard
@@ -1315,7 +1380,9 @@ pub async fn start_network(
                             SearchType::FindSource { file_size: pd.file_size },
                             closest,
                         );
-                        state.download_source_searches.insert(sid, tid);
+                        if sid != SearchId(0) {
+                            state.download_source_searches.insert(sid, tid);
+                        }
                     }
                 }
             }
@@ -1335,8 +1402,8 @@ pub async fn start_network(
                 let peers: Vec<PeerInfo> = state
                     .routing_table
                     .all_contacts()
-                    .take(200)
                     .filter(|c| !banned_ids.contains(&c.id.to_hex()))
+                    .take(200)
                     .map(|c| PeerInfo {
                         id: c.id.to_hex(),
                         addresses: vec![format!("{}:{}", c.ip, c.udp_port)],
@@ -2613,6 +2680,7 @@ async fn handle_command(
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
 ) {
     match cmd {
         NetworkCommand::SearchFiles { query, tx } => {
@@ -2646,6 +2714,10 @@ async fn handle_command(
                 closest,
             );
 
+            if sid == SearchId(0) {
+                let _ = tx.send(local_results);
+                return;
+            }
             state.pending_keyword_searches.insert(sid, (tx, local_results));
         }
 
@@ -2749,15 +2821,16 @@ async fn handle_command(
                 });
 
                 if !closest.is_empty() {
-                    // Prefer non-firewalled contacts for source searching
                     closest.sort_by_key(|c| c.is_tcp_firewalled() as u8);
                     let sid = state.search_manager.start_search(
                         kad_hash,
                         SearchType::FindSource { file_size },
                         closest,
                     );
-                    state.download_source_searches.insert(sid, transfer_id.clone());
-                    info!("Started source search {} for download {}", sid.0, transfer_id);
+                    if sid != SearchId(0) {
+                        state.download_source_searches.insert(sid, transfer_id.clone());
+                        info!("Started source search {} for download {}", sid.0, transfer_id);
+                    }
                 }
             }
         }
@@ -2882,6 +2955,10 @@ async fn handle_command(
                 SearchType::FindNotes { file_size },
                 closest,
             );
+            if sid == SearchId(0) {
+                let _ = tx.send(Vec::new());
+                return;
+            }
             state.pending_notes_searches.insert(sid, tx);
         }
 
@@ -2901,6 +2978,10 @@ async fn handle_command(
                 closest,
             );
 
+            if sid == SearchId(0) {
+                let _ = tx.send(Vec::new());
+                return;
+            }
             state.pending_source_searches.insert(sid, tx);
         }
 
@@ -3027,6 +3108,14 @@ async fn handle_command(
 
         NetworkCommand::KadDisconnect => {
             info!("KAD disconnect requested");
+
+            // Cancel all active download/upload tasks via their controls
+            {
+                let mgr = transfer_manager.read().await;
+                for control in mgr.all_controls() {
+                    control.cancel();
+                }
+            }
 
             // Save routing table before clearing (eMule saves on Stop)
             let contacts = state.routing_table.export_bootstrap_contacts(200);
@@ -3210,6 +3299,15 @@ async fn handle_command(
             info!("Sent {} firewall checks and 3 ping probes", state.firewall_checks_sent);
         }
 
+        NetworkCommand::UpdateSettings { settings } => {
+            state.obfuscation_enabled = settings.obfuscation_enabled;
+            info!(
+                "Network settings updated: obfuscation={}, nickname={}",
+                settings.obfuscation_enabled,
+                settings.nickname,
+            );
+        }
+
         NetworkCommand::Shutdown => {}
     }
 }
@@ -3220,6 +3318,7 @@ async fn handle_download_event(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     db: &Arc<Database>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
+    promoted_out: &mut Vec<Transfer>,
 ) {
     match event {
         DownloadEvent::Progress {
@@ -3261,6 +3360,7 @@ async fn handle_download_event(
             for t in &promoted {
                 info!("Promoted queued transfer {} ({}) to active", t.id, t.file_name);
             }
+            promoted_out.extend(promoted);
             let _ = db.update_transfer_status(&transfer_id, "\"completed\"");
             let _ = app_handle.emit(
                 "transfer-complete",
@@ -3275,6 +3375,7 @@ async fn handle_download_event(
             for t in &promoted {
                 info!("Promoted queued transfer {} ({}) to active", t.id, t.file_name);
             }
+            promoted_out.extend(promoted);
             let _ = db.update_transfer_status(&transfer_id, "\"failed\"");
             let _ = app_handle.emit(
                 "transfer-failed",
@@ -3289,6 +3390,7 @@ async fn handle_upload_event(
     app_handle: &tauri::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
+    promoted_out: &mut Vec<Transfer>,
 ) {
     match event.kind {
         UploadEventKind::Started {
@@ -3356,6 +3458,7 @@ async fn handle_upload_event(
             for t in &promoted {
                 info!("Promoted queued transfer {} ({}) to active", t.id, t.file_name);
             }
+            promoted_out.extend(promoted);
             let _ = app_handle.emit(
                 "transfer-complete",
                 serde_json::json!({ "id": event.transfer_id, "direction": "upload" }),
@@ -3369,6 +3472,7 @@ async fn handle_upload_event(
             for t in &promoted {
                 info!("Promoted queued transfer {} ({}) to active", t.id, t.file_name);
             }
+            promoted_out.extend(promoted);
             let _ = app_handle.emit(
                 "transfer-failed",
                 serde_json::json!({ "id": event.transfer_id, "error": error, "direction": "upload" }),
@@ -3390,6 +3494,8 @@ fn convert_search_results(
         extension: String,
         source_addr: String,
         sources_tag: u32,
+        rating: Option<u8>,
+        comment: Option<String>,
     }
 
     let parsed: Vec<ParsedEntry> = entries
@@ -3401,6 +3507,8 @@ fn convert_search_results(
             let mut source_ip = 0u32;
             let mut source_port = 0u16;
             let mut sources_tag = 0u32;
+            let mut rating: Option<u8> = None;
+            let mut comment: Option<String> = None;
 
             for tag in &entry.tags {
                 match &tag.name {
@@ -3439,6 +3547,18 @@ fn convert_search_results(
                             source_port = v;
                         }
                     }
+                    TagName::Str(s) if s == "filerating" => {
+                        if let Some(v) = tag.uint32_value() {
+                            rating = Some(v as u8);
+                        } else if let Some(v) = tag.uint16_value() {
+                            rating = Some(v as u8);
+                        }
+                    }
+                    TagName::Str(s) if s == "description" => {
+                        if let Some(s) = tag.string_value() {
+                            comment = Some(s.to_string());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -3474,6 +3594,8 @@ fn convert_search_results(
                 extension,
                 source_addr,
                 sources_tag,
+                rating,
+                comment,
             })
         })
         .collect();
@@ -3528,6 +3650,8 @@ fn convert_search_results(
                     availability,
                     file_type: p.file_type,
                     source_addresses,
+                    rating: p.rating,
+                    comment: p.comment,
                 },
             );
         }

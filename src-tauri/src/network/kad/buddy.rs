@@ -136,18 +136,15 @@ impl BuddyManager {
         }
     }
 
-    /// Check if the buddy connection is still alive.
+    /// Check if the buddy connection is still alive using a zero-byte write probe.
     pub async fn check_buddy_alive(&mut self) {
         if self.state == BuddyState::Connected {
             if let Some(ref stream) = self.buddy_stream {
-                match stream.peer_addr() {
-                    Ok(_) => {
-                        // peer_addr succeeds even on closed connections,
-                        // but without splitting/wrapping the stream we can't
-                        // do a cheap zero-cost liveness probe here.
-                    }
+                match stream.try_write(&[]) {
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(_) => {
-                        info!("Buddy connection lost");
+                        info!("Buddy connection lost (write probe failed)");
                         self.buddy_stream = None;
                         self.buddy_id = None;
                         self.buddy_addr = None;

@@ -27,6 +27,7 @@ export async function initTransferStore() {
   initialized = true;
 
   unlisteners.push(await listen<ProgressPayload>('transfer-progress', (event) => {
+    markEventUpdate();
     const p = event.payload;
     transfers.update((list) => {
       const idx = list.findIndex((t) => t.id === p.id);
@@ -44,6 +45,7 @@ export async function initTransferStore() {
   }));
 
   unlisteners.push(await listen<TransferEventPayload>('transfer-complete', (event) => {
+    markEventUpdate();
     const id = event.payload.id;
     transfers.update((list) =>
       list.map((t) =>
@@ -53,10 +55,11 @@ export async function initTransferStore() {
   }));
 
   unlisteners.push(await listen<TransferEventPayload>('transfer-failed', (event) => {
-    const id = event.payload.id;
+    markEventUpdate();
+    const { id, error } = event.payload;
     transfers.update((list) =>
       list.map((t) =>
-        t.id === id ? { ...t, status: 'failed' as const, speed: 0 } : t
+        t.id === id ? { ...t, status: 'failed' as const, speed: 0, failure_reason: error } : t
       )
     );
   }));
@@ -64,6 +67,7 @@ export async function initTransferStore() {
   unlisteners.push(await listen<TransferEventPayload & { status?: string; peer_id?: string }>(
     'transfer-status',
     (event) => {
+      markEventUpdate();
       const { id, status, peer_id } = event.payload;
       transfers.update((list) =>
         list.map((t) => {
@@ -94,8 +98,15 @@ export function cleanupTransferStore() {
   initialized = false;
 }
 
+let lastEventUpdate = 0;
+
+function markEventUpdate() {
+  lastEventUpdate = Date.now();
+}
+
 export function startTransferPoll() {
   const interval = setInterval(async () => {
+    if (Date.now() - lastEventUpdate < 3000) return;
     try {
       const all = await getTransfers();
       transfers.set(all);

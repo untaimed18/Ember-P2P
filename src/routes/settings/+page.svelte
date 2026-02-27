@@ -33,7 +33,7 @@
       setTimeout(() => (saveMessage = null), saveIsWarning ? 8000 : 3000);
     } catch (e) {
       console.error('Failed to save:', e);
-      saveMessage = 'Failed to save settings';
+      saveMessage = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to save settings';
       saveIsWarning = true;
       setTimeout(() => (saveMessage = null), 5000);
     } finally {

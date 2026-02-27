@@ -627,6 +627,12 @@ pub fn read_tag_list<R: Read>(reader: &mut R) -> io::Result<Vec<KadTag>> {
 }
 
 pub fn write_tag_list<W: Write>(writer: &mut W, tags: &[KadTag]) -> io::Result<()> {
+    if tags.len() > 255 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("tag list too large: {} (max 255)", tags.len()),
+        ));
+    }
     writer.write_u8(tags.len() as u8)?;
     for tag in tags {
         tag.write_to(writer)?;

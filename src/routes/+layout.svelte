@@ -12,13 +12,19 @@
 
   onMount(() => {
     initTheme();
-    initNetworkStore();
-    initTransferStore();
-    initSearchStore();
 
-    const stopPoll = startStatsPoll();
+    let stopPoll: (() => void) | null = null;
+    let mounted = true;
+
+    Promise.all([initNetworkStore(), initTransferStore(), initSearchStore()]).then(() => {
+      if (mounted) {
+        stopPoll = startStatsPoll();
+      }
+    });
+
     return () => {
-      stopPoll();
+      mounted = false;
+      if (stopPoll) stopPoll();
       cleanupNetworkStore();
       cleanupTransferStore();
       cleanupSearchStore();

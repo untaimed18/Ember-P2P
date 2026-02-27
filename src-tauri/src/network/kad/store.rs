@@ -109,8 +109,10 @@ impl DhtStore {
             return self.compute_load();
         }
 
-        // Remove existing entry from same sender
+        let len_before = bucket.len();
         bucket.retain(|e| e.id != sender_id);
+        let removed = len_before - bucket.len();
+        self.total_count = self.total_count.saturating_sub(removed);
 
         const MAX_SOURCES_PER_IP: usize = 3;
         let ip_u32 = u32::from_be_bytes(sender_ip.octets());
@@ -193,7 +195,10 @@ impl DhtStore {
             return self.compute_load();
         }
 
+        let len_before = bucket.len();
         bucket.retain(|e| e.id != sender_id);
+        let removed = len_before - bucket.len();
+        self.total_count = self.total_count.saturating_sub(removed);
 
         bucket.push(StoredEntry {
             id: sender_id,

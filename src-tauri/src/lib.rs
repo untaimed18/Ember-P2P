@@ -75,6 +75,8 @@ pub fn run() {
             let shutdown_complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let shutdown_complete_net = shutdown_complete.clone();
 
+            let bw_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
             let cached_peers: Arc<RwLock<Vec<crate::types::PeerInfo>>> = Arc::new(RwLock::new(Vec::new()));
             let cached_stats: Arc<RwLock<crate::types::NetworkStats>> = Arc::new(RwLock::new(crate::types::NetworkStats::default()));
             let cached_contacts: Arc<RwLock<Vec<crate::types::KadContactInfo>>> = Arc::new(RwLock::new(Vec::new()));
@@ -92,6 +94,7 @@ pub fn run() {
                 bandwidth_limiter: bandwidth_limiter.clone(),
                 transfer_manager: transfer_manager.clone(),
                 shutdown_complete,
+                bw_shutdown: bw_shutdown.clone(),
                 cached_peers,
                 cached_stats,
                 cached_contacts,
@@ -162,9 +165,9 @@ pub fn run() {
             });
 
             let bw_limiter = bandwidth_limiter.clone();
-            let bw_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let bw_shutdown_spawn = bw_shutdown.clone();
             tauri::async_runtime::spawn(async move {
-                bandwidth::limiter::start_token_refill(bw_limiter, bw_shutdown).await;
+                bandwidth::limiter::start_token_refill(bw_limiter, bw_shutdown_spawn).await;
             });
 
             info!("Nexus P2P application started");
@@ -218,6 +221,7 @@ pub fn run() {
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
                 if let Some(state) = app_handle.try_state::<AppState>() {
+                    state.bw_shutdown.store(true, std::sync::atomic::Ordering::Release);
                     let tx = state.network_tx.clone();
                     let _ = tx.try_send(network::NetworkCommand::Shutdown);
                     info!("Sent shutdown command to network, waiting for save...");

@@ -154,7 +154,12 @@
               {#each completedDownloads as t (t.id)}
                 <tr>
                   <td class="name-cell" title={t.file_name}>{t.file_name}</td>
-                  <td><span class="badge {t.status}">{t.status}</span></td>
+                  <td>
+                    <span class="badge {t.status}">{t.status}</span>
+                    {#if t.status === 'failed' && t.failure_reason}
+                      <span class="failure-reason" title={t.failure_reason}>{t.failure_reason}</span>
+                    {/if}
+                  </td>
                   <td>{formatSize(t.total_size)}</td>
                   <td class="actions">
                     <button class="action-btn danger" onclick={() => handleRemove(t.id)} title="Remove from list">✕</button>
@@ -354,6 +359,16 @@
     color: var(--warning, #f0ad4e);
     font-style: italic;
     animation: pulse 1.5s ease-in-out infinite;
+  }
+
+  .failure-reason {
+    display: block;
+    font-size: 11px;
+    color: var(--danger, #e74c3c);
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   @keyframes pulse {

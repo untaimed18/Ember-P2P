@@ -114,6 +114,11 @@ pub async fn cancel_transfer(
     let _ = state.db.remove_transfer(&transfer_id);
 
     for t in &promoted {
+        let control = crate::sharing::manager::TransferControl::new();
+        {
+            let mut manager = state.transfer_manager.write().await;
+            manager.register_control(&t.id, control.clone());
+        }
         let _ = state
             .network_tx
             .send(NetworkCommand::StartDownload {
@@ -123,7 +128,7 @@ pub async fn cancel_transfer(
                 peer_ip: t.peer_id.split(':').next().unwrap_or("").to_string(),
                 peer_port: t.peer_id.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(0),
                 transfer_id: t.id.clone(),
-                control: crate::sharing::manager::TransferControl::new(),
+                control,
             })
             .await;
     }

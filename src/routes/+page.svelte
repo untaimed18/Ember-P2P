@@ -47,12 +47,15 @@
       ]);
       if (c.status === 'fulfilled') contacts = c.value;
       if (s.status === 'fulfilled') searches = s.value;
-      kadError = null;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to load KAD data';
-      console.error('Failed to get KAD data:', e);
-      if (contacts.length === 0) {
-        kadError = msg;
+
+      if (c.status === 'rejected' || s.status === 'rejected') {
+        const reason = c.status === 'rejected' ? c.reason : s.reason;
+        const msg = reason instanceof Error ? reason.message : String(reason);
+        if (contacts.length === 0) {
+          kadError = msg;
+        }
+      } else {
+        kadError = null;
       }
     } finally {
       loading = false;

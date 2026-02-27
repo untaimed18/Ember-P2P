@@ -54,6 +54,7 @@ export interface Transfer {
   total_size: number;
   transferred: number;
   started_at: number;
+  failure_reason?: string;
 }
 
 export interface SearchResult {
@@ -63,6 +64,8 @@ export interface SearchResult {
   availability: number;
   file_type: string;
   source_addresses: string[];
+  rating?: number;
+  comment?: string;
 }
 
 export interface NetworkStats {

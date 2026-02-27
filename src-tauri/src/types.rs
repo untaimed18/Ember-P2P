@@ -69,6 +69,10 @@ pub struct SearchResult {
     pub availability: u32,
     pub file_type: String,
     pub source_addresses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -67,6 +67,10 @@ pub async fn update_settings(
         manager.max_concurrent = settings.max_concurrent_downloads;
     }
 
+    let _ = state.network_tx.try_send(NetworkCommand::UpdateSettings {
+        settings: settings.clone(),
+    });
+
     let mut config = state.config.write().await;
     config
         .update(settings)
@@ -95,11 +99,13 @@ pub async fn download_nodes_dat(
 
     let data_dir = app.path().app_data_dir()
         .map_err(|e| format!("Failed to get app data dir: {e}"))?;
-    std::fs::create_dir_all(&data_dir)
+    tokio::fs::create_dir_all(&data_dir)
+        .await
         .map_err(|e| format!("Failed to create data dir: {e}"))?;
 
     let nodes_path = data_dir.join("nodes.dat");
-    std::fs::write(&nodes_path, &bytes)
+    tokio::fs::write(&nodes_path, &bytes)
+        .await
         .map_err(|e| format!("Failed to write nodes.dat: {e}"))?;
 
     let contacts = bootstrap::load_nodes_dat(&nodes_path)
@@ -137,11 +143,13 @@ pub async fn download_ipfilter(
 
     let data_dir = app.path().app_data_dir()
         .map_err(|e| format!("Failed to get app data dir: {e}"))?;
-    std::fs::create_dir_all(&data_dir)
+    tokio::fs::create_dir_all(&data_dir)
+        .await
         .map_err(|e| format!("Failed to create data dir: {e}"))?;
 
     let filter_path = data_dir.join("ipfilter.dat");
-    std::fs::write(&filter_path, &bytes)
+    tokio::fs::write(&filter_path, &bytes)
+        .await
         .map_err(|e| format!("Failed to write ipfilter.dat: {e}"))?;
 
     let byte_count = bytes.len();

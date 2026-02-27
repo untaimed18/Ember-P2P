@@ -2,7 +2,7 @@
   import SearchBar from '$lib/components/SearchBar.svelte';
   import { searchFiles, parseEd2kLink, findNotes, publishNote } from '$lib/api/search';
   import { startDownload } from '$lib/api/transfers';
-  import { searchResults, searchQuery, isSearching, searchProgress } from '$lib/stores/search';
+  import { searchResults, searchQuery, isSearching, searchProgress, newSearchNonce } from '$lib/stores/search';
   import type { SearchResult } from '$lib/types';
 
   let ed2kInput = $state('');
@@ -117,20 +117,34 @@
     return results;
   });
 
+  let searchTimeout: ReturnType<typeof setTimeout> | null = null;
+
   async function handleSearch(query: string) {
     if (!query.trim()) return;
     $searchQuery = query;
     $isSearching = true;
     $searchResults = [];
     searchError = null;
+    newSearchNonce();
+    if (searchTimeout) clearTimeout(searchTimeout);
+    searchTimeout = setTimeout(() => {
+      if ($isSearching) {
+        $isSearching = false;
+        $searchProgress = null;
+      }
+    }, 90_000);
     try {
       const results = await searchFiles(query);
-      $searchResults = results;
+      if (results && results.length > 0) {
+        $searchResults = results;
+      }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Search failed';
       searchError = msg;
       console.error('Search failed:', e);
       $isSearching = false;
+      $searchProgress = null;
+      if (searchTimeout) { clearTimeout(searchTimeout); searchTimeout = null; }
     }
   }
 
@@ -170,10 +184,14 @@
     downloadErrors[key] = '';
     downloadStarted[key] = false;
     try {
-      const addr = result.source_addresses?.[0] || result.peer_id;
-      const parts = addr.split(':');
-      const peerIp = parts[0] || '';
-      const peerPort = parseInt(parts[1] || '4662', 10);
+      let peerIp = '';
+      let peerPort = 0;
+      const addr = result.source_addresses?.[0];
+      if (addr && addr.includes(':')) {
+        const parts = addr.split(':');
+        peerIp = parts[0] || '';
+        peerPort = parseInt(parts[1] || '0', 10);
+      }
       await startDownload(
         result.file.hash,
         result.file.name,
@@ -440,6 +458,12 @@
               {#each notes as note}
                 <div class="note-item">
                   <span class="note-peer">{note.peer_name || 'Anonymous'}</span>
+                  {#if note.rating}
+                    <span class="note-rating">{'★'.repeat(note.rating)}{'☆'.repeat(5 - note.rating)}</span>
+                  {/if}
+                  {#if note.comment}
+                    <span class="note-comment">{note.comment}</span>
+                  {/if}
                 </div>
               {/each}
             </div>

@@ -10,6 +10,16 @@ export const searchProgress = writable<{ nodes_contacted: number; results_so_far
 
 let initialized = false;
 let unlisteners: UnlistenFn[] = [];
+let searchNonce = 0;
+
+export function newSearchNonce(): number {
+  searchNonce += 1;
+  return searchNonce;
+}
+
+export function currentSearchNonce(): number {
+  return searchNonce;
+}
 
 export async function initSearchStore() {
   if (initialized) return;
@@ -38,6 +48,15 @@ export async function initSearchStore() {
     await listen<void>('search-complete', () => {
       isSearching.set(false);
       searchProgress.set(null);
+    })
+  );
+
+  unlisteners.push(
+    await listen<{ nonce?: number }>('search-complete-nonce', (event) => {
+      if (event.payload?.nonce === searchNonce) {
+        isSearching.set(false);
+        searchProgress.set(null);
+      }
     })
   );
 

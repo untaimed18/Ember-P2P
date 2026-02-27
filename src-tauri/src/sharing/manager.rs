@@ -184,6 +184,10 @@ impl TransferManager {
         self.last_progress.remove(id);
     }
 
+    pub fn all_controls(&self) -> Vec<Arc<TransferControl>> {
+        self.controls.values().cloned().collect()
+    }
+
     pub fn get_all(&self) -> Vec<Transfer> {
         let mut all: Vec<Transfer> = self.active.values().cloned().collect();
         all.extend(self.queue.iter().cloned());
