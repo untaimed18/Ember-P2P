@@ -707,8 +707,43 @@ pub async fn start_network(
     info!("Network event loop starting");
 
     loop {
+        // Drain ALL pending commands first (priority over UDP) to prevent UI freezes.
+        // Commands from the Tauri frontend must never be starved by high UDP traffic.
+        let mut shutting_down = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                NetworkCommand::Shutdown => {
+                    shutting_down = true;
+                    break;
+                }
+                cmd => {
+                    handle_command(
+                        &udp_socket,
+                        cmd,
+                        &mut state,
+                        &local_index,
+                        &settings,
+                        &dl_event_tx,
+                        &bandwidth_limiter,
+                        &db,
+                        &app_handle,
+                        &transfer_manager,
+                        &source_manager,
+                        &credit_manager,
+                        &mut stats_manager,
+                        &mut known_files,
+                    ).await;
+                }
+            }
+        }
+        if shutting_down {
+            info!("Network shutting down");
+            break;
+        }
+
         tokio::select! {
-            // Incoming UDP packets (discard when disconnected, like eMule deleting its UDP listener)
+            // Incoming UDP packets: batch up to 20 per iteration so we re-check
+            // commands and timers between batches
             result = udp_socket.recv_from(&mut udp_buf) => {
                 if state.stats.status == NetworkStatus::Disconnected {
                     continue;
@@ -730,9 +765,29 @@ pub async fn start_network(
                         warn!("UDP recv error: {e}");
                     }
                 }
+                // Process up to 19 more queued packets without re-entering select
+                for _ in 0..19 {
+                    match udp_socket.try_recv_from(&mut udp_buf) {
+                        Ok((len, from)) => {
+                            if state.stats.status != NetworkStatus::Disconnected {
+                                handle_udp_packet(
+                                    &udp_socket,
+                                    &udp_buf[..len],
+                                    from,
+                                    &mut state,
+                                    &app_handle,
+                                    &local_index,
+                                    &settings,
+                                    &db,
+                                ).await;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
 
-            // Commands from the frontend
+            // Commands from the frontend (also handled by try_recv drain above)
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(NetworkCommand::Shutdown) | None => {
@@ -2570,12 +2625,12 @@ async fn handle_udp_packet(
         }
 
         KadMessage::KadRes { target, contacts } => {
-            info!("KadRes from {from}: {} contacts for target {target}", contacts.len());
+            debug!("KadRes from {from}: {} contacts for target {target}", contacts.len());
 
             // eMule Process_KADEMLIA2_RES: validate contact count against what we requested.
             let expected = state.search_manager.get_expected_response_count(&target);
             if expected == 0 {
-                info!("  No active search for target {target}, ignoring response");
+                debug!("  No active search for target {target}, ignoring response");
                 return;
             }
             if contacts.len() > expected as usize {
@@ -2595,7 +2650,7 @@ async fn handle_udp_packet(
                 .collect();
 
             if search_ids.is_empty() {
-                info!("  No active search for this target");
+                debug!("  No active search for this target");
             }
 
             let sender_id_lookup = match from.ip() {
@@ -2622,7 +2677,7 @@ async fn handle_udp_packet(
             };
 
             if sender_id_lookup.is_none() && !search_ids.is_empty() {
-                info!("  Could not resolve sender KadId for {from}");
+                debug!("  Could not resolve sender KadId for {from}");
             }
 
             for sid in search_ids {
@@ -2688,7 +2743,7 @@ async fn handle_udp_packet(
                         })
                         .cloned()
                         .collect();
-                    info!("  Search {}: processing {} contacts from {} ({} filtered)", sid.0, safe_contacts.len(), sender_id, contacts.len() - safe_contacts.len());
+                    debug!("  Search {}: processing {} contacts from {} ({} filtered)", sid.0, safe_contacts.len(), sender_id, contacts.len() - safe_contacts.len());
                     search.handle_response(&sender_id, safe_contacts.clone());
 
                     for c in &safe_contacts {
@@ -2703,7 +2758,7 @@ async fn handle_udp_packet(
             target,
             results,
         } => {
-            info!(
+            debug!(
                 "SearchRes from {} for target {}: {} entries",
                 from, target, results.len()
             );
@@ -2739,7 +2794,7 @@ async fn handle_udp_packet(
                 .collect();
 
             if search_ids.is_empty() {
-                info!("  No active search for this target");
+                debug!("  No active search for this target");
             }
 
             for sid in search_ids {
@@ -2747,7 +2802,7 @@ async fn handle_udp_packet(
                     search.handle_search_results(&sender_id, results.clone());
                     let unique: std::collections::HashSet<&kad::types::KadId> =
                         search.results.iter().map(|r| &r.id).collect();
-                    info!(
+                    debug!(
                         "  Search {} now has {} raw / {} unique results (phase={:?})",
                         sid.0, search.results.len(), unique.len(), search.phase
                     );

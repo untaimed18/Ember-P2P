@@ -86,6 +86,10 @@ impl Ed2kServerConnection {
         tcp_port: u16,
     ) -> anyhow::Result<ServerSession> {
         let payload = build_login_request(user_hash, tcp_port, nickname);
+        info!("Sending OP_LOGINREQUEST ({} bytes): port={}, nick={}, flags=0x{:04X}, emule_ver=0x{:X}",
+            payload.len(), tcp_port, nickname,
+            SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_UNICODE | SRVCAP_LARGEFILES,
+            (0u32 << 17) | (50u32 << 10) | (0u32 << 7));
         write_server_packet(&mut self.writer, OP_LOGINREQUEST, &payload).await?;
 
         let mut session = ServerSession {
@@ -283,42 +287,61 @@ pub enum ServerEvent {
     ServerList { data: Vec<u8> },
 }
 
+// CT_SERVER_FLAGS capability bits (from eMule Opcodes.h)
+const SRVCAP_ZLIB: u32 = 0x0001;
+const SRVCAP_NEWTAGS: u32 = 0x0008;
+const SRVCAP_UNICODE: u32 = 0x0010;
+const SRVCAP_LARGEFILES: u32 = 0x0100;
+
+const CT_NAME: u8 = 0x01;
+const CT_VERSION: u8 = 0x11;
+const CT_SERVER_FLAGS: u8 = 0x20;
+const CT_EMULE_VERSION: u8 = 0xFB;
+
 fn build_login_request(user_hash: &[u8; 16], tcp_port: u16, nickname: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
+
+    // eMule: WriteHash16 + WriteUInt32(clientID) + WriteUInt16(port)
     buf.extend_from_slice(user_hash);
-    // Client ID (0 = request new from server)
-    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes()); // client ID 0 = request new
     buf.extend_from_slice(&tcp_port.to_le_bytes());
 
-    let mut tags: Vec<(u8, Ed2kTagValue)> = Vec::new();
-    tags.push((0x01, Ed2kTagValue::String(nickname.to_string()))); // CT_NAME
-    tags.push((0x11, Ed2kTagValue::Uint32(0x3C))); // CT_VERSION
-    // CT_SERVER_FLAGS: indicate capabilities
-    // Bit 0: zlib compression, Bit 1: IP in login, Bit 2: aux port,
-    // Bit 3: new tags, Bit 4: unicode, Bit 9: large files
-    let flags: u32 = (1 << 0) | (1 << 3) | (1 << 4) | (1 << 9);
-    tags.push((0x20, Ed2kTagValue::Uint32(flags))); // CT_SERVER_FLAGS
+    // eMule sends exactly 4 tags
+    let tag_count: u32 = 4;
+    buf.extend_from_slice(&tag_count.to_le_bytes());
 
-    buf.extend_from_slice(&(tags.len() as u32).to_le_bytes());
-    for (name_id, value) in &tags {
-        match value {
-            Ed2kTagValue::String(s) => {
-                buf.push(0x02); // TAGTYPE_STRING
-                buf.extend_from_slice(&1u16.to_le_bytes()); // name length
-                buf.push(*name_id);
-                buf.extend_from_slice(&(s.len() as u16).to_le_bytes());
-                buf.extend_from_slice(s.as_bytes());
-            }
-            Ed2kTagValue::Uint32(v) => {
-                buf.push(0x03); // TAGTYPE_UINT32
-                buf.extend_from_slice(&1u16.to_le_bytes());
-                buf.push(*name_id);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            _ => {}
-        }
-    }
+    // Tag 1: CT_NAME (0x01) - nickname string
+    write_string_tag(&mut buf, CT_NAME, nickname);
+
+    // Tag 2: CT_VERSION (0x11) - EDONKEYVERSION = 0x3C
+    write_uint32_tag(&mut buf, CT_VERSION, 0x3C);
+
+    // Tag 3: CT_SERVER_FLAGS (0x20) - capability flags
+    // Matches eMule: SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_LARGEFILES | SRVCAP_UNICODE
+    let flags: u32 = SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_UNICODE | SRVCAP_LARGEFILES;
+    write_uint32_tag(&mut buf, CT_SERVER_FLAGS, flags);
+
+    // Tag 4: CT_EMULE_VERSION (0xFB) - (major << 17) | (minor << 10) | (update << 7)
+    // Identify as eMule 0.50a compatible
+    let emule_version: u32 = (0u32 << 17) | (50u32 << 10) | (0u32 << 7);
+    write_uint32_tag(&mut buf, CT_EMULE_VERSION, emule_version);
+
     buf
+}
+
+fn write_string_tag(buf: &mut Vec<u8>, name_id: u8, value: &str) {
+    buf.push(0x02); // TAGTYPE_STRING
+    buf.extend_from_slice(&1u16.to_le_bytes()); // name length = 1
+    buf.push(name_id);
+    buf.extend_from_slice(&(value.len() as u16).to_le_bytes());
+    buf.extend_from_slice(value.as_bytes());
+}
+
+fn write_uint32_tag(buf: &mut Vec<u8>, name_id: u8, value: u32) {
+    buf.push(0x03); // TAGTYPE_UINT32
+    buf.extend_from_slice(&1u16.to_le_bytes()); // name length = 1
+    buf.push(name_id);
+    buf.extend_from_slice(&value.to_le_bytes());
 }
 
 fn build_search_request(query: &str) -> Vec<u8> {
