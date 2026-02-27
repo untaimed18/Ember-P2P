@@ -541,8 +541,11 @@ pub async fn start_network(
 
     loop {
         tokio::select! {
-            // Incoming UDP packets
+            // Incoming UDP packets (discard when disconnected, like eMule deleting its UDP listener)
             result = udp_socket.recv_from(&mut udp_buf) => {
+                if state.stats.status == NetworkStatus::Disconnected {
+                    continue;
+                }
                 match result {
                     Ok((len, from)) => {
                         handle_udp_packet(
@@ -579,6 +582,7 @@ pub async fn start_network(
                             &dl_event_tx,
                             &bandwidth_limiter,
                             &db,
+                            &app_handle,
                         ).await;
                     }
                 }
@@ -596,6 +600,7 @@ pub async fn start_network(
 
             // Periodic search polling
             _ = search_poll_timer.tick() => {
+                if state.stats.status == NetworkStatus::Disconnected { continue; }
                 let queries = state.search_manager.poll_queries();
                 if !queries.is_empty() {
                     debug!("Search poll: sending {} queries", queries.len());
@@ -870,6 +875,7 @@ pub async fn start_network(
 
             // Periodic bootstrap (eMule BigTimer style)
             _ = bootstrap_timer.tick() => {
+                if state.stats.status == NetworkStatus::Disconnected { continue; }
                 let table_size = state.routing_table.len();
 
                 if table_size == 0 {
@@ -960,6 +966,7 @@ pub async fn start_network(
 
             // Periodic publishing
             _ = publish_timer.tick() => {
+                if state.stats.status == NetworkStatus::Disconnected { continue; }
                 if state.routing_table.is_empty() {
                     debug!("Skipping publish cycle: routing table is empty");
                 } else {
@@ -1008,6 +1015,7 @@ pub async fn start_network(
 
             // Cleanup stale searches, expired DHT entries, and unconfirmed publishes
             _ = cleanup_timer.tick() => {
+                if state.stats.status == NetworkStatus::Disconnected { continue; }
                 state.search_manager.cleanup(120);
                 state.dht_store.cleanup_expired();
 
@@ -1038,6 +1046,7 @@ pub async fn start_network(
             // Bucket refresh: discover new contacts for stale/sparse buckets.
             // Only refresh a few buckets per tick to avoid search storms.
             _ = bucket_refresh_timer.tick() => {
+                if state.stats.status == NetworkStatus::Disconnected { continue; }
                 let active_find_nodes = state.search_manager.active.values()
                     .filter(|s| !s.completed && matches!(s.search_type, SearchType::FindNode))
                     .count();
@@ -1091,6 +1100,7 @@ pub async fn start_network(
 
             // Send pings for pending evictions and process timeouts
             _ = eviction_ping_timer.tick() => {
+                if state.stats.status == NetworkStatus::Disconnected { continue; }
                 send_eviction_pings(&udp_socket, &mut state).await;
                 let evicted = state.routing_table.process_eviction_timeouts(10);
                 if !evicted.is_empty() {
@@ -1101,6 +1111,7 @@ pub async fn start_network(
 
             // SmallTimer (eMule): probe expired contacts with HELLO_REQ, remove dead
             _ = small_timer.tick() => {
+                if state.stats.status == NetworkStatus::Disconnected { continue; }
                 let dead_removed = state.routing_table.remove_dead_contacts();
                 if dead_removed > 0 {
                     debug!("SmallTimer: removed {dead_removed} dead contacts");
@@ -1152,6 +1163,7 @@ pub async fn start_network(
 
             // Buddy system: find a relay buddy if firewalled (only when NAT traversal is enabled)
             _ = buddy_timer.tick() => {
+                if state.stats.status == NetworkStatus::Disconnected { continue; }
                 if !state.nat_traversal_enabled { continue; }
                 state.buddy_manager.check_buddy_alive().await;
                 if state.buddy_manager.should_find_buddy(state.firewalled) {
@@ -1203,6 +1215,7 @@ pub async fn start_network(
 
             // Retry source search for pending downloads
             _ = source_retry_timer.tick() => {
+                if state.stats.status == NetworkStatus::Disconnected { continue; }
                 let now = chrono::Utc::now().timestamp();
                 let max_retries = 10u32;
                 let retry_interval = 60i64;
@@ -2496,6 +2509,7 @@ async fn handle_command(
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
 ) {
     match cmd {
         NetworkCommand::SearchFiles { query, tx } => {
@@ -2852,6 +2866,24 @@ async fn handle_command(
         NetworkCommand::KadConnect => {
             info!("KAD connect requested");
             state.stats.status = NetworkStatus::Connecting;
+            state.self_lookup_done = false;
+            let _ = app_handle.emit("network-status", "connecting");
+
+            // Reload routing table from saved nodes.dat (eMule recreates RoutingZone on Start)
+            let nodes_path = state.data_dir.join("nodes.dat");
+            if state.routing_table.is_empty() {
+                if nodes_path.exists() {
+                    match bootstrap::load_nodes_dat(&nodes_path) {
+                        Ok(saved) => {
+                            for c in &saved {
+                                state.routing_table.insert(c.clone());
+                            }
+                            info!("Loaded {} contacts from nodes.dat on connect", saved.len());
+                        }
+                        Err(e) => warn!("Failed to load nodes.dat on connect: {e}"),
+                    }
+                }
+            }
 
             let contacts: Vec<KadContact> = state.routing_table.all_contacts().cloned().collect();
             if contacts.is_empty() {
@@ -2893,14 +2925,57 @@ async fn handle_command(
 
         NetworkCommand::KadDisconnect => {
             info!("KAD disconnect requested");
-            state.stats.status = NetworkStatus::Disconnected;
+
+            // Save routing table before clearing (eMule saves on Stop)
+            let contacts = state.routing_table.export_bootstrap_contacts(200);
+            let nodes_path = state.data_dir.join("nodes.dat");
+            if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
+                error!("Failed to save nodes.dat on disconnect: {e}");
+            } else {
+                info!("Saved {} contacts to nodes.dat on disconnect", contacts.len());
+            }
+
+            // Stop all searches and cancel pending oneshot channels
             state.search_manager = SearchManager::new();
-            state.pending_keyword_searches.clear();
-            state.pending_source_searches.clear();
+            for (_, (tx, local)) in state.pending_keyword_searches.drain() {
+                let _ = tx.send(local);
+            }
+            for (_, tx) in state.pending_source_searches.drain() {
+                let _ = tx.send(Vec::new());
+            }
+            for (_, tx) in state.pending_notes_searches.drain() {
+                let _ = tx.send(Vec::new());
+            }
+            state.download_source_searches.clear();
+            state.store_keyword_searches.clear();
+            state.store_source_searches.clear();
+            state.pending_note_publishes.clear();
+            state.publish_pending.clear();
+
+            // Reset network state (eMule resets firewall, deletes routing zone)
+            state.routing_table.clear();
             state.external_ip = None;
+            state.external_udp_port = None;
+            state.firewalled = true;
+            state.firewalled_shared.store(true, std::sync::atomic::Ordering::Relaxed);
             state.firewall_checks_sent = 0;
             state.firewall_responses.clear();
+            state.udp_port_responses.clear();
             state.self_lookup_done = false;
+            state.overloaded_nodes.clear();
+            state.buddy_manager.reset();
+            state.peer_nicknames.clear();
+            state.publish_confirmed = 0;
+
+            state.stats.status = NetworkStatus::Disconnected;
+            state.stats.connected_peers = 0;
+            state.stats.external_ip = String::new();
+            state.stats.firewalled = true;
+            state.stats.buddy_status = "none".to_string();
+            state.stats.stores_acknowledged = 0;
+            let _ = app_handle.emit("network-status", "disconnected");
+
+            info!("KAD fully disconnected — all activity stopped");
         }
 
         NetworkCommand::KadBootstrapIp { ip, port } => {

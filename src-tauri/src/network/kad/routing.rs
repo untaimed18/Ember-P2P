@@ -413,6 +413,15 @@ impl RoutingTable {
         self.len() == 0
     }
 
+    pub fn clear(&mut self) {
+        for bucket in &mut self.buckets {
+            bucket.contacts.clear();
+        }
+        self.pending_evictions.clear();
+        self.global_ip_count.clear();
+        self.global_subnet_count.clear();
+    }
+
     /// Return bucket indices that need a refresh (stale > 1h OR nearly empty < 20% full).
     /// Matches eMule OnBigTimer: a zone gets a RandomLookup if it is a leaf zone and
     /// (zone_index < KK || level < KBASE || bin_remaining >= K*0.8).

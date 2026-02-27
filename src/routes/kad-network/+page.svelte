@@ -1,8 +1,5 @@
 <script lang="ts">
   import {
-    getPeers,
-    banPeer,
-    unbanPeer,
     kadConnect,
     kadDisconnect,
     kadBootstrapIp,
@@ -13,16 +10,13 @@
     getKadSearches,
   } from '$lib/api/kad';
   import { networkStats } from '$lib/stores/network';
-  import type { PeerInfo, KadContact, KadSearchEntry } from '$lib/types';
+  import type { KadContact, KadSearchEntry } from '$lib/types';
   import { onMount } from 'svelte';
 
   let contacts: KadContact[] = $state([]);
   let searches: KadSearchEntry[] = $state([]);
-  let peers: PeerInfo[] = $state([]);
   let loading = $state(true);
   let kadError: string | null = $state(null);
-
-  let activeView: 'contacts' | 'lookup' = $state('contacts');
 
   let bootstrapMode: 'ip' | 'url' | 'clients' = $state('clients');
   let bootstrapIp = $state('');
@@ -47,19 +41,17 @@
     if (refreshInProgress) return;
     refreshInProgress = true;
     try {
-      const [c, s, p] = await Promise.allSettled([
+      const [c, s] = await Promise.allSettled([
         getKadContacts(),
         getKadSearches(),
-        getPeers(),
       ]);
       if (c.status === 'fulfilled') contacts = c.value;
       if (s.status === 'fulfilled') searches = s.value;
-      if (p.status === 'fulfilled') peers = p.value;
       kadError = null;
     } catch (e) {
       const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to load KAD data';
       console.error('Failed to get KAD data:', e);
-      if (contacts.length === 0 && peers.length === 0) {
+      if (contacts.length === 0) {
         kadError = msg;
       }
     } finally {
@@ -134,13 +126,15 @@
     return 'Connect';
   }
 
-  function getContactTypeLabel(type: number): string {
-    if (type === 0) return 'Active (0)';
-    if (type === 1) return 'Active (1)';
-    if (type === 2) return 'Active (2)';
-    if (type === 3) return 'Stale (3)';
-    if (type === 4) return 'Expired (4)';
-    return `Unknown (${type})`;
+  function getContactTypeLabel(contact: KadContact): string {
+    if (contact.bootstrap) return 'Bootstrap';
+    const v = contact.version ? `(${contact.version})` : '';
+    if (contact.type === 0) return `0${v}`;
+    if (contact.type === 1) return `1${v}`;
+    if (contact.type === 2) return `2${v}`;
+    if (contact.type === 3) return `3${v}`;
+    if (contact.type === 4) return `4${v}`;
+    return `${contact.type}${v}`;
   }
 
   let sortedContacts = $derived.by(() => {
@@ -148,7 +142,10 @@
     sorted.sort((a, b) => {
       let cmp = 0;
       if (contactSortCol === 'id') cmp = a.id.localeCompare(b.id);
-      else if (contactSortCol === 'type') cmp = a.type - b.type;
+      else if (contactSortCol === 'type') {
+        cmp = a.type - b.type;
+        if (cmp === 0) cmp = a.version - b.version;
+      }
       else if (contactSortCol === 'distance') cmp = a.distance.localeCompare(b.distance);
       return contactSortAsc ? cmp : -cmp;
     });
@@ -184,7 +181,7 @@
 
   function getSortArrow(current: string, col: string, asc: boolean): string {
     if (current !== col) return '';
-    return asc ? ' ▲' : ' ▼';
+    return asc ? ' \u25B2' : ' \u25BC';
   }
 
   let isConnected = $derived($networkStats.status === 'connected');
@@ -195,33 +192,6 @@
     if (mode === 'url' && !bootstrapUrl.trim()) return true;
     return false;
   });
-
-  async function handleBan(peerId: string) {
-    const confirmed = confirm(`Ban peer ${peerId.slice(0, 16)}...?`);
-    if (!confirmed) return;
-    kadError = null;
-    try {
-      await banPeer(peerId);
-      await refresh();
-    } catch (e: unknown) {
-      kadError = e instanceof Error ? e.message : 'Ban failed';
-    }
-  }
-
-  async function handleUnban(peerId: string) {
-    kadError = null;
-    try {
-      await unbanPeer(peerId);
-      await refresh();
-    } catch (e: unknown) {
-      kadError = e instanceof Error ? e.message : 'Unban failed';
-    }
-  }
-
-  function formatTime(ts: number): string {
-    if (ts === 0) return '\u2014';
-    return new Date(ts * 1000).toLocaleString();
-  }
 </script>
 
 <div class="page-header">
@@ -252,119 +222,54 @@
 {/if}
 
 <div class="kad-layout">
+  <!-- Upper: Contacts list + Bootstrap/Status panel (matches eMule layout) -->
   <div class="kad-upper">
     <div class="kad-upper-left">
       <div class="panel-toolbar">
-        <button
-          class="tab-btn"
-          class:active={activeView === 'contacts'}
-          onclick={() => activeView = 'contacts'}
-        >
-          Contacts ({contacts.length})
-        </button>
-        <button
-          class="tab-btn"
-          class:active={activeView === 'lookup'}
-          onclick={() => activeView = 'lookup'}
-        >
-          Peers ({peers.length})
-        </button>
+        <span class="toolbar-label">Contacts ({contacts.length})</span>
       </div>
 
-      {#if activeView === 'contacts'}
-        <div class="panel-content scrollable">
-          {#if loading}
-            <div class="empty-state compact">
-              <p>Loading contacts...</p>
-            </div>
-          {:else if contacts.length === 0}
-            <div class="empty-state compact">
-              <p>No KAD contacts</p>
-              <p class="sub">Connect to the KAD network to populate contacts</p>
-            </div>
-          {:else}
-            <table class="compact-table">
-              <thead>
+      <div class="panel-content scrollable">
+        {#if loading}
+          <div class="empty-state compact">
+            <p>Loading contacts...</p>
+          </div>
+        {:else if contacts.length === 0}
+          <div class="empty-state compact">
+            <p>No KAD contacts</p>
+            <p class="sub">Connect to the KAD network or bootstrap to populate contacts</p>
+          </div>
+        {:else}
+          <table class="compact-table">
+            <thead>
+              <tr>
+                <th class="sortable" onclick={() => sortContacts('id')}>
+                  ID{getSortArrow(contactSortCol, 'id', contactSortAsc)}
+                </th>
+                <th class="sortable" onclick={() => sortContacts('type')}>
+                  Type{getSortArrow(contactSortCol, 'type', contactSortAsc)}
+                </th>
+                <th class="sortable" onclick={() => sortContacts('distance')}>
+                  Distance{getSortArrow(contactSortCol, 'distance', contactSortAsc)}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each sortedContacts as contact (contact.id)}
                 <tr>
-                  <th class="sortable" onclick={() => sortContacts('id')}>
-                    ID{getSortArrow(contactSortCol, 'id', contactSortAsc)}
-                  </th>
-                  <th class="sortable" onclick={() => sortContacts('type')}>
-                    Type{getSortArrow(contactSortCol, 'type', contactSortAsc)}
-                  </th>
-                  <th class="sortable" onclick={() => sortContacts('distance')}>
-                    Distance{getSortArrow(contactSortCol, 'distance', contactSortAsc)}
-                  </th>
+                  <td class="contact-id" title={contact.id}>{contact.id.slice(0, 16)}\u2026</td>
+                  <td>
+                    <span class="contact-type type-{contact.bootstrap ? 'bootstrap' : contact.type}" class:unverified={!contact.ip_verified && contact.type < 3 && !contact.bootstrap}>
+                      {getContactTypeLabel(contact)}
+                    </span>
+                  </td>
+                  <td class="distance" title={contact.distance}>{contact.distance.slice(0, 24)}\u2026</td>
                 </tr>
-              </thead>
-              <tbody>
-                {#each sortedContacts as contact (contact.id)}
-                  <tr>
-                    <td class="contact-id" title={contact.id}>{contact.id.slice(0, 16)}…</td>
-                    <td>
-                      <span class="contact-type type-{contact.type}">
-                        {getContactTypeLabel(contact.type)}
-                      </span>
-                    </td>
-                    <td class="distance" title={contact.distance}>{contact.distance.slice(0, 24)}…</td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-          {/if}
-        </div>
-      {:else}
-        <div class="panel-content scrollable">
-          {#if loading}
-            <div class="empty-state compact">
-              <p>Loading peers...</p>
-            </div>
-          {:else if peers.length === 0}
-            <div class="empty-state compact">
-              <p>No peers connected</p>
-              <p class="sub">Peers will appear when others join the network</p>
-            </div>
-          {:else}
-            <table class="compact-table">
-              <thead>
-                <tr>
-                  <th>Peer ID</th>
-                  <th>Addresses</th>
-                  <th>Nickname</th>
-                  <th>Last Seen</th>
-                  <th>Files</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each peers as peer (peer.id)}
-                  <tr class:banned={peer.banned}>
-                    <td class="contact-id" title={peer.id}>{peer.id.slice(0, 16)}…</td>
-                    <td class="addresses">
-                      {#each peer.addresses.slice(0, 2) as addr}
-                        <span class="addr">{addr}</span>
-                      {/each}
-                      {#if peer.addresses.length > 2}
-                        <span class="more">+{peer.addresses.length - 2} more</span>
-                      {/if}
-                    </td>
-                    <td>{peer.nickname || '\u2014'}</td>
-                    <td>{formatTime(peer.last_seen)}</td>
-                    <td>{peer.files_shared}</td>
-                    <td>
-                      {#if peer.banned}
-                        <button class="sm-btn" onclick={() => handleUnban(peer.id)}>Unban</button>
-                      {:else}
-                        <button class="sm-btn danger" onclick={() => handleBan(peer.id)}>Ban</button>
-                      {/if}
-                    </td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-          {/if}
-        </div>
-      {/if}
+              {/each}
+            </tbody>
+          </table>
+        {/if}
+      </div>
     </div>
 
     <div class="kad-upper-right">
@@ -440,10 +345,6 @@
             <span class="stat-value">{contacts.length}</span>
           </div>
           <div class="stat-row">
-            <span class="stat-label">Peers</span>
-            <span class="stat-value">{$networkStats.connected_peers}</span>
-          </div>
-          <div class="stat-row">
             <span class="stat-label">External IP</span>
             <span class="stat-value">{$networkStats.external_ip || 'Detecting...'}</span>
           </div>
@@ -475,9 +376,10 @@
     </div>
   </div>
 
+  <!-- Lower: Searches list (always visible, matches eMule) -->
   <div class="kad-lower">
     <div class="section-header">
-      <span class="section-icon">⊕</span>
+      <span class="section-icon">\u2295</span>
       <span>Searches ({searches.length})</span>
     </div>
     <div class="panel-content scrollable">
@@ -519,7 +421,7 @@
             {#each sortedSearches as search (search.id)}
               <tr>
                 <td>{search.id}</td>
-                <td class="contact-id" title={search.target}>{search.target.slice(0, 16)}…</td>
+                <td class="contact-id" title={search.target}>{search.target.slice(0, 16)}\u2026</td>
                 <td>{search.type}</td>
                 <td>{search.name || '\u2014'}</td>
                 <td>
@@ -590,33 +492,18 @@
 
   .panel-toolbar {
     display: flex;
+    align-items: center;
     padding: 0;
     border-bottom: 1px solid var(--border);
     background: var(--bg-secondary);
     flex-shrink: 0;
   }
 
-  .tab-btn {
+  .toolbar-label {
     padding: 8px 16px;
     font-size: 13px;
     font-weight: 600;
-    border-radius: 0;
-    background: transparent;
     color: var(--text-secondary);
-    border: none;
-    border-bottom: 2px solid transparent;
-    transition: all 0.15s;
-  }
-
-  .tab-btn:hover {
-    color: var(--text-primary);
-    background: var(--bg-hover);
-  }
-
-  .tab-btn.active {
-    color: var(--accent);
-    border-bottom-color: var(--accent);
-    background: transparent;
   }
 
   .panel-content {
@@ -838,30 +725,13 @@
     color: var(--danger);
   }
 
-  .addresses {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-  }
-
-  .addr {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--text-secondary);
-  }
-
-  .more {
-    font-size: 10px;
+  .type-bootstrap {
     color: var(--text-muted);
+    font-style: italic;
   }
 
-  .banned td {
-    opacity: 0.5;
-  }
-
-  .sm-btn {
-    font-size: 11px;
-    padding: 2px 8px;
+  .unverified {
+    opacity: 0.6;
   }
 
   .empty-state.compact {

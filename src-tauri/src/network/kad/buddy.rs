@@ -40,6 +40,16 @@ impl BuddyManager {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.state = BuddyState::NoBuddy;
+        self.buddy_id = None;
+        self.buddy_addr = None;
+        self.buddy_stream = None;
+        self.last_find_attempt = 0;
+        self.serving_buddy_for = None;
+        self.serving_stream = None;
+    }
+
     pub fn state(&self) -> BuddyState {
         self.state
     }
