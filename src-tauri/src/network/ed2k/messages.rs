@@ -27,22 +27,15 @@ pub const OP_EMULEINFO: u8 = 0x01;
 pub const OP_EMULEINFOANSWER: u8 = 0x02;
 pub const OP_COMPRESSEDPART: u8 = 0x40;
 pub const OP_QUEUERANKING: u8 = 0x60;
-#[allow(dead_code)]
 pub const OP_MULTIPACKET: u8 = 0x92;
-#[allow(dead_code)]
 pub const OP_MULTIPACKETANSWER: u8 = 0x93;
-#[allow(dead_code)]
 pub const OP_AICHREQUEST: u8 = 0x9B;
-#[allow(dead_code)]
 pub const OP_AICHANSWER: u8 = 0x9C;
 pub const OP_COMPRESSEDPART_I64: u8 = 0xA1;
 pub const OP_SENDINGPART_I64: u8 = 0xA2;
 pub const OP_REQUESTPARTS_I64: u8 = 0xA3;
-#[allow(dead_code)]
 pub const OP_MULTIPACKET_EXT: u8 = 0xA4;
-#[allow(dead_code)]
 pub const OP_MULTIPACKET_EXT2: u8 = 0xA9;
-#[allow(dead_code)]
 pub const OP_MULTIPACKETANSWER_EXT2: u8 = 0xB0;
 pub const OP_PORTTEST: u8 = 0xFE;
 

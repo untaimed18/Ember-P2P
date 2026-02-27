@@ -1,9 +1,11 @@
-use std::io::{Read as _, Seek, SeekFrom};
+use std::io::{Read as _, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::collections::HashMap;
 
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
@@ -674,7 +676,50 @@ impl UploadHandler {
                         // Apply bandwidth limiting
                         self.acquire_upload_bandwidth(data.len() as u64).await;
 
-                        // Build SendingPart_I64 packet
+                        // Compress the data if it's large enough (e.g. > 1KB) to be worth it
+                        let use_compression = data.len() > 1024;
+                        if use_compression {
+                            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+                            if encoder.write_all(&data).is_ok() {
+                                if let Ok(compressed) = encoder.finish() {
+                                    // Only use compression if it actually saves space
+                                    if compressed.len() < data.len() {
+                                        let mut part_payload = Vec::with_capacity(32 + compressed.len());
+                                        part_payload.extend_from_slice(&hash);
+                                        part_payload.extend_from_slice(&start.to_le_bytes());
+                                        part_payload.extend_from_slice(&(data.len() as u32).to_le_bytes()); // Original length
+                                        part_payload.extend_from_slice(&compressed);
+
+                                        write_packet_async(
+                                            &mut writer,
+                                            OP_EMULEPROT,
+                                            OP_COMPRESSEDPART_I64,
+                                            &part_payload,
+                                        )
+                                        .await?;
+
+                                        uploaded += data.len() as u64;
+                                        {
+                                            let mut cm = self.credit_manager.write().await;
+                                            cm.add_uploaded(peer_user_hash, data.len() as u64);
+                                        }
+
+                                        if let Some(tid) = &transfer_id {
+                                            let _ = self.upload_event_tx.send(UploadEvent {
+                                                transfer_id: tid.clone(),
+                                                kind: UploadEventKind::Progress {
+                                                    uploaded,
+                                                    total: total_size,
+                                                },
+                                            }).await;
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Fallback to uncompressed SendingPart_I64 packet
                         let mut part_payload = Vec::with_capacity(32 + data.len());
                         part_payload.extend_from_slice(&hash);
                         part_payload.extend_from_slice(&start.to_le_bytes());
@@ -825,6 +870,56 @@ impl UploadHandler {
                             &resp,
                         )
                         .await?;
+                    }
+                }
+
+                (OP_EMULEPROT, OP_AICHREQUEST) => {
+                    if payload.len() >= 18 {
+                        let mut req_hash = [0u8; 16];
+                        req_hash.copy_from_slice(&payload[..16]);
+                        let part_idx = u16::from_le_bytes([payload[16], payload[17]]) as usize;
+                        
+                        let hash_hex = hex::encode(req_hash);
+                        let file_info = {
+                            let index = self.local_index.read().await;
+                            index.get_by_hash(&hash_hex).cloned()
+                        };
+
+                        if let Some(file) = file_info {
+                            let path = PathBuf::from(&file.path);
+                            // We need to compute/load the AICH tree. 
+                            // Since we don't have a persistent AICH store yet, we compute it on demand.
+                            // This might be slow for large files, but it's correct.
+                            // In a real implementation, this should be cached.
+                            let aich_result = tokio::task::spawn_blocking(move || {
+                                crate::network::ed2k::aich::AICHRecoveryHashSet::build_from_file(&path)
+                            }).await?;
+
+                            match aich_result {
+                                Ok(hs) => {
+                                    // Create recovery data for the requested part
+                                    // PARTSIZE is constant 9.28MB
+                                    let recovery_data = hs.create_part_recovery_data(part_idx, PARTSIZE as usize);
+                                    
+                                    let mut resp = Vec::with_capacity(16 + 2 + 20 + recovery_data.len());
+                                    resp.extend_from_slice(&req_hash);
+                                    resp.extend_from_slice(&(part_idx as u16).to_le_bytes());
+                                    resp.extend_from_slice(&hs.root_hash);
+                                    resp.extend_from_slice(&recovery_data);
+
+                                    write_packet_async(
+                                        &mut writer,
+                                        OP_EMULEPROT,
+                                        OP_AICHANSWER,
+                                        &resp,
+                                    )
+                                    .await?;
+                                }
+                                Err(e) => {
+                                    warn!("Failed to build AICH for request: {e}");
+                                }
+                            }
+                        }
                     }
                 }
 
