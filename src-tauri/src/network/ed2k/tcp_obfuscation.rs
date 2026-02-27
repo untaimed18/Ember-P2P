@@ -30,12 +30,17 @@ pub enum NegotiationResult {
 ///
 /// - Plain: returns `NegotiationResult::Plain` with the first byte (the caller
 ///   must prepend it when parsing the first packet).
-/// - Obfuscated: performs the full RC4 handshake matching eMule's
+/// - Obfuscated: performs the RC4 handshake matching eMule's
 ///   `EncryptedStreamSocket` receiver side, then returns the RC4 keys.
+///
+/// If `send_response` is false, the receive side of the handshake is verified
+/// but no response is sent. This is used for server port test probes where
+/// the server's simple test code doesn't expect a response.
 pub async fn negotiate_incoming<R, W>(
     reader: &mut R,
     writer: &mut W,
     user_hash: &[u8; 16],
+    send_response: bool,
 ) -> io::Result<NegotiationResult>
 where
     R: AsyncReadExt + Unpin,
@@ -107,22 +112,26 @@ where
     }
 
     // Step 6: Send our response (encrypted with send_key)
-    let response_pad_len = (rand::random::<u8>() % 16) as usize;
-    let resp_len = 4 + 1 + 1 + response_pad_len;
-    let mut resp_plain = Vec::with_capacity(resp_len);
-    resp_plain.extend_from_slice(&MAGICVALUE_SYNC.to_le_bytes());
-    resp_plain.push(ENM_OBFUSCATION);
-    resp_plain.push(response_pad_len as u8);
-    for _ in 0..response_pad_len {
-        resp_plain.push(rand::random::<u8>());
+    if send_response {
+        let response_pad_len = (rand::random::<u8>() % 16) as usize;
+        let resp_len = 4 + 1 + 1 + response_pad_len;
+        let mut resp_plain = Vec::with_capacity(resp_len);
+        resp_plain.extend_from_slice(&MAGICVALUE_SYNC.to_le_bytes());
+        resp_plain.push(ENM_OBFUSCATION);
+        resp_plain.push(response_pad_len as u8);
+        for _ in 0..response_pad_len {
+            resp_plain.push(rand::random::<u8>());
+        }
+
+        let mut resp_encrypted = vec![0u8; resp_plain.len()];
+        send_key.process(&resp_plain, &mut resp_encrypted);
+        writer.write_all(&resp_encrypted).await?;
+        writer.flush().await?;
+
+        info!("TCP obfuscation handshake complete (padding_in={padding_len}, padding_out={response_pad_len})");
+    } else {
+        info!("TCP obfuscation verified (no response sent, padding_in={padding_len})");
     }
-
-    let mut resp_encrypted = vec![0u8; resp_plain.len()];
-    send_key.process(&resp_plain, &mut resp_encrypted);
-    writer.write_all(&resp_encrypted).await?;
-    writer.flush().await?;
-
-    info!("TCP obfuscation handshake complete (padding_in={padding_len}, padding_out={response_pad_len})");
 
     Ok(NegotiationResult::Obfuscated { recv_key, send_key })
 }

@@ -83,7 +83,7 @@ impl Ed2kServerConnection {
         tcp_port: u16,
     ) -> anyhow::Result<ServerSession> {
         let flags: u32 = SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_UNICODE | SRVCAP_LARGEFILES
-            | SRVCAP_SUPPORTCRYPT;
+            | SRVCAP_SUPPORTCRYPT | SRVCAP_REQUESTCRYPT;
         let payload = build_login_request(user_hash, tcp_port, nickname);
         info!("Sending OP_LOGINREQUEST ({} bytes): port={}, nick={}, flags=0x{:04X}, emule_ver=0x{:X}",
             payload.len(), tcp_port, nickname,
@@ -291,7 +291,6 @@ const SRVCAP_NEWTAGS: u32 = 0x0008;
 const SRVCAP_UNICODE: u32 = 0x0010;
 const SRVCAP_LARGEFILES: u32 = 0x0100;
 const SRVCAP_SUPPORTCRYPT: u32 = 0x0200;
-#[allow(dead_code)]
 const SRVCAP_REQUESTCRYPT: u32 = 0x0400;
 
 const CT_NAME: u8 = 0x01;
@@ -318,13 +317,9 @@ fn build_login_request(user_hash: &[u8; 16], tcp_port: u16, nickname: &str) -> V
     write_uint32_tag(&mut buf, CT_VERSION, 0x3C);
 
     // Tag 3: CT_SERVER_FLAGS (0x20) - capability flags
-    // SUPPORTCRYPT only (no REQUESTCRYPT): we accept encrypted incoming peer connections
-    // but our outgoing server login is plain text. REQUESTCRYPT would require us to
-    // connect to the server's obfuscation port using DH key exchange, which we don't
-    // implement yet. The server's port test will still use obfuscation (keyed on our
-    // user_hash) since we advertise SUPPORTCRYPT.
+    // REQUESTCRYPT is required by most modern servers to accept our login.
     let flags: u32 = SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_UNICODE | SRVCAP_LARGEFILES
-        | SRVCAP_SUPPORTCRYPT;
+        | SRVCAP_SUPPORTCRYPT | SRVCAP_REQUESTCRYPT;
     write_uint32_tag(&mut buf, CT_SERVER_FLAGS, flags);
 
     // Tag 4: CT_EMULE_VERSION (0xFB) - (major << 17) | (minor << 10) | (update << 7)
