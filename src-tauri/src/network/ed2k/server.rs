@@ -21,6 +21,15 @@ pub const OP_GETSOURCES: u8 = 0x19;
 pub const OP_FOUNDSOURCES: u8 = 0x42;
 pub const OP_GETSERVERLIST: u8 = 0x14;
 pub const OP_REJECT: u8 = 0x05;
+#[allow(dead_code)]
+pub const OP_CALLBACKREQUEST: u8 = 0x1C;
+#[allow(dead_code)]
+pub const OP_CALLBACKREQUESTED: u8 = 0x35;
+#[allow(dead_code)]
+pub const OP_CALLBACK_FAIL: u8 = 0x36;
+
+/// LowID threshold: client_id < this means LowID
+pub const LOWID_THRESHOLD: u32 = 0x0100_0000;
 
 #[derive(Debug, Clone)]
 pub struct ServerSearchResult {
@@ -168,9 +177,86 @@ impl Ed2kServerConnection {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    pub async fn request_callback(&mut self, client_id: u32) -> anyhow::Result<()> {
+        let payload = client_id.to_le_bytes().to_vec();
+        write_server_packet(&mut self.writer, OP_CALLBACKREQUEST, &payload).await?;
+        info!("Sent callback request for LowID client {client_id}");
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn poll_messages(&mut self) -> Vec<ServerEvent> {
+        let mut events = Vec::new();
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            read_server_packet(&mut self.reader),
+        ).await {
+            Ok(Ok((opcode, payload))) => {
+                match opcode {
+                    OP_CALLBACKREQUESTED => {
+                        if payload.len() >= 6 {
+                            let ip = std::net::Ipv4Addr::from(u32::from_le_bytes([
+                                payload[0], payload[1], payload[2], payload[3],
+                            ]).to_be_bytes());
+                            let port = u16::from_le_bytes([payload[4], payload[5]]);
+                            info!("Callback requested: connect to {ip}:{port}");
+                            events.push(ServerEvent::CallbackRequested { ip: ip.to_string(), port });
+                        }
+                    }
+                    OP_CALLBACK_FAIL => {
+                        debug!("Server reported callback failure");
+                        events.push(ServerEvent::CallbackFailed);
+                    }
+                    OP_SERVERMESSAGE => {
+                        if payload.len() >= 2 {
+                            let len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+                            if payload.len() >= 2 + len {
+                                let msg = String::from_utf8_lossy(&payload[2..2 + len]).to_string();
+                                events.push(ServerEvent::Message(msg));
+                            }
+                        }
+                    }
+                    OP_SERVERSTATUS => {
+                        if payload.len() >= 8 {
+                            let users = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                            let files = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                            events.push(ServerEvent::StatusUpdate { users, files });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        events
+    }
+
+    #[allow(dead_code)]
+    pub fn is_low_id(&self) -> bool {
+        self.session
+            .as_ref()
+            .map(|s| s.client_id > 0 && s.client_id < LOWID_THRESHOLD)
+            .unwrap_or(false)
+    }
+
+    #[allow(dead_code)]
+    pub fn our_client_id(&self) -> Option<u32> {
+        self.session.as_ref().map(|s| s.client_id)
+    }
+
     pub async fn disconnect(mut self) {
         let _ = self.writer.shutdown().await;
     }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub enum ServerEvent {
+    CallbackRequested { ip: String, port: u16 },
+    CallbackFailed,
+    Message(String),
+    StatusUpdate { users: u32, files: u32 },
 }
 
 fn build_login_request(user_hash: &[u8; 16], tcp_port: u16, nickname: &str) -> Vec<u8> {

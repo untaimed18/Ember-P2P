@@ -1,6 +1,7 @@
 use crate::app_state::AppState;
 use crate::network::NetworkCommand;
 use crate::types::ServerInfo;
+use tracing::info;
 
 #[tauri::command]
 pub async fn connect_to_server(
@@ -100,4 +101,49 @@ pub async fn get_connected_server(
         .map_err(|e| format!("Network busy: {e}"))?;
 
     rx.await.map_err(|_| "Failed to get connected server".to_string())
+}
+
+#[tauri::command]
+pub async fn download_server_met(
+    state: tauri::State<'_, AppState>,
+    url: String,
+) -> Result<String, String> {
+    if url.is_empty() {
+        return Err("URL is required".into());
+    }
+
+    info!("Downloading server.met from {url}");
+
+    let response = reqwest::get(&url)
+        .await
+        .map_err(|e| format!("HTTP request failed: {e}"))?;
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read response: {e}"))?;
+
+    let data = if bytes.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)
+            .map_err(|e| format!("Failed to decompress gzip: {e}"))?;
+        decompressed
+    } else {
+        bytes.to_vec()
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::MergeServerMet { data, tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
+
+    let added = rx.await.map_err(|_| "Failed to merge servers".to_string())?
+        .map_err(|e| format!("Failed to parse server.met: {e}"))?;
+
+    let msg = format!("Downloaded and merged {added} new servers from server.met");
+    info!("{msg}");
+    Ok(msg)
 }

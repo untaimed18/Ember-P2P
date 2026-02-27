@@ -76,6 +76,171 @@ fn build_tree_recursive(leaves: &[[u8; 20]], is_left_branch: bool) -> [u8; 20] {
     hasher.finalize().into()
 }
 
+#[allow(dead_code)]
+/// AICH Recovery HashSet: stores the full Merkle tree for a file.
+/// Used to identify which 180KB blocks within a part are corrupt.
+pub struct AICHRecoveryHashSet {
+    pub root_hash: [u8; 20],
+    /// All leaf hashes (one per 180KB block)
+    pub leaf_hashes: Vec<[u8; 20]>,
+    /// Trust count: how many unique IPs reported the same root hash
+    pub trust_votes: std::collections::HashMap<[u8; 20], Vec<std::net::Ipv4Addr>>,
+}
+
+#[allow(dead_code)]
+const AICH_TRUST_THRESHOLD: usize = 10;
+#[allow(dead_code)]
+const AICH_TRUST_PERCENTAGE: f64 = 0.92;
+
+#[allow(dead_code)]
+impl AICHRecoveryHashSet {
+    pub fn new(root_hash: [u8; 20]) -> Self {
+        Self {
+            root_hash,
+            leaf_hashes: Vec::new(),
+            trust_votes: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Build from a file, storing all leaf hashes.
+    pub fn build_from_file(path: &Path) -> anyhow::Result<Self> {
+        let mut file = std::fs::File::open(path)?;
+        let file_size = file.metadata()?.len();
+
+        let block_size_u64 = AICH_BLOCK_SIZE as u64;
+        let num_blocks = ((file_size + block_size_u64 - 1) / block_size_u64) as usize;
+        let mut leaf_hashes: Vec<[u8; 20]> = Vec::with_capacity(num_blocks);
+        let mut buf = vec![0u8; AICH_BLOCK_SIZE];
+        let mut remaining = file_size;
+
+        for _ in 0..num_blocks {
+            let block_size = remaining.min(block_size_u64) as usize;
+            let buf_slice = &mut buf[..block_size];
+            file.read_exact(buf_slice)?;
+            leaf_hashes.push(Sha1::digest(buf_slice).into());
+            remaining -= block_size as u64;
+        }
+
+        let root_hash = merkle_root(&leaf_hashes);
+        Ok(Self {
+            root_hash,
+            leaf_hashes,
+            trust_votes: std::collections::HashMap::new(),
+        })
+    }
+
+    /// Build from raw data (e.g., a part or buffer).
+    pub fn build_from_data(data: &[u8]) -> Self {
+        let num_blocks = (data.len() + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE;
+        let mut leaf_hashes: Vec<[u8; 20]> = Vec::with_capacity(num_blocks);
+
+        for chunk in data.chunks(AICH_BLOCK_SIZE) {
+            leaf_hashes.push(Sha1::digest(chunk).into());
+        }
+
+        let root_hash = merkle_root(&leaf_hashes);
+        Self {
+            root_hash,
+            leaf_hashes,
+            trust_votes: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Add a trust vote for a root hash from a specific IP.
+    pub fn add_trust_vote(&mut self, root_hash: [u8; 20], ip: std::net::Ipv4Addr) {
+        let voters = self.trust_votes.entry(root_hash).or_default();
+        if !voters.contains(&ip) {
+            voters.push(ip);
+        }
+    }
+
+    /// Check if the root hash is trusted (enough unique IP votes with consensus).
+    pub fn is_trusted(&self) -> bool {
+        if let Some(voters) = self.trust_votes.get(&self.root_hash) {
+            if voters.len() < AICH_TRUST_THRESHOLD {
+                return false;
+            }
+            let total_votes: usize = self.trust_votes.values().map(|v| v.len()).sum();
+            let our_votes = voters.len();
+            (our_votes as f64 / total_votes as f64) >= AICH_TRUST_PERCENTAGE
+        } else {
+            false
+        }
+    }
+
+    /// Identify which blocks within a part are corrupt by comparing leaf hashes.
+    /// Returns indices of corrupt blocks (relative to the part start).
+    pub fn find_corrupt_blocks(
+        &self,
+        part_index: usize,
+        part_data: &[u8],
+        part_size: usize,
+    ) -> Vec<usize> {
+        let blocks_per_part = (part_size + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE;
+        let start_block = part_index * blocks_per_part;
+        let mut corrupt = Vec::new();
+
+        for (i, chunk) in part_data.chunks(AICH_BLOCK_SIZE).enumerate() {
+            let block_idx = start_block + i;
+            if block_idx >= self.leaf_hashes.len() {
+                break;
+            }
+            let computed: [u8; 20] = Sha1::digest(chunk).into();
+            if computed != self.leaf_hashes[block_idx] {
+                corrupt.push(i);
+            }
+        }
+
+        corrupt
+    }
+
+    /// Create recovery data for a part (serialize the leaf hashes needed).
+    pub fn create_part_recovery_data(&self, part_index: usize, part_size: usize) -> Vec<u8> {
+        let blocks_per_part = (part_size + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE;
+        let start_block = part_index * blocks_per_part;
+        let end_block = (start_block + blocks_per_part).min(self.leaf_hashes.len());
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&(end_block - start_block).to_le_bytes()[..2]);
+        for i in start_block..end_block {
+            data.extend_from_slice(&self.leaf_hashes[i]);
+        }
+        data
+    }
+
+    /// Read recovery data received from a peer.
+    pub fn read_recovery_data(&mut self, data: &[u8], part_index: usize, part_size: usize) -> bool {
+        if data.len() < 2 {
+            return false;
+        }
+        let block_count = u16::from_le_bytes([data[0], data[1]]) as usize;
+        let expected_len = 2 + block_count * 20;
+        if data.len() < expected_len {
+            return false;
+        }
+
+        let blocks_per_part = (part_size + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE;
+        let start_block = part_index * blocks_per_part;
+
+        while self.leaf_hashes.len() < start_block + block_count {
+            self.leaf_hashes.push([0u8; 20]);
+        }
+
+        for i in 0..block_count {
+            let offset = 2 + i * 20;
+            let mut hash = [0u8; 20];
+            hash.copy_from_slice(&data[offset..offset + 20]);
+            self.leaf_hashes[start_block + i] = hash;
+        }
+
+        true
+    }
+
+    pub fn leaf_count(&self) -> usize {
+        self.leaf_hashes.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

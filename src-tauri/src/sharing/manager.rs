@@ -266,6 +266,12 @@ impl TransferManager {
         all
     }
 
+    pub fn get_transfer(&self, id: &str) -> Option<&Transfer> {
+        self.active.get(id)
+            .or_else(|| self.queue.iter().find(|t| t.id == id))
+            .or_else(|| self.completed.iter().find(|t| t.id == id))
+    }
+
     fn promote_next(&mut self) -> Vec<Transfer> {
         let mut promoted = Vec::new();
         while self.active.len() < self.max_concurrent as usize {

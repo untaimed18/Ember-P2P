@@ -8,6 +8,7 @@
     { href: '/search', label: 'Search', icon: '⌕' },
     { href: '/transfers', label: 'Transfers', icon: '⇅' },
     { href: '/sharing', label: 'Sharing', icon: '⊕' },
+    { href: '/statistics', label: 'Statistics', icon: '📊' },
     { href: '/security', label: 'Security', icon: '🛡' },
     { href: '/settings', label: 'Settings', icon: '⚙' },
   ];

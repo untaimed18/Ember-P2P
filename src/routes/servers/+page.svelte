@@ -6,6 +6,7 @@
     disconnectServer,
     addServer,
     removeServer,
+    downloadServerMet,
   } from '$lib/api/server';
   import type { ServerInfo } from '$lib/types';
   import { onMount } from 'svelte';
@@ -171,9 +172,16 @@
     }
     error = null;
     log(`Downloading server.met from ${url}...`);
-    // For now this is handled by adding servers manually
-    // A full implementation would download + parse the binary server.met
-    flash('server.met URL update not yet implemented — add servers manually');
+    try {
+      const result = await downloadServerMet(url);
+      flash(result);
+      log(result);
+      await refresh();
+    } catch (e: unknown) {
+      const msg = String(e);
+      error = msg;
+      log(`Failed: ${msg}`);
+    }
   }
 
   function handleDoubleClick(server: ServerInfo) {

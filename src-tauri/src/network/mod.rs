@@ -19,7 +19,9 @@ use crate::storage::database::Database;
 use crate::types::*;
 
 use self::ed2k::a4af::A4AFManager;
+use self::ed2k::comments::CommentManager;
 use self::ed2k::credits::CreditManager;
+use self::ed2k::dead_sources::DeadSourceList;
 use self::ed2k::server::Ed2kServerConnection;
 use self::ed2k::server_list::{ServerEntry, ServerList};
 use self::ed2k::sources::SourceManager;
@@ -28,6 +30,7 @@ use self::ed2k::multi_source::{DownloadSource, MultiSourceDownload};
 use self::ed2k::transfer::{DownloadEvent, Ed2kDownload};
 use self::kad::bootstrap;
 use self::kad::buddy::{BuddyManager, BuddyState};
+use self::kad::firewall::FirewallChecker;
 use self::kad::ip_filter::{IpFilter, IpFilterStats};
 use self::kad::messages::{self, KadMessage, KADEMLIA_FIND_NODE};
 use self::kad::obfuscation;
@@ -37,6 +40,9 @@ use self::kad::routing::RoutingTable;
 use self::kad::search::{SearchId, SearchManager, SearchType, SEARCH_INITIAL_CONTACTS};
 use self::kad::store::DhtStore;
 use self::kad::types::*;
+
+use crate::storage::known_files::KnownFileList;
+use crate::storage::statistics::StatsManager;
 
 #[derive(Debug)]
 pub enum NetworkCommand {
@@ -139,6 +145,31 @@ pub enum NetworkCommand {
     UpdateSettings {
         settings: AppSettings,
     },
+    SetFileComment {
+        file_hash: String,
+        rating: u8,
+        comment: String,
+    },
+    GetFileComments {
+        file_hash: String,
+        tx: oneshot::Sender<Option<ed2k::comments::FileCommentInfo>>,
+    },
+    GetStatistics {
+        tx: oneshot::Sender<crate::storage::statistics::TransferStats>,
+    },
+    MergeServerMet {
+        data: Vec<u8>,
+        tx: oneshot::Sender<anyhow::Result<usize>>,
+    },
+    PreviewFile {
+        transfer_id: String,
+        tx: oneshot::Sender<Result<String, String>>,
+    },
+    #[allow(dead_code)]
+    UpdateIpFilterFromUrl {
+        url: String,
+        tx: oneshot::Sender<Result<usize, String>>,
+    },
     Shutdown,
 }
 
@@ -224,6 +255,17 @@ struct NetworkState {
     server_addr: Option<SocketAddr>,
     /// A4AF source management (shared with upload handler via a4af_shared Arc)
     _a4af_placeholder: (),
+    /// Dead source tracking (prevents reconnecting to failing sources)
+    dead_sources: DeadSourceList,
+    /// Comment/rating manager
+    comment_manager: CommentManager,
+    /// Firewall checker for systematic NAT/firewall detection
+    #[allow(dead_code)]
+    firewall_checker: FirewallChecker,
+    /// Whether we have LowID from the server
+    low_id: bool,
+    /// Our server-assigned client ID
+    server_client_id: u32,
 }
 
 pub async fn start_network(
@@ -463,7 +505,26 @@ pub async fn start_network(
         server_connection: None,
         server_addr: None,
         _a4af_placeholder: (),
+        dead_sources: DeadSourceList::new(),
+        comment_manager: CommentManager::new(),
+        firewall_checker: FirewallChecker::new(),
+        low_id: false,
+        server_client_id: 0,
     };
+
+    // Load known files for hash cache
+    let known_met_path = data_dir.join("known.met");
+    let mut known_files = KnownFileList::load(&known_met_path);
+    info!("Loaded {} known files", known_files.file_count());
+
+    // Initialize statistics manager
+    let mut stats_manager = StatsManager::new();
+    stats_manager.load_cumulative(&db);
+
+    // Load comments from database
+    if let Ok(rows) = db.load_file_comments() {
+        state.comment_manager.load_from_db_rows(rows);
+    }
 
     // Send bootstrap requests to initial contacts
     for contact in &boot_contacts {
@@ -580,6 +641,10 @@ pub async fn start_network(
     let mut credit_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
     let mut a4af_timer = tokio::time::interval(std::time::Duration::from_secs(480));
     let mut server_timer = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut stats_timer = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut stats_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
+    let mut known_met_save_timer = tokio::time::interval(std::time::Duration::from_secs(660));
+    let mut dead_source_timer = tokio::time::interval(std::time::Duration::from_secs(300));
 
     // Resume incomplete downloads from previous session
     if let Ok(incomplete) = db.get_incomplete_downloads() {
@@ -678,6 +743,8 @@ pub async fn start_network(
                             &transfer_manager,
                             &source_manager,
                             &credit_manager,
+                            &mut stats_manager,
+                            &mut known_files,
                         ).await;
                     }
                 }
@@ -714,6 +781,8 @@ pub async fn start_network(
                         &transfer_manager,
                         &source_manager,
                         &credit_manager,
+                        &mut stats_manager,
+                        &mut known_files,
                     ).await;
                 }
             }
@@ -749,6 +818,8 @@ pub async fn start_network(
                         &transfer_manager,
                         &source_manager,
                         &credit_manager,
+                        &mut stats_manager,
+                        &mut known_files,
                     ).await;
                 }
             }
@@ -1647,8 +1718,12 @@ pub async fn start_network(
                                     let nickname = settings.nickname.clone();
                                     match conn.login(&state.user_hash, &nickname, state.tcp_port).await {
                                         Ok(session) => {
-                                            info!("Connected to ed2k server: {} ({} users, {} files)",
-                                                session.server_name, session.user_count, session.file_count);
+                                            let is_low = session.client_id > 0 && session.client_id < ed2k::server::LOWID_THRESHOLD;
+                                            info!("Connected to ed2k server: {} ({} users, {} files, {})",
+                                                session.server_name, session.user_count, session.file_count,
+                                                if is_low { "LowID" } else { "HighID" });
+                                            state.low_id = is_low;
+                                            state.server_client_id = session.client_id;
                                             state.server_list.record_success(&addr.ip().to_string(), addr.port());
                                             state.server_connected = true;
                                             state.server_addr = Some(addr);
@@ -1677,6 +1752,31 @@ pub async fn start_network(
                 if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
                     error!("Failed periodic nodes.dat save: {e}");
                 }
+            }
+
+            // Statistics rate recording (every second)
+            _ = stats_timer.tick() => {
+                stats_manager.record_rate();
+            }
+
+            // Periodic statistics save (every 5 minutes)
+            _ = stats_save_timer.tick() => {
+                stats_manager.save_cumulative(&db);
+            }
+
+            // Periodic known.met save (every 11 minutes, matching eMule)
+            _ = known_met_save_timer.tick() => {
+                if known_files.is_dirty() {
+                    let known_path = state.data_dir.join("known.met");
+                    if let Err(e) = known_files.save(&known_path) {
+                        error!("Failed to save known.met: {e}");
+                    }
+                }
+            }
+
+            // Dead source cleanup (every 5 minutes)
+            _ = dead_source_timer.tick() => {
+                state.dead_sources.cleanup();
             }
 
             // Refresh shared peer/stats caches for frontend reads (no channel needed)
@@ -1794,13 +1894,24 @@ pub async fn start_network(
         }
     }
 
-    // Save routing table on shutdown (eMule saves ~200 bootstrap contacts)
+    // Save all state on shutdown
     info!("Shutting down network");
     let contacts = state.routing_table.export_bootstrap_contacts(200);
     let nodes_path = state.data_dir.join("nodes.dat");
     if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
         error!("Failed to save nodes.dat: {e}");
     }
+
+    stats_manager.save_cumulative(&db);
+    info!("Statistics saved on shutdown");
+
+    let known_path = state.data_dir.join("known.met");
+    if let Err(e) = known_files.save(&known_path) {
+        error!("Failed to save known.met on shutdown: {e}");
+    }
+
+    let server_met_path = state.data_dir.join("server.met");
+    let _ = state.server_list.save_server_met(&server_met_path);
 
     if upnp_enabled {
         upnp_mappings.teardown().await;
@@ -2966,6 +3077,8 @@ async fn handle_command(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,
+    stats_manager: &mut StatsManager,
+    #[allow(unused)] known_files: &mut KnownFileList,
 ) {
     match cmd {
         NetworkCommand::SearchFiles { query, tx } => {
@@ -3793,6 +3906,72 @@ async fn handle_command(
             state.publish_manager.clear_all();
             state.publish_manager.add_files_batch(files);
             info!("Re-populated publish manager with {count} shared files after change");
+        }
+
+        NetworkCommand::SetFileComment { file_hash, rating, comment } => {
+            state.comment_manager.set_our_comment(&file_hash, rating, comment.clone());
+            if let Err(e) = db.save_file_comment(&file_hash, rating, &comment) {
+                warn!("Failed to save comment: {e}");
+            }
+        }
+
+        NetworkCommand::GetFileComments { file_hash, tx } => {
+            let info = state.comment_manager.get_comments(&file_hash).cloned();
+            let _ = tx.send(info);
+        }
+
+        NetworkCommand::GetStatistics { tx } => {
+            let stats = stats_manager.get_stats();
+            let _ = tx.send(stats);
+        }
+
+        NetworkCommand::MergeServerMet { data, tx } => {
+            let result = state.server_list.merge_from_bytes(&data);
+            let _ = tx.send(result);
+            let met_path = state.data_dir.join("server.met");
+            let _ = state.server_list.save_server_met(&met_path);
+        }
+
+        NetworkCommand::PreviewFile { transfer_id, tx } => {
+            let result = {
+                let mgr = transfer_manager.read().await;
+                if let Some(transfer) = mgr.get_transfer(&transfer_id) {
+                    let ext = std::path::Path::new(&transfer.file_name)
+                        .extension()
+                        .map(|e| e.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if ed2k::preview::is_previewable_extension(&ext) {
+                        Ok(transfer.file_name.clone())
+                    } else {
+                        Err("File type is not previewable".to_string())
+                    }
+                } else {
+                    Err("Transfer not found".to_string())
+                }
+            };
+            let _ = tx.send(result.map(|name| format!("Preview ready for: {name}")));
+        }
+
+        NetworkCommand::UpdateIpFilterFromUrl { url, tx } => {
+            let result = async {
+                let response = reqwest::get(&url).await.map_err(|e| format!("HTTP error: {e}"))?;
+                let bytes = response.bytes().await.map_err(|e| format!("Read error: {e}"))?;
+                let data = if bytes.starts_with(&[0x1f, 0x8b]) {
+                    use std::io::Read;
+                    let mut dec = flate2::read::GzDecoder::new(&bytes[..]);
+                    let mut out = Vec::new();
+                    dec.read_to_end(&mut out).map_err(|e| format!("Gzip error: {e}"))?;
+                    out
+                } else {
+                    bytes.to_vec()
+                };
+                let temp_path = state.data_dir.join("ipfilter_download.tmp");
+                std::fs::write(&temp_path, &data).map_err(|e| format!("Write error: {e}"))?;
+                let count = state.ip_filter.append_from_file(&temp_path);
+                let _ = std::fs::remove_file(&temp_path);
+                Ok(count)
+            }.await;
+            let _ = tx.send(result);
         }
 
         NetworkCommand::Shutdown => {}

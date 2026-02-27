@@ -123,6 +123,23 @@ impl Database {
             conn.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (?1)", params![2i64])?;
         }
 
+        if version < 3 {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS statistics (
+                    key TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS file_comments (
+                    file_hash TEXT PRIMARY KEY,
+                    rating INTEGER NOT NULL DEFAULT 0,
+                    comment TEXT NOT NULL DEFAULT ''
+                );
+                ",
+            )?;
+            conn.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (?1)", params![3i64])?;
+        }
+
         Ok(())
     }
 
@@ -391,6 +408,54 @@ impl Database {
             .filter_map(|r| r.ok())
             .collect();
         Ok(records)
+    }
+
+    pub fn load_statistics(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare("SELECT key, value FROM statistics")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    pub fn save_statistics(&self, pairs: &[(&str, i64)]) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare("INSERT OR REPLACE INTO statistics (key, value) VALUES (?1, ?2)")?;
+            for (key, value) in pairs {
+                stmt.execute(params![key, value])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn load_file_comments(&self) -> anyhow::Result<Vec<(String, u8, String)>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare("SELECT file_hash, rating, comment FROM file_comments")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i32>(1)? as u8,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    pub fn save_file_comment(&self, file_hash: &str, rating: u8, comment: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO file_comments (file_hash, rating, comment) VALUES (?1, ?2, ?3)",
+            params![file_hash, rating as i32, comment],
+        )?;
+        Ok(())
     }
 
     pub fn save_all_credits(&self, credits: &[(&[u8; 16], u64, u64, i64, &[u8])]) -> anyhow::Result<()> {

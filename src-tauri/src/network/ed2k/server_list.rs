@@ -171,6 +171,85 @@ impl ServerList {
         Ok(list)
     }
 
+    /// Merge servers from raw server.met bytes without clearing existing list.
+    pub fn merge_from_bytes(&mut self, data: &[u8]) -> anyhow::Result<usize> {
+        if data.len() < 5 {
+            return Ok(0);
+        }
+        let mut cursor = Cursor::new(data);
+        let version = cursor.read_u8()?;
+        if version != 0x0E && version != 0xE0 && version != 0x0C {
+            anyhow::bail!("Unknown server.met version: 0x{version:02X}");
+        }
+        let count = cursor.read_u32::<LittleEndian>()? as usize;
+        let mut added = 0;
+
+        for _ in 0..count.min(500) {
+            let ip_raw = match cursor.read_u32::<LittleEndian>() {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let ip = std::net::Ipv4Addr::from(ip_raw.to_be_bytes());
+            let port = match cursor.read_u16::<LittleEndian>() {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let tag_count = match cursor.read_u32::<LittleEndian>() {
+                Ok(v) => v as usize,
+                Err(_) => break,
+            };
+
+            let mut entry = ServerEntry::new(ip.to_string(), port);
+
+            for _ in 0..tag_count.min(50) {
+                let tag_type = match cursor.read_u8() {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let name_len = cursor.read_u16::<LittleEndian>().unwrap_or(0) as usize;
+                let mut name = vec![0u8; name_len];
+                let _ = cursor.read_exact(&mut name);
+                let name_id = if name_len == 1 { name[0] } else { 0 };
+
+                match tag_type {
+                    0x02 => {
+                        let slen = cursor.read_u16::<LittleEndian>().unwrap_or(0) as usize;
+                        let mut sbuf = vec![0u8; slen];
+                        let _ = cursor.read_exact(&mut sbuf);
+                        match name_id {
+                            0x01 => entry.name = String::from_utf8_lossy(&sbuf).to_string(),
+                            0x0B => entry.description = String::from_utf8_lossy(&sbuf).to_string(),
+                            _ => {}
+                        }
+                    }
+                    0x03 => {
+                        let _ = cursor.read_u32::<LittleEndian>();
+                    }
+                    0x08 => { let _ = cursor.read_u16::<LittleEndian>(); }
+                    0x09 => { let _ = cursor.read_u8(); }
+                    _ => break,
+                }
+            }
+
+            if !self.servers.iter().any(|s| s.ip == entry.ip && s.port == entry.port) {
+                self.servers.push(entry);
+                added += 1;
+            }
+        }
+
+        info!("Merged {added} new servers from server.met data ({count} total in file)");
+        Ok(added)
+    }
+
+    #[allow(dead_code)]
+    pub fn update_server_stats(&mut self, ip: &str, port: u16, users: u32, files: u32) {
+        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+            entry.user_count = users;
+            entry.file_count = files;
+            entry.last_ping = chrono::Utc::now().timestamp();
+        }
+    }
+
     /// Save server list in server.met format.
     pub fn save_server_met(&self, path: &Path) -> io::Result<()> {
         let mut buf = Vec::new();

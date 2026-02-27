@@ -24,3 +24,7 @@ export async function getServerList(): Promise<ServerInfo[]> {
 export async function getConnectedServer(): Promise<ServerInfo | null> {
   return invoke('get_connected_server');
 }
+
+export async function downloadServerMet(url: string): Promise<string> {
+  return invoke('download_server_met', { url });
+}

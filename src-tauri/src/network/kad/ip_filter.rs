@@ -29,10 +29,6 @@ pub struct IpFilterStats {
     pub entries: Vec<IpFilterEntry>,
 }
 
-/// IP filter supporting eMule's ipfilter.dat format and private/reserved IP blocking.
-///
-/// The ipfilter.dat format is: start_ip - end_ip , access_level , description
-/// Lines with access_level < 128 are blocked.
 pub struct IpFilter {
     blocked_ranges: Vec<IpRange>,
     enabled: bool,
@@ -48,7 +44,6 @@ impl IpFilter {
         }
     }
 
-    /// Load an ipfilter.dat file (eMule format). Replaces existing ranges.
     pub fn load_from_file(&mut self, path: &Path) -> usize {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
@@ -66,7 +61,6 @@ impl IpFilter {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-
             if let Some(range) = parse_ipfilter_line(line) {
                 self.blocked_ranges.push(range);
                 count += 1;
@@ -75,7 +69,6 @@ impl IpFilter {
 
         self.blocked_ranges.sort_by_key(|r| r.start);
         self.merge_overlapping();
-
         info!("Loaded {count} IP filter ranges from {}", path.display());
         count
     }
@@ -101,16 +94,13 @@ impl IpFilter {
         self.blocked_ranges = merged;
     }
 
-    /// Check if an IPv4 address should be blocked, incrementing hit count if so.
     pub fn is_blocked(&mut self, ip: Ipv4Addr) -> bool {
         if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
             return true;
         }
-
         if self.block_private && is_private_or_reserved(ip) {
             return true;
         }
-
         if self.enabled {
             let ip_u32 = u32::from(ip);
             if let Ok(idx) = self.blocked_ranges.binary_search_by(|range| {
@@ -126,20 +116,16 @@ impl IpFilter {
                 return true;
             }
         }
-
         false
     }
 
-    /// Check if an IPv4 address is blocked without modifying hit counts.
     pub fn is_blocked_readonly(&self, ip: Ipv4Addr) -> bool {
         if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
             return true;
         }
-
         if self.block_private && is_private_or_reserved(ip) {
             return true;
         }
-
         if self.enabled {
             let ip_u32 = u32::from(ip);
             if self.blocked_ranges
@@ -157,7 +143,6 @@ impl IpFilter {
                 return true;
             }
         }
-
         false
     }
 
@@ -235,6 +220,137 @@ impl IpFilter {
         self.blocked_ranges.retain(|r| r.start != s || r.end != e);
         self.blocked_ranges.len() < before
     }
+
+    /// Load a PeerGuardian .p2p text file (format: "Description: IP1 - IP2")
+    pub fn load_p2p_file(&mut self, path: &Path) -> usize {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to read .p2p file: {e}");
+                return 0;
+            }
+        };
+
+        let mut count = 0;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(range) = parse_p2p_line(line) {
+                self.blocked_ranges.push(range);
+                count += 1;
+            }
+        }
+
+        self.blocked_ranges.sort_by_key(|r| r.start);
+        self.merge_overlapping();
+        info!("Loaded {count} ranges from .p2p file {}", path.display());
+        count
+    }
+
+    /// Load a PeerGuardian .p2b binary file (v1 or v2).
+    pub fn load_p2b_file(&mut self, path: &Path) -> usize {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("Failed to read .p2b file: {e}");
+                return 0;
+            }
+        };
+
+        if data.len() < 8 {
+            warn!(".p2b file too small");
+            return 0;
+        }
+
+        if &data[0..4] != b"\xff\xff\xff\xff" || &data[4..7] != b"P2B" {
+            warn!("Invalid .p2b header");
+            return 0;
+        }
+
+        let version = data[7];
+        if version != 1 && version != 2 {
+            warn!("Unsupported .p2b version: {version}");
+            return 0;
+        }
+
+        let mut pos = 8;
+        let mut count = 0;
+
+        while pos < data.len() {
+            let name_end = data[pos..].iter().position(|&b| b == 0);
+            let name_end = match name_end {
+                Some(e) => pos + e,
+                None => break,
+            };
+            let desc = String::from_utf8_lossy(&data[pos..name_end]).to_string();
+            pos = name_end + 1;
+
+            if pos + 8 > data.len() {
+                break;
+            }
+
+            let start = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            pos += 4;
+            let end = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            pos += 4;
+
+            if start <= end {
+                self.blocked_ranges.push(IpRange {
+                    start,
+                    end,
+                    description: desc,
+                    hits: 0,
+                });
+                count += 1;
+            }
+        }
+
+        self.blocked_ranges.sort_by_key(|r| r.start);
+        self.merge_overlapping();
+        info!("Loaded {count} ranges from .p2b file {}", path.display());
+        count
+    }
+
+    /// Append ranges from a file without clearing existing ranges.
+    pub fn append_from_file(&mut self, path: &Path) -> usize {
+        let ext = path.extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        match ext.as_str() {
+            "p2b" => self.load_p2b_file(path),
+            "p2p" => self.load_p2p_file(path),
+            _ => {
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("Failed to read filter file: {e}");
+                        return 0;
+                    }
+                };
+                let mut count = 0;
+                for line in content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Some(range) = parse_ipfilter_line(line) {
+                        self.blocked_ranges.push(range);
+                        count += 1;
+                    } else if let Some(range) = parse_p2p_line(line) {
+                        self.blocked_ranges.push(range);
+                        count += 1;
+                    }
+                }
+                self.blocked_ranges.sort_by_key(|r| r.start);
+                self.merge_overlapping();
+                info!("Appended {count} ranges from {}", path.display());
+                count
+            }
+        }
+    }
 }
 
 /// Returns true if the IP is private (RFC1918), loopback, link-local, or reserved.
@@ -244,72 +360,25 @@ pub fn is_private_or_reserved(ip: Ipv4Addr) -> bool {
     if ip.is_unspecified() || ip.is_broadcast() || ip.is_loopback() || ip.is_multicast() {
         return true;
     }
-
-    // 10.0.0.0/8
-    if octets[0] == 10 {
-        return true;
-    }
-
-    // 172.16.0.0/12
-    if octets[0] == 172 && (16..=31).contains(&octets[1]) {
-        return true;
-    }
-
-    // 192.168.0.0/16
-    if octets[0] == 192 && octets[1] == 168 {
-        return true;
-    }
-
-    // 169.254.0.0/16 (link-local)
-    if octets[0] == 169 && octets[1] == 254 {
-        return true;
-    }
-
-    // 100.64.0.0/10 (carrier-grade NAT)
-    if octets[0] == 100 && (64..=127).contains(&octets[1]) {
-        return true;
-    }
-
-    // 0.0.0.0/8 ("this network")
-    if octets[0] == 0 {
-        return true;
-    }
-
-    // 240.0.0.0/4 (reserved for future use)
-    if octets[0] >= 240 {
-        return true;
-    }
-
-    // 198.18.0.0/15 (benchmarking)
-    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
-        return true;
-    }
-
-    // 192.0.0.0/24 and 192.0.2.0/24 (IETF protocol assignments / TEST-NET-1)
-    if octets[0] == 192 && octets[1] == 0 && (octets[2] == 0 || octets[2] == 2) {
-        return true;
-    }
-
-    // 198.51.100.0/24 (TEST-NET-2)
-    if octets[0] == 198 && octets[1] == 51 && octets[2] == 100 {
-        return true;
-    }
-
-    // 203.0.113.0/24 (TEST-NET-3)
-    if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 {
-        return true;
-    }
+    if octets[0] == 10 { return true; }
+    if octets[0] == 172 && (16..=31).contains(&octets[1]) { return true; }
+    if octets[0] == 192 && octets[1] == 168 { return true; }
+    if octets[0] == 169 && octets[1] == 254 { return true; }
+    if octets[0] == 100 && (64..=127).contains(&octets[1]) { return true; }
+    if octets[0] == 0 { return true; }
+    if octets[0] >= 240 { return true; }
+    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) { return true; }
+    if octets[0] == 192 && octets[1] == 0 && (octets[2] == 0 || octets[2] == 2) { return true; }
+    if octets[0] == 198 && octets[1] == 51 && octets[2] == 100 { return true; }
+    if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 { return true; }
 
     false
 }
 
-/// Check if an IP address is a LAN IP (private, loopback, or link-local).
-/// Used for exempting LAN contacts from certain limits (eMule IsLANIP).
 pub fn is_lan_ip(ip: Ipv4Addr) -> bool {
     ip.is_private() || ip.is_loopback() || ip.is_link_local()
 }
 
-/// Validate an IP address received from a remote peer in contact info.
 pub fn is_valid_contact_ip(ip: Ipv4Addr, block_private: bool) -> bool {
     if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
         return false;
@@ -320,17 +389,25 @@ pub fn is_valid_contact_ip(ip: Ipv4Addr, block_private: bool) -> bool {
     true
 }
 
+fn parse_p2p_line(line: &str) -> Option<IpRange> {
+    let colon_pos = line.rfind(':')?;
+    let description = line[..colon_pos].trim().to_string();
+    let ip_range = line[colon_pos + 1..].trim();
+    let dash_pos = ip_range.find('-')?;
+    let start_ip: Ipv4Addr = ip_range[..dash_pos].trim().parse().ok()?;
+    let end_ip: Ipv4Addr = ip_range[dash_pos + 1..].trim().parse().ok()?;
+    let start = u32::from(start_ip);
+    let end = u32::from(end_ip);
+    if start > end { return None; }
+    Some(IpRange { start, end, description, hits: 0 })
+}
+
 fn parse_ipfilter_line(line: &str) -> Option<IpRange> {
-    // Format: start_ip - end_ip , access_level , description
     let parts: Vec<&str> = line.splitn(3, ',').collect();
-    if parts.len() < 2 {
-        return None;
-    }
+    if parts.len() < 2 { return None; }
 
     let access_level: u32 = parts[1].trim().parse().ok()?;
-    if access_level >= 128 {
-        return None;
-    }
+    if access_level >= 128 { return None; }
 
     let description = if parts.len() >= 3 {
         parts[2].trim().to_string()
@@ -340,26 +417,15 @@ fn parse_ipfilter_line(line: &str) -> Option<IpRange> {
 
     let ip_range_part = parts[0].trim();
     let ip_parts: Vec<&str> = ip_range_part.splitn(2, '-').collect();
-    if ip_parts.len() != 2 {
-        return None;
-    }
+    if ip_parts.len() != 2 { return None; }
 
     let start_ip: Ipv4Addr = ip_parts[0].trim().parse().ok()?;
     let end_ip: Ipv4Addr = ip_parts[1].trim().parse().ok()?;
-
     let start = u32::from(start_ip);
     let end = u32::from(end_ip);
+    if start > end { return None; }
 
-    if start > end {
-        return None;
-    }
-
-    Some(IpRange {
-        start,
-        end,
-        description,
-        hits: 0,
-    })
+    Some(IpRange { start, end, description, hits: 0 })
 }
 
 #[cfg(test)]
@@ -375,7 +441,6 @@ mod tests {
         assert!(is_private_or_reserved(Ipv4Addr::new(0, 0, 0, 0)));
         assert!(is_private_or_reserved(Ipv4Addr::new(169, 254, 1, 1)));
         assert!(is_private_or_reserved(Ipv4Addr::new(255, 255, 255, 255)));
-
         assert!(!is_private_or_reserved(Ipv4Addr::new(8, 8, 8, 8)));
         assert!(!is_private_or_reserved(Ipv4Addr::new(93, 184, 216, 34)));
     }
@@ -383,12 +448,7 @@ mod tests {
     #[test]
     fn test_ip_filter_with_ranges() {
         let mut filter = IpFilter::new(true, false);
-        filter.add_range(
-            Ipv4Addr::new(1, 0, 0, 0),
-            Ipv4Addr::new(1, 0, 0, 255),
-            "test".to_string(),
-        );
-
+        filter.add_range(Ipv4Addr::new(1, 0, 0, 0), Ipv4Addr::new(1, 0, 0, 255), "test".to_string());
         assert!(filter.is_blocked(Ipv4Addr::new(1, 0, 0, 50)));
         assert!(!filter.is_blocked(Ipv4Addr::new(2, 0, 0, 50)));
     }
@@ -396,12 +456,7 @@ mod tests {
     #[test]
     fn test_ip_filter_disabled() {
         let mut filter = IpFilter::new(false, false);
-        filter.add_range(
-            Ipv4Addr::new(1, 0, 0, 0),
-            Ipv4Addr::new(1, 0, 0, 255),
-            String::new(),
-        );
-
+        filter.add_range(Ipv4Addr::new(1, 0, 0, 0), Ipv4Addr::new(1, 0, 0, 255), String::new());
         assert!(!filter.is_blocked(Ipv4Addr::new(1, 0, 0, 50)));
         assert!(filter.is_blocked(Ipv4Addr::new(255, 255, 255, 255)));
     }
@@ -428,16 +483,10 @@ mod tests {
     #[test]
     fn test_hit_counting() {
         let mut filter = IpFilter::new(true, false);
-        filter.add_range(
-            Ipv4Addr::new(1, 0, 0, 0),
-            Ipv4Addr::new(1, 0, 0, 255),
-            "test range".to_string(),
-        );
-
+        filter.add_range(Ipv4Addr::new(1, 0, 0, 0), Ipv4Addr::new(1, 0, 0, 255), "test range".to_string());
         filter.is_blocked(Ipv4Addr::new(1, 0, 0, 1));
         filter.is_blocked(Ipv4Addr::new(1, 0, 0, 2));
         filter.is_blocked(Ipv4Addr::new(1, 0, 0, 3));
-
         let stats = filter.get_stats();
         assert_eq!(stats.total_hits, 3);
         assert_eq!(stats.entries[0].hits, 3);
@@ -447,11 +496,7 @@ mod tests {
     #[test]
     fn test_remove_range() {
         let mut filter = IpFilter::new(true, false);
-        filter.add_range(
-            Ipv4Addr::new(1, 0, 0, 0),
-            Ipv4Addr::new(1, 0, 0, 255),
-            String::new(),
-        );
+        filter.add_range(Ipv4Addr::new(1, 0, 0, 0), Ipv4Addr::new(1, 0, 0, 255), String::new());
         assert_eq!(filter.range_count(), 1);
         assert!(filter.remove_range("1.0.0.0", "1.0.0.255"));
         assert_eq!(filter.range_count(), 0);

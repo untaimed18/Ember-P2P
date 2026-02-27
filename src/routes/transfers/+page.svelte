@@ -6,6 +6,7 @@
     clearCompleted, setTransferPriority, pauseAllTransfers, resumeAllTransfers,
   } from '$lib/api/transfers';
   import { findSources } from '$lib/api/search';
+  import { previewFile } from '$lib/api/preview';
   import { formatSize, formatSpeed, formatEta, formatDate } from '$lib/utils';
   import { onMount } from 'svelte';
   import type { Transfer } from '$lib/types';
@@ -153,6 +154,7 @@
         case 'remove': await removeTransfer(t.id); break;
         case 'priority': if (extra) await setTransferPriority(t.id, extra); break;
         case 'find_sources': await findSources(t.file_hash, t.total_size); break;
+        case 'preview': await previewFile(t.id); break;
         case 'copy_link': {
           const link = `ed2k://|file|${encodeURIComponent(t.file_name)}|${t.total_size}|${t.file_hash}|/`;
           await navigator.clipboard.writeText(link);
@@ -390,6 +392,7 @@
       <div class="ctx-sep"></div>
       <button class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy ED2K Link</button>
       <button class="ctx-item" onclick={() => ctxAction('find_sources')}>Find More Sources</button>
+      <button class="ctx-item" onclick={() => ctxAction('preview')}>Preview File</button>
     {:else if ctxMenu.section === 'completed'}
       <button class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy ED2K Link</button>
       <button class="ctx-item danger" onclick={() => ctxAction('remove')}>Remove from List</button>

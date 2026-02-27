@@ -229,6 +229,14 @@ pub fn run() {
             commands::server::remove_server,
             commands::server::get_server_list,
             commands::server::get_connected_server,
+            commands::server::download_server_met,
+            commands::comments::set_file_comment,
+            commands::comments::get_file_comments,
+            commands::statistics::get_statistics,
+            commands::collections::load_collection,
+            commands::collections::create_collection,
+            commands::collections::download_collection_files,
+            commands::preview::preview_file,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
