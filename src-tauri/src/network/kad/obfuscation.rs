@@ -20,14 +20,14 @@ const VALID_INNER_HEADERS: [u8; 6] = [
     0xD4, // OP_PACKEDPROT
 ];
 
-struct Rc4State {
+pub struct Rc4State {
     s: [u8; 256],
     i: u8,
     j: u8,
 }
 
 impl Rc4State {
-    fn new(key: &[u8]) -> Self {
+    pub fn new(key: &[u8]) -> Self {
         let mut s = [0u8; 256];
         for i in 0..256 {
             s[i] = i as u8;
@@ -40,7 +40,7 @@ impl Rc4State {
         Rc4State { s, i: 0, j: 0 }
     }
 
-    fn process(&mut self, data: &[u8], out: &mut [u8]) {
+    pub fn process(&mut self, data: &[u8], out: &mut [u8]) {
         for k in 0..data.len() {
             self.i = self.i.wrapping_add(1);
             self.j = self.j.wrapping_add(self.s[self.i as usize]);
@@ -50,7 +50,7 @@ impl Rc4State {
         }
     }
 
-    fn skip(&mut self, count: usize) {
+    pub fn skip(&mut self, count: usize) {
         for _ in 0..count {
             self.i = self.i.wrapping_add(1);
             self.j = self.j.wrapping_add(self.s[self.i as usize]);

@@ -14,5 +14,6 @@ pub mod server;
 pub mod server_list;
 pub mod server_udp;
 pub mod sources;
+pub mod tcp_obfuscation;
 pub mod transfer;
 pub mod upload;

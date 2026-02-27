@@ -1,4 +1,4 @@
-use std::io::{Read as _, Seek, SeekFrom, Write};
+use std::io::{self, Read as _, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -6,7 +6,8 @@ use std::collections::HashMap;
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::pin::Pin;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -15,6 +16,7 @@ use crate::bandwidth::limiter::BandwidthLimiter;
 use crate::network::ed2k::a4af::A4AFManager;
 use crate::network::ed2k::credits::CreditManager;
 use crate::network::ed2k::sources::SourceManager;
+use crate::network::ed2k::tcp_obfuscation::{self, NegotiationResult, Rc4Reader, Rc4Writer};
 use crate::search::index::LocalIndex;
 use crate::sharing::manager::TransferManager;
 
@@ -203,67 +205,122 @@ impl UploadHandler {
         peer_addr: SocketAddr,
     ) -> anyhow::Result<()> {
         let (reader, writer) = stream.into_split();
-        let mut reader = tokio::io::BufReader::new(reader);
-        let mut writer = tokio::io::BufWriter::new(writer);
+        let mut raw_reader = tokio::io::BufReader::new(reader);
+        let mut raw_writer = tokio::io::BufWriter::new(writer);
 
-        // Read first packet from peer. Several scenarios are possible:
-        //  1. Normal peer: sends OP_HELLO
-        //  2. Port test: sends OP_PORTTEST
-        //  3. Server/KAD probe: connects and immediately disconnects (EOF/reset)
-        //  4. Obfuscated probe: sends encrypted data our parser can't decode
-        //
-        // For cases 3 and 4, we need to keep the connection alive briefly so the
-        // server/peer sees the TCP handshake succeeded (= port is open = HighID).
-        let (proto, opcode, hello_data) = match read_packet_timeout(&mut reader).await {
-            Ok(pkt) => pkt,
-            Err(e) if is_connection_closed(&e) => {
+        // Negotiate obfuscation. This reads the first byte:
+        //  - Plain text protocol marker (0xE3/0xC5/0xD4) -> returns Plain
+        //  - Anything else -> runs the RC4 handshake -> returns Obfuscated or Err
+        //  - EOF/reset -> the peer just probed our port
+        let negotiation = match tokio::time::timeout(
+            std::time::Duration::from_secs(CLIENT_TIMEOUT_SECS),
+            tcp_obfuscation::negotiate_incoming(&mut raw_reader, &mut raw_writer, &self.user_hash),
+        ).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) if is_connection_closed(&e) => {
                 debug!("Probe connection from {peer_addr} (closed immediately)");
                 return Ok(());
             }
-            Err(e) => {
-                // "invalid packet length" or unknown protocol byte = likely an
-                // obfuscated/encrypted probe from the server or a peer doing a
-                // firewall check. Hold the connection open briefly so the remote
-                // side sees a successful TCP connection, then close gracefully.
-                debug!("Unrecognized data from {peer_addr} ({e}), holding connection as probe");
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            Ok(Err(e)) => {
+                debug!("Obfuscation negotiation failed from {peer_addr}: {e}");
                 return Ok(());
+            }
+            Err(_) => {
+                debug!("Timeout during negotiation from {peer_addr}");
+                return Ok(());
+            }
+        };
+
+        // After negotiation, wrap streams based on result.
+        // We use an enum to avoid dyn dispatch issues with AsyncReadExt.
+        enum StreamReader {
+            Plain(tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>),
+            Obfuscated(tokio::io::BufReader<Rc4Reader<tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>>>),
+        }
+        enum StreamWriter {
+            Plain(tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>),
+            Obfuscated(tokio::io::BufWriter<Rc4Writer<tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>>>),
+        }
+
+        impl AsyncRead for StreamReader {
+            fn poll_read(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<io::Result<()>> {
+                match self.get_mut() {
+                    StreamReader::Plain(r) => Pin::new(r).poll_read(cx, buf),
+                    StreamReader::Obfuscated(r) => Pin::new(r).poll_read(cx, buf),
+                }
+            }
+        }
+
+        impl AsyncWrite for StreamWriter {
+            fn poll_write(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
+                match self.get_mut() {
+                    StreamWriter::Plain(w) => Pin::new(w).poll_write(cx, buf),
+                    StreamWriter::Obfuscated(w) => Pin::new(w).poll_write(cx, buf),
+                }
+            }
+            fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+                match self.get_mut() {
+                    StreamWriter::Plain(w) => Pin::new(w).poll_flush(cx),
+                    StreamWriter::Obfuscated(w) => Pin::new(w).poll_flush(cx),
+                }
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+                match self.get_mut() {
+                    StreamWriter::Plain(w) => Pin::new(w).poll_shutdown(cx),
+                    StreamWriter::Obfuscated(w) => Pin::new(w).poll_shutdown(cx),
+                }
+            }
+        }
+
+        let (mut reader, mut writer, first_byte) = match negotiation {
+            NegotiationResult::Plain { first_byte } => {
+                (StreamReader::Plain(raw_reader), StreamWriter::Plain(raw_writer), Some(first_byte))
+            }
+            NegotiationResult::Obfuscated { recv_key, send_key } => {
+                debug!("Obfuscated connection from {peer_addr}");
+                (
+                    StreamReader::Obfuscated(tokio::io::BufReader::new(Rc4Reader::new(raw_reader, recv_key))),
+                    StreamWriter::Obfuscated(tokio::io::BufWriter::new(Rc4Writer::new(raw_writer, send_key))),
+                    None,
+                )
+            }
+        };
+
+        // Read the first eMule packet. For plain connections, we already have
+        // the first byte (protocol header) from negotiation.
+        let (proto, opcode, hello_data) = if let Some(fb) = first_byte {
+            read_packet_with_first_byte(&mut reader, fb).await?
+        } else {
+            match read_packet_timeout(&mut reader).await {
+                Ok(pkt) => pkt,
+                Err(e) if is_connection_closed(&e) => {
+                    debug!("Obfuscated probe from {peer_addr} (disconnected after handshake)");
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
             }
         };
 
         // Handle Port Test (Server connection check)
         if (proto == OP_EDONKEYHEADER || proto == OP_EMULEPROT) && opcode == OP_PORTTEST {
             debug!("Received TCP Port Test from {peer_addr}");
-            // Send reply
-            let mut reply = Vec::with_capacity(1);
-            reply.push(0x12); // eMule uses 0x12 as payload for port test reply
+            let reply = [0x12u8];
             write_packet_async(&mut writer, proto, OP_PORTTEST, &reply).await?;
 
-            // Register for UDP confirmation
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
             {
                 let mut waiters = self.active_port_tests.lock().await;
                 waiters.insert(peer_addr.ip(), tx);
             }
-
-            // Wait for UDP confirmation signal (or timeout)
-            // eMule waits for UDP packet, then sends TCP confirmation.
-            // Here we wait for handle_udp_packet to signal us.
             let signal = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await;
-
             {
                 let mut waiters = self.active_port_tests.lock().await;
                 waiters.remove(&peer_addr.ip());
             }
-
             if let Ok(Some(_)) = signal {
-                debug!("Received UDP Port Test confirmation for {peer_addr}, sending TCP confirmation");
-                // Send TCP confirmation (OP_PORTTEST with payload 0x12 again)
+                debug!("Received UDP Port Test confirmation for {peer_addr}");
                 write_packet_async(&mut writer, proto, OP_PORTTEST, &reply).await?;
-            } else {
-                debug!("Timed out waiting for UDP Port Test from {peer_addr}");
             }
-
             return Ok(());
         }
 
@@ -1188,6 +1245,27 @@ async fn write_packet_async<W: AsyncWriteExt + Unpin>(
     writer.write_all(payload).await?;
     writer.flush().await?;
     Ok(())
+}
+
+async fn read_packet_with_first_byte<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    first_byte: u8,
+) -> std::io::Result<(u8, u8, Vec<u8>)> {
+    let protocol = first_byte;
+    let length = reader.read_u32_le().await? as usize;
+    if length == 0 || length > 10 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid packet length",
+        ));
+    }
+    let opcode = reader.read_u8().await?;
+    let payload_len = length - 1;
+    let mut payload = vec![0u8; payload_len];
+    if payload_len > 0 {
+        reader.read_exact(&mut payload).await?;
+    }
+    Ok((protocol, opcode, payload))
 }
 
 fn is_connection_closed(e: &std::io::Error) -> bool {
