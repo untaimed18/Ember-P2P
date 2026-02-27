@@ -291,6 +291,7 @@ const SRVCAP_NEWTAGS: u32 = 0x0008;
 const SRVCAP_UNICODE: u32 = 0x0010;
 const SRVCAP_LARGEFILES: u32 = 0x0100;
 const SRVCAP_SUPPORTCRYPT: u32 = 0x0200;
+#[allow(dead_code)]
 const SRVCAP_REQUESTCRYPT: u32 = 0x0400;
 
 const CT_NAME: u8 = 0x01;
