@@ -170,7 +170,14 @@ pub async fn start_upload_server(
                 tokio::spawn(async move {
                     let result = server.handle_connection(stream, peer_addr).await;
                     if let Err(e) = &result {
-                        warn!("Connection from {peer_addr} ended: {e}");
+                        let msg = e.to_string();
+                        if msg.contains("end of file") || msg.contains("Connection reset")
+                            || msg.contains("connection reset") || msg.contains("broken pipe")
+                        {
+                            debug!("Probe/short-lived connection from {peer_addr}: {msg}");
+                        } else {
+                            warn!("Connection from {peer_addr} ended: {e}");
+                        }
                     }
                     server.total_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     let mut counts = server.ip_connection_counts.lock().await;

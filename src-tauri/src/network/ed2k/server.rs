@@ -288,6 +288,8 @@ const SRVCAP_ZLIB: u32 = 0x0001;
 const SRVCAP_NEWTAGS: u32 = 0x0008;
 const SRVCAP_UNICODE: u32 = 0x0010;
 const SRVCAP_LARGEFILES: u32 = 0x0100;
+const SRVCAP_SUPPORTCRYPT: u32 = 0x0200;
+const SRVCAP_REQUESTCRYPT: u32 = 0x0400;
 
 const CT_NAME: u8 = 0x01;
 const CT_VERSION: u8 = 0x11;
@@ -313,8 +315,9 @@ fn build_login_request(user_hash: &[u8; 16], tcp_port: u16, nickname: &str) -> V
     write_uint32_tag(&mut buf, CT_VERSION, 0x3C);
 
     // Tag 3: CT_SERVER_FLAGS (0x20) - capability flags
-    // Matches eMule: SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_LARGEFILES | SRVCAP_UNICODE
-    let flags: u32 = SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_UNICODE | SRVCAP_LARGEFILES;
+    // Matches eMule: SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_LARGEFILES | SRVCAP_UNICODE | crypt flags
+    let flags: u32 = SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_UNICODE | SRVCAP_LARGEFILES
+        | SRVCAP_SUPPORTCRYPT | SRVCAP_REQUESTCRYPT;
     write_uint32_tag(&mut buf, CT_SERVER_FLAGS, flags);
 
     // Tag 4: CT_EMULE_VERSION (0xFB) - (major << 17) | (minor << 10) | (update << 7)
