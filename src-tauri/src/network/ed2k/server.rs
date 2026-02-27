@@ -99,10 +99,13 @@ impl Ed2kServerConnection {
         };
 
         // Process login response sequence (may receive SERVERMESSAGE, IDCHANGE, SERVERLIST, SERVERSTATUS)
-        for _ in 0..10 {
+        for i in 0..10 {
             let (opcode, payload) = match read_server_packet_timeout(&mut self.reader).await {
                 Ok(p) => p,
-                Err(_) => break,
+                Err(e) => {
+                    info!("Server read error on packet {i}: {e} (kind={:?})", e.kind());
+                    break;
+                }
             };
 
             match opcode {

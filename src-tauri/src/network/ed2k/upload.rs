@@ -201,10 +201,11 @@ impl UploadHandler {
 
         // Read first packet from peer. Server probe connections and KAD firewall
         // checks may connect and immediately disconnect without sending data.
+        // On Windows this surfaces as ConnectionReset; on Linux as UnexpectedEof.
         let (proto, opcode, hello_data) = match read_packet_timeout(&mut reader).await {
             Ok(pkt) => pkt,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                debug!("Probe connection from {peer_addr} (no data sent, likely server/firewall check)");
+            Err(e) if is_connection_closed(&e) => {
+                debug!("Probe connection from {peer_addr} (closed immediately, likely server/firewall check)");
                 return Ok(());
             }
             Err(e) => return Err(e.into()),
@@ -1167,4 +1168,14 @@ async fn write_packet_async<W: AsyncWriteExt + Unpin>(
     writer.write_all(payload).await?;
     writer.flush().await?;
     Ok(())
+}
+
+fn is_connection_closed(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+    )
 }
