@@ -455,11 +455,14 @@ async fn read_server_packet_timeout<R: AsyncReadExt + Unpin>(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "server read timed out"))?
 }
 
+const OP_PACKEDPROT: u8 = 0xD4;
+const MAX_UNCOMPRESSED_SERVER_PACKET: usize = 300_000;
+
 async fn read_server_packet<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> io::Result<(u8, Vec<u8>)> {
     let protocol = reader.read_u8().await?;
-    if protocol != OP_EDONKEYHEADER {
+    if protocol != OP_EDONKEYHEADER && protocol != OP_PACKEDPROT {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unexpected server protocol byte: 0x{protocol:02X}"),
@@ -478,5 +481,35 @@ async fn read_server_packet<R: AsyncReadExt + Unpin>(
     if payload_len > 0 {
         reader.read_exact(&mut payload).await?;
     }
-    Ok((opcode, payload))
+
+    if protocol == OP_PACKEDPROT {
+        let decompressed = decompress_server_payload(&payload)?;
+        debug!("Decompressed server packet: opcode=0x{opcode:02X}, {payload_len} -> {} bytes", decompressed.len());
+        Ok((opcode, decompressed))
+    } else {
+        Ok((opcode, payload))
+    }
+}
+
+fn decompress_server_payload(compressed: &[u8]) -> io::Result<Vec<u8>> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+
+    let mut decoder = ZlibDecoder::new(compressed);
+    let mut decompressed = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = decoder.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        decompressed.extend_from_slice(&buf[..n]);
+        if decompressed.len() > MAX_UNCOMPRESSED_SERVER_PACKET {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decompressed server packet exceeds size limit",
+            ));
+        }
+    }
+    Ok(decompressed)
 }

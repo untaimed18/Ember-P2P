@@ -199,8 +199,16 @@ impl UploadHandler {
         let mut reader = tokio::io::BufReader::new(reader);
         let mut writer = tokio::io::BufWriter::new(writer);
 
-        // Read Hello from peer and extract their user_hash
-        let (proto, opcode, hello_data) = read_packet_timeout(&mut reader).await?;
+        // Read first packet from peer. Server probe connections and KAD firewall
+        // checks may connect and immediately disconnect without sending data.
+        let (proto, opcode, hello_data) = match read_packet_timeout(&mut reader).await {
+            Ok(pkt) => pkt,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                debug!("Probe connection from {peer_addr} (no data sent, likely server/firewall check)");
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         // Handle Port Test (Server connection check)
         if (proto == OP_EDONKEYHEADER || proto == OP_EMULEPROT) && opcode == OP_PORTTEST {
