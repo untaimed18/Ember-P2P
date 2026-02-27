@@ -206,16 +206,29 @@ impl UploadHandler {
         let mut reader = tokio::io::BufReader::new(reader);
         let mut writer = tokio::io::BufWriter::new(writer);
 
-        // Read first packet from peer. Server probe connections and KAD firewall
-        // checks may connect and immediately disconnect without sending data.
-        // On Windows this surfaces as ConnectionReset; on Linux as UnexpectedEof.
+        // Read first packet from peer. Several scenarios are possible:
+        //  1. Normal peer: sends OP_HELLO
+        //  2. Port test: sends OP_PORTTEST
+        //  3. Server/KAD probe: connects and immediately disconnects (EOF/reset)
+        //  4. Obfuscated probe: sends encrypted data our parser can't decode
+        //
+        // For cases 3 and 4, we need to keep the connection alive briefly so the
+        // server/peer sees the TCP handshake succeeded (= port is open = HighID).
         let (proto, opcode, hello_data) = match read_packet_timeout(&mut reader).await {
             Ok(pkt) => pkt,
             Err(e) if is_connection_closed(&e) => {
-                debug!("Probe connection from {peer_addr} (closed immediately, likely server/firewall check)");
+                debug!("Probe connection from {peer_addr} (closed immediately)");
                 return Ok(());
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                // "invalid packet length" or unknown protocol byte = likely an
+                // obfuscated/encrypted probe from the server or a peer doing a
+                // firewall check. Hold the connection open briefly so the remote
+                // side sees a successful TCP connection, then close gracefully.
+                debug!("Unrecognized data from {peer_addr} ({e}), holding connection as probe");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                return Ok(());
+            }
         };
 
         // Handle Port Test (Server connection check)

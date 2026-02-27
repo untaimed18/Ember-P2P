@@ -82,10 +82,12 @@ impl Ed2kServerConnection {
         nickname: &str,
         tcp_port: u16,
     ) -> anyhow::Result<ServerSession> {
+        let flags: u32 = SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_UNICODE | SRVCAP_LARGEFILES
+            | SRVCAP_SUPPORTCRYPT | SRVCAP_REQUESTCRYPT;
         let payload = build_login_request(user_hash, tcp_port, nickname);
         info!("Sending OP_LOGINREQUEST ({} bytes): port={}, nick={}, flags=0x{:04X}, emule_ver=0x{:X}",
             payload.len(), tcp_port, nickname,
-            SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_UNICODE | SRVCAP_LARGEFILES,
+            flags,
             (0u32 << 17) | (50u32 << 10) | (0u32 << 7));
         write_server_packet(&mut self.writer, OP_LOGINREQUEST, &payload).await?;
 
