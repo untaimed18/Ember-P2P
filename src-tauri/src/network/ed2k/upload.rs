@@ -208,12 +208,10 @@ impl UploadHandler {
         let mut raw_reader = tokio::io::BufReader::new(reader);
         let mut raw_writer = tokio::io::BufWriter::new(writer);
 
-        // Negotiate obfuscation. First pass: don't send response (for server port
-        // tests that don't expect one). If this turns out to be a real peer connection
-        // (OP_HELLO follows), we already have the RC4 keys and can encrypt/decrypt.
+        // Negotiate obfuscation with full handshake response.
         let negotiation = match tokio::time::timeout(
             std::time::Duration::from_secs(CLIENT_TIMEOUT_SECS),
-            tcp_obfuscation::negotiate_incoming(&mut raw_reader, &mut raw_writer, &self.user_hash, false),
+            tcp_obfuscation::negotiate_incoming(&mut raw_reader, &mut raw_writer, &self.user_hash, true),
         ).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) if is_connection_closed(&e) => {
