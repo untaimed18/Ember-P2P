@@ -32,15 +32,20 @@ export async function initTransferStore() {
     transfers.update((list) => {
       const idx = list.findIndex((t) => t.id === p.id);
       if (idx >= 0) {
+        const existing = list[idx];
+        if (existing.status === 'paused' || existing.status === 'completed' || existing.status === 'failed') {
+          return list;
+        }
         list[idx] = {
-          ...list[idx],
+          ...existing,
           transferred: p.downloaded,
           progress: p.progress,
           speed: p.speed,
           status: 'active',
         };
+        return [...list];
       }
-      return [...list];
+      return list;
     });
   }));
 
@@ -106,14 +111,13 @@ function markEventUpdate() {
 
 export function startTransferPoll() {
   const interval = setInterval(async () => {
-    if (Date.now() - lastEventUpdate < 3000) return;
     try {
       const all = await getTransfers();
       transfers.set(all);
     } catch {
       // Ignore
     }
-  }, 2000);
+  }, 3000);
 
   return () => clearInterval(interval);
 }

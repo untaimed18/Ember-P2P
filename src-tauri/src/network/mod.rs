@@ -3109,11 +3109,15 @@ async fn handle_command(
         NetworkCommand::KadDisconnect => {
             info!("KAD disconnect requested");
 
-            // Cancel all active download/upload tasks via their controls
+            // Cancel all active download/upload tasks via their controls and mark them failed
             {
-                let mgr = transfer_manager.read().await;
-                for control in mgr.all_controls() {
-                    control.cancel();
+                let mut mgr = transfer_manager.write().await;
+                let cancelled_ids = mgr.cancel_all_active("Network disconnected");
+                for id in &cancelled_ids {
+                    let _ = app_handle.emit("transfer-failed", serde_json::json!({
+                        "id": id,
+                        "error": "Network disconnected",
+                    }));
                 }
             }
 

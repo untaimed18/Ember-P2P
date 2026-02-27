@@ -234,6 +234,13 @@
     filterMinSources = '';
   }
 
+  function clearResults() {
+    $searchResults = [];
+    searchError = null;
+    selectedResult = null;
+    notes = [];
+  }
+
   let hasActiveFilters = $derived(
     filterType !== '' ||
     filterMinSize !== '' ||
@@ -380,11 +387,14 @@
     </div>
   {:else}
     <div class="results-info">
-      {#if hasActiveFilters}
-        Showing {filteredResults.length} of {$searchResults.length} results
-      {:else}
-        {$searchResults.length} results
-      {/if}
+      <span>
+        {#if hasActiveFilters}
+          Showing {filteredResults.length} of {$searchResults.length} results
+        {:else}
+          {$searchResults.length} results
+        {/if}
+      </span>
+      <button class="ghost clear-results-btn" onclick={clearResults}>Clear Results</button>
     </div>
     <table>
       <thead>
@@ -593,6 +603,14 @@
     color: var(--text-secondary);
     border-bottom: 1px solid var(--border);
     background: var(--bg-secondary);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .clear-results-btn {
+    font-size: 11px;
+    padding: 2px 10px;
   }
 
   .col-name {

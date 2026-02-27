@@ -188,6 +188,26 @@ impl TransferManager {
         self.controls.values().cloned().collect()
     }
 
+    /// Cancel all active transfers and move them to completed with a failure reason.
+    /// Returns the IDs of transfers that were cancelled.
+    pub fn cancel_all_active(&mut self, reason: &str) -> Vec<String> {
+        let ids: Vec<String> = self.active.keys().cloned().collect();
+        for control in self.controls.values() {
+            control.cancel();
+        }
+        for id in &ids {
+            if let Some(mut t) = self.active.remove(id) {
+                t.status = TransferStatus::Failed;
+                t.speed = 0;
+                t.failure_reason = Some(reason.to_string());
+                self.completed.push(t);
+            }
+            self.controls.remove(id);
+            self.last_progress.remove(id);
+        }
+        ids
+    }
+
     pub fn get_all(&self) -> Vec<Transfer> {
         let mut all: Vec<Transfer> = self.active.values().cloned().collect();
         all.extend(self.queue.iter().cloned());
