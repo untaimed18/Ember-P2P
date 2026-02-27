@@ -120,4 +120,7 @@ export interface AppSettings {
   obfuscation_enabled: boolean;
   ip_filter_enabled: boolean;
   block_private_ips: boolean;
+  filter_servers_by_ip: boolean;
+  add_servers_from_server: boolean;
+  add_servers_from_clients: boolean;
 }

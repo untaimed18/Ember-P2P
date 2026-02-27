@@ -205,6 +205,15 @@ pub struct AppSettings {
     /// Block private/reserved IPs from being added to the routing table
     #[serde(default = "default_true")]
     pub block_private_ips: bool,
+    /// Also apply IP filter to ed2k servers (eMule: "Filter servers by IP")
+    #[serde(default = "default_true")]
+    pub filter_servers_by_ip: bool,
+    /// Accept new servers from connected server's OP_SERVERLIST (eMule: "Update server list when connecting")
+    #[serde(default = "default_true")]
+    pub add_servers_from_server: bool,
+    /// Accept new servers from ed2k clients (eMule: "Update server list from clients")
+    #[serde(default)]
+    pub add_servers_from_clients: bool,
     /// Path to server.met file for ed2k server list
     #[serde(default)]
     pub server_list_path: String,
@@ -256,6 +265,9 @@ impl Default for AppSettings {
             obfuscation_enabled: true,
             ip_filter_enabled: true,
             block_private_ips: true,
+            filter_servers_by_ip: true,
+            add_servers_from_server: true,
+            add_servers_from_clients: false,
             server_list_path: String::new(),
         }
     }

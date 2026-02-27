@@ -22,7 +22,7 @@ use self::ed2k::a4af::A4AFManager;
 use self::ed2k::comments::CommentManager;
 use self::ed2k::credits::CreditManager;
 use self::ed2k::dead_sources::DeadSourceList;
-use self::ed2k::server::Ed2kServerConnection;
+use self::ed2k::server::{Ed2kServerConnection, ServerSession};
 use self::ed2k::server_list::{ServerEntry, ServerList};
 use self::ed2k::sources::SourceManager;
 use self::ed2k::upload::{self as upload_server, UploadEvent, UploadEventKind};
@@ -43,6 +43,13 @@ use self::kad::types::*;
 
 use crate::storage::known_files::KnownFileList;
 use crate::storage::statistics::StatsManager;
+
+struct ServerConnectResult {
+    addr: SocketAddr,
+    ip: String,
+    port: u16,
+    result: Result<(Ed2kServerConnection, ServerSession), String>,
+}
 
 #[derive(Debug)]
 pub enum NetworkCommand {
@@ -266,6 +273,8 @@ struct NetworkState {
     low_id: bool,
     /// Our server-assigned client ID
     server_client_id: u32,
+    /// Background server connection task (non-blocking)
+    pending_server_connect: Option<tokio::task::JoinHandle<ServerConnectResult>>,
 }
 
 pub async fn start_network(
@@ -510,6 +519,7 @@ pub async fn start_network(
         firewall_checker: FirewallChecker::new(),
         low_id: false,
         server_client_id: 0,
+        pending_server_connect: None,
     };
 
     // Load known files for hash cache
@@ -1697,10 +1707,41 @@ pub async fn start_network(
                 }
             }
 
-            // ed2k server keep-alive and reconnection
+            // ed2k server keep-alive, message polling, and auto-reconnect (non-blocking)
             _ = server_timer.tick() => {
                 if state.server_connected {
                     if let Some(conn) = &mut state.server_connection {
+                        // Poll for incoming messages (OP_SERVERLIST responses, status updates, etc.)
+                        let events = conn.poll_messages().await;
+                        for event in events {
+                            match event {
+                                ed2k::server::ServerEvent::ServerList { data } => {
+                                    if settings.add_servers_from_server {
+                                        let added = state.server_list.add_from_server_list_packet(
+                                            &data,
+                                            settings.filter_servers_by_ip,
+                                            &mut state.ip_filter,
+                                        );
+                                        if added > 0 {
+                                            let met_path = state.data_dir.join("server.met");
+                                            let _ = state.server_list.save_server_met(&met_path);
+                                        }
+                                    }
+                                }
+                                ed2k::server::ServerEvent::StatusUpdate { users, files } => {
+                                    if let Some(addr) = state.server_addr {
+                                        state.server_list.update_server_stats(
+                                            &addr.ip().to_string(), addr.port(), users, files,
+                                        );
+                                    }
+                                }
+                                ed2k::server::ServerEvent::Message(msg) => {
+                                    info!("Server message: {msg}");
+                                }
+                                _ => {}
+                            }
+                        }
+
                         if let Err(e) = conn.keep_alive().await {
                             warn!("Server keep-alive failed: {e}");
                             state.server_connected = false;
@@ -1708,39 +1749,93 @@ pub async fn start_network(
                             state.server_addr = None;
                         }
                     }
-                } else if !state.server_list.is_empty() && state.server_connection.is_none() {
+                } else if state.pending_server_connect.is_none()
+                    && !state.server_list.is_empty()
+                    && state.server_connection.is_none()
+                {
                     if let Some(server) = state.server_list.get_next_server() {
                         let addr_str = format!("{}:{}", server.ip, server.port);
                         if let Ok(addr) = addr_str.parse::<SocketAddr>() {
-                            info!("Auto-connecting to ed2k server {addr_str}");
-                            match Ed2kServerConnection::connect(addr).await {
-                                Ok(mut conn) => {
-                                    let nickname = settings.nickname.clone();
-                                    match conn.login(&state.user_hash, &nickname, state.tcp_port).await {
-                                        Ok(session) => {
-                                            let is_low = session.client_id > 0 && session.client_id < ed2k::server::LOWID_THRESHOLD;
-                                            info!("Connected to ed2k server: {} ({} users, {} files, {})",
-                                                session.server_name, session.user_count, session.file_count,
-                                                if is_low { "LowID" } else { "HighID" });
-                                            state.low_id = is_low;
-                                            state.server_client_id = session.client_id;
-                                            state.server_list.record_success(&addr.ip().to_string(), addr.port());
-                                            state.server_connected = true;
-                                            state.server_addr = Some(addr);
-                                            state.server_connection = Some(conn);
-                                        }
-                                        Err(e) => {
-                                            warn!("Server login failed: {e}");
-                                            state.server_list.record_failure(&addr.ip().to_string(), addr.port());
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!("Server connect failed: {e}");
-                                    state.server_list.record_failure(&addr.ip().to_string(), addr.port());
+                            let ip = server.ip.clone();
+                            let port = server.port;
+                            let user_hash = state.user_hash;
+                            let nickname = settings.nickname.clone();
+                            let tcp_port = state.tcp_port;
+                            info!("Auto-connecting to ed2k server {addr_str} (background)");
+                            state.pending_server_connect = Some(tokio::spawn(async move {
+                                let result = async {
+                                    let mut conn = Ed2kServerConnection::connect(addr).await
+                                        .map_err(|e| format!("Connect failed: {e}"))?;
+                                    let session = conn.login(&user_hash, &nickname, tcp_port).await
+                                        .map_err(|e| format!("Login failed: {e}"))?;
+                                    Ok((conn, session))
+                                }.await;
+                                ServerConnectResult { addr, ip, port, result }
+                            }));
+                        }
+                    }
+                }
+            }
+
+            // Poll background server connection (non-blocking)
+            result = async {
+                match state.pending_server_connect.as_mut() {
+                    Some(handle) => handle.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                state.pending_server_connect = None;
+                match result {
+                    Ok(ServerConnectResult { addr, ip, port, result: Ok((mut conn, session)) }) => {
+                        // Check server IP against IP filter (eMule: FilterServerByIP)
+                        if settings.filter_servers_by_ip {
+                            if let std::net::IpAddr::V4(ipv4) = addr.ip() {
+                                if state.ip_filter.is_blocked(ipv4) {
+                                    warn!("Server {ip}:{port} blocked by IP filter, disconnecting");
+                                    conn.disconnect().await;
+                                    state.server_list.record_failure(&ip, port);
+                                    continue;
                                 }
                             }
                         }
+
+                        let is_low = session.client_id > 0 && session.client_id < ed2k::server::LOWID_THRESHOLD;
+                        info!("Connected to ed2k server: {} ({} users, {} files, {})",
+                            session.server_name, session.user_count, session.file_count,
+                            if is_low { "LowID" } else { "HighID" });
+                        state.low_id = is_low;
+                        state.server_client_id = session.client_id;
+                        state.server_list.record_success(&ip, port);
+                        state.server_connected = true;
+                        state.server_addr = Some(addr);
+
+                        // Process server list received during login (eMule: AddServersFromServer)
+                        if settings.add_servers_from_server {
+                            if let Some(sl_data) = &session.server_list_data {
+                                let added = state.server_list.add_from_server_list_packet(
+                                    sl_data,
+                                    settings.filter_servers_by_ip,
+                                    &mut state.ip_filter,
+                                );
+                                if added > 0 {
+                                    let met_path = state.data_dir.join("server.met");
+                                    let _ = state.server_list.save_server_met(&met_path);
+                                }
+                            }
+                            // Also explicitly request the server list
+                            if let Err(e) = conn.request_server_list().await {
+                                debug!("Failed to request server list: {e}");
+                            }
+                        }
+
+                        state.server_connection = Some(conn);
+                    }
+                    Ok(ServerConnectResult { ip, port, result: Err(e), .. }) => {
+                        warn!("Failed to connect to server {ip}:{port}: {e}");
+                        state.server_list.record_failure(&ip, port);
+                    }
+                    Err(e) => {
+                        warn!("Server connection task panicked: {e}");
                     }
                 }
             }
@@ -1892,6 +1987,11 @@ pub async fn start_network(
                 *shared_searches.write().await = cached_s;
             }
         }
+    }
+
+    // Abort pending server connection if any
+    if let Some(handle) = state.pending_server_connect.take() {
+        handle.abort();
     }
 
     // Save all state on shutdown
@@ -3800,35 +3900,30 @@ async fn handle_command(
                     return;
                 }
             };
-            info!("Connecting to ed2k server {addr}...");
-            match Ed2kServerConnection::connect(addr).await {
-                Ok(mut conn) => {
-                    match conn.login(&state.user_hash, &settings.nickname, state.tcp_port).await {
-                        Ok(session) => {
-                            info!(
-                                "Connected to ed2k server {addr}: client_id={}, users={}, files={}",
-                                session.client_id, session.user_count, session.file_count
-                            );
-                            state.server_connected = true;
-                            state.server_connection = Some(conn);
-                            state.server_addr = Some(addr);
-                            state.server_list.record_success(&ip, port);
-                        }
-                        Err(e) => {
-                            warn!("Server login failed: {e}");
-                            state.server_list.record_failure(&ip, port);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to connect to server {addr}: {e}");
-                    state.server_list.record_failure(&ip, port);
-                }
+            if let Some(handle) = state.pending_server_connect.take() {
+                handle.abort();
             }
+            let user_hash = state.user_hash;
+            let nickname = settings.nickname.clone();
+            let tcp_port = state.tcp_port;
+            info!("Connecting to ed2k server {addr} (background)...");
+            state.pending_server_connect = Some(tokio::spawn(async move {
+                let result = async {
+                    let mut conn = Ed2kServerConnection::connect(addr).await
+                        .map_err(|e| format!("Connect failed: {e}"))?;
+                    let session = conn.login(&user_hash, &nickname, tcp_port).await
+                        .map_err(|e| format!("Login failed: {e}"))?;
+                    Ok((conn, session))
+                }.await;
+                ServerConnectResult { addr, ip, port, result }
+            }));
         }
 
         NetworkCommand::DisconnectServer => {
             info!("Disconnecting from ed2k server");
+            if let Some(handle) = state.pending_server_connect.take() {
+                handle.abort();
+            }
             if let Some(conn) = state.server_connection.take() {
                 conn.disconnect().await;
             }
@@ -3837,14 +3932,17 @@ async fn handle_command(
         }
 
         NetworkCommand::AddServer { ip, port, name } => {
-            let mut entry = ServerEntry::new(ip, port);
+            let mut entry = ServerEntry::new(ip.clone(), port);
             entry.name = name;
-            state.server_list.add(entry);
-            let met_path = state.data_dir.join("server.met");
-            if let Err(e) = state.server_list.save_server_met(&met_path) {
-                warn!("Failed to save server.met: {e}");
+            if state.server_list.add_filtered(entry, settings.filter_servers_by_ip, &mut state.ip_filter) {
+                let met_path = state.data_dir.join("server.met");
+                if let Err(e) = state.server_list.save_server_met(&met_path) {
+                    warn!("Failed to save server.met: {e}");
+                }
+                info!("Added server {ip}:{port}, total: {}", state.server_list.len());
+            } else {
+                info!("Server {ip}:{port} was not added (duplicate or blocked by IP filter)");
             }
-            info!("Added server, total: {}", state.server_list.len());
         }
 
         NetworkCommand::RemoveServer { ip, port } => {
@@ -3926,7 +4024,11 @@ async fn handle_command(
         }
 
         NetworkCommand::MergeServerMet { data, tx } => {
-            let result = state.server_list.merge_from_bytes(&data);
+            let result = state.server_list.merge_from_bytes_filtered(
+                &data,
+                settings.filter_servers_by_ip,
+                Some(&mut state.ip_filter),
+            );
             let _ = tx.send(result);
             let met_path = state.data_dir.join("server.met");
             let _ = state.server_list.save_server_met(&met_path);

@@ -1,4 +1,5 @@
 use std::io::{self, Cursor, Read, Write};
+use std::net::Ipv4Addr;
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -16,6 +17,8 @@ pub struct ServerEntry {
     pub user_count: u32,
     pub file_count: u32,
     pub last_ping: i64,
+    /// Timestamp of last failed connection attempt (for cooldown)
+    pub last_failed_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,9 +41,9 @@ impl ServerEntry {
             user_count: 0,
             file_count: 0,
             last_ping: 0,
+            last_failed_at: 0,
         }
     }
-
 }
 
 pub struct ServerList {
@@ -62,6 +65,81 @@ impl ServerList {
         }
     }
 
+    /// Check if a server IP is blocked by the IP filter, matching eMule's FilterServerByIP.
+    pub fn is_ip_filtered(ip_str: &str, ip_filter: &mut crate::network::kad::ip_filter::IpFilter) -> bool {
+        if let Ok(addr) = ip_str.parse::<Ipv4Addr>() {
+            ip_filter.is_blocked(addr)
+        } else {
+            false
+        }
+    }
+
+    /// Add a server entry, checking against IP filter if enabled.
+    /// Returns true if the server was added.
+    pub fn add_filtered(
+        &mut self,
+        entry: ServerEntry,
+        filter_by_ip: bool,
+        ip_filter: &mut crate::network::kad::ip_filter::IpFilter,
+    ) -> bool {
+        if self.servers.iter().any(|s| s.ip == entry.ip && s.port == entry.port) {
+            return false;
+        }
+        if filter_by_ip && Self::is_ip_filtered(&entry.ip, ip_filter) {
+            info!("Server {}:{} blocked by IP filter", entry.ip, entry.port);
+            return false;
+        }
+        self.servers.push(entry);
+        true
+    }
+
+    /// Parse an OP_SERVERLIST packet payload (count + IP/port pairs) from a connected server.
+    /// Returns the list of (ip_string, port) pairs discovered.
+    pub fn add_from_server_list_packet(
+        &mut self,
+        payload: &[u8],
+        filter_by_ip: bool,
+        ip_filter: &mut crate::network::kad::ip_filter::IpFilter,
+    ) -> usize {
+        if payload.is_empty() {
+            return 0;
+        }
+        let mut cursor = Cursor::new(payload);
+        let count = match cursor.read_u8() {
+            Ok(c) => c as usize,
+            Err(_) => return 0,
+        };
+        // Validate: 1 + count * 6 (4 bytes IP + 2 bytes port) should fit
+        if payload.len() < 1 + count * 6 {
+            return 0;
+        }
+        let mut added = 0;
+        for _ in 0..count {
+            let ip_raw = match cursor.read_u32::<LittleEndian>() {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let port = match cursor.read_u16::<LittleEndian>() {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let ip = Ipv4Addr::from(ip_raw.to_be_bytes());
+            if ip.is_unspecified() || port == 0 {
+                continue;
+            }
+            let mut entry = ServerEntry::new(ip.to_string(), port);
+            entry.name = ip.to_string();
+            entry.priority = ServerPriority::Low;
+            if self.add_filtered(entry, filter_by_ip, ip_filter) {
+                added += 1;
+            }
+        }
+        if added > 0 {
+            info!("Added {added} new servers from connected server's server list");
+        }
+        added
+    }
+
     pub fn remove(&mut self, ip: &str, port: u16) {
         self.servers.retain(|s| !(s.ip == ip && s.port == port));
     }
@@ -70,6 +148,10 @@ impl ServerList {
         if self.servers.is_empty() {
             return None;
         }
+        let now = chrono::Utc::now().timestamp();
+        // eMule CS_RETRYCONNECTTIME = 30 seconds; scale up with fail_count
+        let cooldown_base: i64 = 30;
+
         // Prefer high-priority servers first, then sort by lowest fail_count
         self.servers.sort_by(|a, b| {
             let pa = match a.priority { ServerPriority::High => 0, ServerPriority::Normal => 1, ServerPriority::Low => 2 };
@@ -77,14 +159,24 @@ impl ServerList {
             pa.cmp(&pb).then(a.fail_count.cmp(&b.fail_count))
         });
 
-        let idx = self.current_index % self.servers.len();
-        self.current_index = (self.current_index + 1) % self.servers.len();
-        Some(&self.servers[idx])
+        let len = self.servers.len();
+        for _ in 0..len {
+            let idx = self.current_index % len;
+            self.current_index = (self.current_index + 1) % len;
+            let entry = &self.servers[idx];
+            let cooldown = cooldown_base * (entry.fail_count as i64 + 1).min(10);
+            if entry.last_failed_at > 0 && (now - entry.last_failed_at) < cooldown {
+                continue;
+            }
+            return Some(entry);
+        }
+        None
     }
 
     pub fn record_failure(&mut self, ip: &str, port: u16) {
         if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
             entry.fail_count += 1;
+            entry.last_failed_at = chrono::Utc::now().timestamp();
         }
     }
 
@@ -172,7 +264,13 @@ impl ServerList {
     }
 
     /// Merge servers from raw server.met bytes without clearing existing list.
-    pub fn merge_from_bytes(&mut self, data: &[u8]) -> anyhow::Result<usize> {
+    /// If filter_by_ip is true and ip_filter is Some, servers are checked against the IP filter.
+    pub fn merge_from_bytes_filtered(
+        &mut self,
+        data: &[u8],
+        filter_by_ip: bool,
+        mut ip_filter: Option<&mut crate::network::kad::ip_filter::IpFilter>,
+    ) -> anyhow::Result<usize> {
         if data.len() < 5 {
             return Ok(0);
         }
@@ -183,13 +281,14 @@ impl ServerList {
         }
         let count = cursor.read_u32::<LittleEndian>()? as usize;
         let mut added = 0;
+        let mut filtered = 0;
 
         for _ in 0..count.min(500) {
             let ip_raw = match cursor.read_u32::<LittleEndian>() {
                 Ok(v) => v,
                 Err(_) => break,
             };
-            let ip = std::net::Ipv4Addr::from(ip_raw.to_be_bytes());
+            let ip = Ipv4Addr::from(ip_raw.to_be_bytes());
             let port = match cursor.read_u16::<LittleEndian>() {
                 Ok(v) => v,
                 Err(_) => break,
@@ -231,17 +330,33 @@ impl ServerList {
                 }
             }
 
-            if !self.servers.iter().any(|s| s.ip == entry.ip && s.port == entry.port) {
-                self.servers.push(entry);
-                added += 1;
+            if self.servers.iter().any(|s| s.ip == entry.ip && s.port == entry.port) {
+                continue;
             }
+
+            if filter_by_ip {
+                if let Some(filter) = ip_filter.as_deref_mut() {
+                    if Self::is_ip_filtered(&entry.ip, filter) {
+                        filtered += 1;
+                        continue;
+                    }
+                }
+            }
+
+            self.servers.push(entry);
+            added += 1;
         }
 
-        info!("Merged {added} new servers from server.met data ({count} total in file)");
+        info!("Merged {added} new servers from server.met data ({count} total in file, {filtered} filtered)");
         Ok(added)
     }
 
+    /// Merge servers from raw server.met bytes without IP filtering.
     #[allow(dead_code)]
+    pub fn merge_from_bytes(&mut self, data: &[u8]) -> anyhow::Result<usize> {
+        self.merge_from_bytes_filtered(data, false, None)
+    }
+
     pub fn update_server_stats(&mut self, ip: &str, port: u16, users: u32, files: u32) {
         if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
             entry.user_count = users;

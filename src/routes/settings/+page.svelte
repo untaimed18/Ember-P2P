@@ -292,6 +292,39 @@
             Requires restart to take effect.
           </span>
         </div>
+        <div class="field toggle-field">
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={settings.filter_servers_by_ip} />
+            <span>Filter Servers by IP Filter</span>
+          </label>
+          <span class="field-hint">
+            Also apply the IP filter to ed2k servers. Servers with blocked IPs will be
+            rejected when adding or connecting.
+          </span>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h3>Server</h3>
+        <div class="field toggle-field">
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={settings.add_servers_from_server} />
+            <span>Update Server List When Connecting to a Server</span>
+          </label>
+          <span class="field-hint">
+            Accept new servers from the connected server's server list.
+            New servers are added with Low priority.
+          </span>
+        </div>
+        <div class="field toggle-field">
+          <label class="toggle-label">
+            <input type="checkbox" bind:checked={settings.add_servers_from_clients} />
+            <span>Update Server List From Clients</span>
+          </label>
+          <span class="field-hint">
+            Accept new servers received from other ed2k clients during file transfers.
+          </span>
+        </div>
       </section>
     </div>
   {/if}

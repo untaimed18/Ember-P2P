@@ -53,6 +53,8 @@ pub struct ServerSession {
     pub server_name: String,
     pub user_count: u32,
     pub file_count: u32,
+    /// Raw OP_SERVERLIST payload received during login (if any)
+    pub server_list_data: Option<Vec<u8>>,
 }
 
 pub struct Ed2kServerConnection {
@@ -64,7 +66,7 @@ pub struct Ed2kServerConnection {
 impl Ed2kServerConnection {
     pub async fn connect(addr: SocketAddr) -> anyhow::Result<Self> {
         let stream = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(10),
             TcpStream::connect(addr),
         )
         .await??;
@@ -92,6 +94,7 @@ impl Ed2kServerConnection {
             server_name: String::new(),
             user_count: 0,
             file_count: 0,
+            server_list_data: None,
         };
 
         // Process login response sequence (may receive SERVERMESSAGE, IDCHANGE, SERVERLIST, SERVERSTATUS)
@@ -134,7 +137,8 @@ impl Ed2kServerConnection {
                     debug!("Got server identification");
                 }
                 OP_SERVERLIST => {
-                    debug!("Got server list from server");
+                    debug!("Got server list from server ({} bytes)", payload.len());
+                    session.server_list_data = Some(payload);
                 }
                 OP_REJECT => {
                     anyhow::bail!("Server rejected login");
@@ -177,6 +181,13 @@ impl Ed2kServerConnection {
         Ok(())
     }
 
+    /// Explicitly request the server's list of known servers (OP_GETSERVERLIST).
+    pub async fn request_server_list(&mut self) -> anyhow::Result<()> {
+        write_server_packet(&mut self.writer, OP_GETSERVERLIST, &[]).await?;
+        debug!("Sent OP_GETSERVERLIST request to server");
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub async fn request_callback(&mut self, client_id: u32) -> anyhow::Result<()> {
         let payload = client_id.to_le_bytes().to_vec();
@@ -185,7 +196,6 @@ impl Ed2kServerConnection {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub async fn poll_messages(&mut self) -> Vec<ServerEvent> {
         let mut events = Vec::new();
         match tokio::time::timeout(
@@ -224,6 +234,10 @@ impl Ed2kServerConnection {
                             events.push(ServerEvent::StatusUpdate { users, files });
                         }
                     }
+                    OP_SERVERLIST => {
+                        debug!("Got server list from server ({} bytes)", payload.len());
+                        events.push(ServerEvent::ServerList { data: payload });
+                    }
                     _ => {}
                 }
             }
@@ -250,13 +264,14 @@ impl Ed2kServerConnection {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum ServerEvent {
     CallbackRequested { ip: String, port: u16 },
     CallbackFailed,
     Message(String),
     StatusUpdate { users: u32, files: u32 },
+    ServerList { data: Vec<u8> },
 }
 
 fn build_login_request(user_hash: &[u8; 16], tcp_port: u16, nickname: &str) -> Vec<u8> {
