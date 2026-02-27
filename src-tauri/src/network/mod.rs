@@ -1566,7 +1566,11 @@ async fn handle_udp_packet(
                 state.routing_table.insert(c);
             }
 
-            // Build HelloReq to send to bootstrap node and all returned contacts
+            // eMule Process_KADEMLIA2_BOOTSTRAP_RES: only adds contacts to routing
+            // zone. Does NOT chain-bootstrap or send HelloReq to returned contacts.
+            // The periodic bootstrap timer and self-lookup handle further discovery.
+
+            // Send HelloReq only to the bootstrap node itself (not all returned contacts)
             let our_options: u8 = if state.firewalled { 0x05 } else { 0x04 };
             let mut hello_tags = vec![
                 KadTag {
@@ -1588,26 +1592,7 @@ async fn handle_udp_packet(
             };
             if let Ok(packet) = messages::encode_packet(&hello) {
                 let _ = socket.send_to(&packet, from).await;
-                for addr in &contact_addrs {
-                    let _ = socket.send_to(&packet, addr).await;
-                }
-                debug!("Sent HelloReq to bootstrap node + {} returned contacts", contact_addrs.len());
-            }
-
-            // Chain-bootstrap: send BootstrapReq to returned contacts so they
-            // return even more contacts (progressive discovery). Send to all
-            // of them when our table is sparse, otherwise limit to 10.
-            let bootstrap_msg = KadMessage::BootstrapReq;
-            if let Ok(bootstrap_pkt) = messages::encode_packet(&bootstrap_msg) {
-                let chain_limit = if state.routing_table.len() < 200 {
-                    contact_addrs.len()
-                } else {
-                    10
-                };
-                for addr in contact_addrs.iter().take(chain_limit) {
-                    state.flood_protection.track_request(*addr, 0x01);
-                    let _ = socket.send_to(&bootstrap_pkt, addr).await;
-                }
+                debug!("Sent HelloReq to bootstrap node {from}");
             }
 
             let table_size = state.routing_table.len();
@@ -2807,23 +2792,25 @@ async fn handle_command(
             for c in &contacts {
                 state.routing_table.insert(c.clone());
             }
+            let table_size = state.routing_table.len();
             info!(
                 "Injected {} bootstrap contacts, routing table now has {} entries",
                 count,
-                state.routing_table.len()
+                table_size
             );
 
-            // Send bootstrap requests to all contacts when table is sparse
-            let table_size = state.routing_table.len();
-            let sample_size = if table_size < 200 { count } else { count.min(20) };
+            // eMule: GetBootstrapContacts returns at most 20 contacts.
+            // Limit bootstrap requests to prevent flooding the event loop.
+            let sample_size = count.min(20);
             for contact in contacts.iter().take(sample_size) {
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                 let msg = KadMessage::BootstrapReq;
                 if let Ok(packet) = messages::encode_packet(&msg) {
+                    state.flood_protection.track_request(addr, 0x01);
                     let _ = socket.send_to(&packet, addr).await;
                 }
             }
-            info!("Sent bootstrap requests to {sample_size} new contacts (table has {table_size})");
+            info!("Sent bootstrap requests to {sample_size} contacts (table has {table_size})");
         }
 
         NetworkCommand::ReloadIpFilter { path } => {

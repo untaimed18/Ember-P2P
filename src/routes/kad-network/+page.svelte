@@ -35,6 +35,8 @@
   let searchSortCol: string = $state('id');
   let searchSortAsc = $state(true);
 
+  let refreshInProgress = false;
+
   onMount(() => {
     refresh();
     const interval = setInterval(refresh, 5000);
@@ -42,6 +44,8 @@
   });
 
   async function refresh() {
+    if (refreshInProgress) return;
+    refreshInProgress = true;
     try {
       const [c, s, p] = await Promise.allSettled([
         getKadContacts(),
@@ -60,6 +64,7 @@
       }
     } finally {
       loading = false;
+      refreshInProgress = false;
     }
   }
 

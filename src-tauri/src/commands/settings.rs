@@ -111,9 +111,8 @@ pub async fn download_nodes_dat(
     // Inject contacts into the running network
     state
         .network_tx
-        .send(NetworkCommand::BootstrapContacts { contacts })
-        .await
-        .map_err(|e| format!("Failed to send contacts to network: {e}"))?;
+        .try_send(NetworkCommand::BootstrapContacts { contacts })
+        .map_err(|e| format!("Network busy: {e}"))?;
 
     let msg = format!(
         "Downloaded and loaded {contact_count} contacts ({byte_count} bytes) — bootstrapping now",
@@ -150,10 +149,9 @@ pub async fn download_ipfilter(
 
     let _ = state
         .network_tx
-        .send(NetworkCommand::ReloadIpFilter {
+        .try_send(NetworkCommand::ReloadIpFilter {
             path: filter_path,
-        })
-        .await;
+        });
 
     let msg = format!(
         "Downloaded ipfilter.dat ({byte_count} bytes, ~{line_count} entries) — reloading filter now",

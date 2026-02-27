@@ -1,8 +1,11 @@
 use tokio::sync::oneshot;
+use std::time::Duration;
 
 use crate::app_state::AppState;
 use crate::network::NetworkCommand;
 use crate::types::*;
+
+const CMD_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tauri::command]
 pub async fn get_peers(
@@ -72,9 +75,8 @@ pub async fn kad_connect(
 ) -> Result<(), String> {
     state
         .network_tx
-        .send(NetworkCommand::KadConnect)
-        .await
-        .map_err(|e| format!("Failed to send KAD connect: {e}"))?;
+        .try_send(NetworkCommand::KadConnect)
+        .map_err(|e| format!("Network busy: {e}"))?;
     Ok(())
 }
 
@@ -84,9 +86,8 @@ pub async fn kad_disconnect(
 ) -> Result<(), String> {
     state
         .network_tx
-        .send(NetworkCommand::KadDisconnect)
-        .await
-        .map_err(|e| format!("Failed to send KAD disconnect: {e}"))?;
+        .try_send(NetworkCommand::KadDisconnect)
+        .map_err(|e| format!("Network busy: {e}"))?;
     Ok(())
 }
 
@@ -105,9 +106,8 @@ pub async fn kad_bootstrap_ip(
 
     state
         .network_tx
-        .send(NetworkCommand::KadBootstrapIp { ip, port })
-        .await
-        .map_err(|e| format!("Failed to send bootstrap command: {e}"))?;
+        .try_send(NetworkCommand::KadBootstrapIp { ip, port })
+        .map_err(|e| format!("Network busy: {e}"))?;
     Ok(())
 }
 
@@ -122,9 +122,8 @@ pub async fn kad_bootstrap_url(
 
     state
         .network_tx
-        .send(NetworkCommand::KadBootstrapUrl { url })
-        .await
-        .map_err(|e| format!("Failed to send bootstrap command: {e}"))?;
+        .try_send(NetworkCommand::KadBootstrapUrl { url })
+        .map_err(|e| format!("Network busy: {e}"))?;
     Ok(())
 }
 
@@ -134,9 +133,8 @@ pub async fn kad_bootstrap_clients(
 ) -> Result<(), String> {
     state
         .network_tx
-        .send(NetworkCommand::KadBootstrapClients)
-        .await
-        .map_err(|e| format!("Failed to send bootstrap command: {e}"))?;
+        .try_send(NetworkCommand::KadBootstrapClients)
+        .map_err(|e| format!("Network busy: {e}"))?;
     Ok(())
 }
 
@@ -146,9 +144,8 @@ pub async fn kad_recheck_firewall(
 ) -> Result<(), String> {
     state
         .network_tx
-        .send(NetworkCommand::RecheckFirewall)
-        .await
-        .map_err(|e| format!("Failed to send firewall recheck: {e}"))?;
+        .try_send(NetworkCommand::RecheckFirewall)
+        .map_err(|e| format!("Network busy: {e}"))?;
     Ok(())
 }
 
@@ -159,10 +156,13 @@ pub async fn get_kad_contacts(
     let (tx, rx) = oneshot::channel();
     state
         .network_tx
-        .send(NetworkCommand::GetKadContacts { tx })
-        .await
-        .map_err(|e| format!("Failed to request KAD contacts: {e}"))?;
-    rx.await.map_err(|e| format!("Failed to receive KAD contacts: {e}"))
+        .try_send(NetworkCommand::GetKadContacts { tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
+    match tokio::time::timeout(CMD_TIMEOUT, rx).await {
+        Ok(Ok(contacts)) => Ok(contacts),
+        Ok(Err(e)) => Err(format!("Failed to receive KAD contacts: {e}")),
+        Err(_) => Err("KAD contacts request timed out (network busy)".into()),
+    }
 }
 
 #[tauri::command]
@@ -172,8 +172,11 @@ pub async fn get_kad_searches(
     let (tx, rx) = oneshot::channel();
     state
         .network_tx
-        .send(NetworkCommand::GetKadSearches { tx })
-        .await
-        .map_err(|e| format!("Failed to request KAD searches: {e}"))?;
-    rx.await.map_err(|e| format!("Failed to receive KAD searches: {e}"))
+        .try_send(NetworkCommand::GetKadSearches { tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
+    match tokio::time::timeout(CMD_TIMEOUT, rx).await {
+        Ok(Ok(searches)) => Ok(searches),
+        Ok(Err(e)) => Err(format!("Failed to receive KAD searches: {e}")),
+        Err(_) => Err("KAD searches request timed out (network busy)".into()),
+    }
 }
