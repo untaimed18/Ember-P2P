@@ -178,6 +178,8 @@ struct NetworkState {
     firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
     /// Whether we've done the initial self-lookup (FindNode for own ID)
     self_lookup_done: bool,
+    /// Timestamp of last self-lookup (eMule repeats every 4 hours)
+    last_self_lookup: i64,
     /// Timestamp of last firewall recheck (eMule rechecks every hour)
     last_firewall_check: i64,
     /// Whether UDP is firewalled (separate from TCP, like eMule)
@@ -402,6 +404,7 @@ pub async fn start_network(
         obfuscation_enabled: settings.obfuscation_enabled,
         firewalled_shared: Arc::new(std::sync::atomic::AtomicBool::new(!upnp_success)),
         self_lookup_done: false,
+        last_self_lookup: 0,
         last_firewall_check: chrono::Utc::now().timestamp(),
         udp_firewalled: true,
         udp_fw_verified: false,
@@ -482,7 +485,7 @@ pub async fn start_network(
     let mut publish_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     let mut search_poll_timer = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut cleanup_timer = tokio::time::interval(std::time::Duration::from_secs(300));
-    let mut bucket_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut bucket_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(10));
     let mut small_timer = tokio::time::interval(std::time::Duration::from_secs(1));
     let mut eviction_ping_timer = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut buddy_timer = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -948,9 +951,11 @@ pub async fn start_network(
                     bootstrap_attempts = 0;
                 }
 
-                // Self-lookup: once we have some contacts, do a FindNode for our own ID
-                // This is the primary mechanism eMule uses to populate the routing table
-                if !state.self_lookup_done && table_size >= 2 {
+                // Self-lookup: FindNode for our own ID to populate close-to-home buckets.
+                // eMule: first within 3 minutes, then every 4 hours (m_tNextSelfLookup).
+                let now_ts = chrono::Utc::now().timestamp();
+                let self_lookup_interval = if state.self_lookup_done { 4 * 3600 } else { 0 };
+                if table_size >= 2 && now_ts - state.last_self_lookup >= self_lookup_interval {
                     let closest = state.routing_table.find_closest(&state.local_id, SEARCH_INITIAL_CONTACTS);
                     if !closest.is_empty() {
                         let sid = state.search_manager.start_search(
@@ -960,21 +965,26 @@ pub async fn start_network(
                         );
                         info!("Started self-lookup (FindNode for own ID), search {}, table has {table_size} contacts", sid.0);
                         state.self_lookup_done = true;
+                        state.last_self_lookup = now_ts;
                     }
                 }
 
                 // Keep bootstrapping until we have a healthy routing table (~200 contacts)
                 if table_size < 200 {
-                    // Send bootstrap to hardcoded nodes
-                    for contact in &bootstrap::default_bootstrap_contacts() {
-                        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-                        let msg = KadMessage::BootstrapReq;
-                        if let Ok(packet) = messages::encode_packet(&msg) {
-                            let _ = udp_socket.send_to(&packet, addr).await;
+                    // eMule: only send BootstrapReq to hardcoded nodes while NOT connected.
+                    // Once connected, rely on FindNode searches and bucket refresh for growth.
+                    if state.stats.status != NetworkStatus::Connected {
+                        for contact in &bootstrap::default_bootstrap_contacts() {
+                            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                            let msg = KadMessage::BootstrapReq;
+                            if let Ok(packet) = messages::encode_packet(&msg) {
+                                let _ = udp_socket.send_to(&packet, addr).await;
+                            }
                         }
                     }
 
-                    // Query a sample of known contacts with BootstrapReq
+                    // Query a sample of known contacts with BootstrapReq to discover
+                    // new peers from their routing tables.
                     let bootstrap_sample_size = if table_size < 50 { 10 } else { 5 };
                     let sample: Vec<KadContact> = {
                         let target = KadId::random();
@@ -996,12 +1006,16 @@ pub async fn start_network(
                         }
                     }
 
-                    // Start a FindNode lookup only if we don't already have too many active
+                    // Start a FindNode lookup targeting the sparsest bucket.
+                    // eMule's BigTimer triggers RandomLookup per-zone; we pick the
+                    // bucket with the most remaining capacity so all regions of the
+                    // ID space get explored (KadId::random() is biased toward bucket 0).
                     let active_find_nodes = state.search_manager.active.values()
                         .filter(|s| !s.completed && matches!(s.search_type, SearchType::FindNode))
                         .count();
                     if table_size >= 10 && active_find_nodes < 3 {
-                        let random_target = KadId::random();
+                        let target_bucket = state.routing_table.sparsest_bucket();
+                        let random_target = state.routing_table.random_id_in_bucket(target_bucket);
                         let closest = state.routing_table.find_closest(&random_target, SEARCH_INITIAL_CONTACTS);
                         if !closest.is_empty() {
                             let _sid = state.search_manager.start_search(
@@ -1009,6 +1023,7 @@ pub async fn start_network(
                                 SearchType::FindNode,
                                 closest,
                             );
+                            debug!("Bootstrap: started FindNode for bucket {target_bucket} (sparsest), table has {table_size} contacts");
                         }
                     }
                 }
@@ -1150,19 +1165,21 @@ pub async fn start_network(
                 }
             }
 
-            // Bucket refresh: discover new contacts for stale/sparse buckets.
-            // Only refresh a few buckets per tick to avoid search storms.
+            // Bucket refresh: discover new contacts for stale/sparse/empty buckets.
+            // During initial growth (< 200 contacts), allow more concurrent searches
+            // to fill the table faster — matching eMule's aggressive BigTimer behavior.
             _ = bucket_refresh_timer.tick() => {
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
+                let table_size = state.routing_table.len();
                 let active_find_nodes = state.search_manager.active.values()
                     .filter(|s| !s.completed && matches!(s.search_type, SearchType::FindNode))
                     .count();
-                const MAX_CONCURRENT_REFRESH_SEARCHES: usize = 3;
-                if active_find_nodes >= MAX_CONCURRENT_REFRESH_SEARCHES {
+                let max_concurrent = if table_size < 200 { 6 } else { 3 };
+                if active_find_nodes >= max_concurrent {
                     continue;
                 }
 
-                let budget = MAX_CONCURRENT_REFRESH_SEARCHES - active_find_nodes;
+                let budget = max_concurrent - active_find_nodes;
                 let now = chrono::Utc::now().timestamp();
                 let stale = state.routing_table.stale_buckets(now);
                 let mut started = 0usize;
@@ -1798,6 +1815,7 @@ async fn handle_udp_packet(
                     );
                     info!("Started self-lookup from BootstrapRes, search {}, {table_size} contacts", sid.0);
                     state.self_lookup_done = true;
+                    state.last_self_lookup = chrono::Utc::now().timestamp();
                 }
             }
         }
@@ -3053,6 +3071,7 @@ async fn handle_command(
             info!("KAD connect requested");
             state.stats.status = NetworkStatus::Connecting;
             state.self_lookup_done = false;
+            state.last_self_lookup = 0;
             let _ = app_handle.emit("network-status", "connecting");
 
             // Reload routing table from saved nodes.dat (eMule recreates RoutingZone on Start)
@@ -3159,6 +3178,7 @@ async fn handle_command(
             state.firewall_responses.clear();
             state.udp_port_responses.clear();
             state.self_lookup_done = false;
+            state.last_self_lookup = 0;
             state.last_firewall_check = 0;
             state.udp_firewalled = true;
             state.udp_fw_verified = false;

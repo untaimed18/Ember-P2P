@@ -422,20 +422,16 @@ impl RoutingTable {
         self.global_subnet_count.clear();
     }
 
-    /// Return bucket indices that need a refresh (stale > 1h OR nearly empty < 20% full).
+    /// Return bucket indices that need a refresh (stale > 1h OR nearly empty/empty).
     /// Matches eMule OnBigTimer: a zone gets a RandomLookup if it is a leaf zone and
     /// (zone_index < KK || level < KBASE || bin_remaining >= K*0.8).
-    /// In our flat-bucket model: bucket needs refresh if it's close to home (high index),
-    /// or has significant remaining capacity, and hasn't been refreshed recently.
+    /// Empty buckets qualify because remaining == K >= K*0.8 in eMule.
     pub fn stale_buckets(&self, now: i64) -> Vec<usize> {
         self.buckets
             .iter()
             .enumerate()
             .filter(|(i, b)| {
-                if b.contacts.is_empty() {
-                    return false;
-                }
-                if !b.needs_refresh(now) && !b.needs_fill() {
+                if !b.needs_refresh(now) && !b.needs_fill() && !b.contacts.is_empty() {
                     return false;
                 }
                 // eMule OnBigTimer: zone_index < KK || level < KBASE || remaining >= K*0.8
@@ -449,12 +445,12 @@ impl RoutingTable {
             .collect()
     }
 
-    /// Return bucket indices that are nearly empty (< 20% full) and need filling.
+    /// Return bucket indices that are nearly empty or empty and need filling.
     pub fn buckets_needing_fill(&self) -> Vec<usize> {
         self.buckets
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.needs_fill() && !b.contacts.is_empty())
+            .filter(|(_, b)| b.contacts.len() < K_BUCKET_SIZE / 5)
             .map(|(i, _)| i)
             .collect()
     }
@@ -464,6 +460,18 @@ impl RoutingTable {
         if idx < NUM_BUCKETS {
             self.buckets[idx].last_refresh = chrono::Utc::now().timestamp();
         }
+    }
+
+    /// Return the index of the sparsest bucket (most remaining capacity).
+    /// Prefers buckets that are completely empty, then those with fewest contacts.
+    /// Used for targeted FindNode lookups to fill the routing table evenly.
+    pub fn sparsest_bucket(&self) -> usize {
+        self.buckets
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, b)| b.contacts.len())
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 
     /// Select up to `max_count` contacts for bootstrap persistence.
