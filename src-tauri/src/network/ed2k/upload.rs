@@ -218,15 +218,15 @@ impl UploadHandler {
         ).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) if is_connection_closed(&e) => {
-                debug!("Probe connection from {peer_addr} (closed immediately)");
+                info!("Probe connection from {peer_addr} (closed immediately)");
                 return Ok(());
             }
             Ok(Err(e)) => {
-                debug!("Obfuscation negotiation failed from {peer_addr}: {e}");
+                info!("Obfuscation negotiation failed from {peer_addr}: {e}");
                 return Ok(());
             }
             Err(_) => {
-                debug!("Timeout during negotiation from {peer_addr}");
+                info!("Timeout during negotiation from {peer_addr}");
                 return Ok(());
             }
         };
@@ -277,7 +277,7 @@ impl UploadHandler {
                 (StreamReader::Plain(raw_reader), StreamWriter::Plain(raw_writer), Some(first_byte))
             }
             NegotiationResult::Obfuscated { recv_key, send_key } => {
-                debug!("Obfuscated connection from {peer_addr}");
+                info!("Obfuscated connection from {peer_addr}");
                 (
                     StreamReader::Obfuscated(tokio::io::BufReader::new(Rc4Reader::new(raw_reader, recv_key))),
                     StreamWriter::Obfuscated(tokio::io::BufWriter::new(Rc4Writer::new(raw_writer, send_key))),
@@ -288,16 +288,25 @@ impl UploadHandler {
 
         // Read the first eMule packet. For plain connections, we already have
         // the first byte (protocol header) from negotiation.
+        // For obfuscated connections, use a short timeout -- if no eMule packet
+        // arrives within 5 seconds, this is a server/peer port test probe.
+        // The server waits for the probe to finish before sending our login response,
+        // so we must close it promptly.
         let (proto, opcode, hello_data) = if let Some(fb) = first_byte {
             read_packet_with_first_byte(&mut reader, fb).await?
         } else {
-            match read_packet_timeout(&mut reader).await {
-                Ok(pkt) => pkt,
-                Err(e) if is_connection_closed(&e) => {
-                    debug!("Obfuscated probe from {peer_addr} (disconnected after handshake)");
+            let probe_timeout = std::time::Duration::from_secs(5);
+            match tokio::time::timeout(probe_timeout, read_packet_async_inner(&mut reader)).await {
+                Ok(Ok(pkt)) => pkt,
+                Ok(Err(e)) if is_connection_closed(&e) => {
+                    info!("Obfuscated probe from {peer_addr} (disconnected after handshake)");
                     return Ok(());
                 }
-                Err(e) => return Err(e.into()),
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    info!("Obfuscated probe from {peer_addr} (no eMule packet after handshake, closing)");
+                    return Ok(());
+                }
             }
         };
 

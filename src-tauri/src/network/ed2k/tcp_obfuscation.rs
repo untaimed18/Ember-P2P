@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 
 use digest::Digest;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::network::kad::obfuscation::Rc4State;
 
@@ -44,13 +44,17 @@ where
     let first_byte = reader.read_u8().await?;
 
     if PLAIN_PROTOCOL_MARKERS.contains(&first_byte) {
+        debug!("TCP negotiation: plain text (protocol 0x{first_byte:02X})");
         return Ok(NegotiationResult::Plain { first_byte });
     }
 
     // --- Obfuscated connection ---
+    info!("TCP negotiation: obfuscated (first byte 0x{first_byte:02X}), user_hash={}", hex::encode(user_hash));
+
     // Step 1: Read the 4-byte random key part (unencrypted)
     let random_key_part_bytes = reader.read_u32_le().await?;
     let rkp = random_key_part_bytes.to_le_bytes();
+    info!("TCP obfuscation: random_key_part=0x{random_key_part_bytes:08X}");
 
     // Step 2: Derive RC4 keys using MD5(userHash[16] || magicByte[1] || randomKeyPart[4])
     let mut key_buf = [0u8; 21];
@@ -77,11 +81,13 @@ where
     let magic = u32::from_le_bytes(dec_magic);
 
     if magic != MAGICVALUE_SYNC {
+        info!("TCP obfuscation: magic MISMATCH: got 0x{magic:08X}, expected 0x{MAGICVALUE_SYNC:08X}");
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("obfuscation handshake: bad magic 0x{magic:08X}, expected 0x{MAGICVALUE_SYNC:08X}"),
         ));
     }
+    info!("TCP obfuscation: magic verified OK");
 
     // Step 4: Read and decrypt method tags + padding length (3 bytes)
     let mut enc_tags = [0u8; 3];
@@ -116,7 +122,7 @@ where
     writer.write_all(&resp_encrypted).await?;
     writer.flush().await?;
 
-    debug!("TCP obfuscation handshake complete (padding_in={padding_len}, padding_out={response_pad_len})");
+    info!("TCP obfuscation handshake complete (padding_in={padding_len}, padding_out={response_pad_len})");
 
     Ok(NegotiationResult::Obfuscated { recv_key, send_key })
 }
