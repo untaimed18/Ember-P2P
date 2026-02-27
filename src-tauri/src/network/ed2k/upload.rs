@@ -287,7 +287,12 @@ impl UploadHandler {
                         info!("Obfuscated data from {peer_addr}: proto=0x{proto:02X} op=0x{opcode:02X} len={}", payload.len());
 
                         if proto == OP_EDONKEYHEADER && opcode == OP_HELLO {
-                            // Server sent Hello -- build HelloAnswer and encrypt manually
+                            // Server sent Hello -- complete the FULL peer handshake:
+                            // 1. Send HelloAnswer
+                            // 2. Send EmuleInfo
+                            // 3. Read EmuleInfoAnswer (or whatever the peer sends next)
+
+                            // Step 1: HelloAnswer
                             let hello_payload = build_hello(&self.user_hash, 0, self.tcp_port, &self.nickname);
                             let mut pkt = Vec::with_capacity(6 + hello_payload.len());
                             pkt.push(OP_EDONKEYHEADER);
@@ -299,8 +304,52 @@ impl UploadHandler {
                             send_key.process(&pkt, &mut encrypted_pkt);
                             raw_writer.write_all(&encrypted_pkt).await?;
                             raw_writer.flush().await?;
+                            info!("Obfuscated probe: sent HelloAnswer ({} bytes)", encrypted_pkt.len());
 
-                            info!("Obfuscated Hello exchange complete with {peer_addr} ({} bytes encrypted)", encrypted_pkt.len());
+                            // Step 2: EmuleInfo
+                            let emule_payload = build_emule_info(self.udp_port);
+                            let mut emule_pkt = Vec::with_capacity(6 + emule_payload.len());
+                            emule_pkt.push(OP_EMULEPROT);
+                            emule_pkt.extend_from_slice(&((1 + emule_payload.len()) as u32).to_le_bytes());
+                            emule_pkt.push(OP_EMULEINFO);
+                            emule_pkt.extend_from_slice(&emule_payload);
+
+                            let mut encrypted_emule = vec![0u8; emule_pkt.len()];
+                            send_key.process(&emule_pkt, &mut encrypted_emule);
+                            raw_writer.write_all(&encrypted_emule).await?;
+                            raw_writer.flush().await?;
+                            info!("Obfuscated probe: sent EmuleInfo ({} bytes)", encrypted_emule.len());
+
+                            // Step 3: Read the next packet(s) from the peer
+                            // (EmuleInfoAnswer, SecIdent, etc.) - just consume them
+                            for _ in 0..5 {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    read_packet_async_inner(&mut obf_reader),
+                                ).await {
+                                    Ok(Ok((p, o, _pl))) => {
+                                        info!("Obfuscated probe: received proto=0x{p:02X} op=0x{o:02X}");
+                                        if p == OP_EMULEPROT && o == OP_EMULEINFOANSWER {
+                                            info!("Obfuscated probe: EmuleInfo exchange complete with {peer_addr}");
+                                            break;
+                                        }
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        } else if proto == OP_EMULEPROT && opcode == OP_PORTTEST {
+                            // Standard port test -- reply with 0x12
+                            let mut pkt = Vec::with_capacity(8);
+                            pkt.push(OP_EMULEPROT);
+                            pkt.extend_from_slice(&2u32.to_le_bytes());
+                            pkt.push(OP_PORTTEST);
+                            pkt.push(0x12);
+
+                            let mut encrypted_pkt = vec![0u8; pkt.len()];
+                            send_key.process(&pkt, &mut encrypted_pkt);
+                            raw_writer.write_all(&encrypted_pkt).await?;
+                            raw_writer.flush().await?;
+                            info!("Obfuscated probe: sent PortTest reply to {peer_addr}");
                         } else {
                             info!("Non-Hello on obfuscated probe: proto=0x{proto:02X} op=0x{opcode:02X}");
                         }
