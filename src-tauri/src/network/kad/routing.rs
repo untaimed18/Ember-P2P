@@ -7,6 +7,21 @@ use super::types::*;
 const NUM_BUCKETS: usize = 128;
 const BUCKET_REFRESH_INTERVAL_SECS: i64 = 3600;
 
+/// Return a human-readable KAD version name for logging.
+pub fn kad_version_name(version: u8) -> &'static str {
+    match version {
+        KADEMLIA_VERSION1_46C => "Kad1 (0.46c)",
+        KADEMLIA_VERSION2_47A => "Kad2 (0.47a)",
+        KADEMLIA_VERSION3_47B => "Kad2 (0.47b)",
+        KADEMLIA_VERSION5_48A => "Kad2 (0.48a)",
+        KADEMLIA_VERSION6_49ABETA => "Kad2 (0.49a-beta)",
+        KADEMLIA_VERSION7_49A => "Kad2 (0.49a)",
+        KADEMLIA_VERSION8_49B => "Kad2 (0.49b)",
+        KADEMLIA_VERSION9_50A => "Kad2 (0.50a+)",
+        _ => "Unknown",
+    }
+}
+
 /// eMule RoutingBin.cpp limits
 const MAX_CONTACTS_IP: u32 = 1;
 const MAX_CONTACTS_SUBNET: u32 = 10;
@@ -146,6 +161,7 @@ impl RoutingTable {
             return None;
         }
         if contact.udp_port == 53 && contact.version <= KADEMLIA_VERSION5_48A {
+            tracing::debug!("Rejecting DNS port contact ({}) version {}", contact.ip, kad_version_name(contact.version));
             return None;
         }
 

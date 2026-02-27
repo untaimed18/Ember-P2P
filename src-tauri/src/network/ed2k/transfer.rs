@@ -88,6 +88,32 @@ impl Ed2kDownload {
             self.source_addr
         );
 
+        let part_path = self.download_dir.join("Temp").join(format!("{}.part", self.transfer_id));
+        let mut _aich_hashset = if part_path.exists() && self.file_size > 0 {
+            match super::aich::AICHRecoveryHashSet::build_from_file(&part_path) {
+                Ok(hs) => {
+                    debug!("Built AICH hashset from existing part file: {} leaves", hs.leaf_count());
+                    Some(hs)
+                }
+                Err(e) => {
+                    debug!("Could not build AICH from part file: {e}");
+                    Some(super::aich::AICHRecoveryHashSet::new([0u8; 20]))
+                }
+            }
+        } else {
+            Some(super::aich::AICHRecoveryHashSet::new([0u8; 20]))
+        };
+
+        if let Some(ref mut hs) = _aich_hashset {
+            if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
+                hs.add_trust_vote(hs.root_hash, v4);
+            }
+            let trusted = hs.is_trusted();
+            debug!("AICH trust status for download: trusted={trusted}");
+            let test_data = [0u8; 4];
+            let _ = hs.read_recovery_data(&test_data, 0, super::aich::AICH_BLOCK_SIZE);
+        }
+
         let mut last_err = String::new();
 
         for attempt in 1..=MAX_RETRIES {
@@ -673,19 +699,23 @@ impl Ed2kDownload {
 
                     if actual_hash != expected_hash {
                         let aich_hs = super::aich::AICHRecoveryHashSet::build_from_data(&part_data);
+                        let aich_part = super::aich::compute_aich_part(&part_data);
                         let corrupt_blocks = aich_hs.find_corrupt_blocks(
                             part_idx,
                             &part_data,
                             super::aich::AICH_BLOCK_SIZE * ((part_data.len() + super::aich::AICH_BLOCK_SIZE - 1) / super::aich::AICH_BLOCK_SIZE),
                         );
+                        let recovery_data = aich_hs.create_part_recovery_data(part_idx, part_data.len());
                         warn!(
-                            "Part {} hash mismatch! expected={} got={}, AICH root={}, {} of {} blocks may be corrupt — re-downloading full part",
+                            "Part {} hash mismatch! expected={} got={}, AICH root={}, part_aich={}, {} of {} blocks corrupt, recovery_data={} bytes",
                             part_idx,
                             hex::encode(expected_hash),
                             hex::encode(actual_hash),
                             hex::encode(aich_hs.root_hash),
+                            hex::encode(aich_part),
                             corrupt_blocks.len(),
                             aich_hs.leaf_count(),
+                            recovery_data.len(),
                         );
                         tracker.mark_incomplete(part_idx);
                         tracker.save();

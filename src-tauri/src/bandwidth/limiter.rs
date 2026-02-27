@@ -185,18 +185,53 @@ pub async fn start_token_refill(
     if max_up > 0 {
         uss.enable();
     }
+    uss.set_tolerance(1.5);
+
+    // Seed USS with common gateway IPs as potential ping hosts
+    use std::net::Ipv4Addr;
+    for octet in [1u8, 2, 3] {
+        uss.add_host_candidate(Ipv4Addr::new(192, 168, 1, octet));
+    }
 
     let mut interval = tokio::time::interval(Duration::from_millis(REFILL_INTERVAL_MS));
     let mut last_uploaded = limiter.total_uploaded();
     let mut last_downloaded = limiter.total_downloaded();
     let mut speed_tick_count: u64 = 0;
+    let mut ping_tick_count: u64 = 0;
+    let ping_ticks = super::uss::PING_INTERVAL.as_millis() as u64 / REFILL_INTERVAL_MS;
 
     loop {
         interval.tick().await;
         if shutdown.load(Ordering::Relaxed) {
+            uss.disable();
             break;
         }
         limiter.refill_tokens_incremental(1, TICKS_PER_SECOND);
+
+        // Check USS state for errors
+        if uss.state() == super::uss::UssState::Error {
+            tracing::warn!("USS entered error state, resetting");
+            let max = limiter.max_upload_rate.load(Ordering::Relaxed);
+            uss.set_limits(1024, max);
+            uss.disable();
+            uss.enable();
+        }
+
+        // Periodic ping check for USS
+        ping_tick_count += 1;
+        if ping_tick_count >= ping_ticks && uss.should_ping() {
+            ping_tick_count = 0;
+            if let Some(_host) = uss.ping_host() {
+                // Use upload utilization as a latency proxy since ICMP ping
+                // requires raw sockets / elevated privileges on most OSes.
+                let up_speed = limiter.upload_speed();
+                let max_rate = limiter.max_upload_rate.load(Ordering::Relaxed);
+                if max_rate > 0 && up_speed > 0 {
+                    let utilization = (up_speed as f64 / max_rate as f64) * 100.0;
+                    uss.record_ping(utilization);
+                }
+            }
+        }
 
         speed_tick_count += 1;
         if speed_tick_count >= TICKS_PER_SECOND {
@@ -209,17 +244,18 @@ pub async fn start_token_refill(
             last_uploaded = current_up;
             last_downloaded = current_down;
 
-            // USS: use download speed as a latency proxy (higher download = connection
-            // not saturated). When upload speed approaches the limit and download drops,
-            // it suggests the upload is saturating the connection.
-            if uss.is_enabled() && up_speed > 0 {
-                let max_rate = limiter.max_upload_rate.load(Ordering::Relaxed);
-                if max_rate > 0 {
-                    let utilization = (up_speed as f64 / max_rate as f64) * 100.0;
-                    uss.record_ping(utilization);
-                    if let Some(new_limit) = uss.compute_limit() {
-                        limiter.set_limits(new_limit, limiter.max_download_rate.load(Ordering::Relaxed));
-                    }
+            if uss.is_enabled() {
+                if let Some(new_limit) = uss.compute_limit() {
+                    let _current = uss.current_limit();
+                    limiter.set_limits(new_limit, limiter.max_download_rate.load(Ordering::Relaxed));
+                }
+
+                // Dynamically adjust limits if the configured max changes
+                let configured_max = limiter.max_upload_rate.load(Ordering::Relaxed);
+                if configured_max == 0 {
+                    uss.disable();
+                } else {
+                    uss.set_limits(1024, configured_max);
                 }
             }
         }

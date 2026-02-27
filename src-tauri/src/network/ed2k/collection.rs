@@ -71,6 +71,11 @@ impl Collection {
                         author = s;
                     }
                 }
+                FT_COLLECTIONAUTHORKEY => {
+                    if let TagValue::Blob(key_data) = &tag_value {
+                        tracing::debug!("Collection has author key ({} bytes)", key_data.len());
+                    }
+                }
                 _ => {}
             }
         }

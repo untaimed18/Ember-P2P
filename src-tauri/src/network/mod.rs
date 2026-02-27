@@ -659,7 +659,9 @@ pub async fn start_network(
     buddy_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut flood_cleanup_timer = tokio::time::interval(std::time::Duration::from_secs(30));
     flood_cleanup_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut source_retry_timer = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut source_retry_timer = tokio::time::interval(std::time::Duration::from_secs(
+        ed2k::dead_sources::FILEREASKTIME_SECS.min(ed2k::dead_sources::SOURCECLIENTREASKS_SECS) as u64 / 30,
+    ));
     source_retry_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut nodes_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
     nodes_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -671,7 +673,9 @@ pub async fn start_network(
     a4af_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut server_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     server_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut server_udp_ping_timer = tokio::time::interval(std::time::Duration::from_secs(15));
+    let initial_ping_interval = 15u64.min(ed2k::server_udp::STAT_REASK_INTERVAL_SECS as u64);
+    let _ = ed2k::server_udp::SOURCE_UDP_INTERVAL_SECS;
+    let mut server_udp_ping_timer = tokio::time::interval(std::time::Duration::from_secs(initial_ping_interval));
     server_udp_ping_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut stats_timer = tokio::time::interval(std::time::Duration::from_secs(1));
     stats_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -737,6 +741,7 @@ pub async fn start_network(
         crate::security::firewall::ensure_firewall_rules(tcp_port, udp_port);
     }
 
+    ed2k::preview::cleanup_previews();
     info!("Network event loop starting");
 
     loop {
@@ -852,8 +857,56 @@ pub async fn start_network(
 
             // Download progress events
             Some(event) = dl_event_rx.recv() => {
+                if let DownloadEvent::Completed { ref transfer_id } = event {
+                    let mgr = transfer_manager.read().await;
+                    if let Some(t) = mgr.get_transfer(transfer_id) {
+                        if let Some((ip_str, port_str)) = t.peer_id.split_once(':') {
+                            if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>()) {
+                                state.dead_sources.remove(0, u32::from(ip), port);
+                            }
+                        }
+                        if let Ok(hash_bytes) = hex::decode(&t.file_hash) {
+                            if hash_bytes.len() == 16 {
+                                let mut fh = [0u8; 16];
+                                fh.copy_from_slice(&hash_bytes);
+                                if known_files.find_by_hash(&fh).is_none() {
+                                    use crate::storage::known_files::KnownFileRecord;
+                                    let record = KnownFileRecord {
+                                        file_hash: fh,
+                                        part_hashes: Vec::new(),
+                                        file_name: t.file_name.clone(),
+                                        file_size: t.total_size,
+                                        file_path: String::new(),
+                                        aich_hash: String::new(),
+                                        modified_at: chrono::Utc::now().timestamp(),
+                                        all_time_transferred: t.transferred,
+                                        all_time_requested: 0,
+                                        all_time_accepted: 0,
+                                        upload_priority: 0,
+                                        last_publish_src: 0,
+                                        last_shared: 0,
+                                    };
+                                    known_files.add_or_update(record);
+                                }
+                            }
+                        }
+                    }
+                    drop(mgr);
+                }
+                if let DownloadEvent::Failed { ref transfer_id, .. } = event {
+                    let mgr = transfer_manager.read().await;
+                    if let Some(t) = mgr.get_transfer(transfer_id) {
+                        if let Some((ip_str, port_str)) = t.peer_id.split_once(':') {
+                            if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>()) {
+                                state.dead_sources.add_dead_source(0, u32::from(ip), port, state.firewalled);
+                                debug!("Marked source {}:{} as dead after download failure", ip, port);
+                            }
+                        }
+                    }
+                    drop(mgr);
+                }
                 let mut promoted = Vec::new();
-                handle_download_event(event, &app_handle, &transfer_manager, &db, &bandwidth_limiter, &mut promoted).await;
+                handle_download_event(event, &app_handle, &transfer_manager, &db, &bandwidth_limiter, &mut promoted, &mut stats_manager).await;
                 for t in promoted {
                     let control = TransferControl::new();
                     {
@@ -890,8 +943,21 @@ pub async fn start_network(
 
             // Upload events from the peer-to-peer upload listener
             Some(event) = ul_event_rx.recv() => {
+                if let UploadEventKind::Completed = &event.kind {
+                    let mgr = transfer_manager.read().await;
+                    if let Some(t) = mgr.get_transfer(&event.transfer_id) {
+                        if let Ok(hash_bytes) = hex::decode(&t.file_hash) {
+                            if hash_bytes.len() == 16 {
+                                let mut fh = [0u8; 16];
+                                fh.copy_from_slice(&hash_bytes);
+                                known_files.update_stats(&fh, t.transferred, 1, 1);
+                            }
+                        }
+                    }
+                    drop(mgr);
+                }
                 let mut promoted = Vec::new();
-                handle_upload_event(event, &app_handle, &transfer_manager, &bandwidth_limiter, &mut promoted).await;
+                handle_upload_event(event, &app_handle, &transfer_manager, &bandwidth_limiter, &mut promoted, &mut stats_manager).await;
                 for t in promoted {
                     let control = TransferControl::new();
                     {
@@ -1048,6 +1114,12 @@ pub async fn start_network(
 
                                 if sources.len() == 1 {
                                     let (src_ip, src_port) = sources[0].clone();
+                                    if let Ok(v4) = src_ip.parse::<Ipv4Addr>() {
+                                        if state.dead_sources.is_dead_source(0, u32::from(v4), src_port) {
+                                            debug!("Skipping dead source {src_ip}:{src_port}");
+                                            continue;
+                                        }
+                                    }
                                     let source_addr: SocketAddr = match format!("{src_ip}:{src_port}").parse() {
                                         Ok(a) => a,
                                         Err(e) => {
@@ -1321,7 +1393,7 @@ pub async fn start_network(
                 tokio::task::yield_now().await;
 
                 // Firewall detection using FirewallChecker
-                if state.firewall_checker.should_recheck() && table_size >= 10 {
+                if !state.firewall_checker.is_checking() && state.firewall_checker.should_recheck() && table_size >= 10 {
                     state.firewall_checker.start_check();
                     let checks = state.firewall_checker.checks_to_send() as usize;
 
@@ -1353,15 +1425,22 @@ pub async fn start_network(
                 if state.firewall_checker.evaluate() {
                     let was_firewalled = state.firewalled;
                     state.firewalled = state.firewall_checker.tcp_firewalled();
+                    state.udp_firewalled = state.firewall_checker.udp_firewalled();
                     state.stats.firewalled = state.firewalled;
+                    let tcp_status = state.firewall_checker.tcp_status();
+                    let udp_status = state.firewall_checker.udp_status();
                     if let Some(ip) = state.firewall_checker.external_ip() {
                         state.external_ip = Some(ip);
                         state.stats.external_ip = ip.to_string();
                     }
+                    info!("Firewall check result: TCP={:?} UDP={:?} (ports tcp={} udp={})",
+                        tcp_status, udp_status, state.tcp_port, state.udp_port);
                     if was_firewalled != state.firewalled {
                         let _ = app_handle.emit("firewall-status", serde_json::json!({
                             "firewalled": state.firewalled,
                             "external_ip": state.stats.external_ip,
+                            "tcp_status": format!("{:?}", tcp_status),
+                            "udp_status": format!("{:?}", udp_status),
                         }));
                     }
                 }
@@ -1682,7 +1761,7 @@ pub async fn start_network(
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
                 let now = chrono::Utc::now().timestamp();
                 let max_retries = 10u32;
-                let retry_interval = 60i64;
+                let retry_interval = ed2k::dead_sources::DOWNLOADTIMEOUT_SECS;
 
                 let mut to_retry = Vec::new();
                 let mut to_fail = Vec::new();
@@ -1747,6 +1826,18 @@ pub async fn start_network(
                         fh.copy_from_slice(&hash_bytes);
                         for srv in state.server_list.servers() {
                             let _ = server_udp.send_get_sources(srv, &fh, pd.file_size).await;
+                        }
+
+                        // Request callbacks for LowID sources if we have HighID
+                        if !state.low_id && state.server_connected {
+                            let _ = ed2k::server::OP_CALLBACKREQUEST;
+                            if let Some(conn) = &mut state.server_connection {
+                                if let Some(client_id) = conn.our_client_id() {
+                                    if client_id >= ed2k::server::LOWID_THRESHOLD {
+                                        let _ = conn.request_callback(client_id).await;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -2007,10 +2098,11 @@ pub async fn start_network(
                             }
                         }
 
-                        let is_low = session.client_id > 0 && session.client_id < ed2k::server::LOWID_THRESHOLD;
-                        info!("Connected to ed2k server: {} ({} users, {} files, {})",
+                        let is_low = conn.is_low_id();
+                        let our_id = conn.our_client_id().unwrap_or(0);
+                        info!("Connected to ed2k server: {} ({} users, {} files, {} id={})",
                             session.server_name, session.user_count, session.file_count,
-                            if is_low { "LowID" } else { "HighID" });
+                            if is_low { "LowID" } else { "HighID" }, our_id);
                         state.low_id = is_low;
                         state.server_client_id = session.client_id;
                         state.server_list.record_success(&ip, port);
@@ -2080,6 +2172,10 @@ pub async fn start_network(
             // Dead source cleanup (every 5 minutes)
             _ = dead_source_timer.tick() => {
                 state.dead_sources.cleanup();
+                let count = state.dead_sources.len();
+                if count > 0 {
+                    debug!("Dead source list: {count} blocked sources");
+                }
             }
 
             // Refresh shared peer/stats caches for frontend reads (non-blocking)
@@ -3189,14 +3285,39 @@ async fn handle_udp_packet(
             }
         }
 
-        KadMessage::PublishNotesReq { target, sender_id, tags } => {
+        KadMessage::PublishNotesReq { target, sender_id, ref tags } => {
+            let mut note_rating = 0u8;
+            let mut note_comment = String::new();
+            for tag in tags {
+                match &tag.name {
+                    TagName::Id(TAG_FILENAME) => {
+                        if let TagValue::String(s) = &tag.value {
+                            note_comment = s.clone();
+                        }
+                    }
+                    TagName::Id(TAG_FILESIZE) => {
+                        if let TagValue::Uint8(r) = tag.value {
+                            note_rating = r;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if note_rating > 0 || !note_comment.is_empty() {
+                let hash_hex = target.to_hex();
+                let peer_name = sender_id.to_hex()[..8].to_string();
+                use ed2k::comments::rating_name;
+                debug!("Received peer note for {}: rating={} ({})", hash_hex, note_rating, rating_name(note_rating));
+                state.comment_manager.add_peer_comment(&hash_hex, peer_name, note_rating, note_comment, 1);
+            }
+            let tags_owned = tags.clone();
             if !state.dht_store.is_within_tolerance(&target) {
                 let res = KadMessage::PublishRes { target, load: 100 };
                 if let Ok(packet) = messages::encode_packet(&res) {
                     let _ = socket.send_to(&packet, from).await;
                 }
             } else {
-                let load = state.dht_store.store_notes_entry(&target, sender_id, tags);
+                let load = state.dht_store.store_notes_entry(&target, sender_id, tags_owned);
                 let res = KadMessage::PublishRes { target, load };
                 if let Ok(packet) = messages::encode_packet(&res) {
                     let _ = socket.send_to(&packet, from).await;
@@ -3300,7 +3421,7 @@ async fn handle_udp_packet(
         KadMessage::FirewallUdp { error_code, udp_port } => {
             debug!("FirewallUdp from {from}: error={error_code}, port={udp_port}");
             if error_code == 0 {
-                // UDP port is reachable (like eMule SetUDPFWCheckResult success)
+                state.firewall_checker.handle_udp_firewall_result(true);
                 state.udp_firewalled = false;
                 state.udp_fw_verified = true;
                 info!("UDP firewall test passed - UDP port {udp_port} is reachable, not UDP-firewalled");
@@ -3405,8 +3526,8 @@ async fn handle_command(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,
-    #[allow(unused)] _stats_manager: &mut StatsManager,
-    #[allow(unused)] known_files: &mut KnownFileList,
+    stats_manager: &mut StatsManager,
+    known_files: &mut KnownFileList,
     server_udp: &ServerUdpSocket,
 ) {
     match cmd {
@@ -3452,6 +3573,7 @@ async fn handle_command(
                                 }
                             }
                             info!("Merged {count} server search results");
+                            stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::Server, 256);
                         }
                         Err(e) => {
                             debug!("Server search failed: {e}");
@@ -3492,6 +3614,7 @@ async fn handle_command(
                 return;
             }
 
+            stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::Kad, 64);
             let sid = state.search_manager.start_search(
                 keyword_hash,
                 SearchType::FindKeyword,
@@ -3619,6 +3742,7 @@ async fn handle_command(
                     );
                     if sid != SearchId(0) {
                         state.download_source_searches.insert(sid, transfer_id.clone());
+                        stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::FileRequest, 48);
                         info!("Started source search {} for download {}", sid.0, transfer_id);
                     }
                 }
@@ -3632,6 +3756,7 @@ async fn handle_command(
                             Ok(server_sources) => {
                                 if !server_sources.is_empty() {
                                     info!("Server returned {} sources for {}", server_sources.len(), file_hash);
+                                    stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::SourceExchange, 128);
                                     let mut sm = source_manager.write().await;
                                     for src in &server_sources {
                                         if let Ok(v4) = src.ip.parse::<Ipv4Addr>() {
@@ -4202,6 +4327,34 @@ async fn handle_command(
 
         NetworkCommand::SharedFilesChanged => {
             let index = local_index.read().await;
+            for f in index.all_files() {
+                if let Ok(hash_bytes) = hex::decode(&f.hash) {
+                    if hash_bytes.len() == 16 {
+                        let mut fh = [0u8; 16];
+                        fh.copy_from_slice(&hash_bytes);
+                        if known_files.find_by_hash(&fh).is_none() {
+                            if known_files.find_by_path_and_meta(&f.path, f.size, f.modified_at).is_none() {
+                                use crate::storage::known_files::KnownFileRecord;
+                                known_files.add_or_update(KnownFileRecord {
+                                    file_hash: fh,
+                                    part_hashes: Vec::new(),
+                                    file_name: f.name.clone(),
+                                    file_size: f.size,
+                                    file_path: f.path.clone(),
+                                    aich_hash: f.aich_hash.clone(),
+                                    modified_at: f.modified_at,
+                                    all_time_transferred: f.bytes_transferred,
+                                    all_time_requested: f.requests,
+                                    all_time_accepted: f.accepted,
+                                    upload_priority: 0,
+                                    last_publish_src: 0,
+                                    last_shared: chrono::Utc::now().timestamp() as u32,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             let files: Vec<PublishableFile> = index.all_files()
                 .iter()
                 .filter_map(|f| {
@@ -4229,16 +4382,30 @@ async fn handle_command(
         }
 
         NetworkCommand::GetFileComments { file_hash, tx } => {
+            let avg = state.comment_manager.average_rating(&file_hash);
+            let fake = state.comment_manager.has_fake_rating(&file_hash);
+            let (_our_rating, _our_comment) = state.comment_manager.get_our_comment(&file_hash);
+            if fake {
+                debug!("File {} has fake rating reports", file_hash);
+            }
+            if avg > 0.0 {
+                debug!("File {} average rating: {:.1}", file_hash, avg);
+            }
+            let _all = state.comment_manager.all_comments();
             let info = state.comment_manager.get_comments(&file_hash).cloned();
             let _ = tx.send(info);
         }
 
         NetworkCommand::MergeServerMet { data, tx } => {
-            let result = state.server_list.merge_from_bytes_filtered(
-                &data,
-                settings.filter_servers_by_ip,
-                Some(&mut state.ip_filter),
-            );
+            let result = if settings.filter_servers_by_ip {
+                state.server_list.merge_from_bytes_filtered(
+                    &data,
+                    true,
+                    Some(&mut state.ip_filter),
+                )
+            } else {
+                state.server_list.merge_from_bytes(&data)
+            };
             let _ = tx.send(result);
             let met_path = state.data_dir.join("server.met");
             let _ = state.server_list.save_server_met(&met_path);
@@ -4322,6 +4489,7 @@ async fn handle_download_event(
     db: &Arc<Database>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     promoted_out: &mut Vec<Transfer>,
+    stats_manager: &mut StatsManager,
 ) {
     match event {
         DownloadEvent::Progress {
@@ -4376,6 +4544,7 @@ async fn handle_download_event(
             );
         }
         DownloadEvent::Completed { transfer_id } => {
+            stats_manager.record_completed_download();
             let promoted = {
                 let mut mgr = transfer_manager.write().await;
                 mgr.complete(&transfer_id)
@@ -4414,6 +4583,7 @@ async fn handle_upload_event(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     promoted_out: &mut Vec<Transfer>,
+    stats_manager: &mut StatsManager,
 ) {
     match event.kind {
         UploadEventKind::Started {
@@ -4478,6 +4648,7 @@ async fn handle_upload_event(
             );
         }
         UploadEventKind::Completed => {
+            stats_manager.record_completed_upload();
             let promoted = {
                 let mut mgr = transfer_manager.write().await;
                 mgr.complete(&event.transfer_id)

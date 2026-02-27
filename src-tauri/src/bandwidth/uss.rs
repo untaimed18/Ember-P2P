@@ -19,7 +19,7 @@ const DEFAULT_PING_TOLERANCE: f64 = 1.5;
 const DEFAULT_GOING_UP_DIVIDER: f64 = 2.0;
 const DEFAULT_GOING_DOWN_DIVIDER: f64 = 1.5;
 const MIN_UPLOAD_BYTES: u64 = 1024;
-const PING_INTERVAL: Duration = Duration::from_secs(2);
+pub const PING_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct UploadSpeedSense {
     state: UssState,

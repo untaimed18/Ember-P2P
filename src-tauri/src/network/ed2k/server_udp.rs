@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use tokio::net::UdpSocket;
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::server_list::ServerEntry;
 
@@ -30,16 +30,6 @@ pub struct ServerUdpSocket {
 }
 
 impl ServerUdpSocket {
-    pub async fn bind(port: u16) -> anyhow::Result<Self> {
-        let addr: SocketAddr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port);
-        let socket = UdpSocket::bind(addr).await?;
-        info!("Server UDP socket bound on port {port}");
-        Ok(Self {
-            socket,
-            last_ping_times: std::collections::HashMap::new(),
-        })
-    }
-
     pub fn from_socket(socket: UdpSocket) -> Self {
         Self {
             socket,
