@@ -113,7 +113,11 @@ pub async fn cancel_transfer(
         manager.cancel(&transfer_id)
     };
 
-    let _ = state.db.remove_transfer(&transfer_id);
+    {
+        let db = state.db.clone();
+        let tid = transfer_id.clone();
+        let _ = tokio::task::spawn_blocking(move || db.remove_transfer(&tid)).await;
+    }
 
     for t in &promoted {
         let control = crate::sharing::manager::TransferControl::new();
@@ -146,7 +150,11 @@ pub async fn remove_transfer(
         let mut manager = state.transfer_manager.write().await;
         manager.remove(&transfer_id);
     }
-    let _ = state.db.remove_transfer(&transfer_id);
+    {
+        let db = state.db.clone();
+        let tid = transfer_id.clone();
+        let _ = tokio::task::spawn_blocking(move || db.remove_transfer(&tid)).await;
+    }
     Ok(())
 }
 
@@ -207,8 +215,11 @@ pub async fn clear_completed(
     manager.completed.clear();
     drop(manager);
 
-    for id in &ids {
-        let _ = state.db.remove_transfer(id);
-    }
+    let db = state.db.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        for id in &ids {
+            let _ = db.remove_transfer(id);
+        }
+    }).await;
     Ok(count)
 }

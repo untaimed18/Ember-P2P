@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use crate::app_state::AppState;
 use crate::network::NetworkCommand;
 use crate::sharing::indexer::FileIndexer;
+use crate::storage::database::Database;
 use crate::types::*;
 use tracing::info;
 
@@ -20,12 +23,14 @@ pub async fn add_shared_folder(
         index.add_files(files.clone());
     }
 
-    for file in &files {
-        state
-            .db
-            .save_shared_file(file)
-            .map_err(|e| format!("DB error: {e}"))?;
-    }
+    // Batch DB writes on a blocking thread to avoid starving the async runtime
+    let db = state.db.clone();
+    let db_files = files.clone();
+    tokio::task::spawn_blocking(move || {
+        save_files_to_db(&db, &db_files);
+    })
+    .await
+    .map_err(|e| format!("DB save failed: {e}"))?;
 
     state
         .network_tx
@@ -35,10 +40,12 @@ pub async fn add_shared_folder(
         .await
         .map_err(|e| format!("Failed to announce files: {e}"))?;
 
-    let mut config = state.config.write().await;
-    if !config.settings.shared_folders.contains(&path) {
-        config.settings.shared_folders.push(path);
-        config.save().map_err(|e| format!("Config save error: {e}"))?;
+    {
+        let mut config = state.config.write().await;
+        if !config.settings.shared_folders.contains(&path) {
+            config.settings.shared_folders.push(path);
+            config.save().map_err(|e| format!("Config save error: {e}"))?;
+        }
     }
 
     Ok(files)
@@ -59,18 +66,27 @@ pub async fn remove_shared_folder(
             .collect()
     };
 
-    let mut config = state.config.write().await;
-    config.settings.shared_folders.retain(|f| f != &path);
-    config.save().map_err(|e| format!("Config save error: {e}"))?;
+    {
+        let mut config = state.config.write().await;
+        config.settings.shared_folders.retain(|f| f != &path);
+        config.save().map_err(|e| format!("Config save error: {e}"))?;
+    }
 
     {
         let mut index = state.local_index.write().await;
         index.remove_files_by_path_prefix(&path);
     }
 
-    for hash in &removed_hashes {
-        let _ = state.db.remove_shared_file_by_hash(hash);
-    }
+    // Batch DB deletes on a blocking thread
+    let db = state.db.clone();
+    let hashes = removed_hashes.clone();
+    tokio::task::spawn_blocking(move || {
+        for hash in &hashes {
+            let _ = db.remove_shared_file_by_hash(hash);
+        }
+    })
+    .await
+    .map_err(|e| format!("DB cleanup failed: {e}"))?;
 
     if !removed_hashes.is_empty() {
         let _ = state
@@ -140,7 +156,6 @@ pub async fn reload_shared_files(
 
     {
         let mut index = state.local_index.write().await;
-        // Clear and rebuild
         for file in &all_files {
             if index.get_by_hash(&file.hash).is_none() {
                 index.add_file(file.clone());
@@ -170,7 +185,14 @@ pub async fn unshare_file(
     };
 
     if removed.is_some() {
-        let _ = state.db.remove_shared_file_by_hash(&file_hash);
+        let db = state.db.clone();
+        let hash = file_hash.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = db.remove_shared_file_by_hash(&hash);
+        })
+        .await
+        .map_err(|e| format!("DB error: {e}"))?;
+
         let _ = state
             .network_tx
             .send(NetworkCommand::UnannounceFiles {
@@ -234,4 +256,13 @@ pub async fn open_shared_folder(file_path: String) -> Result<(), String> {
             .map_err(|e| format!("Failed to open folder: {e}"))?;
     }
     Ok(())
+}
+
+/// Helper: batch-save files to DB on current (blocking) thread.
+fn save_files_to_db(db: &Arc<Database>, files: &[FileInfo]) {
+    for file in files {
+        if let Err(e) = db.save_shared_file(file) {
+            tracing::warn!("Failed to save shared file {}: {e}", file.name);
+        }
+    }
 }
