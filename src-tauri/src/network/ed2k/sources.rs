@@ -14,16 +14,26 @@ pub struct SourceEntry {
 }
 
 /// Tracks known sources (peers) per file hash for source exchange responses.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SourceManager {
     sources: HashMap<[u8; 16], Vec<SourceEntry>>,
+    max_per_file: usize,
+}
+
+impl Default for SourceManager {
+    fn default() -> Self { Self::new() }
 }
 
 impl SourceManager {
     pub fn new() -> Self {
         Self {
             sources: HashMap::new(),
+            max_per_file: MAX_SOURCES_PER_FILE,
         }
+    }
+
+    pub fn set_max_per_file(&mut self, max: u32) {
+        self.max_per_file = (max as usize).max(50);
     }
 
     pub fn register_source(&mut self, file_hash: [u8; 16], ip: Ipv4Addr, tcp_port: u16) {
@@ -35,7 +45,7 @@ impl SourceManager {
             return;
         }
 
-        if entries.len() >= MAX_SOURCES_PER_FILE {
+        if entries.len() >= self.max_per_file {
             entries.sort_by_key(|e| e.last_seen);
             entries.remove(0);
         }

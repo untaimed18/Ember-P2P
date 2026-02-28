@@ -201,6 +201,41 @@
               <input id="max-uploads" type="number" min="1" max="20" bind:value={settings.max_concurrent_uploads} />
             </div>
           </div>
+
+          <div class="field-row">
+            <div class="field half">
+              <label for="max-sources">Max Sources / File</label>
+              <input id="max-sources" type="number" min="50" max="5000" bind:value={settings.max_sources_per_file} />
+              <span class="hint">Max tracked sources per download (default 400)</span>
+            </div>
+            <div class="field half">
+              <label for="max-connections">Max Connections</label>
+              <input id="max-connections" type="number" min="50" max="5000" bind:value={settings.max_connections} />
+              <span class="hint">Total TCP connection limit (default 500)</span>
+            </div>
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Add Downloads Paused</span>
+              <span class="hint">New downloads start paused until manually resumed.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.add_downloads_paused} />
+          </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Auto-Remove Completed</span>
+              <span class="hint">Automatically remove finished downloads from the transfer list.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.remove_finished_downloads} />
+          </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Skip Compress Video</span>
+              <span class="hint">Don't compress AVI/MKV/MP4 during uploads (already compressed).</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.skip_compress_video} />
+          </div>
         </div>
       </section>
 

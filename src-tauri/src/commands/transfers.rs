@@ -35,7 +35,14 @@ pub async fn start_download(
 
     let has_source = !peer_ip.is_empty() && peer_ip != "0.0.0.0" && peer_port > 0;
 
+    let add_paused = {
+        let config = state.config.read().await;
+        config.settings.add_downloads_paused
+    };
     let control = TransferControl::new();
+    if add_paused {
+        control.pause();
+    }
 
     let transfer = Transfer {
         id: transfer_id.clone(),
@@ -48,7 +55,9 @@ pub async fn start_download(
         },
         peer_name: String::new(),
         direction: TransferDirection::Download,
-        status: if has_source {
+        status: if add_paused {
+            TransferStatus::Paused
+        } else if has_source {
             TransferStatus::Queued
         } else {
             TransferStatus::Searching

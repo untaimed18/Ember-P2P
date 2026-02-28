@@ -260,6 +260,21 @@ pub struct AppSettings {
     /// Automatically connect to an ed2k server on startup (eMule: "Autoconnect" for server)
     #[serde(default)]
     pub auto_connect_server: bool,
+    /// Maximum sources tracked per file (eMule: maxsourceperfile, default 400)
+    #[serde(default = "default_max_sources_per_file")]
+    pub max_sources_per_file: u32,
+    /// Maximum total TCP connections (eMule: maxconnections, default 500)
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
+    /// Add new downloads in paused state (eMule: addnewfilespaused)
+    #[serde(default)]
+    pub add_downloads_paused: bool,
+    /// Automatically remove completed downloads from the list
+    #[serde(default)]
+    pub remove_finished_downloads: bool,
+    /// Skip compressing video files during upload (eMule: dontcompressavi)
+    #[serde(default)]
+    pub skip_compress_video: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +298,14 @@ fn default_true() -> bool {
 
 fn default_max_uploads() -> u32 {
     5
+}
+
+fn default_max_sources_per_file() -> u32 {
+    400
+}
+
+fn default_max_connections() -> u32 {
+    500
 }
 
 impl Default for AppSettings {
@@ -317,6 +340,11 @@ impl Default for AppSettings {
             server_list_path: String::new(),
             auto_connect_kad: false,
             auto_connect_server: false,
+            max_sources_per_file: 400,
+            max_connections: 500,
+            add_downloads_paused: false,
+            remove_finished_downloads: false,
+            skip_compress_video: false,
         }
     }
 }

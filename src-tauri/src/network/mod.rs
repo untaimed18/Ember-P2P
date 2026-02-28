@@ -641,7 +641,11 @@ pub async fn start_network(
     // Buddy connection channel (upload listener sends recognized buddy connections here)
     let (buddy_conn_tx, mut buddy_conn_rx) = mpsc::channel::<upload_server::BuddyConnectionParts>(4);
 
-    let source_manager: Arc<RwLock<SourceManager>> = Arc::new(RwLock::new(SourceManager::new()));
+    let source_manager: Arc<RwLock<SourceManager>> = {
+        let mut sm = SourceManager::new();
+        sm.set_max_per_file(settings.max_sources_per_file);
+        Arc::new(RwLock::new(sm))
+    };
 
     // Load credits from DB
     let credit_manager: Arc<RwLock<CreditManager>> = {
@@ -996,7 +1000,7 @@ pub async fn start_network(
                     drop(mgr);
                 }
                 let mut promoted = Vec::new();
-                handle_download_event(event, &app_handle, &transfer_manager, &db, &bandwidth_limiter, &mut promoted, &mut stats_manager).await;
+                handle_download_event(event, &app_handle, &transfer_manager, &db, &bandwidth_limiter, &mut promoted, &mut stats_manager, settings.remove_finished_downloads).await;
                 for t in promoted {
                     let control = TransferControl::new();
                     {
@@ -5024,6 +5028,7 @@ async fn handle_download_event(
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     promoted_out: &mut Vec<Transfer>,
     stats_manager: &mut StatsManager,
+    remove_finished: bool,
 ) {
     match event {
         DownloadEvent::Progress {
@@ -5152,6 +5157,11 @@ async fn handle_download_event(
                 "transfer-complete",
                 serde_json::json!({ "id": transfer_id }),
             );
+            if remove_finished {
+                let mut mgr = transfer_manager.write().await;
+                mgr.remove(&transfer_id);
+                let _ = db.remove_transfer(&transfer_id);
+            }
         }
         DownloadEvent::Failed { transfer_id, error } => {
             let promoted = {

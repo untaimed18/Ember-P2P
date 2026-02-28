@@ -143,4 +143,9 @@ export interface AppSettings {
   server_list_path: string;
   auto_connect_kad: boolean;
   auto_connect_server: boolean;
+  max_sources_per_file: number;
+  max_connections: number;
+  add_downloads_paused: boolean;
+  remove_finished_downloads: boolean;
+  skip_compress_video: boolean;
 }
