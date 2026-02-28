@@ -94,7 +94,7 @@
       const selected = await open({ directory: true, multiple: false });
       if (!mounted || !selected) return;
       await addSharedFolder(selected as string);
-      if (mounted) await refresh();
+      // Command returns instantly; files appear via shared-files-changed event
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
     }
@@ -103,7 +103,7 @@
   async function handleRemoveFolder(path: string) {
     error = null;
     try {
-      await withTimeout(removeSharedFolder(path), 10000);
+      await removeSharedFolder(path);
       if (!mounted) return;
       if (filterFolder === path) filterFolder = null;
       await refresh();
@@ -116,7 +116,7 @@
     error = null;
     try {
       await reloadSharedFiles();
-      if (mounted) await refresh();
+      // Command returns instantly; updates come via events
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
     }

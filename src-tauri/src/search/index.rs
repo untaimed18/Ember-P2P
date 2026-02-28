@@ -28,10 +28,14 @@ impl LocalIndex {
         // (e.g. unhashed placeholder replaced by hashed version, or DB cache + rescan)
         if let Some(pos) = self.files.iter().position(|f| f.path == file.path) {
             let old = &self.files[pos];
-            // Only replace if the new entry is at least as good (has hash, or old has none)
             if !file.hash.is_empty() || old.hash.is_empty() {
+                // Remove old key from hash_map
+                let old_key = if old.hash.is_empty() { &old.id } else { &old.hash };
+                self.hash_map.remove(old_key);
+                // Insert new key
+                let new_key = if file.hash.is_empty() { file.id.clone() } else { file.hash.clone() };
+                self.hash_map.insert(new_key, pos);
                 self.files[pos] = file;
-                self.rebuild_indices();
             }
             return;
         }

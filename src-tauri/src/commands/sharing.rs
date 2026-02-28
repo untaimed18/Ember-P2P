@@ -8,9 +8,10 @@ use crate::sharing::indexer::FileIndexer;
 use crate::types::*;
 use tracing::info;
 
-/// eMule-style two-phase shared folder addition:
-///   Phase 1 (instant): discover files (metadata only) → show in UI immediately
-///   Phase 2 (background): hash files one at a time → update UI + publish to KAD
+/// eMule-style shared folder addition -- returns IMMEDIATELY.
+/// All discovery and hashing runs in a background task:
+///   Phase 1: discover files (metadata only) → show in UI via event
+///   Phase 2: hash files one at a time → update UI + publish to KAD
 #[tauri::command]
 pub async fn add_shared_folder(
     app: tauri::AppHandle,
@@ -32,47 +33,44 @@ pub async fn add_shared_folder(
 
     scanning.fetch_add(1, Ordering::Relaxed);
 
-    // Phase 1: instant file discovery (no hashing)
-    let discover_path = path.clone();
-    let discovered = match tokio::task::spawn_blocking(move || {
-        FileIndexer::discover_directory(&discover_path)
-    })
-    .await
-    {
-        Ok(files) => files,
-        Err(e) => {
-            tracing::error!("Discovery failed for {path}: {e}");
-            scanning.fetch_sub(1, Ordering::Relaxed);
-            return Err(format!("Discovery failed: {e}"));
-        }
-    };
-
-    let total_files = discovered.len();
-    info!("Discovered {total_files} files in {path}, starting background hashing");
-
-    // Add discovered (unhashed) files to the index immediately so the UI shows them
-    {
-        let mut index = local_index.write().await;
-        index.add_files(discovered.clone());
-    }
-
-    // Emit an event so the frontend knows files are available now
-    let _ = app.emit("shared-files-changed", serde_json::json!({
-        "folder": path,
-        "count": total_files,
-        "phase": "discovered",
-    }));
-
-    // Phase 2: hash files one at a time in the background (eMule style)
-    let app_clone = app.clone();
+    // Everything runs in background -- command returns immediately
     tokio::spawn(async move {
+        // Phase 1: instant file discovery (no hashing)
+        let discover_path = path.clone();
+        let discovered = match tokio::task::spawn_blocking(move || {
+            FileIndexer::discover_directory(&discover_path)
+        })
+        .await
+        {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::error!("Discovery failed for {path}: {e}");
+                scanning.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        let total_files = discovered.len();
+        info!("Discovered {total_files} files in {path}, starting background hashing");
+
+        {
+            let mut index = local_index.write().await;
+            index.add_files(discovered.clone());
+        }
+
+        let _ = app.emit("shared-files-changed", serde_json::json!({
+            "folder": path,
+            "count": total_files,
+            "phase": "discovered",
+        }));
+
+        // Phase 2: hash files one at a time (eMule style)
         let mut hashed_count: usize = 0;
 
         for file in &discovered {
             let file_path = file.path.clone();
             let file_temp_id = file.id.clone();
 
-            // Skip if already hashed (file was in the index from a previous session)
             {
                 let index = local_index.read().await;
                 let already_hashed = index.all_files().iter().any(|f| f.path == file.path && !f.hash.is_empty());
@@ -82,7 +80,7 @@ pub async fn add_shared_folder(
                 }
             }
 
-            let _ = app_clone.emit("file-hash-progress", serde_json::json!({
+            let _ = app.emit("file-hash-progress", serde_json::json!({
                 "current": hashed_count + 1,
                 "total": total_files,
                 "file_name": file.name,
@@ -100,14 +98,12 @@ pub async fn add_shared_folder(
                     updated_file.hash = ed2k_hash;
                     updated_file.aich_hash = aich_hash;
 
-                    // Replace the placeholder entry with the hashed version
                     {
                         let mut index = local_index.write().await;
                         index.remove_file_by_id(&file_temp_id);
                         index.add_file(updated_file.clone());
                     }
 
-                    // Persist to DB
                     let db_ref = db.clone();
                     let db_file = updated_file.clone();
                     let _ = tokio::task::spawn_blocking(move || {
@@ -115,14 +111,13 @@ pub async fn add_shared_folder(
                     })
                     .await;
 
-                    // Publish this file to KAD immediately
                     let _ = network_tx
                         .send(NetworkCommand::AnnounceFiles {
                             files: vec![updated_file.clone()],
                         })
                         .await;
 
-                    let _ = app_clone.emit("file-hashed", serde_json::json!({
+                    let _ = app.emit("file-hashed", serde_json::json!({
                         "temp_id": file_temp_id,
                         "hash": updated_file.hash,
                         "aich_hash": updated_file.aich_hash,
@@ -135,7 +130,6 @@ pub async fn add_shared_folder(
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("Failed to hash {}: {e}", file.name);
-                    // Remove the placeholder since we can't share this file
                     let mut index = local_index.write().await;
                     index.remove_file_by_id(&file_temp_id);
                 }
@@ -149,11 +143,9 @@ pub async fn add_shared_folder(
 
         let _ = network_tx.send(NetworkCommand::SharedFilesChanged).await;
         scanning.fetch_sub(1, Ordering::Relaxed);
-        info!(
-            "Background hashing complete: {hashed_count}/{total_files} files from {path}"
-        );
+        info!("Background hashing complete: {hashed_count}/{total_files} files from {path}");
 
-        let _ = app_clone.emit("file-hash-progress", serde_json::json!({
+        let _ = app.emit("file-hash-progress", serde_json::json!({
             "current": total_files,
             "total": total_files,
             "file_name": "",
@@ -190,26 +182,28 @@ pub async fn remove_shared_folder(
         index.remove_files_by_path_prefix(&path);
     }
 
-    // Batch DB deletes on a blocking thread
+    // DB + network cleanup in background -- don't block the command
     let db = state.db.clone();
-    let hashes = removed_hashes.clone();
-    tokio::task::spawn_blocking(move || {
-        for hash in &hashes {
-            let _ = db.remove_shared_file_by_hash(hash);
-        }
-    })
-    .await
-    .map_err(|e| format!("DB cleanup failed: {e}"))?;
-
-    if !removed_hashes.is_empty() {
-        let _ = state
-            .network_tx
-            .send(NetworkCommand::UnannounceFiles {
-                file_hashes: removed_hashes,
+    let network_tx = state.network_tx.clone();
+    tokio::spawn(async move {
+        let hashes = removed_hashes;
+        if !hashes.is_empty() {
+            let db_hashes = hashes.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                for hash in &db_hashes {
+                    let _ = db.remove_shared_file_by_hash(hash);
+                }
             })
             .await;
-        let _ = state.network_tx.send(NetworkCommand::SharedFilesChanged).await;
-    }
+
+            let _ = network_tx
+                .send(NetworkCommand::UnannounceFiles {
+                    file_hashes: hashes,
+                })
+                .await;
+        }
+        let _ = network_tx.send(NetworkCommand::SharedFilesChanged).await;
+    });
 
     Ok(())
 }
@@ -266,46 +260,44 @@ pub async fn reload_shared_files(
 
     scanning.fetch_add(1, Ordering::Relaxed);
 
-    // Phase 1: instant discovery across all folders
-    let discover_folders = folders.clone();
-    let discovered: Vec<FileInfo> = match tokio::task::spawn_blocking(move || {
-        let mut files = Vec::new();
-        for folder in &discover_folders {
-            files.extend(FileIndexer::discover_directory(folder));
-        }
-        files
-    })
-    .await
-    {
-        Ok(files) => files,
-        Err(e) => {
-            tracing::error!("Reload discovery failed: {e}");
-            scanning.fetch_sub(1, Ordering::Relaxed);
-            return Err(format!("Discovery failed: {e}"));
-        }
-    };
-
-    let total_files = discovered.len();
-    {
-        let mut index = local_index.write().await;
-        index.add_files(discovered.clone());
-    }
-
-    let _ = app.emit("shared-files-changed", serde_json::json!({
-        "phase": "discovered",
-        "count": total_files,
-    }));
-
-    // Phase 2: hash one at a time in background
-    let app_clone = app.clone();
+    // Everything runs in background -- command returns immediately
     tokio::spawn(async move {
+        // Phase 1: instant discovery across all folders
+        let discovered: Vec<FileInfo> = match tokio::task::spawn_blocking(move || {
+            let mut files = Vec::new();
+            for folder in &folders {
+                files.extend(FileIndexer::discover_directory(folder));
+            }
+            files
+        })
+        .await
+        {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::error!("Reload discovery failed: {e}");
+                scanning.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        let total_files = discovered.len();
+        {
+            let mut index = local_index.write().await;
+            index.add_files(discovered.clone());
+        }
+
+        let _ = app.emit("shared-files-changed", serde_json::json!({
+            "phase": "discovered",
+            "count": total_files,
+        }));
+
+        // Phase 2: hash one at a time
         let mut hashed_count: usize = 0;
 
         for file in &discovered {
             let file_path = file.path.clone();
             let file_temp_id = file.id.clone();
 
-            // Skip if this file already has a hash in the index (from DB cache or previous scan)
             {
                 let index = local_index.read().await;
                 let already_hashed = index.all_files().iter().any(|f| f.path == file.path && !f.hash.is_empty());
@@ -315,7 +307,7 @@ pub async fn reload_shared_files(
                 }
             }
 
-            let _ = app_clone.emit("file-hash-progress", serde_json::json!({
+            let _ = app.emit("file-hash-progress", serde_json::json!({
                 "current": hashed_count + 1,
                 "total": total_files,
                 "file_name": file.name,
@@ -373,7 +365,7 @@ pub async fn reload_shared_files(
         scanning.fetch_sub(1, Ordering::Relaxed);
         info!("Background reload hashing complete: {hashed_count}/{total_files} files");
 
-        let _ = app_clone.emit("file-hash-progress", serde_json::json!({
+        let _ = app.emit("file-hash-progress", serde_json::json!({
             "current": total_files,
             "total": total_files,
             "file_name": "",
