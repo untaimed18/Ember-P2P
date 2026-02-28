@@ -449,35 +449,40 @@
 
 <!-- Context menu -->
 {#if ctxMenu}
+  {@const fileHashed = !!ctxMenu.file.hash}
   <div class="ctx-menu" style="left:{ctxMenu.x}px;top:{ctxMenu.y}px;" role="menu">
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_file')}>Open File</button>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_folder')}>Open Folder</button>
     <div class="ctx-sep"></div>
-    <div
-      class="ctx-item ctx-sub-parent"
-      role="menuitem"
-      tabindex="0"
-      onmouseenter={() => ctxPrioritySub = true}
-      onmouseleave={() => ctxPrioritySub = false}
-      onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') ctxPrioritySub = true; }}
-    >
-      Priority &raquo;
-      {#if ctxPrioritySub}
-        <div class="ctx-submenu" role="menu">
-          <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'verylow'} onclick={() => ctxAction('priority', 'verylow')}>Very Low</button>
-          <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'low'} onclick={() => ctxAction('priority', 'low')}>Low</button>
-          <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'normal'} onclick={() => ctxAction('priority', 'normal')}>Normal</button>
-          <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'high'} onclick={() => ctxAction('priority', 'high')}>High</button>
-          <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'release'} onclick={() => ctxAction('priority', 'release')}>Release</button>
-          <div class="ctx-sep"></div>
-          <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'auto'} onclick={() => ctxAction('priority', 'auto')}>Auto</button>
-        </div>
-      {/if}
-    </div>
-    <div class="ctx-sep"></div>
-    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>Copy eD2k Link</button>
-    <div class="ctx-sep"></div>
-    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>Unshare</button>
+    {#if fileHashed}
+      <div
+        class="ctx-item ctx-sub-parent"
+        role="menuitem"
+        tabindex="0"
+        onmouseenter={() => ctxPrioritySub = true}
+        onmouseleave={() => ctxPrioritySub = false}
+        onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') ctxPrioritySub = true; }}
+      >
+        Priority &raquo;
+        {#if ctxPrioritySub}
+          <div class="ctx-submenu" role="menu">
+            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'verylow'} onclick={() => ctxAction('priority', 'verylow')}>Very Low</button>
+            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'low'} onclick={() => ctxAction('priority', 'low')}>Low</button>
+            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'normal'} onclick={() => ctxAction('priority', 'normal')}>Normal</button>
+            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'high'} onclick={() => ctxAction('priority', 'high')}>High</button>
+            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'release'} onclick={() => ctxAction('priority', 'release')}>Release</button>
+            <div class="ctx-sep"></div>
+            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'auto'} onclick={() => ctxAction('priority', 'auto')}>Auto</button>
+          </div>
+        {/if}
+      </div>
+      <div class="ctx-sep"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>Copy eD2k Link</button>
+      <div class="ctx-sep"></div>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>Unshare</button>
+    {:else}
+      <button class="ctx-item ctx-disabled" role="menuitem" disabled>Hashing in progress&hellip;</button>
+    {/if}
   </div>
 {/if}
 
@@ -712,6 +717,8 @@
   .ctx-sep { height: 1px; margin: 4px 0; background: var(--border); }
   .ctx-checked::before { content: '\2713  '; }
   .ctx-sub-parent { padding-right: 24px; }
+  .ctx-disabled { color: var(--text-muted); cursor: default; }
+  .ctx-disabled:hover { background: none; color: var(--text-muted); }
   .ctx-submenu {
     position: absolute;
     left: 100%;

@@ -72,6 +72,16 @@ pub async fn add_shared_folder(
             let file_path = file.path.clone();
             let file_temp_id = file.id.clone();
 
+            // Skip if already hashed (file was in the index from a previous session)
+            {
+                let index = local_index.read().await;
+                let already_hashed = index.all_files().iter().any(|f| f.path == file.path && !f.hash.is_empty());
+                if already_hashed {
+                    hashed_count += 1;
+                    continue;
+                }
+            }
+
             let _ = app_clone.emit("file-hash-progress", serde_json::json!({
                 "current": hashed_count + 1,
                 "total": total_files,
@@ -164,7 +174,7 @@ pub async fn remove_shared_folder(
         index
             .all_files()
             .iter()
-            .filter(|f| f.path.starts_with(&path))
+            .filter(|f| f.path.starts_with(&path) && !f.hash.is_empty())
             .map(|f| f.hash.clone())
             .collect()
     };
@@ -295,14 +305,13 @@ pub async fn reload_shared_files(
             let file_path = file.path.clone();
             let file_temp_id = file.id.clone();
 
-            // Skip if already hashed (exists in DB with same path)
+            // Skip if this file already has a hash in the index (from DB cache or previous scan)
             {
                 let index = local_index.read().await;
-                if let Some(existing) = index.all_files().iter().find(|f| f.path == file.path && !f.hash.is_empty()) {
-                    if existing.hash != file.hash {
-                        hashed_count += 1;
-                        continue;
-                    }
+                let already_hashed = index.all_files().iter().any(|f| f.path == file.path && !f.hash.is_empty());
+                if already_hashed {
+                    hashed_count += 1;
+                    continue;
                 }
             }
 
