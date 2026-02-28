@@ -81,6 +81,7 @@ pub fn build_hello(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickname
 }
 
 /// Build a HelloAnswer payload (no hash-size marker byte).
+#[allow(dead_code)]
 pub fn build_hello_answer(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickname: &str) -> Vec<u8> {
     build_hello_inner(user_hash, client_id, tcp_port, nickname, false, None)
 }

@@ -310,146 +310,109 @@ impl UploadHandler {
             }
         }
 
-        // For obfuscated connections, handle the port test directly using manual
-        // encryption to avoid Rc4Writer keystream desync issues.
-        let first_byte = match negotiation {
+        let (mut reader, mut writer, _hello_data, peer_user_hash) = match negotiation {
             NegotiationResult::Obfuscated { recv_key, mut send_key } => {
                 info!("Obfuscated connection from {peer_addr}");
                 let mut obf_reader = tokio::io::BufReader::new(Rc4Reader::new(raw_reader, recv_key));
 
-                // Wait for the first packet (Hello from server port test, or disconnect)
-                let probe_timeout = std::time::Duration::from_secs(3);
+                let probe_timeout = std::time::Duration::from_secs(15);
                 let first_pkt = tokio::time::timeout(probe_timeout, read_packet_async_inner(&mut obf_reader)).await;
 
                 match first_pkt {
-                    Ok(Ok((proto, opcode, payload))) => {
-                        info!("Obfuscated data from {peer_addr}: proto=0x{proto:02X} op=0x{opcode:02X} len={}", payload.len());
+                    Ok(Ok((proto, opcode, payload))) if proto == OP_EDONKEYHEADER && opcode == OP_HELLO => {
+                        let mut puh = [0u8; 16];
+                        if payload.len() >= 17 { puh.copy_from_slice(&payload[1..17]); }
 
-                        if proto == OP_EDONKEYHEADER && opcode == OP_HELLO {
-                            // Server sent Hello -- complete the FULL peer handshake:
-                            // 1. Send HelloAnswer
-                            // 2. Send EmuleInfo
-                            // 3. Read EmuleInfoAnswer (or whatever the peer sends next)
+                        let buddy = self.shared_buddy_info.read().await.clone();
+                        let hello_payload = build_hello_answer_with_buddy(&self.user_hash, 0, self.tcp_port, &self.nickname, buddy);
+                        let mut pkt = Vec::with_capacity(6 + hello_payload.len());
+                        pkt.push(OP_EDONKEYHEADER);
+                        pkt.extend_from_slice(&((1 + hello_payload.len()) as u32).to_le_bytes());
+                        pkt.push(OP_HELLOANSWER);
+                        pkt.extend_from_slice(&hello_payload);
+                        let mut enc = vec![0u8; pkt.len()];
+                        send_key.process(&pkt, &mut enc);
+                        raw_writer.write_all(&enc).await?;
+                        raw_writer.flush().await?;
 
-                            // Step 1: HelloAnswer (no hash-size marker, per eMule protocol)
-                            let hello_payload = build_hello_answer(&self.user_hash, 0, self.tcp_port, &self.nickname);
-                            let mut pkt = Vec::with_capacity(6 + hello_payload.len());
-                            pkt.push(OP_EDONKEYHEADER);
-                            pkt.extend_from_slice(&((1 + hello_payload.len()) as u32).to_le_bytes());
-                            pkt.push(OP_HELLOANSWER);
-                            pkt.extend_from_slice(&hello_payload);
+                        let emule_payload = build_emule_info(self.udp_port);
+                        let mut epkt = Vec::with_capacity(6 + emule_payload.len());
+                        epkt.push(OP_EMULEPROT);
+                        epkt.extend_from_slice(&((1 + emule_payload.len()) as u32).to_le_bytes());
+                        epkt.push(OP_EMULEINFOANSWER);
+                        epkt.extend_from_slice(&emule_payload);
+                        let mut eenc = vec![0u8; epkt.len()];
+                        send_key.process(&epkt, &mut eenc);
+                        raw_writer.write_all(&eenc).await?;
+                        raw_writer.flush().await?;
 
-                            let mut encrypted_pkt = vec![0u8; pkt.len()];
-                            send_key.process(&pkt, &mut encrypted_pkt);
-                            raw_writer.write_all(&encrypted_pkt).await?;
-                            raw_writer.flush().await?;
-                            info!("Obfuscated probe: sent HelloAnswer ({} bytes)", encrypted_pkt.len());
-
-                            // Step 2: EmuleInfo
-                            let emule_payload = build_emule_info(self.udp_port);
-                            let mut emule_pkt = Vec::with_capacity(6 + emule_payload.len());
-                            emule_pkt.push(OP_EMULEPROT);
-                            emule_pkt.extend_from_slice(&((1 + emule_payload.len()) as u32).to_le_bytes());
-                            emule_pkt.push(OP_EMULEINFO);
-                            emule_pkt.extend_from_slice(&emule_payload);
-
-                            let mut encrypted_emule = vec![0u8; emule_pkt.len()];
-                            send_key.process(&emule_pkt, &mut encrypted_emule);
-                            raw_writer.write_all(&encrypted_emule).await?;
-                            raw_writer.flush().await?;
-                            info!("Obfuscated probe: sent EmuleInfo ({} bytes)", encrypted_emule.len());
-
-                            // Step 3: Read the next packet(s) from the peer
-                            // (EmuleInfoAnswer, SecIdent, etc.) - just consume them
-                            for _ in 0..5 {
-                                match tokio::time::timeout(
-                                    std::time::Duration::from_secs(5),
-                                    read_packet_async_inner(&mut obf_reader),
-                                ).await {
-                                    Ok(Ok((p, o, _pl))) => {
-                                        info!("Obfuscated probe: received proto=0x{p:02X} op=0x{o:02X}");
-                                        if p == OP_EMULEPROT && o == OP_EMULEINFOANSWER {
-                                            info!("Obfuscated probe: EmuleInfo exchange complete with {peer_addr}");
-                                            break;
-                                        }
-                                    }
-                                    _ => break,
+                        // Consume peer's EmuleInfo/SecIdent packets
+                        for _ in 0..5 {
+                            match tokio::time::timeout(std::time::Duration::from_secs(5), read_packet_async_inner(&mut obf_reader)).await {
+                                Ok(Ok((p, o, _))) => {
+                                    if p == OP_EMULEPROT && o == OP_EMULEINFOANSWER { break; }
+                                    if p == OP_EMULEPROT && o == OP_EMULEINFO { break; }
                                 }
+                                _ => break,
                             }
-                        } else if proto == OP_EMULEPROT && opcode == OP_PORTTEST {
-                            // Standard port test -- reply with 0x12
-                            let mut pkt = Vec::with_capacity(8);
-                            pkt.push(OP_EMULEPROT);
-                            pkt.extend_from_slice(&2u32.to_le_bytes());
-                            pkt.push(OP_PORTTEST);
-                            pkt.push(0x12);
-
-                            let mut encrypted_pkt = vec![0u8; pkt.len()];
-                            send_key.process(&pkt, &mut encrypted_pkt);
-                            raw_writer.write_all(&encrypted_pkt).await?;
-                            raw_writer.flush().await?;
-                            info!("Obfuscated probe: sent PortTest reply to {peer_addr}");
-                        } else {
-                            info!("Non-Hello on obfuscated probe: proto=0x{proto:02X} op=0x{opcode:02X}");
                         }
+
+                        let obf_writer = tokio::io::BufWriter::new(Rc4Writer::new(raw_writer, send_key));
+                        (StreamReader::Obfuscated(obf_reader), StreamWriter::Obfuscated(obf_writer), payload, puh)
                     }
-                    Ok(Err(e)) if is_connection_closed(&e) => {
-                        info!("Obfuscated probe from {peer_addr} (disconnected after handshake)");
+                    Ok(Ok((proto, opcode, _))) if proto == OP_EMULEPROT && opcode == OP_PORTTEST => {
+                        let mut pkt = Vec::with_capacity(8);
+                        pkt.push(OP_EMULEPROT);
+                        pkt.extend_from_slice(&2u32.to_le_bytes());
+                        pkt.push(OP_PORTTEST);
+                        pkt.push(0x12);
+                        let mut enc = vec![0u8; pkt.len()];
+                        send_key.process(&pkt, &mut enc);
+                        raw_writer.write_all(&enc).await?;
+                        raw_writer.flush().await?;
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        return Ok(());
                     }
                     _ => {
-                        info!("Obfuscated probe from {peer_addr} (no data, port test)");
+                        return Ok(());
                     }
                 }
-                // Hold the connection alive so the server can process the port test
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                return Ok(());
             }
-            NegotiationResult::Plain { first_byte } => first_byte,
+            NegotiationResult::Plain { first_byte } => {
+                let mut rd = StreamReader::Plain(raw_reader);
+                let mut wr = StreamWriter::Plain(raw_writer);
+                let (proto, opcode, hd) = read_packet_with_first_byte(&mut rd, first_byte).await?;
+
+                if (proto == OP_EDONKEYHEADER || proto == OP_EMULEPROT) && opcode == OP_PORTTEST {
+                    debug!("Received TCP Port Test from {peer_addr}");
+                    let reply = [0x12u8];
+                    write_packet_async(&mut wr, proto, OP_PORTTEST, &reply).await?;
+                    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                    { let mut waiters = self.active_port_tests.lock().await; waiters.insert(peer_addr.ip(), tx); }
+                    let signal = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await;
+                    { let mut waiters = self.active_port_tests.lock().await; waiters.remove(&peer_addr.ip()); }
+                    if let Ok(Some(_)) = signal {
+                        write_packet_async(&mut wr, proto, OP_PORTTEST, &reply).await?;
+                    }
+                    return Ok(());
+                }
+
+                if proto != OP_EDONKEYHEADER || opcode != OP_HELLO {
+                    info!("Non-Hello packet from {peer_addr}: proto=0x{proto:02X} op=0x{opcode:02X}");
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    return Ok(());
+                }
+
+                let mut puh = [0u8; 16];
+                if hd.len() >= 17 { puh.copy_from_slice(&hd[1..17]); }
+                debug!("Got Hello from {peer_addr}");
+
+                let buddy = self.shared_buddy_info.read().await.clone();
+                let hello_payload = build_hello_answer_with_buddy(&self.user_hash, 0, self.tcp_port, &self.nickname, buddy);
+                write_packet_async(&mut wr, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_payload).await?;
+                (rd, wr, hd, puh)
+            }
         };
-
-        // --- Plain text path (normal peer connections) ---
-        let mut reader = StreamReader::Plain(raw_reader);
-        let mut writer = StreamWriter::Plain(raw_writer);
-        let (proto, opcode, hello_data) = read_packet_with_first_byte(&mut reader, first_byte).await?;
-
-        // Handle Port Test (Server connection check)
-        if (proto == OP_EDONKEYHEADER || proto == OP_EMULEPROT) && opcode == OP_PORTTEST {
-            debug!("Received TCP Port Test from {peer_addr}");
-            let reply = [0x12u8];
-            write_packet_async(&mut writer, proto, OP_PORTTEST, &reply).await?;
-
-            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-            {
-                let mut waiters = self.active_port_tests.lock().await;
-                waiters.insert(peer_addr.ip(), tx);
-            }
-            let signal = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await;
-            {
-                let mut waiters = self.active_port_tests.lock().await;
-                waiters.remove(&peer_addr.ip());
-            }
-            if let Ok(Some(_)) = signal {
-                debug!("Received UDP Port Test confirmation for {peer_addr}");
-                write_packet_async(&mut writer, proto, OP_PORTTEST, &reply).await?;
-            }
-            return Ok(());
-        }
-
-        if proto != OP_EDONKEYHEADER || opcode != OP_HELLO {
-            info!("Non-Hello packet from {peer_addr}: proto=0x{proto:02X} op=0x{opcode:02X}, treating as probe");
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            return Ok(());
-        }
-        let mut peer_user_hash = [0u8; 16];
-        if hello_data.len() >= 17 {
-            peer_user_hash.copy_from_slice(&hello_data[1..17]);
-        }
-        debug!("Got Hello from {peer_addr}");
-
-        // Send HelloAnswer including buddy info if we have a buddy (eMule CT_EMULE_BUDDYIP/UDP)
-        let buddy = self.shared_buddy_info.read().await.clone();
-        let hello_payload = build_hello_answer_with_buddy(&self.user_hash, 0, self.tcp_port, &self.nickname, buddy);
-        write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_payload).await?;
 
         // Check if this is an incoming buddy connection
         {
@@ -748,7 +711,7 @@ impl UploadHandler {
                         continue;
                     }
 
-                    // Accept the upload
+                    // Accept the upload (guard against duplicate OP_STARTUPLOADREQ)
                     write_packet_async(
                         &mut writer,
                         OP_EDONKEYHEADER,
@@ -757,8 +720,10 @@ impl UploadHandler {
                     )
                     .await?;
 
-                    self.active_count
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !upload_slot_active {
+                        self.active_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     upload_slot_active = true;
                     uploaded = 0;
                     session_start = Some(std::time::Instant::now());
@@ -854,20 +819,17 @@ impl UploadHandler {
                         }
 
                         // Check if the upload was cancelled by the user
-                        // (TransferManager::cancel removes the transfer from active)
                         if let Some(tid) = &transfer_id {
                             let mgr = self.transfer_manager.read().await;
                             let cancelled = !mgr.active.contains_key(tid);
                             drop(mgr);
                             if cancelled {
                                 info!("Upload {tid} cancelled by user, aborting");
-                                self.active_count
-                                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                 return Ok(());
                             }
                         }
 
-                        let len = (end - start) as usize;
+                        let len = ((end - start) as usize).min(PARTSIZE as usize);
 
                         let read_result = {
                             let fp = file_path.clone();
@@ -1219,7 +1181,13 @@ impl UploadHandler {
             queue.retain(|e| e.addr != peer_addr);
         }
 
-        // Cleanup: emit completion/failure for any tracked upload
+        // Always release the upload slot if we activated one
+        if upload_slot_active {
+            self.active_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Emit completion/failure for any tracked upload
         if let Some(tid) = &transfer_id {
             let _ = self.upload_event_tx.send(UploadEvent {
                 transfer_id: tid.clone(),
@@ -1231,11 +1199,6 @@ impl UploadHandler {
                     }
                 },
             }).await;
-
-            if upload_slot_active {
-                self.active_count
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            }
         }
 
         Ok(())

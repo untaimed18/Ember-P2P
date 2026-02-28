@@ -1248,9 +1248,12 @@ pub async fn start_network(
                                         shared_buddy_info: Some(state.shared_buddy_info.clone()),
                                     };
                                     let tx = dl_event_tx.clone();
+                                    let tid = download.transfer_id.clone();
+                                    let tx2 = tx.clone();
                                     tokio::spawn(async move {
                                         if let Err(e) = download.run(tx).await {
                                             error!("Download failed: {e}");
+                                            let _ = tx2.send(DownloadEvent::Failed { transfer_id: tid, error: e.to_string() }).await;
                                         }
                                     });
                                 } else {
@@ -1292,9 +1295,12 @@ pub async fn start_network(
                                         shared_buddy_info: Some(state.shared_buddy_info.clone()),
                                     };
                                     let tx = dl_event_tx.clone();
+                                    let tid = ms_download.transfer_id.clone();
+                                    let tx2 = tx.clone();
                                     tokio::spawn(async move {
                                         if let Err(e) = ms_download.run(tx).await {
                                             error!("Multi-source download failed: {e}");
+                                            let _ = tx2.send(DownloadEvent::Failed { transfer_id: tid, error: e.to_string() }).await;
                                         }
                                     });
                                 }
@@ -1951,6 +1957,8 @@ pub async fn start_network(
                         warn!("Giving up source search for {tid} after {} attempts", pending.search_count);
                         let mut mgr = transfer_manager.write().await;
                         mgr.update_status(tid, TransferStatus::Failed);
+                        mgr.fail(tid, "No sources found after multiple search attempts");
+                        let _ = db.update_transfer_status(tid, "failed");
                         let _ = app_handle.emit("transfer-status", serde_json::json!({
                             "id": tid,
                             "status": "failed",
@@ -1961,6 +1969,9 @@ pub async fn start_network(
 
                 for tid in to_retry {
                     if let Some(pd) = state.pending_downloads.get_mut(&tid) {
+                        pd.search_count += 1;
+                        pd.last_search_at = now;
+
                         let hash_bytes = match hex::decode(&pd.file_hash) {
                             Ok(b) if b.len() == 16 => b,
                             _ => continue,
@@ -1968,11 +1979,9 @@ pub async fn start_network(
                         let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
                         let closest = state.routing_table.find_closest(&kad_hash, SEARCH_INITIAL_CONTACTS);
                         if closest.is_empty() {
+                            debug!("Routing table empty for retry of {tid}, will try again later");
                             continue;
                         }
-
-                        pd.search_count += 1;
-                        pd.last_search_at = now;
                         info!(
                             "Retrying source search for {} (attempt {})",
                             tid, pd.search_count
@@ -2425,40 +2434,48 @@ pub async fn start_network(
                         let cm = credit_manager.clone();
                         let dl_tx = dl_event_tx.clone();
 
-                        if let Some(pd) = state.pending_downloads.values().find(|pd| {
-                            hex::decode(&pd.file_hash).ok()
-                                .filter(|b| b.len() == 16 && b[..] == file_hash[..])
-                                .is_some()
-                        }) {
-                            let transfer_id = pd.transfer_id.clone();
-                            let file_name = pd.file_name.clone();
-                            let file_size = pd.file_size;
-                            let control = pd.control.clone();
-                            let source_addr = SocketAddr::new(dest_ip.into(), dest_port);
-                            let udp_port = state.udp_port;
-                            info!("Starting callback download {transfer_id} to {source_addr}");
-                            let download = ed2k::transfer::Ed2kDownload {
-                                transfer_id,
-                                file_hash,
-                                file_name,
-                                file_size,
-                                source_addr,
-                                download_dir: PathBuf::from(&dl_folder),
-                                user_hash,
-                                nickname,
-                                tcp_port,
-                                udp_port,
-                                bandwidth_limiter: bw,
-                                control,
-                                source_manager: Some(sm),
-                                credit_manager: Some(cm),
-                                shared_buddy_info: Some(state.shared_buddy_info.clone()),
-                            };
-                            tokio::spawn(async move {
-                                if let Err(e) = download.run(dl_tx).await {
-                                    warn!("Callback download failed: {e}");
-                                }
-                            });
+                        let matching_tid = state.pending_downloads.iter()
+                            .find(|(_, pd)| {
+                                hex::decode(&pd.file_hash).ok()
+                                    .filter(|b| b.len() == 16 && b[..] == file_hash[..])
+                                    .is_some()
+                            })
+                            .map(|(tid, _)| tid.clone());
+
+                        if let Some(tid) = matching_tid {
+                            if let Some(pd) = state.pending_downloads.remove(&tid) {
+                                let transfer_id = pd.transfer_id.clone();
+                                let file_name = pd.file_name;
+                                let file_size = pd.file_size;
+                                let control = pd.control;
+                                let source_addr = SocketAddr::new(dest_ip.into(), dest_port);
+                                let udp_port = state.udp_port;
+                                info!("Starting callback download {transfer_id} to {source_addr}");
+                                let download = ed2k::transfer::Ed2kDownload {
+                                    transfer_id: transfer_id.clone(),
+                                    file_hash,
+                                    file_name,
+                                    file_size,
+                                    source_addr,
+                                    download_dir: PathBuf::from(&dl_folder),
+                                    user_hash,
+                                    nickname,
+                                    tcp_port,
+                                    udp_port,
+                                    bandwidth_limiter: bw,
+                                    control,
+                                    source_manager: Some(sm),
+                                    credit_manager: Some(cm),
+                                    shared_buddy_info: Some(state.shared_buddy_info.clone()),
+                                };
+                                let dl_tx2 = dl_tx.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = download.run(dl_tx).await {
+                                        warn!("Callback download failed: {e}");
+                                        let _ = dl_tx2.send(DownloadEvent::Failed { transfer_id, error: e.to_string() }).await;
+                                    }
+                                });
+                            }
                         } else {
                             debug!("No pending download for callback file hash {}", hex::encode(file_hash));
                         }
@@ -4142,9 +4159,12 @@ async fn handle_command(
                 };
 
                 let tx = dl_event_tx.clone();
+                let tid = download.transfer_id.clone();
+                let tx2 = tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = download.run(tx).await {
                         error!("Download failed: {e}");
+                        let _ = tx2.send(DownloadEvent::Failed { transfer_id: tid, error: e.to_string() }).await;
                     }
                 });
             } else {

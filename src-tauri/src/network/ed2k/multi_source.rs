@@ -85,7 +85,7 @@ impl MultiSourceDownload {
                 tcp_port: self.tcp_port,
                 udp_port: self.udp_port,
                 bandwidth_limiter: self.bandwidth_limiter.clone(),
-                control: TransferControl::new(),
+                control: self.control.clone(),
                 source_manager: self.source_manager.clone(),
                 credit_manager: self.credit_manager.clone(),
                 shared_buddy_info: self.shared_buddy_info.clone(),
@@ -573,10 +573,6 @@ impl MultiSourceDownload {
 
             let safe_name = crate::security::sanitize_filename(&self.file_name);
             let final_path = self.download_dir.join(&safe_name);
-            {
-                let t = tracker.read().await;
-                t.delete_met();
-            }
             if let Err(e) = std::fs::rename(&part_path, &final_path) {
                 if is_cross_device_error(&e) {
                     std::fs::copy(&part_path, &final_path)?;
@@ -584,6 +580,11 @@ impl MultiSourceDownload {
                 } else {
                     return Err(e.into());
                 }
+            }
+            // Delete .part.met only after rename succeeds to preserve resume data on failure
+            {
+                let t = tracker.read().await;
+                t.delete_met();
             }
 
             // Verify final file hash (eMule-style: must match or download fails)
@@ -618,6 +619,8 @@ impl MultiSourceDownload {
                     })
                     .await;
             } else {
+                // Delete corrupt file from download directory
+                let _ = std::fs::remove_file(&final_path);
                 let _ = event_tx
                     .send(DownloadEvent::Failed {
                         transfer_id: self.transfer_id.clone(),
@@ -964,6 +967,10 @@ async fn download_parts_from_source(
                         parse_sending_part_32(&payload)?
                     };
 
+                    if start >= end || end > _file_size || data.len() != (end - start) as usize {
+                        tracing::warn!("Invalid block offsets from source {_src_idx}: start={start}, end={end}, data={}", data.len());
+                        continue;
+                    }
                     let piece_len = end - start;
                     bw.acquire_download(piece_len).await;
 
@@ -1003,6 +1010,10 @@ async fn download_parts_from_source(
                     }
 
                     let piece_len = decompressed.len() as u64;
+                    if start + piece_len > _file_size {
+                        tracing::warn!("Compressed block exceeds file size from source {_src_idx}");
+                        continue;
+                    }
                     bw.acquire_download(piece_len).await;
 
                     output.seek(std::io::SeekFrom::Start(start))?;
@@ -1057,6 +1068,9 @@ async fn download_parts_from_source(
                 speed_start = std::time::Instant::now();
             }
         }
+
+        // Flush writes before reading back for verification
+        output.flush()?;
 
         // Verify part hash before marking complete
         let hash_ok = {

@@ -615,6 +615,10 @@ impl Ed2kDownload {
                                     parse_sending_part_32(&payload)?
                                 };
 
+                            if start >= end || end > self.file_size || data.len() != (end - start) as usize {
+                                warn!("Invalid block offsets: start={start}, end={end}, data_len={}, file_size={}", data.len(), self.file_size);
+                                continue;
+                            }
                             let piece_len = end - start;
                             self.acquire_download_bandwidth(piece_len).await;
 
@@ -663,6 +667,10 @@ impl Ed2kDownload {
                             }
 
                             let piece_len = decompressed.len() as u64;
+                            if start + piece_len > self.file_size {
+                                warn!("Compressed block exceeds file size: start={start}, len={piece_len}, file_size={}", self.file_size);
+                                continue;
+                            }
                             self.acquire_download_bandwidth(piece_len).await;
 
                             output.seek(std::io::SeekFrom::Start(start))?;
