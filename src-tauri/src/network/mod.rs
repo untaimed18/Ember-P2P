@@ -76,10 +76,19 @@ async fn try_connect_server(ip: &str, port: u16, obf_port: u16) -> anyhow::Resul
     Ed2kServerConnection::connect(addr).await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchMethod {
+    Global,
+    Server,
+    Kad,
+}
+
 #[derive(Debug)]
 pub enum NetworkCommand {
     SearchFiles {
         query: String,
+        method: SearchMethod,
         tx: oneshot::Sender<Vec<SearchResult>>,
     },
     StartDownload {
@@ -3615,66 +3624,75 @@ async fn handle_command(
     server_udp: &ServerUdpSocket,
 ) {
     match cmd {
-        NetworkCommand::SearchFiles { query, tx } => {
+        NetworkCommand::SearchFiles { query, method, tx } => {
+            let use_server = method == SearchMethod::Global || method == SearchMethod::Server;
+            let use_kad = method == SearchMethod::Global || method == SearchMethod::Kad;
+
             let index = local_index.read().await;
             let mut local_results = index.search(&query);
 
-            // Also search connected ed2k server for additional results
-            if state.server_connected {
-                if let Some(conn) = &mut state.server_connection {
-                    match conn.search(&query).await {
-                        Ok(server_results) => {
-                            let count = server_results.len();
-                            for sr in server_results {
-                                let hash_hex = hex::encode(sr.file_hash);
-                                if !local_results.iter().any(|r| r.file.hash == hash_hex) {
-                                    local_results.push(SearchResult {
-                                        file: FileInfo {
-                                            id: hash_hex.clone(),
-                                            name: sr.file_name.clone(),
-                                            path: String::new(),
-                                            size: sr.file_size,
-                                            hash: hash_hex,
-                                            aich_hash: String::new(),
-                                            extension: String::new(),
-                                            modified_at: 0,
-                                            priority: "normal".to_string(),
-                                            requests: 0,
-                                            accepted: 0,
-                                            bytes_transferred: 0,
-                                            complete_sources: sr.complete_source_count,
-                                            folder: String::new(),
-                                            shared_kad: false,
-                                        },
-                                        peer_id: String::new(),
-                                        peer_name: String::new(),
-                                        availability: sr.source_count,
-                                        file_type: String::new(),
-                                        source_addresses: Vec::new(),
-                                        rating: None,
-                                        comment: None,
-                                    });
+            if use_server {
+                if state.server_connected {
+                    if let Some(conn) = &mut state.server_connection {
+                        match conn.search(&query).await {
+                            Ok(server_results) => {
+                                let count = server_results.len();
+                                for sr in server_results {
+                                    let hash_hex = hex::encode(sr.file_hash);
+                                    if !local_results.iter().any(|r| r.file.hash == hash_hex) {
+                                        local_results.push(SearchResult {
+                                            file: FileInfo {
+                                                id: hash_hex.clone(),
+                                                name: sr.file_name.clone(),
+                                                path: String::new(),
+                                                size: sr.file_size,
+                                                hash: hash_hex,
+                                                aich_hash: String::new(),
+                                                extension: String::new(),
+                                                modified_at: 0,
+                                                priority: "normal".to_string(),
+                                                requests: 0,
+                                                accepted: 0,
+                                                bytes_transferred: 0,
+                                                complete_sources: sr.complete_source_count,
+                                                folder: String::new(),
+                                                shared_kad: false,
+                                            },
+                                            peer_id: String::new(),
+                                            peer_name: String::new(),
+                                            availability: sr.source_count,
+                                            file_type: String::new(),
+                                            source_addresses: Vec::new(),
+                                            rating: None,
+                                            comment: None,
+                                        });
+                                    }
                                 }
+                                info!("Merged {count} server search results");
+                                stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::Server, 256);
                             }
-                            info!("Merged {count} server search results");
-                            stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::Server, 256);
+                            Err(e) => {
+                                debug!("Server search failed: {e}");
+                            }
                         }
-                        Err(e) => {
-                            debug!("Server search failed: {e}");
-                        }
+                    }
+                }
+
+                {
+                    let mut search_expr = Vec::new();
+                    search_expr.push(0x01u8);
+                    search_expr.extend_from_slice(&(query.len() as u16).to_le_bytes());
+                    search_expr.extend_from_slice(query.as_bytes());
+                    for srv in state.server_list.servers() {
+                        let _ = server_udp.send_global_search(srv, &search_expr).await;
                     }
                 }
             }
 
-            // Send UDP global search to all servers in the list for broader results
-            {
-                let mut search_expr = Vec::new();
-                search_expr.push(0x01u8); // string search type
-                search_expr.extend_from_slice(&(query.len() as u16).to_le_bytes());
-                search_expr.extend_from_slice(query.as_bytes());
-                for srv in state.server_list.servers() {
-                    let _ = server_udp.send_global_search(srv, &search_expr).await;
-                }
+            if !use_kad {
+                let _ = tx.send(local_results);
+                app_handle.emit("search-complete", ()).ok();
+                return;
             }
 
             let keywords = kad::publish::extract_keywords(&query);
@@ -3683,8 +3701,6 @@ async fn handle_command(
                 return;
             }
 
-            // eMule PrepareFindKeywords: use the FIRST keyword as the primary search target.
-            // The remaining keywords are used for filtering results on the searcher side.
             let primary_keyword = &keywords[0];
             let keyword_hash = kad::publish::keyword_to_kad_id(primary_keyword);
             info!("Searching KAD for keyword '{}' -> hash {}", primary_keyword, keyword_hash);

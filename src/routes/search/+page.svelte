@@ -1,9 +1,11 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles, parseEd2kLink, findNotes, publishNote } from '$lib/api/search';
+  import { searchFiles, parseEd2kLink, findNotes, publishNote, type SearchMethod } from '$lib/api/search';
   import { startDownload } from '$lib/api/transfers';
   import { searchResults, searchQuery, isSearching, searchProgress, newSearchNonce } from '$lib/stores/search';
   import type { SearchResult } from '$lib/types';
+
+  let searchMethod: SearchMethod = $state('global');
 
   let ed2kInput = $state('');
   let ed2kError = $state('');
@@ -134,7 +136,7 @@
       }
     }, 90_000);
     try {
-      const results = await searchFiles(query);
+      const results = await searchFiles(query, searchMethod);
       if (results && results.length > 0) {
         $searchResults = results;
       }
@@ -260,6 +262,26 @@
     placeholder="Search files across the network..."
     onsubmit={handleSearch}
   />
+  <div class="method-selector">
+    <button
+      class="method-btn"
+      class:active={searchMethod === 'global'}
+      onclick={() => searchMethod = 'global'}
+      title="Search all sources (Server + KAD)"
+    >Global</button>
+    <button
+      class="method-btn"
+      class:active={searchMethod === 'server'}
+      onclick={() => searchMethod = 'server'}
+      title="Search connected ed2k servers only"
+    >Server</button>
+    <button
+      class="method-btn"
+      class:active={searchMethod === 'kad'}
+      onclick={() => searchMethod = 'kad'}
+      title="Search KAD network only"
+    >KAD</button>
+  </div>
   <button onclick={() => handleSearch($searchQuery)} disabled={$isSearching}>
     {$isSearching ? 'Searching...' : 'Search'}
   </button>
@@ -508,6 +530,46 @@
 
   .search-area :global(.search-bar) {
     flex: 1;
+  }
+
+  .method-selector {
+    display: flex;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .method-btn {
+    padding: 6px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    border: none;
+    border-radius: 0;
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    border-right: 1px solid var(--border);
+  }
+
+  .method-btn:last-child {
+    border-right: none;
+  }
+
+  .method-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .method-btn.active {
+    background: var(--accent);
+    color: #fff;
+  }
+
+  [data-theme="dark"] .method-btn.active {
+    background: var(--accent-dim);
+    color: var(--text-primary);
   }
 
   .ed2k-bar {

@@ -2,7 +2,7 @@
   import { getStatistics, type TransferStats } from '$lib/api/statistics';
   import { onMount, onDestroy } from 'svelte';
 
-  let stats: TransferStats | null = $state(null);
+  let stats = $state<TransferStats | null>(null);
   let loading = $state(true);
   let error: string | null = $state(null);
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
@@ -34,10 +34,11 @@
 
   async function loadStats() {
     try {
-      stats = await Promise.race([
+      const result: TransferStats = await Promise.race([
         getStatistics(),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 4000)),
+        new Promise<TransferStats>((_, reject) => setTimeout(() => reject(new Error('timeout')), 4000)),
       ]);
+      stats = result;
       error = null;
     } catch (e) {
       if (stats === null) error = String(e);

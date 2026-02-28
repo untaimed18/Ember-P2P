@@ -1,7 +1,7 @@
 use tokio::sync::oneshot;
 
 use crate::app_state::AppState;
-use crate::network::NetworkCommand;
+use crate::network::{NetworkCommand, SearchMethod};
 use crate::network::ed2k::hash;
 use crate::network::kad::publish::md4_bytes_to_kad_id;
 use crate::types::SearchResult;
@@ -12,12 +12,17 @@ const SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 pub async fn search_files(
     state: tauri::State<'_, AppState>,
     query: String,
+    method: Option<SearchMethod>,
 ) -> Result<Vec<SearchResult>, String> {
     let (tx, rx) = oneshot::channel();
 
     state
         .network_tx
-        .try_send(NetworkCommand::SearchFiles { query, tx })
+        .try_send(NetworkCommand::SearchFiles {
+            query,
+            method: method.unwrap_or(SearchMethod::Global),
+            tx,
+        })
         .map_err(|e| format!("Network busy: {e}"))?;
 
     tokio::time::timeout(SEARCH_TIMEOUT, rx)

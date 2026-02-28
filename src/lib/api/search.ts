@@ -1,8 +1,10 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { SearchResult } from '$lib/types';
 
-export async function searchFiles(query: string): Promise<SearchResult[]> {
-  return invoke('search_files', { query });
+export type SearchMethod = 'global' | 'server' | 'kad';
+
+export async function searchFiles(query: string, method: SearchMethod = 'global'): Promise<SearchResult[]> {
+  return invoke('search_files', { query, method });
 }
 
 export async function formatEd2kLink(name: string, size: number, fileHash: string): Promise<string> {
