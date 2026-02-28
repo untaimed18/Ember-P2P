@@ -4567,13 +4567,33 @@ async fn handle_command(
             }
 
             // Always send firewall check probes on connect (like eMule)
-            let fw_contacts: Vec<KadContact> = state.routing_table.all_contacts().take(3).cloned().collect();
+            state.firewall_checker.start_check();
+            let fw_contacts: Vec<KadContact> = state.routing_table.all_contacts()
+                .filter(|c| c.verified)
+                .take(4)
+                .cloned()
+                .collect();
             for contact in &fw_contacts {
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                 let msg = KadMessage::FirewalledReq { tcp_port: state.tcp_port };
                 if let Ok(packet) = messages::encode_packet(&msg) {
                     let _ = socket.send_to(&packet, addr).await;
                     state.firewall_checks_sent += 1;
+                    state.firewall_checker.record_tcp_request_sent();
+                }
+            }
+            let udp_contacts: Vec<KadContact> = state.routing_table.all_contacts()
+                .filter(|c| c.verified)
+                .skip(4)
+                .take(4)
+                .cloned()
+                .collect();
+            for contact in &udp_contacts {
+                let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                let msg = KadMessage::Ping;
+                if let Ok(packet) = messages::encode_packet(&msg) {
+                    let _ = socket.send_to(&packet, addr).await;
+                    state.firewall_checker.record_udp_request_sent();
                 }
             }
         }
