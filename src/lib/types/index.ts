@@ -11,6 +11,9 @@ export interface FileInfo {
   requests: number;
   accepted: number;
   bytes_transferred: number;
+  alltime_requests: number;
+  alltime_accepted: number;
+  alltime_transferred: number;
   complete_sources: number;
   folder: string;
   shared_kad: boolean;

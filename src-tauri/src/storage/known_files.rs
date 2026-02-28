@@ -298,6 +298,10 @@ impl KnownFileList {
     pub fn file_count(&self) -> usize {
         self.files.len()
     }
+
+    pub fn all_records(&self) -> impl Iterator<Item = &KnownFileRecord> {
+        self.files.values()
+    }
 }
 
 fn write_string_tag(buf: &mut Vec<u8>, name_id: u8, value: &str) -> anyhow::Result<()> {

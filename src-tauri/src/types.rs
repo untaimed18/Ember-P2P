@@ -25,6 +25,15 @@ pub struct FileInfo {
     /// Bytes uploaded for this file this session
     #[serde(default)]
     pub bytes_transferred: u64,
+    /// All-time requests (from known.met)
+    #[serde(default)]
+    pub alltime_requests: u32,
+    /// All-time accepted requests (from known.met)
+    #[serde(default)]
+    pub alltime_accepted: u32,
+    /// All-time bytes uploaded for this file (from known.met)
+    #[serde(default)]
+    pub alltime_transferred: u64,
     /// Number of known complete sources
     #[serde(default)]
     pub complete_sources: u32,

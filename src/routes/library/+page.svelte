@@ -186,6 +186,13 @@
     return ext ? ext.toUpperCase() : '\u2014';
   }
 
+  function formatTransferred(session: number, alltime: number): string {
+    if (session === 0 && alltime === 0) return '\u2014';
+    const s = session > 0 ? formatSize(session) : '0';
+    if (alltime > 0 && alltime !== session) return `${s} (${formatSize(alltime)})`;
+    return s;
+  }
+
   function priorityLabel(p: string): string {
     switch (p) {
       case 'verylow': return 'Very Low';
@@ -244,7 +251,7 @@
     };
     const onUp = () => {
       if (mounted) sidebarDragging = false;
-      localStorage.setItem('sharing-sidebar-w', String(sidebarWidth));
+      localStorage.setItem('library-sidebar-w', String(sidebarWidth));
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
       dragCleanup = null;
@@ -259,7 +266,7 @@
 
   onMount(() => {
     mounted = true;
-    const saved = localStorage.getItem('sharing-sidebar-w');
+    const saved = localStorage.getItem('library-sidebar-w');
     if (saved) {
       const val = parseInt(saved);
       if (!isNaN(val)) sidebarWidth = Math.max(120, Math.min(400, val));
@@ -279,7 +286,7 @@
 <svelte:document onclick={onDocClick} />
 
 <div class="page-header">
-  <h2>Shared Files</h2>
+  <h2>Library</h2>
   <div class="header-actions">
     <button onclick={handleReload} disabled={loading}>Reload</button>
     <button onclick={handleAddFolder} disabled={loading}>+ Add Folder</button>
@@ -358,6 +365,7 @@
               <th class="col-size sortable" onclick={() => toggleSort('bytes_transferred')}>Transferred{arrow('bytes_transferred')}</th>
               <th class="col-folder sortable" onclick={() => toggleSort('folder')}>Folder{arrow('folder')}</th>
               <th class="col-num sortable" onclick={() => toggleSort('complete_sources')}>Complete Src.{arrow('complete_sources')}</th>
+              <th class="col-shared">Shared</th>
             </tr>
           </thead>
           <tbody>
@@ -372,11 +380,12 @@
                 <td class="col-type">{fileType(file.extension)}</td>
                 <td class="col-prio prio-{file.priority}">{priorityLabel(file.priority)}</td>
                 <td class="col-hash" title={file.hash}>{file.hash.substring(0, 16)}&hellip;</td>
-                <td class="col-num">{file.requests}</td>
-                <td class="col-num">{file.accepted}</td>
-                <td class="col-size">{file.bytes_transferred > 0 ? formatSize(file.bytes_transferred) : '\u2014'}</td>
+                <td class="col-num">{file.requests}{file.alltime_requests ? ` (${file.alltime_requests})` : ''}</td>
+                <td class="col-num">{file.accepted}{file.alltime_accepted ? ` (${file.alltime_accepted})` : ''}</td>
+                <td class="col-size">{formatTransferred(file.bytes_transferred, file.alltime_transferred)}</td>
                 <td class="col-folder" title={file.folder}>{file.folder.split(/[\\/]/).filter(Boolean).pop() || file.folder}</td>
-                <td class="col-num">{file.complete_sources}</td>
+                <td class="col-num">{file.complete_sources || '\u2014'}</td>
+                <td class="col-shared">{file.shared_kad ? 'eD2K | Kad' : 'eD2K'}</td>
               </tr>
             {/each}
           </tbody>
@@ -578,6 +587,7 @@
   .col-hash { min-width: 140px; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
   .col-num { text-align: right; min-width: 60px; }
   .col-folder { max-width: 200px; color: var(--text-muted); }
+  .col-shared { min-width: 80px; color: var(--text-secondary); white-space: nowrap; }
 
   /* Priority colors */
   .prio-verylow { color: #888; }

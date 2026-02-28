@@ -2138,6 +2138,9 @@ pub async fn start_network(
                                                 requests: 0,
                                                 accepted: 0,
                                                 bytes_transferred: 0,
+                                                alltime_requests: 0,
+                                                alltime_accepted: 0,
+                                                alltime_transferred: 0,
                                                 complete_sources: sr.complete_source_count,
                                                 folder: String::new(),
                                                 shared_kad: false,
@@ -2305,6 +2308,9 @@ pub async fn start_network(
                                             requests: 0,
                                             accepted: 0,
                                             bytes_transferred: 0,
+                                            alltime_requests: 0,
+                                            alltime_accepted: 0,
+                                            alltime_transferred: 0,
                                             complete_sources: 0,
                                             folder: String::new(),
                                             shared_kad: false,
@@ -2672,6 +2678,22 @@ pub async fn start_network(
                 });
 
                 let cached_tstats = stats_manager.get_stats();
+
+                // Merge all-time stats from known.met into local_index for frontend display
+                {
+                    let mut index = local_index.write().await;
+                    for record in known_files.all_records() {
+                        let hash_hex = hex::encode(record.file_hash);
+                        index.update_file_stats(
+                            &hash_hex,
+                            0, 0, 0,
+                            record.all_time_requested,
+                            record.all_time_accepted,
+                            record.all_time_transferred,
+                            0,
+                        );
+                    }
+                }
 
                 // Spawn ALL heavy work (hex conversion, distance computation, writes)
                 // as a background task so the event loop isn't blocked.
@@ -5365,6 +5387,9 @@ fn convert_search_results(
                         requests: 0,
                         accepted: 0,
                         bytes_transferred: 0,
+                        alltime_requests: 0,
+                        alltime_accepted: 0,
+                        alltime_transferred: 0,
                         complete_sources: 0,
                         folder: String::new(),
                         shared_kad: false,
