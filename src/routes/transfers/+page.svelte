@@ -2,13 +2,13 @@
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import { transfers, startTransferPoll } from '$lib/stores/transfers';
   import {
-    pauseTransfer, resumeTransfer, cancelTransfer, removeTransfer,
+    pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
     clearCompleted, setTransferPriority, pauseAllTransfers, resumeAllTransfers,
-    getTransferSources,
+    getTransferSources, openFile,
   } from '$lib/api/transfers';
   import { findSources } from '$lib/api/search';
   import { previewFile } from '$lib/api/preview';
-  import { formatSize, formatSpeed, formatEta, formatDate } from '$lib/utils';
+  import { formatSize, formatSpeed, formatDate, formatDuration, formatRemaining } from '$lib/utils';
   import { onMount, onDestroy } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import type { UnlistenFn } from '@tauri-apps/api/event';
@@ -23,7 +23,6 @@
       queue_rank?: number; speed: number; transferred: number; client_software: string;
     }>('transfer-source-detail', (event) => {
       const d = event.payload;
-      // Update queue rank on the main transfer row
       if (d.queue_rank) {
         transfers.update((list) =>
           list.map((t) => t.id === d.transfer_id ? { ...t, queue_rank: d.queue_rank } : t)
@@ -94,9 +93,13 @@
   let activeUploads = $derived(allUploads.filter(t => t.status !== 'completed' && t.status !== 'failed'));
   let completedUploads = $derived(allUploads.filter(t => t.status === 'completed' || t.status === 'failed'));
 
+  // --- Bottom pane view tabs (eMule style) ---
+  type BottomView = 'uploading' | 'on_queue' | 'download_clients';
+  let bottomView: BottomView = $state('uploading');
+
   // --- Sorting ---
-  type DlSortField = 'file_name' | 'total_size' | 'transferred' | 'speed' | 'progress' | 'sources' | 'priority' | 'status' | 'remaining' | 'started_at';
-  type UlSortField = 'peer_name' | 'file_name' | 'speed' | 'transferred' | 'status';
+  type DlSortField = 'file_name' | 'total_size' | 'transferred' | 'completed_size' | 'speed' | 'progress' | 'sources' | 'priority' | 'status' | 'remaining' | 'last_seen_complete' | 'last_received' | 'category' | 'started_at';
+  type UlSortField = 'peer_name' | 'file_name' | 'speed' | 'transferred' | 'waited' | 'upload_time' | 'status';
   let dlSortField: DlSortField = $state('file_name');
   let dlSortAsc = $state(true);
   let ulSortField: UlSortField = $state('file_name');
@@ -116,7 +119,7 @@
   }
 
   const priorityOrder: Record<string, number> = { auto: 0, high: 1, normal: 2, low: 3 };
-  const statusOrder: Record<string, number> = { active: 0, verifying: 1, searching: 2, queued: 3, paused: 4, failed: 5, completed: 6 };
+  const statusOrder: Record<string, number> = { active: 0, verifying: 1, completing: 2, searching: 3, queued: 4, paused: 5, stopped: 6, hashing: 7, noneneeded: 8, insufficient: 9, failed: 10, completed: 11 };
 
   function etaSeconds(t: Transfer): number {
     if (t.speed <= 0 || t.transferred >= t.total_size) return Infinity;
@@ -131,12 +134,16 @@
         case 'file_name': cmp = a.file_name.localeCompare(b.file_name); break;
         case 'total_size': cmp = a.total_size - b.total_size; break;
         case 'transferred': cmp = a.transferred - b.transferred; break;
+        case 'completed_size': cmp = (a.completed_size || 0) - (b.completed_size || 0); break;
         case 'speed': cmp = a.speed - b.speed; break;
         case 'progress': cmp = a.progress - b.progress; break;
         case 'sources': cmp = a.sources - b.sources; break;
         case 'priority': cmp = (priorityOrder[a.priority] ?? 2) - (priorityOrder[b.priority] ?? 2); break;
         case 'status': cmp = (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9); break;
         case 'remaining': cmp = etaSeconds(a) - etaSeconds(b); break;
+        case 'last_seen_complete': cmp = (a.last_seen_complete ?? 0) - (b.last_seen_complete ?? 0); break;
+        case 'last_received': cmp = (a.last_received ?? 0) - (b.last_received ?? 0); break;
+        case 'category': cmp = (a.category || '').localeCompare(b.category || ''); break;
         case 'started_at': cmp = a.started_at - b.started_at; break;
       }
       return dlSortAsc ? cmp : -cmp;
@@ -153,6 +160,8 @@
         case 'file_name': cmp = a.file_name.localeCompare(b.file_name); break;
         case 'speed': cmp = a.speed - b.speed; break;
         case 'transferred': cmp = a.transferred - b.transferred; break;
+        case 'waited': cmp = (a.wait_time || 0) - (b.wait_time || 0); break;
+        case 'upload_time': cmp = (a.upload_time || 0) - (b.upload_time || 0); break;
         case 'status': cmp = (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9); break;
       }
       return ulSortAsc ? cmp : -cmp;
@@ -167,19 +176,32 @@
       case 'searching': return t.sources > 0 ? `Searching (${t.sources} src)` : 'Searching';
       case 'queued': return t.queue_rank ? `Queued (QR: ${t.queue_rank})` : 'Waiting';
       case 'paused': return 'Paused';
+      case 'stopped': return 'Stopped';
       case 'verifying': return 'Verifying';
+      case 'completing': return 'Completing';
       case 'completed': return 'Complete';
       case 'failed': return 'Error';
+      case 'hashing': return 'Hashing';
+      case 'insufficient': return 'Insufficient Disk';
+      case 'noneneeded': return 'No Needed Parts';
       default: return t.status;
     }
   }
+
   function sourcesLabel(t: Transfer): string {
     if (!t.sources) return '\u2014';
     const active = t.active_sources || 0;
     const queued = t.queued_sources || 0;
     const current = active + queued;
-    if (current > 0 && current !== t.sources) return `${current}/${t.sources}`;
-    return `${t.sources}`;
+    let label: string;
+    if (active > 0 && current !== t.sources) {
+      label = `${current}/${t.sources}`;
+    } else {
+      label = `${t.sources}`;
+    }
+    if (t.a4af_sources > 0) label += `+${t.a4af_sources}`;
+    if (t.max_sources > 0) label += ` [${t.max_sources}]`;
+    return label;
   }
 
   function ulStatusLabel(t: Transfer): string {
@@ -189,6 +211,18 @@
       case 'failed': return 'Error';
       default: return t.status;
     }
+  }
+
+  function canPause(t: Transfer): boolean {
+    return t.status === 'active' || t.status === 'searching' || t.status === 'queued';
+  }
+
+  function canStop(t: Transfer): boolean {
+    return t.status !== 'completed' && t.status !== 'failed' && t.status !== 'stopped';
+  }
+
+  function canResume(t: Transfer): boolean {
+    return t.status === 'paused' || t.status === 'stopped' || t.status === 'insufficient';
   }
 
   // --- Context menu ---
@@ -211,15 +245,26 @@
     try {
       switch (action) {
         case 'pause': await pauseTransfer(t.id); break;
+        case 'stop': await stopTransfer(t.id); break;
         case 'resume': await resumeTransfer(t.id); break;
         case 'cancel': await cancelTransfer(t.id); break;
         case 'remove': await removeTransfer(t.id); break;
+        case 'open': await openFile(t.id); break;
         case 'priority': if (extra) await setTransferPriority(t.id, extra); break;
         case 'find_sources': await findSources(t.file_hash, t.total_size); break;
         case 'preview': await previewFile(t.id); break;
+        case 'clear_completed': await clearCompleted(); break;
         case 'copy_link': {
           const link = `ed2k://|file|${encodeURIComponent(t.file_name)}|${t.total_size}|${t.file_hash}|/`;
           await navigator.clipboard.writeText(link);
+          break;
+        }
+        case 'paste_link': {
+          const text = await navigator.clipboard.readText();
+          if (text.startsWith('ed2k://')) {
+            // Dispatch to the ed2k link handler (reuse search page logic)
+            window.dispatchEvent(new CustomEvent('paste-ed2k-link', { detail: text }));
+          }
           break;
         }
       }
@@ -273,6 +318,9 @@
   }
 
   onDestroy(() => { dragCleanup?.(); });
+
+  const DL_COL_COUNT = 14;
+  const UL_COL_COUNT = 8;
 </script>
 
 <svelte:document onclick={onDocClick} />
@@ -302,19 +350,23 @@
       </div>
     </div>
     <div class="pane-content">
-      <table class="transfer-table">
+      <table class="transfer-table dl-table">
         <thead>
           <tr>
-            <th class="col-name sortable" onclick={() => toggleDlSort('file_name')}>Filename{sortArrow(dlSortField, 'file_name', dlSortAsc)}</th>
-            <th class="col-size sortable" onclick={() => toggleDlSort('total_size')}>Size{sortArrow(dlSortField, 'total_size', dlSortAsc)}</th>
-            <th class="col-size sortable" onclick={() => toggleDlSort('transferred')}>Transferred{sortArrow(dlSortField, 'transferred', dlSortAsc)}</th>
-            <th class="col-speed sortable" onclick={() => toggleDlSort('speed')}>Speed{sortArrow(dlSortField, 'speed', dlSortAsc)}</th>
-            <th class="col-progress sortable" onclick={() => toggleDlSort('progress')}>Progress{sortArrow(dlSortField, 'progress', dlSortAsc)}</th>
-            <th class="col-num sortable" onclick={() => toggleDlSort('sources')}>Sources{sortArrow(dlSortField, 'sources', dlSortAsc)}</th>
-            <th class="col-prio sortable" onclick={() => toggleDlSort('priority')}>Priority{sortArrow(dlSortField, 'priority', dlSortAsc)}</th>
-            <th class="col-status sortable" onclick={() => toggleDlSort('status')}>Status{sortArrow(dlSortField, 'status', dlSortAsc)}</th>
-            <th class="col-eta sortable" onclick={() => toggleDlSort('remaining')}>Remaining{sortArrow(dlSortField, 'remaining', dlSortAsc)}</th>
-            <th class="col-date sortable" onclick={() => toggleDlSort('started_at')}>Added On{sortArrow(dlSortField, 'started_at', dlSortAsc)}</th>
+            <th class="col-dl-name sortable" onclick={() => toggleDlSort('file_name')}>File Name{sortArrow(dlSortField, 'file_name', dlSortAsc)}</th>
+            <th class="col-dl-size sortable" onclick={() => toggleDlSort('total_size')}>Size{sortArrow(dlSortField, 'total_size', dlSortAsc)}</th>
+            <th class="col-dl-size sortable" onclick={() => toggleDlSort('transferred')}>Transferred{sortArrow(dlSortField, 'transferred', dlSortAsc)}</th>
+            <th class="col-dl-size sortable" onclick={() => toggleDlSort('completed_size')}>Completed{sortArrow(dlSortField, 'completed_size', dlSortAsc)}</th>
+            <th class="col-dl-speed sortable" onclick={() => toggleDlSort('speed')}>Speed{sortArrow(dlSortField, 'speed', dlSortAsc)}</th>
+            <th class="col-dl-progress sortable" onclick={() => toggleDlSort('progress')}>Progress{sortArrow(dlSortField, 'progress', dlSortAsc)}</th>
+            <th class="col-dl-sources sortable" onclick={() => toggleDlSort('sources')}>Sources{sortArrow(dlSortField, 'sources', dlSortAsc)}</th>
+            <th class="col-dl-prio sortable" onclick={() => toggleDlSort('priority')}>Priority{sortArrow(dlSortField, 'priority', dlSortAsc)}</th>
+            <th class="col-dl-status sortable" onclick={() => toggleDlSort('status')}>Status{sortArrow(dlSortField, 'status', dlSortAsc)}</th>
+            <th class="col-dl-remain sortable" onclick={() => toggleDlSort('remaining')}>Remaining{sortArrow(dlSortField, 'remaining', dlSortAsc)}</th>
+            <th class="col-dl-lastseen sortable" onclick={() => toggleDlSort('last_seen_complete')}>Last Seen Complete{sortArrow(dlSortField, 'last_seen_complete', dlSortAsc)}</th>
+            <th class="col-dl-lastrx sortable" onclick={() => toggleDlSort('last_received')}>Last Reception{sortArrow(dlSortField, 'last_received', dlSortAsc)}</th>
+            <th class="col-dl-cat sortable" onclick={() => toggleDlSort('category')}>Category{sortArrow(dlSortField, 'category', dlSortAsc)}</th>
+            <th class="col-dl-date sortable" onclick={() => toggleDlSort('started_at')}>Added On{sortArrow(dlSortField, 'started_at', dlSortAsc)}</th>
           </tr>
         </thead>
         <tbody>
@@ -328,6 +380,7 @@
               <td class="name-cell" title={t.file_name}>{t.file_name}</td>
               <td class="num-cell">{formatSize(t.total_size)}</td>
               <td class="num-cell">{formatSize(t.transferred)}</td>
+              <td class="num-cell">{formatSize(t.completed_size || t.transferred)}</td>
               <td class="num-cell">{t.status === 'active' ? formatSpeed(t.speed) : '\u2014'}</td>
               <td class="progress-cell">
                 {#if t.status === 'searching'}
@@ -335,7 +388,7 @@
                 {:else}
                   <ProgressBar
                     value={t.progress}
-                    color={t.status === 'paused' ? 'var(--warning)' : t.status === 'verifying' ? 'var(--success, #2ecc71)' : 'var(--accent)'}
+                    color={t.status === 'paused' || t.status === 'stopped' ? 'var(--warning)' : t.status === 'verifying' || t.status === 'completing' ? 'var(--success, #2ecc71)' : 'var(--accent)'}
                   />
                 {/if}
               </td>
@@ -346,12 +399,15 @@
               <td class="status-cell">
                 <span class="status-label st-{t.status}">{dlStatusLabel(t)}</span>
               </td>
-              <td class="num-cell">{t.status === 'active' ? formatEta(t.total_size, t.transferred, t.speed) : '\u2014'}</td>
+              <td class="num-cell">{t.status === 'active' ? formatRemaining(t.total_size, t.transferred, t.speed) : '\u2014'}</td>
+              <td class="date-cell">{t.last_seen_complete ? formatDate(t.last_seen_complete) : '\u2014'}</td>
+              <td class="date-cell">{t.last_received ? formatDate(t.last_received) : '\u2014'}</td>
+              <td class="cat-cell">{t.category || '\u2014'}</td>
               <td class="date-cell">{formatDate(t.started_at)}</td>
             </tr>
             {#if expandedTransferId === t.id}
               <tr class="source-detail-row">
-                <td colspan="10">
+                <td colspan={DL_COL_COUNT}>
                   <div class="source-panel">
                     <div class="source-panel-header">Sources for {t.file_name}</div>
                     {#if loadingSources}
@@ -394,12 +450,13 @@
             {/if}
           {/each}
           {#if completedDownloads.length > 0}
-            <tr class="section-divider-row"><td colspan="10">Completed / Failed ({completedDownloads.length})</td></tr>
+            <tr class="section-divider-row"><td colspan={DL_COL_COUNT}>Completed / Failed ({completedDownloads.length})</td></tr>
             {#each completedDownloads as t (t.id)}
               <tr class="dl-row completed-row {t.status}" oncontextmenu={(e) => onCtx(e, t, 'completed')}>
                 <td class="name-cell" title={t.file_name}>{t.file_name}</td>
                 <td class="num-cell">{formatSize(t.total_size)}</td>
                 <td class="num-cell">{formatSize(t.transferred)}</td>
+                <td class="num-cell">{formatSize(t.completed_size || t.transferred)}</td>
                 <td class="num-cell">{'\u2014'}</td>
                 <td class="progress-cell">
                   <ProgressBar
@@ -416,12 +473,15 @@
                   {/if}
                 </td>
                 <td class="num-cell">{'\u2014'}</td>
+                <td class="date-cell">{t.last_seen_complete ? formatDate(t.last_seen_complete) : '\u2014'}</td>
+                <td class="date-cell">{'\u2014'}</td>
+                <td class="cat-cell">{t.category || '\u2014'}</td>
                 <td class="date-cell">{formatDate(t.started_at)}</td>
               </tr>
             {/each}
           {/if}
           {#if allDownloads.length === 0}
-            <tr><td colspan="10" class="empty-cell">No downloads. Start one from the Search page.</td></tr>
+            <tr><td colspan={DL_COL_COUNT} class="empty-cell">No downloads. Start one from the Search page.</td></tr>
           {/if}
         </tbody>
       </table>
@@ -438,49 +498,138 @@
     onmousedown={onSplitterDown}
   ></div>
 
-  <!-- BOTTOM PANE: Uploads -->
+  <!-- BOTTOM PANE: Uploads / On Queue / Download Clients (eMule tabs) -->
   <div class="pane uploads-pane" style="flex: 1;">
     <div class="pane-toolbar">
-      <span class="pane-title">{activeUploads.length} uploading</span>
+      <div class="bottom-tabs">
+        <button
+          class="tab-btn"
+          class:active={bottomView === 'uploading'}
+          onclick={() => bottomView = 'uploading'}
+        >Uploading ({activeUploads.length})</button>
+        <button
+          class="tab-btn"
+          class:active={bottomView === 'on_queue'}
+          onclick={() => bottomView = 'on_queue'}
+        >On Queue</button>
+        <button
+          class="tab-btn"
+          class:active={bottomView === 'download_clients'}
+          onclick={() => bottomView = 'download_clients'}
+        >Download Clients</button>
+      </div>
     </div>
     <div class="pane-content">
-      <table class="transfer-table">
-        <thead>
-          <tr>
-            <th class="col-client sortable" onclick={() => toggleUlSort('peer_name')}>Client{sortArrow(ulSortField, 'peer_name', ulSortAsc)}</th>
-            <th class="col-name sortable" onclick={() => toggleUlSort('file_name')}>Filename{sortArrow(ulSortField, 'file_name', ulSortAsc)}</th>
-            <th class="col-speed sortable" onclick={() => toggleUlSort('speed')}>Speed{sortArrow(ulSortField, 'speed', ulSortAsc)}</th>
-            <th class="col-size sortable" onclick={() => toggleUlSort('transferred')}>Transferred{sortArrow(ulSortField, 'transferred', ulSortAsc)}</th>
-            <th class="col-status sortable" onclick={() => toggleUlSort('status')}>Status{sortArrow(ulSortField, 'status', ulSortAsc)}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each sortedActiveUploads as t (t.id)}
-            <tr class="ul-row" oncontextmenu={(e) => onCtx(e, t, 'upload')}>
-              <td class="client-cell" title={t.peer_name || t.peer_id}>{t.peer_name || t.peer_id || '\u2014'}</td>
-              <td class="name-cell" title={t.file_name}>{t.file_name}</td>
-              <td class="num-cell">{t.status === 'active' ? formatSpeed(t.speed) : '\u2014'}</td>
-              <td class="num-cell">{formatSize(t.transferred)}</td>
-              <td class="status-cell"><span class="status-label st-{t.status}">{ulStatusLabel(t)}</span></td>
+      {#if bottomView === 'uploading'}
+        <!-- UPLOADING VIEW -->
+        <table class="transfer-table ul-table">
+          <thead>
+            <tr>
+              <th class="col-ul-client sortable" onclick={() => toggleUlSort('peer_name')}>User Name{sortArrow(ulSortField, 'peer_name', ulSortAsc)}</th>
+              <th class="col-ul-name sortable" onclick={() => toggleUlSort('file_name')}>File{sortArrow(ulSortField, 'file_name', ulSortAsc)}</th>
+              <th class="col-ul-speed sortable" onclick={() => toggleUlSort('speed')}>Speed{sortArrow(ulSortField, 'speed', ulSortAsc)}</th>
+              <th class="col-ul-size sortable" onclick={() => toggleUlSort('transferred')}>Transferred{sortArrow(ulSortField, 'transferred', ulSortAsc)}</th>
+              <th class="col-ul-waited sortable" onclick={() => toggleUlSort('waited')}>Waited{sortArrow(ulSortField, 'waited', ulSortAsc)}</th>
+              <th class="col-ul-uptime sortable" onclick={() => toggleUlSort('upload_time')}>Upload Time{sortArrow(ulSortField, 'upload_time', ulSortAsc)}</th>
+              <th class="col-ul-status sortable" onclick={() => toggleUlSort('status')}>Status{sortArrow(ulSortField, 'status', ulSortAsc)}</th>
+              <th class="col-ul-bar">Up Status</th>
             </tr>
-          {/each}
-          {#if completedUploads.length > 0}
-            <tr class="section-divider-row"><td colspan="5">Completed ({completedUploads.length})</td></tr>
-            {#each completedUploads as t (t.id)}
-              <tr class="ul-row completed-row">
+          </thead>
+          <tbody>
+            {#each sortedActiveUploads as t (t.id)}
+              <tr class="ul-row" oncontextmenu={(e) => onCtx(e, t, 'upload')}>
                 <td class="client-cell" title={t.peer_name || t.peer_id}>{t.peer_name || t.peer_id || '\u2014'}</td>
                 <td class="name-cell" title={t.file_name}>{t.file_name}</td>
-                <td class="num-cell">{'\u2014'}</td>
+                <td class="num-cell">{t.status === 'active' ? formatSpeed(t.speed) : '\u2014'}</td>
                 <td class="num-cell">{formatSize(t.transferred)}</td>
+                <td class="num-cell">{formatDuration(t.wait_time)}</td>
+                <td class="num-cell">{formatDuration(t.upload_time)}</td>
                 <td class="status-cell"><span class="status-label st-{t.status}">{ulStatusLabel(t)}</span></td>
+                <td class="bar-cell">
+                  {#if t.progress > 0}
+                    <ProgressBar value={t.progress} color="var(--accent)" />
+                  {:else}
+                    <span class="no-bar">\u2014</span>
+                  {/if}
+                </td>
               </tr>
             {/each}
-          {/if}
-          {#if allUploads.length === 0}
-            <tr><td colspan="5" class="empty-cell">No uploads</td></tr>
-          {/if}
-        </tbody>
-      </table>
+            {#if completedUploads.length > 0}
+              <tr class="section-divider-row"><td colspan={UL_COL_COUNT}>Completed ({completedUploads.length})</td></tr>
+              {#each completedUploads as t (t.id)}
+                <tr class="ul-row completed-row">
+                  <td class="client-cell" title={t.peer_name || t.peer_id}>{t.peer_name || t.peer_id || '\u2014'}</td>
+                  <td class="name-cell" title={t.file_name}>{t.file_name}</td>
+                  <td class="num-cell">{'\u2014'}</td>
+                  <td class="num-cell">{formatSize(t.transferred)}</td>
+                  <td class="num-cell">{formatDuration(t.wait_time)}</td>
+                  <td class="num-cell">{formatDuration(t.upload_time)}</td>
+                  <td class="status-cell"><span class="status-label st-{t.status}">{ulStatusLabel(t)}</span></td>
+                  <td class="bar-cell"><span class="no-bar">\u2014</span></td>
+                </tr>
+              {/each}
+            {/if}
+            {#if allUploads.length === 0}
+              <tr><td colspan={UL_COL_COUNT} class="empty-cell">No uploads</td></tr>
+            {/if}
+          </tbody>
+        </table>
+      {:else if bottomView === 'on_queue'}
+        <!-- ON QUEUE VIEW (eMule upload queue) -->
+        <table class="transfer-table queue-table">
+          <thead>
+            <tr>
+              <th class="col-q-client">User Name</th>
+              <th class="col-q-file">File</th>
+              <th class="col-q-prio">File Priority</th>
+              <th class="col-q-rating">Rating</th>
+              <th class="col-q-score">Score</th>
+              <th class="col-q-asked">Asked</th>
+              <th class="col-q-lastseen">Last Seen</th>
+              <th class="col-q-entered">Entered Queue</th>
+              <th class="col-q-banned">Banned</th>
+              <th class="col-q-bar">Up Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td colspan="10" class="empty-cell">Queue data will appear when clients are waiting for upload slots.</td></tr>
+          </tbody>
+        </table>
+      {:else}
+        <!-- DOWNLOAD CLIENTS VIEW (eMule source clients for downloads) -->
+        <table class="transfer-table clients-table">
+          <thead>
+            <tr>
+              <th class="col-c-client">User Name</th>
+              <th class="col-c-soft">Client Software</th>
+              <th class="col-c-file">File</th>
+              <th class="col-c-speed">Download Speed</th>
+              <th class="col-c-parts">Available Parts</th>
+              <th class="col-c-down">Downloaded</th>
+              <th class="col-c-up">Uploaded</th>
+              <th class="col-c-src">Source Type</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#if expandedSources.length > 0 && expandedTransferId}
+              {#each expandedSources as src}
+                <tr class="client-row">
+                  <td class="client-cell">{src.client_software || src.ip}</td>
+                  <td>{src.client_software || '\u2014'}</td>
+                  <td class="name-cell">{allDownloads.find(d => d.id === expandedTransferId)?.file_name || '\u2014'}</td>
+                  <td class="num-cell">{src.status === 'transferring' ? formatSpeed(src.speed) : '\u2014'}</td>
+                  <td class="num-cell">\u2014</td>
+                  <td class="num-cell">{src.transferred > 0 ? formatSize(src.transferred) : '\u2014'}</td>
+                  <td class="num-cell">\u2014</td>
+                  <td>ED2K</td>
+                </tr>
+              {/each}
+            {:else}
+              <tr><td colspan="8" class="empty-cell">Double-click a download to see its source clients here.</td></tr>
+            {/if}
+          </tbody>
+        </table>
+      {/if}
     </div>
   </div>
 </div>
@@ -489,12 +638,19 @@
 {#if ctxMenu}
   <div class="context-menu" style="left: {ctxMenu.x}px; top: {ctxMenu.y}px;">
     {#if ctxMenu.section === 'active'}
-      {#if ctxMenu.transfer.status === 'active'}
+      <!-- eMule-style download context menu -->
+      {#if canPause(ctxMenu.transfer)}
         <button class="ctx-item" onclick={() => ctxAction('pause')}>Pause</button>
-      {:else if ctxMenu.transfer.status === 'paused'}
+      {/if}
+      {#if canStop(ctxMenu.transfer)}
+        <button class="ctx-item" onclick={() => ctxAction('stop')}>Stop</button>
+      {/if}
+      {#if canResume(ctxMenu.transfer)}
         <button class="ctx-item" onclick={() => ctxAction('resume')}>Resume</button>
       {/if}
       <button class="ctx-item danger" onclick={() => ctxAction('cancel')}>Cancel</button>
+      <div class="ctx-sep"></div>
+      <button class="ctx-item" onclick={() => ctxAction('preview')}>Preview</button>
       <div class="ctx-sep"></div>
       <div class="ctx-submenu-wrap">
         <button class="ctx-item has-sub" onclick={() => ctxPrioritySub = !ctxPrioritySub}>
@@ -511,12 +667,21 @@
       </div>
       <div class="ctx-sep"></div>
       <button class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy ED2K Link</button>
+      <button class="ctx-item" onclick={() => ctxAction('paste_link')}>Paste ED2K Link</button>
       <button class="ctx-item" onclick={() => ctxAction('find_sources')}>Find More Sources</button>
-      <button class="ctx-item" onclick={() => ctxAction('preview')}>Preview File</button>
+      <div class="ctx-sep"></div>
+      <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>Clear Completed</button>
     {:else if ctxMenu.section === 'completed'}
+      {#if ctxMenu.transfer.status === 'completed'}
+        <button class="ctx-item" onclick={() => ctxAction('open')}>Open File</button>
+        <div class="ctx-sep"></div>
+      {/if}
       <button class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy ED2K Link</button>
+      <div class="ctx-sep"></div>
       <button class="ctx-item danger" onclick={() => ctxAction('remove')}>Remove from List</button>
+      <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>Clear Completed</button>
     {:else}
+      <!-- Upload context menu (eMule style) -->
       <button class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy ED2K Link</button>
     {/if}
   </div>
@@ -574,6 +739,34 @@
     min-height: 0;
   }
 
+  /* --- Bottom pane tabs (eMule style) --- */
+  .bottom-tabs {
+    display: flex;
+    gap: 0;
+  }
+  .tab-btn {
+    font-size: 11px;
+    padding: 4px 12px;
+    border: 1px solid var(--border);
+    border-bottom: none;
+    border-radius: 4px 4px 0 0;
+    background: var(--bg-primary);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    margin-right: -1px;
+  }
+  .tab-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+  .tab-btn.active {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font-weight: 600;
+    border-bottom: 1px solid var(--bg-secondary);
+  }
+
   /* --- Splitter --- */
   .splitter-bar {
     flex-shrink: 0;
@@ -624,17 +817,51 @@
     background: var(--bg-hover);
   }
 
-  /* Column widths */
-  .col-name { width: 22%; }
-  .col-size { width: 8%; }
-  .col-speed { width: 8%; }
-  .col-progress { width: 12%; min-width: 100px; }
-  .col-num { width: 6%; }
-  .col-prio { width: 7%; }
-  .col-status { width: 9%; }
-  .col-eta { width: 8%; }
-  .col-date { width: 10%; }
-  .col-client { width: 18%; }
+  /* --- Download column widths (14 columns matching eMule) --- */
+  .col-dl-name { width: 17%; }
+  .col-dl-size { width: 6%; }
+  .col-dl-speed { width: 6%; }
+  .col-dl-progress { width: 10%; min-width: 80px; }
+  .col-dl-sources { width: 6%; }
+  .col-dl-prio { width: 5%; }
+  .col-dl-status { width: 8%; }
+  .col-dl-remain { width: 9%; }
+  .col-dl-lastseen { width: 8%; }
+  .col-dl-lastrx { width: 7%; }
+  .col-dl-cat { width: 5%; }
+  .col-dl-date { width: 7%; }
+
+  /* --- Upload column widths (8 columns matching eMule) --- */
+  .col-ul-client { width: 16%; }
+  .col-ul-name { width: 20%; }
+  .col-ul-speed { width: 8%; }
+  .col-ul-size { width: 10%; }
+  .col-ul-waited { width: 8%; }
+  .col-ul-uptime { width: 8%; }
+  .col-ul-status { width: 10%; }
+  .col-ul-bar { width: 20%; }
+
+  /* --- Queue column widths (10 columns matching eMule) --- */
+  .col-q-client { width: 14%; }
+  .col-q-file { width: 18%; }
+  .col-q-prio { width: 8%; }
+  .col-q-rating { width: 6%; }
+  .col-q-score { width: 6%; }
+  .col-q-asked { width: 6%; }
+  .col-q-lastseen { width: 10%; }
+  .col-q-entered { width: 10%; }
+  .col-q-banned { width: 6%; }
+  .col-q-bar { width: 16%; }
+
+  /* --- Download clients column widths (8 columns matching eMule) --- */
+  .col-c-client { width: 14%; }
+  .col-c-soft { width: 12%; }
+  .col-c-file { width: 18%; }
+  .col-c-speed { width: 10%; }
+  .col-c-parts { width: 14%; }
+  .col-c-down { width: 10%; }
+  .col-c-up { width: 10%; }
+  .col-c-src { width: 12%; }
 
   .name-cell {
     font-weight: 500;
@@ -654,8 +881,19 @@
     color: var(--text-muted);
     font-size: 11px;
   }
+  .cat-cell {
+    color: var(--text-muted);
+    font-size: 11px;
+  }
   .progress-cell {
     padding: 4px 6px;
+  }
+  .bar-cell {
+    padding: 4px 6px;
+  }
+  .no-bar {
+    color: var(--text-muted);
+    font-size: 11px;
   }
   .empty-cell {
     text-align: center;
@@ -672,11 +910,16 @@
   }
   .st-active { color: var(--accent); }
   .st-verifying { color: var(--success, #2ecc71); }
+  .st-completing { color: var(--success, #2ecc71); }
   .st-searching { color: var(--warning); }
   .st-queued { color: var(--text-muted); }
   .st-paused { color: var(--warning); }
+  .st-stopped { color: var(--text-muted); }
   .st-completed { color: var(--success, #2ecc71); }
   .st-failed { color: var(--danger, #e74c3c); }
+  .st-hashing { color: var(--text-secondary); }
+  .st-insufficient { color: var(--danger, #e74c3c); }
+  .st-noneneeded { color: var(--text-muted); }
   .failure-hint {
     font-size: 10px;
     color: var(--danger, #e74c3c);
@@ -745,7 +988,7 @@
     border-radius: 6px;
     box-shadow: 0 4px 16px rgba(0,0,0,0.25);
     padding: 4px 0;
-    min-width: 160px;
+    min-width: 180px;
   }
   .ctx-item {
     display: block;

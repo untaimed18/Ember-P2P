@@ -58,11 +58,12 @@ export interface Transfer {
   peer_id: string;
   peer_name: string;
   direction: 'upload' | 'download';
-  status: 'searching' | 'queued' | 'active' | 'paused' | 'verifying' | 'completed' | 'failed';
+  status: 'searching' | 'queued' | 'active' | 'paused' | 'stopped' | 'verifying' | 'completing' | 'completed' | 'failed' | 'hashing' | 'insufficient' | 'noneneeded';
   progress: number;
   speed: number;
   total_size: number;
   transferred: number;
+  completed_size: number;
   started_at: number;
   failure_reason?: string;
   priority: 'low' | 'normal' | 'high' | 'auto';
@@ -70,6 +71,13 @@ export interface Transfer {
   active_sources: number;
   queued_sources: number;
   queue_rank?: number;
+  last_seen_complete?: number;
+  last_received?: number;
+  category: string;
+  wait_time: number;
+  upload_time: number;
+  a4af_sources: number;
+  max_sources: number;
 }
 
 export interface SourceInfo {

@@ -66,6 +66,7 @@ pub async fn start_download(
         speed: 0,
         total_size: file_size,
         transferred: 0,
+        completed_size: 0,
         started_at: chrono::Utc::now().timestamp(),
         failure_reason: None,
         priority: "normal".to_string(),
@@ -73,6 +74,13 @@ pub async fn start_download(
         active_sources: 0,
         queued_sources: 0,
         queue_rank: None,
+        last_seen_complete: None,
+        last_received: None,
+        category: String::new(),
+        wait_time: 0,
+        upload_time: 0,
+        a4af_sources: 0,
+        max_sources: 0,
     };
 
     {
@@ -107,6 +115,44 @@ pub async fn pause_transfer(
 ) -> Result<(), String> {
     let mut manager = state.transfer_manager.write().await;
     manager.pause(&transfer_id);
+    Ok(())
+}
+
+/// eMule "Stop": removes from active download without deleting files.
+/// Different from Pause - a stopped file won't automatically resume.
+#[tauri::command]
+pub async fn stop_transfer(
+    state: tauri::State<'_, AppState>,
+    transfer_id: String,
+) -> Result<(), String> {
+    let mut manager = state.transfer_manager.write().await;
+    manager.stop(&transfer_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn open_file(
+    state: tauri::State<'_, AppState>,
+    transfer_id: String,
+) -> Result<(), String> {
+    let transfer = {
+        let manager = state.transfer_manager.read().await;
+        manager.get_transfer(&transfer_id).cloned()
+    };
+    let transfer = transfer.ok_or("Transfer not found")?;
+    if transfer.status != TransferStatus::Completed {
+        return Err("File is not completed".into());
+    }
+    let config = state.config.read().await;
+    let file_path = std::path::PathBuf::from(&config.settings.download_folder)
+        .join(&transfer.file_name);
+    if !file_path.exists() {
+        return Err("File not found on disk".into());
+    }
+    let path_str = file_path.to_string_lossy().to_string();
+    tokio::task::spawn_blocking(move || {
+        let _ = opener::open(&path_str);
+    }).await.map_err(|e| format!("Failed to open file: {e}"))?;
     Ok(())
 }
 

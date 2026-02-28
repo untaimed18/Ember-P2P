@@ -133,7 +133,9 @@ impl TransferManager {
             };
 
             transfer.transferred = transferred.min(transfer.total_size);
+            transfer.completed_size = transferred.min(transfer.total_size);
             transfer.speed = speed;
+            transfer.last_received = Some(chrono::Utc::now().timestamp());
             if transfer.total_size > 0 {
                 transfer.progress =
                     ((transferred as f64 / transfer.total_size as f64) * 100.0).min(100.0);
@@ -222,6 +224,17 @@ impl TransferManager {
     pub fn pause(&mut self, id: &str) {
         if let Some(transfer) = self.active.get_mut(id) {
             transfer.status = TransferStatus::Paused;
+            transfer.speed = 0;
+        }
+        if let Some(control) = self.controls.get(id) {
+            control.pause();
+        }
+    }
+
+    /// eMule "Stop": like pause but signals the transfer should not auto-resume.
+    pub fn stop(&mut self, id: &str) {
+        if let Some(transfer) = self.active.get_mut(id) {
+            transfer.status = TransferStatus::Stopped;
             transfer.speed = 0;
         }
         if let Some(control) = self.controls.get(id) {

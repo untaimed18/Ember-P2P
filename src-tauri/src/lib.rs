@@ -224,6 +224,8 @@ pub fn run() {
             commands::transfers::set_transfer_priority,
             commands::transfers::pause_all_transfers,
             commands::transfers::resume_all_transfers,
+            commands::transfers::stop_transfer,
+            commands::transfers::open_file,
             commands::sharing::add_shared_folder,
             commands::sharing::remove_shared_folder,
             commands::sharing::get_shared_files,

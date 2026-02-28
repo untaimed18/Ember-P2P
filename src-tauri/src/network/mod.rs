@@ -4197,6 +4197,7 @@ async fn handle_command(
                     speed: 0,
                     total_size: file_size,
                     transferred: 0,
+                    completed_size: 0,
                     started_at: now,
                     failure_reason: None,
                     priority: "normal".to_string(),
@@ -4204,6 +4205,13 @@ async fn handle_command(
                     active_sources: 0,
                     queued_sources: 0,
                     queue_rank: None,
+                    last_seen_complete: None,
+                    last_received: None,
+                    category: String::new(),
+                    wait_time: 0,
+                    upload_time: 0,
+                    a4af_sources: 0,
+                    max_sources: 0,
                 };
                 {
                     let db_ref = db.clone();
@@ -5208,6 +5216,7 @@ async fn handle_upload_event(
                 speed: 0,
                 total_size,
                 transferred: 0,
+                completed_size: 0,
                 started_at: chrono::Utc::now().timestamp(),
                 failure_reason: None,
                 priority: "normal".to_string(),
@@ -5215,6 +5224,13 @@ async fn handle_upload_event(
                 active_sources: 0,
                 queued_sources: 0,
                 queue_rank: None,
+                last_seen_complete: None,
+                last_received: None,
+                category: String::new(),
+                wait_time: 0,
+                upload_time: 0,
+                a4af_sources: 0,
+                max_sources: 0,
             };
             {
                 let mut mgr = transfer_manager.write().await;

@@ -21,6 +21,10 @@ export async function pauseTransfer(transferId: string): Promise<void> {
   return invoke('pause_transfer', { transferId });
 }
 
+export async function stopTransfer(transferId: string): Promise<void> {
+  return invoke('stop_transfer', { transferId });
+}
+
 export async function resumeTransfer(transferId: string): Promise<void> {
   return invoke('resume_transfer', { transferId });
 }
@@ -55,4 +59,8 @@ export async function resumeAllTransfers(): Promise<void> {
 
 export async function getTransferSources(transferId: string): Promise<SourceInfo[]> {
   return invoke('get_transfer_sources', { transferId });
+}
+
+export async function openFile(transferId: string): Promise<void> {
+  return invoke('open_file', { transferId });
 }

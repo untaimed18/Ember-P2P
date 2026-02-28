@@ -71,7 +71,11 @@ pub struct Transfer {
     pub progress: f64,
     pub speed: u64,
     pub total_size: u64,
+    /// Session transferred bytes (eMule: GetTransferred)
     pub transferred: u64,
+    /// Total completed size including resumed data (eMule: GetCompletedSize)
+    #[serde(default)]
+    pub completed_size: u64,
     pub started_at: i64,
     #[serde(default)]
     pub failure_reason: Option<String>,
@@ -86,6 +90,27 @@ pub struct Transfer {
     /// Best queue rank across active sources (eMule QR display)
     #[serde(default)]
     pub queue_rank: Option<u32>,
+    /// Timestamp when a complete source was last seen (eMule: lastseencomplete)
+    #[serde(default)]
+    pub last_seen_complete: Option<i64>,
+    /// Timestamp of last data reception (eMule: GetLastReceptionDate)
+    #[serde(default)]
+    pub last_received: Option<i64>,
+    /// Category name (eMule: category tabs)
+    #[serde(default)]
+    pub category: String,
+    /// Upload: how long client waited in queue (ms) (eMule: GetWaitTime)
+    #[serde(default)]
+    pub wait_time: u64,
+    /// Upload: how long the upload has been active (ms) (eMule: GetUpStartTimeDelay)
+    #[serde(default)]
+    pub upload_time: u64,
+    /// A4AF (Asked For Another File) source count
+    #[serde(default)]
+    pub a4af_sources: u32,
+    /// Max source limit for this file
+    #[serde(default)]
+    pub max_sources: u32,
 }
 
 fn default_priority() -> String {
@@ -106,9 +131,18 @@ pub enum TransferStatus {
     Queued,
     Active,
     Paused,
+    /// eMule "Stopped": removed from active download but not deleted (different from Paused)
+    Stopped,
     Verifying,
+    Completing,
     Completed,
     Failed,
+    /// Waiting for hash verification after loading
+    Hashing,
+    /// Insufficient disk space
+    Insufficient,
+    /// No needed parts available from any source
+    NoneNeeded,
 }
 
 /// Per-source detail for a download (eMule-style source list)

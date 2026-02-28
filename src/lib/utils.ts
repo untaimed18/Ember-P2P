@@ -39,6 +39,37 @@ export function formatDate(ts: number): string {
 }
 
 /**
+ * Format milliseconds as HH:MM (eMule CastSecondsToHM style).
+ * Returns "—" for zero or invalid values.
+ */
+export function formatDuration(ms: number): string {
+  if (!ms || ms <= 0) return '\u2014';
+  const totalSecs = Math.floor(ms / 1000);
+  const hrs = Math.floor(totalSecs / 3600);
+  const mins = Math.floor((totalSecs % 3600) / 60);
+  if (hrs > 0) return `${hrs}:${String(mins).padStart(2, '0')}`;
+  return `${mins} min`;
+}
+
+/** Format remaining size + ETA combined (eMule Remaining column style). */
+export function formatRemaining(totalSize: number, transferred: number, speed: number): string {
+  if (transferred >= totalSize) return '\u2014';
+  const remaining = totalSize - transferred;
+  const remainStr = formatBytes(remaining);
+  if (speed <= 0) return remainStr;
+  const secs = Math.round(remaining / speed);
+  const days = Math.floor(secs / 86400);
+  const hrs = Math.floor((secs % 86400) / 3600);
+  const mins = Math.floor((secs % 3600) / 60);
+  let timeStr: string;
+  if (days > 0) timeStr = `${days}d ${hrs}h`;
+  else if (hrs > 0) timeStr = `${hrs}h ${mins}m`;
+  else if (mins > 0) timeStr = `${mins}m`;
+  else timeStr = '< 1m';
+  return `${timeStr} (${remainStr})`;
+}
+
+/**
  * Format a speed for the settings page where 0 means "Unlimited".
  */
 export function formatSpeedSetting(bytesPerSec: number): string {
