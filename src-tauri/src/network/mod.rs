@@ -338,6 +338,7 @@ pub async fn start_network(
     shared_servers: Arc<RwLock<Vec<ServerInfo>>>,
     shared_connected_server: Arc<RwLock<Option<ServerInfo>>>,
     shared_transfer_stats: Arc<RwLock<TransferStats>>,
+    shared_files: Arc<RwLock<Vec<FileInfo>>>,
 ) -> anyhow::Result<()> {
     let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
         .map(|d| d.data_dir().to_path_buf())
@@ -2796,16 +2797,19 @@ pub async fn start_network(
                 let s_srv = shared_servers.clone();
                 let s_conn = shared_connected_server.clone();
                 let s_tstats = shared_transfer_stats.clone();
+                let s_files = shared_files.clone();
                 let db_ref = db.clone();
                 let li_ref = local_index.clone();
                 cache_write_handle = Some(tokio::spawn(async move {
-                    // Merge all-time stats from known.met into local_index for frontend display
+                    // Merge all-time stats from known.met into local_index, then
+                    // snapshot the file list for frontend IPC reads.
                     {
                         let mut index = li_ref.write().await;
                         for (file_hash, reqs, accepted, transferred) in &known_stats {
                             let hash_hex = hex::encode(file_hash);
                             index.update_alltime_stats(&hash_hex, *reqs, *accepted, *transferred);
                         }
+                        *s_files.write().await = index.all_files().to_vec();
                     }
                     // Do the expensive hex/distance conversions here, off the event loop
                     let mut peers: Vec<PeerInfo> = Vec::new();

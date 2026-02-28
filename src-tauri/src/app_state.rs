@@ -9,7 +9,7 @@ use crate::sharing::manager::TransferManager;
 use crate::storage::config::AppConfig;
 use crate::storage::database::Database;
 use crate::storage::statistics::TransferStats;
-use crate::types::{KadContactInfo, KadSearchInfo, NetworkStats, PeerInfo, ServerInfo};
+use crate::types::{FileInfo, KadContactInfo, KadSearchInfo, NetworkStats, PeerInfo, ServerInfo};
 
 pub struct AppState {
     pub network_tx: mpsc::Sender<NetworkCommand>,
@@ -37,4 +37,8 @@ pub struct AppState {
     pub cached_connected_server: Arc<RwLock<Option<ServerInfo>>>,
     /// Cached transfer statistics — updated by the network loop.
     pub cached_transfer_stats: Arc<RwLock<TransferStats>>,
+    /// Cached shared files list — updated by sharing commands and the network
+    /// loop's background task so `get_shared_files` never contends with
+    /// `local_index` writers (hashing, scanning, stats merge).
+    pub cached_shared_files: Arc<RwLock<Vec<FileInfo>>>,
 }

@@ -85,6 +85,7 @@ pub fn run() {
             let cached_servers: Arc<RwLock<Vec<crate::types::ServerInfo>>> = Arc::new(RwLock::new(Vec::new()));
             let cached_connected_server: Arc<RwLock<Option<crate::types::ServerInfo>>> = Arc::new(RwLock::new(None));
             let cached_transfer_stats: Arc<RwLock<crate::storage::statistics::TransferStats>> = Arc::new(RwLock::new(Default::default()));
+            let cached_shared_files: Arc<RwLock<Vec<crate::types::FileInfo>>> = Arc::new(RwLock::new(Vec::new()));
             let cached_peers_net = cached_peers.clone();
             let cached_stats_net = cached_stats.clone();
             let cached_contacts_net = cached_contacts.clone();
@@ -92,6 +93,7 @@ pub fn run() {
             let cached_servers_net = cached_servers.clone();
             let cached_connected_server_net = cached_connected_server.clone();
             let cached_transfer_stats_net = cached_transfer_stats.clone();
+            let cached_shared_files_net = cached_shared_files.clone();
 
             app.manage(AppState {
                 network_tx,
@@ -110,12 +112,14 @@ pub fn run() {
                 cached_servers,
                 cached_connected_server,
                 cached_transfer_stats,
+                cached_shared_files: cached_shared_files.clone(),
             });
 
             let index_clone = local_index.clone();
             let db_clone = db.clone();
             let shared_folders = settings.shared_folders.clone();
             let startup_scanning = scanning_count.clone();
+            let csf = cached_shared_files.clone();
             tauri::async_runtime::spawn(async move {
                 // Pre-populate index from database for fast startup
                 match db_clone.get_shared_files() {
@@ -127,6 +131,8 @@ pub fn run() {
                     }
                     _ => {}
                 }
+                // Snapshot for frontend reads
+                { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
 
                 if !shared_folders.is_empty() {
                     startup_scanning.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -144,6 +150,8 @@ pub fn run() {
                         let mut index = index_clone.write().await;
                         index.add_files(files.clone());
                     }
+                    // Update snapshot after each folder
+                    { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
 
                     let db_ref = db_clone.clone();
                     let db_files = files.clone();
@@ -187,6 +195,7 @@ pub fn run() {
                     cached_servers_net,
                     cached_connected_server_net,
                     cached_transfer_stats_net,
+                    cached_shared_files_net,
                 )
                 .await
                 {

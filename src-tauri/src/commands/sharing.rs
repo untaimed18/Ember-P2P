@@ -2,11 +2,20 @@ use std::sync::atomic::Ordering;
 
 use tauri::Emitter;
 
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
 use crate::app_state::AppState;
 use crate::network::NetworkCommand;
+use crate::search::index::LocalIndex;
 use crate::sharing::indexer::FileIndexer;
 use crate::types::*;
 use tracing::info;
+
+async fn refresh_file_cache(index: &Arc<RwLock<LocalIndex>>, cache: &Arc<RwLock<Vec<FileInfo>>>) {
+    let snap = index.read().await.all_files().to_vec();
+    *cache.write().await = snap;
+}
 
 /// eMule-style shared folder addition -- returns IMMEDIATELY.
 /// All discovery and hashing runs in a background task:
@@ -34,6 +43,7 @@ pub async fn add_shared_folder(
     }
 
     let local_index = state.local_index.clone();
+    let file_cache = state.cached_shared_files.clone();
     let db = state.db.clone();
     let network_tx = state.network_tx.clone();
     let scanning = state.scanning_count.clone();
@@ -64,6 +74,7 @@ pub async fn add_shared_folder(
             let mut index = local_index.write().await;
             index.add_files(discovered.clone());
         }
+        refresh_file_cache(&local_index, &file_cache).await;
 
         let _ = app.emit("shared-files-changed", serde_json::json!({
             "folder": path,
@@ -123,6 +134,8 @@ pub async fn add_shared_folder(
                             files: vec![updated_file.clone()],
                         });
 
+                    refresh_file_cache(&local_index, &file_cache).await;
+
                     let _ = app.emit("file-hashed", serde_json::json!({
                         "temp_id": file_temp_id,
                         "hash": updated_file.hash,
@@ -147,6 +160,7 @@ pub async fn add_shared_folder(
             }
         }
 
+        refresh_file_cache(&local_index, &file_cache).await;
         let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
         scanning.fetch_sub(1, Ordering::Relaxed);
         info!("Background hashing complete: {hashed_count}/{total_files} files from {path}");
@@ -193,6 +207,7 @@ pub async fn remove_shared_folder(
         let mut index = state.local_index.write().await;
         index.remove_files_by_path_prefix(&path);
     }
+    refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
 
     // DB + network cleanup in background -- don't block the command
     let db = state.db.clone();
@@ -223,8 +238,8 @@ pub async fn remove_shared_folder(
 pub async fn get_shared_files(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<FileInfo>, String> {
-    let index = state.local_index.read().await;
-    Ok(index.all_files().to_vec())
+    let cached = state.cached_shared_files.read().await;
+    Ok(cached.clone())
 }
 
 #[tauri::command]
@@ -245,13 +260,15 @@ pub async fn set_file_priority(
     if !valid.contains(&priority.as_str()) {
         return Err(format!("Invalid priority: {priority}"));
     }
-    let mut index = state.local_index.write().await;
-    if index.set_file_priority(&file_hash, &priority) {
-        info!("Set priority for {} to {}", file_hash, priority);
-        Ok(())
-    } else {
-        Err("File not found".to_string())
+    {
+        let mut index = state.local_index.write().await;
+        if !index.set_file_priority(&file_hash, &priority) {
+            return Err("File not found".to_string());
+        }
     }
+    refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+    info!("Set priority for {} to {}", file_hash, priority);
+    Ok(())
 }
 
 #[tauri::command]
@@ -265,6 +282,7 @@ pub async fn reload_shared_files(
     };
 
     let local_index = state.local_index.clone();
+    let file_cache = state.cached_shared_files.clone();
     let db = state.db.clone();
     let network_tx = state.network_tx.clone();
     let scanning = state.scanning_count.clone();
@@ -296,6 +314,7 @@ pub async fn reload_shared_files(
             let mut index = local_index.write().await;
             index.add_files(discovered.clone());
         }
+        refresh_file_cache(&local_index, &file_cache).await;
 
         let _ = app.emit("shared-files-changed", serde_json::json!({
             "phase": "discovered",
@@ -343,6 +362,7 @@ pub async fn reload_shared_files(
                             index.add_file(updated_file.clone());
                         }
                     }
+                    refresh_file_cache(&local_index, &file_cache).await;
 
                     let db_ref = db.clone();
                     let db_file = updated_file.clone();
@@ -371,6 +391,7 @@ pub async fn reload_shared_files(
             }
         }
 
+        refresh_file_cache(&local_index, &file_cache).await;
         let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
         scanning.fetch_sub(1, Ordering::Relaxed);
         info!("Background reload hashing complete: {hashed_count}/{total_files} files");
@@ -402,6 +423,9 @@ pub async fn unshare_file(
         let mut index = state.local_index.write().await;
         index.remove_file_by_hash(&file_hash)
     };
+    if removed.is_some() {
+        refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+    }
 
     if removed.is_some() {
         let db = state.db.clone();
