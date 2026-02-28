@@ -74,7 +74,16 @@ export function startStatsPoll() {
         getNetworkStats(),
         new Promise<never>((_, reject) => setTimeout(() => reject('timeout'), 4000)),
       ]);
-      networkStats.set(stats);
+      networkStats.update((current) => {
+        const merged = { ...stats };
+        // Don't let a stale poll snapshot regress values already delivered
+        // by real-time events (the backend cache refreshes every 5s, but
+        // events like firewall-status arrive instantly).
+        if (!merged.external_ip && current.external_ip) {
+          merged.external_ip = current.external_ip;
+        }
+        return merged;
+      });
     } catch {
       // Ignore polling errors and timeouts
     }
