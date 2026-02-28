@@ -169,6 +169,7 @@ pub async fn download_and_load_ipfilter(
 
 #[tauri::command]
 pub async fn update_ipfilter_from_url(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     url: String,
 ) -> Result<String, String> {
@@ -185,11 +186,20 @@ pub async fn update_ipfilter_from_url(
         .await
         .map_err(|e| format!("Network busy: {e}"))?;
 
-    let count = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
+    let count = tokio::time::timeout(std::time::Duration::from_secs(60), rx)
         .await
         .map_err(|_| "Download timed out".to_string())?
         .map_err(|_| "Failed to update IP filter".to_string())?
         .map_err(|e| format!("IP filter update failed: {e}"))?;
+
+    // Apply the downloaded filter (the spawned download task saved it to ipfilter.dat)
+    if let Ok(data_dir) = app.path().app_data_dir() {
+        let _ = state
+            .network_tx
+            .try_send(NetworkCommand::ReloadIpFilter {
+                path: data_dir.join("ipfilter.dat"),
+            });
+    }
 
     state
         .network_tx

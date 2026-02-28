@@ -1922,11 +1922,19 @@ pub async fn start_network(
                             state.download_source_searches.insert(sid, tid);
                         }
 
-                        // Also send UDP source requests to all servers
-                        let mut fh = [0u8; 16];
-                        fh.copy_from_slice(&hash_bytes);
-                        for srv in state.server_list.servers() {
-                            let _ = server_udp.send_get_sources(srv, &fh, pd.file_size).await;
+                        // Send UDP source requests to all servers (spawned to avoid blocking)
+                        {
+                            let mut fh = [0u8; 16];
+                            fh.copy_from_slice(&hash_bytes);
+                            let packets: Vec<_> = state.server_list.servers().iter()
+                                .filter_map(|srv| ServerUdpSocket::build_get_sources_packet(srv, &fh, pd.file_size))
+                                .collect();
+                            if !packets.is_empty() {
+                                let sock = server_udp.socket_handle();
+                                tokio::spawn(async move {
+                                    ServerUdpSocket::send_packets(&sock, packets).await;
+                                });
+                            }
                         }
 
                         // Request callbacks for LowID sources if we have HighID
@@ -3800,8 +3808,14 @@ async fn handle_command(
                     search_expr.push(0x01u8);
                     search_expr.extend_from_slice(&(query.len() as u16).to_le_bytes());
                     search_expr.extend_from_slice(query.as_bytes());
-                    for srv in state.server_list.servers() {
-                        let _ = server_udp.send_global_search(srv, &search_expr).await;
+                    let packets: Vec<_> = state.server_list.servers().iter()
+                        .filter_map(|srv| ServerUdpSocket::build_global_search_packet(srv, &search_expr))
+                        .collect();
+                    if !packets.is_empty() {
+                        let sock = server_udp.socket_handle();
+                        tokio::spawn(async move {
+                            ServerUdpSocket::send_packets(&sock, packets).await;
+                        });
                     }
                 }
             }
@@ -3962,7 +3976,11 @@ async fn handle_command(
                     active_sources: 0,
                     queued_sources: 0,
                 };
-                let _ = db.save_transfer(&db_transfer);
+                {
+                    let db_ref = db.clone();
+                    let t = db_transfer.clone();
+                    tokio::task::spawn_blocking(move || { let _ = db_ref.save_transfer(&t); });
+                }
 
                 state.pending_downloads.insert(transfer_id.clone(), PendingDownload {
                     transfer_id: transfer_id.clone(),
@@ -3988,22 +4006,28 @@ async fn handle_command(
                     }
                 }
 
-                // Also request sources from the connected ed2k server (non-blocking)
+                // Request sources from the connected ed2k server (non-blocking)
                 if state.server_connected {
                     if let Some(conn) = &mut state.server_connection {
                         let mut file_hash_arr = [0u8; 16];
                         file_hash_arr.copy_from_slice(&hash_bytes);
-                        if let Err(e) = conn.send_get_sources(&file_hash_arr).await {
-                            debug!("Server source request send failed: {e}");
-                        }
+                        let _ = conn.send_get_sources(&file_hash_arr).await;
                     }
                 }
 
-                // Send UDP source requests to all servers in the list
-                let mut file_hash_arr = [0u8; 16];
-                file_hash_arr.copy_from_slice(&hash_bytes);
-                for srv in state.server_list.servers() {
-                    let _ = server_udp.send_get_sources(srv, &file_hash_arr, file_size).await;
+                // Send UDP source requests to all servers (fire-and-forget spawned task)
+                {
+                    let mut file_hash_arr = [0u8; 16];
+                    file_hash_arr.copy_from_slice(&hash_bytes);
+                    let packets: Vec<_> = state.server_list.servers().iter()
+                        .filter_map(|srv| ServerUdpSocket::build_get_sources_packet(srv, &file_hash_arr, file_size))
+                        .collect();
+                    if !packets.is_empty() {
+                        let sock = server_udp.socket_handle();
+                        tokio::spawn(async move {
+                            ServerUdpSocket::send_packets(&sock, packets).await;
+                        });
+                    }
                 }
             }
         }
@@ -4708,26 +4732,38 @@ async fn handle_command(
         }
 
         NetworkCommand::UpdateIpFilterFromUrl { url, tx } => {
-            let result = async {
-                let response = reqwest::get(&url).await.map_err(|e| format!("HTTP error: {e}"))?;
-                let bytes = response.bytes().await.map_err(|e| format!("Read error: {e}"))?;
-                let data = if bytes.starts_with(&[0x1f, 0x8b]) {
-                    use std::io::Read;
-                    let mut dec = flate2::read::GzDecoder::new(&bytes[..]);
-                    let mut out = Vec::new();
-                    dec.read_to_end(&mut out).map_err(|e| format!("Gzip error: {e}"))?;
-                    out
-                } else {
-                    bytes.to_vec()
-                };
-                // Save to ipfilter.dat to persist across restarts
-                let ipfilter_path = state.data_dir.join("ipfilter.dat");
-                std::fs::write(&ipfilter_path, &data).map_err(|e| format!("Write error: {e}"))?;
-                // Load the new filter (replacing current rules)
-                let count = state.ip_filter.load_from_file(&ipfilter_path);
-                Ok(count)
-            }.await;
-            let _ = tx.send(result);
+            let ipfilter_path = state.data_dir.join("ipfilter.dat");
+            tokio::spawn(async move {
+                let result: Result<usize, String> = async {
+                    let response = reqwest::get(&url).await.map_err(|e| format!("HTTP error: {e}"))?;
+                    let bytes = response.bytes().await.map_err(|e| format!("Read error: {e}"))?;
+                    let data = if bytes.starts_with(&[0x1f, 0x8b]) {
+                        use std::io::Read;
+                        let mut dec = flate2::read::GzDecoder::new(&bytes[..]);
+                        let mut out = Vec::new();
+                        dec.read_to_end(&mut out).map_err(|e| format!("Gzip error: {e}"))?;
+                        out
+                    } else {
+                        bytes.to_vec()
+                    };
+                    let path = ipfilter_path;
+                    tokio::task::spawn_blocking(move || {
+                        std::fs::write(&path, &data).map_err(|e| format!("Write error: {e}"))?;
+                        let count = String::from_utf8_lossy(&data)
+                            .lines()
+                            .filter(|l| {
+                                let t = l.trim();
+                                !t.is_empty() && !t.starts_with('#')
+                            })
+                            .count();
+                        Ok::<usize, String>(count)
+                    })
+                    .await
+                    .map_err(|e| format!("IO error: {e}"))?
+                }
+                .await;
+                let _ = tx.send(result);
+            });
         }
 
         NetworkCommand::Shutdown => {}

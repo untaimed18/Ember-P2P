@@ -1,7 +1,8 @@
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt};
 use tokio::net::UdpSocket;
 use tracing::debug;
 
@@ -25,15 +26,53 @@ pub const STAT_REASK_INTERVAL_SECS: i64 = 16200;
 pub const SOURCE_UDP_INTERVAL_SECS: i64 = 2;
 
 pub struct ServerUdpSocket {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     last_ping_times: std::collections::HashMap<SocketAddr, i64>,
 }
 
 impl ServerUdpSocket {
     pub fn from_socket(socket: UdpSocket) -> Self {
         Self {
-            socket,
+            socket: Arc::new(socket),
             last_ping_times: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Get a clone of the underlying socket for use in spawned tasks.
+    pub fn socket_handle(&self) -> Arc<UdpSocket> {
+        self.socket.clone()
+    }
+
+    /// Build a get-sources packet without sending. Returns (packet, addr).
+    pub fn build_get_sources_packet(server: &ServerEntry, file_hash: &[u8; 16], file_size: u64) -> Option<(Vec<u8>, SocketAddr)> {
+        let addr: SocketAddr = format!("{}:{}", server.ip, server.port + 4).parse().ok()?;
+        let mut packet = Vec::with_capacity(22);
+        packet.push(OP_EDONKEYPROT);
+        if file_size > 0 {
+            packet.push(OP_GLOBGETSOURCES2);
+            packet.extend_from_slice(file_hash);
+            packet.extend_from_slice(&(file_size as u32).to_le_bytes());
+        } else {
+            packet.push(OP_GLOBGETSOURCES);
+            packet.extend_from_slice(file_hash);
+        }
+        Some((packet, addr))
+    }
+
+    /// Build a global search packet without sending. Returns (packet, addr).
+    pub fn build_global_search_packet(server: &ServerEntry, search_expr: &[u8]) -> Option<(Vec<u8>, SocketAddr)> {
+        let addr: SocketAddr = format!("{}:{}", server.ip, server.port + 4).parse().ok()?;
+        let mut packet = Vec::with_capacity(2 + search_expr.len());
+        packet.push(OP_EDONKEYPROT);
+        packet.push(OP_GLOBSEARCHREQ);
+        packet.extend_from_slice(search_expr);
+        Some((packet, addr))
+    }
+
+    /// Send pre-built packets on a socket handle (for use in spawned tasks).
+    pub async fn send_packets(socket: &UdpSocket, packets: Vec<(Vec<u8>, SocketAddr)>) {
+        for (packet, addr) in packets {
+            let _ = socket.send_to(&packet, addr).await;
         }
     }
 
@@ -56,41 +95,6 @@ impl ServerUdpSocket {
         self.socket.send_to(&packet, addr).await?;
         self.last_ping_times.insert(addr, now);
         debug!("Sent status ping to {}:{}", server.ip, server.port);
-        Ok(())
-    }
-
-    pub async fn send_get_sources(&self, server: &ServerEntry, file_hash: &[u8; 16], file_size: u64) -> anyhow::Result<()> {
-        let addr: SocketAddr = format!("{}:{}", server.ip, server.port + 4)
-            .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid server address: {e}"))?;
-
-        let mut packet = Vec::with_capacity(22);
-        packet.push(OP_EDONKEYPROT);
-
-        if file_size > 0 {
-            packet.push(OP_GLOBGETSOURCES2);
-            packet.write_all(file_hash)?;
-            packet.write_u32::<LittleEndian>(file_size as u32)?;
-        } else {
-            packet.push(OP_GLOBGETSOURCES);
-            packet.write_all(file_hash)?;
-        }
-
-        self.socket.send_to(&packet, addr).await?;
-        Ok(())
-    }
-
-    pub async fn send_global_search(&self, server: &ServerEntry, search_expr: &[u8]) -> anyhow::Result<()> {
-        let addr: SocketAddr = format!("{}:{}", server.ip, server.port + 4)
-            .parse()
-            .map_err(|e| anyhow::anyhow!("Invalid server address: {e}"))?;
-
-        let mut packet = Vec::with_capacity(2 + search_expr.len());
-        packet.push(OP_EDONKEYPROT);
-        packet.push(OP_GLOBSEARCHREQ);
-        packet.write_all(search_expr)?;
-
-        self.socket.send_to(&packet, addr).await?;
         Ok(())
     }
 
