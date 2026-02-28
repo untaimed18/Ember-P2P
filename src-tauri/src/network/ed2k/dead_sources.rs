@@ -11,6 +11,7 @@ pub const FILEREASKTIME_SECS: i64 = 1740;
 /// eMule: SOURCECLIENTREASKS — normal source re-ask interval (40 minutes)
 pub const SOURCECLIENTREASKS_SECS: i64 = 2400;
 /// eMule: DOWNLOADTIMEOUT — no data timeout (100 seconds)
+#[allow(dead_code)]
 pub const DOWNLOADTIMEOUT_SECS: i64 = 100;
 /// Cleanup interval (5 minutes)
 const CLEANUP_INTERVAL_SECS: i64 = 300;

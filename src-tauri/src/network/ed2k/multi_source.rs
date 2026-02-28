@@ -833,11 +833,11 @@ async fn download_parts_from_source(
     let queue_start = std::time::Instant::now();
     emit_source!("queued", None, 0u64);
     loop {
-        if queue_start.elapsed().as_secs() > 600 {
+        if queue_start.elapsed().as_secs() > 1800 {
             emit_source!("failed", None, 0u64);
             anyhow::bail!("timed out waiting for upload slot");
         }
-        let remaining = 600u64.saturating_sub(queue_start.elapsed().as_secs()).max(60);
+        let remaining = 1800u64.saturating_sub(queue_start.elapsed().as_secs()).max(60);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(remaining),
             read_packet_async_ms(&mut reader),

@@ -69,6 +69,7 @@ export interface Transfer {
   sources: number;
   active_sources: number;
   queued_sources: number;
+  queue_rank?: number;
 }
 
 export interface SourceInfo {

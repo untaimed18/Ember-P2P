@@ -380,6 +380,7 @@ impl Database {
                     sources: 0,
                     active_sources: 0,
                     queued_sources: 0,
+                    queue_rank: None,
                 })
             })?
             .filter_map(|r| r.ok())

@@ -19,7 +19,7 @@ use super::sources::SourceManager;
 
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY_SECS: u64 = 10;
-const MAX_QUEUE_WAIT_SECS: u64 = 600;
+const MAX_QUEUE_WAIT_SECS: u64 = 1800;
 const READ_TIMEOUT_SECS: u64 = 60;
 
 /// Maximum decompressed part size (PARTSIZE + margin = 10 MiB)

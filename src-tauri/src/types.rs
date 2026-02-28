@@ -83,6 +83,9 @@ pub struct Transfer {
     pub active_sources: u32,
     #[serde(default)]
     pub queued_sources: u32,
+    /// Best queue rank across active sources (eMule QR display)
+    #[serde(default)]
+    pub queue_rank: Option<u32>,
 }
 
 fn default_priority() -> String {

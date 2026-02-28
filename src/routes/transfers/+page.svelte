@@ -23,6 +23,12 @@
       queue_rank?: number; speed: number; transferred: number; client_software: string;
     }>('transfer-source-detail', (event) => {
       const d = event.payload;
+      // Update queue rank on the main transfer row
+      if (d.queue_rank) {
+        transfers.update((list) =>
+          list.map((t) => t.id === d.transfer_id ? { ...t, queue_rank: d.queue_rank } : t)
+        );
+      }
       if (d.transfer_id !== expandedTransferId) return;
       expandedSources = expandedSources.map((s) => {
         if (s.ip === d.ip && s.port === d.port) {
@@ -158,8 +164,8 @@
   function dlStatusLabel(t: Transfer): string {
     switch (t.status) {
       case 'active': return 'Downloading';
-      case 'searching': return 'Searching';
-      case 'queued': return 'Waiting';
+      case 'searching': return t.sources > 0 ? `Searching (${t.sources} src)` : 'Searching';
+      case 'queued': return t.queue_rank ? `Queued (QR: ${t.queue_rank})` : 'Waiting';
       case 'paused': return 'Paused';
       case 'verifying': return 'Verifying';
       case 'completed': return 'Complete';

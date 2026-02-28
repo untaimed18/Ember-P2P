@@ -66,6 +66,7 @@ pub async fn download_collection_files(
             sources: 0,
             active_sources: 0,
             queued_sources: 0,
+            queue_rank: None,
         };
 
         {

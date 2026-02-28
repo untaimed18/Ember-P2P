@@ -1928,23 +1928,18 @@ pub async fn start_network(
                 state.overloaded_nodes.retain(|_, &mut ts| now - ts < 600);
             }
 
-            // Retry source search for pending downloads
+            // Retry source search for pending downloads (eMule: never auto-fail, search forever)
             _ = source_retry_timer.tick() => {
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
                 let now = chrono::Utc::now().timestamp();
-                let max_retries = 10u32;
-                let retry_interval = ed2k::dead_sources::DOWNLOADTIMEOUT_SECS;
+                let retry_interval = ed2k::dead_sources::FILEREASKTIME_SECS;
 
                 let mut to_retry = Vec::new();
-                let mut to_fail = Vec::new();
+                let mut to_cancel = Vec::new();
 
                 for (tid, pd) in &state.pending_downloads {
                     if pd.control.is_cancelled() {
-                        to_fail.push(tid.clone());
-                        continue;
-                    }
-                    if pd.search_count >= max_retries {
-                        to_fail.push(tid.clone());
+                        to_cancel.push(tid.clone());
                         continue;
                     }
                     if now - pd.last_search_at >= retry_interval {
@@ -1952,17 +1947,16 @@ pub async fn start_network(
                     }
                 }
 
-                for tid in &to_fail {
-                    if let Some(pending) = state.pending_downloads.remove(tid) {
-                        warn!("Giving up source search for {tid} after {} attempts", pending.search_count);
+                for tid in &to_cancel {
+                    if let Some(_pending) = state.pending_downloads.remove(tid) {
                         let mut mgr = transfer_manager.write().await;
                         mgr.update_status(tid, TransferStatus::Failed);
-                        mgr.fail(tid, "No sources found after multiple search attempts");
+                        mgr.fail(tid, "Cancelled by user");
                         let _ = db.update_transfer_status(tid, "failed");
                         let _ = app_handle.emit("transfer-status", serde_json::json!({
                             "id": tid,
                             "status": "failed",
-                            "error": "No sources found after multiple search attempts",
+                            "error": "Cancelled by user",
                         }));
                     }
                 }
@@ -4205,6 +4199,7 @@ async fn handle_command(
                     sources: 0,
                     active_sources: 0,
                     queued_sources: 0,
+                    queue_rank: None,
                 };
                 {
                     let db_ref = db.clone();
@@ -5209,6 +5204,7 @@ async fn handle_upload_event(
                 sources: 0,
                 active_sources: 0,
                 queued_sources: 0,
+                queue_rank: None,
             };
             {
                 let mut mgr = transfer_manager.write().await;
