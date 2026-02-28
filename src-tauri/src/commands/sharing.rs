@@ -119,10 +119,9 @@ pub async fn add_shared_folder(
                     .await;
 
                     let _ = network_tx
-                        .send(NetworkCommand::AnnounceFiles {
+                        .try_send(NetworkCommand::AnnounceFiles {
                             files: vec![updated_file.clone()],
-                        })
-                        .await;
+                        });
 
                     let _ = app.emit("file-hashed", serde_json::json!({
                         "temp_id": file_temp_id,
@@ -148,7 +147,7 @@ pub async fn add_shared_folder(
             }
         }
 
-        let _ = network_tx.send(NetworkCommand::SharedFilesChanged).await;
+        let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
         scanning.fetch_sub(1, Ordering::Relaxed);
         info!("Background hashing complete: {hashed_count}/{total_files} files from {path}");
 
@@ -210,12 +209,11 @@ pub async fn remove_shared_folder(
             .await;
 
             let _ = network_tx
-                .send(NetworkCommand::UnannounceFiles {
+                .try_send(NetworkCommand::UnannounceFiles {
                     file_hashes: hashes,
-                })
-                .await;
+                });
         }
-        let _ = network_tx.send(NetworkCommand::SharedFilesChanged).await;
+        let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
     });
 
     Ok(())
@@ -354,10 +352,9 @@ pub async fn reload_shared_files(
                     .await;
 
                     let _ = network_tx
-                        .send(NetworkCommand::AnnounceFiles {
+                        .try_send(NetworkCommand::AnnounceFiles {
                             files: vec![updated_file.clone()],
-                        })
-                        .await;
+                        });
 
                     hashed_count += 1;
                 }
@@ -374,7 +371,7 @@ pub async fn reload_shared_files(
             }
         }
 
-        let _ = network_tx.send(NetworkCommand::SharedFilesChanged).await;
+        let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
         scanning.fetch_sub(1, Ordering::Relaxed);
         info!("Background reload hashing complete: {hashed_count}/{total_files} files");
 
@@ -417,11 +414,10 @@ pub async fn unshare_file(
 
         let _ = state
             .network_tx
-            .send(NetworkCommand::UnannounceFiles {
+            .try_send(NetworkCommand::UnannounceFiles {
                 file_hashes: vec![file_hash],
-            })
-            .await;
-        let _ = state.network_tx.send(NetworkCommand::SharedFilesChanged).await;
+            });
+        let _ = state.network_tx.try_send(NetworkCommand::SharedFilesChanged);
     }
 
     Ok(())

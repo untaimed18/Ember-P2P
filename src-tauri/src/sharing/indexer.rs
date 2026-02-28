@@ -28,12 +28,27 @@ impl FileIndexer {
         for entry in WalkDir::new(path)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|e| {
+                // Skip Temp directories (contain .part download files)
+                if e.file_type().is_dir() {
+                    let name = e.file_name().to_string_lossy();
+                    return name != "Temp" && name != "temp";
+                }
+                true
+            })
             .filter_map(|e| match e {
                 Ok(entry) => Some(entry),
                 Err(e) => { warn!("WalkDir error: {e}"); None }
             })
         {
             if entry.file_type().is_file() {
+                let name = entry.file_name().to_string_lossy();
+                // Skip temporary/partial download files
+                if name.ends_with(".part") || name.ends_with(".part.met")
+                    || name.ends_with(".met.tmp") || name.ends_with(".bak")
+                {
+                    continue;
+                }
                 match Self::discover_file(entry.path()) {
                     Ok(info) => {
                         debug!("Discovered: {}", info.name);
@@ -123,12 +138,25 @@ impl FileIndexer {
         for entry in WalkDir::new(path)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|e| {
+                if e.file_type().is_dir() {
+                    let name = e.file_name().to_string_lossy();
+                    return name != "Temp" && name != "temp";
+                }
+                true
+            })
             .filter_map(|e| match e {
                 Ok(entry) => Some(entry),
                 Err(e) => { warn!("WalkDir error: {e}"); None }
             })
         {
             if entry.file_type().is_file() {
+                let name = entry.file_name().to_string_lossy();
+                if name.ends_with(".part") || name.ends_with(".part.met")
+                    || name.ends_with(".met.tmp") || name.ends_with(".bak")
+                {
+                    continue;
+                }
                 match Self::index_file(entry.path()) {
                     Ok(info) => {
                         debug!("Indexed: {}", info.name);
