@@ -2725,6 +2725,8 @@ pub async fn start_network(
                     hard_files: s.hard_files,
                     is_static: s.is_static,
                     fail_count: s.fail_count,
+                    client_id: 0,
+                    is_low_id: false,
                 }).collect();
 
                 let cached_conn_srv: Option<ServerInfo> = state.server_connection.as_ref().and_then(|conn| {
@@ -2742,6 +2744,8 @@ pub async fn start_network(
                         hard_files: 0,
                         is_static: false,
                         fail_count: 0,
+                        client_id: state.server_client_id,
+                        is_low_id: state.low_id,
                     })
                 });
 

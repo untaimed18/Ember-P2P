@@ -523,6 +523,21 @@
               <span class="info-value mono">{connectedServer.ip}:{connectedServer.port}</span>
             </div>
             <div class="info-row">
+              <span class="info-label">eD2K ID</span>
+              <span class="info-value">
+                {#if connectedServer.client_id}
+                  <span class="mono">{connectedServer.client_id}</span>
+                  {#if connectedServer.is_low_id}
+                    <span class="badge lowid">LowID</span>
+                  {:else}
+                    <span class="badge highid">HighID</span>
+                  {/if}
+                {:else}
+                  <span class="muted">Pending...</span>
+                {/if}
+              </span>
+            </div>
+            <div class="info-row">
               <span class="info-label">Users</span>
               <span class="info-value">{connectedServer.user_count.toLocaleString()}</span>
             </div>

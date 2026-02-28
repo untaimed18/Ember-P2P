@@ -128,6 +128,8 @@ export interface ServerInfo {
   hard_files: number;
   is_static: boolean;
   fail_count: number;
+  client_id: number;
+  is_low_id: boolean;
 }
 
 export interface AppSettings {

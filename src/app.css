@@ -231,6 +231,8 @@ tr:hover td {
 .badge.upload { background: var(--warning); color: #fff; }
 .badge.download { background: var(--accent); color: #fff; }
 .badge.searching { background: var(--text-muted); color: #fff; }
+.badge.highid { background: var(--success); color: #fff; }
+.badge.lowid { background: var(--danger); color: #fff; }
 
 .empty-state {
   display: flex;

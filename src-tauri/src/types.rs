@@ -324,6 +324,10 @@ pub struct ServerInfo {
     pub hard_files: u32,
     pub is_static: bool,
     pub fail_count: u32,
+    #[serde(default)]
+    pub client_id: u32,
+    #[serde(default)]
+    pub is_low_id: bool,
 }
 
 fn default_true() -> bool {
