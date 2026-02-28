@@ -1,3 +1,5 @@
+use tauri::Emitter;
+
 use crate::app_state::AppState;
 use crate::network::NetworkCommand;
 use crate::sharing::manager::TransferControl;
@@ -5,6 +7,7 @@ use crate::types::*;
 
 #[tauri::command]
 pub async fn start_download(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     file_hash: String,
     file_name: String,
@@ -64,9 +67,11 @@ pub async fn start_download(
 
     {
         let mut manager = state.transfer_manager.write().await;
-        manager.enqueue(transfer);
+        manager.enqueue(transfer.clone());
         manager.register_control(&transfer_id, control.clone());
     }
+
+    let _ = app.emit("transfer-started", &transfer);
 
     state
         .network_tx
