@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
@@ -20,6 +21,8 @@ pub struct AppState {
     /// Signaled by the network task after it finishes saving nodes.dat on shutdown.
     pub shutdown_complete: Arc<std::sync::atomic::AtomicBool>,
     pub bw_shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Number of folder scans currently running in the background.
+    pub scanning_count: Arc<AtomicUsize>,
     /// Cached peer list updated by the network loop — read directly by Tauri commands.
     pub cached_peers: Arc<RwLock<Vec<PeerInfo>>>,
     /// Cached network stats updated by the network loop — read directly by Tauri commands.

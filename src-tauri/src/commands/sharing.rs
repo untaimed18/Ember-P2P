@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::app_state::AppState;
@@ -11,46 +12,61 @@ use tracing::info;
 pub async fn add_shared_folder(
     state: tauri::State<'_, AppState>,
     path: String,
-) -> Result<Vec<FileInfo>, String> {
-    let scan_path = path.clone();
-    let files =
-        tokio::task::spawn_blocking(move || FileIndexer::scan_directory(&scan_path))
-            .await
-            .map_err(|e| format!("Scan failed: {e}"))?;
-
-    {
-        let mut index = state.local_index.write().await;
-        index.add_files(files.clone());
-    }
-
-    // Batch DB writes on a blocking thread to avoid starving the async runtime
-    let db = state.db.clone();
-    let db_files = files.clone();
-    tokio::task::spawn_blocking(move || {
-        save_files_to_db(&db, &db_files);
-    })
-    .await
-    .map_err(|e| format!("DB save failed: {e}"))?;
-
-    state
-        .network_tx
-        .send(NetworkCommand::AnnounceFiles {
-            files: files.clone(),
-        })
-        .await
-        .map_err(|e| format!("Failed to announce files: {e}"))?;
-
-    let _ = state.network_tx.send(NetworkCommand::SharedFilesChanged).await;
-
+) -> Result<(), String> {
     {
         let mut config = state.config.write().await;
         if !config.settings.shared_folders.contains(&path) {
-            config.settings.shared_folders.push(path);
+            config.settings.shared_folders.push(path.clone());
             config.save().map_err(|e| format!("Config save error: {e}"))?;
         }
     }
 
-    Ok(files)
+    let local_index = state.local_index.clone();
+    let db = state.db.clone();
+    let network_tx = state.network_tx.clone();
+    let scanning = state.scanning_count.clone();
+
+    scanning.fetch_add(1, Ordering::Relaxed);
+
+    tokio::spawn(async move {
+        let scan_path = path.clone();
+        let files = match tokio::task::spawn_blocking(move || {
+            FileIndexer::scan_directory(&scan_path)
+        })
+        .await
+        {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::error!("Background scan failed for {path}: {e}");
+                scanning.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        {
+            let mut index = local_index.write().await;
+            index.add_files(files.clone());
+        }
+
+        let db_files = files.clone();
+        let db_ref = db.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            save_files_to_db(&db_ref, &db_files);
+        })
+        .await;
+
+        let _ = network_tx
+            .send(NetworkCommand::AnnounceFiles {
+                files: files.clone(),
+            })
+            .await;
+        let _ = network_tx.send(NetworkCommand::SharedFilesChanged).await;
+
+        scanning.fetch_sub(1, Ordering::Relaxed);
+        info!("Background scan complete: {} files from {}", files.len(), path);
+    });
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -141,42 +157,64 @@ pub async fn set_file_priority(
 #[tauri::command]
 pub async fn reload_shared_files(
     state: tauri::State<'_, AppState>,
-) -> Result<Vec<FileInfo>, String> {
+) -> Result<(), String> {
     let folders = {
         let config = state.config.read().await;
         config.settings.shared_folders.clone()
     };
 
-    let all_files: Vec<FileInfo> = tokio::task::spawn_blocking(move || {
-        let mut files = Vec::new();
-        for folder in &folders {
-            files.extend(FileIndexer::scan_directory(folder));
-        }
-        files
-    })
-    .await
-    .map_err(|e| format!("Scan failed: {e}"))?;
+    let local_index = state.local_index.clone();
+    let network_tx = state.network_tx.clone();
+    let scanning = state.scanning_count.clone();
 
-    {
-        let mut index = state.local_index.write().await;
-        for file in &all_files {
-            if index.get_by_hash(&file.hash).is_none() {
-                index.add_file(file.clone());
+    scanning.fetch_add(1, Ordering::Relaxed);
+
+    tokio::spawn(async move {
+        let all_files: Vec<FileInfo> = match tokio::task::spawn_blocking(move || {
+            let mut files = Vec::new();
+            for folder in &folders {
+                files.extend(FileIndexer::scan_directory(folder));
+            }
+            files
+        })
+        .await
+        {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::error!("Reload scan failed: {e}");
+                scanning.fetch_sub(1, Ordering::Relaxed);
+                return;
+            }
+        };
+
+        {
+            let mut index = local_index.write().await;
+            for file in &all_files {
+                if index.get_by_hash(&file.hash).is_none() {
+                    index.add_file(file.clone());
+                }
             }
         }
-    }
 
-    let _ = state
-        .network_tx
-        .send(NetworkCommand::AnnounceFiles {
-            files: all_files.clone(),
-        })
-        .await;
+        let _ = network_tx
+            .send(NetworkCommand::AnnounceFiles {
+                files: all_files,
+            })
+            .await;
+        let _ = network_tx.send(NetworkCommand::SharedFilesChanged).await;
 
-    let _ = state.network_tx.send(NetworkCommand::SharedFilesChanged).await;
+        scanning.fetch_sub(1, Ordering::Relaxed);
+        info!("Background reload scan complete");
+    });
 
-    let index = state.local_index.read().await;
-    Ok(index.all_files().to_vec())
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_scan_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    Ok(state.scanning_count.load(Ordering::Relaxed) > 0)
 }
 
 #[tauri::command]

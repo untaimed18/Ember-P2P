@@ -5,6 +5,7 @@
     getSharedFiles,
     getSharedFolders,
     reloadSharedFiles,
+    getScanStatus,
     setFilePriority,
     unshareFile,
     openSharedFile,
@@ -17,7 +18,7 @@
 
   let folders: string[] = $state([]);
   let files: FileInfo[] = $state([]);
-  let loading = $state(false);
+  let scanning = $state(false);
   let error: string | null = $state(null);
   let selectedHash: string | null = $state(null);
   let filterFolder: string | null = $state(null);
@@ -46,20 +47,18 @@
   }
 
   async function refresh() {
-    loading = true;
     try {
-      const [newFolders, newFiles] = await withTimeout(
-        Promise.all([getSharedFolders(), getSharedFiles()]),
+      const [newFolders, newFiles, isScanning] = await withTimeout(
+        Promise.all([getSharedFolders(), getSharedFiles(), getScanStatus()]),
         4000,
       );
       if (!mounted) return;
       folders = newFolders;
+      scanning = isScanning;
       if (filesChanged(files, newFiles)) files = newFiles;
     } catch (e) {
       if (e instanceof Error && e.message !== 'timeout')
         console.error('Failed to load shared files:', e);
-    } finally {
-      if (mounted) loading = false;
     }
   }
 
@@ -67,8 +66,12 @@
     if (pollBusy || !mounted) return;
     pollBusy = true;
     try {
-      const newFiles = await withTimeout(getSharedFiles(), 4000);
+      const [newFiles, isScanning] = await withTimeout(
+        Promise.all([getSharedFiles(), getScanStatus()]),
+        4000,
+      );
       if (!mounted) return;
+      scanning = isScanning;
       if (filesChanged(files, newFiles)) files = newFiles;
     } catch { /* ignore */ } finally {
       pollBusy = false;
@@ -85,43 +88,32 @@
       const { open } = await import('@tauri-apps/plugin-dialog');
       const selected = await open({ directory: true, multiple: false });
       if (!mounted || !selected) return;
-      loading = true;
-      await withTimeout(addSharedFolder(selected as string), 30000);
+      await addSharedFolder(selected as string);
       if (mounted) await refresh();
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
-    } finally {
-      if (mounted) loading = false;
     }
   }
 
   async function handleRemoveFolder(path: string) {
     error = null;
     try {
-      loading = true;
       await withTimeout(removeSharedFolder(path), 10000);
       if (!mounted) return;
       if (filterFolder === path) filterFolder = null;
       await refresh();
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
-    } finally {
-      if (mounted) loading = false;
     }
   }
 
   async function handleReload() {
     error = null;
-    loading = true;
     try {
-      const newFiles = await withTimeout(reloadSharedFiles(), 60000);
-      if (!mounted) return;
-      files = newFiles;
-      folders = await withTimeout(getSharedFolders(), 4000);
+      await reloadSharedFiles();
+      if (mounted) await refresh();
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
-    } finally {
-      if (mounted) loading = false;
     }
   }
 
@@ -273,7 +265,7 @@
     }
 
     refresh();
-    const pollInterval = setInterval(refreshFiles, 5000);
+    const pollInterval = setInterval(refreshFiles, 3000);
 
     return () => {
       mounted = false;
@@ -288,8 +280,8 @@
 <div class="page-header">
   <h2>Library</h2>
   <div class="header-actions">
-    <button onclick={handleReload} disabled={loading}>Reload</button>
-    <button onclick={handleAddFolder} disabled={loading}>+ Add Folder</button>
+    <button onclick={handleReload}>Reload</button>
+    <button onclick={handleAddFolder}>+ Add Folder</button>
   </div>
 </div>
 
@@ -343,13 +335,19 @@
 
   <!-- Main: file list -->
   <div class="file-list-area">
-    {#if loading && files.length === 0}
-      <div class="empty-state"><p>Scanning files...</p></div>
-    {:else if sortedFiles.length === 0}
+    {#if scanning}
+      <div class="scan-banner">
+        <span class="scan-spinner"></span>
+        Scanning files in background&hellip;
+      </div>
+    {/if}
+    {#if sortedFiles.length === 0 && !scanning}
       <div class="empty-state">
         <p>No shared files</p>
         <p class="sub">Click "Add Folder" to share files with the network</p>
       </div>
+    {:else if sortedFiles.length === 0 && scanning}
+      <div class="empty-state"><p>Waiting for scan results&hellip;</p></div>
     {:else}
       <div class="table-scroll">
         <table class="shared-table">
@@ -454,6 +452,31 @@
     border-bottom: 1px solid var(--danger, #e74c3c);
     color: var(--danger, #e74c3c);
     font-size: 13px;
+  }
+
+  .scan-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    color: var(--accent, #3498db);
+    font-size: 12px;
+    flex-shrink: 0;
+  }
+
+  .scan-spinner {
+    width: 12px;
+    height: 12px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent, #3498db);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
   }
 
   .shared-layout {

@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { FileInfo } from '$lib/types';
 
-export async function addSharedFolder(path: string): Promise<FileInfo[]> {
+export async function addSharedFolder(path: string): Promise<void> {
   return invoke('add_shared_folder', { path });
 }
 
@@ -21,8 +21,12 @@ export async function setFilePriority(fileHash: string, priority: string): Promi
   return invoke('set_file_priority', { fileHash, priority });
 }
 
-export async function reloadSharedFiles(): Promise<FileInfo[]> {
+export async function reloadSharedFiles(): Promise<void> {
   return invoke('reload_shared_files');
+}
+
+export async function getScanStatus(): Promise<boolean> {
+  return invoke('get_scan_status');
 }
 
 export async function unshareFile(fileHash: string): Promise<void> {

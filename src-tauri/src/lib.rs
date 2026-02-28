@@ -76,6 +76,7 @@ pub fn run() {
             let shutdown_complete_net = shutdown_complete.clone();
 
             let bw_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let scanning_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
             let cached_peers: Arc<RwLock<Vec<crate::types::PeerInfo>>> = Arc::new(RwLock::new(Vec::new()));
             let cached_stats: Arc<RwLock<crate::types::NetworkStats>> = Arc::new(RwLock::new(crate::types::NetworkStats::default()));
@@ -101,6 +102,7 @@ pub fn run() {
                 transfer_manager: transfer_manager.clone(),
                 shutdown_complete,
                 bw_shutdown: bw_shutdown.clone(),
+                scanning_count: scanning_count.clone(),
                 cached_peers,
                 cached_stats,
                 cached_contacts,
@@ -113,6 +115,7 @@ pub fn run() {
             let index_clone = local_index.clone();
             let db_clone = db.clone();
             let shared_folders = settings.shared_folders.clone();
+            let startup_scanning = scanning_count.clone();
             tauri::async_runtime::spawn(async move {
                 // Pre-populate index from database for fast startup
                 match db_clone.get_shared_files() {
@@ -123,6 +126,10 @@ pub fn run() {
                         info!("Pre-loaded {count} files from database cache");
                     }
                     _ => {}
+                }
+
+                if !shared_folders.is_empty() {
+                    startup_scanning.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 for folder in &shared_folders {
@@ -147,6 +154,10 @@ pub fn run() {
                     })
                     .await
                     .ok();
+                }
+
+                if !shared_folders.is_empty() {
+                    startup_scanning.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 info!(
                     "Indexed {} files from {} shared folders",
@@ -220,6 +231,7 @@ pub fn run() {
             commands::sharing::set_file_priority,
             commands::sharing::reload_shared_files,
             commands::sharing::unshare_file,
+            commands::sharing::get_scan_status,
             commands::sharing::open_shared_file,
             commands::sharing::open_shared_folder,
             commands::peers::get_peers,
