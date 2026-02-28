@@ -1,5 +1,6 @@
 pub mod a4af;
 pub mod aich;
+pub mod archive_recovery;
 pub mod chunk_selection;
 pub mod collection;
 pub mod comments;

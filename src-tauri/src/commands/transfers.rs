@@ -332,3 +332,52 @@ pub async fn clear_completed(
     }).await;
     Ok(count)
 }
+
+#[tauri::command]
+pub async fn recover_archive(
+    state: tauri::State<'_, AppState>,
+    transfer_id: String,
+) -> Result<String, String> {
+    let (file_name, file_size, transfer_id_clone) = {
+        let manager = state.transfer_manager.read().await;
+        let transfer = manager.get_transfer(&transfer_id)
+            .ok_or("Transfer not found")?;
+        (transfer.file_name.clone(), transfer.total_size, transfer.id.clone())
+    };
+
+    if !crate::network::ed2k::archive_recovery::is_recoverable_archive(&file_name) {
+        return Err("File is not a supported archive format (ZIP, RAR, ACE)".into());
+    }
+
+    let dl_folder = {
+        let config = state.config.read().await;
+        config.settings.download_folder.clone()
+    };
+
+    let part_path = std::path::PathBuf::from(&dl_folder)
+        .join("Temp")
+        .join(format!("{transfer_id_clone}.part"));
+
+    if !part_path.exists() {
+        return Err("Part file not found — download may not have started".into());
+    }
+
+    let filled_ranges = {
+        let tracker = crate::network::ed2k::part_tracker::PartTracker::new(file_size, &part_path);
+        tracker.filled_ranges()
+    };
+
+    if filled_ranges.is_empty() {
+        return Err("No completed parts available for recovery".into());
+    }
+
+    let fname = file_name.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::network::ed2k::archive_recovery::recover_archive(&part_path, &fname, &filled_ranges)
+    })
+    .await
+    .map_err(|e| format!("Recovery task failed: {e}"))?
+    .map_err(|e| format!("Recovery failed: {e}"))?;
+
+    Ok(result.to_string_lossy().to_string())
+}

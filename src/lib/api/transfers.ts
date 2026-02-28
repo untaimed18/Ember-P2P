@@ -64,3 +64,7 @@ export async function getTransferSources(transferId: string): Promise<SourceInfo
 export async function openFile(transferId: string): Promise<void> {
   return invoke('open_file', { transferId });
 }
+
+export async function recoverArchive(transferId: string): Promise<string> {
+  return invoke('recover_archive', { transferId });
+}

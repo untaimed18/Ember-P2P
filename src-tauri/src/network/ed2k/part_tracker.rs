@@ -106,6 +106,28 @@ impl PartTracker {
         (start, end)
     }
 
+    /// Return byte ranges that are fully downloaded (inverse of gap list).
+    /// Used for archive recovery which needs to know which bytes are available.
+    pub fn filled_ranges(&self) -> Vec<(u64, u64)> {
+        let mut ranges = Vec::new();
+        let mut range_start: Option<u64> = None;
+
+        for i in 0..self.part_count {
+            let (ps, pe) = self.part_range(i);
+            if self.completed[i] {
+                if range_start.is_none() {
+                    range_start = Some(ps);
+                }
+                if i + 1 >= self.part_count || !self.completed[i + 1] {
+                    ranges.push((range_start.unwrap(), pe));
+                    range_start = None;
+                }
+            }
+        }
+
+        ranges
+    }
+
     pub fn save(&self) {
         if let Err(e) = self.save_emule_format() {
             tracing::warn!("Failed to save part.met: {e}");

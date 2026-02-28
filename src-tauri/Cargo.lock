@@ -2332,6 +2332,7 @@ dependencies = [
  "blake3",
  "byteorder",
  "chrono",
+ "crc32fast",
  "digest",
  "directories",
  "flate2",

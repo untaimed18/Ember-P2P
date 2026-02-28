@@ -4,7 +4,7 @@
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
     clearCompleted, setTransferPriority, pauseAllTransfers, resumeAllTransfers,
-    getTransferSources, openFile,
+    getTransferSources, openFile, recoverArchive,
   } from '$lib/api/transfers';
   import { findSources } from '$lib/api/search';
   import { previewFile } from '$lib/api/preview';
@@ -225,6 +225,12 @@
     return t.status === 'paused' || t.status === 'stopped' || t.status === 'insufficient';
   }
 
+  const archiveExts = ['zip', 'cbz', 'jar', 'rar', 'cbr', 'ace'];
+  function isArchive(t: Transfer): boolean {
+    const ext = t.file_name.split('.').pop()?.toLowerCase() ?? '';
+    return archiveExts.includes(ext);
+  }
+
   // --- Context menu ---
   let ctxMenu: { x: number; y: number; transfer: Transfer; section: 'active' | 'completed' | 'upload' } | null = $state(null);
   let ctxPrioritySub = $state(false);
@@ -253,6 +259,11 @@
         case 'priority': if (extra) await setTransferPriority(t.id, extra); break;
         case 'find_sources': await findSources(t.file_hash, t.total_size); break;
         case 'preview': await previewFile(t.id); break;
+        case 'recover_archive': {
+          const path = await recoverArchive(t.id);
+          transferError = `Archive recovered: ${path}`;
+          break;
+        }
         case 'clear_completed': await clearCompleted(); break;
         case 'copy_link': {
           const link = `ed2k://|file|${encodeURIComponent(t.file_name)}|${t.total_size}|${t.file_hash}|/`;
@@ -651,6 +662,9 @@
       <button class="ctx-item danger" onclick={() => ctxAction('cancel')}>Cancel</button>
       <div class="ctx-sep"></div>
       <button class="ctx-item" onclick={() => ctxAction('preview')}>Preview</button>
+      {#if isArchive(ctxMenu.transfer)}
+        <button class="ctx-item" onclick={() => ctxAction('recover_archive')}>Recover Archive</button>
+      {/if}
       <div class="ctx-sep"></div>
       <div class="ctx-submenu-wrap">
         <button class="ctx-item has-sub" onclick={() => ctxPrioritySub = !ctxPrioritySub}>

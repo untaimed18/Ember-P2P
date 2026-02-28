@@ -226,6 +226,7 @@ pub fn run() {
             commands::transfers::resume_all_transfers,
             commands::transfers::stop_transfer,
             commands::transfers::open_file,
+            commands::transfers::recover_archive,
             commands::sharing::add_shared_folder,
             commands::sharing::remove_shared_folder,
             commands::sharing::get_shared_files,
