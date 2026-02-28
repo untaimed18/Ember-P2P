@@ -131,10 +131,6 @@ impl BuddyManager {
         self.buddy_id.as_ref()
     }
 
-    pub fn buddy_addr(&self) -> Option<SocketAddr> {
-        self.buddy_addr
-    }
-
     pub fn find_buddy_target(&self) -> KadId {
         let mut target = self.local_id.0;
         target[0] ^= 0xFF;
@@ -425,39 +421,6 @@ async fn buddy_hello_handshake_outgoing(
 
     debug!("Buddy handshake complete (outgoing)");
     Ok(())
-}
-
-/// Incoming buddy handshake: read Hello, send HelloAnswer.
-/// Returns the peer's user_hash extracted from the Hello payload.
-pub async fn buddy_hello_handshake_incoming(
-    reader: &mut BufReader<OwnedReadHalf>,
-    writer: &mut BufWriter<OwnedWriteHalf>,
-    user_hash: &[u8; 16],
-    nickname: &str,
-    tcp_port: u16,
-) -> anyhow::Result<[u8; 16]> {
-    let (proto, opcode, payload) =
-        tokio::time::timeout(std::time::Duration::from_secs(15), read_ed2k_packet(reader))
-            .await
-            .map_err(|_| anyhow::anyhow!("Hello handshake timeout"))??;
-
-    if proto != OP_EDONKEYHEADER || opcode != OP_HELLO {
-        anyhow::bail!(
-            "Expected Hello, got proto=0x{proto:02X} op=0x{opcode:02X}"
-        );
-    }
-
-    let mut peer_user_hash = [0u8; 16];
-    if payload.len() >= 17 {
-        peer_user_hash.copy_from_slice(&payload[1..17]);
-    }
-
-    let hello_ans =
-        crate::network::ed2k::messages::build_hello_answer(user_hash, 0, tcp_port, nickname);
-    write_ed2k_packet(writer, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_ans).await?;
-
-    debug!("Buddy Hello handshake complete (incoming)");
-    Ok(peer_user_hash)
 }
 
 /// Long-running reader task for a buddy TCP connection.

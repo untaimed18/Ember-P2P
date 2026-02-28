@@ -47,6 +47,7 @@ pub struct MultiSourceDownload {
     pub control: Arc<TransferControl>,
     pub source_manager: Option<Arc<RwLock<SourceManager>>>,
     pub credit_manager: Option<Arc<RwLock<CreditManager>>>,
+    pub shared_buddy_info: Option<super::upload::SharedBuddyInfo>,
 }
 
 impl MultiSourceDownload {
@@ -87,6 +88,7 @@ impl MultiSourceDownload {
                 control: TransferControl::new(),
                 source_manager: self.source_manager.clone(),
                 credit_manager: self.credit_manager.clone(),
+                shared_buddy_info: self.shared_buddy_info.clone(),
             };
             return download.run(event_tx).await;
         }
@@ -272,6 +274,7 @@ impl MultiSourceDownload {
             let src_avail = self.sources[src_idx].available_parts.clone();
             let etx_clone = event_tx.clone();
             let tid_clone = self.transfer_id.clone();
+            let bi_clone = self.shared_buddy_info.clone();
 
             let handle = tokio::spawn(async move {
                 let result = download_parts_from_source(
@@ -298,6 +301,7 @@ impl MultiSourceDownload {
                     None,
                     Some(etx_clone),
                     tid_clone,
+                    bi_clone,
                 )
                 .await;
 
@@ -422,13 +426,14 @@ impl MultiSourceDownload {
                 let ravail = self.sources[src_idx].available_parts.clone();
                 let retx = event_tx.clone();
                 let rtid = self.transfer_id.clone();
+                let rbi = self.shared_buddy_info.clone();
                 retry_handles.push(tokio::spawn(async move {
                     let _ = download_parts_from_source(
                         src_idx, &source, &parts, tracker, &part_path,
                         &file_hash, file_size, &user_hash, &nickname,
                         tcp_port, udp_port, bw, retry_tx, ph,
                         ra, rq, rsm, rcm, Some(rcs), ravail, None,
-                        Some(retx), rtid,
+                        Some(retx), rtid, rbi,
                     )
                     .await;
                 }));
@@ -513,9 +518,9 @@ impl MultiSourceDownload {
                     let egcm = self.credit_manager.clone();
                     let egetx = event_tx.clone();
                     let egtid = self.transfer_id.clone();
+                    let egbi = self.shared_buddy_info.clone();
 
                     eg_handles.push(tokio::spawn(async move {
-                        // Filter to only parts not yet received by another source
                         let parts_to_try: Vec<usize> = {
                             let r = received.read().await;
                             parts.iter().copied().filter(|p| !r.contains(p)).collect()
@@ -530,7 +535,7 @@ impl MultiSourceDownload {
                             tcp_port, udp_port, bw, eg_tx, ph,
                             ra, rq, egsm, egcm, None, Vec::new(),
                             Some(eg_received),
-                            Some(egetx), egtid,
+                            Some(egetx), egtid, egbi,
                         )
                         .await;
                         if result.is_ok() {
@@ -661,6 +666,7 @@ async fn download_parts_from_source(
     endgame_received: Option<Arc<RwLock<std::collections::HashSet<usize>>>>,
     event_tx: Option<mpsc::Sender<DownloadEvent>>,
     transfer_id: String,
+    buddy_info: Option<super::upload::SharedBuddyInfo>,
 ) -> anyhow::Result<()> {
     use super::messages::*;
     use flate2::read::ZlibDecoder;
@@ -712,8 +718,12 @@ async fn download_parts_from_source(
     let mut reader = tokio::io::BufReader::new(reader);
     let mut writer = tokio::io::BufWriter::new(writer);
 
-    // Hello handshake
-    let hello_payload = build_hello(user_hash, 0, tcp_port, nickname);
+    // Hello handshake (include buddy tags if we have a buddy)
+    let buddy = match &buddy_info {
+        Some(bi) => bi.read().await.clone(),
+        None => None,
+    };
+    let hello_payload = build_hello_with_buddy(user_hash, 0, tcp_port, nickname, buddy);
     write_packet_async_ms(&mut writer, OP_EDONKEYHEADER, OP_HELLO, &hello_payload).await?;
 
     let (h_proto, h_opcode, hello_ans_data) = read_packet_timeout_ms(&mut reader).await?;

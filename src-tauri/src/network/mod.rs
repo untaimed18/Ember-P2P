@@ -308,6 +308,8 @@ struct NetworkState {
     /// Shared set of user hashes expected as incoming buddy connections (checked by upload listener)
     #[allow(dead_code)]
     pending_buddy_hashes: PendingBuddySet,
+    /// Shared buddy info for Hello tags (updated when buddy connects/disconnects)
+    shared_buddy_info: upload_server::SharedBuddyInfo,
     /// Event receiver for our buddy connection (we are firewalled)
     buddy_event_rx: Option<mpsc::Receiver<BuddyEvent>>,
     /// Event receiver for the client we're serving as buddy for
@@ -474,6 +476,7 @@ pub async fn start_network(
     let udp_key_seed = identity.udp_key_seed;
     let pending_buddy_hashes: PendingBuddySet = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let buddy_manager = BuddyManager::new(local_id, user_hash, settings.nickname.clone(), tcp_port, udp_port, pending_buddy_hashes.clone());
+    let shared_buddy_info: upload_server::SharedBuddyInfo = std::sync::Arc::new(tokio::sync::RwLock::new(None));
 
     // Initialize IP filter (controlled by user settings)
     let mut ip_filter = IpFilter::new(settings.ip_filter_enabled, settings.block_private_ips);
@@ -568,6 +571,7 @@ pub async fn start_network(
         server_client_id: 0,
         pending_server_connect: None,
         pending_buddy_hashes: pending_buddy_hashes.clone(),
+        shared_buddy_info: shared_buddy_info.clone(),
         buddy_event_rx: None,
         serving_event_rx: None,
         server_auto_reconnect: settings.auto_connect_server,
@@ -669,6 +673,7 @@ pub async fn start_network(
         let ul_apt = active_port_tests.clone();
         let ul_buddy_hashes = pending_buddy_hashes.clone();
         let ul_buddy_tx = buddy_conn_tx.clone();
+        let ul_buddy_info = shared_buddy_info.clone();
         tokio::spawn(async move {
             if let Err(e) = upload_server::start_upload_server(
                 tcp_port,
@@ -688,6 +693,7 @@ pub async fn start_network(
                 ul_apt,
                 ul_buddy_hashes,
                 ul_buddy_tx,
+                ul_buddy_info,
             )
             .await
             {
@@ -1230,6 +1236,7 @@ pub async fn start_network(
                                         control: pending.control,
                                         source_manager: Some(source_manager.clone()),
                                         credit_manager: Some(credit_manager.clone()),
+                                        shared_buddy_info: Some(state.shared_buddy_info.clone()),
                                     };
                                     let tx = dl_event_tx.clone();
                                     tokio::spawn(async move {
@@ -1273,6 +1280,7 @@ pub async fn start_network(
                                         control: pending.control,
                                         source_manager: Some(source_manager.clone()),
                                         credit_manager: Some(credit_manager.clone()),
+                                        shared_buddy_info: Some(state.shared_buddy_info.clone()),
                                     };
                                     let tx = dl_event_tx.clone();
                                     tokio::spawn(async move {
@@ -2427,6 +2435,7 @@ pub async fn start_network(
                                 control,
                                 source_manager: Some(sm),
                                 credit_manager: Some(cm),
+                                shared_buddy_info: Some(state.shared_buddy_info.clone()),
                             };
                             tokio::spawn(async move {
                                 if let Err(e) = download.run(dl_tx).await {
@@ -2445,6 +2454,7 @@ pub async fn start_network(
                         if state.buddy_manager.state() == BuddyState::Connected {
                             state.buddy_manager.disconnect_buddy();
                             state.buddy_event_rx = None;
+                            *state.shared_buddy_info.write().await = None;
                         }
                     }
                 }
@@ -3864,6 +3874,10 @@ async fn handle_udp_packet(
                     peer_tcp_port,
                 ).await {
                     state.buddy_event_rx = Some(rx);
+                    *state.shared_buddy_info.write().await = Some(ed2k::messages::BuddyInfo {
+                        buddy_ip: u32::from(buddy_ip),
+                        buddy_port: peer_tcp_port,
+                    });
                     info!("Successfully connected to buddy {} at {}:{}", buddy_id, buddy_ip, peer_tcp_port);
                 }
             }
@@ -4057,6 +4071,7 @@ async fn handle_command(
                     control,
                     source_manager: Some(source_manager.clone()),
                     credit_manager: Some(credit_manager.clone()),
+                    shared_buddy_info: Some(state.shared_buddy_info.clone()),
                 };
 
                 let tx = dl_event_tx.clone();
@@ -4504,6 +4519,7 @@ async fn handle_command(
             state.buddy_manager.reset();
             state.buddy_event_rx = None;
             state.serving_event_rx = None;
+            *state.shared_buddy_info.write().await = None;
             state.peer_nicknames.clear();
             state.publish_confirmed = 0;
             state.first_publish_done = false;

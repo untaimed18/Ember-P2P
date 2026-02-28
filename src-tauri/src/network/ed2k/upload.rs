@@ -23,6 +23,9 @@ use crate::sharing::manager::TransferManager;
 use super::messages::*;
 use crate::network::kad::buddy::PendingBuddySet;
 
+/// Shared buddy info for including in Hello tags (updated by network task)
+pub type SharedBuddyInfo = Arc<RwLock<Option<BuddyInfo>>>;
+
 /// Recognized incoming buddy connection: (user_hash, reader, writer)
 pub type BuddyConnectionParts = (
     [u8; 16],
@@ -100,6 +103,8 @@ struct UploadHandler {
     pending_buddy_hashes: PendingBuddySet,
     /// Channel to send recognized buddy connections back to the network task
     buddy_conn_tx: tokio::sync::mpsc::Sender<BuddyConnectionParts>,
+    /// Shared buddy info for Hello tags
+    shared_buddy_info: SharedBuddyInfo,
 }
 
 pub async fn start_upload_server(
@@ -120,6 +125,7 @@ pub async fn start_upload_server(
     active_port_tests: Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, tokio::sync::mpsc::Sender<()>>>>,
     pending_buddy_hashes: PendingBuddySet,
     buddy_conn_tx: tokio::sync::mpsc::Sender<BuddyConnectionParts>,
+    shared_buddy_info: SharedBuddyInfo,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     let listener = match TcpListener::bind(addr).await {
@@ -156,6 +162,7 @@ pub async fn start_upload_server(
         active_port_tests,
         pending_buddy_hashes,
         buddy_conn_tx,
+        shared_buddy_info,
     });
 
     loop {
@@ -423,8 +430,9 @@ impl UploadHandler {
         }
         debug!("Got Hello from {peer_addr}");
 
-        // Send HelloAnswer (no hash-size marker, per eMule protocol)
-        let hello_payload = build_hello_answer(&self.user_hash, 0, self.tcp_port, &self.nickname);
+        // Send HelloAnswer including buddy info if we have a buddy (eMule CT_EMULE_BUDDYIP/UDP)
+        let buddy = self.shared_buddy_info.read().await.clone();
+        let hello_payload = build_hello_answer_with_buddy(&self.user_hash, 0, self.tcp_port, &self.nickname, buddy);
         write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_payload).await?;
 
         // Check if this is an incoming buddy connection

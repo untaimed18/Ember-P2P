@@ -43,6 +43,7 @@ pub struct Ed2kDownload {
     pub control: Arc<TransferControl>,
     pub source_manager: Option<Arc<tokio::sync::RwLock<SourceManager>>>,
     pub credit_manager: Option<Arc<tokio::sync::RwLock<CreditManager>>>,
+    pub shared_buddy_info: Option<super::upload::SharedBuddyInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -221,8 +222,12 @@ impl Ed2kDownload {
         let mut reader = tokio::io::BufReader::new(reader);
         let mut writer = tokio::io::BufWriter::new(writer);
 
-        // Send Hello
-        let hello_payload = build_hello(&self.user_hash, 0, self.tcp_port, &self.nickname);
+        // Send Hello (include buddy tags if we have a buddy, so peers know our relay)
+        let buddy = match &self.shared_buddy_info {
+            Some(bi) => bi.read().await.clone(),
+            None => None,
+        };
+        let hello_payload = build_hello_with_buddy(&self.user_hash, 0, self.tcp_port, &self.nickname, buddy);
         write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_HELLO, &hello_payload).await?;
 
         // Read HelloAnswer and extract peer's user hash

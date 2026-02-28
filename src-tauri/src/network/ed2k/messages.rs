@@ -68,6 +68,7 @@ pub enum Ed2kTagValue {
 }
 
 /// Optional buddy info to include in Hello/HelloAnswer tags.
+#[derive(Clone)]
 pub struct BuddyInfo {
     pub buddy_ip: u32,
     pub buddy_port: u16,
