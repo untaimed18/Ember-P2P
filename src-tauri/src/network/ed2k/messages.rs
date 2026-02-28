@@ -48,7 +48,6 @@ pub const OP_QUEUERANK: u8 = 0x5C;
 
 // Source exchange opcodes (OP_EMULEPROT)
 pub const OP_REQUESTSOURCES: u8 = 0x81;
-pub const OP_REQUESTSOURCES2: u8 = 0x83;
 pub const OP_ANSWERSOURCES2: u8 = 0x84;
 
 // Secure identification opcodes (OP_EMULEPROT)
