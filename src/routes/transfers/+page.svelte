@@ -241,6 +241,8 @@
     if (saved) splitPercent = Math.max(20, Math.min(80, parseFloat(saved)));
   });
 
+  let dragCleanup: (() => void) | null = $state(null);
+
   function onSplitterDown(e: MouseEvent) {
     e.preventDefault();
     dragging = true;
@@ -254,10 +256,17 @@
       localStorage.setItem('transfers-split', String(splitPercent));
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      dragCleanup = null;
     };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
+    dragCleanup = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
   }
+
+  onDestroy(() => { dragCleanup?.(); });
 </script>
 
 <svelte:document onclick={onDocClick} />

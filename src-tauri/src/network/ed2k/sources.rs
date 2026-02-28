@@ -4,6 +4,7 @@ use std::net::Ipv4Addr;
 const MAX_SOURCES_PER_FILE: usize = 500;
 const SOURCE_EXPIRY_SECS: i64 = 3600;
 const MAX_SOURCES_IN_RESPONSE: usize = 50;
+const MAX_TRACKED_FILES: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct SourceEntry {
@@ -44,6 +45,10 @@ impl SourceManager {
             tcp_port,
             last_seen: now,
         });
+
+        if self.sources.len() > MAX_TRACKED_FILES {
+            self.cleanup_expired();
+        }
     }
 
     /// Build an OP_ANSWERSOURCES2 response payload for the given file hash,

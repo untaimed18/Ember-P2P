@@ -165,10 +165,6 @@ impl PublishManager {
                         name: TagName::Id(TAG_SOURCES),
                         value: TagValue::Uint32(1),
                     },
-                    KadTag {
-                        name: TagName::Id(TAG_SOURCEPORT),
-                        value: TagValue::Uint16(self.tcp_port),
-                    },
                 ],
             };
 

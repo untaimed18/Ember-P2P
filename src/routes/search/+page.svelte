@@ -3,7 +3,12 @@
   import { searchFiles, cancelSearch, parseEd2kLink, findNotes, publishNote, type SearchMethod } from '$lib/api/search';
   import { startDownload } from '$lib/api/transfers';
   import { searchResults, searchQuery, isSearching, searchProgress, newSearchNonce } from '$lib/stores/search';
+  import { onDestroy } from 'svelte';
   import type { SearchResult } from '$lib/types';
+
+  onDestroy(() => {
+    if (searchTimeout) { clearTimeout(searchTimeout); searchTimeout = null; }
+  });
 
   let searchMethod: SearchMethod = $state('global');
 
@@ -142,7 +147,7 @@
           const merged = [...existing];
           for (const result of results) {
             const idx = merged.findIndex(
-              (r) => r.file.hash === result.file.hash
+              (r) => r.file.hash === result.file.hash && r.peer_id === result.peer_id
             );
             if (idx >= 0) {
               if (result.availability > merged[idx].availability) {

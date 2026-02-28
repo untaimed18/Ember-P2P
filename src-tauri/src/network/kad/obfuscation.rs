@@ -80,30 +80,48 @@ pub fn try_decrypt_kad_packet(
 
     let random_key_part = u16::from_le_bytes([data[1], data[2]]);
 
-    // Try NodeID key first (most common for incoming KAD responses)
+    // eMule uses marker bits in the first byte to hint which key was used:
+    //   bit0 == 1 -> UserHash (ed2k), bit1 == 1 & bit0 == 0 -> ReceiverVerifyKey, else -> NodeID
+    let marker = data[0] & 0x03;
+
     let mut key_data = [0u8; 18];
+
+    if marker == 1 {
+        // Likely UserHash key
+        key_data[..16].copy_from_slice(user_hash);
+        key_data[16..18].copy_from_slice(&random_key_part.to_le_bytes());
+        if let Some(result) = try_decrypt_with_key(data, &md5::Md5::digest(&key_data)) {
+            return Some(result);
+        }
+    } else if marker == 2 && receiver_verify_key != 0 {
+        // Likely ReceiverVerifyKey
+        let mut vkey_data = [0u8; 6];
+        vkey_data[..4].copy_from_slice(&receiver_verify_key.to_le_bytes());
+        vkey_data[4..6].copy_from_slice(&random_key_part.to_le_bytes());
+        if let Some(result) = try_decrypt_with_key(data, &md5::Md5::digest(&vkey_data)) {
+            return Some(result);
+        }
+    }
+
+    // Try NodeID (always valid fallback, and primary for marker == 0)
     key_data[..16].copy_from_slice(&local_kad_id.0);
     key_data[16..18].copy_from_slice(&random_key_part.to_le_bytes());
-    let md5_hash = md5::Md5::digest(&key_data);
-    if let Some(result) = try_decrypt_with_key(data, &md5_hash) {
+    if let Some(result) = try_decrypt_with_key(data, &md5::Md5::digest(&key_data)) {
         return Some(result);
     }
 
-    // Try UserHash key (ed2k)
+    // Try remaining keys as fallback
     key_data[..16].copy_from_slice(user_hash);
     key_data[16..18].copy_from_slice(&random_key_part.to_le_bytes());
-    let md5_hash = md5::Md5::digest(&key_data);
-    if let Some(result) = try_decrypt_with_key(data, &md5_hash) {
+    if let Some(result) = try_decrypt_with_key(data, &md5::Md5::digest(&key_data)) {
         return Some(result);
     }
 
-    // Try ReceiverVerifyKey
     if receiver_verify_key != 0 {
         let mut vkey_data = [0u8; 6];
         vkey_data[..4].copy_from_slice(&receiver_verify_key.to_le_bytes());
         vkey_data[4..6].copy_from_slice(&random_key_part.to_le_bytes());
-        let md5_hash = md5::Md5::digest(&vkey_data);
-        if let Some(result) = try_decrypt_with_key(data, &md5_hash) {
+        if let Some(result) = try_decrypt_with_key(data, &md5::Md5::digest(&vkey_data)) {
             return Some(result);
         }
     }

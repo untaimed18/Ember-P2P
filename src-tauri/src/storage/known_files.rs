@@ -171,7 +171,11 @@ impl KnownFileList {
                 }
                 0x08 => { let _ = cursor.read_u16::<LittleEndian>(); }
                 0x09 => { let _ = cursor.read_u8(); }
-                _ => break,
+                0x0B => { let _ = cursor.read_u64::<LittleEndian>(); }
+                _ => {
+                    tracing::trace!("Skipping unknown known.met tag type 0x{:02X}", tag_type);
+                    break;
+                }
             }
         }
 
@@ -196,10 +200,15 @@ impl KnownFileList {
     pub fn add_or_update(&mut self, record: KnownFileRecord) {
         let hash = record.file_hash;
         let path = record.file_path.clone();
-        self.files.insert(hash, record);
         if !path.is_empty() {
+            if let Some(&old_hash) = self.path_index.get(&path) {
+                if old_hash != hash {
+                    self.files.remove(&old_hash);
+                }
+            }
             self.path_index.insert(path, hash);
         }
+        self.files.insert(hash, record);
         self.dirty = true;
     }
 

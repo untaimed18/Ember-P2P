@@ -272,7 +272,9 @@ impl SearchState {
         self.pending_times.remove(from);
 
         for entry in entries {
-            self.results.push(entry);
+            if self.results.len() < 3000 {
+                self.results.push(entry);
+            }
         }
         self.check_completion();
     }

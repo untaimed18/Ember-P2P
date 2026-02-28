@@ -811,7 +811,6 @@ impl UploadHandler {
                         }
 
                         let len = (end - start) as usize;
-                        let mut data = vec![0u8; len];
 
                         let read_result = {
                             let fp = file_path.clone();
@@ -825,7 +824,7 @@ impl UploadHandler {
                             .await?
                         };
 
-                        data = match read_result {
+                        let data = match read_result {
                             Ok(d) => d,
                             Err(e) => {
                                 warn!("Failed to read file chunk: {e}");

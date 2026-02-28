@@ -340,7 +340,7 @@ impl Database {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
             "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at
-             FROM transfers WHERE status NOT IN ('\"completed\"', '\"failed\"', 'completed', 'failed') AND direction IN ('\"download\"', 'download')"
+             FROM transfers WHERE status NOT IN ('completed', 'failed') AND direction = 'download'"
         )?;
 
         let transfers = stmt

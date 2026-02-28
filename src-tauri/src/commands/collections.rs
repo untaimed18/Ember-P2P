@@ -1,5 +1,6 @@
 use crate::app_state::AppState;
 use crate::network::ed2k::collection::{Collection, CollectionFile};
+use crate::types::{Transfer, TransferStatus, TransferDirection};
 
 #[tauri::command]
 pub async fn load_collection(
@@ -46,6 +47,33 @@ pub async fn download_collection_files(
         }
         let transfer_id = uuid::Uuid::new_v4().to_string();
         let control = crate::sharing::manager::TransferControl::new();
+
+        let transfer = Transfer {
+            id: transfer_id.clone(),
+            file_name: file.name.clone(),
+            file_hash: file.hash.clone(),
+            peer_id: String::new(),
+            peer_name: String::new(),
+            direction: TransferDirection::Download,
+            status: TransferStatus::Searching,
+            progress: 0.0,
+            speed: 0,
+            total_size: file.size,
+            transferred: 0,
+            started_at: chrono::Utc::now().timestamp(),
+            failure_reason: None,
+            priority: "normal".to_string(),
+            sources: 0,
+            active_sources: 0,
+            queued_sources: 0,
+        };
+
+        {
+            let mut mgr = state.transfer_manager.write().await;
+            mgr.enqueue(transfer);
+            mgr.register_control(&transfer_id, control.clone());
+        }
+
         let _ = state.network_tx.try_send(crate::network::NetworkCommand::StartDownload {
             file_hash: file.hash,
             file_name: file.name,

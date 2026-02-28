@@ -48,10 +48,14 @@ impl DeadSourceList {
         }
     }
 
-    pub fn is_dead_source(&self, client_id: u32, ip: u32, port: u16) -> bool {
+    pub fn is_dead_source(&mut self, client_id: u32, ip: u32, port: u16) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        if now - self.last_cleanup > CLEANUP_INTERVAL_SECS {
+            self.cleanup();
+        }
         let key = DeadSourceKey { client_id, ip, port };
         if let Some(&expiry) = self.sources.get(&key) {
-            chrono::Utc::now().timestamp() < expiry
+            now < expiry
         } else {
             false
         }

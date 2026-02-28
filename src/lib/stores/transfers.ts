@@ -26,6 +26,15 @@ export async function initTransferStore() {
   if (initialized) return;
   initialized = true;
 
+  unlisteners.push(await listen<Transfer>('transfer-started', (event) => {
+    markEventUpdate();
+    const t = event.payload;
+    transfers.update((list) => {
+      if (list.some((x) => x.id === t.id)) return list;
+      return [...list, t];
+    });
+  }));
+
   unlisteners.push(await listen<ProgressPayload>('transfer-progress', (event) => {
     markEventUpdate();
     const p = event.payload;

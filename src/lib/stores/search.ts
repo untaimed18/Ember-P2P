@@ -52,15 +52,6 @@ export async function initSearchStore() {
   );
 
   unlisteners.push(
-    await listen<{ nonce?: number }>('search-complete-nonce', (event) => {
-      if (event.payload?.nonce === searchNonce) {
-        isSearching.set(false);
-        searchProgress.set(null);
-      }
-    })
-  );
-
-  unlisteners.push(
     await listen<{ nodes_contacted: number; results_so_far: number; phase: string }>('search-progress', (event) => {
       searchProgress.set(event.payload);
     })

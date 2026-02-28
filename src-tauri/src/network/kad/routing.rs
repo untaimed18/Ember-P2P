@@ -463,10 +463,19 @@ impl RoutingTable {
                 self.track_ip_remove(old.ip);
             }
             if !self.buckets[eviction.bucket_idx].is_full() {
-                self.track_ip_add(eviction.replacement.ip);
-                self.buckets[eviction.bucket_idx]
-                    .contacts
-                    .push_back(eviction.replacement.clone());
+                let rip = eviction.replacement.ip;
+                let ip_ok = self.global_ip_count.get(&rip).copied().unwrap_or(0) < MAX_CONTACTS_IP;
+                let snet = subnet_key(rip);
+                let is_lan = ip_filter::is_lan_ip(rip);
+                let snet_ok = is_lan || self.global_subnet_count.get(&snet).copied().unwrap_or(0) < MAX_CONTACTS_SUBNET;
+                let bin_ok = is_lan || self.buckets[eviction.bucket_idx].contacts.iter()
+                    .filter(|c| subnet_key(c.ip) == snet).count() < MAX_CONTACTS_SUBNET_PER_BIN;
+                if ip_ok && snet_ok && bin_ok {
+                    self.track_ip_add(rip);
+                    self.buckets[eviction.bucket_idx]
+                        .contacts
+                        .push_back(eviction.replacement.clone());
+                }
             }
             self.promote_replacement(eviction.bucket_idx);
         }

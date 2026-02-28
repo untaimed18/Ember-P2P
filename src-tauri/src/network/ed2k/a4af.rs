@@ -44,6 +44,10 @@ impl A4AFManager {
             return;
         }
 
+        if entries.len() >= 500 {
+            return;
+        }
+
         entries.push(A4AFEntry {
             peer_addr,
             assigned_file_hash,

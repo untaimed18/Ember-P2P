@@ -5,6 +5,11 @@ use tokio::io::AsyncWriteExt;
 
 use super::types::KadId;
 
+const OP_EMULEPROT: u8 = 0xC5;
+const OP_BUDDYPING: u8 = 0x9F;
+#[allow(dead_code)]
+const OP_BUDDYPONG: u8 = 0xA0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuddyState {
     NoBuddy,
@@ -136,15 +141,18 @@ impl BuddyManager {
         }
     }
 
-    /// Check if the buddy connection is still alive using a zero-byte write probe.
+    /// Send OP_BUDDYPING to verify the buddy connection (eMule keepalive).
     pub async fn check_buddy_alive(&mut self) {
         if self.state == BuddyState::Connected {
-            if let Some(ref stream) = self.buddy_stream {
-                match stream.try_write(&[]) {
-                    Ok(_) => {}
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => {
-                        info!("Buddy connection lost (write probe failed)");
+            if let Some(ref mut stream) = self.buddy_stream {
+                let ping = build_emule_packet(OP_BUDDYPING, &[]);
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    stream.write_all(&ping),
+                ).await {
+                    Ok(Ok(())) => {}
+                    _ => {
+                        info!("Buddy connection lost (ping failed)");
                         self.buddy_stream = None;
                         self.buddy_id = None;
                         self.buddy_addr = None;
@@ -173,21 +181,15 @@ impl BuddyManager {
         true
     }
 
-    /// Forward a callback request to our buddy (we're acting as relay).
-    /// Uses length-prefix framing so the receiver can delimit messages.
+    /// Forward a callback request to our buddy using ed2k packet framing.
     pub async fn relay_callback(&mut self, data: &[u8]) -> bool {
         if let Some(ref mut stream) = self.serving_stream {
-            let len = data.len() as u32;
-            match stream.write_all(&len.to_le_bytes()).await {
-                Ok(()) => {}
-                Err(e) => {
-                    warn!("Failed to write relay frame length: {}", e);
-                    self.serving_buddy_for = None;
-                    self.serving_stream = None;
-                    return false;
-                }
-            }
-            match stream.write_all(data).await {
+            // eMule ed2k framing: [protocol(1)][length(4)][payload]
+            let mut packet = Vec::with_capacity(5 + data.len());
+            packet.push(OP_EMULEPROT);
+            packet.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            packet.extend_from_slice(data);
+            match stream.write_all(&packet).await {
                 Ok(()) => true,
                 Err(e) => {
                     warn!("Failed to relay callback: {}", e);
@@ -208,4 +210,14 @@ impl BuddyManager {
     pub fn serving_for(&self) -> Option<&KadId> {
         self.serving_buddy_for.as_ref()
     }
+}
+
+fn build_emule_packet(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let len = (1 + payload.len()) as u32;
+    let mut pkt = Vec::with_capacity(6 + payload.len());
+    pkt.push(OP_EMULEPROT);
+    pkt.extend_from_slice(&len.to_le_bytes());
+    pkt.push(opcode);
+    pkt.extend_from_slice(payload);
+    pkt
 }

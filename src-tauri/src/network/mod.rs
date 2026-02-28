@@ -4425,6 +4425,7 @@ async fn handle_command(
             state.peer_nicknames.clear();
             state.publish_confirmed = 0;
             state.first_publish_done = false;
+            state.pending_downloads.clear();
 
             state.stats.status = NetworkStatus::Disconnected;
             state.stats.connected_peers = 0;
@@ -4784,37 +4785,45 @@ async fn handle_command(
 
         NetworkCommand::UpdateIpFilterFromUrl { url, tx } => {
             let ipfilter_path = state.data_dir.join("ipfilter.dat");
-            tokio::spawn(async move {
-                let result: Result<usize, String> = async {
-                    let response = reqwest::get(&url).await.map_err(|e| format!("HTTP error: {e}"))?;
-                    let bytes = response.bytes().await.map_err(|e| format!("Read error: {e}"))?;
-                    let data = if bytes.starts_with(&[0x1f, 0x8b]) {
-                        use std::io::Read;
-                        let mut dec = flate2::read::GzDecoder::new(&bytes[..]);
-                        let mut out = Vec::new();
-                        dec.read_to_end(&mut out).map_err(|e| format!("Gzip error: {e}"))?;
-                        out
-                    } else {
-                        bytes.to_vec()
-                    };
-                    let path = ipfilter_path;
-                    tokio::task::spawn_blocking(move || {
-                        std::fs::write(&path, &data).map_err(|e| format!("Write error: {e}"))?;
-                        let count = String::from_utf8_lossy(&data)
-                            .lines()
-                            .filter(|l| {
-                                let t = l.trim();
-                                !t.is_empty() && !t.starts_with('#')
-                            })
-                            .count();
-                        Ok::<usize, String>(count)
-                    })
-                    .await
-                    .map_err(|e| format!("IO error: {e}"))?
-                }
-                .await;
-                let _ = tx.send(result);
-            });
+            let ipfilter_path2 = ipfilter_path.clone();
+            let ip_filter_enabled = state.ip_filter.is_enabled();
+            let block_private = state.ip_filter.blocks_private();
+            let ip_filter_ref = &mut state.ip_filter;
+            let result: Result<usize, String> = async {
+                let response = reqwest::get(&url).await.map_err(|e| format!("HTTP error: {e}"))?;
+                let bytes = response.bytes().await.map_err(|e| format!("Read error: {e}"))?;
+                let data = if bytes.starts_with(&[0x1f, 0x8b]) {
+                    use std::io::Read;
+                    let mut dec = flate2::read::GzDecoder::new(&bytes[..]);
+                    let mut out = Vec::new();
+                    dec.read_to_end(&mut out).map_err(|e| format!("Gzip error: {e}"))?;
+                    out
+                } else {
+                    bytes.to_vec()
+                };
+                let path = ipfilter_path;
+                tokio::task::spawn_blocking(move || {
+                    std::fs::write(&path, &data).map_err(|e| format!("Write error: {e}"))?;
+                    let count = String::from_utf8_lossy(&data)
+                        .lines()
+                        .filter(|l| {
+                            let t = l.trim();
+                            !t.is_empty() && !t.starts_with('#')
+                        })
+                        .count();
+                    Ok::<usize, String>(count)
+                })
+                .await
+                .map_err(|e| format!("IO error: {e}"))?
+            }
+            .await;
+            if result.is_ok() && ip_filter_enabled {
+                let mut new_filter = IpFilter::new(true, block_private);
+                let loaded = new_filter.load_from_file(&ipfilter_path2);
+                info!("Reloaded IP filter from updated ipfilter.dat ({loaded} ranges)");
+                *ip_filter_ref = new_filter;
+            }
+            let _ = tx.send(result);
         }
 
         NetworkCommand::Shutdown => {}

@@ -27,9 +27,11 @@ pub async fn ban_peer(
         return Err("Invalid peer ID".into());
     }
 
-    state
-        .db
-        .ban_peer(&peer_id)
+    let db = state.db.clone();
+    let pid = peer_id.clone();
+    tokio::task::spawn_blocking(move || db.ban_peer(&pid))
+        .await
+        .map_err(|e| format!("Task error: {e}"))?
         .map_err(|e| format!("Failed to ban peer: {e}"))?;
 
     let _ = state
@@ -50,9 +52,11 @@ pub async fn unban_peer(
         return Err("Invalid peer ID".into());
     }
 
-    state
-        .db
-        .unban_peer(&peer_id)
+    let db = state.db.clone();
+    let pid = peer_id.clone();
+    tokio::task::spawn_blocking(move || db.unban_peer(&pid))
+        .await
+        .map_err(|e| format!("Task error: {e}"))?
         .map_err(|e| format!("Failed to unban peer: {e}"))?;
 
     let _ = state

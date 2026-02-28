@@ -572,7 +572,14 @@ impl MultiSourceDownload {
                 let t = tracker.read().await;
                 t.delete_met();
             }
-            std::fs::rename(&part_path, &final_path)?;
+            if let Err(e) = std::fs::rename(&part_path, &final_path) {
+                if e.raw_os_error() == Some(17) || e.to_string().contains("cross") || e.to_string().contains("Invalid") {
+                    std::fs::copy(&part_path, &final_path)?;
+                    let _ = std::fs::remove_file(&part_path);
+                } else {
+                    return Err(e.into());
+                }
+            }
 
             // Verify final file hash (eMule-style: must match or download fails)
             let verify_path = final_path.clone();

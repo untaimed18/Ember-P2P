@@ -29,13 +29,6 @@ export async function initNetworkStore() {
   initialized = true;
 
   unlisteners.push(
-    await listen<NetworkStats>('network-stats', (event) => {
-      lastEventUpdate = Date.now();
-      networkStats.set(event.payload);
-    })
-  );
-
-  unlisteners.push(
     await listen<string>('network-status', (event) => {
       lastEventUpdate = Date.now();
       networkStats.update((s) => ({ ...s, status: event.payload as NetworkStats['status'] }));
