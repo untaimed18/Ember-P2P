@@ -9,6 +9,20 @@ const BUCKET_REFRESH_INTERVAL_SECS: i64 = 3600;
 const SPARSE_REFRESH_INTERVAL_SECS: i64 = 60;
 const REPLACEMENT_CACHE_SIZE: usize = 5;
 
+/// Distant buckets (low indices) cover a huge portion of the ID space.
+/// Bucket 0 alone covers 50%. Giving them more capacity improves lookup
+/// diversity without requiring eMule's dynamic tree structure.
+const DISTANT_BUCKET_THRESHOLD: usize = 8;
+const DISTANT_BUCKET_SIZE: usize = 20;
+
+fn bucket_capacity(bucket_idx: usize) -> usize {
+    if bucket_idx < DISTANT_BUCKET_THRESHOLD {
+        DISTANT_BUCKET_SIZE
+    } else {
+        K_BUCKET_SIZE
+    }
+}
+
 /// Return a human-readable KAD version name for logging.
 pub fn kad_version_name(version: u8) -> &'static str {
     match version {
@@ -59,27 +73,29 @@ struct KBucket {
     contacts: VecDeque<KadContact>,
     replacements: VecDeque<KadContact>,
     last_refresh: i64,
+    capacity: usize,
 }
 
 impl KBucket {
-    fn new() -> Self {
+    fn new(capacity: usize) -> Self {
         KBucket {
-            contacts: VecDeque::with_capacity(K_BUCKET_SIZE),
+            contacts: VecDeque::with_capacity(capacity),
             replacements: VecDeque::with_capacity(REPLACEMENT_CACHE_SIZE),
             last_refresh: 0,
+            capacity,
         }
     }
 
     fn is_full(&self) -> bool {
-        self.contacts.len() >= K_BUCKET_SIZE
+        self.contacts.len() >= self.capacity
     }
 }
 
 impl RoutingTable {
     pub fn new(local_id: KadId, block_private_ips: bool) -> Self {
         let mut buckets = Vec::with_capacity(NUM_BUCKETS);
-        for _ in 0..NUM_BUCKETS {
-            buckets.push(KBucket::new());
+        for i in 0..NUM_BUCKETS {
+            buckets.push(KBucket::new(bucket_capacity(i)));
         }
         RoutingTable {
             local_id,
@@ -257,14 +273,14 @@ impl RoutingTable {
 
         let bucket = &self.buckets[bucket_idx];
         if !bucket.is_full() {
-            tracing::debug!("RT insert {}: bucket {} ({}/{})", contact.ip, bucket_idx, bucket.contacts.len() + 1, K_BUCKET_SIZE);
+            tracing::debug!("RT insert {}: bucket {} ({}/{})", contact.ip, bucket_idx, bucket.contacts.len() + 1, bucket.capacity);
             self.track_ip_add(contact.ip);
             self.buckets[bucket_idx].contacts.push_back(contact);
             return None;
         }
 
         // Bucket full: add to replacement cache and request ping-before-evict
-        tracing::trace!("RT evict-check {}: bucket {} full ({}/{})", contact.ip, bucket_idx, bucket.contacts.len(), K_BUCKET_SIZE);
+        tracing::trace!("RT evict-check {}: bucket {} full ({}/{})", contact.ip, bucket_idx, bucket.contacts.len(), bucket.capacity);
 
         let bucket = &mut self.buckets[bucket_idx];
         if !bucket.replacements.iter().any(|c| c.id == contact.id) {
@@ -476,15 +492,16 @@ impl RoutingTable {
             .iter()
             .enumerate()
             .filter(|(i, b)| {
-                let is_sparse = b.contacts.len() < K_BUCKET_SIZE / 2;
+                let cap = b.capacity;
+                let is_sparse = b.contacts.len() < cap / 2;
                 let interval = if is_sparse { SPARSE_REFRESH_INTERVAL_SECS } else { BUCKET_REFRESH_INTERVAL_SECS };
                 if now - b.last_refresh < interval {
                     return false;
                 }
-                let remaining = K_BUCKET_SIZE.saturating_sub(b.contacts.len());
+                let remaining = cap.saturating_sub(b.contacts.len());
                 let is_close = *i >= NUM_BUCKETS.saturating_sub(KK);
                 let is_deep = *i < KBASE;
-                let has_space = remaining as f64 >= K_BUCKET_SIZE as f64 * 0.8;
+                let has_space = remaining as f64 >= cap as f64 * 0.8;
                 is_close || is_deep || has_space
             })
             .map(|(i, _)| i)
@@ -499,7 +516,7 @@ impl RoutingTable {
             .iter()
             .enumerate()
             .filter(|(_, b)| {
-                b.contacts.len() < K_BUCKET_SIZE / 5
+                b.contacts.len() < b.capacity / 5
                     && now - b.last_refresh >= SPARSE_REFRESH_INTERVAL_SECS
             })
             .map(|(i, _)| i)
