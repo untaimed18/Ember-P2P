@@ -2668,6 +2668,7 @@ pub async fn start_network(
                     state.firewalled = false;
                 }
                 state.stats.firewalled = state.firewalled;
+                state.publish_manager.firewalled = state.firewalled;
 
                 let cached_s: Vec<KadSearchInfo> = state
                     .search_manager
@@ -4772,11 +4773,12 @@ async fn handle_command(
             state.firewall_responses.clear();
             state.udp_port_responses.clear();
 
+            state.firewall_checker.start_check();
+
             let contacts: Vec<KadContact> = state
                 .routing_table
                 .all_contacts()
-                .filter(|c| c.verified && c.contact_type <= CONTACT_TYPE_OPEN)
-                .take(3)
+                .take(4)
                 .cloned()
                 .collect();
 
@@ -4787,15 +4789,15 @@ async fn handle_command(
                     state.flood_protection.track_request(addr, 0x50);
                     let _ = send_kad_packet(socket, &packet, addr, &state, &contact.id).await;
                     state.firewall_checks_sent += 1;
+                    state.firewall_checker.record_tcp_request_sent();
                 }
             }
 
             let ping_contacts: Vec<KadContact> = state
                 .routing_table
                 .all_contacts()
-                .filter(|c| c.verified && c.contact_type <= CONTACT_TYPE_OPEN)
-                .skip(3)
-                .take(3)
+                .skip(4)
+                .take(4)
                 .cloned()
                 .collect();
             for contact in &ping_contacts {
@@ -4804,6 +4806,7 @@ async fn handle_command(
                 if let Ok(packet) = messages::encode_packet(&msg) {
                     state.flood_protection.track_request(addr, 0x60);
                     let _ = send_kad_packet(socket, &packet, addr, &state, &contact.id).await;
+                    state.firewall_checker.record_udp_request_sent();
                 }
             }
 

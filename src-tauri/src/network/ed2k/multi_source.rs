@@ -197,12 +197,17 @@ impl MultiSourceDownload {
                 // Find the incomplete part with fewest competing sources
                 let mut best_part: Option<usize> = None;
                 let mut best_count = usize::MAX;
+                let completed_parts = {
+                    let t = tracker.read().await;
+                    t.completed_parts().to_vec()
+                };
                 for p in 0..part_count {
+                    if completed_parts.get(p).copied().unwrap_or(false) {
+                        continue;
+                    }
                     if part_source_count[p] < MAX_SOURCES_PER_PART
                         && p < src_available.len() && src_available[p]
                     {
-                        // Prefer parts that already have at least one source
-                        // (they're confirmed available) but also accept unassigned ones
                         if part_source_count[p] < best_count {
                             best_count = part_source_count[p];
                             best_part = Some(p);

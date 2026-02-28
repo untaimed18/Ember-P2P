@@ -197,27 +197,48 @@ pub fn build_emule_info(udp_port: u16) -> Vec<u8> {
 
     buf.write_u8(1).unwrap(); // version
 
-    // MiscOptions1: AICH=1 | Unicode=1 | UDPver=4 | Compress=1 | SrcExch=4 | ExtReq=2 | Comments=1 | NoViewShared=1 | MultiPacket=1
+    // MiscOptions1 bit layout (eMule BaseClient.cpp:980-993):
+    //   bits 29-31: AICH version (3 bits)
+    //   bit  28:    Unicode support
+    //   bits 24-27: UDP version (4 bits)
+    //   bits 20-23: Data compression version (4 bits)
+    //   bits 16-19: Secure ident support (4 bits)
+    //   bits 12-15: Source exchange version (4 bits)
+    //   bits  8-11: Extended requests version (4 bits)
+    //   bits  4-7:  Accept comment version (4 bits)
+    //   bit   3:    Peer cache (0)
+    //   bit   2:    No view shared files
+    //   bit   1:    Multi-packet support
+    //   bit   0:    Preview support
     let misc_options1: u32 =
-          1              // AICH ver 1
-        | (1 << 4)      // Unicode
-        | (4 << 5)      // UDP ver 4
-        | (1 << 8)      // Compression ver 1
-        | (1 << 12)     // Secure ident supported
-        | (4 << 13)     // Source exchange ver 4
-        | (2 << 16)     // Extended requests ver 2
-        | (1 << 20)     // Comments ver 1
-        | (0 << 24)     // No peer cache
-        | (1 << 25)     // No view shared files
-        | (1 << 26);    // Multi-packet support
+          (1u32 << 29)   // AICH ver 1
+        | (1u32 << 28)   // Unicode
+        | (4u32 << 24)   // UDP ver 4
+        | (1u32 << 20)   // Compression ver 1
+        | (1u32 << 16)   // Secure ident ver 1
+        | (4u32 << 12)   // Source exchange ver 4
+        | (2u32 << 8)    // Extended requests ver 2
+        | (1u32 << 4)    // Comments ver 1
+        | (0u32 << 3)    // No peer cache
+        | (1u32 << 2)    // No view shared files
+        | (1u32 << 1)    // Multi-packet support
+        | (0u32 << 0);   // Preview support
 
-    // MiscOptions2: KAD=1 | LargeFiles=1 | ExtMultiPacket=1 | SrcExch2=1 | CryptSupport=1
+    // MiscOptions2 bit layout (eMule BaseClient.cpp:1011-1024):
+    //   bit  13:    Direct UDP callback
+    //   bits 10-12: KAD version (3 bits) -- we don't put it here, use tag 0x23
+    //   bit  10:    Source exchange 2
+    //   bit   9:    Requires crypt layer
+    //   bit   8:    Requests crypt layer
+    //   bit   7:    Supports crypt layer
+    //   bit   5:    Extended multi-packet
+    //   bit   4:    Large files (>4GB)
+    //   bits  0-3:  reserved
     let misc_options2: u32 =
-          1              // KAD version
-        | (1 << 4)      // Large files (>4GB)
-        | (1 << 5)      // Extended multi-packet
-        | (1 << 14)     // Source exchange 2
-        | (1 << 17);    // Supports crypt layer
+          (1u32 << 10)   // Source exchange 2
+        | (1u32 << 7)    // Supports crypt layer
+        | (1u32 << 5)    // Extended multi-packet
+        | (1u32 << 4);   // Large files (>4GB)
 
     let tags: Vec<(&[u8], Ed2kTagValue)> = vec![
         (&[0x21], Ed2kTagValue::Uint16(udp_port)),       // ET_UDPPORT

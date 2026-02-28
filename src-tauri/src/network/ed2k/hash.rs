@@ -21,23 +21,24 @@ pub fn ed2k_hash_file(path: &Path) -> anyhow::Result<String> {
         return Ok(hex::encode(hash));
     }
 
-    let num_chunks = (file_size + PARTSIZE - 1) / PARTSIZE;
-
-    if num_chunks == 1 {
+    // eMule ED2K hash rules (KnownFile.cpp:597-602):
+    //   file_size < PARTSIZE:       hash = MD4(data)            (single part, no part hashes)
+    //   file_size == PARTSIZE:      hash = MD4(MD4(data) + MD4(""))  (1 data part + 1 empty part)
+    //   file_size == n*PARTSIZE:    hash = MD4(part_hashes + MD4("")) (n data parts + trailing empty)
+    //   file_size > PARTSIZE (not multiple): hash = MD4(part_hashes)
+    if file_size > 0 && file_size < PARTSIZE {
         let mut hasher = Md4::new();
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
+            if n == 0 { break; }
             hasher.update(&buf[..n]);
         }
         return Ok(hex::encode(hasher.finalize()));
     }
 
-    // Multiple chunks: hash each chunk with MD4, then hash the concatenated chunk hashes.
-    let mut chunk_hashes = Vec::with_capacity(num_chunks as usize);
+    let num_chunks = (file_size + PARTSIZE - 1) / PARTSIZE;
+    let mut chunk_hashes = Vec::with_capacity((num_chunks as usize + 1) * 16);
     let mut remaining = file_size;
     let mut buf = vec![0u8; 64 * 1024];
 
@@ -45,19 +46,21 @@ pub fn ed2k_hash_file(path: &Path) -> anyhow::Result<String> {
         let chunk_size = remaining.min(PARTSIZE);
         let mut hasher = Md4::new();
         let mut chunk_remaining = chunk_size;
-
         while chunk_remaining > 0 {
             let to_read = (chunk_remaining as usize).min(buf.len());
             let n = file.read(&mut buf[..to_read])?;
-            if n == 0 {
-                break;
-            }
+            if n == 0 { break; }
             hasher.update(&buf[..n]);
             chunk_remaining -= n as u64;
         }
-
         chunk_hashes.extend_from_slice(&hasher.finalize());
         remaining -= chunk_size;
+    }
+
+    // eMule appends MD4(empty) when file size is an exact multiple of PARTSIZE
+    if file_size % PARTSIZE == 0 {
+        let empty_hash = Md4::digest([]);
+        chunk_hashes.extend_from_slice(&empty_hash);
     }
 
     let final_hash = Md4::digest(&chunk_hashes);
@@ -70,15 +73,19 @@ pub fn ed2k_hash_bytes(data: &[u8]) -> String {
         return hex::encode(Md4::digest([]));
     }
 
-    let num_chunks = (file_size + PARTSIZE - 1) / PARTSIZE;
-
-    if num_chunks == 1 {
+    if file_size > 0 && file_size < PARTSIZE {
         return hex::encode(Md4::digest(data));
     }
 
-    let mut chunk_hashes = Vec::with_capacity(num_chunks as usize * 16);
+    let num_chunks = (file_size + PARTSIZE - 1) / PARTSIZE;
+    let mut chunk_hashes = Vec::with_capacity((num_chunks as usize + 1) * 16);
     for chunk in data.chunks(PARTSIZE as usize) {
         chunk_hashes.extend_from_slice(&Md4::digest(chunk));
+    }
+
+    if file_size % PARTSIZE == 0 {
+        let empty_hash = Md4::digest([]);
+        chunk_hashes.extend_from_slice(&empty_hash);
     }
 
     hex::encode(Md4::digest(&chunk_hashes))
