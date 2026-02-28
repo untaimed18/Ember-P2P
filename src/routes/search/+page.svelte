@@ -1,6 +1,6 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles, parseEd2kLink, findNotes, publishNote, type SearchMethod } from '$lib/api/search';
+  import { searchFiles, cancelSearch, parseEd2kLink, findNotes, publishNote, type SearchMethod } from '$lib/api/search';
   import { startDownload } from '$lib/api/transfers';
   import { searchResults, searchQuery, isSearching, searchProgress, newSearchNonce } from '$lib/stores/search';
   import type { SearchResult } from '$lib/types';
@@ -138,8 +138,26 @@
     try {
       const results = await searchFiles(query, searchMethod);
       if (results && results.length > 0) {
-        $searchResults = results;
+        searchResults.update((existing) => {
+          const merged = [...existing];
+          for (const result of results) {
+            const idx = merged.findIndex(
+              (r) => r.file.hash === result.file.hash
+            );
+            if (idx >= 0) {
+              if (result.availability > merged[idx].availability) {
+                merged[idx] = result;
+              }
+            } else {
+              merged.push(result);
+            }
+          }
+          return merged;
+        });
       }
+      $isSearching = false;
+      $searchProgress = null;
+      if (searchTimeout) { clearTimeout(searchTimeout); searchTimeout = null; }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Search failed';
       searchError = msg;
@@ -147,6 +165,17 @@
       $isSearching = false;
       $searchProgress = null;
       if (searchTimeout) { clearTimeout(searchTimeout); searchTimeout = null; }
+    }
+  }
+
+  async function stopSearch() {
+    $isSearching = false;
+    $searchProgress = null;
+    if (searchTimeout) { clearTimeout(searchTimeout); searchTimeout = null; }
+    try {
+      await cancelSearch();
+    } catch (e) {
+      console.error('Failed to cancel search:', e);
     }
   }
 
@@ -282,9 +311,11 @@
       title="Search KAD network only"
     >KAD</button>
   </div>
-  <button onclick={() => handleSearch($searchQuery)} disabled={$isSearching}>
-    {$isSearching ? 'Searching...' : 'Search'}
-  </button>
+  {#if $isSearching}
+    <button class="stop-btn" onclick={stopSearch}>Stop</button>
+  {:else}
+    <button onclick={() => handleSearch($searchQuery)}>Search</button>
+  {/if}
 </div>
 
 <div class="ed2k-bar">
@@ -388,13 +419,7 @@
       <button class="ghost" onclick={() => searchError = null}>Dismiss</button>
     </div>
   {/if}
-  {#if $searchResults.length === 0 && !$isSearching}
-    <div class="empty-state">
-      <div class="icon">&#x2315;</div>
-      <p>Search for files across the P2P network</p>
-      <p class="hint">Enter a query and press Enter or click Search</p>
-    </div>
-  {:else if $isSearching}
+  {#if $isSearching && $searchResults.length === 0}
     <div class="empty-state">
       <p>Searching the network...</p>
       {#if $searchProgress}
@@ -407,9 +432,18 @@
         </p>
       {/if}
     </div>
+  {:else if $searchResults.length === 0 && !$isSearching}
+    <div class="empty-state">
+      <div class="icon">&#x2315;</div>
+      <p>Search for files across the P2P network</p>
+      <p class="hint">Enter a query and press Enter or click Search</p>
+    </div>
   {:else}
     <div class="results-info">
       <span>
+        {#if $isSearching}
+          <span class="searching-indicator">Searching...</span>
+        {/if}
         {#if hasActiveFilters}
           Showing {filteredResults.length} of {$searchResults.length} results
         {:else}
@@ -723,6 +757,36 @@
   .source-count.high-sources {
     background: var(--accent-dim);
     color: var(--text-accent);
+  }
+
+  .stop-btn {
+    background: var(--danger, #e74c3c);
+    color: #fff;
+    border: none;
+    border-radius: var(--radius-md);
+    padding: 6px 18px;
+    font-weight: 600;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .stop-btn:hover {
+    opacity: 0.85;
+  }
+
+  .searching-indicator {
+    color: var(--accent);
+    font-weight: 600;
+    margin-right: 8px;
+  }
+
+  @keyframes pulse-opacity {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  .searching-indicator {
+    animation: pulse-opacity 1.5s ease-in-out infinite;
   }
 
   .hint, .search-detail {

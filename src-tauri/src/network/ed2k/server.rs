@@ -243,28 +243,21 @@ impl Ed2kServerConnection {
         }
     }
 
-    pub async fn search(&mut self, query: &str) -> anyhow::Result<Vec<ServerSearchResult>> {
+    /// Send a search request to the server (non-blocking).
+    /// The result will arrive later via `poll_messages()` as `ServerEvent::SearchResult`.
+    pub async fn send_search(&mut self, query: &str) -> anyhow::Result<()> {
         let payload = build_search_request(query);
         self.write_packet(OP_SEARCHREQUEST, &payload).await?;
-
-        let mut results = Vec::new();
-        let (opcode, payload) = self.read_packet().await?;
-        if opcode == OP_SEARCHRESULT {
-            results = parse_search_result(&payload)?;
-        }
-        Ok(results)
+        Ok(())
     }
 
-    pub async fn get_sources(&mut self, file_hash: &[u8; 16]) -> anyhow::Result<Vec<ServerSource>> {
+    /// Send a source request to the server (non-blocking).
+    /// The result will arrive later via `poll_messages()` as `ServerEvent::FoundSources`.
+    pub async fn send_get_sources(&mut self, file_hash: &[u8; 16]) -> anyhow::Result<()> {
         let mut payload = Vec::with_capacity(16);
         payload.extend_from_slice(file_hash);
         self.write_packet(OP_GETSOURCES, &payload).await?;
-
-        let (opcode, resp) = self.read_packet().await?;
-        if opcode == OP_FOUNDSOURCES {
-            return parse_found_sources(&resp);
-        }
-        Ok(Vec::new())
+        Ok(())
     }
 
     pub async fn keep_alive(&mut self) -> anyhow::Result<()> {
@@ -286,50 +279,10 @@ impl Ed2kServerConnection {
     }
 
     pub async fn poll_messages(&mut self) -> Vec<ServerEvent> {
-        let mut events = Vec::new();
         match self.poll_read_packet().await {
-            Some((opcode, payload)) => {
-                match opcode {
-                    OP_CALLBACKREQUESTED => {
-                        if payload.len() >= 6 {
-                            let ip = std::net::Ipv4Addr::from(u32::from_le_bytes([
-                                payload[0], payload[1], payload[2], payload[3],
-                            ]).to_be_bytes());
-                            let port = u16::from_le_bytes([payload[4], payload[5]]);
-                            info!("Callback requested: connect to {ip}:{port}");
-                            events.push(ServerEvent::CallbackRequested { ip: ip.to_string(), port });
-                        }
-                    }
-                    OP_CALLBACK_FAIL => {
-                        debug!("Server reported callback failure");
-                        events.push(ServerEvent::CallbackFailed);
-                    }
-                    OP_SERVERMESSAGE => {
-                        if payload.len() >= 2 {
-                            let len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-                            if payload.len() >= 2 + len {
-                                let msg = String::from_utf8_lossy(&payload[2..2 + len]).to_string();
-                                events.push(ServerEvent::Message(msg));
-                            }
-                        }
-                    }
-                    OP_SERVERSTATUS => {
-                        if payload.len() >= 8 {
-                            let users = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                            let files = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                            events.push(ServerEvent::StatusUpdate { users, files });
-                        }
-                    }
-                    OP_SERVERLIST => {
-                        debug!("Got server list from server ({} bytes)", payload.len());
-                        events.push(ServerEvent::ServerList { data: payload });
-                    }
-                    _ => {}
-                }
-            }
-            None => {}
+            Some((opcode, payload)) => parse_server_event(opcode, &payload),
+            None => Vec::new(),
         }
-        events
     }
 
     pub fn is_low_id(&self) -> bool {
@@ -368,6 +321,74 @@ pub enum ServerEvent {
     Message(String),
     StatusUpdate { users: u32, files: u32 },
     ServerList { data: Vec<u8> },
+    SearchResult { results: Vec<ServerSearchResult> },
+    FoundSources { sources: Vec<ServerSource> },
+}
+
+fn parse_server_event(opcode: u8, payload: &[u8]) -> Vec<ServerEvent> {
+    let mut events = Vec::new();
+    match opcode {
+        OP_CALLBACKREQUESTED => {
+            if payload.len() >= 6 {
+                let ip = std::net::Ipv4Addr::from(u32::from_le_bytes([
+                    payload[0], payload[1], payload[2], payload[3],
+                ]).to_be_bytes());
+                let port = u16::from_le_bytes([payload[4], payload[5]]);
+                info!("Callback requested: connect to {ip}:{port}");
+                events.push(ServerEvent::CallbackRequested { ip: ip.to_string(), port });
+            }
+        }
+        OP_CALLBACK_FAIL => {
+            debug!("Server reported callback failure");
+            events.push(ServerEvent::CallbackFailed);
+        }
+        OP_SERVERMESSAGE => {
+            if payload.len() >= 2 {
+                let len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+                if payload.len() >= 2 + len {
+                    let msg = String::from_utf8_lossy(&payload[2..2 + len]).to_string();
+                    events.push(ServerEvent::Message(msg));
+                }
+            }
+        }
+        OP_SERVERSTATUS => {
+            if payload.len() >= 8 {
+                let users = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let files = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                events.push(ServerEvent::StatusUpdate { users, files });
+            }
+        }
+        OP_SERVERLIST => {
+            debug!("Got server list from server ({} bytes)", payload.len());
+            events.push(ServerEvent::ServerList { data: payload.to_vec() });
+        }
+        OP_SEARCHRESULT => {
+            match parse_search_result(payload) {
+                Ok(results) => {
+                    debug!("Server search result: {} files", results.len());
+                    events.push(ServerEvent::SearchResult { results });
+                }
+                Err(e) => {
+                    debug!("Failed to parse search result: {e}");
+                }
+            }
+        }
+        OP_FOUNDSOURCES => {
+            match parse_found_sources(payload) {
+                Ok(sources) => {
+                    debug!("Server found {} sources", sources.len());
+                    events.push(ServerEvent::FoundSources { sources });
+                }
+                Err(e) => {
+                    debug!("Failed to parse found sources: {e}");
+                }
+            }
+        }
+        _ => {
+            debug!("Ignoring server opcode 0x{opcode:02X}");
+        }
+    }
+    events
 }
 
 // CT_SERVER_FLAGS capability bits (from eMule Opcodes.h)
@@ -439,6 +460,167 @@ fn build_search_request(query: &str) -> Vec<u8> {
     buf
 }
 
+/// Read one eMule-style tag (supports both old and "new tags" compressed format).
+/// Returns (name_id, tag_type, was read successfully).
+fn read_tag_header(cursor: &mut Cursor<&[u8]>) -> Option<(u8, u8)> {
+    let raw_type = ReadBytesExt::read_u8(cursor).ok()?;
+
+    if raw_type & 0x80 != 0 {
+        // New tag format: high bit set → single-byte name follows, type is low 7 bits
+        let tag_type = raw_type & 0x7F;
+        let name_id = ReadBytesExt::read_u8(cursor).ok()?;
+        Some((name_id, tag_type))
+    } else {
+        // Old format: u16 name length + name bytes
+        let name_len = ReadBytesExt::read_u16::<LittleEndian>(cursor).ok()? as usize;
+        let name_id = if name_len == 1 {
+            ReadBytesExt::read_u8(cursor).ok()?
+        } else {
+            let mut name_buf = vec![0u8; name_len];
+            Read::read_exact(cursor, &mut name_buf).ok()?;
+            0u8
+        };
+        Some((name_id, raw_type))
+    }
+}
+
+/// Read and skip a tag value, extracting file metadata we care about.
+/// Handles all eMule tag types including TAGTYPE_STR1..STR16 (0x11..0x20).
+fn read_tag_value(
+    cursor: &mut Cursor<&[u8]>,
+    tag_type: u8,
+    name_id: u8,
+    file_name: &mut String,
+    file_size: &mut u64,
+    source_count: &mut u32,
+    complete_sources: &mut u32,
+) -> bool {
+    match tag_type {
+        // TAGTYPE_HASH (0x01)
+        0x01 => {
+            let mut buf = [0u8; 16];
+            Read::read_exact(cursor, &mut buf).is_ok()
+        }
+        // TAGTYPE_STRING (0x02)
+        0x02 => {
+            let slen = match ReadBytesExt::read_u16::<LittleEndian>(cursor) {
+                Ok(v) => v as usize,
+                Err(_) => return false,
+            };
+            let mut sbuf = vec![0u8; slen.min(8192)];
+            if Read::read_exact(cursor, &mut sbuf).is_err() {
+                return false;
+            }
+            if name_id == 0x01 { // FT_FILENAME
+                *file_name = String::from_utf8_lossy(&sbuf).to_string();
+            }
+            true
+        }
+        // TAGTYPE_UINT32 (0x03)
+        0x03 => {
+            let v = match ReadBytesExt::read_u32::<LittleEndian>(cursor) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            match name_id {
+                0x02 => *file_size = v as u64,     // FT_FILESIZE
+                0x15 => *source_count = v,          // FT_SOURCES
+                0x30 => *complete_sources = v,      // FT_COMPLETE_SOURCES
+                _ => {}
+            }
+            true
+        }
+        // TAGTYPE_FLOAT32 (0x04)
+        0x04 => {
+            let mut buf = [0u8; 4];
+            Read::read_exact(cursor, &mut buf).is_ok()
+        }
+        // TAGTYPE_BOOL (0x05)
+        0x05 => {
+            let _ = ReadBytesExt::read_u8(cursor);
+            true
+        }
+        // TAGTYPE_BLOB (0x07)
+        0x07 => {
+            if let Ok(blob_len) = ReadBytesExt::read_u32::<LittleEndian>(cursor) {
+                let skip = blob_len.min(1_000_000) as usize;
+                let pos = cursor.position() as usize;
+                let len = cursor.get_ref().len();
+                if pos + skip <= len {
+                    cursor.set_position((pos + skip) as u64);
+                    return true;
+                }
+            }
+            false
+        }
+        // TAGTYPE_UINT16 (0x08)
+        0x08 => {
+            if let Ok(v) = ReadBytesExt::read_u16::<LittleEndian>(cursor) {
+                match name_id {
+                    0x02 => *file_size = v as u64,
+                    0x15 => *source_count = v as u32,
+                    0x30 => *complete_sources = v as u32,
+                    _ => {}
+                }
+                true
+            } else {
+                false
+            }
+        }
+        // TAGTYPE_UINT8 (0x09)
+        0x09 => {
+            if let Ok(v) = ReadBytesExt::read_u8(cursor) {
+                match name_id {
+                    0x02 => *file_size = v as u64,
+                    0x15 => *source_count = v as u32,
+                    0x30 => *complete_sources = v as u32,
+                    _ => {}
+                }
+                true
+            } else {
+                false
+            }
+        }
+        // TAGTYPE_BSOB (0x0A)
+        0x0A => {
+            if let Ok(bsob_len) = ReadBytesExt::read_u8(cursor) {
+                let skip = bsob_len as usize;
+                let pos = cursor.position() as usize;
+                let len = cursor.get_ref().len();
+                if pos + skip <= len {
+                    cursor.set_position((pos + skip) as u64);
+                    return true;
+                }
+            }
+            false
+        }
+        // TAGTYPE_UINT64 (0x0B)
+        0x0B => {
+            if let Ok(v) = ReadBytesExt::read_u64::<LittleEndian>(cursor) {
+                if name_id == 0x02 { // FT_FILESIZE
+                    *file_size = v;
+                }
+                true
+            } else {
+                false
+            }
+        }
+        // TAGTYPE_STR1..TAGTYPE_STR16 (0x11..0x20) — string with length embedded in type
+        t if (0x11..=0x20).contains(&t) => {
+            let slen = (t - 0x11 + 1) as usize;
+            let mut sbuf = vec![0u8; slen];
+            if Read::read_exact(cursor, &mut sbuf).is_err() {
+                return false;
+            }
+            if name_id == 0x01 { // FT_FILENAME
+                *file_name = String::from_utf8_lossy(&sbuf).to_string();
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 fn parse_search_result(payload: &[u8]) -> anyhow::Result<Vec<ServerSearchResult>> {
     let mut cursor = Cursor::new(payload);
     let count = ReadBytesExt::read_u32::<LittleEndian>(&mut cursor)? as usize;
@@ -459,33 +641,15 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<Vec<ServerSearchResult>
         let mut complete_sources: u32 = 0;
 
         for _ in 0..tag_count {
-            let tag_type = ReadBytesExt::read_u8(&mut cursor).unwrap_or(0);
-            let name_len = ReadBytesExt::read_u16::<LittleEndian>(&mut cursor).unwrap_or(0) as usize;
-            let mut name_buf = vec![0u8; name_len];
-            let _ = Read::read_exact(&mut cursor, &mut name_buf);
-            let name_id = if name_len == 1 { name_buf[0] } else { 0 };
-
-            match tag_type {
-                0x02 => {
-                    let slen = ReadBytesExt::read_u16::<LittleEndian>(&mut cursor).unwrap_or(0) as usize;
-                    let mut sbuf = vec![0u8; slen];
-                    let _ = Read::read_exact(&mut cursor, &mut sbuf);
-                    if name_id == 0x01 {
-                        file_name = String::from_utf8_lossy(&sbuf).to_string();
-                    }
-                }
-                0x03 => {
-                    let v = ReadBytesExt::read_u32::<LittleEndian>(&mut cursor).unwrap_or(0);
-                    match name_id {
-                        0x02 => file_size = v as u64,
-                        0x15 => source_count = v,
-                        0x30 => complete_sources = v,
-                        _ => {}
-                    }
-                }
-                0x08 => { let _ = ReadBytesExt::read_u16::<LittleEndian>(&mut cursor); }
-                0x09 => { let _ = ReadBytesExt::read_u8(&mut cursor); }
-                _ => break,
+            let (name_id, tag_type) = match read_tag_header(&mut cursor) {
+                Some(v) => v,
+                None => break,
+            };
+            if !read_tag_value(
+                &mut cursor, tag_type, name_id,
+                &mut file_name, &mut file_size, &mut source_count, &mut complete_sources,
+            ) {
+                break;
             }
         }
 

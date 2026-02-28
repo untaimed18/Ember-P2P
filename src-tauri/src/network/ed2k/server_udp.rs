@@ -199,31 +199,89 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
         let mut file_size: u64 = 0;
 
         for _ in 0..tag_count.min(50) {
-            let tag_type = cursor.read_u8().ok()?;
-            let name_len = cursor.read_u16::<LittleEndian>().ok()? as usize;
-            let mut name_buf = vec![0u8; name_len];
-            std::io::Read::read_exact(&mut cursor, &mut name_buf).ok()?;
-            let name_id = if name_len == 1 { name_buf[0] } else { 0 };
+            let raw_type = cursor.read_u8().ok()?;
+            let (name_id, tag_type) = if raw_type & 0x80 != 0 {
+                let t = raw_type & 0x7F;
+                let n = cursor.read_u8().ok()?;
+                (n, t)
+            } else {
+                let name_len = cursor.read_u16::<LittleEndian>().ok()? as usize;
+                let n = if name_len == 1 {
+                    cursor.read_u8().ok()?
+                } else {
+                    let mut name_buf = vec![0u8; name_len];
+                    std::io::Read::read_exact(&mut cursor, &mut name_buf).ok()?;
+                    0u8
+                };
+                (n, raw_type)
+            };
 
-            match tag_type {
-                0x02 => {
-                    let slen = cursor.read_u16::<LittleEndian>().ok()? as usize;
-                    let mut sbuf = vec![0u8; slen.min(4096)];
-                    std::io::Read::read_exact(&mut cursor, &mut sbuf).ok()?;
-                    if name_id == 0x01 {
-                        file_name = String::from_utf8_lossy(&sbuf).to_string();
-                    }
+            let ok = match tag_type {
+                0x01 => { // TAGTYPE_HASH
+                    let mut buf = [0u8; 16];
+                    std::io::Read::read_exact(&mut cursor, &mut buf).is_ok()
                 }
-                0x03 => {
-                    let v = cursor.read_u32::<LittleEndian>().ok()?;
-                    if name_id == 0x02 {
-                        file_size = v as u64;
-                    }
+                0x02 => { // TAGTYPE_STRING
+                    let slen = cursor.read_u16::<LittleEndian>().ok().unwrap_or(0) as usize;
+                    let mut sbuf = vec![0u8; slen.min(8192)];
+                    if std::io::Read::read_exact(&mut cursor, &mut sbuf).is_ok() {
+                        if name_id == 0x01 {
+                            file_name = String::from_utf8_lossy(&sbuf).to_string();
+                        }
+                        true
+                    } else { false }
                 }
-                0x08 => { let _ = cursor.read_u16::<LittleEndian>(); }
-                0x09 => { let _ = cursor.read_u8(); }
-                _ => break,
-            }
+                0x03 => { // TAGTYPE_UINT32
+                    if let Ok(v) = cursor.read_u32::<LittleEndian>() {
+                        if name_id == 0x02 { file_size = v as u64; }
+                        true
+                    } else { false }
+                }
+                0x04 => { let mut b = [0u8; 4]; std::io::Read::read_exact(&mut cursor, &mut b).is_ok() }
+                0x05 => { let _ = cursor.read_u8(); true }
+                0x07 => { // TAGTYPE_BLOB
+                    if let Ok(bl) = cursor.read_u32::<LittleEndian>() {
+                        let pos = cursor.position() as usize + bl.min(1_000_000) as usize;
+                        if pos <= payload.len() { cursor.set_position(pos as u64); true }
+                        else { false }
+                    } else { false }
+                }
+                0x08 => { // TAGTYPE_UINT16
+                    if let Ok(v) = cursor.read_u16::<LittleEndian>() {
+                        if name_id == 0x02 { file_size = v as u64; }
+                        true
+                    } else { false }
+                }
+                0x09 => { // TAGTYPE_UINT8
+                    if let Ok(v) = cursor.read_u8() {
+                        if name_id == 0x02 { file_size = v as u64; }
+                        true
+                    } else { false }
+                }
+                0x0A => { // TAGTYPE_BSOB
+                    if let Ok(bl) = cursor.read_u8() {
+                        let pos = cursor.position() as usize + bl as usize;
+                        if pos <= payload.len() { cursor.set_position(pos as u64); true }
+                        else { false }
+                    } else { false }
+                }
+                0x0B => { // TAGTYPE_UINT64
+                    if let Ok(v) = cursor.read_u64::<LittleEndian>() {
+                        if name_id == 0x02 { file_size = v; }
+                        true
+                    } else { false }
+                }
+                t if (0x11..=0x20).contains(&t) => { // TAGTYPE_STR1..STR16
+                    let slen = (t - 0x11 + 1) as usize;
+                    let mut sbuf = vec![0u8; slen];
+                    if std::io::Read::read_exact(&mut cursor, &mut sbuf).is_ok() {
+                        if name_id == 0x01 { file_name = String::from_utf8_lossy(&sbuf).to_string(); }
+                        true
+                    } else { false }
+                }
+                _ => false,
+            };
+            if !ok { break; }
         }
 
         results.push(ServerSearchResult {

@@ -127,6 +127,7 @@ pub enum NetworkCommand {
         rating: u8,
         comment: String,
     },
+    CancelSearch,
     BootstrapContacts {
         contacts: Vec<kad::types::KadContact>,
     },
@@ -223,6 +224,13 @@ struct NetworkState {
     dht_store: DhtStore,
     stats: NetworkStats,
     pending_keyword_searches: HashMap<SearchId, (oneshot::Sender<Vec<SearchResult>>, Vec<SearchResult>)>,
+    /// Pending server TCP search: when we send OP_SEARCHREQUEST, store the results here
+    /// until poll_messages() delivers OP_SEARCHRESULT.
+    pending_server_search: Option<(oneshot::Sender<Vec<SearchResult>>, Vec<SearchResult>, SearchMethod)>,
+    /// Counter for throttling server keep-alive (sent every N poll ticks)
+    server_poll_count: u32,
+    /// Counter for pending server search timeout (in poll ticks)
+    server_search_age: u32,
     pending_source_searches: HashMap<SearchId, oneshot::Sender<Vec<(String, u16)>>>,
     /// Source searches tied to pending downloads (search_id -> transfer_id)
     download_source_searches: HashMap<SearchId, String>,
@@ -497,6 +505,9 @@ pub async fn start_network(
             ..Default::default()
         },
         pending_keyword_searches: HashMap::new(),
+        pending_server_search: None,
+        server_poll_count: 0,
+        server_search_age: 0,
         pending_source_searches: HashMap::new(),
         download_source_searches: HashMap::new(),
         pending_downloads: HashMap::new(),
@@ -707,7 +718,7 @@ pub async fn start_network(
     credit_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut a4af_timer = tokio::time::interval(std::time::Duration::from_secs(480));
     a4af_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut server_timer = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut server_timer = tokio::time::interval(std::time::Duration::from_secs(2));
     server_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let initial_ping_interval = 15u64.min(ed2k::server_udp::STAT_REASK_INTERVAL_SECS as u64);
     let _ = ed2k::server_udp::SOURCE_UDP_INTERVAL_SECS;
@@ -2000,6 +2011,70 @@ pub async fn start_network(
                                             &addr.ip().to_string(), addr.port(), users, files,
                                         );
                                     }
+                                    if let Some(session) = conn.session.as_mut() {
+                                        session.user_count = users;
+                                        session.file_count = files;
+                                    }
+                                }
+                                ed2k::server::ServerEvent::SearchResult { results } => {
+                                    let count = results.len();
+                                    info!("Server returned {count} search results via poll");
+                                    let search_results: Vec<SearchResult> = results.iter().map(|sr| {
+                                        let hash_hex = hex::encode(sr.file_hash);
+                                        SearchResult {
+                                            file: FileInfo {
+                                                id: hash_hex.clone(),
+                                                name: sr.file_name.clone(),
+                                                path: String::new(),
+                                                size: sr.file_size,
+                                                hash: hash_hex,
+                                                aich_hash: String::new(),
+                                                extension: String::new(),
+                                                modified_at: 0,
+                                                priority: "normal".to_string(),
+                                                requests: 0,
+                                                accepted: 0,
+                                                bytes_transferred: 0,
+                                                complete_sources: sr.complete_source_count,
+                                                folder: String::new(),
+                                                shared_kad: false,
+                                            },
+                                            peer_id: String::new(),
+                                            peer_name: String::new(),
+                                            availability: sr.source_count,
+                                            file_type: String::new(),
+                                            source_addresses: Vec::new(),
+                                            rating: None,
+                                            comment: None,
+                                        }
+                                    }).collect();
+
+                                    if let Some((tx, mut local, _)) = state.pending_server_search.take() {
+                                        local.extend(search_results);
+                                        let _ = tx.send(local);
+                                        app_handle.emit("search-complete", ()).ok();
+                                    } else if !search_results.is_empty() {
+                                        let _ = app_handle.emit("search-results", &search_results);
+                                    }
+                                }
+                                ed2k::server::ServerEvent::FoundSources { sources } => {
+                                    if !sources.is_empty() {
+                                        info!("Server found {} sources via poll", sources.len());
+                                        let mut sm = source_manager.write().await;
+                                        for src in &sources {
+                                            if let Ok(v4) = src.ip.parse::<Ipv4Addr>() {
+                                                for (_hash, pd) in &state.pending_downloads {
+                                                    if let Ok(hash_bytes) = hex::decode(&pd.file_hash) {
+                                                        if hash_bytes.len() >= 16 {
+                                                            let mut fh = [0u8; 16];
+                                                            fh.copy_from_slice(&hash_bytes[..16]);
+                                                            sm.register_source(fh, v4, src.port);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 ed2k::server::ServerEvent::Message(msg) => {
                                     info!("Server message: {msg}");
@@ -2027,14 +2102,36 @@ pub async fn start_network(
                             }
                         }
 
-                        if let Err(e) = conn.keep_alive().await {
-                            warn!("Server keep-alive failed: {e}");
-                            state.server_connected = false;
-                            state.server_connection = None;
-                            state.server_addr = None;
+                        state.server_poll_count += 1;
+                        if state.server_poll_count >= 30 {
+                            state.server_poll_count = 0;
+                            if let Err(e) = conn.keep_alive().await {
+                                warn!("Server keep-alive failed: {e}");
+                                state.server_connected = false;
+                                state.server_connection = None;
+                                state.server_addr = None;
+                            }
                         }
                     }
-                } else if state.pending_server_connect.is_none()
+                }
+
+                // Timeout pending server search after 30 seconds
+                if let Some((_, _, _)) = &state.pending_server_search {
+                    state.server_search_age += 1;
+                    if state.server_search_age > 15 {
+                        if let Some((tx, results, _)) = state.pending_server_search.take() {
+                            info!("Server search timed out, returning {} local results", results.len());
+                            let _ = tx.send(results);
+                            app_handle.emit("search-complete", ()).ok();
+                        }
+                        state.server_search_age = 0;
+                    }
+                } else {
+                    state.server_search_age = 0;
+                }
+
+                if !state.server_connected
+                    && state.pending_server_connect.is_none()
                     && !state.server_list.is_empty()
                     && state.server_connection.is_none()
                 {
@@ -3639,51 +3736,15 @@ async fn handle_command(
             let use_kad = method == SearchMethod::Global || method == SearchMethod::Kad;
 
             let index = local_index.read().await;
-            let mut local_results = index.search(&query);
+            let local_results = index.search(&query);
 
             if use_server {
                 if state.server_connected {
                     if let Some(conn) = &mut state.server_connection {
-                        match conn.search(&query).await {
-                            Ok(server_results) => {
-                                let count = server_results.len();
-                                for sr in server_results {
-                                    let hash_hex = hex::encode(sr.file_hash);
-                                    if !local_results.iter().any(|r| r.file.hash == hash_hex) {
-                                        local_results.push(SearchResult {
-                                            file: FileInfo {
-                                                id: hash_hex.clone(),
-                                                name: sr.file_name.clone(),
-                                                path: String::new(),
-                                                size: sr.file_size,
-                                                hash: hash_hex,
-                                                aich_hash: String::new(),
-                                                extension: String::new(),
-                                                modified_at: 0,
-                                                priority: "normal".to_string(),
-                                                requests: 0,
-                                                accepted: 0,
-                                                bytes_transferred: 0,
-                                                complete_sources: sr.complete_source_count,
-                                                folder: String::new(),
-                                                shared_kad: false,
-                                            },
-                                            peer_id: String::new(),
-                                            peer_name: String::new(),
-                                            availability: sr.source_count,
-                                            file_type: String::new(),
-                                            source_addresses: Vec::new(),
-                                            rating: None,
-                                            comment: None,
-                                        });
-                                    }
-                                }
-                                info!("Merged {count} server search results");
-                                stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::Server, 256);
-                            }
-                            Err(e) => {
-                                debug!("Server search failed: {e}");
-                            }
+                        if let Err(e) = conn.send_search(&query).await {
+                            debug!("Server search send failed: {e}");
+                        } else {
+                            info!("Sent search request to server");
                         }
                     }
                 }
@@ -3700,8 +3761,14 @@ async fn handle_command(
             }
 
             if !use_kad {
-                let _ = tx.send(local_results);
-                app_handle.emit("search-complete", ()).ok();
+                // For server-only search: store the pending tx so poll_messages()
+                // can deliver the OP_SEARCHRESULT when it arrives.
+                if use_server && state.server_connected {
+                    state.pending_server_search = Some((tx, local_results, method));
+                } else {
+                    let _ = tx.send(local_results);
+                    app_handle.emit("search-complete", ()).ok();
+                }
                 return;
             }
 
@@ -3736,6 +3803,24 @@ async fn handle_command(
                 return;
             }
             state.pending_keyword_searches.insert(sid, (tx, local_results));
+        }
+
+        NetworkCommand::CancelSearch => {
+            let cancelled: Vec<_> = state.pending_keyword_searches.keys().cloned().collect();
+            for sid in &cancelled {
+                if let Some(search) = state.search_manager.get_mut(sid) {
+                    search.completed = true;
+                }
+                if let Some((tx, results)) = state.pending_keyword_searches.remove(sid) {
+                    let _ = tx.send(results);
+                }
+                state.search_manager.remove(sid);
+            }
+            if let Some((tx, results, _)) = state.pending_server_search.take() {
+                let _ = tx.send(results);
+            }
+            info!("Cancelled {} active keyword searches", cancelled.len());
+            app_handle.emit("search-complete", ()).ok();
         }
 
         NetworkCommand::StartDownload {
@@ -3857,27 +3942,13 @@ async fn handle_command(
                     }
                 }
 
-                // Also request sources from the connected ed2k server
+                // Also request sources from the connected ed2k server (non-blocking)
                 if state.server_connected {
                     if let Some(conn) = &mut state.server_connection {
                         let mut file_hash_arr = [0u8; 16];
                         file_hash_arr.copy_from_slice(&hash_bytes);
-                        match conn.get_sources(&file_hash_arr).await {
-                            Ok(server_sources) => {
-                                if !server_sources.is_empty() {
-                                    info!("Server returned {} sources for {}", server_sources.len(), file_hash);
-                                    stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::SourceExchange, 128);
-                                    let mut sm = source_manager.write().await;
-                                    for src in &server_sources {
-                                        if let Ok(v4) = src.ip.parse::<Ipv4Addr>() {
-                                            sm.register_source(file_hash_arr, v4, src.port);
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                debug!("Server source request failed: {e}");
-                            }
+                        if let Err(e) = conn.send_get_sources(&file_hash_arr).await {
+                            debug!("Server source request send failed: {e}");
                         }
                     }
                 }

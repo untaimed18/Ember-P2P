@@ -113,6 +113,17 @@ pub async fn publish_note(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn cancel_search(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .network_tx
+        .try_send(NetworkCommand::CancelSearch)
+        .map_err(|e| format!("Network busy: {e}"))?;
+    Ok(())
+}
+
 /// Compute the ed2k hash of raw bytes (for in-memory content)
 #[tauri::command]
 pub fn compute_ed2k_hash(data: Vec<u8>) -> Result<String, String> {

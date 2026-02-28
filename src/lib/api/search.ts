@@ -7,6 +7,10 @@ export async function searchFiles(query: string, method: SearchMethod = 'global'
   return invoke('search_files', { query, method });
 }
 
+export async function cancelSearch(): Promise<void> {
+  return invoke('cancel_search');
+}
+
 export async function formatEd2kLink(name: string, size: number, fileHash: string): Promise<string> {
   return invoke('format_ed2k_link', { name, size, fileHash });
 }

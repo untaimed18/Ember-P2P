@@ -187,6 +187,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::search::search_files,
+            commands::search::cancel_search,
             commands::search::find_notes,
             commands::search::find_sources,
             commands::search::compute_ed2k_hash,
