@@ -138,12 +138,16 @@ impl MultiSourceDownload {
             Arc::new(RwLock::new(cs))
         };
 
-        // Pre-assign initial parts to each source using rarest-first,
-        // but each source also dynamically selects more parts as it finishes.
+        // Pre-assign initial parts to each source using rarest-first.
+        // eMule-style: when there are more sources than parts, allow multiple
+        // sources to compete for the same part (first to finish wins).
+        // Cap at MAX_SOURCES_PER_PART to avoid excessive connections.
+        const MAX_SOURCES_PER_PART: usize = 5;
         let mut source_parts: Vec<Vec<usize>> = vec![Vec::new(); self.sources.len()];
         {
             let cs = chunk_selector.read().await;
             let mut assigned: Vec<bool> = vec![false; part_count];
+            let mut part_source_count: Vec<usize> = vec![0; part_count];
             let mut active: Vec<usize> = Vec::new();
 
             {
@@ -156,7 +160,7 @@ impl MultiSourceDownload {
                 }
             }
 
-            // Give each source one initial part via rarest-first
+            // First pass: unique part per source where possible (rarest-first)
             for src_idx in 0..self.sources.len() {
                 let src = &self.sources[src_idx];
                 let src_available: Vec<bool> = if src.available_parts.is_empty() {
@@ -168,8 +172,43 @@ impl MultiSourceDownload {
                 let in_progress = vec![false; part_count];
                 if let Some(p) = cs.select_part(&assigned, &in_progress, &src_available, &active) {
                     source_parts[src_idx].push(p);
+                    part_source_count[p] += 1;
                     assigned[p] = true;
                     active.push(p);
+                }
+            }
+
+            // Second pass: sources that got no part compete for existing parts
+            // (allows multiple sources to try the same part for small files)
+            for src_idx in 0..self.sources.len() {
+                if !source_parts[src_idx].is_empty() {
+                    continue;
+                }
+                let src = &self.sources[src_idx];
+                let src_available: Vec<bool> = if src.available_parts.is_empty() {
+                    vec![true; part_count]
+                } else {
+                    src.available_parts.clone()
+                };
+
+                // Find the incomplete part with fewest competing sources
+                let mut best_part: Option<usize> = None;
+                let mut best_count = usize::MAX;
+                for p in 0..part_count {
+                    if part_source_count[p] < MAX_SOURCES_PER_PART
+                        && p < src_available.len() && src_available[p]
+                    {
+                        // Prefer parts that already have at least one source
+                        // (they're confirmed available) but also accept unassigned ones
+                        if part_source_count[p] < best_count {
+                            best_count = part_source_count[p];
+                            best_part = Some(p);
+                        }
+                    }
+                }
+                if let Some(p) = best_part {
+                    source_parts[src_idx].push(p);
+                    part_source_count[p] += 1;
                 }
             }
         }
@@ -276,6 +315,10 @@ impl MultiSourceDownload {
             let tid_clone = self.transfer_id.clone();
             let bi_clone = self.shared_buddy_info.clone();
 
+            let fail_etx = event_tx.clone();
+            let fail_tid = self.transfer_id.clone();
+            let fail_ip = source.peer_ip.clone();
+            let fail_port = source.peer_port;
             let handle = tokio::spawn(async move {
                 let result = download_parts_from_source(
                     src_idx,
@@ -306,7 +349,17 @@ impl MultiSourceDownload {
                 .await;
 
                 if let Err(e) = &result {
-                    warn!("Source {} ({}) failed: {e}", src_idx, source.peer_ip);
+                    warn!("Source {} ({}) failed: {e}", src_idx, fail_ip);
+                    let _ = fail_etx.send(DownloadEvent::SourceDetail {
+                        transfer_id: fail_tid,
+                        ip: fail_ip,
+                        port: fail_port,
+                        status: "failed".to_string(),
+                        queue_rank: None,
+                        speed: 0,
+                        transferred: 0,
+                        client_software: String::new(),
+                    }).await;
                 }
                 (src_idx, parts, result)
             });
@@ -427,15 +480,31 @@ impl MultiSourceDownload {
                 let retx = event_tx.clone();
                 let rtid = self.transfer_id.clone();
                 let rbi = self.shared_buddy_info.clone();
+                let rfail_etx = event_tx.clone();
+                let rfail_tid = self.transfer_id.clone();
+                let rfail_ip = source.peer_ip.clone();
+                let rfail_port = source.peer_port;
                 retry_handles.push(tokio::spawn(async move {
-                    let _ = download_parts_from_source(
+                    if let Err(e) = download_parts_from_source(
                         src_idx, &source, &parts, tracker, &part_path,
                         &file_hash, file_size, &user_hash, &nickname,
                         tcp_port, udp_port, bw, retry_tx, ph,
                         ra, rq, rsm, rcm, Some(rcs), ravail, None,
                         Some(retx), rtid, rbi,
                     )
-                    .await;
+                    .await {
+                        let _ = rfail_etx.send(DownloadEvent::SourceDetail {
+                            transfer_id: rfail_tid,
+                            ip: rfail_ip,
+                            port: rfail_port,
+                            status: "failed".to_string(),
+                            queue_rank: None,
+                            speed: 0,
+                            transferred: 0,
+                            client_software: String::new(),
+                        }).await;
+                        warn!("Retry source {} failed: {e}", src_idx);
+                    }
                 }));
             }
 
@@ -520,6 +589,10 @@ impl MultiSourceDownload {
                     let egtid = self.transfer_id.clone();
                     let egbi = self.shared_buddy_info.clone();
 
+                    let egfail_etx = event_tx.clone();
+                    let egfail_tid = self.transfer_id.clone();
+                    let egfail_ip = source.peer_ip.clone();
+                    let egfail_port = source.peer_port;
                     eg_handles.push(tokio::spawn(async move {
                         let parts_to_try: Vec<usize> = {
                             let r = received.read().await;
@@ -538,6 +611,19 @@ impl MultiSourceDownload {
                             Some(egetx), egtid, egbi,
                         )
                         .await;
+                        if let Err(e) = &result {
+                            let _ = egfail_etx.send(DownloadEvent::SourceDetail {
+                                transfer_id: egfail_tid,
+                                ip: egfail_ip,
+                                port: egfail_port,
+                                status: "failed".to_string(),
+                                queue_rank: None,
+                                speed: 0,
+                                transferred: 0,
+                                client_software: String::new(),
+                            }).await;
+                            warn!("End-game source {} failed: {e}", src_idx);
+                        }
                         if result.is_ok() {
                             let mut r = received.write().await;
                             for &p in &parts_to_try {
