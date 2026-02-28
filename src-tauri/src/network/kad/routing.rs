@@ -6,6 +6,8 @@ use super::types::*;
 
 const NUM_BUCKETS: usize = 128;
 const BUCKET_REFRESH_INTERVAL_SECS: i64 = 3600;
+const SPARSE_REFRESH_INTERVAL_SECS: i64 = 60;
+const REPLACEMENT_CACHE_SIZE: usize = 5;
 
 /// Return a human-readable KAD version name for logging.
 pub fn kad_version_name(version: u8) -> &'static str {
@@ -55,6 +57,7 @@ pub struct RoutingTable {
 #[derive(Debug)]
 struct KBucket {
     contacts: VecDeque<KadContact>,
+    replacements: VecDeque<KadContact>,
     last_refresh: i64,
 }
 
@@ -62,6 +65,7 @@ impl KBucket {
     fn new() -> Self {
         KBucket {
             contacts: VecDeque::with_capacity(K_BUCKET_SIZE),
+            replacements: VecDeque::with_capacity(REPLACEMENT_CACHE_SIZE),
             last_refresh: 0,
         }
     }
@@ -69,22 +73,13 @@ impl KBucket {
     fn is_full(&self) -> bool {
         self.contacts.len() >= K_BUCKET_SIZE
     }
-
-    fn needs_refresh(&self, now: i64) -> bool {
-        now - self.last_refresh > BUCKET_REFRESH_INTERVAL_SECS
-    }
 }
 
 impl RoutingTable {
     pub fn new(local_id: KadId, block_private_ips: bool) -> Self {
-        let now = chrono::Utc::now().timestamp();
         let mut buckets = Vec::with_capacity(NUM_BUCKETS);
-        for i in 0..NUM_BUCKETS {
-            let mut b = KBucket::new();
-            // Stagger initial refresh times so buckets don't all become stale at once.
-            // Spread them over the first hour: bucket 0 refreshes first, bucket 127 last.
-            b.last_refresh = now - (i as i64 * BUCKET_REFRESH_INTERVAL_SECS / NUM_BUCKETS as i64);
-            buckets.push(b);
+        for _ in 0..NUM_BUCKETS {
+            buckets.push(KBucket::new());
         }
         RoutingTable {
             local_id,
@@ -122,16 +117,39 @@ impl RoutingTable {
         }
     }
 
-    /// Remove a contact by ID. Returns true if it was present.
+    /// Remove a contact by ID. Promotes a replacement from the cache if available.
+    /// Returns true if it was present.
     pub fn remove(&mut self, id: &KadId) -> bool {
         let bucket_idx = self.bucket_for(id);
         let bucket = &mut self.buckets[bucket_idx];
         if let Some(pos) = bucket.contacts.iter().position(|c| c.id == *id) {
             let removed = bucket.contacts.remove(pos).unwrap();
             self.track_ip_remove(removed.ip);
+            self.promote_replacement(bucket_idx);
             return true;
         }
         false
+    }
+
+    /// Try to promote a contact from the replacement cache into the main bucket.
+    fn promote_replacement(&mut self, bucket_idx: usize) {
+        let bucket = &mut self.buckets[bucket_idx];
+        while let Some(candidate) = bucket.replacements.pop_back() {
+            let ip_count = self.global_ip_count.get(&candidate.ip).copied().unwrap_or(0);
+            if ip_count >= MAX_CONTACTS_IP { continue; }
+            let snet = subnet_key(candidate.ip);
+            let subnet_count = self.global_subnet_count.get(&snet).copied().unwrap_or(0);
+            if subnet_count >= MAX_CONTACTS_SUBNET { continue; }
+            let bin_snet = bucket.contacts.iter().filter(|c| subnet_key(c.ip) == snet).count();
+            if bin_snet >= MAX_CONTACTS_SUBNET_PER_BIN { continue; }
+            if !bucket.is_full() {
+                tracing::debug!("RT promote replacement {}: bucket {}", candidate.ip, bucket_idx);
+                self.track_ip_add(candidate.ip);
+                self.buckets[bucket_idx].contacts.push_back(candidate);
+                return;
+            }
+            break;
+        }
     }
 
     fn bucket_for(&self, id: &KadId) -> usize {
@@ -245,8 +263,17 @@ impl RoutingTable {
             return None;
         }
 
-        // Bucket full: request ping-before-evict
+        // Bucket full: add to replacement cache and request ping-before-evict
         tracing::trace!("RT evict-check {}: bucket {} full ({}/{})", contact.ip, bucket_idx, bucket.contacts.len(), K_BUCKET_SIZE);
+
+        let bucket = &mut self.buckets[bucket_idx];
+        if !bucket.replacements.iter().any(|c| c.id == contact.id) {
+            if bucket.replacements.len() >= REPLACEMENT_CACHE_SIZE {
+                bucket.replacements.pop_front();
+            }
+            bucket.replacements.push_back(contact.clone());
+        }
+
         if let Some(oldest) = bucket.contacts.front() {
             let eviction = PendingEviction {
                 bucket_idx,
@@ -374,7 +401,7 @@ impl RoutingTable {
     }
 
     /// Process timed-out evictions (ping got no response within timeout_secs).
-    /// Returns the contacts that should be replaced.
+    /// Evicts unresponsive contacts and inserts replacements.
     pub fn process_eviction_timeouts(&mut self, timeout_secs: i64) -> Vec<PendingEviction> {
         let now = chrono::Utc::now().timestamp();
         let (timed_out, remaining): (Vec<_>, Vec<_>) = self
@@ -396,6 +423,7 @@ impl RoutingTable {
                     .contacts
                     .push_back(eviction.replacement.clone());
             }
+            self.promote_replacement(eviction.bucket_idx);
         }
 
         timed_out
@@ -432,6 +460,7 @@ impl RoutingTable {
     pub fn clear(&mut self) {
         for bucket in &mut self.buckets {
             bucket.contacts.clear();
+            bucket.replacements.clear();
         }
         self.pending_evictions.clear();
         self.global_ip_count.clear();
@@ -439,21 +468,19 @@ impl RoutingTable {
     }
 
     /// Return bucket indices that need a refresh.
-    /// Matches eMule OnBigTimer: a zone gets a RandomLookup if it is a leaf zone and
-    /// (zone_index < KK || level < KBASE || bin_remaining >= K*0.8).
-    /// Empty buckets qualify (remaining == K >= K*0.8), but must still respect the
-    /// refresh interval so `mark_refreshed` prevents re-searching every tick.
+    /// Empty/sparse buckets use a shorter refresh interval (60s) so they fill
+    /// quickly during bootstrap. Full or nearly-full buckets use the standard
+    /// 1-hour interval matching eMule's OnBigTimer.
     pub fn stale_buckets(&self, now: i64) -> Vec<usize> {
         self.buckets
             .iter()
             .enumerate()
             .filter(|(i, b)| {
-                // All buckets (empty or not) must be past their refresh interval.
-                // This ensures mark_refreshed() is respected.
-                if !b.needs_refresh(now) {
+                let is_sparse = b.contacts.len() < K_BUCKET_SIZE / 2;
+                let interval = if is_sparse { SPARSE_REFRESH_INTERVAL_SECS } else { BUCKET_REFRESH_INTERVAL_SECS };
+                if now - b.last_refresh < interval {
                     return false;
                 }
-                // eMule OnBigTimer: zone_index < KK || level < KBASE || remaining >= K*0.8
                 let remaining = K_BUCKET_SIZE.saturating_sub(b.contacts.len());
                 let is_close = *i >= NUM_BUCKETS.saturating_sub(KK);
                 let is_deep = *i < KBASE;
@@ -465,14 +492,15 @@ impl RoutingTable {
     }
 
     /// Return bucket indices that are nearly empty or empty and need filling.
-    /// Only returns buckets that haven't been recently refreshed.
+    /// Uses the shorter sparse refresh interval.
     pub fn buckets_needing_fill(&self) -> Vec<usize> {
         let now = chrono::Utc::now().timestamp();
         self.buckets
             .iter()
             .enumerate()
             .filter(|(_, b)| {
-                b.contacts.len() < K_BUCKET_SIZE / 5 && b.needs_refresh(now)
+                b.contacts.len() < K_BUCKET_SIZE / 5
+                    && now - b.last_refresh >= SPARSE_REFRESH_INTERVAL_SECS
             })
             .map(|(i, _)| i)
             .collect()
@@ -601,7 +629,8 @@ impl RoutingTable {
         let now = chrono::Utc::now().timestamp();
         let mut removed = 0;
         let mut ips_to_remove = Vec::new();
-        for bucket in &mut self.buckets {
+        let mut buckets_affected = Vec::new();
+        for (idx, bucket) in self.buckets.iter_mut().enumerate() {
             let before = bucket.contacts.len();
             bucket.contacts.retain(|c| {
                 if now - c.last_seen >= max_age_secs || c.is_expired() {
@@ -611,10 +640,17 @@ impl RoutingTable {
                     true
                 }
             });
-            removed += before - bucket.contacts.len();
+            let delta = before - bucket.contacts.len();
+            if delta > 0 {
+                buckets_affected.push(idx);
+            }
+            removed += delta;
         }
         for ip in ips_to_remove {
             self.track_ip_remove(ip);
+        }
+        for idx in buckets_affected {
+            self.promote_replacement(idx);
         }
         removed
     }
@@ -624,7 +660,8 @@ impl RoutingTable {
         let now = chrono::Utc::now().timestamp();
         let mut removed = 0;
         let mut ips_to_remove = Vec::new();
-        for bucket in &mut self.buckets {
+        let mut buckets_affected = Vec::new();
+        for (idx, bucket) in self.buckets.iter_mut().enumerate() {
             let before = bucket.contacts.len();
             bucket.contacts.retain(|c| {
                 if c.is_dead() && c.expires_at > 0 && now > c.expires_at {
@@ -634,10 +671,17 @@ impl RoutingTable {
                     true
                 }
             });
-            removed += before - bucket.contacts.len();
+            let delta = before - bucket.contacts.len();
+            if delta > 0 {
+                buckets_affected.push(idx);
+            }
+            removed += delta;
         }
         for ip in ips_to_remove {
             self.track_ip_remove(ip);
+        }
+        for idx in buckets_affected {
+            self.promote_replacement(idx);
         }
         removed
     }

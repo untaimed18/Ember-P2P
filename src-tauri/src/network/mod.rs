@@ -1663,15 +1663,16 @@ pub async fn start_network(
             }
 
             // Bucket refresh: discover new contacts for stale/sparse/empty buckets.
-            // During initial growth (< 200 contacts), allow more concurrent searches
-            // to fill the table faster — matching eMule's aggressive BigTimer behavior.
+            // Bucket refresh: fill empty/sparse buckets and refresh stale ones.
+            // During initial growth (< 300 contacts), use higher concurrency and
+            // prioritize sparse buckets to build the table quickly.
             _ = bucket_refresh_timer.tick() => {
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
                 let table_size = state.routing_table.len();
                 let active_find_nodes = state.search_manager.active.values()
                     .filter(|s| !s.completed && matches!(s.search_type, SearchType::FindNode))
                     .count();
-                let max_concurrent = if table_size < 200 { 6 } else { 3 };
+                let max_concurrent = if table_size < 300 { 8 } else { 3 };
                 if active_find_nodes >= max_concurrent {
                     continue;
                 }
@@ -1679,11 +1680,30 @@ pub async fn start_network(
                 let budget = max_concurrent - active_find_nodes;
                 let now = chrono::Utc::now().timestamp();
                 let stale = state.routing_table.stale_buckets(now);
+                let sparse = state.routing_table.buckets_needing_fill();
                 let mut started = 0usize;
+
+                // Prioritize sparse buckets first during growth
+                for bucket_idx in &sparse {
+                    if started >= budget { break; }
+                    let bucket_idx = *bucket_idx;
+                    let target = state.routing_table.random_id_in_bucket(bucket_idx);
+                    let closest = state.routing_table.find_closest(&target, SEARCH_INITIAL_CONTACTS);
+                    if !closest.is_empty() {
+                        state.search_manager.start_search(
+                            target,
+                            SearchType::FindNode,
+                            closest,
+                        );
+                        state.routing_table.mark_refreshed(bucket_idx);
+                        started += 1;
+                    }
+                }
 
                 for bucket_idx in &stale {
                     if started >= budget { break; }
                     let bucket_idx = *bucket_idx;
+                    if sparse.contains(&bucket_idx) { continue; }
                     let target = state.routing_table.random_id_in_bucket(bucket_idx);
                     let closest = state.routing_table.find_closest(&target, SEARCH_INITIAL_CONTACTS);
                     if !closest.is_empty() {
@@ -1698,24 +1718,8 @@ pub async fn start_network(
                     }
                 }
 
-                if started < budget {
-                    let sparse = state.routing_table.buckets_needing_fill();
-                    for bucket_idx in sparse {
-                        if started >= budget { break; }
-                        if stale.contains(&bucket_idx) {
-                            continue;
-                        }
-                        let target = state.routing_table.random_id_in_bucket(bucket_idx);
-                        let closest = state.routing_table.find_closest(&target, SEARCH_INITIAL_CONTACTS);
-                        if !closest.is_empty() {
-                            state.search_manager.start_search(
-                                target,
-                                SearchType::FindNode,
-                                closest,
-                            );
-                            started += 1;
-                        }
-                    }
+                if started > 0 && table_size < 300 {
+                    debug!("Bucket refresh: started {started} FindNode searches (table={table_size}, stale={}, sparse={})", stale.len(), sparse.len());
                 }
             }
 
