@@ -220,11 +220,25 @@ impl Ed2kServerConnection {
         }
     }
 
+    /// Poll for a server packet without blocking. Cancel-safe: only starts
+    /// reading after confirming data is available, avoiding mid-read cancellation
+    /// that would corrupt the stream (read_exact is NOT cancel-safe).
     async fn poll_read_packet(&mut self) -> Option<(u8, Vec<u8>)> {
         match &mut self.transport {
             ServerTransport::Plain { reader, .. } => {
+                let has_buffered = !reader.buffer().is_empty();
+                if !has_buffered {
+                    let tcp = reader.get_ref();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        tcp.readable(),
+                    ).await {
+                        Ok(Ok(_)) => {}
+                        _ => return None,
+                    }
+                }
                 match tokio::time::timeout(
-                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_secs(5),
                     read_server_packet(reader),
                 ).await {
                     Ok(Ok(pkt)) => Some(pkt),
@@ -232,8 +246,19 @@ impl Ed2kServerConnection {
                 }
             }
             ServerTransport::Encrypted(stream) => {
+                let has_buffered = !stream.reader.buffer().is_empty();
+                if !has_buffered {
+                    let tcp = stream.reader.get_ref();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        tcp.readable(),
+                    ).await {
+                        Ok(Ok(_)) => {}
+                        _ => return None,
+                    }
+                }
                 match tokio::time::timeout(
-                    std::time::Duration::from_millis(50),
+                    std::time::Duration::from_secs(5),
                     stream.read_packet(),
                 ).await {
                     Ok(Ok(pkt)) => Some(pkt),

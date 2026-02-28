@@ -3576,13 +3576,24 @@ async fn handle_udp_packet(
 
         KadMessage::FirewalledRes { ip } => {
             let external_ip = Ipv4Addr::from(ip.to_be_bytes());
-            debug!("FirewalledRes: our external IP is {external_ip}");
+            info!("FirewalledRes: our external IP is {external_ip}");
             state.firewall_checker.handle_firewalled_response(external_ip);
-            // Receiving this UDP response proves our UDP port is reachable
             state.firewall_checker.handle_udp_firewall_result(true);
+            let was_unknown = state.external_ip.is_none();
             if let Some(confirmed) = state.firewall_checker.external_ip() {
                 state.external_ip = Some(confirmed);
                 state.stats.external_ip = confirmed.to_string();
+            } else if state.external_ip.is_none() && !external_ip.is_unspecified() {
+                state.external_ip = Some(external_ip);
+                state.stats.external_ip = external_ip.to_string();
+            }
+            if was_unknown && state.external_ip.is_some() {
+                let _ = app_handle.emit("firewall-status", serde_json::json!({
+                    "firewalled": state.firewalled,
+                    "external_ip": state.stats.external_ip,
+                    "tcp_status": "Open",
+                    "udp_status": "Open",
+                }));
             }
         }
 
