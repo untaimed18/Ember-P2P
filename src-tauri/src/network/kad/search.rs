@@ -632,7 +632,7 @@ impl SearchManager {
         self.active.values().filter(|s| !s.completed).count()
     }
 
-    pub fn poll_queries(&mut self) -> Vec<(SearchId, SocketAddr, KadMessage)> {
+    pub fn poll_queries(&mut self) -> Vec<(SearchId, SocketAddr, KadMessage, KadId)> {
         let mut queries = Vec::new();
         let search_ids: Vec<SearchId> = self.active.keys().cloned().collect();
 
@@ -689,7 +689,7 @@ impl SearchManager {
             for contact in &batch {
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                 let msg = state.build_query_message(contact);
-                queries.push((sid, addr, msg));
+                queries.push((sid, addr, msg, contact.id));
             }
         }
         queries

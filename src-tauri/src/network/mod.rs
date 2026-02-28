@@ -1048,7 +1048,7 @@ pub async fn start_network(
                 if !queries.is_empty() {
                     debug!("Search poll: sending {} queries", queries.len());
                 }
-                for (sid, addr, msg) in &queries {
+                for (sid, addr, msg, contact_id) in &queries {
                     if state.flood_protection.check_outgoing_rate(addr.ip()) {
                         debug!("Throttling outgoing search {} packet to {addr}", sid.0);
                         continue;
@@ -1057,7 +1057,9 @@ pub async fn start_network(
                         let opcode = packet.get(1).copied().unwrap_or(0);
                         debug!("Search {}: sending 0x{opcode:02X} to {addr}", sid.0);
                         state.flood_protection.track_request(*addr, opcode);
-                        let _ = udp_socket.send_to(&packet, addr).await;
+                        let _ = send_kad_packet(
+                            &udp_socket, &packet, *addr, &state, contact_id,
+                        ).await;
                     }
                 }
 
@@ -1428,15 +1430,17 @@ pub async fn start_network(
                         }
                     }
 
-                    // Start a FindNode lookup targeting the sparsest bucket.
-                    // eMule's BigTimer triggers RandomLookup per-zone; we pick the
-                    // bucket with the most remaining capacity so all regions of the
-                    // ID space get explored (KadId::random() is biased toward bucket 0).
+                    // Start FindNode lookups targeting buckets that can still grow.
                     let active_find_nodes = state.search_manager.active.values()
                         .filter(|s| !s.completed && matches!(s.search_type, SearchType::FindNode))
                         .count();
                     if table_size >= 10 && active_find_nodes < 3 {
-                        let target_bucket = state.routing_table.sparsest_bucket();
+                        let fillable = state.routing_table.buckets_needing_fill();
+                        let target_bucket = if !fillable.is_empty() {
+                            fillable[0]
+                        } else {
+                            state.routing_table.sparsest_bucket()
+                        };
                         let random_target = state.routing_table.random_id_in_bucket(target_bucket);
                         let closest = state.routing_table.find_closest(&random_target, SEARCH_INITIAL_CONTACTS);
                         if !closest.is_empty() {
@@ -1445,7 +1449,8 @@ pub async fn start_network(
                                 SearchType::FindNode,
                                 closest,
                             );
-                            debug!("Bootstrap: started FindNode for bucket {target_bucket} (sparsest), table has {table_size} contacts");
+                            state.routing_table.mark_refreshed(target_bucket);
+                            debug!("Bootstrap: started FindNode for bucket {target_bucket}, table has {table_size} contacts");
                         }
                     }
                 }

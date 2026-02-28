@@ -492,32 +492,40 @@ impl RoutingTable {
             .iter()
             .enumerate()
             .filter(|(i, b)| {
+                if b.is_full() {
+                    return false;
+                }
                 let cap = b.capacity;
                 let is_sparse = b.contacts.len() < cap / 2;
                 let interval = if is_sparse { SPARSE_REFRESH_INTERVAL_SECS } else { BUCKET_REFRESH_INTERVAL_SECS };
                 if now - b.last_refresh < interval {
                     return false;
                 }
-                let remaining = cap.saturating_sub(b.contacts.len());
+                // Distant buckets (low index) cover huge portions of the ID space
+                // and are very likely to find contacts. Always include them if not full.
+                let is_distant = *i < DISTANT_BUCKET_THRESHOLD;
                 let is_close = *i >= NUM_BUCKETS.saturating_sub(KK);
                 let is_deep = *i < KBASE;
-                let has_space = remaining as f64 >= cap as f64 * 0.8;
-                is_close || is_deep || has_space
+                is_distant || is_close || is_deep || is_sparse
             })
             .map(|(i, _)| i)
             .collect()
     }
 
-    /// Return bucket indices that are nearly empty or empty and need filling.
-    /// Uses the shorter sparse refresh interval.
+    /// Return bucket indices that need filling, prioritizing distant buckets
+    /// that cover more of the ID space and can actually find contacts.
     pub fn buckets_needing_fill(&self) -> Vec<usize> {
         let now = chrono::Utc::now().timestamp();
         self.buckets
             .iter()
             .enumerate()
-            .filter(|(_, b)| {
-                b.contacts.len() < b.capacity / 5
-                    && now - b.last_refresh >= SPARSE_REFRESH_INTERVAL_SECS
+            .filter(|(i, b)| {
+                if b.is_full() { return false; }
+                if now - b.last_refresh < SPARSE_REFRESH_INTERVAL_SECS { return false; }
+                // Distant buckets always qualify if not full
+                if *i < DISTANT_BUCKET_THRESHOLD { return true; }
+                // Other buckets only if very sparse
+                b.contacts.len() < b.capacity / 3
             })
             .map(|(i, _)| i)
             .collect()
@@ -530,14 +538,23 @@ impl RoutingTable {
         }
     }
 
-    /// Return the index of the sparsest bucket (most remaining capacity).
-    /// Prefers buckets that are completely empty, then those with fewest contacts.
-    /// Used for targeted FindNode lookups to fill the routing table evenly.
+    /// Return a not-full bucket that's most likely to benefit from a FindNode.
+    /// Prioritizes low-indexed buckets (which cover a larger portion of the ID
+    /// space and are far more likely to find contacts) over high-indexed ones
+    /// (which are almost impossible to fill). Only considers buckets that
+    /// actually have room for more contacts.
     pub fn sparsest_bucket(&self) -> usize {
         self.buckets
             .iter()
             .enumerate()
-            .min_by_key(|(_, b)| b.contacts.len())
+            .filter(|(_, b)| !b.is_full())
+            .min_by_key(|(i, b)| {
+                let fill_pct = (b.contacts.len() * 100) / b.capacity.max(1);
+                // Weight: prefer low bucket indices (more of ID space) and low fill %
+                // Bucket 0 at 50% full is better to target than bucket 50 at 0% full
+                let bucket_weight = *i * 2;
+                fill_pct + bucket_weight
+            })
             .map(|(i, _)| i)
             .unwrap_or(0)
     }
