@@ -316,6 +316,8 @@ struct NetworkState {
     buddy_event_rx: Option<mpsc::Receiver<BuddyEvent>>,
     /// Event receiver for the client we're serving as buddy for
     serving_event_rx: Option<mpsc::Receiver<BuddyEvent>>,
+    /// Background buddy outgoing connect+handshake task
+    pending_outgoing_buddy: Option<tokio::task::JoinHandle<Option<(KadId, std::net::Ipv4Addr, u16, mpsc::Receiver<BuddyEvent>)>>>,
     /// Whether the server auto-reconnect loop is allowed to run.
     /// Starts from settings; enabled on manual connect, disabled on manual disconnect.
     server_auto_reconnect: bool,
@@ -578,6 +580,7 @@ pub async fn start_network(
         shared_ip_filter: shared_ip_filter.clone(),
         buddy_event_rx: None,
         serving_event_rx: None,
+        pending_outgoing_buddy: None,
         server_auto_reconnect: settings.auto_connect_server,
     };
 
@@ -1871,8 +1874,10 @@ pub async fn start_network(
                 if state.buddy_manager.should_find_buddy(state.firewalled) {
                     state.buddy_manager.start_finding();
                     let target = state.buddy_manager.find_buddy_target();
-                    let local = *state.buddy_manager.local_id();
                     let local_tcp = state.buddy_manager.tcp_port();
+                    // Use user_hash (not KadId) as user_id so the buddy can match it
+                    // against the Hello packet's user_hash when we TCP-connect to them
+                    let user_id_for_buddy = KadId(state.user_hash);
                     let closest = state.routing_table.find_closest(&target, SEARCH_INITIAL_CONTACTS);
                     if !closest.is_empty() {
                         let _sid = state.search_manager.start_search(
@@ -1884,7 +1889,7 @@ pub async fn start_network(
                             let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                             let msg = KadMessage::FindBuddyReq {
                                 buddy_id: target,
-                                user_id: local,
+                                user_id: user_id_for_buddy,
                                 tcp_port: local_tcp,
                             };
                             if let Ok(packet) = messages::encode_packet(&msg) {
@@ -2498,6 +2503,38 @@ pub async fn start_network(
                 }
             }
 
+            // Poll outgoing buddy connect (spawned from FindBuddyRes)
+            result = async {
+                match state.pending_outgoing_buddy.as_mut() {
+                    Some(handle) => handle.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                state.pending_outgoing_buddy = None;
+                match result {
+                    Ok(Some((buddy_id, buddy_ip, buddy_port, rx))) => {
+                        state.buddy_event_rx = Some(rx);
+                        state.buddy_manager.set_connected(buddy_id);
+                        *state.shared_buddy_info.write().await = Some(ed2k::messages::BuddyInfo {
+                            buddy_ip: u32::from(buddy_ip),
+                            buddy_port,
+                        });
+                        info!("Buddy connected: {} at {}:{}", buddy_id, buddy_ip, buddy_port);
+                    }
+                    Ok(None) => {
+                        if state.buddy_manager.state() == BuddyState::FindingBuddy {
+                            state.buddy_manager.find_failed();
+                        }
+                    }
+                    Err(e) => {
+                        debug!("Buddy connect task panicked: {e}");
+                        if state.buddy_manager.state() == BuddyState::FindingBuddy {
+                            state.buddy_manager.find_failed();
+                        }
+                    }
+                }
+            }
+
             // Accept incoming buddy connections forwarded from the upload listener
             buddy_conn = buddy_conn_rx.recv() => {
                 if let Some((peer_hash, reader, writer)) = buddy_conn {
@@ -2684,13 +2721,11 @@ pub async fn start_network(
                     let mut index = local_index.write().await;
                     for record in known_files.all_records() {
                         let hash_hex = hex::encode(record.file_hash);
-                        index.update_file_stats(
+                        index.update_alltime_stats(
                             &hash_hex,
-                            0, 0, 0,
                             record.all_time_requested,
                             record.all_time_accepted,
                             record.all_time_transferred,
-                            0,
                         );
                     }
                 }
@@ -3892,34 +3927,37 @@ async fn handle_udp_packet(
 
         KadMessage::FindBuddyRes { buddy_id, user_hash: _, tcp_port: peer_tcp_port, .. } => {
             debug!("FindBuddyRes from {from}: buddy_id={buddy_id}, tcp_port={peer_tcp_port}");
-            if state.buddy_manager.state() == BuddyState::FindingBuddy {
+            if state.buddy_manager.state() == BuddyState::FindingBuddy
+                && state.pending_outgoing_buddy.is_none()
+            {
                 let buddy_ip = match from.ip() {
                     std::net::IpAddr::V4(v4) => v4,
                     _ => return,
                 };
-                if let Some(rx) = state.buddy_manager.handle_findbuddy_response(
-                    buddy_id,
-                    buddy_ip,
-                    peer_tcp_port,
-                ).await {
-                    state.buddy_event_rx = Some(rx);
-                    *state.shared_buddy_info.write().await = Some(ed2k::messages::BuddyInfo {
-                        buddy_ip: u32::from(buddy_ip),
-                        buddy_port: peer_tcp_port,
-                    });
-                    info!("Successfully connected to buddy {} at {}:{}", buddy_id, buddy_ip, peer_tcp_port);
-                }
+                let mut mgr_clone = BuddyManager::new(
+                    state.buddy_manager.local_id().clone(),
+                    state.user_hash,
+                    settings.nickname.clone(),
+                    state.tcp_port,
+                    state.udp_port,
+                    state.pending_buddy_hashes.clone(),
+                );
+                state.pending_outgoing_buddy = Some(tokio::spawn(async move {
+                    match mgr_clone.handle_findbuddy_response(buddy_id, buddy_ip, peer_tcp_port).await {
+                        Some(rx) => Some((buddy_id, buddy_ip, peer_tcp_port, rx)),
+                        None => None,
+                    }
+                }));
             }
         }
 
         KadMessage::CallbackReq { buddy_id, file_id, tcp_port: peer_tcp_port } => {
             debug!("CallbackReq from {from}: buddy_id={buddy_id}, file_id={file_id}");
-            if state.buddy_manager.is_serving() {
+            if let Some(serving_id) = state.buddy_manager.serving_for().cloned() {
                 let client_ip = match from.ip() {
                     std::net::IpAddr::V4(v4) => v4,
                     _ => return,
                 };
-                let serving_id = state.buddy_manager.serving_for().cloned().unwrap_or(KadId([0u8; 16]));
                 let relayed = state.buddy_manager.send_callback_relay(
                     &serving_id, client_ip, peer_tcp_port, file_id.0,
                 ).await;

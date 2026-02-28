@@ -131,6 +131,12 @@ impl BuddyManager {
         self.buddy_id.as_ref()
     }
 
+    /// Set buddy state to Connected (used when spawned connect task succeeds).
+    pub fn set_connected(&mut self, buddy_id: KadId) {
+        self.buddy_id = Some(buddy_id);
+        self.state = BuddyState::Connected;
+    }
+
     pub fn find_buddy_target(&self) -> KadId {
         let mut target = self.local_id.0;
         target[0] ^= 0xFF;
@@ -264,10 +270,12 @@ impl BuddyManager {
     pub async fn send_buddy_ping(&mut self) -> bool {
         if let Some(ref mut w) = self.buddy_writer {
             let pkt = build_emule_packet(OP_BUDDYPING, &[]);
-            match tokio::time::timeout(std::time::Duration::from_secs(10), w.write_all(&pkt)).await
+            match tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                w.write_all(&pkt).await?;
+                w.flush().await
+            }).await
             {
                 Ok(Ok(())) => {
-                    let _ = w.flush().await;
                     true
                 }
                 _ => {
@@ -373,12 +381,12 @@ impl BuddyManager {
 
 async fn send_pong(w: &mut BufWriter<OwnedWriteHalf>) -> bool {
     let pkt = build_emule_packet(OP_BUDDYPONG, &[]);
-    match w.write_all(&pkt).await {
-        Ok(()) => {
-            let _ = w.flush().await;
-            true
-        }
-        Err(_) => false,
+    match tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        w.write_all(&pkt).await?;
+        w.flush().await
+    }).await {
+        Ok(Ok(())) => true,
+        _ => false,
     }
 }
 

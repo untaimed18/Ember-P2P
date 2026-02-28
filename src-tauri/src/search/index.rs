@@ -109,16 +109,12 @@ impl LocalIndex {
         None
     }
 
-    pub fn update_file_stats(&mut self, hash: &str, requests: u32, accepted: u32, transferred: u64, alltime_requests: u32, alltime_accepted: u32, alltime_transferred: u64, complete_sources: u32) {
+    pub fn update_alltime_stats(&mut self, hash: &str, alltime_requests: u32, alltime_accepted: u32, alltime_transferred: u64) {
         if let Some(&idx) = self.hash_map.get(hash) {
             if let Some(file) = self.files.get_mut(idx) {
-                file.requests = requests;
-                file.accepted = accepted;
-                file.bytes_transferred = transferred;
                 file.alltime_requests = alltime_requests;
                 file.alltime_accepted = alltime_accepted;
                 file.alltime_transferred = alltime_transferred;
-                file.complete_sources = complete_sources;
             }
         }
     }
