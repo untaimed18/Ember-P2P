@@ -134,7 +134,12 @@ function markEventUpdate() {
 }
 
 export function startTransferPoll() {
+  let busy = false;
   const interval = setInterval(async () => {
+    if (busy) return;
+    // Skip poll if events recently updated the store (avoid redundant fetches)
+    if (Date.now() - lastEventUpdate < 2000) return;
+    busy = true;
     try {
       const all = await Promise.race([
         getTransfers(),
@@ -143,6 +148,8 @@ export function startTransferPoll() {
       transfers.set(all);
     } catch {
       // Ignore timeouts and errors
+    } finally {
+      busy = false;
     }
   }, 3000);
 

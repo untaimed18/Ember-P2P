@@ -45,21 +45,34 @@ impl AppConfig {
         })
     }
 
-    pub fn save(&self) -> anyhow::Result<()> {
+    /// Serialize settings to JSON and return the data + path for async writing.
+    /// This lets the caller drop the RwLock before doing file I/O.
+    pub fn prepare_save(&self) -> anyhow::Result<(String, std::path::PathBuf, std::path::PathBuf)> {
         let data = serde_json::to_string_pretty(&self.settings)?;
         let tmp_path = self.config_path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, &data)?;
-        std::fs::rename(&tmp_path, &self.config_path)?;
+        Ok((data, tmp_path, self.config_path.clone()))
+    }
+
+    /// Blocking file write -- call this OUTSIDE of the RwLock.
+    pub fn write_to_disk(data: &str, tmp_path: &std::path::Path, final_path: &std::path::Path) -> anyhow::Result<()> {
+        std::fs::write(tmp_path, data)?;
+        std::fs::rename(tmp_path, final_path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(
-                &self.config_path,
+                final_path,
                 std::fs::Permissions::from_mode(0o600),
             );
         }
         info!("Config saved");
         Ok(())
+    }
+
+    /// Legacy synchronous save -- only used at startup before async runtime is available.
+    pub fn save(&self) -> anyhow::Result<()> {
+        let (data, tmp_path, final_path) = self.prepare_save()?;
+        Self::write_to_disk(&data, &tmp_path, &final_path)
     }
 
     pub fn update(&mut self, settings: AppSettings) -> anyhow::Result<()> {

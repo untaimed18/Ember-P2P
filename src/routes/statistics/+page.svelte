@@ -6,6 +6,7 @@
   let loading = $state(true);
   let error: string | null = $state(null);
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
+  let refreshBusy = false;
 
   function formatBytes(bytes: number): string {
     if (bytes === 0) return '0 B';
@@ -33,6 +34,8 @@
   }
 
   async function loadStats() {
+    if (refreshBusy) return;
+    refreshBusy = true;
     try {
       const result: TransferStats = await Promise.race([
         getStatistics(),
@@ -44,6 +47,7 @@
       if (stats === null) error = String(e);
     } finally {
       loading = false;
+      refreshBusy = false;
     }
   }
 

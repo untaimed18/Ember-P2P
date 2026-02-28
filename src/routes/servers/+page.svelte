@@ -165,11 +165,9 @@
 
   async function handleRemoveAll() {
     error = null;
-    for (const s of [...servers]) {
-      try {
-        await removeServer(s.ip, s.port);
-      } catch { /* continue */ }
-    }
+    await Promise.allSettled(
+      [...servers].map(s => removeServer(s.ip, s.port))
+    );
     selectedServer = null;
     log('Removed all servers');
     flash('Removed all servers');
@@ -273,9 +271,9 @@
   async function handleRemoveSelected() {
     error = null;
     const toRemove = servers.filter(s => selectedServers.has(serverKey(s)));
-    for (const s of toRemove) {
-      try { await removeServer(s.ip, s.port); } catch { /* continue */ }
-    }
+    await Promise.allSettled(
+      toRemove.map(s => removeServer(s.ip, s.port))
+    );
     const count = toRemove.length;
     selectedServers = new Set();
     selectedServer = null;

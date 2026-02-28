@@ -71,10 +71,17 @@ pub async fn update_settings(
         settings: settings.clone(),
     });
 
-    let mut config = state.config.write().await;
-    config
-        .update(settings)
-        .map_err(|e| format!("Failed to save settings: {e}"))?;
+    let save_data = {
+        let mut config = state.config.write().await;
+        config.settings = settings;
+        config.prepare_save().map_err(|e| format!("Failed to serialize settings: {e}"))?
+    };
+    {
+        let (data, tmp, final_path) = save_data;
+        tokio::task::spawn_blocking(move || {
+            crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+        }).await.map_err(|e| format!("Save failed: {e}"))?.map_err(|e| format!("Save failed: {e}"))?;
+    }
 
     if port_changed {
         Ok("Settings saved. Port changes require an application restart to take effect.".into())

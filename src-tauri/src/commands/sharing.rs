@@ -18,12 +18,19 @@ pub async fn add_shared_folder(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
-    {
+    let save_data = {
         let mut config = state.config.write().await;
         if !config.settings.shared_folders.contains(&path) {
             config.settings.shared_folders.push(path.clone());
-            config.save().map_err(|e| format!("Config save error: {e}"))?;
+            Some(config.prepare_save().map_err(|e| format!("Config save error: {e}"))?)
+        } else {
+            None
         }
+    };
+    if let Some((data, tmp, final_path)) = save_data {
+        tokio::task::spawn_blocking(move || {
+            crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+        }).await.map_err(|e| format!("Config save error: {e}"))?.map_err(|e| format!("Config save error: {e}"))?;
     }
 
     let local_index = state.local_index.clone();
@@ -171,10 +178,16 @@ pub async fn remove_shared_folder(
             .collect()
     };
 
-    {
+    let save_data = {
         let mut config = state.config.write().await;
         config.settings.shared_folders.retain(|f| f != &path);
-        config.save().map_err(|e| format!("Config save error: {e}"))?;
+        config.prepare_save().map_err(|e| format!("Config save error: {e}"))?
+    };
+    {
+        let (data, tmp, final_path) = save_data;
+        tokio::task::spawn_blocking(move || {
+            crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+        }).await.map_err(|e| format!("Config save error: {e}"))?.map_err(|e| format!("Config save error: {e}"))?;
     }
 
     {
@@ -416,24 +429,32 @@ pub async fn unshare_file(
 
 #[tauri::command]
 pub async fn open_shared_file(file_path: String) -> Result<(), String> {
-    let path = std::path::Path::new(&file_path);
-    if !path.exists() {
-        return Err("File does not exist".to_string());
-    }
-    let canonical = path.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
-    opener::open(&canonical).map_err(|e| format!("Failed to open file: {e}"))?;
-    Ok(())
+    tokio::task::spawn_blocking(move || {
+        let path = std::path::Path::new(&file_path);
+        if !path.exists() {
+            return Err("File does not exist".to_string());
+        }
+        let canonical = path.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
+        opener::open(&canonical).map_err(|e| format!("Failed to open file: {e}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Task failed: {e}"))?
 }
 
 #[tauri::command]
 pub async fn open_shared_folder(file_path: String) -> Result<(), String> {
-    let path = std::path::Path::new(&file_path);
-    let folder = path.parent().unwrap_or(path);
-    if !folder.exists() {
-        return Err("Folder does not exist".to_string());
-    }
-    let canonical = folder.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
-    opener::open(&canonical).map_err(|e| format!("Failed to open folder: {e}"))?;
-    Ok(())
+    tokio::task::spawn_blocking(move || {
+        let path = std::path::Path::new(&file_path);
+        let folder = path.parent().unwrap_or(path);
+        if !folder.exists() {
+            return Err("Folder does not exist".to_string());
+        }
+        let canonical = folder.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
+        opener::open(&canonical).map_err(|e| format!("Failed to open folder: {e}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Task failed: {e}"))?
 }
 
