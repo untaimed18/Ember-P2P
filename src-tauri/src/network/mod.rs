@@ -4330,20 +4330,30 @@ async fn handle_command(
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                 let msg = KadMessage::FirewalledReq { tcp_port: state.tcp_port };
                 if let Ok(packet) = messages::encode_packet(&msg) {
-                    let _ = socket.send_to(&packet, addr).await;
+                    state.flood_protection.track_request(addr, 0x50);
+                    let _ = send_kad_packet(socket, &packet, addr, &state, &contact.id).await;
                     state.firewall_checks_sent += 1;
                 }
             }
 
-            for contact in state.routing_table.all_contacts().skip(3).take(3) {
+            let ping_contacts: Vec<KadContact> = state
+                .routing_table
+                .all_contacts()
+                .filter(|c| c.verified && c.contact_type <= CONTACT_TYPE_OPEN)
+                .skip(3)
+                .take(3)
+                .cloned()
+                .collect();
+            for contact in &ping_contacts {
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                 let msg = KadMessage::Ping;
                 if let Ok(packet) = messages::encode_packet(&msg) {
-                    let _ = socket.send_to(&packet, addr).await;
+                    state.flood_protection.track_request(addr, 0x60);
+                    let _ = send_kad_packet(socket, &packet, addr, &state, &contact.id).await;
                 }
             }
 
-            info!("Sent {} firewall checks and 3 ping probes", state.firewall_checks_sent);
+            info!("Sent {} firewall checks and {} ping probes", state.firewall_checks_sent, ping_contacts.len());
         }
 
         NetworkCommand::UpdateSettings { settings } => {
