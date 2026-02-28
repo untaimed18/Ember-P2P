@@ -260,6 +260,14 @@
             <ToggleSwitch bind:checked={settings.upnp_enabled} />
           </div>
 
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Auto-Connect KAD <span class="restart-badge">Restart</span></span>
+              <span class="hint">Automatically bootstrap KAD on startup. When off, press Connect to start.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.auto_connect_kad} />
+          </div>
+
           <div class="divider"></div>
 
           <div class="field">
@@ -347,6 +355,13 @@
           </div>
         </div>
         <div class="card-body">
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Auto-Connect Server <span class="restart-badge">Restart</span></span>
+              <span class="hint">Automatically connect to an ed2k server on startup. When off, press Connect to start.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.auto_connect_server} />
+          </div>
           <div class="field toggle-row">
             <div class="toggle-info">
               <span class="toggle-title">Update List From Servers</span>

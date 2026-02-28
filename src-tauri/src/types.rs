@@ -241,6 +241,12 @@ pub struct AppSettings {
     /// Path to server.met file for ed2k server list
     #[serde(default)]
     pub server_list_path: String,
+    /// Automatically connect to KAD on startup (eMule: "Autoconnect" for Kad)
+    #[serde(default)]
+    pub auto_connect_kad: bool,
+    /// Automatically connect to an ed2k server on startup (eMule: "Autoconnect" for server)
+    #[serde(default)]
+    pub auto_connect_server: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +302,8 @@ impl Default for AppSettings {
             add_servers_from_server: true,
             add_servers_from_clients: false,
             server_list_path: String::new(),
+            auto_connect_kad: false,
+            auto_connect_server: false,
         }
     }
 }

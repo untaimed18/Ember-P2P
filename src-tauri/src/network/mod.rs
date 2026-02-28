@@ -305,6 +305,9 @@ struct NetworkState {
     server_client_id: u32,
     /// Background server connection task (non-blocking)
     pending_server_connect: Option<tokio::task::JoinHandle<ServerConnectResult>>,
+    /// Whether the server auto-reconnect loop is allowed to run.
+    /// Starts from settings; enabled on manual connect, disabled on manual disconnect.
+    server_auto_reconnect: bool,
 }
 
 pub async fn start_network(
@@ -501,7 +504,7 @@ pub async fn start_network(
         publish_manager,
         dht_store,
         stats: NetworkStats {
-            status: NetworkStatus::Connecting,
+            status: if settings.auto_connect_kad { NetworkStatus::Connecting } else { NetworkStatus::Disconnected },
             ..Default::default()
         },
         pending_keyword_searches: HashMap::new(),
@@ -556,6 +559,7 @@ pub async fn start_network(
         low_id: false,
         server_client_id: 0,
         pending_server_connect: None,
+        server_auto_reconnect: settings.auto_connect_server,
     };
 
     // Load known files for hash cache
@@ -572,34 +576,38 @@ pub async fn start_network(
         state.comment_manager.load_from_db_rows(rows);
     }
 
-    // Send bootstrap requests to initial contacts
-    for contact in &boot_contacts {
-        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-        let msg = KadMessage::BootstrapReq;
-        if let Ok(packet) = messages::encode_packet(&msg) {
-            let _ = udp_socket.send_to(&packet, addr).await;
-            debug!("Sent bootstrap req to {addr}");
+    if settings.auto_connect_kad {
+        // Send bootstrap requests to initial contacts
+        for contact in &boot_contacts {
+            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+            let msg = KadMessage::BootstrapReq;
+            if let Ok(packet) = messages::encode_packet(&msg) {
+                let _ = udp_socket.send_to(&packet, addr).await;
+                debug!("Sent bootstrap req to {addr}");
+            }
         }
-    }
 
-    // Send FirewalledReq to a few contacts to detect our external IP (always-on, like eMule)
-    for contact in boot_contacts.iter().take(3) {
-        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-        let msg = KadMessage::FirewalledReq { tcp_port };
-        if let Ok(packet) = messages::encode_packet(&msg) {
-            let _ = udp_socket.send_to(&packet, addr).await;
-            state.firewall_checks_sent += 1;
+        // Send FirewalledReq to a few contacts to detect our external IP
+        for contact in boot_contacts.iter().take(3) {
+            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+            let msg = KadMessage::FirewalledReq { tcp_port };
+            if let Ok(packet) = messages::encode_packet(&msg) {
+                let _ = udp_socket.send_to(&packet, addr).await;
+                state.firewall_checks_sent += 1;
+            }
         }
-    }
-    debug!("Sent {} firewall check requests", state.firewall_checks_sent);
+        debug!("Sent {} firewall check requests", state.firewall_checks_sent);
 
-    // Send Ping to detect our external UDP port
-    for contact in boot_contacts.iter().skip(3).take(3) {
-        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-        let msg = KadMessage::Ping;
-        if let Ok(packet) = messages::encode_packet(&msg) {
-            let _ = udp_socket.send_to(&packet, addr).await;
+        // Send Ping to detect our external UDP port
+        for contact in boot_contacts.iter().skip(3).take(3) {
+            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+            let msg = KadMessage::Ping;
+            if let Ok(packet) = messages::encode_packet(&msg) {
+                let _ = udp_socket.send_to(&packet, addr).await;
+            }
         }
+    } else {
+        info!("KAD auto-connect disabled, skipping bootstrap (use Connect to start KAD)");
     }
 
     // Download event channel
@@ -2173,7 +2181,8 @@ pub async fn start_network(
                     state.server_search_age = 0;
                 }
 
-                if !state.server_connected
+                if state.server_auto_reconnect
+                    && !state.server_connected
                     && state.pending_server_connect.is_none()
                     && !state.server_list.is_empty()
                     && state.server_connection.is_none()
@@ -4535,6 +4544,7 @@ async fn handle_command(
         }
 
         NetworkCommand::ConnectToServer { ip, port } => {
+            state.server_auto_reconnect = true;
             let addr: SocketAddr = match format!("{ip}:{port}").parse() {
                 Ok(a) => a,
                 Err(e) => {
@@ -4568,6 +4578,7 @@ async fn handle_command(
 
         NetworkCommand::DisconnectServer => {
             info!("Disconnecting from ed2k server");
+            state.server_auto_reconnect = false;
             if let Some(handle) = state.pending_server_connect.take() {
                 handle.abort();
             }
