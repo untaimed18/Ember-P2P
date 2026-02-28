@@ -491,6 +491,8 @@ impl Ed2kDownload {
         let final_path = self.download_dir.join(&safe_name);
 
         let mut tracker = PartTracker::new(self.file_size, &part_path);
+        tracker.set_file_hash(self.file_hash);
+        tracker.set_file_name(&self.file_name);
 
         let mut output = if part_path.exists() && tracker.completed_count() > 0 {
             info!(

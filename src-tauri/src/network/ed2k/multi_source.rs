@@ -109,7 +109,10 @@ impl MultiSourceDownload {
         }
 
         let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
-        let tracker = Arc::new(RwLock::new(PartTracker::new(self.file_size, &part_path)));
+        let mut pt = PartTracker::new(self.file_size, &part_path);
+        pt.set_file_hash(self.file_hash);
+        pt.set_file_name(&self.file_name);
+        let tracker = Arc::new(RwLock::new(pt));
 
         // Pre-create the output file
         {

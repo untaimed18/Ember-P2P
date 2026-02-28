@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 use tracing::{debug, info};
 
@@ -82,6 +82,10 @@ pub struct SearchState {
     /// because they are closer to target than their referring contact and
     /// made it into the top ALPHA closest. Set during handle_response().
     priority_queries: Vec<KadContact>,
+    /// eMule m_mapTried: maps (IP, port) to KadId for every contact we've
+    /// sent a query to. Used for reliable sender identification in KadRes
+    /// responses, even if the contact was evicted from the routing table.
+    pub tried: HashMap<(Ipv4Addr, u16), KadId>,
 }
 
 impl SearchState {
@@ -107,6 +111,7 @@ impl SearchState {
             lookup_reask_more_target: None,
             lookup_reask_more_done: false,
             priority_queries: Vec::new(),
+            tried: HashMap::new(),
         }
     }
 
@@ -189,6 +194,7 @@ impl SearchState {
         for c in &batch {
             self.pending.insert(c.id);
             self.pending_times.insert(c.id, now);
+            self.tried.insert((c.ip, c.udp_port), c.id);
             if self.phase == SearchPhase::Fetch {
                 self.fetched.insert(c.id);
             }

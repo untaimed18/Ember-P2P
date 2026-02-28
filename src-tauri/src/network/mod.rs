@@ -3448,37 +3448,26 @@ async fn handle_udp_packet(
                 debug!("  No active search for this target");
             }
 
-            let sender_id_lookup = match from.ip() {
-                std::net::IpAddr::V4(v4) => {
-                    let from_routing = state
-                        .routing_table
-                        .all_contacts()
-                        .find(|c| c.ip == v4 && c.udp_port == from.port())
-                        .map(|c| c.id);
-                    if from_routing.is_some() {
-                        from_routing
-                    } else {
-                        let mut found = None;
-                        for (_, search) in state.search_manager.active.iter() {
-                            if let Some(c) = search.closest.iter().find(|c| c.ip == v4 && c.udp_port == from.port()) {
-                                found = Some(c.id);
-                                break;
-                            }
-                        }
-                        found
-                    }
-                }
+            // Resolve sender KadId using per-search tried maps (eMule m_mapTried),
+            // falling back to routing table lookup.
+            let sender_ip_port: Option<(Ipv4Addr, u16)> = match from.ip() {
+                std::net::IpAddr::V4(v4) => Some((v4, from.port())),
                 _ => None,
             };
 
-            if sender_id_lookup.is_none() && !search_ids.is_empty() {
-                debug!("  Could not resolve sender KadId for {from}");
-            }
-
             for sid in search_ids {
-                // eMule ProcessResponse: sender must be identifiable in m_mapTried
-                // (matched by IP+port). Never fall back to guessing — ignore unknown.
-                let sender_id = sender_id_lookup;
+                // Primary: look up in this search's tried map (reliable, tracks all queried contacts)
+                let sender_id = sender_ip_port.and_then(|(ip, port)| {
+                    state.search_manager.active.get(&sid)
+                        .and_then(|s| s.tried.get(&(ip, port)).copied())
+                }).or_else(|| {
+                    // Fallback: routing table (for contacts that were already known)
+                    sender_ip_port.and_then(|(ip, port)| {
+                        state.routing_table.all_contacts()
+                            .find(|c| c.ip == ip && c.udp_port == port)
+                            .map(|c| c.id)
+                    })
+                });
 
                 if let (Some(search), Some(sender_id)) =
                     (state.search_manager.get_mut(&sid), sender_id)
