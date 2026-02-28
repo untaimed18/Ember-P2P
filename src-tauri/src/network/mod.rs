@@ -1437,15 +1437,29 @@ pub async fn start_network(
                         let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                         let msg = KadMessage::FirewalledReq { tcp_port: state.tcp_port };
                         if let Ok(packet) = messages::encode_packet(&msg) {
-                            let _ = udp_socket.send_to(&packet, addr).await;
+                            state.flood_protection.track_request(addr, 0x50);
+                            let _ = send_kad_packet(
+                                &udp_socket, &packet, addr, &state, &contact.id,
+                            ).await;
                             state.firewall_checker.record_tcp_request_sent();
                         }
                     }
-                    for contact in state.routing_table.all_contacts().skip(checks).take(checks) {
+                    let udp_contacts: Vec<KadContact> = state
+                        .routing_table
+                        .all_contacts()
+                        .filter(|c| c.verified && c.contact_type <= CONTACT_TYPE_OPEN)
+                        .skip(checks)
+                        .take(checks)
+                        .cloned()
+                        .collect();
+                    for contact in &udp_contacts {
                         let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                         let msg = KadMessage::Ping;
                         if let Ok(packet) = messages::encode_packet(&msg) {
-                            let _ = udp_socket.send_to(&packet, addr).await;
+                            state.flood_protection.track_request(addr, 0x60);
+                            let _ = send_kad_packet(
+                                &udp_socket, &packet, addr, &state, &contact.id,
+                            ).await;
                             state.firewall_checker.record_udp_request_sent();
                         }
                     }
