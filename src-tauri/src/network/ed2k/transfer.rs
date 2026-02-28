@@ -61,6 +61,16 @@ pub enum DownloadEvent {
     Verifying {
         transfer_id: String,
     },
+    SourceDetail {
+        transfer_id: String,
+        ip: String,
+        port: u16,
+        status: String,
+        queue_rank: Option<u32>,
+        speed: u64,
+        transferred: u64,
+        client_software: String,
+    },
     Completed {
         transfer_id: String,
     },
@@ -168,7 +178,31 @@ impl Ed2kDownload {
         anyhow::bail!("Failed after {MAX_RETRIES} attempts: {last_err}")
     }
 
+    async fn emit_source_detail(
+        &self,
+        event_tx: &mpsc::Sender<DownloadEvent>,
+        status: &str,
+        queue_rank: Option<u32>,
+        speed: u64,
+        transferred: u64,
+    ) {
+        let _ = event_tx
+            .send(DownloadEvent::SourceDetail {
+                transfer_id: self.transfer_id.clone(),
+                ip: self.source_addr.ip().to_string(),
+                port: self.source_addr.port(),
+                status: status.to_string(),
+                queue_rank,
+                speed,
+                transferred,
+                client_software: String::new(),
+            })
+            .await;
+    }
+
     async fn download_inner(&self, event_tx: &mpsc::Sender<DownloadEvent>) -> anyhow::Result<()> {
+        self.emit_source_detail(event_tx, "connecting", None, 0, 0).await;
+
         let stream = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             TcpStream::connect(self.source_addr),
@@ -355,6 +389,7 @@ impl Ed2kDownload {
         // we simply keep the connection open and listen. Re-requesting too
         // aggressively gets clients penalised by eMule servers.
         let queue_start = std::time::Instant::now();
+        self.emit_source_detail(event_tx, "queued", None, 0, 0).await;
 
         loop {
             self.check_control().await?;
@@ -385,6 +420,7 @@ impl Ed2kDownload {
 
             if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
                 debug!("Upload accepted");
+                self.emit_source_detail(event_tx, "transferring", None, 0, 0).await;
                 let _ = event_tx
                     .send(DownloadEvent::SourcesUpdate {
                         transfer_id: self.transfer_id.clone(),
@@ -402,6 +438,7 @@ impl Ed2kDownload {
                     "Queued at position {} on peer {}",
                     rank, self.source_addr
                 );
+                self.emit_source_detail(event_tx, "queued", Some(rank as u32), 0, 0).await;
                 continue;
             }
 
@@ -413,6 +450,7 @@ impl Ed2kDownload {
                     "Queued at position {} on peer {} (legacy)",
                     rank, self.source_addr
                 );
+                self.emit_source_detail(event_tx, "queued", Some(rank), 0, 0).await;
                 continue;
             }
 
@@ -750,8 +788,13 @@ impl Ed2kDownload {
         .await
         .ok();
 
+        self.emit_source_detail(
+            event_tx, "completed", None, measured_speed, downloaded.min(self.file_size),
+        ).await;
+
         if !tracker.all_complete() {
             let remaining = tracker.part_count - tracker.completed_count();
+            self.emit_source_detail(event_tx, "failed", None, 0, downloaded.min(self.file_size)).await;
             anyhow::bail!(
                 "{remaining} parts still failing hash verification after {MAX_PART_RETRIES} retries"
             );

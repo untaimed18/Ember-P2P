@@ -61,6 +61,8 @@ pub struct TransferManager {
     /// Rolling speed history per transfer: VecDeque of (cumulative_bytes, Instant)
     speed_history: HashMap<String, VecDeque<(u64, Instant)>>,
     controls: HashMap<String, Arc<TransferControl>>,
+    /// Per-transfer source details (eMule-style per-source tracking)
+    source_details: HashMap<String, Vec<crate::types::SourceInfo>>,
 }
 
 impl TransferManager {
@@ -72,6 +74,7 @@ impl TransferManager {
             max_concurrent,
             speed_history: HashMap::new(),
             controls: HashMap::new(),
+            source_details: HashMap::new(),
         }
     }
 
@@ -149,6 +152,7 @@ impl TransferManager {
             }
             self.speed_history.remove(id);
             self.controls.remove(id);
+            self.source_details.remove(id);
             return self.promote_next();
         }
         Vec::new()
@@ -190,6 +194,31 @@ impl TransferManager {
         }
     }
 
+    /// Update or insert a per-source detail entry for a transfer.
+    pub fn update_source_detail(&mut self, transfer_id: &str, source: crate::types::SourceInfo) {
+        let sources = self.source_details.entry(transfer_id.to_string()).or_default();
+        if let Some(existing) = sources.iter_mut().find(|s| s.ip == source.ip && s.port == source.port) {
+            existing.status = source.status;
+            if source.queue_rank.is_some() {
+                existing.queue_rank = source.queue_rank;
+            }
+            if source.speed > 0 {
+                existing.speed = source.speed;
+            }
+            existing.transferred = source.transferred;
+            if !source.client_software.is_empty() {
+                existing.client_software = source.client_software;
+            }
+        } else {
+            sources.push(source);
+        }
+    }
+
+    /// Get all source details for a transfer.
+    pub fn get_source_details(&self, transfer_id: &str) -> Vec<crate::types::SourceInfo> {
+        self.source_details.get(transfer_id).cloned().unwrap_or_default()
+    }
+
     pub fn pause(&mut self, id: &str) {
         if let Some(transfer) = self.active.get_mut(id) {
             transfer.status = TransferStatus::Paused;
@@ -217,6 +246,7 @@ impl TransferManager {
         self.queue.retain(|t| t.id != id);
         self.controls.remove(id);
         self.speed_history.remove(id);
+        self.source_details.remove(id);
         self.promote_next()
     }
 
@@ -229,6 +259,7 @@ impl TransferManager {
         self.completed.retain(|t| t.id != id);
         self.controls.remove(id);
         self.speed_history.remove(id);
+        self.source_details.remove(id);
     }
 
     pub fn set_priority(&mut self, id: &str, priority: &str) {

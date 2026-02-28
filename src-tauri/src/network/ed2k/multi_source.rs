@@ -270,6 +270,8 @@ impl MultiSourceDownload {
             let cm_clone = self.credit_manager.clone();
             let cs_clone = chunk_selector.clone();
             let src_avail = self.sources[src_idx].available_parts.clone();
+            let etx_clone = event_tx.clone();
+            let tid_clone = self.transfer_id.clone();
 
             let handle = tokio::spawn(async move {
                 let result = download_parts_from_source(
@@ -294,6 +296,8 @@ impl MultiSourceDownload {
                     Some(cs_clone),
                     src_avail,
                     None,
+                    Some(etx_clone),
+                    tid_clone,
                 )
                 .await;
 
@@ -416,12 +420,15 @@ impl MultiSourceDownload {
 
                 let rcs = chunk_selector.clone();
                 let ravail = self.sources[src_idx].available_parts.clone();
+                let retx = event_tx.clone();
+                let rtid = self.transfer_id.clone();
                 retry_handles.push(tokio::spawn(async move {
                     let _ = download_parts_from_source(
                         src_idx, &source, &parts, tracker, &part_path,
                         &file_hash, file_size, &user_hash, &nickname,
                         tcp_port, udp_port, bw, retry_tx, ph,
                         ra, rq, rsm, rcm, Some(rcs), ravail, None,
+                        Some(retx), rtid,
                     )
                     .await;
                 }));
@@ -504,6 +511,8 @@ impl MultiSourceDownload {
                     let received = received_parts.clone();
                     let egsm = self.source_manager.clone();
                     let egcm = self.credit_manager.clone();
+                    let egetx = event_tx.clone();
+                    let egtid = self.transfer_id.clone();
 
                     eg_handles.push(tokio::spawn(async move {
                         // Filter to only parts not yet received by another source
@@ -521,6 +530,7 @@ impl MultiSourceDownload {
                             tcp_port, udp_port, bw, eg_tx, ph,
                             ra, rq, egsm, egcm, None, Vec::new(),
                             Some(eg_received),
+                            Some(egetx), egtid,
                         )
                         .await;
                         if result.is_ok() {
@@ -642,6 +652,8 @@ async fn download_parts_from_source(
     chunk_sel: Option<Arc<RwLock<ChunkSelector>>>,
     source_available: Vec<bool>,
     endgame_received: Option<Arc<RwLock<std::collections::HashSet<usize>>>>,
+    event_tx: Option<mpsc::Sender<DownloadEvent>>,
+    transfer_id: String,
 ) -> anyhow::Result<()> {
     use super::messages::*;
     use flate2::read::ZlibDecoder;
@@ -649,6 +661,31 @@ async fn download_parts_from_source(
     use tokio::net::TcpStream;
 
     let addr: SocketAddr = format!("{}:{}", source.peer_ip, source.peer_port).parse()?;
+    let src_ip = addr.ip().to_string();
+    let src_port = addr.port();
+    let mut src_transferred: u64 = 0;
+
+    // Helper to emit per-source detail events
+    macro_rules! emit_source {
+        ($status:expr, $qr:expr, $speed:expr) => {
+            if let Some(ref etx) = event_tx {
+                let _ = etx
+                    .send(DownloadEvent::SourceDetail {
+                        transfer_id: transfer_id.clone(),
+                        ip: src_ip.clone(),
+                        port: src_port,
+                        status: $status.to_string(),
+                        queue_rank: $qr,
+                        speed: $speed,
+                        transferred: src_transferred,
+                        client_software: String::new(),
+                    })
+                    .await;
+            }
+        };
+    }
+
+    emit_source!("connecting", None, 0u64);
 
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -774,8 +811,10 @@ async fn download_parts_from_source(
     // Wait for the uploader to grant a slot. Don't re-request; eMule
     // uploaders push OP_ACCEPTUPLOADREQ when a slot opens.
     let queue_start = std::time::Instant::now();
+    emit_source!("queued", None, 0u64);
     loop {
         if queue_start.elapsed().as_secs() > 600 {
+            emit_source!("failed", None, 0u64);
             anyhow::bail!("timed out waiting for upload slot");
         }
         let remaining = 600u64.saturating_sub(queue_start.elapsed().as_secs()).max(60);
@@ -784,22 +823,36 @@ async fn download_parts_from_source(
             read_packet_async_ms(&mut reader),
         )
         .await;
-        let (proto, opcode, _payload) = match result {
+        let (proto, opcode, payload) = match result {
             Ok(Ok(p)) => p,
-            Ok(Err(e)) => anyhow::bail!("connection lost while queued: {e}"),
-            Err(_) => anyhow::bail!("timed out waiting for upload slot"),
+            Ok(Err(e)) => {
+                emit_source!("failed", None, 0u64);
+                anyhow::bail!("connection lost while queued: {e}");
+            }
+            Err(_) => {
+                emit_source!("failed", None, 0u64);
+                anyhow::bail!("timed out waiting for upload slot");
+            }
         };
         if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
             queued_guard.armed = false;
             queued_count.fetch_sub(1, Ordering::Relaxed);
             active_count.fetch_add(1, Ordering::Relaxed);
             _active_guard.armed = true;
+            emit_source!("transferring", None, 0u64);
             break;
         }
         if proto == OP_EDONKEYHEADER && opcode == OP_OUTOFPARTREQS {
+            emit_source!("failed", None, 0u64);
             anyhow::bail!("peer has no free upload slots (OutOfPartReqs)");
         }
-        // OP_QUEUERANKING or OP_QUEUERANK — just keep waiting
+        if proto == OP_EMULEPROT && opcode == OP_QUEUERANKING && payload.len() >= 2 {
+            let rank = u16::from_le_bytes([payload[0], payload[1]]);
+            emit_source!("queued", Some(rank as u32), 0u64);
+        } else if proto == OP_EDONKEYHEADER && opcode == OP_QUEUERANK && payload.len() >= 4 {
+            let rank = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            emit_source!("queued", Some(rank), 0u64);
+        }
     }
 
     // Open the shared .part file
@@ -901,6 +954,7 @@ async fn download_parts_from_source(
                     output.write_all(data)?;
 
                     total_received += piece_len;
+                    src_transferred += piece_len;
                     blocks_received_in_current_req += 1;
                     speed_bytes += piece_len;
                     if let Some(cm) = &credit_mgr {
@@ -938,6 +992,7 @@ async fn download_parts_from_source(
                     output.write_all(&decompressed)?;
 
                     total_received += piece_len;
+                    src_transferred += piece_len;
                     blocks_received_in_current_req += 1;
                     speed_bytes += piece_len;
                     if let Some(cm) = &credit_mgr {
@@ -1073,6 +1128,8 @@ async fn download_parts_from_source(
     )
     .await
     .ok();
+
+    emit_source!("completed", None, measured_speed);
 
     Ok(())
 }

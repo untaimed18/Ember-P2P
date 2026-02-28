@@ -4,19 +4,74 @@
   import {
     pauseTransfer, resumeTransfer, cancelTransfer, removeTransfer,
     clearCompleted, setTransferPriority, pauseAllTransfers, resumeAllTransfers,
+    getTransferSources,
   } from '$lib/api/transfers';
   import { findSources } from '$lib/api/search';
   import { previewFile } from '$lib/api/preview';
   import { formatSize, formatSpeed, formatEta, formatDate } from '$lib/utils';
-  import { onMount } from 'svelte';
-  import type { Transfer } from '$lib/types';
+  import { onMount, onDestroy } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
+  import type { UnlistenFn } from '@tauri-apps/api/event';
+  import type { Transfer, SourceInfo } from '$lib/types';
+
+  let sourceUnlisten: UnlistenFn | null = $state(null);
 
   onMount(() => {
     const stop = startTransferPoll();
+    listen<{
+      transfer_id: string; ip: string; port: number; status: string;
+      queue_rank?: number; speed: number; transferred: number; client_software: string;
+    }>('transfer-source-detail', (event) => {
+      const d = event.payload;
+      if (d.transfer_id !== expandedTransferId) return;
+      expandedSources = expandedSources.map((s) => {
+        if (s.ip === d.ip && s.port === d.port) {
+          return { ...s, status: d.status as SourceInfo['status'], queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software || s.client_software };
+        }
+        return s;
+      });
+      if (!expandedSources.some((s) => s.ip === d.ip && s.port === d.port)) {
+        expandedSources = [...expandedSources, { ip: d.ip, port: d.port, status: d.status as SourceInfo['status'], queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software }];
+      }
+    }).then((u) => { sourceUnlisten = u; });
     return () => stop();
   });
 
+  onDestroy(() => { sourceUnlisten?.(); });
+
   let transferError: string | null = $state(null);
+
+  // --- Source detail panel (eMule-style) ---
+  let expandedTransferId: string | null = $state(null);
+  let expandedSources: SourceInfo[] = $state([]);
+  let loadingSources = $state(false);
+
+  async function toggleSourceDetail(t: Transfer) {
+    if (expandedTransferId === t.id) {
+      expandedTransferId = null;
+      expandedSources = [];
+      return;
+    }
+    expandedTransferId = t.id;
+    loadingSources = true;
+    try {
+      expandedSources = await getTransferSources(t.id);
+    } catch {
+      expandedSources = [];
+    }
+    loadingSources = false;
+  }
+
+  function sourceStatusLabel(s: SourceInfo): string {
+    switch (s.status) {
+      case 'connecting': return 'Connecting';
+      case 'queued': return s.queue_rank ? `QR: ${s.queue_rank}` : 'Queued';
+      case 'transferring': return 'Transferring';
+      case 'completed': return 'Done';
+      case 'failed': return 'Failed';
+      default: return s.status;
+    }
+  }
 
   function toErrorMsg(e: unknown): string {
     return e instanceof Error ? e.message : typeof e === 'string' ? e : 'Operation failed';
@@ -249,7 +304,12 @@
         </thead>
         <tbody>
           {#each sortedActiveDownloads as t (t.id)}
-            <tr class="dl-row {t.status}" oncontextmenu={(e) => onCtx(e, t, 'active')}>
+            <tr
+              class="dl-row {t.status}"
+              class:expanded={expandedTransferId === t.id}
+              oncontextmenu={(e) => onCtx(e, t, 'active')}
+              ondblclick={() => toggleSourceDetail(t)}
+            >
               <td class="name-cell" title={t.file_name}>{t.file_name}</td>
               <td class="num-cell">{formatSize(t.total_size)}</td>
               <td class="num-cell">{formatSize(t.transferred)}</td>
@@ -274,6 +334,49 @@
               <td class="num-cell">{t.status === 'active' ? formatEta(t.total_size, t.transferred, t.speed) : '\u2014'}</td>
               <td class="date-cell">{formatDate(t.started_at)}</td>
             </tr>
+            {#if expandedTransferId === t.id}
+              <tr class="source-detail-row">
+                <td colspan="10">
+                  <div class="source-panel">
+                    <div class="source-panel-header">Sources for {t.file_name}</div>
+                    {#if loadingSources}
+                      <div class="source-loading">Loading sources...</div>
+                    {:else if expandedSources.length === 0}
+                      <div class="source-empty">No source details available yet</div>
+                    {:else}
+                      <table class="source-table">
+                        <thead>
+                          <tr>
+                            <th>IP</th>
+                            <th>Port</th>
+                            <th>Status</th>
+                            <th>Queue Rank</th>
+                            <th>Speed</th>
+                            <th>Transferred</th>
+                            <th>Client</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {#each expandedSources as src}
+                            <tr class="src-row src-{src.status}">
+                              <td>{src.ip}</td>
+                              <td>{src.port}</td>
+                              <td>
+                                <span class="src-status src-st-{src.status}">{sourceStatusLabel(src)}</span>
+                              </td>
+                              <td class="num-cell">{src.queue_rank ?? '\u2014'}</td>
+                              <td class="num-cell">{src.status === 'transferring' ? formatSpeed(src.speed) : '\u2014'}</td>
+                              <td class="num-cell">{src.transferred > 0 ? formatSize(src.transferred) : '\u2014'}</td>
+                              <td>{src.client_software || '\u2014'}</td>
+                            </tr>
+                          {/each}
+                        </tbody>
+                      </table>
+                    {/if}
+                  </div>
+                </td>
+              </tr>
+            {/if}
           {/each}
           {#if completedDownloads.length > 0}
             <tr class="section-divider-row"><td colspan="10">Completed / Failed ({completedDownloads.length})</td></tr>
@@ -662,4 +765,69 @@
     padding: 4px 0;
     min-width: 100px;
   }
+
+  /* --- Source detail panel (eMule-style) --- */
+  .dl-row.expanded {
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+  }
+  .dl-row {
+    cursor: default;
+  }
+  .source-detail-row td {
+    padding: 0 !important;
+    border-bottom: 2px solid var(--accent);
+  }
+  .source-panel {
+    background: color-mix(in srgb, var(--bg-secondary) 80%, var(--bg-primary));
+    padding: 6px 12px 8px;
+  }
+  .source-panel-header {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+    padding-bottom: 3px;
+    border-bottom: 1px solid var(--border);
+  }
+  .source-loading, .source-empty {
+    font-size: 11px;
+    color: var(--text-muted);
+    padding: 8px 0;
+    text-align: center;
+    font-style: italic;
+  }
+  .source-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+    table-layout: auto;
+  }
+  .source-table th {
+    background: color-mix(in srgb, var(--bg-secondary) 60%, transparent);
+    padding: 3px 8px;
+    font-size: 10px;
+    font-weight: 600;
+    text-align: left;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  .source-table td {
+    padding: 3px 8px;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 30%, transparent);
+  }
+  .source-table tbody tr:hover {
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
+  }
+  .src-status {
+    font-weight: 600;
+    font-size: 10px;
+  }
+  .src-st-connecting { color: var(--warning); }
+  .src-st-queued { color: var(--text-muted); }
+  .src-st-transferring { color: var(--accent); }
+  .src-st-completed { color: var(--success, #2ecc71); }
+  .src-st-failed { color: var(--danger, #e74c3c); }
 </style>

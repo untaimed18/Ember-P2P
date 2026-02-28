@@ -68,6 +68,16 @@ export interface Transfer {
   queued_sources: number;
 }
 
+export interface SourceInfo {
+  ip: string;
+  port: number;
+  status: 'connecting' | 'queued' | 'transferring' | 'completed' | 'failed';
+  queue_rank?: number;
+  speed: number;
+  transferred: number;
+  client_software: string;
+}
+
 export interface SearchResult {
   file: FileInfo;
   peer_id: string;

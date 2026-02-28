@@ -98,6 +98,30 @@ pub enum TransferStatus {
     Failed,
 }
 
+/// Per-source detail for a download (eMule-style source list)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceInfo {
+    pub ip: String,
+    pub port: u16,
+    pub status: SourceStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_rank: Option<u32>,
+    pub speed: u64,
+    pub transferred: u64,
+    #[serde(default)]
+    pub client_software: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceStatus {
+    Connecting,
+    Queued,
+    Transferring,
+    Completed,
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub file: FileInfo,

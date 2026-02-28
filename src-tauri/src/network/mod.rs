@@ -4809,6 +4809,52 @@ async fn handle_download_event(
                 }),
             );
         }
+        DownloadEvent::SourceDetail {
+            transfer_id,
+            ip,
+            port,
+            status,
+            queue_rank,
+            speed,
+            transferred,
+            client_software,
+        } => {
+            let source_status = match status.as_str() {
+                "connecting" => crate::types::SourceStatus::Connecting,
+                "queued" => crate::types::SourceStatus::Queued,
+                "transferring" => crate::types::SourceStatus::Transferring,
+                "completed" => crate::types::SourceStatus::Completed,
+                _ => crate::types::SourceStatus::Failed,
+            };
+            {
+                let mut mgr = transfer_manager.write().await;
+                mgr.update_source_detail(
+                    &transfer_id,
+                    crate::types::SourceInfo {
+                        ip: ip.clone(),
+                        port,
+                        status: source_status,
+                        queue_rank,
+                        speed,
+                        transferred,
+                        client_software: client_software.clone(),
+                    },
+                );
+            }
+            let _ = app_handle.emit(
+                "transfer-source-detail",
+                serde_json::json!({
+                    "transfer_id": transfer_id,
+                    "ip": ip,
+                    "port": port,
+                    "status": status,
+                    "queue_rank": queue_rank,
+                    "speed": speed,
+                    "transferred": transferred,
+                    "client_software": client_software,
+                }),
+            );
+        }
         DownloadEvent::Completed { transfer_id } => {
             stats_manager.record_completed_download();
             let promoted = {

@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Transfer } from '$lib/types';
+import type { Transfer, SourceInfo } from '$lib/types';
 
 export async function startDownload(
   fileHash: string,
@@ -51,4 +51,8 @@ export async function pauseAllTransfers(): Promise<void> {
 
 export async function resumeAllTransfers(): Promise<void> {
   return invoke('resume_all_transfers');
+}
+
+export async function getTransferSources(transferId: string): Promise<SourceInfo[]> {
+  return invoke('get_transfer_sources', { transferId });
 }

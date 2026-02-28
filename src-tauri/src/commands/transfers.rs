@@ -208,6 +208,15 @@ pub async fn resume_all_transfers(
 }
 
 #[tauri::command]
+pub async fn get_transfer_sources(
+    state: tauri::State<'_, AppState>,
+    transfer_id: String,
+) -> Result<Vec<crate::types::SourceInfo>, String> {
+    let manager = state.transfer_manager.read().await;
+    Ok(manager.get_source_details(&transfer_id))
+}
+
+#[tauri::command]
 pub async fn clear_completed(
     state: tauri::State<'_, AppState>,
 ) -> Result<u32, String> {
