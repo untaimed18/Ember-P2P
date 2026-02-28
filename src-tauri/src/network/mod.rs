@@ -3466,6 +3466,8 @@ async fn handle_udp_packet(
             let external_ip = Ipv4Addr::from(ip.to_be_bytes());
             debug!("FirewalledRes: our external IP is {external_ip}");
             state.firewall_checker.handle_firewalled_response(external_ip);
+            // Receiving this UDP response proves our UDP port is reachable
+            state.firewall_checker.handle_udp_firewall_result(true);
             if let Some(confirmed) = state.firewall_checker.external_ip() {
                 state.external_ip = Some(confirmed);
                 state.stats.external_ip = confirmed.to_string();
