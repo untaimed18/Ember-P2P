@@ -16,15 +16,20 @@
   import type { FileInfo } from '$lib/types';
   import { onMount } from 'svelte';
 
+  import { listen } from '@tauri-apps/api/event';
+  import type { UnlistenFn } from '@tauri-apps/api/event';
+
   let folders: string[] = $state([]);
   let files: FileInfo[] = $state([]);
   let scanning = $state(false);
   let error: string | null = $state(null);
   let selectedHash: string | null = $state(null);
   let filterFolder: string | null = $state(null);
+  let hashProgress: { current: number; total: number; file_name: string } | null = $state(null);
 
   let mounted = true;
   let pollBusy = false;
+  let eventUnlisteners: UnlistenFn[] = [];
 
   function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
     return Promise.race([
@@ -267,10 +272,37 @@
     refresh();
     const pollInterval = setInterval(refreshFiles, 3000);
 
+    listen<{ phase: string; count: number }>('shared-files-changed', () => {
+      if (mounted) refreshFiles();
+    }).then((u) => eventUnlisteners.push(u));
+
+    listen<{ current: number; total: number; file_name: string; done?: boolean }>(
+      'file-hash-progress',
+      (event) => {
+        if (!mounted) return;
+        if (event.payload.done) {
+          hashProgress = null;
+          refreshFiles();
+        } else {
+          hashProgress = {
+            current: event.payload.current,
+            total: event.payload.total,
+            file_name: event.payload.file_name,
+          };
+        }
+      }
+    ).then((u) => eventUnlisteners.push(u));
+
+    listen<{ hash: string; file_name: string }>('file-hashed', () => {
+      if (mounted) refreshFiles();
+    }).then((u) => eventUnlisteners.push(u));
+
     return () => {
       mounted = false;
       clearInterval(pollInterval);
       dragCleanup?.();
+      for (const u of eventUnlisteners) u();
+      eventUnlisteners = [];
     };
   });
 </script>
@@ -335,10 +367,14 @@
 
   <!-- Main: file list -->
   <div class="file-list-area">
-    {#if scanning}
+    {#if scanning || hashProgress}
       <div class="scan-banner">
         <span class="scan-spinner"></span>
-        Scanning files in background&hellip;
+        {#if hashProgress}
+          Hashing file {hashProgress.current} of {hashProgress.total}: {hashProgress.file_name}
+        {:else}
+          Scanning files&hellip;
+        {/if}
       </div>
     {/if}
     {#if sortedFiles.length === 0 && !scanning}
@@ -377,13 +413,27 @@
                 <td class="col-size">{formatSize(file.size)}</td>
                 <td class="col-type">{fileType(file.extension)}</td>
                 <td class="col-prio prio-{file.priority}">{priorityLabel(file.priority)}</td>
-                <td class="col-hash" title={file.hash}>{file.hash.substring(0, 16)}&hellip;</td>
+                <td class="col-hash" title={file.hash || 'Hashing...'}>
+                  {#if file.hash}
+                    {file.hash.substring(0, 16)}&hellip;
+                  {:else}
+                    <span class="hashing-label">Hashing&hellip;</span>
+                  {/if}
+                </td>
                 <td class="col-num">{file.requests}{file.alltime_requests ? ` (${file.alltime_requests})` : ''}</td>
                 <td class="col-num">{file.accepted}{file.alltime_accepted ? ` (${file.alltime_accepted})` : ''}</td>
                 <td class="col-size">{formatTransferred(file.bytes_transferred, file.alltime_transferred)}</td>
                 <td class="col-folder" title={file.folder}>{file.folder.split(/[\\/]/).filter(Boolean).pop() || file.folder}</td>
                 <td class="col-num">{file.complete_sources || '\u2014'}</td>
-                <td class="col-shared">{file.shared_kad ? 'eD2K | Kad' : 'eD2K'}</td>
+                <td class="col-shared">
+                  {#if !file.hash}
+                    <span class="hashing-label">Pending</span>
+                  {:else if file.shared_kad}
+                    eD2K | Kad
+                  {:else}
+                    eD2K
+                  {/if}
+                </td>
               </tr>
             {/each}
           </tbody>
@@ -611,6 +661,16 @@
   .col-num { text-align: right; min-width: 60px; }
   .col-folder { max-width: 200px; color: var(--text-muted); }
   .col-shared { min-width: 80px; color: var(--text-secondary); white-space: nowrap; }
+  .hashing-label {
+    color: var(--warning, #e0a030);
+    font-style: italic;
+    font-size: 11px;
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
 
   /* Priority colors */
   .prio-verylow { color: #888; }

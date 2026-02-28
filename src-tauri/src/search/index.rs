@@ -25,7 +25,9 @@ impl LocalIndex {
 
     pub fn add_file(&mut self, file: FileInfo) {
         let idx = self.files.len();
-        self.hash_map.insert(file.hash.clone(), idx);
+        // Index by hash if available, otherwise by id (for unhashed "pending:" files)
+        let key = if file.hash.is_empty() { file.id.clone() } else { file.hash.clone() };
+        self.hash_map.insert(key, idx);
 
         let name_lower = file.name.to_lowercase();
         for token in tokenize(&name_lower) {
@@ -109,6 +111,18 @@ impl LocalIndex {
         None
     }
 
+    /// Remove a file by its `id` field (handles temporary "pending:..." ids
+    /// assigned during the discovery phase before hashing completes).
+    pub fn remove_file_by_id(&mut self, id: &str) -> Option<FileInfo> {
+        if let Some(pos) = self.files.iter().position(|f| f.id == id) {
+            let removed = self.files.remove(pos);
+            self.rebuild_indices();
+            Some(removed)
+        } else {
+            None
+        }
+    }
+
     pub fn update_alltime_stats(&mut self, hash: &str, alltime_requests: u32, alltime_accepted: u32, alltime_transferred: u64) {
         if let Some(&idx) = self.hash_map.get(hash) {
             if let Some(file) = self.files.get_mut(idx) {
@@ -133,7 +147,8 @@ impl LocalIndex {
         self.hash_map.clear();
         self.name_tokens.clear();
         for (idx, file) in self.files.iter().enumerate() {
-            self.hash_map.insert(file.hash.clone(), idx);
+            let key = if file.hash.is_empty() { file.id.clone() } else { file.hash.clone() };
+            self.hash_map.insert(key, idx);
             let name_lower = file.name.to_lowercase();
             for token in tokenize(&name_lower) {
                 self.name_tokens.entry(token).or_default().push(idx);
