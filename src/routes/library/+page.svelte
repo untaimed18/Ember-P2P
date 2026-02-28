@@ -30,6 +30,7 @@
   let mounted = true;
   let pollBusy = false;
   let eventUnlisteners: UnlistenFn[] = [];
+  let refreshDebounce: ReturnType<typeof setTimeout> | null = null;
 
   function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
     return Promise.race([
@@ -269,11 +270,17 @@
       if (!isNaN(val)) sidebarWidth = Math.max(120, Math.min(400, val));
     }
 
+    function debouncedRefresh() {
+      if (!mounted) return;
+      if (refreshDebounce) clearTimeout(refreshDebounce);
+      refreshDebounce = setTimeout(() => { refreshDebounce = null; refreshFiles(); }, 500);
+    }
+
     refresh();
-    const pollInterval = setInterval(refreshFiles, 3000);
+    const pollInterval = setInterval(refreshFiles, 5000);
 
     listen<{ phase: string; count: number }>('shared-files-changed', () => {
-      if (mounted) refreshFiles();
+      debouncedRefresh();
     }).then((u) => eventUnlisteners.push(u));
 
     listen<{ current: number; total: number; file_name: string; done?: boolean }>(
@@ -282,7 +289,7 @@
         if (!mounted) return;
         if (event.payload.done) {
           hashProgress = null;
-          refreshFiles();
+          debouncedRefresh();
         } else {
           hashProgress = {
             current: event.payload.current,
@@ -294,12 +301,13 @@
     ).then((u) => eventUnlisteners.push(u));
 
     listen<{ hash: string; file_name: string }>('file-hashed', () => {
-      if (mounted) refreshFiles();
+      debouncedRefresh();
     }).then((u) => eventUnlisteners.push(u));
 
     return () => {
       mounted = false;
       clearInterval(pollInterval);
+      if (refreshDebounce) clearTimeout(refreshDebounce);
       dragCleanup?.();
       for (const u of eventUnlisteners) u();
       eventUnlisteners = [];

@@ -2780,22 +2780,15 @@ pub async fn start_network(
 
                 let cached_tstats = stats_manager.get_stats();
 
-                // Merge all-time stats from known.met into local_index for frontend display
-                {
-                    let mut index = local_index.write().await;
-                    for record in known_files.all_records() {
-                        let hash_hex = hex::encode(record.file_hash);
-                        index.update_alltime_stats(
-                            &hash_hex,
-                            record.all_time_requested,
-                            record.all_time_accepted,
-                            record.all_time_transferred,
-                        );
-                    }
-                }
+                // Collect known-file stats for the background task (can't move known_files into spawn)
+                let known_stats: Vec<([u8; 16], u32, u32, u64)> = known_files
+                    .all_records()
+                    .map(|r| (r.file_hash, r.all_time_requested, r.all_time_accepted, r.all_time_transferred))
+                    .collect();
 
-                // Spawn ALL heavy work (hex conversion, distance computation, writes)
-                // as a background task so the event loop isn't blocked.
+                // Spawn ALL heavy work (hex conversion, distance computation, writes,
+                // and the local_index stats merge) as a background task so the event
+                // loop isn't blocked by any RwLock contention.
                 let sp = shared_peers.clone();
                 let ss = shared_stats.clone();
                 let sc = shared_contacts.clone();
@@ -2804,7 +2797,16 @@ pub async fn start_network(
                 let s_conn = shared_connected_server.clone();
                 let s_tstats = shared_transfer_stats.clone();
                 let db_ref = db.clone();
+                let li_ref = local_index.clone();
                 cache_write_handle = Some(tokio::spawn(async move {
+                    // Merge all-time stats from known.met into local_index for frontend display
+                    {
+                        let mut index = li_ref.write().await;
+                        for (file_hash, reqs, accepted, transferred) in &known_stats {
+                            let hash_hex = hex::encode(file_hash);
+                            index.update_alltime_stats(&hash_hex, *reqs, *accepted, *transferred);
+                        }
+                    }
                     // Do the expensive hex/distance conversions here, off the event loop
                     let mut peers: Vec<PeerInfo> = Vec::new();
                     let mut cached_c: Vec<KadContactInfo> = Vec::new();
