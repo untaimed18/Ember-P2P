@@ -609,13 +609,16 @@ pub async fn start_network(
             }
         }
 
-        // Send FirewalledReq to a few contacts to detect our external IP
+        // Send FirewalledReq to detect our external IP + TCP firewall status.
+        // Register with FirewallChecker so responses are properly counted.
+        state.firewall_checker.start_check();
         for contact in boot_contacts.iter().take(3) {
             let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
             let msg = KadMessage::FirewalledReq { tcp_port };
             if let Ok(packet) = messages::encode_packet(&msg) {
                 let _ = udp_socket.send_to(&packet, addr).await;
                 state.firewall_checks_sent += 1;
+                state.firewall_checker.record_tcp_request_sent();
             }
         }
         debug!("Sent {} firewall check requests", state.firewall_checks_sent);
@@ -626,6 +629,7 @@ pub async fn start_network(
             let msg = KadMessage::Ping;
             if let Ok(packet) = messages::encode_packet(&msg) {
                 let _ = udp_socket.send_to(&packet, addr).await;
+                state.firewall_checker.record_udp_request_sent();
             }
         }
     } else {
@@ -3863,7 +3867,16 @@ async fn handle_udp_packet(
             info!("FirewalledRes: our external IP is {external_ip}");
             state.firewall_checker.handle_firewalled_response(external_ip);
             state.firewall_checker.handle_udp_firewall_result(true);
-            let was_unknown = state.external_ip.is_none();
+
+            // Immediately update firewalled status — this is definitive proof
+            // an external peer connected to our TCP port (no need to wait for evaluate).
+            let was_firewalled = state.firewalled;
+            state.firewalled = false;
+            state.stats.firewalled = false;
+            state.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
+            state.udp_firewalled = false;
+            state.publish_manager.firewalled = false;
+
             if let Some(confirmed) = state.firewall_checker.external_ip() {
                 state.external_ip = Some(confirmed);
                 state.stats.external_ip = confirmed.to_string();
@@ -3871,9 +3884,11 @@ async fn handle_udp_packet(
                 state.external_ip = Some(external_ip);
                 state.stats.external_ip = external_ip.to_string();
             }
-            if was_unknown && state.external_ip.is_some() {
+
+            if was_firewalled || state.external_ip.is_some() {
+                info!("Firewall status: OPEN (confirmed by peer), external IP: {}", state.stats.external_ip);
                 let _ = app_handle.emit("firewall-status", serde_json::json!({
-                    "firewalled": state.firewalled,
+                    "firewalled": false,
                     "external_ip": state.stats.external_ip,
                     "tcp_status": "Open",
                     "udp_status": "Open",

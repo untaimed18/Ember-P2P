@@ -60,11 +60,13 @@ impl FirewallChecker {
         let now = chrono::Utc::now().timestamp();
         self.checking = true;
         self.last_check_start = now;
+        // Reset per-cycle counters but preserve tcp_status/udp_status
+        // so a confirmed-Open status isn't lost between cycles.
         self.tcp_responses_received = 0;
         self.tcp_requests_sent = 0;
         self.udp_responses_received = 0;
         self.udp_requests_sent = 0;
-        info!("Starting firewall check cycle");
+        info!("Starting firewall check cycle (current TCP={:?}, UDP={:?})", self.tcp_status, self.udp_status);
     }
 
     pub fn record_tcp_request_sent(&mut self) {
@@ -132,18 +134,21 @@ impl FirewallChecker {
 
         self.checking = false;
 
-        if self.tcp_requests_sent > 0 && self.tcp_responses_received == 0 {
+        // Never downgrade a confirmed-Open status to Firewalled based on a single
+        // check cycle where contacts didn't respond (they might just be offline).
+        // Only mark Firewalled if we've never been confirmed Open.
+        if self.tcp_responses_received > 0 {
+            self.tcp_status = FirewallStatus::Open;
+        } else if self.tcp_requests_sent > 0 && self.tcp_status != FirewallStatus::Open {
             self.tcp_status = FirewallStatus::Firewalled;
             info!("TCP firewall check complete: FIREWALLED (0/{} responses)", self.tcp_requests_sent);
-        } else if self.tcp_responses_received > 0 {
-            self.tcp_status = FirewallStatus::Open;
         }
 
-        if self.udp_requests_sent > 0 && self.udp_responses_received == 0 && self.udp_status != FirewallStatus::Open {
+        if self.udp_responses_received > 0 {
+            self.udp_status = FirewallStatus::Open;
+        } else if self.udp_requests_sent > 0 && self.udp_status != FirewallStatus::Open {
             self.udp_status = FirewallStatus::Firewalled;
             info!("UDP firewall check complete: FIREWALLED");
-        } else if self.udp_responses_received > 0 && self.udp_status != FirewallStatus::Open {
-            self.udp_status = FirewallStatus::Open;
         }
 
         true
