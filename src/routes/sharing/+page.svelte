@@ -292,6 +292,7 @@
   </div>
 
   <!-- Sidebar resize handle -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div class="sidebar-divider" onmousedown={onSidebarDown} role="separator"></div>
 
   <!-- Main: file list -->
@@ -352,33 +353,35 @@
 
 <!-- Context menu -->
 {#if ctxMenu}
-  <div class="ctx-menu" style="left:{ctxMenu.x}px;top:{ctxMenu.y}px;">
-    <div class="ctx-item" onclick={() => ctxAction('open_file')}>Open File</div>
-    <div class="ctx-item" onclick={() => ctxAction('open_folder')}>Open Folder</div>
+  <div class="ctx-menu" style="left:{ctxMenu.x}px;top:{ctxMenu.y}px;" role="menu">
+    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_file')}>Open File</button>
+    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_folder')}>Open Folder</button>
     <div class="ctx-sep"></div>
     <div
       class="ctx-item ctx-sub-parent"
+      role="menuitem"
+      tabindex="0"
       onmouseenter={() => ctxPrioritySub = true}
       onmouseleave={() => ctxPrioritySub = false}
-      role="menuitem"
+      onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') ctxPrioritySub = true; }}
     >
       Priority &raquo;
       {#if ctxPrioritySub}
-        <div class="ctx-submenu">
-          <div class="ctx-item" class:ctx-checked={ctxMenu.file.priority === 'verylow'} onclick={() => ctxAction('priority', 'verylow')}>Very Low</div>
-          <div class="ctx-item" class:ctx-checked={ctxMenu.file.priority === 'low'} onclick={() => ctxAction('priority', 'low')}>Low</div>
-          <div class="ctx-item" class:ctx-checked={ctxMenu.file.priority === 'normal'} onclick={() => ctxAction('priority', 'normal')}>Normal</div>
-          <div class="ctx-item" class:ctx-checked={ctxMenu.file.priority === 'high'} onclick={() => ctxAction('priority', 'high')}>High</div>
-          <div class="ctx-item" class:ctx-checked={ctxMenu.file.priority === 'release'} onclick={() => ctxAction('priority', 'release')}>Release</div>
+        <div class="ctx-submenu" role="menu">
+          <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'verylow'} onclick={() => ctxAction('priority', 'verylow')}>Very Low</button>
+          <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'low'} onclick={() => ctxAction('priority', 'low')}>Low</button>
+          <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'normal'} onclick={() => ctxAction('priority', 'normal')}>Normal</button>
+          <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'high'} onclick={() => ctxAction('priority', 'high')}>High</button>
+          <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'release'} onclick={() => ctxAction('priority', 'release')}>Release</button>
           <div class="ctx-sep"></div>
-          <div class="ctx-item" class:ctx-checked={ctxMenu.file.priority === 'auto'} onclick={() => ctxAction('priority', 'auto')}>Auto</div>
+          <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'auto'} onclick={() => ctxAction('priority', 'auto')}>Auto</button>
         </div>
       {/if}
     </div>
     <div class="ctx-sep"></div>
-    <div class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy eD2k Link</div>
+    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>Copy eD2k Link</button>
     <div class="ctx-sep"></div>
-    <div class="ctx-item" onclick={() => ctxAction('unshare')}>Unshare</div>
+    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>Unshare</button>
   </div>
 {/if}
 
@@ -558,10 +561,20 @@
     font-size: 12px;
   }
   .ctx-item {
+    display: block;
+    width: 100%;
+    text-align: left;
     padding: 5px 16px;
     cursor: pointer;
     white-space: nowrap;
     position: relative;
+    border: none;
+    border-radius: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    font-size: 12px;
+    line-height: inherit;
   }
   .ctx-item:hover { background: var(--accent, #3498db); color: #fff; }
   .ctx-sep { height: 1px; margin: 4px 0; background: var(--border); }

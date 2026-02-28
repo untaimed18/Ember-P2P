@@ -567,7 +567,7 @@
     color: #fff;
   }
 
-  [data-theme="dark"] .method-btn.active {
+  :global([data-theme="dark"]) .method-btn.active {
     background: var(--accent-dim);
     color: var(--text-primary);
   }
