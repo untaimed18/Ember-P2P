@@ -2833,14 +2833,17 @@ pub async fn start_network(
                 cache_write_handle = Some(tokio::spawn(async move {
                     // Merge all-time stats from known.met into local_index, then
                     // snapshot the file list for frontend IPC reads.
-                    {
+                    // IMPORTANT: release the local_index lock before acquiring
+                    // cached_shared_files -- never nest these two locks.
+                    let file_snap = {
                         let mut index = li_ref.write().await;
                         for (file_hash, reqs, accepted, transferred) in &known_stats {
                             let hash_hex = hex::encode(file_hash);
                             index.update_alltime_stats(&hash_hex, *reqs, *accepted, *transferred);
                         }
-                        *s_files.write().await = index.all_files().to_vec();
-                    }
+                        index.all_files().to_vec()
+                    };
+                    *s_files.write().await = file_snap;
                     // Do the expensive hex/distance conversions here, off the event loop
                     let mut peers: Vec<PeerInfo> = Vec::new();
                     let mut cached_c: Vec<KadContactInfo> = Vec::new();

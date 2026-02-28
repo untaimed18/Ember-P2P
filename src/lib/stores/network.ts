@@ -54,7 +54,13 @@ export async function initNetworkStore() {
 
   try {
     const stats = await getNetworkStats();
-    networkStats.set(stats);
+    networkStats.update((current) => {
+      const merged = { ...stats };
+      if (!merged.external_ip && current.external_ip) {
+        merged.external_ip = current.external_ip;
+      }
+      return merged;
+    });
   } catch {
     // Backend not ready yet
   }
