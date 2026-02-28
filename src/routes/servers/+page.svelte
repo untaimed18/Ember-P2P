@@ -30,8 +30,13 @@
   let sortCol: string = $state('name');
   let sortAsc = $state(true);
 
-  // Selection
+  // Selection (multi-select support)
   let selectedServer: ServerInfo | null = $state(null);
+  let selectedServers: Set<string> = $state(new Set());
+  let lastClickedKey: string | null = $state(null);
+
+  // Context menu
+  let ctxMenu: { x: number; y: number; server: ServerInfo } | null = $state(null);
 
   let connecting = $state(false);
   let refreshInProgress = false;
@@ -191,16 +196,92 @@
     }
   }
 
+  function serverKey(s: ServerInfo): string {
+    return `${s.ip}:${s.port}`;
+  }
+
   function handleDoubleClick(server: ServerInfo) {
     handleConnect(server);
   }
 
-  function selectServer(server: ServerInfo) {
-    selectedServer = server;
+  function selectServer(server: ServerInfo, e: MouseEvent) {
+    const key = serverKey(server);
+    if (e.ctrlKey || e.metaKey) {
+      const next = new Set(selectedServers);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      selectedServers = next;
+      selectedServer = server;
+      lastClickedKey = key;
+    } else if (e.shiftKey && lastClickedKey) {
+      const keys = sortedServers.map(serverKey);
+      const startIdx = keys.indexOf(lastClickedKey);
+      const endIdx = keys.indexOf(key);
+      if (startIdx >= 0 && endIdx >= 0) {
+        const lo = Math.min(startIdx, endIdx);
+        const hi = Math.max(startIdx, endIdx);
+        const next = new Set(selectedServers);
+        for (let i = lo; i <= hi; i++) next.add(keys[i]);
+        selectedServers = next;
+      }
+      selectedServer = server;
+    } else {
+      selectedServers = new Set([key]);
+      selectedServer = server;
+      lastClickedKey = key;
+    }
+  }
+
+  function isSelected(server: ServerInfo): boolean {
+    return selectedServers.has(serverKey(server));
   }
 
   function isConnected(server: ServerInfo): boolean {
     return connectedServer?.ip === server.ip && connectedServer?.port === server.port;
+  }
+
+  function handleContextMenu(e: MouseEvent, server: ServerInfo) {
+    e.preventDefault();
+    const key = serverKey(server);
+    if (!selectedServers.has(key)) {
+      selectedServers = new Set([key]);
+      selectedServer = server;
+      lastClickedKey = key;
+    }
+    ctxMenu = { x: e.clientX, y: e.clientY, server };
+  }
+
+  function closeContextMenu() {
+    ctxMenu = null;
+  }
+
+  async function ctxAction(action: string) {
+    const target = ctxMenu?.server;
+    closeContextMenu();
+    if (action === 'connect' && target) {
+      await handleConnect(target);
+    } else if (action === 'disconnect') {
+      await handleDisconnect();
+    } else if (action === 'remove') {
+      await handleRemoveSelected();
+    } else if (action === 'copy_ip' && target) {
+      try { await navigator.clipboard.writeText(`${target.ip}:${target.port}`); flash('Copied to clipboard'); } catch {}
+    } else if (action === 'copy_ed2k' && target) {
+      try { await navigator.clipboard.writeText(`ed2k://|server|${target.ip}|${target.port}|/`); flash('ED2K link copied'); } catch {}
+    }
+  }
+
+  async function handleRemoveSelected() {
+    error = null;
+    const toRemove = servers.filter(s => selectedServers.has(serverKey(s)));
+    for (const s of toRemove) {
+      try { await removeServer(s.ip, s.port); } catch { /* continue */ }
+    }
+    const count = toRemove.length;
+    selectedServers = new Set();
+    selectedServer = null;
+    log(`Removed ${count} server${count !== 1 ? 's' : ''}`);
+    flash(`Removed ${count} server${count !== 1 ? 's' : ''}`);
+    await refresh();
   }
 
   function toggleSort(col: string) {
@@ -247,11 +328,17 @@
   }
 
   let connectButtonLabel = $derived(connectedServer ? 'Disconnect' : 'Connect');
+  let selectionCount = $derived(selectedServers.size);
 </script>
+
+<svelte:document onclick={closeContextMenu} />
 
 <div class="page-header">
   <h2>Servers</h2>
   <div class="header-actions">
+    {#if selectionCount > 1}
+      <button class="danger" onclick={handleRemoveSelected}>Remove {selectionCount} Servers</button>
+    {/if}
     {#if connectedServer}
       <button class="danger" onclick={handleDisconnect}>Disconnect</button>
     {:else if selectedServer}
@@ -330,10 +417,11 @@
               {#each sortedServers as server (`${server.ip}:${server.port}`)}
                 <tr
                   class:connected={isConnected(server)}
-                  class:selected={selectedServer?.ip === server.ip && selectedServer?.port === server.port}
+                  class:selected={isSelected(server)}
                   class:failed-server={server.fail_count >= 3}
-                  onclick={() => selectServer(server)}
+                  onclick={(e: MouseEvent) => selectServer(server, e)}
                   ondblclick={() => handleDoubleClick(server)}
+                  oncontextmenu={(e: MouseEvent) => handleContextMenu(e, server)}
                 >
                   <td class="name-cell">
                     <span class="server-icon" class:connected-icon={isConnected(server)}>S</span>
@@ -475,6 +563,23 @@
     </div>
   </div>
 </div>
+
+{#if ctxMenu}
+  <div class="context-menu" style="left: {ctxMenu.x}px; top: {ctxMenu.y}px;">
+    {#if !isConnected(ctxMenu.server)}
+      <button class="ctx-item" onclick={() => ctxAction('connect')}>Connect</button>
+    {:else}
+      <button class="ctx-item" onclick={() => ctxAction('disconnect')}>Disconnect</button>
+    {/if}
+    <div class="ctx-sep"></div>
+    <button class="ctx-item danger" onclick={() => ctxAction('remove')}>
+      {selectionCount > 1 ? `Remove ${selectionCount} Servers` : 'Remove Server'}
+    </button>
+    <div class="ctx-sep"></div>
+    <button class="ctx-item" onclick={() => ctxAction('copy_ip')}>Copy IP:Port</button>
+    <button class="ctx-item" onclick={() => ctxAction('copy_ed2k')}>Copy ED2K Link</button>
+  </div>
+{/if}
 
 <style>
   .header-actions {
@@ -810,5 +915,44 @@
   .sub {
     font-size: 12px;
     color: var(--text-muted);
+  }
+
+  /* Context menu */
+  .context-menu {
+    position: fixed;
+    z-index: 1000;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md, 6px);
+    box-shadow: var(--shadow-lg, 0 4px 12px rgba(0,0,0,0.15));
+    padding: 4px 0;
+    min-width: 180px;
+  }
+
+  .ctx-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 6px 14px;
+    font-size: 12px;
+    background: none;
+    border: none;
+    color: var(--text-primary);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .ctx-item:hover {
+    background: var(--bg-hover);
+  }
+
+  .ctx-item.danger {
+    color: var(--danger, #e74c3c);
+  }
+
+  .ctx-sep {
+    height: 1px;
+    background: var(--border);
+    margin: 3px 0;
   }
 </style>
