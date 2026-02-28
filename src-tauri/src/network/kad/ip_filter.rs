@@ -1,5 +1,6 @@
 use std::net::Ipv4Addr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 use tracing::{info, warn};
@@ -20,6 +21,49 @@ pub struct IpFilterEntry {
     pub hits: u64,
 }
 
+/// Lightweight shared IP filter for use in spawned tasks (upload handler).
+/// Contains a sorted snapshot of blocked ranges and settings.
+pub type SharedIpFilter = std::sync::Arc<std::sync::RwLock<IpFilterSnapshot>>;
+
+pub struct IpFilterSnapshot {
+    pub ranges: Vec<(u32, u32)>,
+    pub enabled: bool,
+    pub block_private: bool,
+    pub hit_counter: AtomicU64,
+}
+
+impl IpFilterSnapshot {
+    pub fn is_blocked(&self, ip: Ipv4Addr) -> bool {
+        if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
+            self.hit_counter.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if self.block_private && is_private_or_reserved(ip) {
+            self.hit_counter.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        if self.enabled {
+            let ip_u32 = u32::from(ip);
+            if self.ranges
+                .binary_search_by(|&(start, end)| {
+                    if ip_u32 < start {
+                        std::cmp::Ordering::Greater
+                    } else if ip_u32 > end {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .is_ok()
+            {
+                self.hit_counter.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct IpFilterStats {
     pub enabled: bool,
@@ -33,6 +77,10 @@ pub struct IpFilter {
     blocked_ranges: Vec<IpRange>,
     enabled: bool,
     block_private: bool,
+    /// Total range-based filter hits (atomic so readonly checks can also count)
+    total_range_hits: AtomicU64,
+    /// Hits from blocking private/reserved/special IPs (not in any range)
+    total_special_hits: AtomicU64,
 }
 
 impl IpFilter {
@@ -41,17 +89,44 @@ impl IpFilter {
             blocked_ranges: Vec::new(),
             enabled,
             block_private,
+            total_range_hits: AtomicU64::new(0),
+            total_special_hits: AtomicU64::new(0),
+        }
+    }
+
+    /// Transfer accumulated hit counts from another IpFilter (used when replacing the filter instance).
+    pub fn transfer_hits_from(&mut self, old: &IpFilter) {
+        let old_total = old.total_range_hits.load(Ordering::Relaxed);
+        let old_special = old.total_special_hits.load(Ordering::Relaxed);
+        self.total_range_hits.fetch_add(old_total, Ordering::Relaxed);
+        self.total_special_hits.fetch_add(old_special, Ordering::Relaxed);
+
+        let mut old_hits: std::collections::HashMap<(u32, u32), u64> = std::collections::HashMap::new();
+        for r in &old.blocked_ranges {
+            if r.hits > 0 {
+                old_hits.insert((r.start, r.end), r.hits);
+            }
+        }
+        for r in &mut self.blocked_ranges {
+            if let Some(&hits) = old_hits.get(&(r.start, r.end)) {
+                r.hits = hits;
+            }
         }
     }
 
     pub fn load_from_file(&mut self, path: &Path) -> usize {
+        let saved_hits: std::collections::HashMap<(u32, u32), u64> = self.blocked_ranges
+            .iter()
+            .filter(|r| r.hits > 0)
+            .map(|r| ((r.start, r.end), r.hits))
+            .collect();
         self.blocked_ranges.clear();
 
         let ext = path.extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
 
-        match ext.as_str() {
+        let count = match ext.as_str() {
             "p2b" => self.load_p2b_file(path),
             "p2p" => self.load_p2p_file(path),
             _ => {
@@ -83,7 +158,16 @@ impl IpFilter {
                 info!("Loaded {count} IP filter ranges from {}", path.display());
                 count
             }
+        };
+
+        if !saved_hits.is_empty() {
+            for r in &mut self.blocked_ranges {
+                if let Some(&hits) = saved_hits.get(&(r.start, r.end)) {
+                    r.hits = hits;
+                }
+            }
         }
+        count
     }
 
     fn merge_overlapping(&mut self) {
@@ -109,9 +193,11 @@ impl IpFilter {
 
     pub fn is_blocked(&mut self, ip: Ipv4Addr) -> bool {
         if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
+            self.total_special_hits.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         if self.block_private && is_private_or_reserved(ip) {
+            self.total_special_hits.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         if self.enabled {
@@ -126,17 +212,23 @@ impl IpFilter {
                 }
             }) {
                 self.blocked_ranges[idx].hits += 1;
+                self.total_range_hits.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
         }
         false
     }
 
+    /// Check if an IP is blocked without requiring &mut self.
+    /// Increments the atomic total hit counter but not per-range counters.
+    #[allow(dead_code)]
     pub fn is_blocked_readonly(&self, ip: Ipv4Addr) -> bool {
         if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
+            self.total_special_hits.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         if self.block_private && is_private_or_reserved(ip) {
+            self.total_special_hits.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         if self.enabled {
@@ -153,6 +245,7 @@ impl IpFilter {
                 })
                 .is_ok()
             {
+                self.total_range_hits.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
         }
@@ -179,8 +272,41 @@ impl IpFilter {
         self.block_private = block_private;
     }
 
+    /// Create a shared snapshot for use by the upload handler.
+    pub fn create_shared_snapshot(&self) -> SharedIpFilter {
+        std::sync::Arc::new(std::sync::RwLock::new(IpFilterSnapshot {
+            ranges: self.blocked_ranges.iter().map(|r| (r.start, r.end)).collect(),
+            enabled: self.enabled,
+            block_private: self.block_private,
+            hit_counter: AtomicU64::new(0),
+        }))
+    }
+
+    /// Update an existing shared snapshot with current filter state, preserving its hit counter.
+    pub fn update_shared_snapshot(&self, shared: &SharedIpFilter) {
+        if let Ok(mut snap) = shared.write() {
+            snap.ranges = self.blocked_ranges.iter().map(|r| (r.start, r.end)).collect();
+            snap.enabled = self.enabled;
+            snap.block_private = self.block_private;
+        }
+    }
+
+    /// Collect hits from the shared snapshot into the total counter.
+    pub fn collect_shared_hits(&self, shared: &SharedIpFilter) {
+        if let Ok(snap) = shared.read() {
+            let hits = snap.hit_counter.swap(0, Ordering::Relaxed);
+            if hits > 0 {
+                self.total_range_hits.fetch_add(hits, Ordering::Relaxed);
+            }
+        }
+    }
+
     pub fn get_stats(&self) -> IpFilterStats {
-        let total_hits: u64 = self.blocked_ranges.iter().map(|r| r.hits).sum();
+        let per_range_hits: u64 = self.blocked_ranges.iter().map(|r| r.hits).sum();
+        let atomic_range_hits = self.total_range_hits.load(Ordering::Relaxed);
+        let special_hits = self.total_special_hits.load(Ordering::Relaxed);
+        let total_hits = atomic_range_hits.max(per_range_hits) + special_hits;
+
         let entries: Vec<IpFilterEntry> = self
             .blocked_ranges
             .iter()

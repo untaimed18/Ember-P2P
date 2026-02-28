@@ -22,6 +22,7 @@ use crate::sharing::manager::TransferManager;
 
 use super::messages::*;
 use crate::network::kad::buddy::PendingBuddySet;
+use crate::network::kad::ip_filter::SharedIpFilter;
 
 /// Shared buddy info for including in Hello tags (updated by network task)
 pub type SharedBuddyInfo = Arc<RwLock<Option<BuddyInfo>>>;
@@ -105,6 +106,8 @@ struct UploadHandler {
     buddy_conn_tx: tokio::sync::mpsc::Sender<BuddyConnectionParts>,
     /// Shared buddy info for Hello tags
     shared_buddy_info: SharedBuddyInfo,
+    /// Shared IP filter snapshot for blocking incoming connections
+    shared_ip_filter: SharedIpFilter,
 }
 
 pub async fn start_upload_server(
@@ -126,6 +129,7 @@ pub async fn start_upload_server(
     pending_buddy_hashes: PendingBuddySet,
     buddy_conn_tx: tokio::sync::mpsc::Sender<BuddyConnectionParts>,
     shared_buddy_info: SharedBuddyInfo,
+    shared_ip_filter: SharedIpFilter,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     let listener = match TcpListener::bind(addr).await {
@@ -163,12 +167,24 @@ pub async fn start_upload_server(
         pending_buddy_hashes,
         buddy_conn_tx,
         shared_buddy_info,
+        shared_ip_filter,
     });
 
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
                 let server = server.clone();
+
+                // IP filter check (eMule filters all incoming TCP connections)
+                if let std::net::IpAddr::V4(ipv4) = peer_addr.ip() {
+                    if let Ok(snap) = server.shared_ip_filter.read() {
+                        if snap.is_blocked(ipv4) {
+                            debug!("Rejecting TCP connection from blocked IP {peer_addr}");
+                            drop(stream);
+                            continue;
+                        }
+                    }
+                }
 
                 // Enforce global connection limit
                 let current_total = server.total_connections.load(std::sync::atomic::Ordering::Relaxed);

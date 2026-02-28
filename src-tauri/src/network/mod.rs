@@ -310,6 +310,8 @@ struct NetworkState {
     pending_buddy_hashes: PendingBuddySet,
     /// Shared buddy info for Hello tags (updated when buddy connects/disconnects)
     shared_buddy_info: upload_server::SharedBuddyInfo,
+    /// Shared IP filter snapshot for the upload handler
+    shared_ip_filter: kad::ip_filter::SharedIpFilter,
     /// Event receiver for our buddy connection (we are firewalled)
     buddy_event_rx: Option<mpsc::Receiver<BuddyEvent>>,
     /// Event receiver for the client we're serving as buddy for
@@ -484,6 +486,7 @@ pub async fn start_network(
     if settings.ip_filter_enabled && ipfilter_path.exists() {
         ip_filter.load_from_file(&ipfilter_path);
     }
+    let shared_ip_filter = ip_filter.create_shared_snapshot();
     info!(
         "IP filter: enabled={}, block_private={}, ranges={}",
         ip_filter.is_enabled(),
@@ -572,6 +575,7 @@ pub async fn start_network(
         pending_server_connect: None,
         pending_buddy_hashes: pending_buddy_hashes.clone(),
         shared_buddy_info: shared_buddy_info.clone(),
+        shared_ip_filter: shared_ip_filter.clone(),
         buddy_event_rx: None,
         serving_event_rx: None,
         server_auto_reconnect: settings.auto_connect_server,
@@ -674,6 +678,7 @@ pub async fn start_network(
         let ul_buddy_hashes = pending_buddy_hashes.clone();
         let ul_buddy_tx = buddy_conn_tx.clone();
         let ul_buddy_info = shared_buddy_info.clone();
+        let ul_ip_filter = shared_ip_filter.clone();
         tokio::spawn(async move {
             if let Err(e) = upload_server::start_upload_server(
                 tcp_port,
@@ -694,6 +699,7 @@ pub async fn start_network(
                 ul_buddy_hashes,
                 ul_buddy_tx,
                 ul_buddy_info,
+                ul_ip_filter,
             )
             .await
             {
@@ -2509,6 +2515,7 @@ pub async fn start_network(
             // Statistics rate recording (every second)
             _ = stats_timer.tick() => {
                 stats_manager.record_rate();
+                state.ip_filter.collect_shared_hits(&shared_ip_filter);
             }
 
             // Periodic statistics save (every 5 minutes)
@@ -3419,7 +3426,7 @@ async fn handle_udp_packet(
                             if c.udp_port == 53 && c.version <= KADEMLIA_VERSION5_48A {
                                 return false;
                             }
-                            if state.ip_filter.is_blocked_readonly(c.ip)
+                            if state.ip_filter.is_blocked(c.ip)
                                 || state.banned_ips.contains(&c.ip)
                             {
                                 return false;
@@ -4363,6 +4370,7 @@ async fn handle_command(
             }
             // Load from the (now updated) default path
             state.ip_filter.load_from_file(&default_path);
+            state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
             info!(
                 "Reloaded IP filter: {} ranges",
                 state.ip_filter.range_count(),
@@ -4388,11 +4396,13 @@ async fn handle_command(
 
         NetworkCommand::SetIpFilterEnabled { enabled } => {
             state.ip_filter.set_enabled(enabled);
+            state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
             info!("IP filter enabled: {enabled}");
         }
 
         NetworkCommand::SetBlockPrivateIps { block_private } => {
             state.ip_filter.set_block_private(block_private);
+            state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
             info!("Block private IPs: {block_private}");
         }
 
@@ -4886,6 +4896,7 @@ async fn handle_command(
             let ipfilter_path2 = ipfilter_path.clone();
             let ip_filter_enabled = state.ip_filter.is_enabled();
             let block_private = state.ip_filter.blocks_private();
+            let shared_filter_ref = state.shared_ip_filter.clone();
             let ip_filter_ref = &mut state.ip_filter;
             let result: Result<usize, String> = async {
                 let response = reqwest::get(&url).await.map_err(|e| format!("HTTP error: {e}"))?;
@@ -4918,8 +4929,10 @@ async fn handle_command(
             if result.is_ok() && ip_filter_enabled {
                 let mut new_filter = IpFilter::new(true, block_private);
                 let loaded = new_filter.load_from_file(&ipfilter_path2);
+                new_filter.transfer_hits_from(ip_filter_ref);
                 info!("Reloaded IP filter from updated ipfilter.dat ({loaded} ranges)");
                 *ip_filter_ref = new_filter;
+                ip_filter_ref.update_shared_snapshot(&shared_filter_ref);
             }
             let _ = tx.send(result);
         }
