@@ -471,8 +471,8 @@ impl UploadHandler {
                 };
                 let state_byte: u8 = if has_peer_key { 2 } else { 1 };
                 let mut secident_payload = Vec::with_capacity(5);
-                secident_payload.extend_from_slice(&challenge.to_le_bytes());
                 secident_payload.push(state_byte);
+                secident_payload.extend_from_slice(&challenge.to_le_bytes());
                 write_packet_async(
                     &mut writer,
                     OP_EMULEPROT,
@@ -571,15 +571,15 @@ impl UploadHandler {
                         let hash_hex = hex::encode(hash);
                         let index = self.local_index.read().await;
                         if let Some(file) = index.get_by_hash(&hash_hex) {
-                            let part_count = ((file.size + PARTSIZE - 1) / PARTSIZE) as u16;
-                            let bitmap_bytes = ((part_count as usize) + 7) / 8;
+                            // eMule ED2K part count: size / PARTSIZE + 1
+                            let ed2k_part_count = (file.size / PARTSIZE + 1) as u16;
+                            let bitmap_bytes = ((ed2k_part_count as usize) + 7) / 8;
                             let mut status_payload = Vec::with_capacity(18 + bitmap_bytes);
                             status_payload.extend_from_slice(&hash);
-                            status_payload.extend_from_slice(&part_count.to_le_bytes());
-                            // All parts available (all bits set)
+                            status_payload.extend_from_slice(&ed2k_part_count.to_le_bytes());
                             let full_bytes = bitmap_bytes;
                             for i in 0..full_bytes {
-                                let remaining_bits = part_count as usize - i * 8;
+                                let remaining_bits = ed2k_part_count as usize - i * 8;
                                 if remaining_bits >= 8 {
                                     status_payload.push(0xFF);
                                 } else {

@@ -15,6 +15,7 @@ pub struct PublishableFile {
     pub file_name: String,
     pub file_size: u64,
     pub file_type: String,
+    pub complete_sources: u32,
 }
 
 #[derive(Debug)]
@@ -30,6 +31,10 @@ pub struct PublishManager {
     local_id: KadId,
     tcp_port: u16,
     udp_port: u16,
+    pub firewalled: bool,
+    pub buddy_ip: u32,
+    pub buddy_port: u16,
+    pub buddy_id: Option<KadId>,
     records: HashMap<KadId, PublishRecord>,
 }
 
@@ -39,6 +44,10 @@ impl PublishManager {
             local_id,
             tcp_port,
             udp_port,
+            firewalled: false,
+            buddy_ip: 0,
+            buddy_port: 0,
+            buddy_id: None,
             records: HashMap::new(),
         }
     }
@@ -106,12 +115,14 @@ impl PublishManager {
     }
 
     /// Build a KADEMLIA2_PUBLISH_SOURCE_REQ message for a file.
+    /// For firewalled clients, includes buddy information so peers can reach us
+    /// via relay (matching eMule's Search.cpp StorePacket STOREFILE case).
     pub fn build_source_publish(&self, file: &PublishableFile) -> KadMessage {
         let mut tags = Vec::new();
 
         tags.push(KadTag {
             name: TagName::Id(TAG_SOURCEIP),
-            value: TagValue::Uint32(0), // filled in by the receiver with our IP
+            value: TagValue::Uint32(0),
         });
         tags.push(KadTag {
             name: TagName::Id(TAG_SOURCEPORT),
@@ -121,10 +132,43 @@ impl PublishManager {
             name: TagName::Id(TAG_SOURCEUPORT),
             value: TagValue::Uint16(self.udp_port),
         });
-        tags.push(KadTag {
-            name: TagName::Id(TAG_SOURCETYPE),
-            value: TagValue::Uint8(3), // SourceType: KAD
-        });
+
+        if self.firewalled {
+            if let Some(ref buddy_id) = self.buddy_id {
+                // eMule source type 2 = KAD firewalled with buddy
+                tags.push(KadTag {
+                    name: TagName::Id(TAG_SOURCETYPE),
+                    value: TagValue::Uint8(2),
+                });
+                tags.push(KadTag {
+                    name: TagName::Id(TAG_SERVERIP),
+                    value: TagValue::Uint32(self.buddy_ip),
+                });
+                tags.push(KadTag {
+                    name: TagName::Id(TAG_SERVERPORT),
+                    value: TagValue::Uint16(self.buddy_port),
+                });
+                // Buddy KAD ID as a binary tag so the downloader can do a callback
+                tags.push(KadTag {
+                    name: TagName::Id(TAG_BUDDYHASH),
+                    value: TagValue::Hash(buddy_id.0),
+                });
+            } else {
+                // Firewalled without a buddy - still publish but mark as type 4
+                // (KAD firewalled, no buddy -- peers can try UDP callback)
+                tags.push(KadTag {
+                    name: TagName::Id(TAG_SOURCETYPE),
+                    value: TagValue::Uint8(4),
+                });
+            }
+        } else {
+            // Not firewalled - direct connect (eMule source type 3 = KAD)
+            tags.push(KadTag {
+                name: TagName::Id(TAG_SOURCETYPE),
+                value: TagValue::Uint8(3),
+            });
+        }
+
         tags.push(KadTag {
             name: TagName::Id(TAG_FILESIZE),
             value: TagValue::Uint64(file.file_size),
@@ -164,6 +208,10 @@ impl PublishManager {
                     KadTag {
                         name: TagName::Id(TAG_SOURCES),
                         value: TagValue::Uint32(1),
+                    },
+                    KadTag {
+                        name: TagName::Id(TAG_COMPLETE_SOURCES),
+                        value: TagValue::Uint32(file.complete_sources.max(1)),
                     },
                 ],
             };

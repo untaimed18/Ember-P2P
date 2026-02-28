@@ -470,7 +470,7 @@ impl SearchState {
     /// - NODE/NODECOMPLETE → KADEMLIA_FIND_NODE (11)
     /// - FILE/KEYWORD/FINDSOURCE/NOTES → KADEMLIA_FIND_VALUE (2)
     /// - FINDBUDDY/STOREFILE/STOREKEYWORD/STORENOTES → KADEMLIA_STORE (4)
-    pub fn build_query_message(&self, receiver: &KadContact) -> KadMessage {
+    pub fn build_query_message(&mut self, receiver: &KadContact) -> KadMessage {
         match self.phase {
             SearchPhase::Lookup => {
                 let search_type = match self.search_type {
@@ -495,10 +495,17 @@ impl SearchState {
                 }
             }
             SearchPhase::Fetch => match self.search_type {
-                SearchType::FindKeyword | SearchType::StoreKeyword => KadMessage::SearchKeyReq {
+                SearchType::FindKeyword => KadMessage::SearchKeyReq {
                     target: self.target,
                     start_position: 0,
                 },
+                SearchType::StoreKeyword | SearchType::StoreFile | SearchType::StoreNotes => {
+                    // Store searches don't fetch -- they complete immediately
+                    // after lookup so mod.rs can send the actual publish requests.
+                    // Return a dummy Ping that won't be sent (search marked complete).
+                    self.completed = true;
+                    KadMessage::Ping
+                }
                 SearchType::FindSource { file_size } => {
                     KadMessage::SearchSourceReq {
                         target: self.target,
@@ -506,23 +513,10 @@ impl SearchState {
                         file_size,
                     }
                 }
-                SearchType::StoreFile => {
-                    KadMessage::SearchSourceReq {
-                        target: self.target,
-                        start_position: 0,
-                        file_size: 0,
-                    }
-                }
                 SearchType::FindNotes { file_size } => {
                     KadMessage::SearchNotesReq {
                         target: self.target,
                         file_size,
-                    }
-                }
-                SearchType::StoreNotes => {
-                    KadMessage::SearchNotesReq {
-                        target: self.target,
-                        file_size: 0,
                     }
                 }
                 SearchType::FindNode | SearchType::FindBuddy => KadMessage::KadReq {

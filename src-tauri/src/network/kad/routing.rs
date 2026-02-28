@@ -530,21 +530,24 @@ impl RoutingTable {
             .iter()
             .enumerate()
             .filter(|(i, b)| {
-                if b.is_full() {
-                    return false;
-                }
                 let cap = b.capacity;
                 let is_sparse = b.contacts.len() < cap / 2;
-                let interval = if is_sparse { SPARSE_REFRESH_INTERVAL_SECS } else { BUCKET_REFRESH_INTERVAL_SECS };
+                // Full buckets use a longer refresh interval to verify liveness
+                // (eMule refreshes all zones via OnBigTimer)
+                let interval = if is_sparse {
+                    SPARSE_REFRESH_INTERVAL_SECS
+                } else if b.is_full() {
+                    BUCKET_REFRESH_INTERVAL_SECS * 2
+                } else {
+                    BUCKET_REFRESH_INTERVAL_SECS
+                };
                 if now - b.last_refresh < interval {
                     return false;
                 }
-                // Distant buckets (low index) cover huge portions of the ID space
-                // and are very likely to find contacts. Always include them if not full.
                 let is_distant = *i < DISTANT_BUCKET_THRESHOLD;
                 let is_close = *i >= NUM_BUCKETS.saturating_sub(KK);
                 let is_deep = *i < KBASE;
-                is_distant || is_close || is_deep || is_sparse
+                is_distant || is_close || is_deep || is_sparse || b.is_full()
             })
             .map(|(i, _)| i)
             .collect()

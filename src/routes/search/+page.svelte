@@ -476,7 +476,7 @@
         </tr>
       </thead>
       <tbody>
-        {#each filteredResults as result (result.file.hash)}
+        {#each filteredResults as result, i (result.file.hash + ':' + i)}
           <tr>
             <td class="col-name" title={result.file.name}>
               <button class="ghost link-btn" onclick={() => showFileDetails(result)}>{result.file.name}</button>

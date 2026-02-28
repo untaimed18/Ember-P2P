@@ -373,6 +373,9 @@ pub const TAG_SOURCEIP: u8 = 0xFE;
 pub const TAG_SOURCEPORT: u8 = 0xFD;
 pub const TAG_SOURCEUPORT: u8 = 0xFC;
 pub const TAG_SOURCETYPE: u8 = 0xFF;
+pub const TAG_SERVERIP: u8 = 0xFB;
+pub const TAG_SERVERPORT: u8 = 0xFA;
+pub const TAG_BUDDYHASH: u8 = 0xF9;
 
 #[derive(Debug, Clone)]
 pub enum TagName {

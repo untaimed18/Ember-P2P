@@ -61,16 +61,16 @@ impl SourceManager {
         }
     }
 
-    /// Build an OP_ANSWERSOURCES2 response payload for the given file hash,
-    /// excluding the requesting peer's address.
+    /// Build an OP_ANSWERSOURCES2 response payload for the given file hash.
+    /// Format: <version 1><file_hash 16><count 2><sources...>
+    /// Each source: <ip 4><tcp_port 2><udp_port 2> (version 2+ format)
     pub fn build_answer_sources2(
         &self,
         file_hash: &[u8; 16],
         exclude_ip: Ipv4Addr,
     ) -> Vec<u8> {
         let now = chrono::Utc::now().timestamp();
-        let mut resp = Vec::with_capacity(18 + MAX_SOURCES_IN_RESPONSE * 12);
-        resp.extend_from_slice(file_hash);
+        let version: u8 = 2; // SX_CURRENT_VERSION used by eMule
 
         let sources: Vec<&SourceEntry> = self
             .sources
@@ -87,12 +87,14 @@ impl SourceManager {
             })
             .unwrap_or_default();
 
+        let mut resp = Vec::with_capacity(1 + 16 + 2 + sources.len() * 8);
+        resp.push(version);
+        resp.extend_from_slice(file_hash);
         resp.extend_from_slice(&(sources.len() as u16).to_le_bytes());
         for src in &sources {
             resp.extend_from_slice(&src.ip.octets());
             resp.extend_from_slice(&src.tcp_port.to_le_bytes());
-            resp.extend_from_slice(&0u32.to_le_bytes()); // server_ip (0 = KAD)
-            resp.extend_from_slice(&0u16.to_le_bytes()); // server_port
+            resp.extend_from_slice(&0u16.to_le_bytes()); // udp_port (0 = unknown)
         }
 
         resp

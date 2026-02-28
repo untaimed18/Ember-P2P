@@ -278,7 +278,8 @@ impl Ed2kDownload {
                     debug!("Received peer's public key");
                 }
                 (OP_EMULEPROT, OP_SECIDENTSTATE) if pl.len() >= 5 => {
-                    let challenge = u32::from_le_bytes([pl[0], pl[1], pl[2], pl[3]]);
+                    let _state = pl[0];
+                    let challenge = u32::from_le_bytes([pl[1], pl[2], pl[3], pl[4]]);
                     let peer_ip_u32 = match self.source_addr.ip() {
                         std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
                         _ => 0,

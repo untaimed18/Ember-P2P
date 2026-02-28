@@ -403,7 +403,7 @@
             </tr>
           </thead>
           <tbody>
-            {#each sortedFiles as file (file.hash)}
+            {#each sortedFiles as file (file.hash || file.id)}
               <tr
                 class:selected={selectedHash === file.hash}
                 onclick={() => selectedHash = file.hash}

@@ -66,26 +66,31 @@ impl CreditManager {
     }
 
     /// eMule credit ratio formula from CClientCredits::GetScoreRatio.
-    /// ratio = min(downloaded*2/uploaded, sqrt(downloaded_MB+2), 10.0), clamped to [1.0, 10.0]
+    /// Uses all three eMule ratio formulas with 1MB minimum threshold.
     pub fn get_score_ratio(&self, user_hash: &[u8; 16]) -> f64 {
         let record = match self.credits.get(user_hash) {
             Some(r) => r,
             None => return MIN_CREDIT_RATIO,
         };
 
-        if record.downloaded == 0 {
+        // eMule: if downloaded < 1MB, return 1.0 (no credits for trivial transfers)
+        if record.downloaded < 1_048_576 {
             return MIN_CREDIT_RATIO;
         }
 
         let uploaded = record.uploaded.max(1) as f64;
         let downloaded = record.downloaded as f64;
-        let downloaded_mb = downloaded / (1024.0 * 1024.0);
 
         let ratio1 = (downloaded * 2.0) / uploaded;
-        let ratio2 = (downloaded_mb + 2.0).sqrt();
-        let ratio = ratio1.min(ratio2).min(MAX_CREDIT_RATIO).max(MIN_CREDIT_RATIO);
+        let ratio2 = (downloaded / 1_048_576.0 + 2.0).sqrt();
+        // ratio3: linear ramp from 1.0 to ~3.34 for the first ~9.2 MB, then cap at 10.0
+        let ratio3 = if downloaded < 9_646_899.0 {
+            (downloaded - 1_048_576.0) / 8_598_323.0 * 2.34 + 1.0
+        } else {
+            MAX_CREDIT_RATIO
+        };
 
-        ratio
+        ratio1.min(ratio2).min(ratio3).min(MAX_CREDIT_RATIO).max(MIN_CREDIT_RATIO)
     }
 
     /// Queue score for upload slot selection.

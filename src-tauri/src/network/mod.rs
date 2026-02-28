@@ -1329,7 +1329,7 @@ pub async fn start_network(
                             for (kw_hash, msg) in &kw_publishes {
                                 for contact in search.closest.iter()
                                     .filter(|c| !state.overloaded_nodes.contains_key(&c.ip))
-                                    .take(3)
+                                    .take(10)
                                 {
                                     let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                                     if let Ok(packet) = messages::encode_packet(msg) {
@@ -1353,7 +1353,7 @@ pub async fn start_network(
                             let mut sent = 0;
                             for contact in search.closest.iter()
                                 .filter(|c| !state.overloaded_nodes.contains_key(&c.ip))
-                                .take(3)
+                                .take(10)
                             {
                                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                                 if let Ok(packet) = messages::encode_packet(&msg) {
@@ -1387,7 +1387,7 @@ pub async fn start_network(
                                 tags: note_tags,
                             };
                             let mut sent = 0;
-                            for contact in search.closest.iter().take(3) {
+                            for contact in search.closest.iter().take(10) {
                                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                                 if let Ok(packet) = messages::encode_packet(&msg) {
                                     let _ = udp_socket.send_to(&packet, addr).await;
@@ -1570,6 +1570,17 @@ pub async fn start_network(
                     state.udp_firewalled = state.firewall_checker.udp_firewalled();
                     state.stats.firewalled = state.firewalled;
                     state.firewalled_shared.store(state.firewalled, std::sync::atomic::Ordering::Relaxed);
+                    // Sync publish manager with firewall/buddy state
+                    state.publish_manager.firewalled = state.firewalled;
+                    if let Some(buddy) = state.buddy_manager.buddy_id().cloned() {
+                        state.publish_manager.buddy_id = Some(buddy);
+                        if let Some((ip, port)) = state.buddy_manager.buddy_addr() {
+                            state.publish_manager.buddy_ip = u32::from_be_bytes(ip.octets());
+                            state.publish_manager.buddy_port = port;
+                        }
+                    } else {
+                        state.publish_manager.buddy_id = None;
+                    }
                     let tcp_status = state.firewall_checker.tcp_status();
                     let udp_status = state.firewall_checker.udp_status();
                     if let Some(ip) = state.firewall_checker.external_ip() {
@@ -1629,6 +1640,7 @@ pub async fn start_network(
                                     file_name: f.name.clone(),
                                     file_size: f.size,
                                     file_type: f.extension.clone(),
+                                    complete_sources: f.complete_sources,
                                 })
                             })
                             .collect();
@@ -4278,6 +4290,7 @@ async fn handle_command(
                         file_name: file.name.clone(),
                         file_size: file.size,
                         file_type: file.extension.clone(),
+                        complete_sources: file.complete_sources,
                     };
                     state.publish_manager.add_file(publishable);
                 }
@@ -4887,6 +4900,7 @@ async fn handle_command(
                         file_name: f.name.clone(),
                         file_size: f.size,
                         file_type: f.extension.clone(),
+                        complete_sources: f.complete_sources,
                     })
                 })
                 .collect();
@@ -5508,26 +5522,73 @@ fn extract_sources_from_results(
     for entry in entries {
         let mut ip = 0u32;
         let mut port = 0u16;
+        let mut source_type = 0u8;
+        let mut server_ip = 0u32;
+        let mut server_port = 0u16;
         for tag in &entry.tags {
             match &tag.name {
                 TagName::Id(TAG_SOURCEIP) => {
-                    if let Some(v) = tag.uint32_value() {
-                        ip = v;
-                    }
+                    if let Some(v) = tag.uint32_value() { ip = v; }
                 }
                 TagName::Id(TAG_SOURCEPORT) => {
-                    if let Some(v) = tag.uint16_value() {
-                        port = v;
-                    }
+                    if let Some(v) = tag.uint16_value() { port = v; }
+                }
+                TagName::Id(TAG_SOURCETYPE) => {
+                    if let Some(v) = tag.uint8_value() { source_type = v; }
+                }
+                TagName::Id(TAG_SERVERIP) => {
+                    if let Some(v) = tag.uint32_value() { server_ip = v; }
+                }
+                TagName::Id(TAG_SERVERPORT) => {
+                    if let Some(v) = tag.uint16_value() { server_port = v; }
                 }
                 _ => {}
             }
         }
-        if ip != 0 && port != 0 {
-            let addr = Ipv4Addr::from(ip.to_be_bytes());
-            let key = (addr.to_string(), port);
-            if !sources.contains(&key) {
-                sources.push(key);
+
+        match source_type {
+            3 => {
+                // Direct KAD source (not firewalled)
+                if ip != 0 && port != 0 {
+                    let addr = Ipv4Addr::from(ip.to_be_bytes());
+                    let key = (addr.to_string(), port);
+                    if !sources.contains(&key) {
+                        sources.push(key);
+                    }
+                }
+            }
+            2 => {
+                // Firewalled KAD source with buddy relay
+                // Use the buddy's address for the initial connection attempt;
+                // the download task will handle the callback protocol.
+                if server_ip != 0 && server_port != 0 {
+                    let addr = Ipv4Addr::from(server_ip.to_be_bytes());
+                    let key = (addr.to_string(), server_port);
+                    if !sources.contains(&key) {
+                        sources.push(key);
+                    }
+                }
+            }
+            4 => {
+                // Firewalled KAD source, no buddy (UDP callback possible)
+                // Include with the direct IP if available; download will attempt UDP callback
+                if ip != 0 && port != 0 {
+                    let addr = Ipv4Addr::from(ip.to_be_bytes());
+                    let key = (addr.to_string(), port);
+                    if !sources.contains(&key) {
+                        sources.push(key);
+                    }
+                }
+            }
+            _ => {
+                // Unknown or legacy source type - try direct connect as fallback
+                if ip != 0 && port != 0 {
+                    let addr = Ipv4Addr::from(ip.to_be_bytes());
+                    let key = (addr.to_string(), port);
+                    if !sources.contains(&key) {
+                        sources.push(key);
+                    }
+                }
             }
         }
     }

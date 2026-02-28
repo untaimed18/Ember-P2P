@@ -23,7 +23,7 @@ pub fn ed2k_hash_file(path: &Path) -> anyhow::Result<String> {
 
     let num_chunks = (file_size + PARTSIZE - 1) / PARTSIZE;
 
-    if num_chunks == 1 && file_size < PARTSIZE {
+    if num_chunks == 1 {
         let mut hasher = Md4::new();
         let mut buf = vec![0u8; 64 * 1024];
         loop {
@@ -36,8 +36,7 @@ pub fn ed2k_hash_file(path: &Path) -> anyhow::Result<String> {
         return Ok(hex::encode(hasher.finalize()));
     }
 
-    // Multiple chunks or file size is exact multiple of PARTSIZE:
-    // hash each chunk with MD4, then hash the concatenated chunk hashes.
+    // Multiple chunks: hash each chunk with MD4, then hash the concatenated chunk hashes.
     let mut chunk_hashes = Vec::with_capacity(num_chunks as usize);
     let mut remaining = file_size;
     let mut buf = vec![0u8; 64 * 1024];
@@ -73,7 +72,7 @@ pub fn ed2k_hash_bytes(data: &[u8]) -> String {
 
     let num_chunks = (file_size + PARTSIZE - 1) / PARTSIZE;
 
-    if num_chunks == 1 && file_size < PARTSIZE {
+    if num_chunks == 1 {
         return hex::encode(Md4::digest(data));
     }
 

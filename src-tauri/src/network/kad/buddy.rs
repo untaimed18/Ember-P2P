@@ -131,6 +131,16 @@ impl BuddyManager {
         self.buddy_id.as_ref()
     }
 
+    pub fn buddy_addr(&self) -> Option<(std::net::Ipv4Addr, u16)> {
+        self.buddy_addr.as_ref().and_then(|addr| {
+            if let std::net::IpAddr::V4(v4) = addr.ip() {
+                Some((v4, addr.port()))
+            } else {
+                None
+            }
+        })
+    }
+
     /// Set buddy state to Connected (used when spawned connect task succeeds).
     pub fn set_connected(&mut self, buddy_id: KadId) {
         self.buddy_id = Some(buddy_id);
@@ -139,8 +149,9 @@ impl BuddyManager {
 
     pub fn find_buddy_target(&self) -> KadId {
         let mut target = self.local_id.0;
-        target[0] ^= 0xFF;
-        target[1] ^= 0xFF;
+        for byte in &mut target {
+            *byte ^= 0xFF;
+        }
         KadId(target)
     }
 

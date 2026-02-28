@@ -48,7 +48,8 @@ pub const OP_QUEUERANK: u8 = 0x5C;
 
 // Source exchange opcodes (OP_EMULEPROT)
 pub const OP_REQUESTSOURCES: u8 = 0x81;
-pub const OP_ANSWERSOURCES2: u8 = 0x83;
+pub const OP_REQUESTSOURCES2: u8 = 0x83;
+pub const OP_ANSWERSOURCES2: u8 = 0x84;
 
 // Secure identification opcodes (OP_EMULEPROT)
 pub const OP_PUBLICKEY: u8 = 0x85;
@@ -223,8 +224,8 @@ pub fn build_emule_info(udp_port: u16) -> Vec<u8> {
         (&[0x21], Ed2kTagValue::Uint16(udp_port)),       // ET_UDPPORT
         (&[0x20], Ed2kTagValue::Uint8(1)),                // ET_COMPRESSION
         (&[0x23], Ed2kTagValue::Uint32(4)),               // ET_SOURCEEXCHANGE2_VERSION
-        (&[0xF5], Ed2kTagValue::Uint32(misc_options1)),   // CT_EMULE_MISCOPTIONS1
-        (&[0xF6], Ed2kTagValue::Uint32(misc_options2)),   // CT_EMULE_MISCOPTIONS2
+        (&[0xFA], Ed2kTagValue::Uint32(misc_options1)),   // CT_EMULE_MISCOPTIONS1
+        (&[0xFE], Ed2kTagValue::Uint32(misc_options2)),   // CT_EMULE_MISCOPTIONS2
     ];
 
     buf.write_u32::<LittleEndian>(tags.len() as u32).unwrap();
@@ -316,9 +317,9 @@ pub fn parse_compressed_part_i64(payload: &[u8]) -> io::Result<([u8; 16], u64, u
     let mut hash = [0u8; 16];
     cursor.read_exact(&mut hash)?;
     let start = cursor.read_u64::<LittleEndian>()?;
-    let packed_len = cursor.read_u32::<LittleEndian>()?;
+    let uncompressed_size = cursor.read_u32::<LittleEndian>()?;
     let data_start = cursor.position() as usize;
-    Ok((hash, start, packed_len, &payload[data_start..]))
+    Ok((hash, start, uncompressed_size, &payload[data_start..]))
 }
 
 /// Parse a CompressedPart payload (32-bit start offset, used by older eMule clients).
@@ -330,9 +331,9 @@ pub fn parse_compressed_part_32(payload: &[u8]) -> io::Result<([u8; 16], u64, u3
     let mut hash = [0u8; 16];
     cursor.read_exact(&mut hash)?;
     let start = cursor.read_u32::<LittleEndian>()? as u64;
-    let packed_len = cursor.read_u32::<LittleEndian>()?;
+    let uncompressed_size = cursor.read_u32::<LittleEndian>()?;
     let data_start = cursor.position() as usize;
-    Ok((hash, start, packed_len, &payload[data_start..]))
+    Ok((hash, start, uncompressed_size, &payload[data_start..]))
 }
 
 /// Build a HashSetReq payload (just the file hash).
@@ -466,8 +467,10 @@ pub fn build_multipacket_answer(
     is_ext2: bool,
     sub_opcodes: &[MultiPacketSubReq],
 ) -> Vec<u8> {
-    let part_count = ((file_size + PARTSIZE - 1) / PARTSIZE) as u16;
-    let bitmap_bytes = ((part_count as usize) + 7) / 8;
+    // eMule ED2K part count for OP_FILESTATUS: size / PARTSIZE + 1
+    // This differs from the data part count (ceil division) used for actual data transfer.
+    let ed2k_part_count = (file_size / PARTSIZE + 1) as u16;
+    let bitmap_bytes = ((ed2k_part_count as usize) + 7) / 8;
     let name_bytes = file_name.as_bytes();
 
     let mut buf = Vec::with_capacity(16 + 1 + 2 + name_bytes.len() + 1 + 2 + bitmap_bytes + 8);
@@ -487,9 +490,9 @@ pub fn build_multipacket_answer(
             }
             MultiPacketSubReq::SetReqFileId => {
                 buf.write_u8(OP_FILESTATUS).unwrap();
-                buf.write_u16::<LittleEndian>(part_count).unwrap();
+                buf.write_u16::<LittleEndian>(ed2k_part_count).unwrap();
                 for i in 0..bitmap_bytes {
-                    let remaining_bits = part_count as usize - i * 8;
+                    let remaining_bits = ed2k_part_count as usize - i * 8;
                     if remaining_bits >= 8 {
                         buf.write_u8(0xFF).unwrap();
                     } else {
