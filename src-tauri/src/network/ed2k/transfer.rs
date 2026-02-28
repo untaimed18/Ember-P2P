@@ -58,6 +58,9 @@ pub enum DownloadEvent {
         active: u32,
         queued: u32,
     },
+    Verifying {
+        transfer_id: String,
+    },
     Completed {
         transfer_id: String,
     },
@@ -588,7 +591,7 @@ impl Ed2kDownload {
                             let _ = event_tx
                                 .send(DownloadEvent::Progress {
                                     transfer_id: self.transfer_id.clone(),
-                                    downloaded,
+                                    downloaded: downloaded.min(self.file_size),
                                     total: self.file_size,
                                 })
                                 .await;
@@ -596,7 +599,11 @@ impl Ed2kDownload {
                         (OP_EMULEPROT, OP_COMPRESSEDPART_I64)
                         | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
                             let (_hash, start, _packed_len, compressed) =
-                                parse_compressed_part_i64(&payload)?;
+                                if opcode == OP_COMPRESSEDPART_I64 {
+                                    parse_compressed_part_i64(&payload)?
+                                } else {
+                                    parse_compressed_part_32(&payload)?
+                                };
 
                             let mut decoder = ZlibDecoder::new(compressed);
                             let mut decompressed = Vec::new();
@@ -631,7 +638,7 @@ impl Ed2kDownload {
                             let _ = event_tx
                                 .send(DownloadEvent::Progress {
                                     transfer_id: self.transfer_id.clone(),
-                                    downloaded,
+                                    downloaded: downloaded.min(self.file_size),
                                     total: self.file_size,
                                 })
                                 .await;
@@ -717,6 +724,7 @@ impl Ed2kDownload {
                             aich_hs.leaf_count(),
                             recovery_data.len(),
                         );
+                        downloaded = downloaded.saturating_sub(part_len as u64);
                         tracker.mark_incomplete(part_idx);
                         tracker.save();
                         continue;
@@ -752,10 +760,17 @@ impl Ed2kDownload {
         output.flush()?;
         drop(output);
 
+        let _ = event_tx
+            .send(DownloadEvent::Verifying {
+                transfer_id: self.transfer_id.clone(),
+            })
+            .await;
+
         // Clean up part.met and rename to final filename
         tracker.delete_met();
         std::fs::rename(&part_path, &final_path)?;
-        // Verify the final file hash
+
+        // Verify the final file hash (eMule-style: must match or download fails)
         let output_path = final_path.clone();
         let expected_hash = hex::encode(self.file_hash);
         match tokio::task::spawn_blocking(move || {
@@ -766,12 +781,19 @@ impl Ed2kDownload {
             }
             Ok(Ok(actual_hash)) => {
                 warn!(
-                    "Download complete but hash mismatch for {}: expected={}, got={}",
+                    "Download hash mismatch for {}: expected={}, got={}",
                     self.file_name, expected_hash, actual_hash
                 );
+                anyhow::bail!(
+                    "Final hash verification failed: expected={}, got={}",
+                    expected_hash, actual_hash
+                );
             }
-            _ => {
-                info!("Download complete (could not verify hash): {}", self.file_name);
+            Ok(Err(e)) => {
+                warn!("Could not verify hash for {}: {e}", self.file_name);
+            }
+            Err(e) => {
+                warn!("Hash verification task failed for {}: {e}", self.file_name);
             }
         }
 

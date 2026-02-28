@@ -129,11 +129,11 @@ impl TransferManager {
                 0
             };
 
-            transfer.transferred = transferred;
+            transfer.transferred = transferred.min(transfer.total_size);
             transfer.speed = speed;
             if transfer.total_size > 0 {
                 transfer.progress =
-                    (transferred as f64 / transfer.total_size as f64) * 100.0;
+                    ((transferred as f64 / transfer.total_size as f64) * 100.0).min(100.0);
             }
         }
     }

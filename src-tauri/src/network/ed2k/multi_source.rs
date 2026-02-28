@@ -189,26 +189,42 @@ impl MultiSourceDownload {
             })
             .await;
 
-        // Progress aggregator channel
-        let (progress_tx, mut progress_rx) = mpsc::channel::<(usize, u64)>(256);
+        // Progress aggregator channel: i64 to allow negative adjustments on hash failure
+        let (progress_tx, mut progress_rx) = mpsc::channel::<(usize, i64)>(256);
         let transfer_id = self.transfer_id.clone();
         let file_size = self.file_size;
         let event_tx_clone = event_tx.clone();
         let agg_active = active_count.clone();
         let agg_queued = queued_count.clone();
 
-        // Aggregator task that merges progress from all sources and periodically emits source counts
+        // Calculate initial downloaded bytes from any previously completed parts (resume)
+        let initial_downloaded: u64 = {
+            let t = tracker.read().await;
+            (0..t.part_count)
+                .filter(|&i| t.is_part_complete(i))
+                .map(|i| {
+                    let (s, e) = t.part_range(i);
+                    e - s
+                })
+                .sum()
+        };
+
         let aggregator = tokio::spawn(async move {
-            let mut total_downloaded: u64 = 0;
+            let mut total_downloaded: u64 = initial_downloaded;
             let mut last_active: u32 = 0;
             let mut last_queued: u32 = 0;
 
             while let Some((_source_idx, bytes)) = progress_rx.recv().await {
-                total_downloaded += bytes;
+                if bytes >= 0 {
+                    total_downloaded = total_downloaded.saturating_add(bytes as u64);
+                } else {
+                    total_downloaded = total_downloaded.saturating_sub((-bytes) as u64);
+                }
+                let capped = total_downloaded.min(file_size);
                 let _ = event_tx_clone
                     .send(DownloadEvent::Progress {
                         transfer_id: transfer_id.clone(),
-                        downloaded: total_downloaded,
+                        downloaded: capped,
                         total: file_size,
                     })
                     .await;
@@ -344,18 +360,32 @@ impl MultiSourceDownload {
                 retry_assignments[i % self.sources.len()].push(part_idx);
             }
 
-            let (retry_tx, mut retry_rx) = mpsc::channel::<(usize, u64)>(256);
+            let (retry_tx, mut retry_rx) = mpsc::channel::<(usize, i64)>(256);
             let tid = self.transfer_id.clone();
             let fs = self.file_size;
             let etx = event_tx.clone();
+            let retry_initial: u64 = {
+                let t = tracker.read().await;
+                (0..t.part_count)
+                    .filter(|&i| t.is_part_complete(i))
+                    .map(|i| {
+                        let (s, e) = t.part_range(i);
+                        e - s
+                    })
+                    .sum()
+            };
             let retry_agg = tokio::spawn(async move {
-                let mut total: u64 = 0;
+                let mut total: u64 = retry_initial;
                 while let Some((_, bytes)) = retry_rx.recv().await {
-                    total += bytes;
+                    if bytes >= 0 {
+                        total = total.saturating_add(bytes as u64);
+                    } else {
+                        total = total.saturating_sub((-bytes) as u64);
+                    }
                     let _ = etx
                         .send(DownloadEvent::Progress {
                             transfer_id: tid.clone(),
-                            downloaded: total,
+                            downloaded: total.min(fs),
                             total: fs,
                         })
                         .await;
@@ -422,18 +452,32 @@ impl MultiSourceDownload {
                 let received_parts: Arc<RwLock<std::collections::HashSet<usize>>> =
                     Arc::new(RwLock::new(std::collections::HashSet::new()));
 
-                let (eg_tx, mut eg_rx) = mpsc::channel::<(usize, u64)>(256);
+                let (eg_tx, mut eg_rx) = mpsc::channel::<(usize, i64)>(256);
                 let tid = self.transfer_id.clone();
                 let fs = self.file_size;
                 let etx = event_tx.clone();
+                let eg_initial: u64 = {
+                    let t = tracker.read().await;
+                    (0..t.part_count)
+                        .filter(|&i| t.is_part_complete(i))
+                        .map(|i| {
+                            let (s, e) = t.part_range(i);
+                            e - s
+                        })
+                        .sum()
+                };
                 let eg_agg = tokio::spawn(async move {
-                    let mut total: u64 = 0;
+                    let mut total: u64 = eg_initial;
                     while let Some((_, bytes)) = eg_rx.recv().await {
-                        total += bytes;
+                        if bytes >= 0 {
+                            total = total.saturating_add(bytes as u64);
+                        } else {
+                            total = total.saturating_sub((-bytes) as u64);
+                        }
                         let _ = etx
                             .send(DownloadEvent::Progress {
                                 transfer_id: tid.clone(),
-                                downloaded: total,
+                                downloaded: total.min(fs),
                                 total: fs,
                             })
                             .await;
@@ -506,6 +550,12 @@ impl MultiSourceDownload {
         };
 
         if all_done {
+            let _ = event_tx
+                .send(DownloadEvent::Verifying {
+                    transfer_id: self.transfer_id.clone(),
+                })
+                .await;
+
             let safe_name = crate::security::sanitize_filename(&self.file_name);
             let final_path = self.download_dir.join(&safe_name);
             {
@@ -514,9 +564,10 @@ impl MultiSourceDownload {
             }
             std::fs::rename(&part_path, &final_path)?;
 
-            // Verify final file hash
+            // Verify final file hash (eMule-style: must match or download fails)
             let verify_path = final_path.clone();
             let expected = hex::encode(self.file_hash);
+            let mut verified_ok = true;
             match tokio::task::spawn_blocking(move || {
                 super::hash::ed2k_hash_file(&verify_path)
             }).await {
@@ -528,17 +579,30 @@ impl MultiSourceDownload {
                         "Multi-source download hash mismatch for {}: expected={}, got={}",
                         self.file_name, expected, actual
                     );
+                    verified_ok = false;
                 }
-                _ => {
-                    info!("Multi-source download complete (hash check failed): {}", self.file_name);
+                Ok(Err(e)) => {
+                    warn!("Could not verify hash for {}: {e}", self.file_name);
+                }
+                Err(e) => {
+                    warn!("Hash verification task failed for {}: {e}", self.file_name);
                 }
             }
 
-            let _ = event_tx
-                .send(DownloadEvent::Completed {
-                    transfer_id: self.transfer_id.clone(),
-                })
-                .await;
+            if verified_ok {
+                let _ = event_tx
+                    .send(DownloadEvent::Completed {
+                        transfer_id: self.transfer_id.clone(),
+                    })
+                    .await;
+            } else {
+                let _ = event_tx
+                    .send(DownloadEvent::Failed {
+                        transfer_id: self.transfer_id.clone(),
+                        error: "Final hash verification failed".to_string(),
+                    })
+                    .await;
+            }
         } else {
             let remaining = {
                 let t = tracker.read().await;
@@ -569,7 +633,7 @@ async fn download_parts_from_source(
     tcp_port: u16,
     udp_port: u16,
     bw: Arc<BandwidthLimiter>,
-    progress_tx: mpsc::Sender<(usize, u64)>,
+    progress_tx: mpsc::Sender<(usize, i64)>,
     shared_part_hashes: Arc<RwLock<Vec<[u8; 16]>>>,
     active_count: Arc<AtomicU32>,
     queued_count: Arc<AtomicU32>,
@@ -843,11 +907,15 @@ async fn download_parts_from_source(
                         let mut cm = cm.write().await;
                         cm.add_downloaded(peer_user_hash, piece_len);
                     }
-                    let _ = progress_tx.send((_src_idx, piece_len)).await;
+                    let _ = progress_tx.send((_src_idx, piece_len as i64)).await;
                 }
                 (OP_EMULEPROT, OP_COMPRESSEDPART_I64) | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
                     let (_hash, start, _packed_len, compressed) =
-                        parse_compressed_part_i64(&payload)?;
+                        if opcode == OP_COMPRESSEDPART_I64 {
+                            parse_compressed_part_i64(&payload)?
+                        } else {
+                            parse_compressed_part_32(&payload)?
+                        };
 
                     let mut decoder = ZlibDecoder::new(compressed);
                     let mut decompressed = Vec::new();
@@ -876,7 +944,7 @@ async fn download_parts_from_source(
                         let mut cm = cm.write().await;
                         cm.add_downloaded(peer_user_hash, piece_len);
                     }
-                    let _ = progress_tx.send((_src_idx, piece_len)).await;
+                    let _ = progress_tx.send((_src_idx, piece_len as i64)).await;
                 }
                 (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
                     peer_out_of_parts = true;
@@ -946,6 +1014,7 @@ async fn download_parts_from_source(
                         hex::encode(aich_hs.root_hash),
                         aich_hs.leaf_count(),
                     );
+                    let _ = progress_tx.send((_src_idx, -(part_len as i64))).await;
                     false
                 } else {
                     debug!("Multi-source part {} hash verified OK (source {})", part_idx, _src_idx);

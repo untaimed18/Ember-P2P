@@ -4749,9 +4749,10 @@ async fn handle_download_event(
             downloaded,
             total,
         } => {
+            let capped_downloaded = if total > 0 { downloaded.min(total) } else { downloaded };
             let speed = {
                 let mut mgr = transfer_manager.write().await;
-                mgr.update_progress(&transfer_id, downloaded, 0);
+                mgr.update_progress(&transfer_id, capped_downloaded, 0);
                 if let Some(t) = mgr.active.get(&transfer_id) {
                     t.speed
                 } else {
@@ -4759,7 +4760,7 @@ async fn handle_download_event(
                 }
             };
             let progress = if total > 0 {
-                (downloaded as f64 / total as f64) * 100.0
+                ((capped_downloaded as f64 / total as f64) * 100.0).min(100.0)
             } else {
                 0.0
             };
@@ -4767,11 +4768,24 @@ async fn handle_download_event(
                 "transfer-progress",
                 serde_json::json!({
                     "id": transfer_id,
-                    "downloaded": downloaded,
+                    "downloaded": capped_downloaded,
                     "total": total,
                     "progress": progress,
                     "speed": speed,
                     "global_download_speed": bandwidth_limiter.download_speed(),
+                }),
+            );
+        }
+        DownloadEvent::Verifying { transfer_id } => {
+            {
+                let mut mgr = transfer_manager.write().await;
+                mgr.update_status(&transfer_id, crate::types::TransferStatus::Active);
+            }
+            let _ = app_handle.emit(
+                "transfer-status",
+                serde_json::json!({
+                    "id": transfer_id,
+                    "status": "verifying",
                 }),
             );
         }

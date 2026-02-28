@@ -55,7 +55,7 @@ export interface Transfer {
   peer_id: string;
   peer_name: string;
   direction: 'upload' | 'download';
-  status: 'searching' | 'queued' | 'active' | 'paused' | 'completed' | 'failed';
+  status: 'searching' | 'queued' | 'active' | 'paused' | 'verifying' | 'completed' | 'failed';
   progress: number;
   speed: number;
   total_size: number;

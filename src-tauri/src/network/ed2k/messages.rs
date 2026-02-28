@@ -283,15 +283,29 @@ pub fn parse_sending_part_i64(payload: &[u8]) -> io::Result<([u8; 16], u64, u64,
     Ok((hash, start, end, &payload[data_start..]))
 }
 
-/// Parse a CompressedPart_I64 payload.
+/// Parse a CompressedPart_I64 payload (64-bit start offset).
 pub fn parse_compressed_part_i64(payload: &[u8]) -> io::Result<([u8; 16], u64, u32, &[u8])> {
     if payload.len() < 28 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "compressed part too short"));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "compressed part i64 too short"));
     }
     let mut cursor = Cursor::new(payload);
     let mut hash = [0u8; 16];
     cursor.read_exact(&mut hash)?;
     let start = cursor.read_u64::<LittleEndian>()?;
+    let packed_len = cursor.read_u32::<LittleEndian>()?;
+    let data_start = cursor.position() as usize;
+    Ok((hash, start, packed_len, &payload[data_start..]))
+}
+
+/// Parse a CompressedPart payload (32-bit start offset, used by older eMule clients).
+pub fn parse_compressed_part_32(payload: &[u8]) -> io::Result<([u8; 16], u64, u32, &[u8])> {
+    if payload.len() < 24 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "compressed part 32 too short"));
+    }
+    let mut cursor = Cursor::new(payload);
+    let mut hash = [0u8; 16];
+    cursor.read_exact(&mut hash)?;
+    let start = cursor.read_u32::<LittleEndian>()? as u64;
     let packed_len = cursor.read_u32::<LittleEndian>()?;
     let data_start = cursor.position() as usize;
     Ok((hash, start, packed_len, &payload[data_start..]))

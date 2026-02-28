@@ -55,7 +55,7 @@
   }
 
   const priorityOrder: Record<string, number> = { auto: 0, high: 1, normal: 2, low: 3 };
-  const statusOrder: Record<string, number> = { active: 0, searching: 1, queued: 2, paused: 3, failed: 4, completed: 5 };
+  const statusOrder: Record<string, number> = { active: 0, verifying: 1, searching: 2, queued: 3, paused: 4, failed: 5, completed: 6 };
 
   function etaSeconds(t: Transfer): number {
     if (t.speed <= 0 || t.transferred >= t.total_size) return Infinity;
@@ -106,6 +106,7 @@
       case 'searching': return 'Searching';
       case 'queued': return 'Waiting';
       case 'paused': return 'Paused';
+      case 'verifying': return 'Verifying';
       case 'completed': return 'Complete';
       case 'failed': return 'Error';
       default: return t.status;
@@ -259,7 +260,7 @@
                 {:else}
                   <ProgressBar
                     value={t.progress}
-                    color={t.status === 'paused' ? 'var(--warning)' : 'var(--accent)'}
+                    color={t.status === 'paused' ? 'var(--warning)' : t.status === 'verifying' ? 'var(--success, #2ecc71)' : 'var(--accent)'}
                   />
                 {/if}
               </td>
@@ -552,6 +553,7 @@
     font-weight: 600;
   }
   .st-active { color: var(--accent); }
+  .st-verifying { color: var(--success, #2ecc71); }
   .st-searching { color: var(--warning); }
   .st-queued { color: var(--text-muted); }
   .st-paused { color: var(--warning); }

@@ -33,7 +33,7 @@ export async function initTransferStore() {
       const idx = list.findIndex((t) => t.id === p.id);
       if (idx >= 0) {
         const existing = list[idx];
-        if (existing.status === 'paused' || existing.status === 'completed' || existing.status === 'failed') {
+        if (existing.status === 'paused' || existing.status === 'completed' || existing.status === 'failed' || existing.status === 'verifying') {
           return list;
         }
         list[idx] = {
