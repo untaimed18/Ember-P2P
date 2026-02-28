@@ -1479,6 +1479,7 @@ pub async fn start_network(
                     state.firewalled = state.firewall_checker.tcp_firewalled();
                     state.udp_firewalled = state.firewall_checker.udp_firewalled();
                     state.stats.firewalled = state.firewalled;
+                    state.firewalled_shared.store(state.firewalled, std::sync::atomic::Ordering::Relaxed);
                     let tcp_status = state.firewall_checker.tcp_status();
                     let udp_status = state.firewall_checker.udp_status();
                     if let Some(ip) = state.firewall_checker.external_ip() {
@@ -1499,11 +1500,13 @@ pub async fn start_network(
 
                 tokio::task::yield_now().await;
 
-                // Sync firewalled status from async tasks (spawned TCP probes update the atomic)
+                // Sync firewalled status from async TCP probe tasks.
+                // Only allow the atomic to CLEAR the firewalled flag, never re-assert it,
+                // so it doesn't overwrite the FirewallChecker's determination.
                 let fw_from_shared = state.firewalled_shared.load(std::sync::atomic::Ordering::Relaxed);
-                if state.firewalled != fw_from_shared {
-                    state.firewalled = fw_from_shared;
-                    state.stats.firewalled = fw_from_shared;
+                if state.firewalled && !fw_from_shared {
+                    state.firewalled = false;
+                    state.stats.firewalled = false;
                     if let Some(ip) = state.external_ip {
                         state.stats.external_ip = ip.to_string();
                     }
