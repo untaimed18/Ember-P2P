@@ -138,9 +138,7 @@ impl StatsManager {
     pub fn add_overhead(&mut self, category: OverheadCategory, bytes: u64) {
         self.stats.session_down_overhead += bytes;
         match category {
-            OverheadCategory::Server => self.stats.overhead_server += bytes,
             OverheadCategory::Kad => self.stats.overhead_kad += bytes,
-            OverheadCategory::SourceExchange => self.stats.overhead_source_exchange += bytes,
             OverheadCategory::FileRequest => self.stats.overhead_file_request += bytes,
         }
     }
@@ -160,8 +158,6 @@ impl StatsManager {
 
 #[derive(Debug, Clone, Copy)]
 pub enum OverheadCategory {
-    Server,
     Kad,
-    SourceExchange,
     FileRequest,
 }
