@@ -223,7 +223,7 @@ struct NetworkState {
     publish_manager: PublishManager,
     dht_store: DhtStore,
     stats: NetworkStats,
-    pending_keyword_searches: HashMap<SearchId, (oneshot::Sender<Vec<SearchResult>>, Vec<SearchResult>)>,
+    pending_keyword_searches: HashMap<SearchId, (oneshot::Sender<Vec<SearchResult>>, Vec<SearchResult>, Vec<String>)>,
     /// Pending server TCP search: when we send OP_SEARCHREQUEST, store the results here
     /// until poll_messages() delivers OP_SEARCHRESULT.
     pending_server_search: Option<(oneshot::Sender<Vec<SearchResult>>, Vec<SearchResult>, SearchMethod)>,
@@ -1087,7 +1087,7 @@ pub async fn start_network(
                 }
 
                 for sid in completed_ids {
-                    if let Some((tx, mut local_results)) = state.pending_keyword_searches.remove(&sid) {
+                    if let Some((tx, mut local_results, keywords)) = state.pending_keyword_searches.remove(&sid) {
                         let network_results = if let Some(search) = state.search_manager.get(&sid) {
                             let unique: std::collections::HashSet<&kad::types::KadId> =
                                 search.results.iter().map(|r| &r.id).collect();
@@ -1095,7 +1095,18 @@ pub async fn start_network(
                                 "Keyword search {} completed: {} unique files ({} raw entries from KAD), {} local results",
                                 sid.0, unique.len(), search.results.len(), local_results.len()
                             );
-                            convert_search_results(&search.results)
+                            let all_results = convert_search_results(&search.results);
+                            if keywords.len() > 1 {
+                                let before = all_results.len();
+                                let filtered: Vec<SearchResult> = all_results.into_iter().filter(|r| {
+                                    let name_lower = r.file.name.to_lowercase();
+                                    keywords.iter().all(|kw| name_lower.contains(kw))
+                                }).collect();
+                                info!("Keyword filter: {before} -> {} results (matched all {} keywords)", filtered.len(), keywords.len());
+                                filtered
+                            } else {
+                                all_results
+                            }
                         } else {
                             Vec::new()
                         };
@@ -3789,9 +3800,9 @@ async fn handle_command(
                 return;
             }
 
-            let primary_keyword = &keywords[0];
+            let primary_keyword = keywords.iter().max_by_key(|k| k.len()).unwrap();
             let keyword_hash = kad::publish::keyword_to_kad_id(primary_keyword);
-            info!("Searching KAD for keyword '{}' -> hash {}", primary_keyword, keyword_hash);
+            info!("Searching KAD for keyword '{}' (longest of {}) -> hash {}", primary_keyword, keywords.len(), keyword_hash);
 
             let closest = state
                 .routing_table
@@ -3813,7 +3824,7 @@ async fn handle_command(
                 let _ = tx.send(local_results);
                 return;
             }
-            state.pending_keyword_searches.insert(sid, (tx, local_results));
+            state.pending_keyword_searches.insert(sid, (tx, local_results, keywords));
         }
 
         NetworkCommand::CancelSearch => {
@@ -3822,7 +3833,7 @@ async fn handle_command(
                 if let Some(search) = state.search_manager.get_mut(sid) {
                     search.completed = true;
                 }
-                if let Some((tx, results)) = state.pending_keyword_searches.remove(sid) {
+                if let Some((tx, results, _)) = state.pending_keyword_searches.remove(sid) {
                     let _ = tx.send(results);
                 }
                 state.search_manager.remove(sid);
@@ -4284,7 +4295,7 @@ async fn handle_command(
 
             // Stop all searches and cancel pending oneshot channels
             state.search_manager = SearchManager::new();
-            for (_, (tx, local)) in state.pending_keyword_searches.drain() {
+            for (_, (tx, local, _)) in state.pending_keyword_searches.drain() {
                 let _ = tx.send(local);
             }
             for (_, tx) in state.pending_source_searches.drain() {

@@ -199,6 +199,7 @@ impl RoutingTable {
         // Global IP limit (eMule: max 1 contact per IP)
         let ip_count = self.global_ip_count.get(&contact.ip).copied().unwrap_or(0);
         if ip_count >= MAX_CONTACTS_IP {
+            tracing::trace!("RT reject {}: duplicate IP ({})", contact.ip, ip_count);
             return None;
         }
 
@@ -208,6 +209,7 @@ impl RoutingTable {
         if !is_lan {
             let subnet_count = self.global_subnet_count.get(&snet).copied().unwrap_or(0);
             if subnet_count >= MAX_CONTACTS_SUBNET {
+                tracing::trace!("RT reject {}: subnet limit ({}/{})", contact.ip, subnet_count, MAX_CONTACTS_SUBNET);
                 return None;
             }
         }
@@ -221,6 +223,7 @@ impl RoutingTable {
                 .filter(|c| subnet_key(c.ip) == snet)
                 .count();
             if bin_subnet_count >= MAX_CONTACTS_SUBNET_PER_BIN {
+                tracing::trace!("RT reject {}: bin {} subnet limit ({}/{})", contact.ip, bucket_idx, bin_subnet_count, MAX_CONTACTS_SUBNET_PER_BIN);
                 return None;
             }
         }
@@ -236,12 +239,14 @@ impl RoutingTable {
 
         let bucket = &self.buckets[bucket_idx];
         if !bucket.is_full() {
+            tracing::debug!("RT insert {}: bucket {} ({}/{})", contact.ip, bucket_idx, bucket.contacts.len() + 1, K_BUCKET_SIZE);
             self.track_ip_add(contact.ip);
             self.buckets[bucket_idx].contacts.push_back(contact);
             return None;
         }
 
         // Bucket full: request ping-before-evict
+        tracing::trace!("RT evict-check {}: bucket {} full ({}/{})", contact.ip, bucket_idx, bucket.contacts.len(), K_BUCKET_SIZE);
         if let Some(oldest) = bucket.contacts.front() {
             let eviction = PendingEviction {
                 bucket_idx,
