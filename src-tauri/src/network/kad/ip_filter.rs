@@ -495,12 +495,31 @@ fn parse_p2p_line(line: &str) -> Option<IpRange> {
     let description = line[..colon_pos].trim().to_string();
     let ip_range = line[colon_pos + 1..].trim();
     let dash_pos = ip_range.find('-')?;
-    let start_ip: Ipv4Addr = ip_range[..dash_pos].trim().parse().ok()?;
-    let end_ip: Ipv4Addr = ip_range[dash_pos + 1..].trim().parse().ok()?;
+    let start_ip = parse_ip_lenient(&ip_range[..dash_pos])?;
+    let end_ip = parse_ip_lenient(&ip_range[dash_pos + 1..])?;
     let start = u32::from(start_ip);
     let end = u32::from(end_ip);
     if start > end { return None; }
     Some(IpRange { start, end, description, hits: 0 })
+}
+
+/// Parse an IP address string, handling leading zeros (e.g., "003.000.000.000")
+/// which are common in ipfilter.dat files but rejected by Rust's Ipv4Addr parser.
+fn parse_ip_lenient(s: &str) -> Option<Ipv4Addr> {
+    let s = s.trim();
+    // Try direct parse first (fast path for IPs without leading zeros)
+    if let Ok(ip) = s.parse::<Ipv4Addr>() {
+        return Some(ip);
+    }
+    // Strip leading zeros from each octet and retry
+    let stripped: String = s.split('.')
+        .map(|octet| {
+            let trimmed = octet.trim_start_matches('0');
+            if trimmed.is_empty() { "0" } else { trimmed }
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    stripped.parse().ok()
 }
 
 fn parse_ipfilter_line(line: &str) -> Option<IpRange> {
@@ -520,8 +539,8 @@ fn parse_ipfilter_line(line: &str) -> Option<IpRange> {
     let ip_parts: Vec<&str> = ip_range_part.splitn(2, '-').collect();
     if ip_parts.len() != 2 { return None; }
 
-    let start_ip: Ipv4Addr = ip_parts[0].trim().parse().ok()?;
-    let end_ip: Ipv4Addr = ip_parts[1].trim().parse().ok()?;
+    let start_ip = parse_ip_lenient(ip_parts[0])?;
+    let end_ip = parse_ip_lenient(ip_parts[1])?;
     let start = u32::from(start_ip);
     let end = u32::from(end_ip);
     if start > end { return None; }
@@ -601,5 +620,40 @@ mod tests {
         assert_eq!(filter.range_count(), 1);
         assert!(filter.remove_range("1.0.0.0", "1.0.0.255"));
         assert_eq!(filter.range_count(), 0);
+    }
+
+    #[test]
+    fn test_parse_ipfilter_dat_format() {
+        // Standard emule ipfilter.dat format
+        let line1 = "1.0.0.0 - 1.0.0.255 , 000 , Test Range";
+        let r1 = parse_ipfilter_line(line1);
+        assert!(r1.is_some(), "Failed to parse standard ipfilter.dat line");
+        let r1 = r1.unwrap();
+        assert_eq!(r1.start, u32::from(Ipv4Addr::new(1, 0, 0, 0)));
+        assert_eq!(r1.end, u32::from(Ipv4Addr::new(1, 0, 0, 255)));
+        assert_eq!(r1.description, "Test Range");
+
+        // With leading zeros (common in ipfilter.dat files)
+        let line2 = "003.000.000.000 - 003.255.255.255 , 000 , IANA-ARIN";
+        let r2 = parse_ipfilter_line(line2);
+        assert!(r2.is_some(), "Failed to parse ipfilter.dat line with leading zeros");
+        let r2 = r2.unwrap();
+        assert_eq!(r2.start, u32::from(Ipv4Addr::new(3, 0, 0, 0)));
+        assert_eq!(r2.end, u32::from(Ipv4Addr::new(3, 255, 255, 255)));
+        assert_eq!(r2.description, "IANA-ARIN");
+
+        // Without leading zeros (should always work)
+        let line3 = "3.0.0.0 - 3.255.255.255 , 000 , IANA-ARIN";
+        let r3 = parse_ipfilter_line(line3);
+        assert!(r3.is_some(), "Failed to parse ipfilter.dat line without leading zeros");
+
+        // Access level >= 128 should be skipped
+        let line4 = "1.0.0.0 - 1.0.0.255 , 128 , Allowed";
+        assert!(parse_ipfilter_line(line4).is_none(), "Should skip access level >= 128");
+
+        // P2P format
+        let p2p = "Test Range:1.0.0.0-1.0.0.255";
+        let rp = parse_p2p_line(p2p);
+        assert!(rp.is_some(), "Failed to parse P2P line");
     }
 }
