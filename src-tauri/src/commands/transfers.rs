@@ -115,6 +115,26 @@ pub async fn cancel_transfer(
         manager.cancel(&transfer_id)
     };
 
+    // Clean up .part and .part.met files
+    {
+        let config = state.config.read().await;
+        let dl_folder = config.settings.download_folder.clone();
+        let tid = transfer_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let temp_dir = std::path::PathBuf::from(&dl_folder).join("Temp");
+            let part_path = temp_dir.join(format!("{tid}.part"));
+            let met_path = temp_dir.join(format!("{tid}.part.met"));
+            if part_path.exists() {
+                let _ = std::fs::remove_file(&part_path);
+                tracing::debug!("Deleted part file: {}", part_path.display());
+            }
+            if met_path.exists() {
+                let _ = std::fs::remove_file(&met_path);
+                tracing::debug!("Deleted met file: {}", met_path.display());
+            }
+        }).await;
+    }
+
     {
         let db = state.db.clone();
         let tid = transfer_id.clone();
@@ -151,6 +171,23 @@ pub async fn remove_transfer(
     {
         let mut manager = state.transfer_manager.write().await;
         manager.remove(&transfer_id);
+    }
+    // Clean up .part and .part.met files (if they exist from an incomplete download)
+    {
+        let config = state.config.read().await;
+        let dl_folder = config.settings.download_folder.clone();
+        let tid = transfer_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let temp_dir = std::path::PathBuf::from(&dl_folder).join("Temp");
+            let part_path = temp_dir.join(format!("{tid}.part"));
+            let met_path = temp_dir.join(format!("{tid}.part.met"));
+            if part_path.exists() {
+                let _ = std::fs::remove_file(&part_path);
+            }
+            if met_path.exists() {
+                let _ = std::fs::remove_file(&met_path);
+            }
+        }).await;
     }
     {
         let db = state.db.clone();
