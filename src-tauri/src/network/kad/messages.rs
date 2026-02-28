@@ -32,6 +32,7 @@ pub const KADEMLIA_FIREWALLED_REQ: u8 = 0x50;
 pub const KADEMLIA_FIREWALLED_RES: u8 = 0x58;
 pub const KADEMLIA_FINDBUDDY_REQ: u8 = 0x51;
 pub const KADEMLIA_FINDBUDDY_RES: u8 = 0x5A;
+pub const KADEMLIA_FIREWALLED_ACK_RES: u8 = 0x59;
 pub const KADEMLIA2_PING: u8 = 0x60;
 pub const KADEMLIA2_PONG: u8 = 0x61;
 pub const KADEMLIA2_FIREWALLUDP: u8 = 0x62;
@@ -169,6 +170,8 @@ pub enum KadMessage {
         file_id: KadId,
         tcp_port: u16,
     },
+    /// Acknowledgement from a peer that received our KADEMLIA_FIREWALLED_RES (null payload)
+    FirewalledAckRes,
 }
 
 #[derive(Debug, Clone)]
@@ -496,6 +499,8 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
             Ok(KadMessage::CallbackReq { buddy_id, file_id, tcp_port })
         }
 
+        KADEMLIA_FIREWALLED_ACK_RES => Ok(KadMessage::FirewalledAckRes),
+
         // Legacy Kad1.0 opcodes - decode into equivalent Kad2 messages where possible
         KADEMLIA_BOOTSTRAP_REQ_OLD => Ok(KadMessage::BootstrapReq),
         KADEMLIA_BOOTSTRAP_RES_OLD => {
@@ -793,6 +798,10 @@ fn encode_message(msg: &KadMessage, out: &mut Vec<u8>) -> io::Result<()> {
             buddy_id.write_to(out)?;
             file_id.write_to(out)?;
             out.write_u16::<LittleEndian>(*tcp_port)?;
+        }
+
+        KadMessage::FirewalledAckRes => {
+            out.write_u8(KADEMLIA_FIREWALLED_ACK_RES)?;
         }
     }
 

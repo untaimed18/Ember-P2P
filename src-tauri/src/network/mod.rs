@@ -3609,6 +3609,10 @@ async fn handle_udp_packet(
             }
         }
 
+        KadMessage::FirewalledAckRes => {
+            debug!("FirewalledAckRes from {from} (peer acknowledged our firewall check response)");
+        }
+
     }
 }
 
