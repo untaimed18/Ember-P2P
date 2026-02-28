@@ -1350,6 +1350,17 @@ pub async fn start_network(
                             }
                         }
                     }
+
+                    // Reset buddy manager when a FindBuddy search completes without success
+                    if let Some(search) = state.search_manager.get(&sid) {
+                        if matches!(search.search_type, SearchType::FindBuddy) {
+                            if state.buddy_manager.state() == BuddyState::FindingBuddy {
+                                state.buddy_manager.find_failed();
+                                info!("FindBuddy search {} completed without finding a buddy", sid.0);
+                            }
+                        }
+                    }
+
                     state.search_manager.remove(&sid);
                 }
             }
@@ -1522,6 +1533,12 @@ pub async fn start_network(
                             "tcp_status": format!("{:?}", tcp_status),
                             "udp_status": format!("{:?}", udp_status),
                         }));
+                    }
+                    if was_firewalled && !state.firewalled {
+                        if state.buddy_manager.state() == BuddyState::FindingBuddy {
+                            state.buddy_manager.find_failed();
+                            info!("Cancelled buddy search: firewall is open, no buddy needed");
+                        }
                     }
                 }
 
@@ -1807,7 +1824,6 @@ pub async fn start_network(
                             SearchType::FindBuddy,
                             closest,
                         );
-                        // Send FindBuddyReq to closest contacts
                         for contact in state.routing_table.find_closest(&target, 3) {
                             let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                             let msg = KadMessage::FindBuddyReq {
@@ -1816,7 +1832,10 @@ pub async fn start_network(
                                 tcp_port: local_tcp,
                             };
                             if let Ok(packet) = messages::encode_packet(&msg) {
-                                let _ = udp_socket.send_to(&packet, addr).await;
+                                state.flood_protection.track_request(addr, packet.get(1).copied().unwrap_or(0));
+                                let _ = send_kad_packet(
+                                    &udp_socket, &packet, addr, &state, &contact.id,
+                                ).await;
                             }
                         }
                     }
