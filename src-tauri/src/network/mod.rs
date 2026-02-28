@@ -4566,10 +4566,10 @@ async fn handle_command(
                 info!("Sent bootstrap requests to {} existing contacts", contacts.len().min(20));
             }
 
-            // Always send firewall check probes on connect (like eMule)
+            // Always send firewall check probes on connect (like eMule).
+            // Don't filter by verified — bootstrap contacts aren't verified yet.
             state.firewall_checker.start_check();
             let fw_contacts: Vec<KadContact> = state.routing_table.all_contacts()
-                .filter(|c| c.verified)
                 .take(4)
                 .cloned()
                 .collect();
@@ -4583,7 +4583,6 @@ async fn handle_command(
                 }
             }
             let udp_contacts: Vec<KadContact> = state.routing_table.all_contacts()
-                .filter(|c| c.verified)
                 .skip(4)
                 .take(4)
                 .cloned()
