@@ -27,6 +27,10 @@ use crate::network::kad::ip_filter::SharedIpFilter;
 /// Shared buddy info for including in Hello tags (updated by network task)
 pub type SharedBuddyInfo = Arc<RwLock<Option<BuddyInfo>>>;
 
+/// IPs we've sent KADEMLIA_FIREWALLED_REQ to; a TCP connect-back from one of
+/// these proves our TCP port is reachable (not firewalled).
+pub type FirewallProbeSet = Arc<std::sync::Mutex<std::collections::HashSet<std::net::Ipv4Addr>>>;
+
 /// Recognized incoming buddy connection: (user_hash, reader, writer)
 pub type BuddyConnectionParts = (
     [u8; 16],
@@ -108,6 +112,10 @@ struct UploadHandler {
     shared_buddy_info: SharedBuddyInfo,
     /// Shared IP filter snapshot for blocking incoming connections
     shared_ip_filter: SharedIpFilter,
+    /// IPs we probed with FirewalledReq -- connect-back proves TCP is open
+    firewall_probe_ips: FirewallProbeSet,
+    /// Shared atomic: set to false when TCP is proven open
+    firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub async fn start_upload_server(
@@ -130,6 +138,8 @@ pub async fn start_upload_server(
     buddy_conn_tx: tokio::sync::mpsc::Sender<BuddyConnectionParts>,
     shared_buddy_info: SharedBuddyInfo,
     shared_ip_filter: SharedIpFilter,
+    firewall_probe_ips: FirewallProbeSet,
+    firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     let listener = match TcpListener::bind(addr).await {
@@ -168,6 +178,8 @@ pub async fn start_upload_server(
         buddy_conn_tx,
         shared_buddy_info,
         shared_ip_filter,
+        firewall_probe_ips,
+        firewalled_shared,
     });
 
     loop {
@@ -183,6 +195,19 @@ pub async fn start_upload_server(
                             drop(stream);
                             continue;
                         }
+                    }
+                }
+
+                // KAD firewall check: if this IP is one we probed, the TCP
+                // connect-back proves our port is reachable.
+                if let std::net::IpAddr::V4(ipv4) = peer_addr.ip() {
+                    let is_probe = {
+                        let mut probes = server.firewall_probe_ips.lock().unwrap_or_else(|e| e.into_inner());
+                        probes.remove(&ipv4)
+                    };
+                    if is_probe {
+                        info!("TCP connect-back from {peer_addr} confirms port is open (firewall check passed)");
+                        server.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
 

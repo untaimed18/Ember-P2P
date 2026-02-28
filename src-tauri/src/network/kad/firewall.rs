@@ -78,8 +78,9 @@ impl FirewallChecker {
     }
 
     /// Handle KADEMLIA_FIREWALLED_RES: a peer reports our external IP.
+    /// This message arrives via UDP, so it only proves UDP connectivity --
+    /// it does NOT indicate TCP is open (the separate TCP connect-back does).
     pub fn handle_firewalled_response(&mut self, reported_ip: Ipv4Addr) {
-        self.tcp_responses_received += 1;
         *self.external_ip_votes.entry(reported_ip).or_insert(0) += 1;
 
         let best_ip = self.external_ip_votes.iter()
@@ -96,8 +97,16 @@ impl FirewallChecker {
             }
         }
 
+        debug!("External IP vote for {reported_ip} ({} total votes)", self.external_ip_votes.values().sum::<u32>());
+    }
+
+    /// Record that a peer successfully connected back to our TCP port,
+    /// proving we are reachable (not firewalled on TCP).
+    #[allow(dead_code)]
+    pub fn handle_tcp_connect_back(&mut self) {
+        self.tcp_responses_received += 1;
         self.tcp_status = FirewallStatus::Open;
-        debug!("TCP firewall check: open (response received, {} total)", self.tcp_responses_received);
+        debug!("TCP firewall check: open (connect-back received, {} total)", self.tcp_responses_received);
     }
 
     /// Handle KADEMLIA2_PONG: peer reports what UDP port it sees us on.
