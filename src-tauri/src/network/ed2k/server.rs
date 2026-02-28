@@ -52,6 +52,8 @@ pub struct ServerSession {
     pub file_count: u32,
     /// Raw OP_SERVERLIST payload received during login (if any)
     pub server_list_data: Option<Vec<u8>>,
+    /// MOTD messages received during login (for frontend display)
+    pub motd_messages: Vec<String>,
 }
 
 enum ServerTransport {
@@ -130,6 +132,7 @@ impl Ed2kServerConnection {
             user_count: 0,
             file_count: 0,
             server_list_data: None,
+            motd_messages: Vec::new(),
         };
 
         for i in 0..10 {
@@ -146,8 +149,9 @@ impl Ed2kServerConnection {
                     if payload.len() >= 2 {
                         let len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
                         if payload.len() >= 2 + len {
-                            let msg = String::from_utf8_lossy(&payload[2..2 + len]);
+                            let msg = String::from_utf8_lossy(&payload[2..2 + len]).to_string();
                             info!("Server MOTD: {msg}");
+                            session.motd_messages.push(msg);
                         }
                     }
                 }

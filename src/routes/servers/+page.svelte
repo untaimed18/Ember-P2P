@@ -10,6 +10,8 @@
   } from '$lib/api/server';
   import type { ServerInfo } from '$lib/types';
   import { onMount } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
+  import type { UnlistenFn } from '@tauri-apps/api/event';
 
   let servers: ServerInfo[] = $state([]);
   let connectedServer: ServerInfo | null = $state(null);
@@ -41,13 +43,32 @@
   let connecting = $state(false);
   let refreshInProgress = false;
   let mounted = true;
+  let eventUnlisteners: UnlistenFn[] = [];
+  let logArea: HTMLDivElement | undefined = $state(undefined);
 
   onMount(() => {
     refresh();
     const interval = setInterval(refresh, 5000);
+
+    listen<{ message: string }>('server-log', (event) => {
+      if (!mounted) return;
+      log(event.payload.message);
+      requestAnimationFrame(() => {
+        if (logArea) logArea.scrollTop = logArea.scrollHeight;
+      });
+    }).then((u) => eventUnlisteners.push(u));
+
+    listen<{ connected: boolean }>('server-status-changed', (event) => {
+      if (!mounted) return;
+      if (!event.payload.connected) connecting = false;
+      refresh();
+    }).then((u) => eventUnlisteners.push(u));
+
     return () => {
       mounted = false;
       clearInterval(interval);
+      for (const u of eventUnlisteners) u();
+      eventUnlisteners = [];
     };
   });
 
@@ -99,15 +120,11 @@
     connecting = true;
     error = null;
     try {
-      const msg = await connectToServer(target.ip, target.port);
-      log(msg);
-      flash(msg);
-      await refresh();
+      await connectToServer(target.ip, target.port);
     } catch (e: unknown) {
       const msg = toErrorMsg(e);
       error = msg;
       log(`Connection failed: ${msg}`);
-    } finally {
       connecting = false;
     }
   }
@@ -341,6 +358,7 @@
       <button class="danger" onclick={handleDisconnect}>Disconnect</button>
     {:else if selectedServer}
       <button onclick={() => handleConnect()} disabled={connecting}>
+        {#if connecting}<span class="connect-spinner"></span>{/if}
         {connecting ? 'Connecting...' : 'Connect'}
       </button>
     {:else}
@@ -545,6 +563,14 @@
               <span class="info-label">Files</span>
               <span class="info-value">{connectedServer.file_count.toLocaleString()}</span>
             </div>
+          {:else if connecting}
+            <div class="info-row">
+              <span class="info-label">Status</span>
+              <span class="badge connecting"><span class="connect-spinner"></span> Connecting</span>
+            </div>
+            <div class="info-row muted">
+              <span>Establishing connection...</span>
+            </div>
           {:else}
             <div class="info-row">
               <span class="info-label">Status</span>
@@ -565,7 +591,7 @@
       <span class="toolbar-label">Server Log</span>
       <button class="ghost btn-sm" onclick={() => (logMessages = [])}>Clear</button>
     </div>
-    <div class="log-area">
+    <div class="log-area" bind:this={logArea}>
       {#if logMessages.length === 0}
         <span class="log-placeholder">Server messages will appear here...</span>
       {:else}
@@ -967,5 +993,59 @@
     height: 1px;
     background: var(--border);
     margin: 3px 0;
+  }
+
+  .connect-spinner {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent, #3498db);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    vertical-align: middle;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .badge.connected {
+    background: rgba(46, 204, 113, 0.15);
+    color: #2ecc71;
+  }
+
+  .badge.connecting {
+    background: rgba(52, 152, 219, 0.15);
+    color: var(--accent, #3498db);
+  }
+
+  .badge.disconnected {
+    background: rgba(200, 200, 200, 0.1);
+    color: var(--text-muted);
+  }
+
+  .badge.lowid {
+    background: rgba(231, 76, 60, 0.15);
+    color: #e74c3c;
+    font-size: 10px;
+    padding: 1px 6px;
+  }
+
+  .badge.highid {
+    background: rgba(46, 204, 113, 0.15);
+    color: #2ecc71;
+    font-size: 10px;
+    padding: 1px 6px;
   }
 </style>

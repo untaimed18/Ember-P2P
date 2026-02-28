@@ -59,21 +59,30 @@ struct ServerConnectResult {
 /// Many servers use the same port for both plain and obfuscated connections (the server
 /// detects the mode from the first byte). If no dedicated obfuscation port is known,
 /// we try DH on the regular port first.
-async fn try_connect_server(ip: &str, port: u16, obf_port: u16) -> anyhow::Result<Ed2kServerConnection> {
+fn emit_server_log(app: &tauri::AppHandle, message: &str) {
+    let _ = app.emit("server-log", serde_json::json!({ "message": message }));
+}
+
+async fn try_connect_server(ip: &str, port: u16, obf_port: u16, app: &tauri::AppHandle) -> anyhow::Result<Ed2kServerConnection> {
     let encrypt_port = if obf_port != 0 { obf_port } else { port };
     let obf_addr: SocketAddr = format!("{ip}:{encrypt_port}").parse()?;
     info!("Trying encrypted DH connection to server {ip}:{encrypt_port}");
+    emit_server_log(app, &format!("Trying encrypted connection to {ip}:{encrypt_port}..."));
     match Ed2kServerConnection::connect_encrypted(obf_addr).await {
         Ok(conn) => {
             info!("Encrypted DH connection to server {ip}:{encrypt_port} established");
+            emit_server_log(app, "Encrypted connection established");
             return Ok(conn);
         }
         Err(e) => {
             warn!("Encrypted DH connection to server {ip}:{encrypt_port} failed: {e}, falling back to plain");
+            emit_server_log(app, &format!("Encrypted connection failed, trying plain TCP on port {port}..."));
         }
     }
     let addr: SocketAddr = format!("{ip}:{port}").parse()?;
-    Ed2kServerConnection::connect(addr).await
+    let conn = Ed2kServerConnection::connect(addr).await?;
+    emit_server_log(app, "TCP connection established");
+    Ok(conn)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -2233,6 +2242,7 @@ pub async fn start_network(
                                 }
                                 ed2k::server::ServerEvent::Message(msg) => {
                                     info!("Server message: {msg}");
+                                    emit_server_log(&app_handle, &format!("Server: {msg}"));
                                 }
                                 ed2k::server::ServerEvent::CallbackRequested { ip, port } => {
                                     info!("Server callback requested: peer at {ip}:{port}");
@@ -2301,10 +2311,13 @@ pub async fn start_network(
                             let nickname = settings.nickname.clone();
                             let tcp_port = state.tcp_port;
                             info!("Auto-connecting to ed2k server {addr_str} (background)");
+                            emit_server_log(&app_handle, &format!("Auto-connecting to {addr_str}..."));
+                            let app_for_auto = app_handle.clone();
                             state.pending_server_connect = Some(tokio::spawn(async move {
                                 let result = async {
-                                    let mut conn = try_connect_server(&ip, port, obf_port).await
+                                    let mut conn = try_connect_server(&ip, port, obf_port, &app_for_auto).await
                                         .map_err(|e| format!("Connect failed: {e}"))?;
+                                    emit_server_log(&app_for_auto, "Sending login request...");
                                     let session = conn.login(&user_hash, &nickname, tcp_port).await
                                         .map_err(|e| format!("Login failed: {e}"))?;
                                     Ok((conn, session))
@@ -2403,18 +2416,30 @@ pub async fn start_network(
                             if let std::net::IpAddr::V4(ipv4) = addr.ip() {
                                 if state.ip_filter.is_blocked(ipv4) {
                                     warn!("Server {ip}:{port} blocked by IP filter, disconnecting");
+                                    emit_server_log(&app_handle, &format!("Server {ip}:{port} blocked by IP filter"));
                                     conn.disconnect().await;
                                     state.server_list.record_failure(&ip, port);
+                                    let _ = app_handle.emit("server-status-changed", serde_json::json!({ "connected": false }));
                                     continue;
                                 }
                             }
                         }
 
+                        for motd in &session.motd_messages {
+                            emit_server_log(&app_handle, &format!("Server: {motd}"));
+                        }
+
                         let is_low = conn.is_low_id();
                         let our_id = conn.our_client_id().unwrap_or(0);
+                        let id_type = if is_low { "LowID" } else { "HighID" };
                         info!("Connected to ed2k server: {} ({} users, {} files, {} id={})",
                             session.server_name, session.user_count, session.file_count,
-                            if is_low { "LowID" } else { "HighID" }, our_id);
+                            id_type, our_id);
+                        emit_server_log(&app_handle, &format!(
+                            "Connected to {} ({} users, {} files, {})",
+                            if session.server_name.is_empty() { &ip } else { &session.server_name },
+                            session.user_count, session.file_count, id_type,
+                        ));
                         state.low_id = is_low;
                         state.server_client_id = session.client_id;
                         state.server_list.record_success(&ip, port);
@@ -2441,13 +2466,18 @@ pub async fn start_network(
                         }
 
                         state.server_connection = Some(conn);
+                        let _ = app_handle.emit("server-status-changed", serde_json::json!({ "connected": true }));
                     }
                     Ok(ServerConnectResult { ip, port, result: Err(e), .. }) => {
                         warn!("Failed to connect to server {ip}:{port}: {e}");
+                        emit_server_log(&app_handle, &format!("Connection failed: {e}"));
                         state.server_list.record_failure(&ip, port);
+                        let _ = app_handle.emit("server-status-changed", serde_json::json!({ "connected": false }));
                     }
                     Err(e) => {
                         warn!("Server connection task panicked: {e}");
+                        emit_server_log(&app_handle, &format!("Connection error: {e}"));
+                        let _ = app_handle.emit("server-status-changed", serde_json::json!({ "connected": false }));
                     }
                 }
             }
@@ -4881,11 +4911,14 @@ async fn handle_command(
                 .map(|s| s.obfuscation_port_tcp)
                 .unwrap_or(0);
             let ip_clone = ip.clone();
+            let app_for_connect = app_handle.clone();
             info!("Connecting to ed2k server {addr} (background)...");
+            emit_server_log(app_handle, &format!("Connecting to {ip}:{port}..."));
             state.pending_server_connect = Some(tokio::spawn(async move {
                 let result = async {
-                    let mut conn = try_connect_server(&ip_clone, port, obf_port).await
+                    let mut conn = try_connect_server(&ip_clone, port, obf_port, &app_for_connect).await
                         .map_err(|e| format!("Connect failed: {e}"))?;
+                    emit_server_log(&app_for_connect, "Sending login request...");
                     let session = conn.login(&user_hash, &nickname, tcp_port).await
                         .map_err(|e| format!("Login failed: {e}"))?;
                     Ok((conn, session))
@@ -4905,6 +4938,8 @@ async fn handle_command(
             }
             state.server_connected = false;
             state.server_addr = None;
+            emit_server_log(app_handle, "Disconnected from server");
+            let _ = app_handle.emit("server-status-changed", serde_json::json!({ "connected": false }));
         }
 
         NetworkCommand::AddServer { ip, port, name } => {
