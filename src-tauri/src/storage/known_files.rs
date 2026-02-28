@@ -140,9 +140,9 @@ impl KnownFileList {
             match tag_type {
                 TAG_STRING => {
                     let slen = cursor.read_u16::<LittleEndian>()? as usize;
-                    let mut sbuf = vec![0u8; slen.min(4096)];
+                    let mut sbuf = vec![0u8; slen];
                     cursor.read_exact(&mut sbuf)?;
-                    let s = String::from_utf8_lossy(&sbuf).to_string();
+                    let s = String::from_utf8_lossy(&sbuf[..slen.min(4096)]).to_string();
                     match name_id {
                         FT_FILENAME => record.file_name = s,
                         FT_AICH_HASH => record.aich_hash = s,
@@ -278,7 +278,9 @@ impl KnownFileList {
             buf.write_all(&tags)?;
         }
 
-        std::fs::write(path, &buf)?;
+        let tmp_path = path.with_extension("met.tmp");
+        std::fs::write(&tmp_path, &buf)?;
+        std::fs::rename(&tmp_path, path)?;
         self.dirty = false;
         info!("Saved {} known files to known.met", self.files.len());
         Ok(())

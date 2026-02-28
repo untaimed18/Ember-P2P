@@ -136,6 +136,7 @@ export interface AppSettings {
   filter_servers_by_ip: boolean;
   add_servers_from_server: boolean;
   add_servers_from_clients: boolean;
+  server_list_path: string;
   auto_connect_kad: boolean;
   auto_connect_server: boolean;
 }

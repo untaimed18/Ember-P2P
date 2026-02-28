@@ -80,8 +80,8 @@ pub fn load_nodes_dat(path: &Path) -> anyhow::Result<Vec<KadContact>> {
                 info!("Loaded {} valid contacts from bootstrap nodes.dat", contacts.len());
                 return Ok(contacts);
             }
-            // v3 with bootstrap_edition != 1: treat as normal (count follows)
-            let count = bootstrap_edition as usize; // re-interpret as count
+            // v3 with bootstrap_edition != 1: separate count follows (eMule RoutingZone format)
+            let count = cursor.read_u32::<LittleEndian>()? as usize;
             info!("Loading {count} contacts from nodes.dat v3");
             for _ in 0..count {
                 match read_contact_v2(&mut cursor) {

@@ -205,6 +205,35 @@ impl RoutingTable {
         if let Some(pos) = bucket.contacts.iter().position(|c| c.id == contact.id) {
             let mut existing = bucket.contacts.remove(pos).unwrap();
             let old_ip = existing.ip;
+
+            // eMule ChangeContactIPAddress: validate limits before accepting IP change
+            if old_ip != contact.ip {
+                let new_ip_count = self.global_ip_count.get(&contact.ip).copied().unwrap_or(0);
+                if new_ip_count >= MAX_CONTACTS_IP {
+                    tracing::trace!("RT reject IP change for {}: new IP {} already at limit", existing.id, contact.ip);
+                    bucket.contacts.push_back(existing);
+                    return None;
+                }
+                let new_snet = subnet_key(contact.ip);
+                let is_lan = ip_filter::is_lan_ip(contact.ip);
+                if !is_lan {
+                    let snet_count = self.global_subnet_count.get(&new_snet).copied().unwrap_or(0);
+                    if snet_count >= MAX_CONTACTS_SUBNET {
+                        tracing::trace!("RT reject IP change for {}: subnet limit", existing.id);
+                        bucket.contacts.push_back(existing);
+                        return None;
+                    }
+                    let bin_snet = bucket.contacts.iter()
+                        .filter(|c| subnet_key(c.ip) == new_snet)
+                        .count();
+                    if bin_snet >= MAX_CONTACTS_SUBNET_PER_BIN {
+                        tracing::trace!("RT reject IP change for {}: bin subnet limit", existing.id);
+                        bucket.contacts.push_back(existing);
+                        return None;
+                    }
+                }
+            }
+
             // eMule SetIPAddress: clears verified flag when IP changes
             existing.set_ip(contact.ip);
             existing.udp_port = contact.udp_port;

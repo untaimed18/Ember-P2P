@@ -94,6 +94,7 @@ pub enum TransferStatus {
     Queued,
     Active,
     Paused,
+    Verifying,
     Completed,
     Failed,
 }

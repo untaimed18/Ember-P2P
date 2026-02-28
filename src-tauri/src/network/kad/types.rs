@@ -8,7 +8,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 pub const KAD_ID_SIZE: usize = 16;
-pub const KADEMLIA_VERSION: u8 = 0x0A;
+pub const KADEMLIA_VERSION: u8 = 0x09;
 pub const K_BUCKET_SIZE: usize = 10;
 pub const ALPHA: usize = 3;
 pub const DEFAULT_TCP_PORT: u16 = 4662;

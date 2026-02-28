@@ -322,6 +322,7 @@ impl Database {
                     TransferStatus::Queued => "queued",
                     TransferStatus::Active => "active",
                     TransferStatus::Paused => "paused",
+                    TransferStatus::Verifying => "verifying",
                     TransferStatus::Completed => "completed",
                     TransferStatus::Failed => "failed",
                 }.to_string(),

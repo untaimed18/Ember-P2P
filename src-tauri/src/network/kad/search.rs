@@ -695,19 +695,24 @@ impl SearchManager {
         queries
     }
 
-    pub fn cleanup(&mut self, max_age_secs: i64) {
+    pub fn cleanup(&mut self, max_age_secs: i64) -> Vec<SearchId> {
         let now = chrono::Utc::now().timestamp();
+        let hard_timeout = max_age_secs * 3;
         let to_remove: Vec<SearchId> = self
             .active
             .iter()
-            .filter(|(_, s)| s.completed && now - s.started_at > max_age_secs)
+            .filter(|(_, s)| {
+                let age = now - s.started_at;
+                (s.completed && age > max_age_secs) || age > hard_timeout
+            })
             .map(|(id, _)| *id)
             .collect();
-        for id in to_remove {
+        for &id in &to_remove {
             if let Some(state) = self.active.remove(&id) {
                 self.target_map.remove(&state.target);
             }
         }
+        to_remove
     }
 
     pub fn remove(&mut self, id: &SearchId) -> Option<SearchState> {

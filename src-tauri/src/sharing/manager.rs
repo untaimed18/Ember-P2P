@@ -286,6 +286,7 @@ impl TransferManager {
             }
             self.controls.remove(id);
             self.speed_history.remove(id);
+            self.source_details.remove(id);
         }
         ids
     }

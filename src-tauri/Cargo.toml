@@ -48,3 +48,4 @@ pkcs8 = { version = "0.10", features = ["std"] }
 signature = "2"
 num-bigint-dig = "0.8"
 num-traits = "0.2"
+opener = "0.8.4"

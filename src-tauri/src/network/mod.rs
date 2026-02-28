@@ -305,6 +305,8 @@ struct NetworkState {
     server_client_id: u32,
     /// Background server connection task (non-blocking)
     pending_server_connect: Option<tokio::task::JoinHandle<ServerConnectResult>>,
+    /// Background buddy TCP connect (non-blocking, avoids stalling the event loop)
+    pending_buddy_connect: Option<tokio::task::JoinHandle<Option<(KadId, tokio::net::TcpStream)>>>,
     /// Whether the server auto-reconnect loop is allowed to run.
     /// Starts from settings; enabled on manual connect, disabled on manual disconnect.
     server_auto_reconnect: bool,
@@ -559,6 +561,7 @@ pub async fn start_network(
         low_id: false,
         server_client_id: 0,
         pending_server_connect: None,
+        pending_buddy_connect: None,
         server_auto_reconnect: settings.auto_connect_server,
     };
 
@@ -1152,7 +1155,8 @@ pub async fn start_network(
                                         arr
                                     }
                                     _ => {
-                                        error!("Bad hash in pending download");
+                                        error!("Bad hash in pending download, re-queuing for retry");
+                                        state.pending_downloads.insert(transfer_id, pending);
                                         continue;
                                     }
                                 };
@@ -1182,14 +1186,16 @@ pub async fn start_network(
                                     let (src_ip, src_port) = sources[0].clone();
                                     if let Ok(v4) = src_ip.parse::<Ipv4Addr>() {
                                         if state.dead_sources.is_dead_source(0, u32::from(v4), src_port) {
-                                            debug!("Skipping dead source {src_ip}:{src_port}");
+                                            debug!("Skipping dead source {src_ip}:{src_port}, re-queuing download");
+                                            state.pending_downloads.insert(transfer_id, pending);
                                             continue;
                                         }
                                     }
                                     let source_addr: SocketAddr = match format!("{src_ip}:{src_port}").parse() {
                                         Ok(a) => a,
                                         Err(e) => {
-                                            error!("Invalid source address: {e}");
+                                            error!("Invalid source address: {e}, re-queuing download");
+                                            state.pending_downloads.insert(transfer_id, pending);
                                             continue;
                                         }
                                     };
@@ -1649,7 +1655,22 @@ pub async fn start_network(
             // Cleanup stale searches, expired DHT entries, and unconfirmed publishes
             _ = cleanup_timer.tick() => {
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
-                state.search_manager.cleanup(120);
+                let removed_sids = state.search_manager.cleanup(120);
+                for sid in &removed_sids {
+                    if let Some((tx, results, _)) = state.pending_keyword_searches.remove(sid) {
+                        let _ = tx.send(results);
+                    }
+                    if let Some(tx) = state.pending_source_searches.remove(sid) {
+                        let _ = tx.send(Vec::new());
+                    }
+                    if let Some(tx) = state.pending_notes_searches.remove(sid) {
+                        let _ = tx.send(Vec::new());
+                    }
+                    state.download_source_searches.remove(sid);
+                    state.store_keyword_searches.remove(sid);
+                    state.store_source_searches.remove(sid);
+                    state.pending_note_publishes.remove(sid);
+                }
                 state.dht_store.cleanup_expired();
 
                 // Prune expired sources (older than 1 hour)
@@ -2108,21 +2129,13 @@ pub async fn start_network(
                                         let _ = app_handle.emit("search-results", &search_results);
                                     }
                                 }
-                                ed2k::server::ServerEvent::FoundSources { sources } => {
+                                ed2k::server::ServerEvent::FoundSources { file_hash, sources } => {
                                     if !sources.is_empty() {
-                                        info!("Server found {} sources via poll", sources.len());
+                                        info!("Server found {} sources for file {} via poll", sources.len(), hex::encode(file_hash));
                                         let mut sm = source_manager.write().await;
                                         for src in &sources {
                                             if let Ok(v4) = src.ip.parse::<Ipv4Addr>() {
-                                                for (_hash, pd) in &state.pending_downloads {
-                                                    if let Ok(hash_bytes) = hex::decode(&pd.file_hash) {
-                                                        if hash_bytes.len() >= 16 {
-                                                            let mut fh = [0u8; 16];
-                                                            fh.copy_from_slice(&hash_bytes[..16]);
-                                                            sm.register_source(fh, v4, src.port);
-                                                        }
-                                                    }
-                                                }
+                                                sm.register_source(file_hash, v4, src.port);
                                             }
                                         }
                                     }
@@ -2341,6 +2354,27 @@ pub async fn start_network(
                     }
                     Err(e) => {
                         warn!("Server connection task panicked: {e}");
+                    }
+                }
+            }
+
+            // Poll background buddy TCP connect (non-blocking)
+            result = async {
+                match state.pending_buddy_connect.as_mut() {
+                    Some(handle) => handle.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                state.pending_buddy_connect = None;
+                match result {
+                    Ok(Some((user_id, stream))) => {
+                        if state.buddy_manager.accept_buddy_request(user_id, stream) {
+                            info!("Accepted buddy request from {user_id}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        debug!("Buddy connect task panicked: {e}");
                     }
                 }
             }
@@ -3703,28 +3737,33 @@ async fn handle_udp_packet(
                 }
                 info!("Offered to be buddy for {user_id} (tcp_port={})", peer_tcp_port);
 
-                // The firewalled client will connect to us via TCP. 
-                // Accept the buddy relationship proactively via a TCP connection attempt.
+                // The firewalled client will connect to us via TCP.
+                // Spawn as background task to avoid blocking the event loop.
                 let buddy_ip = match from.ip() {
                     std::net::IpAddr::V4(v4) => v4,
                     _ => return,
                 };
-                let buddy_addr = SocketAddr::new(buddy_ip.into(), peer_tcp_port);
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(15),
-                    tokio::net::TcpStream::connect(buddy_addr),
-                ).await {
-                    Ok(Ok(stream)) => {
-                        if state.buddy_manager.accept_buddy_request(user_id, stream) {
-                            info!("Accepted buddy request from {} at {}", user_id, buddy_addr);
+                if state.pending_buddy_connect.is_none() {
+                    let buddy_addr = SocketAddr::new(buddy_ip.into(), peer_tcp_port);
+                    state.pending_buddy_connect = Some(tokio::spawn(async move {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(15),
+                            tokio::net::TcpStream::connect(buddy_addr),
+                        ).await {
+                            Ok(Ok(stream)) => {
+                                info!("Buddy TCP connected to {buddy_addr}");
+                                Some((user_id, stream))
+                            }
+                            Ok(Err(e)) => {
+                                debug!("Could not establish buddy TCP with {buddy_addr}: {e}");
+                                None
+                            }
+                            Err(_) => {
+                                debug!("Buddy TCP connect to {buddy_addr} timed out");
+                                None
+                            }
                         }
-                    }
-                    Ok(Err(e)) => {
-                        debug!("Could not establish buddy TCP with {}: {}", user_id, e);
-                    }
-                    Err(_) => {
-                        debug!("Buddy TCP connect to {} timed out", user_id);
-                    }
+                    }));
                 }
             }
         }
@@ -4267,7 +4306,7 @@ async fn handle_command(
             state.stats.status = NetworkStatus::Connecting;
             state.self_lookup_done = false;
             state.last_self_lookup = 0;
-            let _ = app_handle.emit("network-status", "connecting");
+            let _ = app_handle.emit("network-status", NetworkStatus::Connecting);
 
             // Reload routing table from saved nodes.dat (eMule recreates RoutingZone on Start)
             let nodes_path = state.data_dir.join("nodes.dat");
@@ -4385,6 +4424,7 @@ async fn handle_command(
             state.buddy_manager.reset();
             state.peer_nicknames.clear();
             state.publish_confirmed = 0;
+            state.first_publish_done = false;
 
             state.stats.status = NetworkStatus::Disconnected;
             state.stats.connected_peers = 0;
@@ -4392,7 +4432,7 @@ async fn handle_command(
             state.stats.firewalled = true;
             state.stats.buddy_status = "none".to_string();
             state.stats.stores_acknowledged = 0;
-            let _ = app_handle.emit("network-status", "disconnected");
+            let _ = app_handle.emit("network-status", NetworkStatus::Disconnected);
 
             info!("KAD fully disconnected — all activity stopped");
         }
@@ -4698,8 +4738,8 @@ async fn handle_command(
         }
 
         NetworkCommand::PreviewFile { transfer_id, tx } => {
-            let result = (|| -> Result<String, String> {
-                let mgr_guard = futures::executor::block_on(transfer_manager.read());
+            let result = async {
+                let mgr_guard = transfer_manager.read().await;
                 let transfer = mgr_guard.get_transfer(&transfer_id)
                     .ok_or_else(|| "Transfer not found".to_string())?;
 
@@ -4737,8 +4777,8 @@ async fn handle_command(
                 ed2k::preview::launch_preview(&preview_path)
                     .map_err(|e| format!("Failed to launch preview: {e}"))?;
 
-                Ok(format!("Preview launched: {}", preview_path.display()))
-            })();
+                Ok::<String, String>(format!("Preview launched: {}", preview_path.display()))
+            }.await;
             let _ = tx.send(result);
         }
 

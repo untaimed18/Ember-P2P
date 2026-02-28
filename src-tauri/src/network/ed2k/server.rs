@@ -347,7 +347,7 @@ pub enum ServerEvent {
     StatusUpdate { users: u32, files: u32 },
     ServerList { data: Vec<u8> },
     SearchResult { results: Vec<ServerSearchResult> },
-    FoundSources { sources: Vec<ServerSource> },
+    FoundSources { file_hash: [u8; 16], sources: Vec<ServerSource> },
 }
 
 fn parse_server_event(opcode: u8, payload: &[u8]) -> Vec<ServerEvent> {
@@ -400,9 +400,9 @@ fn parse_server_event(opcode: u8, payload: &[u8]) -> Vec<ServerEvent> {
         }
         OP_FOUNDSOURCES => {
             match parse_found_sources(payload) {
-                Ok(sources) => {
-                    debug!("Server found {} sources", sources.len());
-                    events.push(ServerEvent::FoundSources { sources });
+                Ok((file_hash, sources)) => {
+                    debug!("Server found {} sources for file {}", sources.len(), hex::encode(file_hash));
+                    events.push(ServerEvent::FoundSources { file_hash, sources });
                 }
                 Err(e) => {
                     debug!("Failed to parse found sources: {e}");
@@ -690,13 +690,13 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<Vec<ServerSearchResult>
     Ok(results)
 }
 
-fn parse_found_sources(payload: &[u8]) -> anyhow::Result<Vec<ServerSource>> {
+fn parse_found_sources(payload: &[u8]) -> anyhow::Result<([u8; 16], Vec<ServerSource>)> {
     if payload.len() < 17 {
-        return Ok(Vec::new());
+        return Ok(([0u8; 16], Vec::new()));
     }
     let mut cursor = Cursor::new(payload);
-    let mut _hash = [0u8; 16];
-    Read::read_exact(&mut cursor, &mut _hash)?;
+    let mut file_hash = [0u8; 16];
+    Read::read_exact(&mut cursor, &mut file_hash)?;
     let count = ReadBytesExt::read_u8(&mut cursor)? as usize;
     let mut sources = Vec::with_capacity(count);
 
@@ -710,7 +710,7 @@ fn parse_found_sources(payload: &[u8]) -> anyhow::Result<Vec<ServerSource>> {
         });
     }
 
-    Ok(sources)
+    Ok((file_hash, sources))
 }
 
 async fn write_server_packet<W: AsyncWriteExt + Unpin>(

@@ -83,7 +83,8 @@ impl PartTracker {
     }
 
     fn save_inner(&self) -> anyhow::Result<()> {
-        let mut file = std::fs::File::create(&self.met_path)?;
+        let tmp_path = self.met_path.with_extension("met.tmp");
+        let mut file = std::fs::File::create(&tmp_path)?;
         file.write_all(&PART_MET_MAGIC.to_le_bytes())?;
         file.write_all(&(self.file_size).to_le_bytes())?;
         file.write_all(&(self.part_count as u32).to_le_bytes())?;
@@ -97,11 +98,14 @@ impl PartTracker {
         }
         file.write_all(&bitmap)?;
         file.flush()?;
+        drop(file);
+        std::fs::rename(&tmp_path, &self.met_path)?;
         Ok(())
     }
 
     fn load(&mut self) {
-        if let Err(_) = self.load_inner() {
+        if let Err(e) = self.load_inner() {
+            tracing::warn!("Failed to load part.met ({}), resetting progress: {e}", self.met_path.display());
             self.completed = vec![false; self.part_count];
         }
         self.in_progress = vec![false; self.part_count];

@@ -212,55 +212,24 @@ pub async fn unshare_file(
 
 #[tauri::command]
 pub async fn open_shared_file(file_path: String) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", &file_path])
-            .spawn()
-            .map_err(|e| format!("Failed to open file: {e}"))?;
+    let path = std::path::Path::new(&file_path);
+    if !path.exists() {
+        return Err("File does not exist".to_string());
     }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(&file_path)
-            .spawn()
-            .map_err(|e| format!("Failed to open file: {e}"))?;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(&file_path)
-            .spawn()
-            .map_err(|e| format!("Failed to open file: {e}"))?;
-    }
+    let canonical = path.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
+    opener::open(&canonical).map_err(|e| format!("Failed to open file: {e}"))?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn open_shared_folder(file_path: String) -> Result<(), String> {
     let path = std::path::Path::new(&file_path);
-    let folder = path.parent().unwrap_or(path).to_string_lossy().to_string();
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("explorer")
-            .arg(&folder)
-            .spawn()
-            .map_err(|e| format!("Failed to open folder: {e}"))?;
+    let folder = path.parent().unwrap_or(path);
+    if !folder.exists() {
+        return Err("Folder does not exist".to_string());
     }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(&folder)
-            .spawn()
-            .map_err(|e| format!("Failed to open folder: {e}"))?;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(&folder)
-            .spawn()
-            .map_err(|e| format!("Failed to open folder: {e}"))?;
-    }
+    let canonical = folder.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
+    opener::open(&canonical).map_err(|e| format!("Failed to open folder: {e}"))?;
     Ok(())
 }
 

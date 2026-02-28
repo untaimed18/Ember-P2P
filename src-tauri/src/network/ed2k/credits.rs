@@ -137,11 +137,29 @@ fn generate_rsa_keypair() -> (Vec<u8>, Vec<u8>) {
 
     let mut rng = rand::thread_rng();
     let bits = 384;
-    let private_key = RsaPrivateKey::new(&mut rng, bits).expect("RSA keygen failed");
+    let private_key = match RsaPrivateKey::new(&mut rng, bits) {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!("RSA keygen failed: {e}, credits will be disabled");
+            return (Vec::new(), Vec::new());
+        }
+    };
     let public_key = private_key.to_public_key();
 
-    let priv_der = private_key.to_pkcs8_der().expect("private key encode failed");
-    let pub_der = public_key.to_public_key_der().expect("public key encode failed");
+    let priv_der = match private_key.to_pkcs8_der() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("RSA private key encode failed: {e}");
+            return (Vec::new(), Vec::new());
+        }
+    };
+    let pub_der = match public_key.to_public_key_der() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("RSA public key encode failed: {e}");
+            return (Vec::new(), Vec::new());
+        }
+    };
 
     (pub_der.as_ref().to_vec(), priv_der.as_bytes().to_vec())
 }
