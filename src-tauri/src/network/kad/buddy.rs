@@ -1,14 +1,24 @@
-use std::net::SocketAddr;
-use tracing::{debug, info, warn};
+use std::collections::HashSet;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::io::AsyncWriteExt;
+use tokio::sync::{mpsc, Mutex};
+use tracing::{debug, info, warn};
 
 use super::types::KadId;
 
+const OP_EDONKEYHEADER: u8 = 0xE3;
 const OP_EMULEPROT: u8 = 0xC5;
+const OP_HELLO: u8 = 0x01;
+const OP_HELLOANSWER: u8 = 0x4C;
 const OP_BUDDYPING: u8 = 0x9F;
-#[allow(dead_code)]
 const OP_BUDDYPONG: u8 = 0xA0;
+const OP_REASKCALLBACKTCP: u8 = 0x9A;
+
+const BUDDY_EVENT_CHANNEL_SIZE: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuddyState {
@@ -17,31 +27,63 @@ pub enum BuddyState {
     Connected,
 }
 
+#[derive(Debug)]
+pub enum BuddyEvent {
+    PingReceived,
+    PongReceived,
+    CallbackRelay {
+        dest_ip: Ipv4Addr,
+        dest_port: u16,
+        file_hash: [u8; 16],
+    },
+    Disconnected,
+}
+
+pub type PendingBuddySet = Arc<Mutex<HashSet<[u8; 16]>>>;
+
 pub struct BuddyManager {
     local_id: KadId,
+    user_hash: [u8; 16],
+    nickname: String,
     tcp_port: u16,
     state: BuddyState,
     buddy_id: Option<KadId>,
     buddy_addr: Option<SocketAddr>,
-    buddy_stream: Option<TcpStream>,
     last_find_attempt: i64,
-    /// If we're acting as a buddy for another firewalled node
+
+    buddy_writer: Option<BufWriter<OwnedWriteHalf>>,
+    buddy_reader_handle: Option<tokio::task::JoinHandle<()>>,
+
     serving_buddy_for: Option<KadId>,
-    serving_stream: Option<TcpStream>,
+    serving_writer: Option<BufWriter<OwnedWriteHalf>>,
+    serving_reader_handle: Option<tokio::task::JoinHandle<()>>,
+
+    pending_buddy_hashes: PendingBuddySet,
 }
 
 impl BuddyManager {
-    pub fn new(local_id: KadId, tcp_port: u16) -> Self {
+    pub fn new(
+        local_id: KadId,
+        user_hash: [u8; 16],
+        nickname: String,
+        tcp_port: u16,
+        pending_buddy_hashes: PendingBuddySet,
+    ) -> Self {
         BuddyManager {
             local_id,
+            user_hash,
+            nickname,
             tcp_port,
             state: BuddyState::NoBuddy,
             buddy_id: None,
             buddy_addr: None,
-            buddy_stream: None,
             last_find_attempt: 0,
+            buddy_writer: None,
+            buddy_reader_handle: None,
             serving_buddy_for: None,
-            serving_stream: None,
+            serving_writer: None,
+            serving_reader_handle: None,
+            pending_buddy_hashes,
         }
     }
 
@@ -49,10 +91,16 @@ impl BuddyManager {
         self.state = BuddyState::NoBuddy;
         self.buddy_id = None;
         self.buddy_addr = None;
-        self.buddy_stream = None;
         self.last_find_attempt = 0;
+        if let Some(h) = self.buddy_reader_handle.take() {
+            h.abort();
+        }
+        self.buddy_writer = None;
+        if let Some(h) = self.serving_reader_handle.take() {
+            h.abort();
+        }
+        self.serving_writer = None;
         self.serving_buddy_for = None;
-        self.serving_stream = None;
     }
 
     pub fn state(&self) -> BuddyState {
@@ -71,16 +119,17 @@ impl BuddyManager {
         self.buddy_id.as_ref()
     }
 
-    /// Compute the target for FindBuddy search (our_id XOR buddy_mask).
+    pub fn buddy_addr(&self) -> Option<SocketAddr> {
+        self.buddy_addr
+    }
+
     pub fn find_buddy_target(&self) -> KadId {
         let mut target = self.local_id.0;
-        // XOR with a mask that has high bits set to search in a different part of the space
         target[0] ^= 0xFF;
         target[1] ^= 0xFF;
         KadId(target)
     }
 
-    /// Should we attempt to find a buddy? (firewalled, no current buddy, enough time passed)
     pub fn should_find_buddy(&self, firewalled: bool) -> bool {
         if !firewalled {
             return false;
@@ -92,7 +141,7 @@ impl BuddyManager {
             return false;
         }
         let now = chrono::Utc::now().timestamp();
-        now - self.last_find_attempt > 1200 // Every 20 minutes (eMule: MIN2S(20))
+        now - self.last_find_attempt > 1200
     }
 
     pub fn start_finding(&mut self) {
@@ -106,101 +155,186 @@ impl BuddyManager {
         debug!("Buddy search failed, will retry later");
     }
 
-    /// Handle a FindBuddyRes: connect to the buddy via TCP.
+    /// Handle FindBuddyRes: connect to buddy, do Hello handshake, start read loop.
+    /// We are the firewalled client connecting to a non-firewalled buddy.
     pub async fn handle_findbuddy_response(
         &mut self,
         buddy_id: KadId,
-        buddy_ip: std::net::Ipv4Addr,
+        buddy_ip: Ipv4Addr,
         tcp_port: u16,
-    ) -> bool {
+    ) -> Option<mpsc::Receiver<BuddyEvent>> {
         let addr = SocketAddr::new(buddy_ip.into(), tcp_port);
-        info!("Attempting to connect to buddy {} at {}", buddy_id, addr);
+        info!("Connecting to buddy {} at {}", buddy_id, addr);
 
-        match tokio::time::timeout(
+        let stream = match tokio::time::timeout(
             std::time::Duration::from_secs(10),
             TcpStream::connect(addr),
-        ).await {
-            Ok(Ok(stream)) => {
-                info!("Connected to buddy {} at {}", buddy_id, addr);
-                self.buddy_id = Some(buddy_id);
-                self.buddy_addr = Some(addr);
-                self.buddy_stream = Some(stream);
-                self.state = BuddyState::Connected;
-                true
-            }
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
             Ok(Err(e)) => {
                 warn!("Failed to connect to buddy {}: {}", buddy_id, e);
                 self.find_failed();
-                false
+                return None;
             }
             Err(_) => {
                 warn!("Timeout connecting to buddy {}", buddy_id);
                 self.find_failed();
-                false
+                return None;
             }
+        };
+
+        let (reader, writer) = stream.into_split();
+        let mut writer = BufWriter::new(writer);
+        let mut reader = BufReader::new(reader);
+
+        // Outgoing buddy: we send Hello first, read HelloAnswer
+        if let Err(e) = buddy_hello_handshake_outgoing(
+            &mut reader,
+            &mut writer,
+            &self.user_hash,
+            &self.nickname,
+            self.tcp_port,
+        )
+        .await
+        {
+            warn!("Buddy Hello handshake failed: {e}");
+            self.find_failed();
+            return None;
         }
+
+        let (event_tx, event_rx) = mpsc::channel(BUDDY_EVENT_CHANNEL_SIZE);
+        let handle = tokio::spawn(run_buddy_reader(reader, event_tx));
+
+        self.buddy_id = Some(buddy_id);
+        self.buddy_addr = Some(addr);
+        self.buddy_writer = Some(writer);
+        self.buddy_reader_handle = Some(handle);
+        self.state = BuddyState::Connected;
+        info!("Buddy connected: {} at {}", buddy_id, addr);
+        Some(event_rx)
     }
 
-    /// Send OP_BUDDYPING to verify the buddy connection (eMule keepalive).
-    pub async fn check_buddy_alive(&mut self) {
-        if self.state == BuddyState::Connected {
-            if let Some(ref mut stream) = self.buddy_stream {
-                let ping = build_emule_packet(OP_BUDDYPING, &[]);
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    stream.write_all(&ping),
-                ).await {
-                    Ok(Ok(())) => {}
-                    _ => {
-                        info!("Buddy connection lost (ping failed)");
-                        self.buddy_stream = None;
-                        self.buddy_id = None;
-                        self.buddy_addr = None;
-                        self.state = BuddyState::NoBuddy;
-                    }
-                }
-            } else {
-                self.state = BuddyState::NoBuddy;
-            }
-        }
-    }
-
-    /// Accept serving as a buddy for a firewalled client (if we're not firewalled).
-    pub fn accept_buddy_request(
+    /// Accept an incoming buddy connection (we are the non-firewalled buddy).
+    /// The firewalled client already sent Hello; we already sent HelloAnswer.
+    /// `stream` is the already-handshaked TCP connection.
+    pub fn accept_buddy_connection(
         &mut self,
         requester_id: KadId,
-        stream: TcpStream,
-    ) -> bool {
+        reader: BufReader<OwnedReadHalf>,
+        writer: BufWriter<OwnedWriteHalf>,
+    ) -> Option<mpsc::Receiver<BuddyEvent>> {
         if self.serving_buddy_for.is_some() {
-            debug!("Already serving as buddy, rejecting request from {}", requester_id);
-            return false;
+            debug!(
+                "Already serving as buddy, rejecting request from {}",
+                requester_id
+            );
+            return None;
         }
-        info!("Accepting buddy request from {}", requester_id);
+        let (event_tx, event_rx) = mpsc::channel(BUDDY_EVENT_CHANNEL_SIZE);
+        let handle = tokio::spawn(run_buddy_reader(reader, event_tx));
+
         self.serving_buddy_for = Some(requester_id);
-        self.serving_stream = Some(stream);
-        true
+        self.serving_writer = Some(writer);
+        self.serving_reader_handle = Some(handle);
+        info!("Now serving as buddy for {}", requester_id);
+        Some(event_rx)
     }
 
-    /// Forward a callback request to our buddy using ed2k packet framing.
-    pub async fn relay_callback(&mut self, data: &[u8]) -> bool {
-        if let Some(ref mut stream) = self.serving_stream {
-            // eMule ed2k framing: [protocol(1)][length(4)][payload]
-            let mut packet = Vec::with_capacity(5 + data.len());
-            packet.push(OP_EMULEPROT);
-            packet.extend_from_slice(&(data.len() as u32).to_le_bytes());
-            packet.extend_from_slice(data);
-            match stream.write_all(&packet).await {
-                Ok(()) => true,
-                Err(e) => {
-                    warn!("Failed to relay callback: {}", e);
-                    self.serving_buddy_for = None;
-                    self.serving_stream = None;
+    /// Register a user hash as a pending buddy (upload listener will check this).
+    pub async fn register_pending_buddy(&self, user_hash: [u8; 16]) {
+        let mut set = self.pending_buddy_hashes.lock().await;
+        set.insert(user_hash);
+    }
+
+    /// Send OP_BUDDYPING to our buddy (we are firewalled).
+    pub async fn send_buddy_ping(&mut self) -> bool {
+        if let Some(ref mut w) = self.buddy_writer {
+            let pkt = build_emule_packet(OP_BUDDYPING, &[]);
+            match tokio::time::timeout(std::time::Duration::from_secs(10), w.write_all(&pkt)).await
+            {
+                Ok(Ok(())) => {
+                    let _ = w.flush().await;
+                    true
+                }
+                _ => {
+                    warn!("Buddy ping failed, connection lost");
+                    self.disconnect_buddy();
                     false
                 }
             }
         } else {
             false
         }
+    }
+
+    /// Send OP_BUDDYPONG reply on a writer.
+    pub async fn send_pong_to_buddy(&mut self) -> bool {
+        if let Some(ref mut w) = self.buddy_writer {
+            send_pong(w).await
+        } else {
+            false
+        }
+    }
+
+    /// Send OP_BUDDYPONG reply to our serving client.
+    pub async fn send_pong_to_serving(&mut self) -> bool {
+        if let Some(ref mut w) = self.serving_writer {
+            send_pong(w).await
+        } else {
+            false
+        }
+    }
+
+    /// Send OP_REASKCALLBACKTCP to our serving buddy client.
+    /// Format: [client_ip:4][client_port:2][file_hash:16]
+    pub async fn send_callback_relay(
+        &mut self,
+        client_ip: Ipv4Addr,
+        client_port: u16,
+        file_hash: [u8; 16],
+    ) -> bool {
+        if let Some(ref mut w) = self.serving_writer {
+            let mut payload = Vec::with_capacity(22);
+            payload.extend_from_slice(&u32::from(client_ip).to_le_bytes());
+            payload.extend_from_slice(&client_port.to_le_bytes());
+            payload.extend_from_slice(&file_hash);
+            let pkt = build_emule_packet(OP_REASKCALLBACKTCP, &payload);
+            match w.write_all(&pkt).await {
+                Ok(()) => {
+                    let _ = w.flush().await;
+                    true
+                }
+                Err(e) => {
+                    warn!("Failed to relay callback: {e}");
+                    self.disconnect_serving();
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    }
+
+    pub fn disconnect_buddy(&mut self) {
+        if let Some(h) = self.buddy_reader_handle.take() {
+            h.abort();
+        }
+        self.buddy_writer = None;
+        self.buddy_id = None;
+        self.buddy_addr = None;
+        self.state = BuddyState::NoBuddy;
+        info!("Buddy disconnected");
+    }
+
+    pub fn disconnect_serving(&mut self) {
+        if let Some(h) = self.serving_reader_handle.take() {
+            h.abort();
+        }
+        self.serving_writer = None;
+        self.serving_buddy_for = None;
+        info!("Stopped serving as buddy");
     }
 
     pub fn is_serving(&self) -> bool {
@@ -210,6 +344,178 @@ impl BuddyManager {
     pub fn serving_for(&self) -> Option<&KadId> {
         self.serving_buddy_for.as_ref()
     }
+}
+
+async fn send_pong(w: &mut BufWriter<OwnedWriteHalf>) -> bool {
+    let pkt = build_emule_packet(OP_BUDDYPONG, &[]);
+    match w.write_all(&pkt).await {
+        Ok(()) => {
+            let _ = w.flush().await;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Outgoing buddy handshake: we send Hello, read HelloAnswer.
+async fn buddy_hello_handshake_outgoing(
+    reader: &mut BufReader<OwnedReadHalf>,
+    writer: &mut BufWriter<OwnedWriteHalf>,
+    user_hash: &[u8; 16],
+    nickname: &str,
+    tcp_port: u16,
+) -> anyhow::Result<()> {
+    let hello = crate::network::ed2k::messages::build_hello(user_hash, 0, tcp_port, nickname);
+    write_ed2k_packet(writer, OP_EDONKEYHEADER, OP_HELLO, &hello).await?;
+
+    let (proto, opcode, _payload) =
+        tokio::time::timeout(std::time::Duration::from_secs(15), read_ed2k_packet(reader))
+            .await
+            .map_err(|_| anyhow::anyhow!("Hello handshake timeout"))??;
+
+    if proto != OP_EDONKEYHEADER || opcode != OP_HELLOANSWER {
+        anyhow::bail!(
+            "Expected HelloAnswer, got proto=0x{proto:02X} op=0x{opcode:02X}"
+        );
+    }
+    debug!("Buddy Hello handshake complete (outgoing)");
+    Ok(())
+}
+
+/// Incoming buddy handshake: read Hello, send HelloAnswer.
+/// Returns the peer's user_hash extracted from the Hello payload.
+pub async fn buddy_hello_handshake_incoming(
+    reader: &mut BufReader<OwnedReadHalf>,
+    writer: &mut BufWriter<OwnedWriteHalf>,
+    user_hash: &[u8; 16],
+    nickname: &str,
+    tcp_port: u16,
+) -> anyhow::Result<[u8; 16]> {
+    let (proto, opcode, payload) =
+        tokio::time::timeout(std::time::Duration::from_secs(15), read_ed2k_packet(reader))
+            .await
+            .map_err(|_| anyhow::anyhow!("Hello handshake timeout"))??;
+
+    if proto != OP_EDONKEYHEADER || opcode != OP_HELLO {
+        anyhow::bail!(
+            "Expected Hello, got proto=0x{proto:02X} op=0x{opcode:02X}"
+        );
+    }
+
+    let mut peer_user_hash = [0u8; 16];
+    if payload.len() >= 17 {
+        peer_user_hash.copy_from_slice(&payload[1..17]);
+    }
+
+    let hello_ans =
+        crate::network::ed2k::messages::build_hello_answer(user_hash, 0, tcp_port, nickname);
+    write_ed2k_packet(writer, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_ans).await?;
+
+    debug!("Buddy Hello handshake complete (incoming)");
+    Ok(peer_user_hash)
+}
+
+/// Long-running reader task for a buddy TCP connection.
+/// Reads ed2k packets and sends events back via channel.
+async fn run_buddy_reader(
+    reader: BufReader<OwnedReadHalf>,
+    event_tx: mpsc::Sender<BuddyEvent>,
+) {
+    let mut reader = reader;
+    loop {
+        match read_ed2k_packet(&mut reader).await {
+            Ok((proto, opcode, payload)) => {
+                let event = match (proto, opcode) {
+                    (OP_EMULEPROT, OP_BUDDYPING) => {
+                        debug!("Received OP_BUDDYPING");
+                        Some(BuddyEvent::PingReceived)
+                    }
+                    (OP_EMULEPROT, OP_BUDDYPONG) => {
+                        debug!("Received OP_BUDDYPONG");
+                        Some(BuddyEvent::PongReceived)
+                    }
+                    (OP_EMULEPROT, OP_REASKCALLBACKTCP) => {
+                        if payload.len() >= 22 {
+                            let ip_bytes = [payload[0], payload[1], payload[2], payload[3]];
+                            let dest_ip = Ipv4Addr::from(u32::from_le_bytes(ip_bytes));
+                            let dest_port =
+                                u16::from_le_bytes([payload[4], payload[5]]);
+                            let mut file_hash = [0u8; 16];
+                            file_hash.copy_from_slice(&payload[6..22]);
+                            debug!(
+                                "Received OP_REASKCALLBACKTCP: {}:{} hash={}",
+                                dest_ip,
+                                dest_port,
+                                hex::encode(file_hash)
+                            );
+                            Some(BuddyEvent::CallbackRelay {
+                                dest_ip,
+                                dest_port,
+                                file_hash,
+                            })
+                        } else {
+                            debug!(
+                                "OP_REASKCALLBACKTCP too short ({} bytes)",
+                                payload.len()
+                            );
+                            None
+                        }
+                    }
+                    _ => {
+                        debug!(
+                            "Buddy reader: ignoring proto=0x{proto:02X} op=0x{opcode:02X}"
+                        );
+                        None
+                    }
+                };
+                if let Some(ev) = event {
+                    if event_tx.send(ev).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                debug!("Buddy reader disconnected: {e}");
+                let _ = event_tx.send(BuddyEvent::Disconnected).await;
+                break;
+            }
+        }
+    }
+}
+
+async fn read_ed2k_packet(
+    reader: &mut BufReader<OwnedReadHalf>,
+) -> std::io::Result<(u8, u8, Vec<u8>)> {
+    let protocol = reader.read_u8().await?;
+    let length = reader.read_u32_le().await? as usize;
+    if length == 0 || length > 5_000_000 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid packet length: {length}"),
+        ));
+    }
+    let opcode = reader.read_u8().await?;
+    let payload_len = length.saturating_sub(1);
+    let mut payload = vec![0u8; payload_len];
+    if payload_len > 0 {
+        reader.read_exact(&mut payload).await?;
+    }
+    Ok((protocol, opcode, payload))
+}
+
+async fn write_ed2k_packet(
+    writer: &mut BufWriter<OwnedWriteHalf>,
+    protocol: u8,
+    opcode: u8,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let length = (1 + payload.len()) as u32;
+    writer.write_u8(protocol).await?;
+    writer.write_u32_le(length).await?;
+    writer.write_u8(opcode).await?;
+    writer.write_all(payload).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 fn build_emule_packet(opcode: u8, payload: &[u8]) -> Vec<u8> {

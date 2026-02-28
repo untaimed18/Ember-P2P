@@ -30,7 +30,7 @@ use self::ed2k::upload::{self as upload_server, UploadEvent, UploadEventKind};
 use self::ed2k::multi_source::{DownloadSource, MultiSourceDownload};
 use self::ed2k::transfer::{DownloadEvent, Ed2kDownload};
 use self::kad::bootstrap;
-use self::kad::buddy::{BuddyManager, BuddyState};
+use self::kad::buddy::{BuddyManager, BuddyState, BuddyEvent, PendingBuddySet};
 use self::kad::firewall::FirewallChecker;
 use self::kad::ip_filter::{IpFilter, IpFilterStats};
 use self::kad::messages::{self, KadMessage, KADEMLIA_FIND_NODE};
@@ -305,8 +305,13 @@ struct NetworkState {
     server_client_id: u32,
     /// Background server connection task (non-blocking)
     pending_server_connect: Option<tokio::task::JoinHandle<ServerConnectResult>>,
-    /// Background buddy TCP connect (non-blocking, avoids stalling the event loop)
-    pending_buddy_connect: Option<tokio::task::JoinHandle<Option<(KadId, tokio::net::TcpStream)>>>,
+    /// Shared set of user hashes expected as incoming buddy connections (checked by upload listener)
+    #[allow(dead_code)]
+    pending_buddy_hashes: PendingBuddySet,
+    /// Event receiver for our buddy connection (we are firewalled)
+    buddy_event_rx: Option<mpsc::Receiver<BuddyEvent>>,
+    /// Event receiver for the client we're serving as buddy for
+    serving_event_rx: Option<mpsc::Receiver<BuddyEvent>>,
     /// Whether the server auto-reconnect loop is allowed to run.
     /// Starts from settings; enabled on manual connect, disabled on manual disconnect.
     server_auto_reconnect: bool,
@@ -467,7 +472,8 @@ pub async fn start_network(
     dht_store.set_local_id(local_id);
 
     let udp_key_seed = identity.udp_key_seed;
-    let buddy_manager = BuddyManager::new(local_id, tcp_port);
+    let pending_buddy_hashes: PendingBuddySet = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    let buddy_manager = BuddyManager::new(local_id, user_hash, settings.nickname.clone(), tcp_port, pending_buddy_hashes.clone());
 
     // Initialize IP filter (controlled by user settings)
     let mut ip_filter = IpFilter::new(settings.ip_filter_enabled, settings.block_private_ips);
@@ -561,7 +567,9 @@ pub async fn start_network(
         low_id: false,
         server_client_id: 0,
         pending_server_connect: None,
-        pending_buddy_connect: None,
+        pending_buddy_hashes: pending_buddy_hashes.clone(),
+        buddy_event_rx: None,
+        serving_event_rx: None,
         server_auto_reconnect: settings.auto_connect_server,
     };
 
@@ -619,6 +627,9 @@ pub async fn start_network(
     // Upload event channel
     let (ul_event_tx, mut ul_event_rx) = mpsc::channel::<UploadEvent>(128);
 
+    // Buddy connection channel (upload listener sends recognized buddy connections here)
+    let (buddy_conn_tx, mut buddy_conn_rx) = mpsc::channel::<upload_server::BuddyConnectionParts>(4);
+
     let source_manager: Arc<RwLock<SourceManager>> = Arc::new(RwLock::new(SourceManager::new()));
 
     // Load credits from DB
@@ -656,6 +667,8 @@ pub async fn start_network(
         let ul_a4af = a4af_shared.clone();
         let ul_pdh = pending_dl_hashes.clone();
         let ul_apt = active_port_tests.clone();
+        let ul_buddy_hashes = pending_buddy_hashes.clone();
+        let ul_buddy_tx = buddy_conn_tx.clone();
         tokio::spawn(async move {
             if let Err(e) = upload_server::start_upload_server(
                 tcp_port,
@@ -673,6 +686,8 @@ pub async fn start_network(
                 ul_a4af,
                 ul_pdh,
                 ul_apt,
+                ul_buddy_hashes,
+                ul_buddy_tx,
             )
             .await
             {
@@ -1836,7 +1851,9 @@ pub async fn start_network(
             // Buddy system: find a relay buddy if firewalled (always-on, like eMule)
             _ = buddy_timer.tick() => {
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
-                state.buddy_manager.check_buddy_alive().await;
+                if state.buddy_manager.state() == BuddyState::Connected {
+                    state.buddy_manager.send_buddy_ping().await;
+                }
                 if state.buddy_manager.should_find_buddy(state.firewalled) {
                     state.buddy_manager.start_finding();
                     let target = state.buddy_manager.find_buddy_target();
@@ -2358,23 +2375,110 @@ pub async fn start_network(
                 }
             }
 
-            // Poll background buddy TCP connect (non-blocking)
-            result = async {
-                match state.pending_buddy_connect.as_mut() {
-                    Some(handle) => handle.await,
+            // Poll buddy events (we are firewalled, buddy relays to us)
+            event = async {
+                match state.buddy_event_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
                     None => std::future::pending().await,
                 }
             } => {
-                state.pending_buddy_connect = None;
-                match result {
-                    Ok(Some((user_id, stream))) => {
-                        if state.buddy_manager.accept_buddy_request(user_id, stream) {
-                            info!("Accepted buddy request from {user_id}");
+                match event {
+                    Some(BuddyEvent::PingReceived) => {
+                        state.buddy_manager.send_pong_to_buddy().await;
+                    }
+                    Some(BuddyEvent::PongReceived) => {
+                        debug!("Buddy pong received");
+                    }
+                    Some(BuddyEvent::CallbackRelay { dest_ip, dest_port, file_hash }) => {
+                        info!("Buddy relayed callback: connect to {dest_ip}:{dest_port} for file {}", hex::encode(file_hash));
+                        let user_hash = state.user_hash;
+                        let nickname = settings.nickname.clone();
+                        let tcp_port = state.tcp_port;
+                        let dl_folder = settings.download_folder.clone();
+                        let bw = bandwidth_limiter.clone();
+                        let sm = source_manager.clone();
+                        let cm = credit_manager.clone();
+                        let dl_tx = dl_event_tx.clone();
+
+                        if let Some(pd) = state.pending_downloads.values().find(|pd| {
+                            hex::decode(&pd.file_hash).ok()
+                                .filter(|b| b.len() == 16 && b[..] == file_hash[..])
+                                .is_some()
+                        }) {
+                            let transfer_id = pd.transfer_id.clone();
+                            let file_name = pd.file_name.clone();
+                            let file_size = pd.file_size;
+                            let control = pd.control.clone();
+                            let source_addr = SocketAddr::new(dest_ip.into(), dest_port);
+                            let udp_port = state.udp_port;
+                            info!("Starting callback download {transfer_id} to {source_addr}");
+                            let download = ed2k::transfer::Ed2kDownload {
+                                transfer_id,
+                                file_hash,
+                                file_name,
+                                file_size,
+                                source_addr,
+                                download_dir: PathBuf::from(&dl_folder),
+                                user_hash,
+                                nickname,
+                                tcp_port,
+                                udp_port,
+                                bandwidth_limiter: bw,
+                                control,
+                                source_manager: Some(sm),
+                                credit_manager: Some(cm),
+                            };
+                            tokio::spawn(async move {
+                                if let Err(e) = download.run(dl_tx).await {
+                                    warn!("Callback download failed: {e}");
+                                }
+                            });
+                        } else {
+                            debug!("No pending download for callback file hash {}", hex::encode(file_hash));
                         }
                     }
-                    Ok(None) => {}
-                    Err(e) => {
-                        debug!("Buddy connect task panicked: {e}");
+                    Some(BuddyEvent::Disconnected) | None => {
+                        if state.buddy_manager.state() == BuddyState::Connected {
+                            state.buddy_manager.disconnect_buddy();
+                            state.buddy_event_rx = None;
+                        }
+                    }
+                }
+            }
+
+            // Poll serving buddy events (we are the non-firewalled buddy)
+            event = async {
+                match state.serving_event_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match event {
+                    Some(BuddyEvent::PingReceived) => {
+                        state.buddy_manager.send_pong_to_serving().await;
+                    }
+                    Some(BuddyEvent::PongReceived) => {
+                        debug!("Serving buddy pong received");
+                    }
+                    Some(BuddyEvent::CallbackRelay { .. }) => {
+                        debug!("Unexpected callback relay on serving side");
+                    }
+                    Some(BuddyEvent::Disconnected) | None => {
+                        if state.buddy_manager.is_serving() {
+                            state.buddy_manager.disconnect_serving();
+                            state.serving_event_rx = None;
+                        }
+                    }
+                }
+            }
+
+            // Accept incoming buddy connections forwarded from the upload listener
+            buddy_conn = buddy_conn_rx.recv() => {
+                if let Some((peer_hash, reader, writer)) = buddy_conn {
+                    let peer_id = KadId(peer_hash);
+                    if let Some(rx) = state.buddy_manager.accept_buddy_connection(peer_id, reader, writer) {
+                        state.serving_event_rx = Some(rx);
+                        info!("Accepted incoming buddy connection from {}", peer_id);
                     }
                 }
             }
@@ -3737,34 +3841,9 @@ async fn handle_udp_packet(
                 }
                 info!("Offered to be buddy for {user_id} (tcp_port={})", peer_tcp_port);
 
-                // The firewalled client will connect to us via TCP.
-                // Spawn as background task to avoid blocking the event loop.
-                let buddy_ip = match from.ip() {
-                    std::net::IpAddr::V4(v4) => v4,
-                    _ => return,
-                };
-                if state.pending_buddy_connect.is_none() {
-                    let buddy_addr = SocketAddr::new(buddy_ip.into(), peer_tcp_port);
-                    state.pending_buddy_connect = Some(tokio::spawn(async move {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(15),
-                            tokio::net::TcpStream::connect(buddy_addr),
-                        ).await {
-                            Ok(Ok(stream)) => {
-                                info!("Buddy TCP connected to {buddy_addr}");
-                                Some((user_id, stream))
-                            }
-                            Ok(Err(e)) => {
-                                debug!("Could not establish buddy TCP with {buddy_addr}: {e}");
-                                None
-                            }
-                            Err(_) => {
-                                debug!("Buddy TCP connect to {buddy_addr} timed out");
-                                None
-                            }
-                        }
-                    }));
-                }
+                // Register this user's hash so the upload listener recognizes the incoming
+                // buddy TCP connection (the firewalled client will connect to us).
+                state.buddy_manager.register_pending_buddy(user_id.0).await;
             }
         }
 
@@ -3775,12 +3854,12 @@ async fn handle_udp_packet(
                     std::net::IpAddr::V4(v4) => v4,
                     _ => return,
                 };
-                let connected = state.buddy_manager.handle_findbuddy_response(
+                if let Some(rx) = state.buddy_manager.handle_findbuddy_response(
                     buddy_id,
                     buddy_ip,
                     peer_tcp_port,
-                ).await;
-                if connected {
+                ).await {
+                    state.buddy_event_rx = Some(rx);
                     info!("Successfully connected to buddy {} at {}:{}", buddy_id, buddy_ip, peer_tcp_port);
                 }
             }
@@ -3789,21 +3868,17 @@ async fn handle_udp_packet(
         KadMessage::CallbackReq { buddy_id, file_id, tcp_port: peer_tcp_port } => {
             debug!("CallbackReq from {from}: buddy_id={buddy_id}, file_id={file_id}");
             if state.buddy_manager.is_serving() {
-                if let Some(serving_for) = state.buddy_manager.serving_for().cloned() {
-                    debug!("Relaying callback to our buddy {}", serving_for);
-                    let relay_data = messages::encode_packet(&KadMessage::CallbackReq {
-                        buddy_id,
-                        file_id,
-                        tcp_port: peer_tcp_port,
-                    });
-                    if let Ok(data) = relay_data {
-                        let relayed = state.buddy_manager.relay_callback(&data).await;
-                        if relayed {
-                            debug!("Callback relayed successfully");
-                        } else {
-                            warn!("Failed to relay callback to buddy");
-                        }
-                    }
+                let client_ip = match from.ip() {
+                    std::net::IpAddr::V4(v4) => v4,
+                    _ => return,
+                };
+                let relayed = state.buddy_manager.send_callback_relay(
+                    client_ip, peer_tcp_port, file_id.0,
+                ).await;
+                if relayed {
+                    debug!("Callback relayed via OP_REASKCALLBACKTCP to buddy");
+                } else {
+                    warn!("Failed to relay callback to buddy");
                 }
             }
         }
@@ -4422,6 +4497,8 @@ async fn handle_command(
             state.udp_fw_verified = false;
             state.overloaded_nodes.clear();
             state.buddy_manager.reset();
+            state.buddy_event_rx = None;
+            state.serving_event_rx = None;
             state.peer_nicknames.clear();
             state.publish_confirmed = 0;
             state.first_publish_done = false;

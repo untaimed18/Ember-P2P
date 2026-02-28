@@ -67,18 +67,34 @@ pub enum Ed2kTagValue {
     Uint8(u8),
 }
 
+/// Optional buddy info to include in Hello/HelloAnswer tags.
+pub struct BuddyInfo {
+    pub buddy_ip: u32,
+    pub buddy_port: u16,
+}
+
 /// Build a Hello/HelloAnswer payload.
 /// OP_HELLO includes a hash-size marker byte (16); OP_HELLOANSWER does not.
 pub fn build_hello(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickname: &str) -> Vec<u8> {
-    build_hello_inner(user_hash, client_id, tcp_port, nickname, true)
+    build_hello_inner(user_hash, client_id, tcp_port, nickname, true, None)
 }
 
 /// Build a HelloAnswer payload (no hash-size marker byte).
 pub fn build_hello_answer(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickname: &str) -> Vec<u8> {
-    build_hello_inner(user_hash, client_id, tcp_port, nickname, false)
+    build_hello_inner(user_hash, client_id, tcp_port, nickname, false, None)
 }
 
-fn build_hello_inner(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickname: &str, include_hash_size: bool) -> Vec<u8> {
+/// Build Hello with buddy info tags.
+pub fn build_hello_with_buddy(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickname: &str, buddy: Option<BuddyInfo>) -> Vec<u8> {
+    build_hello_inner(user_hash, client_id, tcp_port, nickname, true, buddy)
+}
+
+/// Build HelloAnswer with buddy info tags.
+pub fn build_hello_answer_with_buddy(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickname: &str, buddy: Option<BuddyInfo>) -> Vec<u8> {
+    build_hello_inner(user_hash, client_id, tcp_port, nickname, false, buddy)
+}
+
+fn build_hello_inner(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickname: &str, include_hash_size: bool, buddy: Option<BuddyInfo>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
 
     if include_hash_size {
@@ -100,6 +116,12 @@ fn build_hello_inner(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickna
 
     // CT_MOD_VERSION (0x55): identifies our client name to other peers
     tags.push((&[0x55], Ed2kTagValue::String("Nexus 0.1".to_string())));
+
+    // CT_EMULE_BUDDYIP (0xFC) and CT_EMULE_BUDDYUDP (0xFD) if we have a buddy
+    if let Some(ref bi) = buddy {
+        tags.push((&[0xFC], Ed2kTagValue::Uint32(bi.buddy_ip)));
+        tags.push((&[0xFD], Ed2kTagValue::Uint32(bi.buddy_port as u32)));
+    }
 
     // Tag count
     buf.write_u32::<LittleEndian>(tags.len() as u32).unwrap();

@@ -21,6 +21,14 @@ use crate::search::index::LocalIndex;
 use crate::sharing::manager::TransferManager;
 
 use super::messages::*;
+use crate::network::kad::buddy::PendingBuddySet;
+
+/// Recognized incoming buddy connection: (user_hash, reader, writer)
+pub type BuddyConnectionParts = (
+    [u8; 16],
+    tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>,
+);
 
 const CLIENT_TIMEOUT_SECS: u64 = 120;
 /// Maximum concurrent TCP connections from a single IP address
@@ -88,6 +96,10 @@ struct UploadHandler {
     pending_download_hashes: Arc<RwLock<Vec<[u8; 16]>>>,
     /// Active port test waiters (IP -> Sender)
     active_port_tests: Arc<tokio::sync::Mutex<HashMap<IpAddr, tokio::sync::mpsc::Sender<()>>>>,
+    /// User hashes expected as incoming buddy connections
+    pending_buddy_hashes: PendingBuddySet,
+    /// Channel to send recognized buddy connections back to the network task
+    buddy_conn_tx: tokio::sync::mpsc::Sender<BuddyConnectionParts>,
 }
 
 pub async fn start_upload_server(
@@ -106,6 +118,8 @@ pub async fn start_upload_server(
     a4af_manager: Arc<RwLock<A4AFManager>>,
     pending_download_hashes: Arc<RwLock<Vec<[u8; 16]>>>,
     active_port_tests: Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, tokio::sync::mpsc::Sender<()>>>>,
+    pending_buddy_hashes: PendingBuddySet,
+    buddy_conn_tx: tokio::sync::mpsc::Sender<BuddyConnectionParts>,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     let listener = match TcpListener::bind(addr).await {
@@ -140,6 +154,8 @@ pub async fn start_upload_server(
         a4af_manager,
         pending_download_hashes,
         active_port_tests,
+        pending_buddy_hashes,
+        buddy_conn_tx,
     });
 
     loop {
@@ -410,6 +426,23 @@ impl UploadHandler {
         // Send HelloAnswer (no hash-size marker, per eMule protocol)
         let hello_payload = build_hello_answer(&self.user_hash, 0, self.tcp_port, &self.nickname);
         write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_payload).await?;
+
+        // Check if this is an incoming buddy connection
+        {
+            let mut pending = self.pending_buddy_hashes.lock().await;
+            if pending.remove(&peer_user_hash) {
+                info!("Recognized incoming buddy connection from {peer_addr}");
+                let (tcp_reader, tcp_writer) = match (reader, writer) {
+                    (StreamReader::Plain(r), StreamWriter::Plain(w)) => (r, w),
+                    _ => {
+                        warn!("Buddy on obfuscated stream not supported, treating as normal");
+                        return Ok(());
+                    }
+                };
+                let _ = self.buddy_conn_tx.send((peer_user_hash, tcp_reader, tcp_writer)).await;
+                return Ok(());
+            }
+        }
 
         // Handle EmuleInfo exchange (or the peer may skip straight to file requests)
         let (proto2, opcode2, payload2) = read_packet_timeout(&mut reader).await?;
