@@ -1045,9 +1045,6 @@ pub async fn start_network(
             _ = search_poll_timer.tick() => {
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
                 let queries = state.search_manager.poll_queries();
-                if !queries.is_empty() {
-                    debug!("Search poll: sending {} queries", queries.len());
-                }
                 for (sid, addr, msg, contact_id) in &queries {
                     if state.flood_protection.check_outgoing_rate(addr.ip()) {
                         debug!("Throttling outgoing search {} packet to {addr}", sid.0);
@@ -1055,7 +1052,6 @@ pub async fn start_network(
                     }
                     if let Ok(packet) = messages::encode_packet(msg) {
                         let opcode = packet.get(1).copied().unwrap_or(0);
-                        debug!("Search {}: sending 0x{opcode:02X} to {addr}", sid.0);
                         state.flood_protection.track_request(*addr, opcode);
                         let _ = send_kad_packet(
                             &udp_socket, &packet, *addr, &state, contact_id,

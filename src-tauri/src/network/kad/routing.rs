@@ -159,7 +159,7 @@ impl RoutingTable {
             let bin_snet = bucket.contacts.iter().filter(|c| subnet_key(c.ip) == snet).count();
             if bin_snet >= MAX_CONTACTS_SUBNET_PER_BIN { continue; }
             if !bucket.is_full() {
-                tracing::debug!("RT promote replacement {}: bucket {}", candidate.ip, bucket_idx);
+                tracing::trace!("RT promote replacement {}: bucket {}", candidate.ip, bucket_idx);
                 self.track_ip_add(candidate.ip);
                 self.buckets[bucket_idx].contacts.push_back(candidate);
                 return;
@@ -273,7 +273,7 @@ impl RoutingTable {
 
         let bucket = &self.buckets[bucket_idx];
         if !bucket.is_full() {
-            tracing::debug!("RT insert {}: bucket {} ({}/{})", contact.ip, bucket_idx, bucket.contacts.len() + 1, bucket.capacity);
+            tracing::trace!("RT insert {}: bucket {} ({}/{})", contact.ip, bucket_idx, bucket.contacts.len() + 1, bucket.capacity);
             self.track_ip_add(contact.ip);
             self.buckets[bucket_idx].contacts.push_back(contact);
             return None;
