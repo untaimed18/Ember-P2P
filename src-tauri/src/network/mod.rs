@@ -472,8 +472,8 @@ pub async fn start_network(
     dht_store.set_local_id(local_id);
 
     let udp_key_seed = identity.udp_key_seed;
-    let pending_buddy_hashes: PendingBuddySet = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
-    let buddy_manager = BuddyManager::new(local_id, user_hash, settings.nickname.clone(), tcp_port, pending_buddy_hashes.clone());
+    let pending_buddy_hashes: PendingBuddySet = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let buddy_manager = BuddyManager::new(local_id, user_hash, settings.nickname.clone(), tcp_port, udp_port, pending_buddy_hashes.clone());
 
     // Initialize IP filter (controlled by user settings)
     let mut ip_filter = IpFilter::new(settings.ip_filter_enabled, settings.block_private_ips);
@@ -2389,8 +2389,8 @@ pub async fn start_network(
                     Some(BuddyEvent::PongReceived) => {
                         debug!("Buddy pong received");
                     }
-                    Some(BuddyEvent::CallbackRelay { dest_ip, dest_port, file_hash }) => {
-                        info!("Buddy relayed callback: connect to {dest_ip}:{dest_port} for file {}", hex::encode(file_hash));
+                    Some(BuddyEvent::Callback { file_hash, dest_ip, dest_port }) => {
+                        info!("Buddy callback: connect to {dest_ip}:{dest_port} for file {}", hex::encode(file_hash));
                         let user_hash = state.user_hash;
                         let nickname = settings.nickname.clone();
                         let tcp_port = state.tcp_port;
@@ -2437,6 +2437,10 @@ pub async fn start_network(
                             debug!("No pending download for callback file hash {}", hex::encode(file_hash));
                         }
                     }
+                    Some(BuddyEvent::ReaskCallback { dest_ip, dest_port, file_hash }) => {
+                        debug!("Buddy reask callback for {}:{} file={} (UDP reask not yet implemented)",
+                            dest_ip, dest_port, hex::encode(file_hash));
+                    }
                     Some(BuddyEvent::Disconnected) | None => {
                         if state.buddy_manager.state() == BuddyState::Connected {
                             state.buddy_manager.disconnect_buddy();
@@ -2460,8 +2464,8 @@ pub async fn start_network(
                     Some(BuddyEvent::PongReceived) => {
                         debug!("Serving buddy pong received");
                     }
-                    Some(BuddyEvent::CallbackRelay { .. }) => {
-                        debug!("Unexpected callback relay on serving side");
+                    Some(BuddyEvent::Callback { .. }) | Some(BuddyEvent::ReaskCallback { .. }) => {
+                        debug!("Unexpected callback on serving side");
                     }
                     Some(BuddyEvent::Disconnected) | None => {
                         if state.buddy_manager.is_serving() {
@@ -3872,11 +3876,12 @@ async fn handle_udp_packet(
                     std::net::IpAddr::V4(v4) => v4,
                     _ => return,
                 };
+                let serving_id = state.buddy_manager.serving_for().cloned().unwrap_or(KadId([0u8; 16]));
                 let relayed = state.buddy_manager.send_callback_relay(
-                    client_ip, peer_tcp_port, file_id.0,
+                    &serving_id, client_ip, peer_tcp_port, file_id.0,
                 ).await;
                 if relayed {
-                    debug!("Callback relayed via OP_REASKCALLBACKTCP to buddy");
+                    debug!("Callback relayed via OP_CALLBACK to buddy");
                 } else {
                     warn!("Failed to relay callback to buddy");
                 }
@@ -5038,7 +5043,7 @@ async fn handle_download_event(
                 info!("Promoted queued transfer {} ({}) to active", t.id, t.file_name);
             }
             promoted_out.extend(promoted);
-            let _ = db.update_transfer_status(&transfer_id, "\"completed\"");
+            let _ = db.update_transfer_status(&transfer_id, "completed");
             let _ = app_handle.emit(
                 "transfer-complete",
                 serde_json::json!({ "id": transfer_id }),
@@ -5053,7 +5058,7 @@ async fn handle_download_event(
                 info!("Promoted queued transfer {} ({}) to active", t.id, t.file_name);
             }
             promoted_out.extend(promoted);
-            let _ = db.update_transfer_status(&transfer_id, "\"failed\"");
+            let _ = db.update_transfer_status(&transfer_id, "failed");
             let _ = app_handle.emit(
                 "transfer-failed",
                 serde_json::json!({ "id": transfer_id, "error": error }),

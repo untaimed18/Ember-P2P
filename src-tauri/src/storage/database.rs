@@ -340,7 +340,7 @@ impl Database {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
             "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at
-             FROM transfers WHERE status NOT IN ('completed', 'failed') AND direction = 'download'"
+             FROM transfers WHERE status NOT IN ('completed', 'failed', '\"completed\"', '\"failed\"') AND direction IN ('download', '\"download\"')"
         )?;
 
         let transfers = stmt
@@ -353,8 +353,20 @@ impl Database {
                     file_hash: row.get(2)?,
                     peer_id: row.get(3)?,
                     peer_name: row.get(4)?,
-                    direction: serde_json::from_str(&direction_str).unwrap_or(TransferDirection::Download),
-                    status: serde_json::from_str(&status_str).unwrap_or(TransferStatus::Searching),
+                    direction: match direction_str.trim_matches('"') {
+                        "upload" => TransferDirection::Upload,
+                        _ => TransferDirection::Download,
+                    },
+                    status: match status_str.trim_matches('"') {
+                        "searching" => TransferStatus::Searching,
+                        "queued" => TransferStatus::Queued,
+                        "active" => TransferStatus::Active,
+                        "paused" => TransferStatus::Paused,
+                        "verifying" => TransferStatus::Verifying,
+                        "completed" => TransferStatus::Completed,
+                        "failed" => TransferStatus::Failed,
+                        _ => TransferStatus::Searching,
+                    },
                     progress: row.get(7)?,
                     speed: row.get::<_, i64>(8)? as u64,
                     total_size: row.get::<_, i64>(9)? as u64,

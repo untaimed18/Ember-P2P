@@ -88,11 +88,9 @@ impl ServerUdpSocket {
             }
         }
 
-        let challenge: u32 = rand::random();
-        let mut packet = Vec::with_capacity(6);
+        let mut packet = Vec::with_capacity(2);
         packet.push(OP_EDONKEYPROT);
         packet.push(OP_GLOBSERVSTATREQ);
-        packet.extend_from_slice(&challenge.to_le_bytes());
 
         self.socket.send_to(&packet, addr).await?;
         self.last_ping_times.insert(addr, now);

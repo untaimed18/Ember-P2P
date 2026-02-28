@@ -573,7 +573,7 @@ impl MultiSourceDownload {
                 t.delete_met();
             }
             if let Err(e) = std::fs::rename(&part_path, &final_path) {
-                if e.raw_os_error() == Some(17) || e.to_string().contains("cross") || e.to_string().contains("Invalid") {
+                if is_cross_device_error(&e) {
                     std::fs::copy(&part_path, &final_path)?;
                     let _ = std::fs::remove_file(&part_path);
                 } else {
@@ -1149,6 +1149,10 @@ fn outstanding_requests_for_speed_ms(speed: u64) -> usize {
     } else {
         3
     }
+}
+
+fn is_cross_device_error(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(17) | Some(18))
 }
 
 fn parse_sending_part_32(payload: &[u8]) -> std::io::Result<([u8; 16], u64, u64, &[u8])> {

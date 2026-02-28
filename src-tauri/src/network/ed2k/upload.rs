@@ -430,7 +430,7 @@ impl UploadHandler {
         // Check if this is an incoming buddy connection
         {
             let mut pending = self.pending_buddy_hashes.lock().await;
-            if pending.remove(&peer_user_hash) {
+            if pending.remove(&peer_user_hash).is_some() {
                 info!("Recognized incoming buddy connection from {peer_addr}");
                 let (tcp_reader, tcp_writer) = match (reader, writer) {
                     (StreamReader::Plain(r), StreamWriter::Plain(w)) => (r, w),

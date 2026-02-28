@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -17,6 +16,9 @@ const OP_HELLOANSWER: u8 = 0x4C;
 const OP_BUDDYPING: u8 = 0x9F;
 const OP_BUDDYPONG: u8 = 0xA0;
 const OP_REASKCALLBACKTCP: u8 = 0x9A;
+const OP_CALLBACK: u8 = 0x99;
+const OP_EMULEINFO: u8 = 0x01;
+const OP_EMULEINFOANSWER: u8 = 0x02;
 
 const BUDDY_EVENT_CHANNEL_SIZE: usize = 32;
 
@@ -31,7 +33,14 @@ pub enum BuddyState {
 pub enum BuddyEvent {
     PingReceived,
     PongReceived,
-    CallbackRelay {
+    /// OP_CALLBACK: full Kad callback -- firewalled client should connect out to the requester
+    Callback {
+        file_hash: [u8; 16],
+        dest_ip: Ipv4Addr,
+        dest_port: u16,
+    },
+    /// OP_REASKCALLBACKTCP: UDP reask relay -- firewalled client should send UDP queue response
+    ReaskCallback {
         dest_ip: Ipv4Addr,
         dest_port: u16,
         file_hash: [u8; 16],
@@ -39,13 +48,14 @@ pub enum BuddyEvent {
     Disconnected,
 }
 
-pub type PendingBuddySet = Arc<Mutex<HashSet<[u8; 16]>>>;
+pub type PendingBuddySet = Arc<Mutex<std::collections::HashMap<[u8; 16], i64>>>;
 
 pub struct BuddyManager {
     local_id: KadId,
     user_hash: [u8; 16],
     nickname: String,
     tcp_port: u16,
+    udp_port: u16,
     state: BuddyState,
     buddy_id: Option<KadId>,
     buddy_addr: Option<SocketAddr>,
@@ -67,6 +77,7 @@ impl BuddyManager {
         user_hash: [u8; 16],
         nickname: String,
         tcp_port: u16,
+        udp_port: u16,
         pending_buddy_hashes: PendingBuddySet,
     ) -> Self {
         BuddyManager {
@@ -74,6 +85,7 @@ impl BuddyManager {
             user_hash,
             nickname,
             tcp_port,
+            udp_port,
             state: BuddyState::NoBuddy,
             buddy_id: None,
             buddy_addr: None,
@@ -196,6 +208,7 @@ impl BuddyManager {
             &self.user_hash,
             &self.nickname,
             self.tcp_port,
+            self.udp_port,
         )
         .await
         {
@@ -243,9 +256,12 @@ impl BuddyManager {
     }
 
     /// Register a user hash as a pending buddy (upload listener will check this).
+    /// Entries expire after 2 minutes to prevent unbounded growth.
     pub async fn register_pending_buddy(&self, user_hash: [u8; 16]) {
-        let mut set = self.pending_buddy_hashes.lock().await;
-        set.insert(user_hash);
+        let now = chrono::Utc::now().timestamp();
+        let mut map = self.pending_buddy_hashes.lock().await;
+        map.retain(|_, &mut ts| now - ts < 120);
+        map.insert(user_hash, now);
     }
 
     /// Send OP_BUDDYPING to our buddy (we are firewalled).
@@ -287,27 +303,40 @@ impl BuddyManager {
         }
     }
 
-    /// Send OP_REASKCALLBACKTCP to our serving buddy client.
-    /// Format: [client_ip:4][client_port:2][file_hash:16]
+    /// Send OP_CALLBACK (0x99) to our serving buddy client (Kad callback relay).
+    /// Format: [check_hash:16][file_id:16][client_ip:4][client_tcp_port:2]
+    /// check_hash = buddy's KadID XOR'd with 0xFF..FF mask (eMule verification)
     pub async fn send_callback_relay(
         &mut self,
+        buddy_kad_id: &KadId,
         client_ip: Ipv4Addr,
         client_port: u16,
         file_hash: [u8; 16],
     ) -> bool {
         if let Some(ref mut w) = self.serving_writer {
-            let mut payload = Vec::with_capacity(22);
+            let mut check_hash = buddy_kad_id.0;
+            for b in &mut check_hash { *b ^= 0xFF; }
+            let mut payload = Vec::with_capacity(38);
+            payload.extend_from_slice(&check_hash);
+            payload.extend_from_slice(&file_hash);
             payload.extend_from_slice(&u32::from(client_ip).to_le_bytes());
             payload.extend_from_slice(&client_port.to_le_bytes());
-            payload.extend_from_slice(&file_hash);
-            let pkt = build_emule_packet(OP_REASKCALLBACKTCP, &payload);
-            match w.write_all(&pkt).await {
-                Ok(()) => {
+            let pkt = build_emule_packet(OP_CALLBACK, &payload);
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                w.write_all(&pkt),
+            ).await {
+                Ok(Ok(())) => {
                     let _ = w.flush().await;
                     true
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!("Failed to relay callback: {e}");
+                    self.disconnect_serving();
+                    false
+                }
+                Err(_) => {
+                    warn!("Callback relay write timed out");
                     self.disconnect_serving();
                     false
                 }
@@ -357,13 +386,14 @@ async fn send_pong(w: &mut BufWriter<OwnedWriteHalf>) -> bool {
     }
 }
 
-/// Outgoing buddy handshake: we send Hello, read HelloAnswer.
+/// Outgoing buddy handshake: we send Hello, read HelloAnswer, then exchange EmuleInfo.
 async fn buddy_hello_handshake_outgoing(
     reader: &mut BufReader<OwnedReadHalf>,
     writer: &mut BufWriter<OwnedWriteHalf>,
     user_hash: &[u8; 16],
     nickname: &str,
     tcp_port: u16,
+    udp_port: u16,
 ) -> anyhow::Result<()> {
     let hello = crate::network::ed2k::messages::build_hello(user_hash, 0, tcp_port, nickname);
     write_ed2k_packet(writer, OP_EDONKEYHEADER, OP_HELLO, &hello).await?;
@@ -378,7 +408,22 @@ async fn buddy_hello_handshake_outgoing(
             "Expected HelloAnswer, got proto=0x{proto:02X} op=0x{opcode:02X}"
         );
     }
-    debug!("Buddy Hello handshake complete (outgoing)");
+
+    let emule_info = crate::network::ed2k::messages::build_emule_info(udp_port);
+    write_ed2k_packet(writer, OP_EMULEPROT, OP_EMULEINFO, &emule_info).await?;
+
+    let (proto2, opcode2, _) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), read_ed2k_packet(reader))
+            .await
+            .map_err(|_| anyhow::anyhow!("EmuleInfo timeout"))??;
+
+    if proto2 == OP_EMULEPROT && opcode2 == OP_EMULEINFOANSWER {
+        debug!("Buddy EmuleInfo exchange complete");
+    } else {
+        debug!("Buddy peer did not send EmuleInfoAnswer (proto=0x{proto2:02X} op=0x{opcode2:02X}), continuing");
+    }
+
+    debug!("Buddy handshake complete (outgoing)");
     Ok(())
 }
 
@@ -434,32 +479,53 @@ async fn run_buddy_reader(
                         debug!("Received OP_BUDDYPONG");
                         Some(BuddyEvent::PongReceived)
                     }
+                    (OP_EMULEPROT, OP_CALLBACK) => {
+                        // OP_CALLBACK: [check_hash:16][file_id:16][ip:4][tcp_port:2] = 38 bytes
+                        if payload.len() >= 38 {
+                            let mut file_hash = [0u8; 16];
+                            file_hash.copy_from_slice(&payload[16..32]);
+                            let ip_bytes = [payload[32], payload[33], payload[34], payload[35]];
+                            let dest_ip = Ipv4Addr::from(u32::from_le_bytes(ip_bytes));
+                            let dest_port = u16::from_le_bytes([payload[36], payload[37]]);
+                            debug!(
+                                "Received OP_CALLBACK: {}:{} file={}",
+                                dest_ip, dest_port, hex::encode(file_hash)
+                            );
+                            Some(BuddyEvent::Callback {
+                                file_hash,
+                                dest_ip,
+                                dest_port,
+                            })
+                        } else {
+                            debug!("OP_CALLBACK too short ({} bytes)", payload.len());
+                            None
+                        }
+                    }
                     (OP_EMULEPROT, OP_REASKCALLBACKTCP) => {
+                        // OP_REASKCALLBACKTCP: [ip:4][port:2][file_hash:16] = 22 bytes
                         if payload.len() >= 22 {
                             let ip_bytes = [payload[0], payload[1], payload[2], payload[3]];
                             let dest_ip = Ipv4Addr::from(u32::from_le_bytes(ip_bytes));
-                            let dest_port =
-                                u16::from_le_bytes([payload[4], payload[5]]);
+                            let dest_port = u16::from_le_bytes([payload[4], payload[5]]);
                             let mut file_hash = [0u8; 16];
                             file_hash.copy_from_slice(&payload[6..22]);
                             debug!(
                                 "Received OP_REASKCALLBACKTCP: {}:{} hash={}",
-                                dest_ip,
-                                dest_port,
-                                hex::encode(file_hash)
+                                dest_ip, dest_port, hex::encode(file_hash)
                             );
-                            Some(BuddyEvent::CallbackRelay {
+                            Some(BuddyEvent::ReaskCallback {
                                 dest_ip,
                                 dest_port,
                                 file_hash,
                             })
                         } else {
-                            debug!(
-                                "OP_REASKCALLBACKTCP too short ({} bytes)",
-                                payload.len()
-                            );
+                            debug!("OP_REASKCALLBACKTCP too short ({} bytes)", payload.len());
                             None
                         }
+                    }
+                    (OP_EMULEPROT, OP_EMULEINFO) => {
+                        debug!("Received OP_EMULEINFO from buddy, ignoring (already handshaked)");
+                        None
                     }
                     _ => {
                         debug!(

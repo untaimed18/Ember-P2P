@@ -169,9 +169,10 @@ pub fn encrypt_kad_packet(
     let mut encrypted = vec![0u8; plaintext.len()];
     rc4.process(&plaintext, &mut encrypted);
 
-    // Semi-random first byte: use a value that doesn't collide with known protocol headers
+    // Semi-random first byte: eMule clears low 2 bits for KadID key marker (0x00),
+    // sets bit0 for UserHash key, bit1 for ReceiverVerifyKey. We always use KadID.
     let semi_random = loop {
-        let b: u8 = rng.gen();
+        let b: u8 = rng.gen::<u8>() & 0xFC; // clear marker bits (KadID = 0x00)
         if !VALID_INNER_HEADERS.contains(&b) && b != 0x00 {
             break b;
         }
