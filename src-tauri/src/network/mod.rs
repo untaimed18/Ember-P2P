@@ -2278,7 +2278,10 @@ pub async fn start_network(
                     .external_ip
                     .map(|ip| ip.to_string())
                     .unwrap_or_default();
-                state.firewalled = state.firewalled_shared.load(std::sync::atomic::Ordering::Relaxed);
+                let fw_shared = state.firewalled_shared.load(std::sync::atomic::Ordering::Relaxed);
+                if !fw_shared {
+                    state.firewalled = false;
+                }
                 state.stats.firewalled = state.firewalled;
 
                 let cached_s: Vec<KadSearchInfo> = state
