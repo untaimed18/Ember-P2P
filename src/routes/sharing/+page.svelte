@@ -22,13 +22,8 @@
   let selectedHash: string | null = $state(null);
   let filterFolder: string | null = $state(null);
 
-  let pollInterval: ReturnType<typeof setInterval> | undefined;
-
-  onMount(() => {
-    refresh();
-    pollInterval = setInterval(refreshFiles, 5000);
-    return () => { if (pollInterval) clearInterval(pollInterval); };
-  });
+  let mounted = true;
+  let pollBusy = false;
 
   function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
     return Promise.race([
@@ -37,25 +32,47 @@
     ]);
   }
 
+  function filesChanged(oldArr: FileInfo[], newArr: FileInfo[]): boolean {
+    if (oldArr.length !== newArr.length) return true;
+    for (let i = 0; i < oldArr.length; i++) {
+      if (oldArr[i].hash !== newArr[i].hash ||
+          oldArr[i].requests !== newArr[i].requests ||
+          oldArr[i].accepted !== newArr[i].accepted ||
+          oldArr[i].bytes_transferred !== newArr[i].bytes_transferred ||
+          oldArr[i].priority !== newArr[i].priority ||
+          oldArr[i].complete_sources !== newArr[i].complete_sources) return true;
+    }
+    return false;
+  }
+
   async function refresh() {
     loading = true;
     try {
-      [folders, files] = await withTimeout(
+      const [newFolders, newFiles] = await withTimeout(
         Promise.all([getSharedFolders(), getSharedFiles()]),
         4000,
       );
+      if (!mounted) return;
+      folders = newFolders;
+      if (filesChanged(files, newFiles)) files = newFiles;
     } catch (e) {
       if (e instanceof Error && e.message !== 'timeout')
         console.error('Failed to load shared files:', e);
     } finally {
-      loading = false;
+      if (mounted) loading = false;
     }
   }
 
   async function refreshFiles() {
+    if (pollBusy || !mounted) return;
+    pollBusy = true;
     try {
-      files = await withTimeout(getSharedFiles(), 4000);
-    } catch { /* ignore */ }
+      const newFiles = await withTimeout(getSharedFiles(), 4000);
+      if (!mounted) return;
+      if (filesChanged(files, newFiles)) files = newFiles;
+    } catch { /* ignore */ } finally {
+      pollBusy = false;
+    }
   }
 
   function toErr(e: unknown): string {
@@ -67,15 +84,14 @@
     try {
       const { open } = await import('@tauri-apps/plugin-dialog');
       const selected = await open({ directory: true, multiple: false });
-      if (selected) {
-        loading = true;
-        await addSharedFolder(selected as string);
-        await refresh();
-      }
+      if (!mounted || !selected) return;
+      loading = true;
+      await withTimeout(addSharedFolder(selected as string), 30000);
+      if (mounted) await refresh();
     } catch (e: unknown) {
-      error = toErr(e);
+      if (mounted) error = toErr(e);
     } finally {
-      loading = false;
+      if (mounted) loading = false;
     }
   }
 
@@ -83,13 +99,14 @@
     error = null;
     try {
       loading = true;
-      await removeSharedFolder(path);
+      await withTimeout(removeSharedFolder(path), 10000);
+      if (!mounted) return;
       if (filterFolder === path) filterFolder = null;
       await refresh();
     } catch (e: unknown) {
-      error = toErr(e);
+      if (mounted) error = toErr(e);
     } finally {
-      loading = false;
+      if (mounted) loading = false;
     }
   }
 
@@ -97,12 +114,14 @@
     error = null;
     loading = true;
     try {
-      files = await reloadSharedFiles();
-      folders = await getSharedFolders();
+      const newFiles = await withTimeout(reloadSharedFiles(), 60000);
+      if (!mounted) return;
+      files = newFiles;
+      folders = await withTimeout(getSharedFolders(), 4000);
     } catch (e: unknown) {
-      error = toErr(e);
+      if (mounted) error = toErr(e);
     } finally {
-      loading = false;
+      if (mounted) loading = false;
     }
   }
 
@@ -214,26 +233,46 @@
   // --- Sidebar resize ---
   let sidebarWidth = $state(200);
   let sidebarDragging = $state(false);
+  let dragCleanup: (() => void) | null = null;
 
   function onSidebarDown(e: MouseEvent) {
     e.preventDefault();
     sidebarDragging = true;
     const onMove = (ev: MouseEvent) => {
+      if (!mounted) return;
       sidebarWidth = Math.max(120, Math.min(400, ev.clientX));
     };
     const onUp = () => {
-      sidebarDragging = false;
+      if (mounted) sidebarDragging = false;
       localStorage.setItem('sharing-sidebar-w', String(sidebarWidth));
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
+      dragCleanup = null;
     };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
+    dragCleanup = () => {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
   }
 
   onMount(() => {
+    mounted = true;
     const saved = localStorage.getItem('sharing-sidebar-w');
-    if (saved) sidebarWidth = Math.max(120, Math.min(400, parseInt(saved)));
+    if (saved) {
+      const val = parseInt(saved);
+      if (!isNaN(val)) sidebarWidth = Math.max(120, Math.min(400, val));
+    }
+
+    refresh();
+    const pollInterval = setInterval(refreshFiles, 5000);
+
+    return () => {
+      mounted = false;
+      clearInterval(pollInterval);
+      dragCleanup?.();
+    };
   });
 </script>
 

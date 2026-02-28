@@ -133,12 +133,20 @@ pub fn run() {
                     .await
                     .unwrap_or_default();
 
-                    let mut index = index_clone.write().await;
-                    index.add_files(files.clone());
-
-                    for file in &files {
-                        let _ = db_clone.save_shared_file(file);
+                    {
+                        let mut index = index_clone.write().await;
+                        index.add_files(files.clone());
                     }
+
+                    let db_ref = db_clone.clone();
+                    let db_files = files.clone();
+                    tokio::task::spawn_blocking(move || {
+                        for file in &db_files {
+                            let _ = db_ref.save_shared_file(file);
+                        }
+                    })
+                    .await
+                    .ok();
                 }
                 info!(
                     "Indexed {} files from {} shared folders",
