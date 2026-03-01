@@ -399,13 +399,19 @@
           </div>
           <div class="stat-row">
             <span class="stat-label">External IP</span>
-            <span class="stat-value">{$networkStats.external_ip || 'Detecting...'}</span>
+            <span class="stat-value">{$networkStats.status === 'disconnected' ? 'Unknown' : ($networkStats.external_ip || 'Detecting...')}</span>
           </div>
           <div class="stat-row">
             <span class="stat-label">Firewall</span>
-            <span class="badge {$networkStats.firewalled ? 'firewalled' : 'open'}">
-              {$networkStats.firewalled ? 'Firewalled' : 'Open'}
-            </span>
+            {#if $networkStats.status === 'disconnected'}
+              <span class="badge unknown">Unknown</span>
+            {:else if $networkStats.status === 'connecting'}
+              <span class="badge unknown">Checking...</span>
+            {:else}
+              <span class="badge {$networkStats.firewalled ? 'firewalled' : 'open'}">
+                {$networkStats.firewalled ? 'Firewalled' : 'Open'}
+              </span>
+            {/if}
           </div>
           <div class="stat-row">
             <span class="stat-label">UPnP</span>
@@ -419,10 +425,6 @@
                $networkStats.buddy_status.startsWith('serving') ? 'Serving' :
                $networkStats.buddy_status}
             </span>
-          </div>
-          <div class="stat-row">
-            <span class="stat-label">DHT Stores</span>
-            <span class="stat-value">{$networkStats.stores_acknowledged}</span>
           </div>
         </div>
       </div>
@@ -828,6 +830,11 @@
   .badge.firewalled {
     background: var(--warning);
     color: #fff;
+  }
+
+  .badge.unknown {
+    background: var(--bg-tertiary);
+    color: var(--text-muted);
   }
 
   .badge.stopping {

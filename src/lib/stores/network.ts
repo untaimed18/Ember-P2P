@@ -12,7 +12,7 @@ export const networkStats = writable<NetworkStats>({
   total_downloaded: 0,
   status: 'disconnected',
   external_ip: '',
-  firewalled: true,
+  firewalled: false,
   buddy_status: 'none',
   upnp_mapped: false,
   stores_acknowledged: 0,

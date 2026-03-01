@@ -247,7 +247,7 @@ impl Default for NetworkStats {
             total_downloaded: 0,
             status: NetworkStatus::Disconnected,
             external_ip: String::new(),
-            firewalled: true,
+            firewalled: false,
             buddy_status: String::from("none"),
             upnp_mapped: false,
             stores_acknowledged: 0,

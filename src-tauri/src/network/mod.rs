@@ -1527,7 +1527,7 @@ pub async fn start_network(
                     let fw_contacts: Vec<KadContact> = state
                         .routing_table
                         .all_contacts()
-                        .filter(|c| c.verified && c.contact_type <= CONTACT_TYPE_OPEN)
+                        .filter(|c| c.verified && !c.is_dead())
                         .take(checks)
                         .cloned()
                         .collect();
@@ -1546,7 +1546,7 @@ pub async fn start_network(
                     let udp_contacts: Vec<KadContact> = state
                         .routing_table
                         .all_contacts()
-                        .filter(|c| c.verified && c.contact_type <= CONTACT_TYPE_OPEN)
+                        .filter(|c| c.verified && !c.is_dead())
                         .skip(checks)
                         .take(checks)
                         .cloned()
@@ -2732,7 +2732,7 @@ pub async fn start_network(
                 if !fw_shared {
                     state.firewalled = false;
                 }
-                state.stats.firewalled = state.firewalled;
+                state.stats.firewalled = state.udp_firewalled;
                 state.publish_manager.firewalled = state.firewalled;
 
                 let cached_s: Vec<KadSearchInfo> = state

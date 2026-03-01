@@ -5,8 +5,10 @@ use tracing::{debug, info};
 
 /// Minimum unique IPs needed to confirm external IP
 const MIN_IP_VOTES: usize = 3;
-/// Number of firewall check requests to send per cycle
-const FIREWALL_CHECK_COUNT: u32 = 4;
+/// Number of firewall check requests to send per cycle.
+/// Higher than eMule's default (4) because some contacts won't respond to
+/// FirewalledReq if their RequestTCP fails on their end.
+const FIREWALL_CHECK_COUNT: u32 = 8;
 /// Recheck interval (1 hour)
 pub const FIREWALL_RECHECK_SECS: i64 = 3600;
 /// How long to wait for firewall responses before concluding
