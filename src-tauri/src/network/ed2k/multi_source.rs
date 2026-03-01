@@ -842,7 +842,18 @@ async fn download_parts_from_source(
     match read_packet_timeout_ms(&mut reader).await {
         Ok((proto, opcode, payload)) => {
             if proto == OP_EMULEPROT && opcode == OP_EMULEINFOANSWER {
-                debug!("Got EmuleInfoAnswer from source {}", _src_idx);
+                let peer_udp = parse_emule_info_udp_port(&payload);
+                if peer_udp > 0 {
+                    if let Some(sm) = &source_mgr {
+                        let mut sm = sm.write().await;
+                        if let std::net::IpAddr::V4(v4) = addr.ip() {
+                            sm.register_source_full(*file_hash, v4, addr.port(), peer_udp, peer_user_hash);
+                        }
+                    }
+                    debug!("Got EmuleInfoAnswer from source {} (UDP port: {peer_udp})", _src_idx);
+                } else {
+                    debug!("Got EmuleInfoAnswer from source {}", _src_idx);
+                }
             } else {
                 deferred_packet = Some((proto, opcode, payload));
             }

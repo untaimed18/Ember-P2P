@@ -10,6 +10,7 @@ const MAX_TRACKED_FILES: usize = 500;
 pub struct SourceEntry {
     pub ip: Ipv4Addr,
     pub tcp_port: u16,
+    pub udp_port: u16,
     pub last_seen: i64,
     pub user_hash: [u8; 16],
 }
@@ -42,6 +43,10 @@ impl SourceManager {
     }
 
     pub fn register_source_with_hash(&mut self, file_hash: [u8; 16], ip: Ipv4Addr, tcp_port: u16, user_hash: [u8; 16]) {
+        self.register_source_full(file_hash, ip, tcp_port, 0, user_hash);
+    }
+
+    pub fn register_source_full(&mut self, file_hash: [u8; 16], ip: Ipv4Addr, tcp_port: u16, udp_port: u16, user_hash: [u8; 16]) {
         let now = chrono::Utc::now().timestamp();
         let entries = self.sources.entry(file_hash).or_default();
 
@@ -49,6 +54,9 @@ impl SourceManager {
             existing.last_seen = now;
             if user_hash != [0u8; 16] {
                 existing.user_hash = user_hash;
+            }
+            if udp_port > 0 {
+                existing.udp_port = udp_port;
             }
             return;
         }
@@ -61,6 +69,7 @@ impl SourceManager {
         entries.push(SourceEntry {
             ip,
             tcp_port,
+            udp_port,
             last_seen: now,
             user_hash,
         });
@@ -121,6 +130,21 @@ impl SourceManager {
 
     pub fn source_count(&self, file_hash: &[u8; 16]) -> usize {
         self.sources.get(file_hash).map(|v| v.len()).unwrap_or(0)
+    }
+
+    /// Return non-expired sources that have UDP ports, for UDP reask pings.
+    pub fn get_udp_sources(&self, file_hash: &[u8; 16]) -> Vec<(Ipv4Addr, u16, u16)> {
+        let now = chrono::Utc::now().timestamp();
+        self.sources
+            .get(file_hash)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| (now - e.last_seen) < SOURCE_EXPIRY_SECS && e.udp_port > 0)
+                    .map(|e| (e.ip, e.tcp_port, e.udp_port))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Return non-expired sources for a file, suitable for starting downloads.

@@ -50,6 +50,11 @@ pub const OP_QUEUERANK: u8 = 0x5C;
 pub const OP_REQUESTSOURCES: u8 = 0x81;
 pub const OP_ANSWERSOURCES2: u8 = 0x84;
 
+// UDP reask opcodes (OP_EMULEPROT, peer-to-peer UDP)
+pub const OP_REASKFILEPING: u8 = 0x90;
+pub const OP_REASKACK: u8 = 0x91;
+pub const OP_QUEUEFULL_UDP: u8 = 0x93;
+
 // Secure identification opcodes (OP_EMULEPROT)
 pub const OP_PUBLICKEY: u8 = 0x85;
 pub const OP_SIGNATURE: u8 = 0x86;
@@ -281,6 +286,53 @@ pub fn build_emule_info(udp_port: u16) -> Vec<u8> {
     }
 
     buf
+}
+
+/// Extract the peer's UDP port from an EmuleInfo or EmuleInfoAnswer payload.
+/// The payload starts with version (1 byte) then tag_count (u32) then tags.
+/// Tag 0x21 (ET_UDPPORT) contains the UDP port.
+pub fn parse_emule_info_udp_port(payload: &[u8]) -> u16 {
+    if payload.len() < 5 { return 0; }
+    let mut cursor = Cursor::new(payload);
+    let _version = cursor.read_u8().unwrap_or(0);
+    let tag_count = cursor.read_u32::<LittleEndian>().unwrap_or(0);
+
+    for _ in 0..tag_count.min(20) {
+        let pos = cursor.position() as usize;
+        if pos >= payload.len() { break; }
+
+        let tag_type = cursor.read_u8().unwrap_or(0);
+        let name_len = match cursor.read_u16::<LittleEndian>() {
+            Ok(n) => n as usize,
+            Err(_) => break,
+        };
+        if pos + 3 + name_len > payload.len() { break; }
+        let mut name_buf = vec![0u8; name_len];
+        if cursor.read_exact(&mut name_buf).is_err() { break; }
+
+        match tag_type {
+            0x03 => { // uint32
+                let val = cursor.read_u32::<LittleEndian>().unwrap_or(0);
+                if name_len == 1 && name_buf[0] == 0x21 { return val as u16; }
+            }
+            0x08 => { // uint16
+                let val = cursor.read_u16::<LittleEndian>().unwrap_or(0);
+                if name_len == 1 && name_buf[0] == 0x21 { return val; }
+            }
+            0x09 => { // uint8
+                let val = cursor.read_u8().unwrap_or(0);
+                if name_len == 1 && name_buf[0] == 0x21 { return val as u16; }
+            }
+            0x02 => { // string
+                let slen = cursor.read_u16::<LittleEndian>().unwrap_or(0) as usize;
+                let p = cursor.position() as usize;
+                if p + slen > payload.len() { break; }
+                cursor.set_position((p + slen) as u64);
+            }
+            _ => break,
+        }
+    }
+    0
 }
 
 /// Build a SetReqFileId + RequestFileName packet payload.

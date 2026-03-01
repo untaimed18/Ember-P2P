@@ -1098,6 +1098,13 @@ pub async fn start_network(
                         if let Some((ip_str, port_str)) = t.peer_id.split_once(':') {
                             if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>()) {
                                 state.dead_sources.add_dead_source(0, u32::from(ip), port, state.firewalled);
+                                if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
+                                    if fh_bytes.len() == 16 {
+                                        let mut fh = [0u8; 16];
+                                        fh.copy_from_slice(&fh_bytes);
+                                        state.dead_sources.add_dead_source_for_file(fh, u32::from(ip), port);
+                                    }
+                                }
                                 debug!("Marked source {}:{} as dead after download failure", ip, port);
                             }
                         }
@@ -2208,7 +2215,7 @@ pub async fn start_network(
                                     fh.copy_from_slice(&hash_bytes);
                                     let sm_sources = sm.get_sources(&fh);
                                     let live_sources: Vec<(String, u16)> = sm_sources.into_iter()
-                                        .filter(|(ip, port)| !state.dead_sources.is_dead_source(0, u32::from(*ip), *port))
+                                        .filter(|(ip, port)| !state.dead_sources.is_dead_source_for_file(&fh, u32::from(*ip), *port))
                                         .map(|(ip, port)| (ip.to_string(), port))
                                         .collect();
                                     if !live_sources.is_empty() {
@@ -2237,7 +2244,7 @@ pub async fn start_network(
                             sm.get_sources(&hash_bytes)
                         };
                         let live_sources: Vec<(String, u16)> = sm_sources.into_iter()
-                            .filter(|(ip, port)| !state.dead_sources.is_dead_source(0, u32::from(*ip), *port))
+                            .filter(|(ip, port)| !state.dead_sources.is_dead_source_for_file(&hash_bytes, u32::from(*ip), *port))
                             .map(|(ip, port)| (ip.to_string(), port))
                             .collect();
                         if live_sources.is_empty() {
@@ -2339,6 +2346,39 @@ pub async fn start_network(
                 let to_retry: Vec<String> = to_retry.into_iter()
                     .filter(|tid| !started_from_sm.contains(tid))
                     .collect();
+
+                // UDP reask pass: for sources with known UDP ports, send lightweight
+                // OP_REASKFILEPING instead of full TCP/KAD search. This refreshes the
+                // source's last_seen so the next retry tick can start the download.
+                {
+                    let sm = source_manager.read().await;
+                    for tid in &to_retry {
+                        if let Some(pd) = state.pending_downloads.get(tid) {
+                            if let Ok(hash_bytes) = hex::decode(&pd.file_hash) {
+                                if hash_bytes.len() == 16 {
+                                    let mut fh = [0u8; 16];
+                                    fh.copy_from_slice(&hash_bytes);
+                                    let udp_sources = sm.get_udp_sources(&fh);
+                                    for (ip, _tcp_port, udp_port) in &udp_sources {
+                                        if state.dead_sources.is_dead_source(0, u32::from(*ip), *udp_port) {
+                                            continue;
+                                        }
+                                        let addr = SocketAddr::new((*ip).into(), *udp_port);
+                                        let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
+                                        pkt.extend_from_slice(&fh);
+                                        let _ = udp_socket.send_to(&pkt, addr).await;
+                                    }
+                                    if !udp_sources.is_empty() {
+                                        debug!(
+                                            "Sent UDP reask to {} sources for pending download {}",
+                                            udp_sources.len(), tid
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Second pass: for remaining pending downloads, start new Kad + server searches
                 for tid in to_retry {
@@ -3460,30 +3500,61 @@ async fn handle_udp_packet(
         return;
     }
 
-    // Handle Server UDP packets (e.g. Port Test)
-    // eMule servers use OP_EDONKEYHEADER (0xE3) or OP_EMULEPROT (0xC5)
+    // Handle eMule peer-to-peer and server UDP packets
     let header = data.first().copied().unwrap_or(0);
     if header == OP_EDONKEYHEADER || header == OP_EMULEPROT {
         if data.len() >= 2 {
-            let opcode = data[1]; // UDP header is [protocol, opcode, payload...]
+            let opcode = data[1];
+            let payload = &data[2..];
+
             if opcode == OP_PORTTEST {
-                // OP_PORTTEST payload is usually 1 byte (0x12)
                 debug!("Received UDP Port Test from {from}");
-                // Notify TCP handler if waiting
                 let waiters = active_port_tests.lock().await;
                 if let Some(tx) = waiters.get(&from.ip()) {
                     let _ = tx.send(()).await;
-                    debug!("Signaled TCP handler for UDP Port Test from {from}");
-                } else {
-                    debug!("No TCP handler waiting for UDP Port Test from {from}");
                 }
                 return;
             }
+
+            // eMule UDP reask: peer asks if we still have a file and what their queue rank is
+            if header == OP_EMULEPROT && opcode == ed2k::messages::OP_REASKFILEPING && payload.len() >= 16 {
+                let mut file_hash = [0u8; 16];
+                file_hash.copy_from_slice(&payload[..16]);
+                let hash_hex = hex::encode(file_hash);
+
+                let has_file = {
+                    let idx = local_index.read().await;
+                    idx.get_by_hash(&hash_hex).is_some()
+                };
+
+                if has_file {
+                    // Respond with OP_REASKACK and queue rank (0 = no queue, just alive)
+                    let mut resp = vec![OP_EMULEPROT, ed2k::messages::OP_REASKACK];
+                    resp.extend_from_slice(&0u16.to_le_bytes());
+                    let _ = socket.send_to(&resp, from).await;
+                    debug!("Answered UDP reask from {from} for {hash_hex}: file available");
+                } else {
+                    let resp = vec![OP_EMULEPROT, ed2k::messages::OP_FILEREQANSNOFIL];
+                    let _ = socket.send_to(&resp, from).await;
+                    debug!("Answered UDP reask from {from} for {hash_hex}: file not found");
+                }
+                return;
+            }
+
+            // eMule UDP reask response: source confirms it has the file.
+            // We don't know which file — just log it. The retry loop
+            // will pick up the source via SourceManager last_seen updates.
+            if header == OP_EMULEPROT && opcode == ed2k::messages::OP_REASKACK {
+                debug!("UDP reask ACK from {from} (source alive)");
+                return;
+            }
+
+            // eMule UDP: queue full or file not found responses
+            if header == OP_EMULEPROT && (opcode == ed2k::messages::OP_QUEUEFULL_UDP || opcode == ed2k::messages::OP_FILEREQANSNOFIL) {
+                debug!("UDP reask negative response (opcode 0x{opcode:02X}) from {from}");
+                return;
+            }
         }
-        // If we want to handle other server UDP packets (like status responses) here, we can.
-        // But ServerUdpSocket handles them on a separate socket usually.
-        // However, if the server sends to our KAD port, we should probably handle them or at least not error.
-        // For now, we just ignore non-PortTest server packets on KAD port to avoid "Unreadable packet" logs.
         return;
     }
 

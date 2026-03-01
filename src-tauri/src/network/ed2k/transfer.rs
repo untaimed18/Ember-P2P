@@ -249,7 +249,18 @@ impl Ed2kDownload {
         let (proto2, opcode2, payload2) = read_packet_with_timeout(&mut reader).await?;
         let mut deferred_packet: Option<(u8, u8, Vec<u8>)> = None;
         if proto2 == OP_EMULEPROT && opcode2 == OP_EMULEINFOANSWER {
-            debug!("Got EmuleInfoAnswer");
+            let peer_udp = parse_emule_info_udp_port(&payload2);
+            if peer_udp > 0 {
+                if let Some(sm) = &self.source_manager {
+                    let mut sm = sm.write().await;
+                    if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
+                        sm.register_source_full(self.file_hash, v4, self.source_addr.port(), peer_udp, peer_user_hash);
+                    }
+                }
+                debug!("Got EmuleInfoAnswer (peer UDP port: {peer_udp})");
+            } else {
+                debug!("Got EmuleInfoAnswer");
+            }
         } else {
             debug!("Peer skipped EmuleInfoAnswer (got proto=0x{proto2:02X} op=0x{opcode2:02X}), deferring");
             deferred_packet = Some((proto2, opcode2, payload2));
