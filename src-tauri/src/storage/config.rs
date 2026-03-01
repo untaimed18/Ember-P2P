@@ -20,7 +20,7 @@ impl AppConfig {
         std::fs::create_dir_all(&app_dir)?;
         let config_path = app_dir.join("config.json");
 
-        let settings = if config_path.exists() {
+        let mut settings = if config_path.exists() {
             let data = std::fs::read_to_string(&config_path)?;
             match serde_json::from_str(&data) {
                 Ok(s) => s,
@@ -37,6 +37,38 @@ impl AppConfig {
             std::fs::write(&config_path, data)?;
             defaults
         };
+
+        let mut config_changed = false;
+
+        // Migrate: old configs pointed download_folder directly at the user's
+        // Downloads dir.  It should be a Nexus subfolder so we don't pollute it.
+        if !settings.download_folder.is_empty() {
+            let dl = std::path::Path::new(&settings.download_folder);
+            if dl.file_name().map(|n| n != "Nexus").unwrap_or(false) {
+                let migrated = dl.join("Nexus").to_string_lossy().to_string();
+                tracing::info!("Migrating download_folder: {} -> {}", settings.download_folder, migrated);
+                settings.download_folder = migrated;
+                config_changed = true;
+            }
+        }
+
+        // Ensure the completed-downloads folder is shared by default.
+        if !settings.download_folder.is_empty() {
+            let completed_dir = std::path::Path::new(&settings.download_folder)
+                .join("Downloads")
+                .to_string_lossy()
+                .to_string();
+            if !settings.shared_folders.iter().any(|f| f == &completed_dir) {
+                tracing::info!("Adding default shared folder: {completed_dir}");
+                settings.shared_folders.push(completed_dir);
+                config_changed = true;
+            }
+        }
+
+        if config_changed {
+            let data = serde_json::to_string_pretty(&settings)?;
+            std::fs::write(&config_path, &data)?;
+        }
 
         info!("Config loaded from {}", config_path.display());
         Ok(Self {

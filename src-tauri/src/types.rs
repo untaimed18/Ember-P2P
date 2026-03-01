@@ -366,9 +366,14 @@ impl Default for AppSettings {
                     .to_string()
             });
 
+        let completed_dir = std::path::PathBuf::from(&download_dir)
+            .join("Downloads")
+            .to_string_lossy()
+            .to_string();
+
         Self {
             nickname: format!("Nexus-{}", &uuid::Uuid::new_v4().to_string()[..8]),
-            shared_folders: Vec::new(),
+            shared_folders: vec![completed_dir],
             download_folder: download_dir,
             max_upload_speed: 0,
             max_download_speed: 0,
