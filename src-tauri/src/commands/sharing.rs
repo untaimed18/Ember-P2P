@@ -136,18 +136,6 @@ pub async fn add_shared_folder(
                             files: vec![updated_file.clone()],
                         });
 
-                    refresh_file_cache(&local_index, &file_cache).await;
-                    tokio::task::yield_now().await;
-
-                    let _ = app.emit("file-hashed", serde_json::json!({
-                        "temp_id": file_temp_id,
-                        "hash": updated_file.hash,
-                        "aich_hash": updated_file.aich_hash,
-                        "file_name": updated_file.name,
-                        "current": hashed_count + 1,
-                        "total": total_files,
-                    }));
-
                     hashed_count += 1;
                 }
                 Ok(Ok(Err(e))) => {
@@ -369,9 +357,6 @@ pub async fn reload_shared_files(
                         .try_send(NetworkCommand::AnnounceFiles {
                             files: vec![updated_file.clone()],
                         });
-
-                    refresh_file_cache(&local_index, &file_cache).await;
-                    tokio::task::yield_now().await;
 
                     hashed_count += 1;
                 }

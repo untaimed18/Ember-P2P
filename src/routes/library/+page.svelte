@@ -252,7 +252,6 @@
     }
 
     refresh();
-    const pollInterval = setInterval(refresh, 5000);
 
     const unlisteners: Array<() => void> = [];
 
@@ -275,14 +274,10 @@
           }
         }
       ));
-      unlisteners.push(await listen<{ hash: string; file_name: string }>(
-        'file-hashed', () => { if (mounted) debouncedRefresh(); }
-      ));
     })();
 
     return () => {
       mounted = false;
-      clearInterval(pollInterval);
       if (refreshTimer) clearTimeout(refreshTimer);
       dragCleanup?.();
       for (const u of unlisteners) u();

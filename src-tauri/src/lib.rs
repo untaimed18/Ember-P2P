@@ -199,8 +199,6 @@ pub fn run() {
                             let _ = net_tx.try_send(network::NetworkCommand::AnnounceFiles {
                                 files: vec![updated],
                             });
-                            { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
-                            tokio::task::yield_now().await;
                             hashed += 1;
                         }
                         Ok(Ok(Err(e))) => {
