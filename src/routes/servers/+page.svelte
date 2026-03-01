@@ -11,7 +11,6 @@
   import type { ServerInfo } from '$lib/types';
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
-  import type { UnlistenFn } from '@tauri-apps/api/event';
 
   let servers: ServerInfo[] = $state([]);
   let connectedServer: ServerInfo | null = $state(null);
@@ -43,32 +42,34 @@
   let connecting = $state(false);
   let refreshInProgress = false;
   let mounted = true;
-  let eventUnlisteners: UnlistenFn[] = [];
   let logArea: HTMLDivElement | undefined = $state(undefined);
 
   onMount(() => {
     refresh();
     const interval = setInterval(refresh, 5000);
 
-    listen<{ message: string }>('server-log', (event) => {
-      if (!mounted) return;
-      log(event.payload.message);
-      requestAnimationFrame(() => {
-        if (logArea) logArea.scrollTop = logArea.scrollHeight;
-      });
-    }).then((u) => eventUnlisteners.push(u));
+    const unlisteners: Array<() => void> = [];
 
-    listen<{ connected: boolean }>('server-status-changed', (event) => {
-      if (!mounted) return;
-      if (!event.payload.connected) connecting = false;
-      refresh();
-    }).then((u) => eventUnlisteners.push(u));
+    (async () => {
+      unlisteners.push(await listen<{ message: string }>('server-log', (event) => {
+        if (!mounted) return;
+        log(event.payload.message);
+        requestAnimationFrame(() => {
+          if (logArea) logArea.scrollTop = logArea.scrollHeight;
+        });
+      }));
+
+      unlisteners.push(await listen<{ connected: boolean }>('server-status-changed', (event) => {
+        if (!mounted) return;
+        if (!event.payload.connected) connecting = false;
+        refresh();
+      }));
+    })();
 
     return () => {
       mounted = false;
       clearInterval(interval);
-      for (const u of eventUnlisteners) u();
-      eventUnlisteners = [];
+      for (const u of unlisteners) u();
     };
   });
 

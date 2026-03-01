@@ -36,20 +36,14 @@ pub async fn add_shared_folder(
             None
         }
     };
+    if save_data.is_none() {
+        info!("Folder {path} is already shared, skipping duplicate scan");
+        return Ok(());
+    }
     if let Some((data, tmp, final_path)) = save_data {
         tokio::task::spawn_blocking(move || {
             crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
         }).await.map_err(|e| format!("Config save error: {e}"))?.map_err(|e| format!("Config save error: {e}"))?;
-    }
-
-    // Don't re-scan if a startup scan is already running for this folder
-    if state.scanning_count.load(Ordering::Relaxed) > 0 {
-        let index = state.local_index.read().await;
-        let already_has_files = index.all_files().iter().any(|f| f.path.starts_with(&path));
-        if already_has_files {
-            info!("Folder {path} is already being scanned, skipping duplicate");
-            return Ok(());
-        }
     }
 
     let local_index = state.local_index.clone();

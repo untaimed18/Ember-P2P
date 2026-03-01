@@ -249,7 +249,6 @@
     const pollInterval = setInterval(refresh, 5000);
 
     const unlisteners: Array<() => void> = [];
-    let listenersReady = false;
 
     (async () => {
       unlisteners.push(await listen<{ phase: string; count: number }>(
@@ -273,16 +272,13 @@
       unlisteners.push(await listen<{ hash: string; file_name: string }>(
         'file-hashed', () => { if (mounted) refresh(); }
       ));
-      listenersReady = true;
     })();
 
     return () => {
       mounted = false;
       clearInterval(pollInterval);
       dragCleanup?.();
-      if (listenersReady) {
-        for (const u of unlisteners) u();
-      }
+      for (const u of unlisteners) u();
     };
   });
 </script>
