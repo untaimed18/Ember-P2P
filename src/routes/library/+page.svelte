@@ -236,6 +236,35 @@
     } catch (e: unknown) { error = toErr(e); }
   }
 
+  // --- Virtual scroll ---
+  const ROW_HEIGHT = 28;
+  const OVERSCAN = 10;
+  let scrollContainer: HTMLDivElement | undefined = $state(undefined);
+  let scrollTop = $state(0);
+  let viewportHeight = $state(600);
+
+  let virtualSlice = $derived.by(() => {
+    const totalRows = sortedFiles.length;
+    if (totalRows === 0) return { startIdx: 0, endIdx: 0, topPad: 0, bottomPad: 0, visible: [] as FileInfo[] };
+    const firstVisible = Math.floor(scrollTop / ROW_HEIGHT);
+    const visibleCount = Math.ceil(viewportHeight / ROW_HEIGHT);
+    const startIdx = Math.max(0, firstVisible - OVERSCAN);
+    const endIdx = Math.min(totalRows, firstVisible + visibleCount + OVERSCAN);
+    return {
+      startIdx,
+      endIdx,
+      topPad: startIdx * ROW_HEIGHT,
+      bottomPad: (totalRows - endIdx) * ROW_HEIGHT,
+      visible: sortedFiles.slice(startIdx, endIdx),
+    };
+  });
+
+  function onTableScroll(e: Event) {
+    const el = e.target as HTMLDivElement;
+    scrollTop = el.scrollTop;
+    viewportHeight = el.clientHeight;
+  }
+
   // --- Sidebar resize ---
   let sidebarWidth = $state(200);
   let sidebarDragging = $state(false);
@@ -272,6 +301,17 @@
     }
 
     refresh();
+
+    const resizeObs = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        viewportHeight = entry.contentRect.height;
+      }
+    });
+    if (scrollContainer) resizeObs.observe(scrollContainer);
+    const checkContainer = setInterval(() => {
+      if (scrollContainer && !resizeObs.observe) return;
+      if (scrollContainer) { resizeObs.observe(scrollContainer); clearInterval(checkContainer); }
+    }, 100);
 
     // Poll every 3s: refresh file list while scanning, detect completion as fallback.
     const scanPoll = setInterval(async () => {
@@ -320,6 +360,8 @@
     return () => {
       mounted = false;
       clearInterval(scanPoll);
+      clearInterval(checkContainer);
+      resizeObs.disconnect();
       if (refreshTimer) clearTimeout(refreshTimer);
       dragCleanup?.();
       for (const u of unlisteners) u();
@@ -412,7 +454,7 @@
     {:else if sortedFiles.length === 0 && scanning}
       <div class="empty-state"><p>Waiting for scan results&hellip;</p></div>
     {:else}
-      <div class="table-scroll">
+      <div class="vtable-header">
         <table class="shared-table">
           <thead>
             <tr>
@@ -429,48 +471,55 @@
               <th class="col-shared">Shared</th>
             </tr>
           </thead>
-          <tbody>
-            {#each sortedFiles as file (file.hash || file.id)}
-              <tr
-                class:selected={selectedHash === file.hash}
-                onclick={() => selectedHash = file.hash}
-                oncontextmenu={(e) => onCtx(e, file)}
-              >
-                <td class="col-name" title={file.path}>{file.name}</td>
-                <td class="col-size">{formatSize(file.size)}</td>
-                <td class="col-type">{fileType(file.extension)}</td>
-                <td class="col-prio prio-{file.priority}">{priorityLabel(file.priority)}</td>
-                <td class="col-hash" title={file.hash || 'Hashing...'}>
-                  {#if file.hash}
-                    {file.hash.substring(0, 16)}&hellip;
-                  {:else}
-                    <span class="hashing-label">Hashing&hellip;</span>
-                  {/if}
-                </td>
-                <td class="col-num">{file.requests}{file.alltime_requests ? ` (${file.alltime_requests})` : ''}</td>
-                <td class="col-num">{file.accepted}{file.alltime_accepted ? ` (${file.alltime_accepted})` : ''}</td>
-                <td class="col-size">{formatTransferred(file.bytes_transferred, file.alltime_transferred)}</td>
-                <td class="col-folder" title={file.folder}>{file.folder.split(/[\\/]/).filter(Boolean).pop() || file.folder}</td>
-                <td class="col-num">{file.complete_sources || '\u2014'}</td>
-                <td class="col-shared">
-                  {#if !file.hash}
-                    <span class="hashing-label">Pending</span>
-                  {:else if file.shared}
-                    <span class="shared-icon shared-yes" title="Shared">&#x2713;</span>
-                    {#if file.shared_kad || file.shared_ed2k}
-                      <span class="shared-badges">
-                        {#if file.shared_kad}<span class="shared-badge kad">KAD</span>{/if}
-                        {#if file.shared_ed2k}<span class="shared-badge ed2k">eD2K</span>{/if}
-                      </span>
-                    {/if}
-                  {:else}
-                    <span class="shared-icon shared-no" title="Not shared">&#x2715;</span>
-                  {/if}
-                </td>
-              </tr>
-            {/each}
-          </tbody>
         </table>
+      </div>
+      <div class="vtable-scroll" bind:this={scrollContainer} onscroll={onTableScroll}>
+        <div style="height:{sortedFiles.length * ROW_HEIGHT}px; position:relative;">
+          <table class="shared-table vtable-body" style="transform:translateY({virtualSlice.topPad}px);">
+            <tbody>
+              {#each virtualSlice.visible as file (file.hash || file.id)}
+                <tr
+                  class:selected={selectedHash === file.hash}
+                  onclick={() => selectedHash = file.hash}
+                  oncontextmenu={(e) => onCtx(e, file)}
+                  style="height:{ROW_HEIGHT}px;"
+                >
+                  <td class="col-name" title={file.path}>{file.name}</td>
+                  <td class="col-size">{formatSize(file.size)}</td>
+                  <td class="col-type">{fileType(file.extension)}</td>
+                  <td class="col-prio prio-{file.priority}">{priorityLabel(file.priority)}</td>
+                  <td class="col-hash" title={file.hash || 'Hashing...'}>
+                    {#if file.hash}
+                      {file.hash.substring(0, 16)}&hellip;
+                    {:else}
+                      <span class="hashing-label">Hashing&hellip;</span>
+                    {/if}
+                  </td>
+                  <td class="col-num">{file.requests}{file.alltime_requests ? ` (${file.alltime_requests})` : ''}</td>
+                  <td class="col-num">{file.accepted}{file.alltime_accepted ? ` (${file.alltime_accepted})` : ''}</td>
+                  <td class="col-size">{formatTransferred(file.bytes_transferred, file.alltime_transferred)}</td>
+                  <td class="col-folder" title={file.folder}>{file.folder.split(/[\\/]/).filter(Boolean).pop() || file.folder}</td>
+                  <td class="col-num">{file.complete_sources || '\u2014'}</td>
+                  <td class="col-shared">
+                    {#if !file.hash}
+                      <span class="hashing-label">Pending</span>
+                    {:else if file.shared}
+                      <span class="shared-icon shared-yes" title="Shared">&#x2713;</span>
+                      {#if file.shared_kad || file.shared_ed2k}
+                        <span class="shared-badges">
+                          {#if file.shared_kad}<span class="shared-badge kad">KAD</span>{/if}
+                          {#if file.shared_ed2k}<span class="shared-badge ed2k">eD2K</span>{/if}
+                        </span>
+                      {/if}
+                    {:else}
+                      <span class="shared-icon shared-no" title="Not shared">&#x2715;</span>
+                    {/if}
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
       </div>
     {/if}
 
@@ -647,7 +696,18 @@
     min-width: 0;
     overflow: hidden;
   }
-  .table-scroll { flex: 1; overflow: auto; }
+  .vtable-header {
+    flex-shrink: 0;
+    overflow: hidden;
+  }
+  .vtable-header table { margin-bottom: 0; }
+  .vtable-scroll {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-height: 0;
+  }
+  .vtable-body { position: absolute; left: 0; right: 0; }
   .empty-state {
     flex: 1;
     display: flex;
@@ -672,8 +732,8 @@
     width: 100%;
     border-collapse: collapse;
     font-size: 12px;
+    table-layout: fixed;
   }
-  .shared-table thead { position: sticky; top: 0; z-index: 2; }
   .shared-table th {
     padding: 5px 8px;
     text-align: left;
@@ -683,6 +743,7 @@
     background: var(--bg-secondary);
     border-bottom: 1px solid var(--border);
     user-select: none;
+    box-sizing: border-box;
   }
   .shared-table th.sortable { cursor: pointer; }
   .shared-table th.sortable:hover { color: var(--accent, #3498db); }
@@ -693,19 +754,20 @@
     overflow: hidden;
     text-overflow: ellipsis;
     border-bottom: 1px solid var(--border-light, rgba(255,255,255,0.04));
+    box-sizing: border-box;
   }
-  .shared-table tbody tr { cursor: default; }
+  .shared-table tbody tr { cursor: default; box-sizing: border-box; }
   .shared-table tbody tr:hover { background: var(--bg-hover); }
   .shared-table tbody tr.selected { background: var(--accent, #3498db); color: #fff; }
 
-  .col-name { min-width: 200px; max-width: 350px; }
-  .col-size { text-align: right; min-width: 80px; }
-  .col-type { min-width: 60px; }
-  .col-prio { min-width: 70px; }
-  .col-hash { min-width: 140px; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
-  .col-num { text-align: right; min-width: 60px; }
-  .col-folder { max-width: 200px; color: var(--text-muted); }
-  .col-shared { min-width: 90px; color: var(--text-secondary); white-space: nowrap; }
+  .col-name { width: 22%; }
+  .col-size { width: 7%; text-align: right; }
+  .col-type { width: 6%; }
+  .col-prio { width: 7%; }
+  .col-hash { width: 13%; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+  .col-num { width: 6%; text-align: right; }
+  .col-folder { width: 12%; color: var(--text-muted); }
+  .col-shared { width: 9%; color: var(--text-secondary); white-space: nowrap; }
   .hashing-label {
     color: var(--warning, #e0a030);
     font-style: italic;
