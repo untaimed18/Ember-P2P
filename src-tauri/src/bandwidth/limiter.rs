@@ -176,29 +176,20 @@ impl BandwidthLimiter {
 pub async fn start_token_refill(
     limiter: std::sync::Arc<BandwidthLimiter>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    uss_rtt_queue: super::UssRttQueue,
+    uss_enabled_flag: super::UssEnabledFlag,
 ) {
     const REFILL_INTERVAL_MS: u64 = 100;
     const TICKS_PER_SECOND: u64 = 1000 / REFILL_INTERVAL_MS;
 
     let max_up = limiter.max_upload_rate.load(Ordering::Relaxed);
     let mut uss = super::uss::UploadSpeedSense::new(1024, max_up);
-    if max_up > 0 {
-        uss.enable();
-    }
     uss.set_tolerance(1.5);
-
-    // Seed USS with common gateway IPs as potential ping hosts
-    use std::net::Ipv4Addr;
-    for octet in [1u8, 2, 3] {
-        uss.add_host_candidate(Ipv4Addr::new(192, 168, 1, octet));
-    }
 
     let mut interval = tokio::time::interval(Duration::from_millis(REFILL_INTERVAL_MS));
     let mut last_uploaded = limiter.total_uploaded();
     let mut last_downloaded = limiter.total_downloaded();
     let mut speed_tick_count: u64 = 0;
-    let mut ping_tick_count: u64 = 0;
-    let ping_ticks = super::uss::PING_INTERVAL.as_millis() as u64 / REFILL_INTERVAL_MS;
 
     loop {
         interval.tick().await;
@@ -208,29 +199,22 @@ pub async fn start_token_refill(
         }
         limiter.refill_tokens_incremental(1, TICKS_PER_SECOND);
 
-        // Check USS state for errors
-        if uss.state() == super::uss::UssState::Error {
-            tracing::warn!("USS entered error state, resetting");
-            let max = limiter.max_upload_rate.load(Ordering::Relaxed);
-            uss.set_limits(1024, max);
-            uss.disable();
-            uss.enable();
+        // Drain real KAD RTT samples from the network loop
+        if let Ok(mut queue) = uss_rtt_queue.try_lock() {
+            while let Some(rtt_ms) = queue.pop_front() {
+                uss.record_ping(rtt_ms);
+            }
         }
 
-        // Periodic ping check for USS
-        ping_tick_count += 1;
-        if ping_tick_count >= ping_ticks && uss.should_ping() {
-            ping_tick_count = 0;
-            if let Some(_host) = uss.ping_host() {
-                // Use upload utilization as a latency proxy since ICMP ping
-                // requires raw sockets / elevated privileges on most OSes.
-                let up_speed = limiter.upload_speed();
-                let max_rate = limiter.max_upload_rate.load(Ordering::Relaxed);
-                if max_rate > 0 && up_speed > 0 {
-                    let utilization = (up_speed as f64 / max_rate as f64) * 100.0;
-                    uss.record_ping(utilization);
-                }
-            }
+        // Sync USS enabled state from user settings
+        let want_enabled = uss_enabled_flag.load(Ordering::Relaxed)
+            && limiter.max_upload_rate.load(Ordering::Relaxed) > 0;
+        if want_enabled && !uss.is_enabled() {
+            let max = limiter.max_upload_rate.load(Ordering::Relaxed);
+            uss.set_limits(1024, max);
+            uss.enable();
+        } else if !want_enabled && uss.is_enabled() {
+            uss.disable();
         }
 
         speed_tick_count += 1;
@@ -246,15 +230,10 @@ pub async fn start_token_refill(
 
             if uss.is_enabled() {
                 if let Some(new_limit) = uss.compute_limit() {
-                    let _current = uss.current_limit();
                     limiter.set_limits(new_limit, limiter.max_download_rate.load(Ordering::Relaxed));
                 }
-
-                // Dynamically adjust limits if the configured max changes
                 let configured_max = limiter.max_upload_rate.load(Ordering::Relaxed);
-                if configured_max == 0 {
-                    uss.disable();
-                } else {
+                if configured_max > 0 {
                     uss.set_limits(1024, configured_max);
                 }
             }

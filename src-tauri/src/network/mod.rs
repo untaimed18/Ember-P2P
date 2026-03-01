@@ -326,6 +326,18 @@ struct NetworkState {
     /// Whether the server auto-reconnect loop is allowed to run.
     /// Starts from settings; enabled on manual connect, disabled on manual disconnect.
     server_auto_reconnect: bool,
+    /// Pending USS ping timestamps for RTT measurement
+    pending_uss_pings: HashMap<SocketAddr, std::time::Instant>,
+    /// Currently selected USS ping target
+    uss_host: Option<SocketAddr>,
+    /// Consecutive missed USS pongs (rotate host after 3)
+    uss_missed_pongs: u32,
+    /// When the current USS host was selected
+    uss_host_selected_at: i64,
+    /// Shared RTT queue for feeding latency samples to the limiter loop
+    uss_rtt_queue: crate::bandwidth::UssRttQueue,
+    /// Shared USS enabled flag
+    uss_enabled_flag: crate::bandwidth::UssEnabledFlag,
 }
 
 pub async fn start_network(
@@ -344,6 +356,8 @@ pub async fn start_network(
     shared_connected_server: Arc<RwLock<Option<ServerInfo>>>,
     shared_transfer_stats: Arc<RwLock<TransferStats>>,
     shared_files: Arc<RwLock<Vec<FileInfo>>>,
+    uss_rtt_queue: crate::bandwidth::UssRttQueue,
+    uss_enabled_flag: crate::bandwidth::UssEnabledFlag,
 ) -> anyhow::Result<()> {
     let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
         .map(|d| d.data_dir().to_path_buf())
@@ -585,6 +599,12 @@ pub async fn start_network(
         serving_event_rx: None,
         pending_outgoing_buddy: None,
         server_auto_reconnect: settings.auto_connect_server,
+        pending_uss_pings: HashMap::new(),
+        uss_host: None,
+        uss_missed_pongs: 0,
+        uss_host_selected_at: 0,
+        uss_rtt_queue,
+        uss_enabled_flag,
     };
 
     // Load known files for hash cache
@@ -771,6 +791,8 @@ pub async fn start_network(
     known_met_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut dead_source_timer = tokio::time::interval(std::time::Duration::from_secs(300));
     dead_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut uss_ping_timer = tokio::time::interval(std::time::Duration::from_secs(2));
+    uss_ping_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut cache_write_handle: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -1912,7 +1934,7 @@ pub async fn start_network(
                 if state.buddy_manager.state() == BuddyState::Connected {
                     state.buddy_manager.send_buddy_ping().await;
                 }
-                if state.buddy_manager.should_find_buddy(state.firewalled) {
+                if state.buddy_manager.should_find_buddy(state.firewall_checker.tcp_status()) {
                     state.buddy_manager.start_finding();
                     let target = state.buddy_manager.find_buddy_target();
                     let local_tcp = state.buddy_manager.tcp_port();
@@ -2427,6 +2449,33 @@ pub async fn start_network(
                         state.server_connected = true;
                         state.server_addr = Some(addr);
 
+                        // HighID from server is the most reliable TCP firewall test:
+                        // the server successfully connected back to our TCP port.
+                        if !is_low && our_id >= ed2k::server::LOWID_THRESHOLD {
+                            if state.firewalled {
+                                info!("HighID from server confirms TCP port is open, clearing firewalled status");
+                                state.firewalled = false;
+                                state.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
+                                state.firewall_checker.handle_tcp_connect_back();
+                                state.publish_manager.firewalled = false;
+                                if state.buddy_manager.state() == BuddyState::FindingBuddy {
+                                    state.buddy_manager.find_failed();
+                                    info!("Cancelled buddy search: HighID proves TCP is open");
+                                }
+                            }
+                            // HighID = our external IP in network byte order
+                            let ip_bytes = our_id.to_be_bytes();
+                            let ext_ip = Ipv4Addr::from(ip_bytes);
+                            if !ext_ip.is_unspecified() && !ext_ip.is_loopback() {
+                                if state.external_ip.is_none() || state.external_ip == Some(ext_ip) {
+                                    state.external_ip = Some(ext_ip);
+                                    state.stats.external_ip = ext_ip.to_string();
+                                    info!("External IP from HighID: {ext_ip}");
+                                }
+                                state.firewall_checker.handle_firewalled_response(ext_ip);
+                            }
+                        }
+
                         // Process server list received during login (eMule: AddServersFromServer)
                         if settings.add_servers_from_server {
                             if let Some(sl_data) = &session.server_list_data {
@@ -2678,6 +2727,54 @@ pub async fn start_network(
                 let count = state.dead_sources.len();
                 if count > 0 {
                     debug!("Dead source list: {count} blocked sources");
+                }
+            }
+
+            // USS: send a KAD Ping to the selected host for RTT measurement
+            _ = uss_ping_timer.tick() => {
+                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                if !state.uss_enabled_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    state.uss_host = None;
+                    continue;
+                }
+                let now_ts = chrono::Utc::now().timestamp();
+
+                // Expire old pending pings (> 10s without response)
+                state.pending_uss_pings.retain(|_, sent| sent.elapsed().as_secs() < 10);
+
+                // Rotate host every 5 minutes or after 3 consecutive missed pongs
+                let should_rotate = state.uss_host.is_some()
+                    && (state.uss_missed_pongs >= 3 || now_ts - state.uss_host_selected_at > 300);
+                if should_rotate {
+                    debug!("USS: rotating ping host (missed={}, age={}s)", state.uss_missed_pongs, now_ts - state.uss_host_selected_at);
+                    state.uss_host = None;
+                }
+
+                // Select a host if needed
+                if state.uss_host.is_none() {
+                    let candidate = state.routing_table.all_contacts()
+                        .filter(|c| c.verified && !c.is_dead() && !c.is_udp_firewalled())
+                        .find(|c| {
+                            let addr = SocketAddr::new(c.ip.into(), c.udp_port);
+                            Some(addr) != state.uss_host
+                        });
+                    if let Some(contact) = candidate {
+                        let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                        state.uss_host = Some(addr);
+                        state.uss_missed_pongs = 0;
+                        state.uss_host_selected_at = now_ts;
+                        info!("USS: selected ping host {addr}");
+                    }
+                }
+
+                // Send Ping to the USS host
+                if let Some(addr) = state.uss_host {
+                    let msg = KadMessage::Ping;
+                    if let Ok(packet) = messages::encode_packet(&msg) {
+                        let _ = udp_socket.send_to(&packet, addr).await;
+                        state.pending_uss_pings.insert(addr, std::time::Instant::now());
+                        state.uss_missed_pongs += 1;
+                    }
                 }
             }
 
@@ -3724,6 +3821,15 @@ async fn handle_udp_packet(
                 if let Some(ext_port) = state.firewall_checker.external_udp_port() {
                     state.external_udp_port = Some(ext_port);
                 }
+            }
+            // USS RTT measurement: if this Pong is from our USS ping target, compute RTT
+            if let Some(sent_at) = state.pending_uss_pings.remove(&from) {
+                let rtt_ms = sent_at.elapsed().as_secs_f64() * 1000.0;
+                if let Ok(mut queue) = state.uss_rtt_queue.try_lock() {
+                    queue.push_back(rtt_ms);
+                }
+                state.uss_missed_pongs = 0;
+                debug!("USS RTT from {from}: {rtt_ms:.1}ms");
             }
         }
 
@@ -4873,9 +4979,15 @@ async fn handle_command(
 
         NetworkCommand::UpdateSettings { settings } => {
             state.obfuscation_enabled = settings.obfuscation_enabled;
+            state.uss_enabled_flag.store(settings.uss_enabled, std::sync::atomic::Ordering::Relaxed);
+            if !settings.uss_enabled {
+                state.uss_host = None;
+                state.pending_uss_pings.clear();
+            }
             info!(
-                "Network settings updated: obfuscation={}, nickname={}",
+                "Network settings updated: obfuscation={}, uss={}, nickname={}",
                 settings.obfuscation_enabled,
+                settings.uss_enabled,
                 settings.nickname,
             );
         }

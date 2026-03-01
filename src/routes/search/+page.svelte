@@ -257,7 +257,7 @@
       ed2kInput = '';
       setTimeout(() => (ed2kSuccess = ''), 5000);
     } catch (e: unknown) {
-      ed2kError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Invalid ed2k link';
+      ed2kError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Invalid eD2K link';
       setTimeout(() => (ed2kError = ''), 5000);
     }
   }

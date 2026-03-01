@@ -160,4 +160,5 @@ export interface AppSettings {
   add_downloads_paused: boolean;
   remove_finished_downloads: boolean;
   skip_compress_video: boolean;
+  uss_enabled: boolean;
 }

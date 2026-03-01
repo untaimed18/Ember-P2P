@@ -7,6 +7,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
+use super::firewall::FirewallStatus;
 use super::types::KadId;
 
 const OP_EDONKEYHEADER: u8 = 0xE3;
@@ -155,8 +156,12 @@ impl BuddyManager {
         KadId(target)
     }
 
-    pub fn should_find_buddy(&self, firewalled: bool) -> bool {
-        if !firewalled {
+    /// Only search for a buddy when TCP has been explicitly confirmed as Firewalled
+    /// by a completed firewall check or server LowID. Don't trigger on the initial
+    /// Unknown state before any check has run -- that produces false buddy searches
+    /// for users who are actually open.
+    pub fn should_find_buddy(&self, tcp_status: FirewallStatus) -> bool {
+        if tcp_status != FirewallStatus::Firewalled {
             return false;
         }
         if self.state == BuddyState::Connected {

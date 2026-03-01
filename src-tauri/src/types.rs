@@ -319,6 +319,9 @@ pub struct AppSettings {
     /// Skip compressing video files during upload (eMule: dontcompressavi)
     #[serde(default)]
     pub skip_compress_video: bool,
+    /// Upload Speed Sense: dynamically adjust upload limit based on network latency
+    #[serde(default)]
+    pub uss_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -389,6 +392,7 @@ impl Default for AppSettings {
             add_downloads_paused: false,
             remove_finished_downloads: false,
             skip_compress_video: false,
+            uss_enabled: false,
         }
     }
 }

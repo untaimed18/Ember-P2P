@@ -255,6 +255,13 @@
           <div class="field">
             <SpeedInput label="Max Download Speed" bind:value={settings.max_download_speed} />
           </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Upload Speed Sense (USS)</span>
+              <span class="hint">Automatically adjusts upload speed based on network latency to prevent congestion. Requires an upload speed limit to be set.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.uss_enabled} />
+          </div>
         </div>
       </section>
 

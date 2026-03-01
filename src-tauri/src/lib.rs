@@ -71,6 +71,8 @@ pub fn run() {
                 settings.max_upload_speed,
                 settings.max_download_speed,
             ));
+            let uss_rtt_queue = bandwidth::new_uss_rtt_queue();
+            let uss_enabled_flag = bandwidth::new_uss_enabled_flag(settings.uss_enabled);
 
             let transfer_manager = Arc::new(RwLock::new(TransferManager::new(settings.max_concurrent_downloads)));
 
@@ -245,6 +247,10 @@ pub fn run() {
             let net_db = db.clone();
             let net_transfers = transfer_manager.clone();
             let net_bw = bandwidth_limiter.clone();
+            let bw_limiter = bandwidth_limiter.clone();
+            let bw_shutdown_spawn = bw_shutdown.clone();
+            let bw_rtt = uss_rtt_queue.clone();
+            let bw_uss_flag = uss_enabled_flag.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = network::start_network(
                     net_handle,
@@ -262,6 +268,8 @@ pub fn run() {
                     cached_connected_server_net,
                     cached_transfer_stats_net,
                     cached_shared_files_net,
+                    uss_rtt_queue,
+                    uss_enabled_flag,
                 )
                 .await
                 {
@@ -269,11 +277,8 @@ pub fn run() {
                 }
                 shutdown_complete_net.store(true, std::sync::atomic::Ordering::Release);
             });
-
-            let bw_limiter = bandwidth_limiter.clone();
-            let bw_shutdown_spawn = bw_shutdown.clone();
             tauri::async_runtime::spawn(async move {
-                bandwidth::limiter::start_token_refill(bw_limiter, bw_shutdown_spawn).await;
+                bandwidth::limiter::start_token_refill(bw_limiter, bw_shutdown_spawn, bw_rtt, bw_uss_flag).await;
             });
 
             info!("Nexus P2P application started");
