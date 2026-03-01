@@ -3,7 +3,7 @@
   import { transfers, startTransferPoll } from '$lib/stores/transfers';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
-    clearCompleted, setTransferPriority, pauseAllTransfers, resumeAllTransfers,
+    clearCompleted, setTransferPriority, setPreviewPriority, pauseAllTransfers, resumeAllTransfers,
     getTransferSources, openFile, recoverArchive,
   } from '$lib/api/transfers';
   import { findSources } from '$lib/api/search';
@@ -259,6 +259,7 @@
         case 'priority': if (extra) await setTransferPriority(t.id, extra); break;
         case 'find_sources': await findSources(t.file_hash, t.total_size); break;
         case 'preview': await previewFile(t.id); break;
+        case 'toggle_preview_prio': await setPreviewPriority(t.id, !t.preview_priority); break;
         case 'recover_archive': {
           const path = await recoverArchive(t.id);
           transferError = `Archive recovered: ${path}`;
@@ -662,6 +663,9 @@
       <button class="ctx-item danger" onclick={() => ctxAction('cancel')}>Cancel</button>
       <div class="ctx-sep"></div>
       <button class="ctx-item" onclick={() => ctxAction('preview')}>Preview</button>
+      <button class="ctx-item" onclick={() => ctxAction('toggle_preview_prio')}>
+        {ctxMenu.transfer.preview_priority ? '✓ ' : ''}Preview Priority
+      </button>
       {#if isArchive(ctxMenu.transfer)}
         <button class="ctx-item" onclick={() => ctxAction('recover_archive')}>Recover Archive</button>
       {/if}

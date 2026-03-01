@@ -81,6 +81,7 @@ pub async fn start_download(
         upload_time: 0,
         a4af_sources: 0,
         max_sources: 0,
+        preview_priority: false,
     };
 
     {
@@ -279,6 +280,17 @@ pub async fn set_transfer_priority(
     }
     let mut manager = state.transfer_manager.write().await;
     manager.set_priority(&transfer_id, &priority);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_preview_priority(
+    state: tauri::State<'_, AppState>,
+    transfer_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut manager = state.transfer_manager.write().await;
+    manager.set_preview_priority(&transfer_id, enabled);
     Ok(())
 }
 

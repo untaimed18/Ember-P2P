@@ -38,13 +38,32 @@ impl ChunkSelector {
     /// - Common: everything else
     ///
     /// Within each zone: prefer nearest-to-complete, then already-active chunks.
+    ///
+    /// When `preview_priority` is true (eMule's SetPreviewPrio), the first and
+    /// last parts are returned before any rarity-based selection so that media
+    /// files become previewable as quickly as possible.
     pub fn select_part(
         &self,
         completed: &[bool],
         in_progress: &[bool],
         source_available: &[bool],
         active_parts: &[usize],
+        preview_priority: bool,
     ) -> Option<usize> {
+        let part_count = self.part_frequency.len();
+
+        if preview_priority && part_count > 0 {
+            let last = part_count - 1;
+            for &target in &[0, last] {
+                if !completed.get(target).copied().unwrap_or(true)
+                    && !in_progress.get(target).copied().unwrap_or(false)
+                    && source_available.get(target).copied().unwrap_or(true)
+                {
+                    return Some(target);
+                }
+            }
+        }
+
         let s = self.total_sources as u32;
         let t1 = (s + 9) / 10;
         let t2 = 2 * t1;
@@ -52,7 +71,7 @@ impl ChunkSelector {
 
         let mut candidates: Vec<(usize, u32)> = Vec::new();
 
-        for i in 0..self.part_frequency.len() {
+        for i in 0..part_count {
             if completed.get(i).copied().unwrap_or(true) {
                 continue;
             }

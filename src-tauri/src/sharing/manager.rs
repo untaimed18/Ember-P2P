@@ -13,6 +13,7 @@ const MAX_SPEED_SAMPLES: usize = 500;
 pub struct TransferControl {
     cancelled: AtomicBool,
     paused: AtomicBool,
+    preview_priority: AtomicBool,
 }
 
 impl std::fmt::Debug for TransferControl {
@@ -29,6 +30,7 @@ impl TransferControl {
         Arc::new(Self {
             cancelled: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            preview_priority: AtomicBool::new(false),
         })
     }
 
@@ -50,6 +52,14 @@ impl TransferControl {
 
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Acquire)
+    }
+
+    pub fn set_preview_priority(&self, enabled: bool) {
+        self.preview_priority.store(enabled, Ordering::Release);
+    }
+
+    pub fn is_preview_priority(&self) -> bool {
+        self.preview_priority.load(Ordering::Acquire)
     }
 }
 
@@ -280,6 +290,17 @@ impl TransferManager {
             transfer.priority = priority.to_string();
         } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
             transfer.priority = priority.to_string();
+        }
+    }
+
+    pub fn set_preview_priority(&mut self, id: &str, enabled: bool) {
+        if let Some(transfer) = self.active.get_mut(id) {
+            transfer.preview_priority = enabled;
+        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
+            transfer.preview_priority = enabled;
+        }
+        if let Some(control) = self.controls.get(id) {
+            control.set_preview_priority(enabled);
         }
     }
 

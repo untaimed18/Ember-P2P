@@ -337,6 +337,7 @@ impl Database {
                     upload_time: 0,
                     a4af_sources: 0,
                     max_sources: 0,
+                    preview_priority: false,
                 })
             })?
             .filter_map(|r| r.ok())

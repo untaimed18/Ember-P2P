@@ -356,6 +356,7 @@ pub fn run() {
             commands::transfers::clear_completed,
             commands::transfers::get_transfer_sources,
             commands::transfers::set_transfer_priority,
+            commands::transfers::set_preview_priority,
             commands::transfers::pause_all_transfers,
             commands::transfers::resume_all_transfers,
             commands::transfers::stop_transfer,

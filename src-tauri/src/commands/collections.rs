@@ -75,6 +75,7 @@ pub async fn download_collection_files(
             upload_time: 0,
             a4af_sources: 0,
             max_sources: 0,
+            preview_priority: false,
         };
 
         {

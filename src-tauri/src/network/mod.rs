@@ -4722,6 +4722,7 @@ async fn handle_command(
                     upload_time: 0,
                     a4af_sources: 0,
                     max_sources: 0,
+                    preview_priority: false,
                 };
                 {
                     let db_ref = db.clone();
@@ -5777,6 +5778,7 @@ async fn handle_upload_event(
                 upload_time: 0,
                 a4af_sources: 0,
                 max_sources: 0,
+                preview_priority: false,
             };
             {
                 let mut mgr = transfer_manager.write().await;

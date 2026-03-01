@@ -535,9 +535,25 @@ impl Ed2kDownload {
         let mut speed_measure_bytes: u64 = 0;
 
         for retry_round in 0..=MAX_PART_RETRIES {
-            let needed = tracker.needed_parts(&available_parts);
+            let mut needed = tracker.needed_parts(&available_parts);
             if needed.is_empty() {
                 break;
+            }
+
+            // eMule-style preview priority: move first and last parts to front
+            if self.control.is_preview_priority() && needed.len() > 1 {
+                let last_part = tracker.part_count.saturating_sub(1);
+                let mut front = Vec::new();
+                if let Some(pos) = needed.iter().position(|&p| p == 0) {
+                    front.push(needed.remove(pos));
+                }
+                if last_part > 0 {
+                    if let Some(pos) = needed.iter().position(|&p| p == last_part) {
+                        front.push(needed.remove(pos));
+                    }
+                }
+                front.extend(needed);
+                needed = front;
             }
             if retry_round > 0 {
                 warn!(

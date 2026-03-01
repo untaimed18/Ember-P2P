@@ -80,6 +80,7 @@ export interface Transfer {
   upload_time: number;
   a4af_sources: number;
   max_sources: number;
+  preview_priority: boolean;
 }
 
 export interface SourceInfo {

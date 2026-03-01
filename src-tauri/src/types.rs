@@ -121,6 +121,9 @@ pub struct Transfer {
     /// Max source limit for this file
     #[serde(default)]
     pub max_sources: u32,
+    /// eMule-style preview priority: download first and last parts first
+    #[serde(default)]
+    pub preview_priority: bool,
 }
 
 fn default_priority() -> String {

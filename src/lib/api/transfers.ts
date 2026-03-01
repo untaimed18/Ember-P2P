@@ -49,6 +49,10 @@ export async function setTransferPriority(transferId: string, priority: string):
   return invoke('set_transfer_priority', { transferId, priority });
 }
 
+export async function setPreviewPriority(transferId: string, enabled: boolean): Promise<void> {
+  return invoke('set_preview_priority', { transferId, enabled });
+}
+
 export async function pauseAllTransfers(): Promise<void> {
   return invoke('pause_all_transfers');
 }

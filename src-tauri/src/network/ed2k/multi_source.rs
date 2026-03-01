@@ -159,6 +159,8 @@ impl MultiSourceDownload {
                 }
             }
 
+            let preview_prio = self.control.is_preview_priority();
+
             // First pass: unique part per source where possible (rarest-first)
             for src_idx in 0..self.sources.len() {
                 let src = &self.sources[src_idx];
@@ -169,7 +171,7 @@ impl MultiSourceDownload {
                 };
 
                 let in_progress = vec![false; part_count];
-                if let Some(p) = cs.select_part(&assigned, &in_progress, &src_available, &active) {
+                if let Some(p) = cs.select_part(&assigned, &in_progress, &src_available, &active, preview_prio) {
                     source_parts[src_idx].push(p);
                     part_source_count[p] += 1;
                     assigned[p] = true;
@@ -318,6 +320,7 @@ impl MultiSourceDownload {
             let etx_clone = event_tx.clone();
             let tid_clone = self.transfer_id.clone();
             let bi_clone = self.shared_buddy_info.clone();
+            let ctrl_clone = self.control.clone();
 
             let fail_etx = event_tx.clone();
             let fail_tid = self.transfer_id.clone();
@@ -349,6 +352,7 @@ impl MultiSourceDownload {
                     Some(etx_clone),
                     tid_clone,
                     bi_clone,
+                    ctrl_clone,
                 )
                 .await;
 
@@ -484,6 +488,7 @@ impl MultiSourceDownload {
                 let retx = event_tx.clone();
                 let rtid = self.transfer_id.clone();
                 let rbi = self.shared_buddy_info.clone();
+                let rctrl = self.control.clone();
                 let rfail_etx = event_tx.clone();
                 let rfail_tid = self.transfer_id.clone();
                 let rfail_ip = source.peer_ip.clone();
@@ -494,7 +499,7 @@ impl MultiSourceDownload {
                         &file_hash, file_size, &user_hash, &nickname,
                         tcp_port, udp_port, bw, retry_tx, ph,
                         ra, rq, rsm, rcm, Some(rcs), ravail, None,
-                        Some(retx), rtid, rbi,
+                        Some(retx), rtid, rbi, rctrl,
                     )
                     .await {
                         let _ = rfail_etx.send(DownloadEvent::SourceDetail {
@@ -593,6 +598,7 @@ impl MultiSourceDownload {
                     let egtid = self.transfer_id.clone();
                     let egbi = self.shared_buddy_info.clone();
 
+                    let egctrl = self.control.clone();
                     let egfail_etx = event_tx.clone();
                     let egfail_tid = self.transfer_id.clone();
                     let egfail_ip = source.peer_ip.clone();
@@ -612,7 +618,7 @@ impl MultiSourceDownload {
                             tcp_port, udp_port, bw, eg_tx, ph,
                             ra, rq, egsm, egcm, None, Vec::new(),
                             Some(eg_received),
-                            Some(egetx), egtid, egbi,
+                            Some(egetx), egtid, egbi, egctrl,
                         )
                         .await;
                         if let Err(e) = &result {
@@ -760,6 +766,7 @@ async fn download_parts_from_source(
     event_tx: Option<mpsc::Sender<DownloadEvent>>,
     transfer_id: String,
     buddy_info: Option<super::upload::SharedBuddyInfo>,
+    control: Arc<TransferControl>,
 ) -> anyhow::Result<()> {
     use super::messages::*;
     use flate2::read::ZlibDecoder;
@@ -1230,7 +1237,8 @@ async fn download_parts_from_source(
             } else {
                 source_available.clone()
             };
-            if let Some(next) = cs.select_part(&completed, &in_prog, &avail, &[]) {
+            let pp = control.is_preview_priority();
+            if let Some(next) = cs.select_part(&completed, &in_prog, &avail, &[], pp) {
                 if !part_queue.contains(&next) {
                     part_queue.push(next);
                     let mut t = tracker.write().await;
