@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
 use tracing::{debug, info};
@@ -32,6 +32,9 @@ pub struct FirewallChecker {
     external_udp_port: Option<u16>,
     udp_port_votes: HashMap<u16, u32>,
     checking: bool,
+    /// IPs we sent FirewalledReq to (eMule: IsKadFirewallCheckIP).
+    /// Only accept FirewalledRes from these IPs to prevent spoofing.
+    pending_check_ips: HashSet<Ipv4Addr>,
 }
 
 impl FirewallChecker {
@@ -49,6 +52,7 @@ impl FirewallChecker {
             external_udp_port: None,
             udp_port_votes: HashMap::new(),
             checking: false,
+            pending_check_ips: HashSet::new(),
         }
     }
 
@@ -60,26 +64,33 @@ impl FirewallChecker {
         let now = chrono::Utc::now().timestamp();
         self.checking = true;
         self.last_check_start = now;
-        // Reset per-cycle counters but preserve tcp_status/udp_status
-        // so a confirmed-Open status isn't lost between cycles.
         self.tcp_responses_received = 0;
         self.tcp_requests_sent = 0;
         self.udp_responses_received = 0;
         self.udp_requests_sent = 0;
+        self.pending_check_ips.clear();
         info!("Starting firewall check cycle (current TCP={:?}, UDP={:?})", self.tcp_status, self.udp_status);
     }
 
-    pub fn record_tcp_request_sent(&mut self) {
+    pub fn record_tcp_request_sent(&mut self, peer_ip: Ipv4Addr) {
         self.tcp_requests_sent += 1;
+        self.pending_check_ips.insert(peer_ip);
     }
 
     pub fn record_udp_request_sent(&mut self) {
         self.udp_requests_sent += 1;
     }
 
+    /// Validate that a FirewalledRes came from a peer we actually sent a
+    /// FirewalledReq to (eMule: IsKadFirewallCheckIP).
+    pub fn is_firewall_check_ip(&self, ip: Ipv4Addr) -> bool {
+        self.pending_check_ips.contains(&ip)
+    }
+
     /// Handle KADEMLIA_FIREWALLED_RES: a peer reports our external IP.
     /// This message arrives via UDP, so it only proves UDP connectivity --
     /// it does NOT indicate TCP is open (the separate TCP connect-back does).
+    /// The caller must validate the sender via is_firewall_check_ip() first.
     pub fn handle_firewalled_response(&mut self, reported_ip: Ipv4Addr) {
         *self.external_ip_votes.entry(reported_ip).or_insert(0) += 1;
 
@@ -132,6 +143,7 @@ impl FirewallChecker {
     }
 
     /// Called periodically to evaluate results if the response window has elapsed.
+    /// Returns true only if meaningful data was collected and status was updated.
     pub fn evaluate(&mut self) -> bool {
         if !self.checking {
             return false;
@@ -142,6 +154,14 @@ impl FirewallChecker {
         }
 
         self.checking = false;
+
+        // If no requests were sent at all this cycle, don't change any status --
+        // we have no data to make a determination and shouldn't overwrite whatever
+        // the caller already has.
+        if self.tcp_requests_sent == 0 && self.udp_requests_sent == 0 {
+            debug!("Firewall check cycle completed with no requests sent, preserving existing status");
+            return false;
+        }
 
         // Never downgrade a confirmed-Open status to Firewalled based on a single
         // check cycle where contacts didn't respond (they might just be offline).
@@ -172,11 +192,11 @@ impl FirewallChecker {
     }
 
     pub fn tcp_firewalled(&self) -> bool {
-        self.tcp_status == FirewallStatus::Firewalled
+        self.tcp_status != FirewallStatus::Open
     }
 
     pub fn udp_firewalled(&self) -> bool {
-        self.udp_status == FirewallStatus::Firewalled
+        self.udp_status != FirewallStatus::Open
     }
 
     pub fn external_ip(&self) -> Option<Ipv4Addr> {

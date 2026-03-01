@@ -250,8 +250,6 @@ struct NetworkState {
     external_udp_port: Option<u16>,
     firewalled: bool,
     firewall_checks_sent: u32,
-    firewall_responses: Vec<Ipv4Addr>,
-    udp_port_responses: Vec<u16>,
     peer_nicknames: HashMap<KadId, String>,
     /// target -> (file_hash, sent_at, is_source_publish)
     publish_pending: HashMap<KadId, (KadId, i64, bool)>,
@@ -285,8 +283,6 @@ struct NetworkState {
     self_lookup_done: bool,
     /// Timestamp of last self-lookup (eMule repeats every 4 hours)
     last_self_lookup: i64,
-    /// Timestamp of last firewall recheck (eMule rechecks every hour)
-    last_firewall_check: i64,
     /// Whether UDP is firewalled (separate from TCP, like eMule)
     udp_firewalled: bool,
     /// Whether UDP firewall status has been verified
@@ -545,8 +541,6 @@ pub async fn start_network(
         external_udp_port: None,
         firewalled: !upnp_success,
         firewall_checks_sent: 0,
-        firewall_responses: Vec::new(),
-        udp_port_responses: Vec::new(),
         peer_nicknames: HashMap::new(),
         publish_pending: HashMap::new(),
         publish_confirmed: 0,
@@ -567,7 +561,6 @@ pub async fn start_network(
         firewalled_shared: Arc::new(std::sync::atomic::AtomicBool::new(!upnp_success)),
         self_lookup_done: false,
         last_self_lookup: 0,
-        last_firewall_check: chrono::Utc::now().timestamp(),
         udp_firewalled: true,
         udp_fw_verified: false,
         first_publish_done: false,
@@ -634,7 +627,7 @@ pub async fn start_network(
                 if let Ok(mut probes) = firewall_probe_ips.lock() { probes.insert(contact.ip); }
                 let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
                 state.firewall_checks_sent += 1;
-                state.firewall_checker.record_tcp_request_sent();
+                state.firewall_checker.record_tcp_request_sent(contact.ip);
             }
         }
         debug!("Sent {} firewall check requests", state.firewall_checks_sent);
@@ -1571,7 +1564,7 @@ pub async fn start_network(
                             let _ = send_kad_packet(
                                 &udp_socket, &packet, addr, &state, &contact.id,
                             ).await;
-                            state.firewall_checker.record_tcp_request_sent();
+                            state.firewall_checker.record_tcp_request_sent(contact.ip);
                         }
                     }
                     let udp_contacts: Vec<KadContact> = state
@@ -3972,12 +3965,17 @@ async fn handle_udp_packet(
         }
 
         KadMessage::FirewalledRes { ip } => {
+            let sender_ip = match from.ip() {
+                std::net::IpAddr::V4(v4) => v4,
+                _ => return,
+            };
+            if !state.firewall_checker.is_firewall_check_ip(sender_ip) {
+                tracing::warn!("Ignoring unrequested FirewalledRes from {from}");
+                return;
+            }
             let external_ip = Ipv4Addr::from(ip.to_be_bytes());
-            info!("FirewalledRes: our external IP is {external_ip}");
+            info!("FirewalledRes from {from}: our external IP is {external_ip}");
             state.firewall_checker.handle_firewalled_response(external_ip);
-            // FirewalledRes arrives via UDP, so UDP is proven open.
-            // TCP status is NOT determined by this message -- the peer
-            // separately tries a TCP connect-back; evaluate() handles that.
             state.firewall_checker.handle_udp_firewall_result(true);
             state.udp_firewalled = false;
 
@@ -4687,7 +4685,7 @@ async fn handle_command(
                     if let Ok(mut probes) = firewall_probe_ips.lock() { probes.insert(contact.ip); }
                     let _ = send_kad_packet(socket, &packet, addr, &state, &contact.id).await;
                     state.firewall_checks_sent += 1;
-                    state.firewall_checker.record_tcp_request_sent();
+                    state.firewall_checker.record_tcp_request_sent(contact.ip);
                 }
             }
             let udp_contacts: Vec<KadContact> = state.routing_table.all_contacts()
@@ -4754,11 +4752,8 @@ async fn handle_command(
             state.firewalled = true;
             state.firewalled_shared.store(true, std::sync::atomic::Ordering::Relaxed);
             state.firewall_checks_sent = 0;
-            state.firewall_responses.clear();
-            state.udp_port_responses.clear();
             state.self_lookup_done = false;
             state.last_self_lookup = 0;
-            state.last_firewall_check = 0;
             state.udp_firewalled = true;
             state.udp_fw_verified = false;
             state.overloaded_nodes.clear();
@@ -4878,8 +4873,6 @@ async fn handle_command(
         NetworkCommand::RecheckFirewall => {
             info!("Rechecking firewall status");
             state.firewall_checks_sent = 0;
-            state.firewall_responses.clear();
-            state.udp_port_responses.clear();
 
             state.firewall_checker.start_check();
             if let Ok(mut probes) = firewall_probe_ips.lock() { probes.clear(); }
@@ -4899,7 +4892,7 @@ async fn handle_command(
                     if let Ok(mut probes) = firewall_probe_ips.lock() { probes.insert(contact.ip); }
                     let _ = send_kad_packet(socket, &packet, addr, &state, &contact.id).await;
                     state.firewall_checks_sent += 1;
-                    state.firewall_checker.record_tcp_request_sent();
+                    state.firewall_checker.record_tcp_request_sent(contact.ip);
                 }
             }
 

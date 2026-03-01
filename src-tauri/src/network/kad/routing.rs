@@ -5,9 +5,14 @@ use super::ip_filter;
 use super::types::*;
 
 const NUM_BUCKETS: usize = 128;
-const BUCKET_REFRESH_INTERVAL_SECS: i64 = 3600;
-const SPARSE_REFRESH_INTERVAL_SECS: i64 = 60;
 const REPLACEMENT_CACHE_SIZE: usize = 5;
+
+/// eMule HR2S(1): per-zone big timer fires every hour for RandomLookup refresh.
+const BIG_TIMER_INTERVAL_SECS: i64 = 3600;
+/// eMule SEC(10): initial big timer delay so zones start filling quickly.
+const BIG_TIMER_INITIAL_SECS: i64 = 10;
+/// eMule MIN2S(1): per-zone small timer fires every minute for liveness probing.
+const SMALL_TIMER_INTERVAL_SECS: i64 = 60;
 
 /// Distant buckets (low indices) cover a huge portion of the ID space.
 /// Bucket 0 alone covers 50%. Giving them more capacity improves lookup
@@ -72,17 +77,21 @@ pub struct RoutingTable {
 struct KBucket {
     contacts: VecDeque<KadContact>,
     replacements: VecDeque<KadContact>,
-    last_refresh: i64,
     capacity: usize,
+    /// eMule m_tNextSmallTimer: next time this bucket's oldest contact should be probed.
+    next_small_timer: i64,
+    /// eMule m_tNextBigTimer: next time this bucket should trigger a RandomLookup refresh.
+    next_big_timer: i64,
 }
 
 impl KBucket {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, next_small_timer: i64, next_big_timer: i64) -> Self {
         KBucket {
             contacts: VecDeque::with_capacity(capacity),
             replacements: VecDeque::with_capacity(REPLACEMENT_CACHE_SIZE),
-            last_refresh: 0,
             capacity,
+            next_small_timer,
+            next_big_timer,
         }
     }
 
@@ -93,9 +102,14 @@ impl KBucket {
 
 impl RoutingTable {
     pub fn new(local_id: KadId, block_private_ips: bool) -> Self {
+        let now = chrono::Utc::now().timestamp();
         let mut buckets = Vec::with_capacity(NUM_BUCKETS);
         for i in 0..NUM_BUCKETS {
-            buckets.push(KBucket::new(bucket_capacity(i)));
+            // eMule staggers small timers: m_tNextSmallTimer = time(NULL) + m_uZoneIndex.Get32BitChunk(3)
+            // bucket_idx is our analog of zone_index; close buckets (high idx) fire sooner.
+            let small_timer = now + (i as i64);
+            let big_timer = now + BIG_TIMER_INITIAL_SECS;
+            buckets.push(KBucket::new(bucket_capacity(i), small_timer, big_timer));
         }
         RoutingTable {
             local_id,
@@ -521,33 +535,24 @@ impl RoutingTable {
         self.global_subnet_count.clear();
     }
 
-    /// Return bucket indices that need a refresh.
-    /// Empty/sparse buckets use a shorter refresh interval (60s) so they fill
-    /// quickly during bootstrap. Full or nearly-full buckets use the standard
-    /// 1-hour interval matching eMule's OnBigTimer.
+    /// Per-bucket big timer (matching eMule OnBigTimer / m_tNextBigTimer).
+    /// Returns bucket indices whose big timer has fired AND that qualify for
+    /// a RandomLookup refresh under eMule's criteria:
+    ///   - zone_index < KK  →  bucket is among the closest to our ID
+    ///   - level < KBASE    →  bucket is a coarse/root-level split
+    ///   - remaining >= K*0.8  →  bucket is very sparse (needs filling)
     pub fn stale_buckets(&self, now: i64) -> Vec<usize> {
         self.buckets
             .iter()
             .enumerate()
             .filter(|(i, b)| {
-                let cap = b.capacity;
-                let is_sparse = b.contacts.len() < cap / 2;
-                // Full buckets use a longer refresh interval to verify liveness
-                // (eMule refreshes all zones via OnBigTimer)
-                let interval = if is_sparse {
-                    SPARSE_REFRESH_INTERVAL_SECS
-                } else if b.is_full() {
-                    BUCKET_REFRESH_INTERVAL_SECS * 2
-                } else {
-                    BUCKET_REFRESH_INTERVAL_SECS
-                };
-                if now - b.last_refresh < interval {
+                if b.next_big_timer > now {
                     return false;
                 }
-                let is_distant = *i < DISTANT_BUCKET_THRESHOLD;
-                let is_close = *i >= NUM_BUCKETS.saturating_sub(KK);
-                let is_deep = *i < KBASE;
-                is_distant || is_close || is_deep || is_sparse || b.is_full()
+                let is_close = *i >= NUM_BUCKETS - KK;
+                let is_shallow = *i < KBASE;
+                let is_sparse = b.contacts.len() <= K_BUCKET_SIZE / 5;
+                is_close || is_shallow || is_sparse
             })
             .map(|(i, _)| i)
             .collect()
@@ -555,6 +560,7 @@ impl RoutingTable {
 
     /// Return bucket indices that need filling, prioritizing distant buckets
     /// that cover more of the ID space and can actually find contacts.
+    /// Uses the per-bucket big timer to avoid refreshing too frequently.
     pub fn buckets_needing_fill(&self) -> Vec<usize> {
         let now = chrono::Utc::now().timestamp();
         self.buckets
@@ -562,20 +568,19 @@ impl RoutingTable {
             .enumerate()
             .filter(|(i, b)| {
                 if b.is_full() { return false; }
-                if now - b.last_refresh < SPARSE_REFRESH_INTERVAL_SECS { return false; }
-                // Distant buckets always qualify if not full
+                if b.next_big_timer > now { return false; }
                 if *i < DISTANT_BUCKET_THRESHOLD { return true; }
-                // Other buckets only if very sparse
                 b.contacts.len() < b.capacity / 3
             })
             .map(|(i, _)| i)
             .collect()
     }
 
-    /// Mark a bucket as refreshed.
+    /// Mark a bucket as refreshed, resetting its big timer to now + 1 hour
+    /// (matching eMule's m_tNextBigTimer = tNow + HR2S(1)).
     pub fn mark_refreshed(&mut self, idx: usize) {
         if idx < NUM_BUCKETS {
-            self.buckets[idx].last_refresh = chrono::Utc::now().timestamp();
+            self.buckets[idx].next_big_timer = chrono::Utc::now().timestamp() + BIG_TIMER_INTERVAL_SECS;
         }
     }
 
@@ -761,11 +766,15 @@ impl RoutingTable {
         removed
     }
 
-    /// SmallTimer (matching eMule OnSmallTimer):
-    /// 1. Remove dead+expired contacts from all entries
+    /// Per-bucket small timer (matching eMule OnSmallTimer with staggered m_tNextSmallTimer).
+    /// Only processes buckets whose small timer has fired (next_small_timer <= now),
+    /// then resets their timer to now + 60s (eMule MIN2S(1)).
+    ///
+    /// For each due bucket:
+    /// 1. Remove dead+expired contacts
     /// 2. Set expires_at = now for contacts with expires_at == 0 (eMule behavior)
-    /// 3. Check oldest contact in each bucket:
-    ///    - If expired >= now or type == 4: push to bottom (rotate)
+    /// 3. Check oldest contact:
+    ///    - If expires_at >= now or type == 4: push to bottom (rotate)
     ///    - Otherwise: call checking_type() and return for HELLO_REQ probing
     pub fn get_contacts_to_probe(&mut self) -> Vec<(usize, KadContact)> {
         let now = chrono::Utc::now().timestamp();
@@ -773,11 +782,11 @@ impl RoutingTable {
         let mut ips_removed = Vec::new();
 
         for (bucket_idx, bucket) in self.buckets.iter_mut().enumerate() {
-            if bucket.contacts.is_empty() {
+            if bucket.next_small_timer > now || bucket.contacts.is_empty() {
                 continue;
             }
+            bucket.next_small_timer = now + SMALL_TIMER_INTERVAL_SECS;
 
-            // Step 1+2: Remove dead+expired, set expires_at for contacts with 0
             let mut dead_ips = Vec::new();
             bucket.contacts.retain_mut(|c| {
                 if c.is_dead() && c.expires_at > 0 && now > c.expires_at {
@@ -795,15 +804,12 @@ impl RoutingTable {
                 continue;
             }
 
-            // Step 3: Check the oldest contact (front of deque)
             let oldest = bucket.contacts.front().unwrap();
             if oldest.expires_at >= now || oldest.contact_type >= CONTACT_TYPE_DEAD {
-                // Not expired yet or dead — push to bottom (rotate)
                 if let Some(c) = bucket.contacts.pop_front() {
                     bucket.contacts.push_back(c);
                 }
             } else {
-                // Expired but not dead — probe it
                 let contact_clone = oldest.clone();
                 if let Some(front) = bucket.contacts.front_mut() {
                     front.checking_type();
