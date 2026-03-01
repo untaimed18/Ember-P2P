@@ -325,10 +325,23 @@ pub async fn clear_completed(
     manager.completed.clear();
     drop(manager);
 
+    let dl_folder = {
+        let config = state.config.read().await;
+        config.settings.download_folder.clone()
+    };
     let db = state.db.clone();
     let _ = tokio::task::spawn_blocking(move || {
+        let temp_dir = std::path::PathBuf::from(&dl_folder).join("Temp");
         for id in &ids {
             let _ = db.remove_transfer(id);
+            let part_path = temp_dir.join(format!("{id}.part"));
+            let met_path = temp_dir.join(format!("{id}.part.met"));
+            if part_path.exists() {
+                let _ = std::fs::remove_file(&part_path);
+            }
+            if met_path.exists() {
+                let _ = std::fs::remove_file(&met_path);
+            }
         }
     }).await;
     Ok(count)
