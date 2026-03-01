@@ -2465,6 +2465,30 @@ pub async fn start_network(
                             }
                         }
 
+                        // eMule: send OP_OFFERFILES after login to announce shared files
+                        {
+                            let index = local_index.read().await;
+                            let offer_files: Vec<ed2k::server::OfferFile> = index.all_files()
+                                .iter()
+                                .filter_map(|f| {
+                                    let hash_bytes = hex::decode(&f.hash).ok()?;
+                                    if hash_bytes.len() < 16 { return None; }
+                                    let mut h = [0u8; 16];
+                                    h.copy_from_slice(&hash_bytes[..16]);
+                                    Some(ed2k::server::OfferFile {
+                                        hash: h,
+                                        name: f.name.clone(),
+                                        size: f.size,
+                                    })
+                                })
+                                .collect();
+                            if !offer_files.is_empty() {
+                                if let Err(e) = conn.offer_files(&offer_files).await {
+                                    warn!("Failed to send OP_OFFERFILES: {e}");
+                                }
+                            }
+                        }
+
                         state.server_connection = Some(conn);
                         let _ = app_handle.emit("server-status-changed", serde_json::json!({ "connected": true }));
                     }
@@ -5015,6 +5039,31 @@ async fn handle_command(
             state.publish_manager.clear_all();
             state.publish_manager.add_files_batch(files);
             info!("Re-populated publish manager with {count} shared files after change");
+
+            // eMule: re-send OP_OFFERFILES to the server when shared files change
+            if state.server_connected {
+                if let Some(conn) = state.server_connection.as_mut() {
+                    let offer_files: Vec<ed2k::server::OfferFile> = index.all_files()
+                        .iter()
+                        .filter_map(|f| {
+                            let hash_bytes = hex::decode(&f.hash).ok()?;
+                            if hash_bytes.len() < 16 { return None; }
+                            let mut h = [0u8; 16];
+                            h.copy_from_slice(&hash_bytes[..16]);
+                            Some(ed2k::server::OfferFile {
+                                hash: h,
+                                name: f.name.clone(),
+                                size: f.size,
+                            })
+                        })
+                        .collect();
+                    if !offer_files.is_empty() {
+                        if let Err(e) = conn.offer_files(&offer_files).await {
+                            warn!("Failed to re-send OP_OFFERFILES: {e}");
+                        }
+                    }
+                }
+            }
         }
 
         NetworkCommand::SetFileComment { file_hash, rating, comment } => {

@@ -21,12 +21,20 @@ pub const OP_GETSOURCES: u8 = 0x19;
 pub const OP_FOUNDSOURCES: u8 = 0x42;
 pub const OP_GETSERVERLIST: u8 = 0x14;
 pub const OP_REJECT: u8 = 0x05;
+pub const OP_OFFERFILES: u8 = 0x15;
 pub const OP_CALLBACKREQUEST: u8 = 0x1C;
 pub const OP_CALLBACKREQUESTED: u8 = 0x35;
 pub const OP_CALLBACK_FAIL: u8 = 0x36;
 
 /// LowID threshold: client_id < this means LowID
 pub const LOWID_THRESHOLD: u32 = 0x0100_0000;
+
+/// A file to offer to the ed2k server via OP_OFFERFILES.
+pub struct OfferFile {
+    pub hash: [u8; 16],
+    pub name: String,
+    pub size: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct ServerSearchResult {
@@ -304,6 +312,38 @@ impl Ed2kServerConnection {
         let payload = client_id.to_le_bytes().to_vec();
         self.write_packet(OP_CALLBACKREQUEST, &payload).await?;
         info!("Sent callback request for LowID client {client_id}");
+        Ok(())
+    }
+
+    /// Send OP_OFFERFILES to the server with our shared file list.
+    /// eMule sends this after login (OP_IDCHANGE) and when shared files change.
+    pub async fn offer_files(&mut self, files: &[OfferFile]) -> anyhow::Result<()> {
+        let client_id = self.our_client_id().unwrap_or(0);
+        let tcp_port = self.session.as_ref().map(|_| 0u16).unwrap_or(0);
+        let mut payload = Vec::with_capacity(4 + files.len() * 64);
+        payload.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        for file in files {
+            payload.extend_from_slice(&file.hash);
+            payload.extend_from_slice(&client_id.to_le_bytes());
+            payload.extend_from_slice(&tcp_port.to_le_bytes());
+            let mut tag_count: u32 = 0;
+            let mut tags = Vec::new();
+            write_string_tag(&mut tags, 0x01, &file.name); // FT_FILENAME
+            tag_count += 1;
+            if file.size > u32::MAX as u64 {
+                tags.push(0x0B); // TAGTYPE_UINT64
+                tags.extend_from_slice(&1u16.to_le_bytes());
+                tags.push(0x02); // FT_FILESIZE
+                tags.extend_from_slice(&file.size.to_le_bytes());
+            } else {
+                write_uint32_tag(&mut tags, 0x02, file.size as u32); // FT_FILESIZE
+            }
+            tag_count += 1;
+            payload.extend_from_slice(&tag_count.to_le_bytes());
+            payload.extend_from_slice(&tags);
+        }
+        self.write_packet(OP_OFFERFILES, &payload).await?;
+        info!("Sent OP_OFFERFILES with {} shared files to server", files.len());
         Ok(())
     }
 

@@ -96,6 +96,7 @@ pub fn run() {
             let cached_connected_server_net = cached_connected_server.clone();
             let cached_transfer_stats_net = cached_transfer_stats.clone();
             let cached_shared_files_net = cached_shared_files.clone();
+            let startup_network_tx = network_tx.clone();
 
             app.manage(AppState {
                 network_tx,
@@ -123,6 +124,7 @@ pub fn run() {
             let startup_scanning = scanning_count.clone();
             let csf = cached_shared_files.clone();
             let startup_app = app_handle.clone();
+            let net_tx = startup_network_tx;
             tauri::async_runtime::spawn(async move {
                 // Pre-populate index from database for fast startup
                 match db_clone.get_shared_files() {
@@ -201,9 +203,13 @@ pub fn run() {
                             }
                             { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
                             let db_ref = db_clone.clone();
+                            let announce = updated.clone();
                             tokio::task::spawn_blocking(move || {
-                                let _ = db_ref.save_shared_file(&updated);
+                                let _ = db_ref.save_shared_file(&announce);
                             }).await.ok();
+                            let _ = net_tx.try_send(network::NetworkCommand::AnnounceFiles {
+                                files: vec![updated],
+                            });
                             hashed += 1;
                         }
                         Ok(Err(e)) => {
@@ -220,6 +226,7 @@ pub fn run() {
                 }
 
                 startup_scanning.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = net_tx.try_send(network::NetworkCommand::SharedFilesChanged);
                 let _ = startup_app.emit("file-hash-progress", serde_json::json!({
                     "current": total,
                     "total": total,
