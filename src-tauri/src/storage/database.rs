@@ -167,80 +167,6 @@ impl Database {
         }
     }
 
-    pub fn save_shared_file(&self, file: &FileInfo) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO shared_files (id, name, path, size, hash, aich_hash, extension, modified_at, shared)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                file.id,
-                file.name,
-                file.path,
-                file.size,
-                file.hash,
-                file.aich_hash,
-                file.extension,
-                file.modified_at,
-                file.shared as i32,
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn update_shared_flag(&self, hash: &str, shared: bool) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
-        conn.execute(
-            "UPDATE shared_files SET shared = ?1 WHERE hash = ?2",
-            params![shared as i32, hash],
-        )?;
-        Ok(())
-    }
-
-    pub fn get_shared_files(&self) -> anyhow::Result<Vec<FileInfo>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
-        let mut stmt = conn.prepare(
-            "SELECT id, name, path, size, hash, aich_hash, extension, modified_at, COALESCE(shared, 1) FROM shared_files",
-        )?;
-
-        let files = stmt
-            .query_map([], |row| {
-                let path_str: String = row.get(2)?;
-                let folder = std::path::Path::new(&path_str)
-                    .parent()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                Ok(FileInfo {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    path: path_str,
-                    size: row.get(3)?,
-                    hash: row.get(4)?,
-                    aich_hash: row.get::<_, String>(5).unwrap_or_default(),
-                    extension: row.get(6)?,
-                    modified_at: row.get(7)?,
-                    priority: "normal".to_string(),
-                    requests: 0,
-                    accepted: 0,
-                    bytes_transferred: 0,
-                    alltime_requests: 0,
-                    alltime_accepted: 0,
-                    alltime_transferred: 0,
-                    complete_sources: 0,
-                    folder,
-                    shared: row.get::<_, i32>(8).unwrap_or(1) != 0,
-                    shared_kad: false,
-                    shared_ed2k: false,
-                })
-            })?
-            .filter_map(|r| match r {
-                Ok(v) => Some(v),
-                Err(e) => { tracing::warn!("Failed to read DB row: {e}"); None }
-            })
-            .collect();
-
-        Ok(files)
-    }
-
     pub fn save_peer(&self, peer: &PeerInfo) -> anyhow::Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         let addresses = serde_json::to_string(&peer.addresses)?;
@@ -319,11 +245,6 @@ impl Database {
         Ok(result)
     }
 
-    pub fn remove_shared_file_by_hash(&self, hash: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
-        conn.execute("DELETE FROM shared_files WHERE hash = ?1", params![hash])?;
-        Ok(())
-    }
 
     pub fn save_transfer(&self, transfer: &Transfer) -> anyhow::Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;

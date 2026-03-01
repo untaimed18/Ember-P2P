@@ -10,7 +10,7 @@ use crate::network::NetworkCommand;
 use crate::search::index::LocalIndex;
 use crate::sharing::indexer::FileIndexer;
 use crate::types::*;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 async fn refresh_file_cache(index: &Arc<RwLock<LocalIndex>>, cache: &Arc<RwLock<Vec<FileInfo>>>) {
     let snap = index.read().await.all_files().to_vec();
@@ -48,7 +48,6 @@ pub async fn add_shared_folder(
 
     let local_index = state.local_index.clone();
     let file_cache = state.cached_shared_files.clone();
-    let db = state.db.clone();
     let network_tx = state.network_tx.clone();
     let scanning = state.scanning_count.clone();
 
@@ -89,7 +88,7 @@ pub async fn add_shared_folder(
         // Phase 2: hash files one at a time (eMule style)
         let mut hashed_count: usize = 0;
 
-        for file in &discovered {
+        for (file_idx, file) in discovered.iter().enumerate() {
             let file_path = file.path.clone();
             let file_temp_id = file.id.clone();
 
@@ -102,19 +101,25 @@ pub async fn add_shared_folder(
                 }
             }
 
+            debug!("Hashing file {}/{}: {}", file_idx + 1, total_files, file.name);
+
             let _ = app.emit("file-hash-progress", serde_json::json!({
                 "current": hashed_count + 1,
                 "total": total_files,
                 "file_name": file.name,
             }));
 
-            let hash_result = tokio::task::spawn_blocking(move || {
-                FileIndexer::hash_file(std::path::Path::new(&file_path))
-            })
+            let hash_result = tokio::time::timeout(
+                std::time::Duration::from_secs(300),
+                tokio::task::spawn_blocking(move || {
+                    FileIndexer::hash_file(std::path::Path::new(&file_path))
+                }),
+            )
             .await;
 
             match hash_result {
-                Ok(Ok((ed2k_hash, aich_hash))) => {
+                Ok(Ok(Ok((ed2k_hash, aich_hash)))) => {
+                    debug!("Hash complete {}/{}: {} -> {}", file_idx + 1, total_files, file.name, &ed2k_hash[..8]);
                     let mut updated_file = file.clone();
                     updated_file.id = ed2k_hash.clone();
                     updated_file.hash = ed2k_hash;
@@ -126,19 +131,13 @@ pub async fn add_shared_folder(
                         index.add_file(updated_file.clone());
                     }
 
-                    let db_ref = db.clone();
-                    let db_file = updated_file.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _ = db_ref.save_shared_file(&db_file);
-                    })
-                    .await;
-
                     let _ = network_tx
                         .try_send(NetworkCommand::AnnounceFiles {
                             files: vec![updated_file.clone()],
                         });
 
                     refresh_file_cache(&local_index, &file_cache).await;
+                    tokio::task::yield_now().await;
 
                     let _ = app.emit("file-hashed", serde_json::json!({
                         "temp_id": file_temp_id,
@@ -151,13 +150,18 @@ pub async fn add_shared_folder(
 
                     hashed_count += 1;
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!("Failed to hash {}: {e}", file.name);
+                Ok(Ok(Err(e))) => {
+                    warn!("Failed to hash {}: {e}", file.name);
                     let mut index = local_index.write().await;
                     index.remove_file_by_id(&file_temp_id);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::error!("Hash task panicked for {}: {e}", file.name);
+                    let mut index = local_index.write().await;
+                    index.remove_file_by_id(&file_temp_id);
+                }
+                Err(_) => {
+                    warn!("Hash timed out after 5 min for {} (file may be on cloud storage or locked), skipping", file.name);
                     let mut index = local_index.write().await;
                     index.remove_file_by_id(&file_temp_id);
                 }
@@ -213,23 +217,12 @@ pub async fn remove_shared_folder(
     }
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
 
-    // DB + network cleanup in background -- don't block the command
-    let db = state.db.clone();
     let network_tx = state.network_tx.clone();
     tokio::spawn(async move {
-        let hashes = removed_hashes;
-        if !hashes.is_empty() {
-            let db_hashes = hashes.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                for hash in &db_hashes {
-                    let _ = db.remove_shared_file_by_hash(hash);
-                }
-            })
-            .await;
-
+        if !removed_hashes.is_empty() {
             let _ = network_tx
                 .try_send(NetworkCommand::UnannounceFiles {
-                    file_hashes: hashes,
+                    file_hashes: removed_hashes,
                 });
         }
         let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
@@ -287,7 +280,6 @@ pub async fn reload_shared_files(
 
     let local_index = state.local_index.clone();
     let file_cache = state.cached_shared_files.clone();
-    let db = state.db.clone();
     let network_tx = state.network_tx.clone();
     let scanning = state.scanning_count.clone();
 
@@ -328,7 +320,7 @@ pub async fn reload_shared_files(
         // Phase 2: hash one at a time
         let mut hashed_count: usize = 0;
 
-        for file in &discovered {
+        for (file_idx, file) in discovered.iter().enumerate() {
             let file_path = file.path.clone();
             let file_temp_id = file.id.clone();
 
@@ -341,19 +333,25 @@ pub async fn reload_shared_files(
                 }
             }
 
+            debug!("Reload hashing {}/{}: {}", file_idx + 1, total_files, file.name);
+
             let _ = app.emit("file-hash-progress", serde_json::json!({
                 "current": hashed_count + 1,
                 "total": total_files,
                 "file_name": file.name,
             }));
 
-            let hash_result = tokio::task::spawn_blocking(move || {
-                FileIndexer::hash_file(std::path::Path::new(&file_path))
-            })
+            let hash_result = tokio::time::timeout(
+                std::time::Duration::from_secs(300),
+                tokio::task::spawn_blocking(move || {
+                    FileIndexer::hash_file(std::path::Path::new(&file_path))
+                }),
+            )
             .await;
 
             match hash_result {
-                Ok(Ok((ed2k_hash, aich_hash))) => {
+                Ok(Ok(Ok((ed2k_hash, aich_hash)))) => {
+                    debug!("Reload hash complete {}/{}: {} -> {}", file_idx + 1, total_files, file.name, &ed2k_hash[..8]);
                     let mut updated_file = file.clone();
                     updated_file.id = ed2k_hash.clone();
                     updated_file.hash = ed2k_hash;
@@ -366,29 +364,29 @@ pub async fn reload_shared_files(
                             index.add_file(updated_file.clone());
                         }
                     }
-                    refresh_file_cache(&local_index, &file_cache).await;
-
-                    let db_ref = db.clone();
-                    let db_file = updated_file.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _ = db_ref.save_shared_file(&db_file);
-                    })
-                    .await;
 
                     let _ = network_tx
                         .try_send(NetworkCommand::AnnounceFiles {
                             files: vec![updated_file.clone()],
                         });
 
+                    refresh_file_cache(&local_index, &file_cache).await;
+                    tokio::task::yield_now().await;
+
                     hashed_count += 1;
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!("Failed to hash {}: {e}", file.name);
+                Ok(Ok(Err(e))) => {
+                    warn!("Failed to hash {}: {e}", file.name);
                     let mut index = local_index.write().await;
                     index.remove_file_by_id(&file_temp_id);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::error!("Hash task panicked for {}: {e}", file.name);
+                    let mut index = local_index.write().await;
+                    index.remove_file_by_id(&file_temp_id);
+                }
+                Err(_) => {
+                    warn!("Hash timed out after 5 min for {} (file may be on cloud storage or locked), skipping", file.name);
                     let mut index = local_index.write().await;
                     index.remove_file_by_id(&file_temp_id);
                 }
@@ -429,11 +427,6 @@ pub async fn unshare_file(
     };
     if toggled {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        let db = state.db.clone();
-        let hash = file_hash.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = db.update_shared_flag(&hash, false);
-        }).await.ok();
         let _ = state.network_tx.try_send(NetworkCommand::UnannounceFiles {
             file_hashes: vec![file_hash],
         });
@@ -454,11 +447,6 @@ pub async fn share_file(
     };
     if let Some(f) = file {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        let db = state.db.clone();
-        let hash = file_hash.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = db.update_shared_flag(&hash, true);
-        }).await.ok();
         let _ = state.network_tx.try_send(NetworkCommand::AnnounceFiles {
             files: vec![f],
         });
@@ -478,13 +466,6 @@ pub async fn unshare_folder(
     };
     if !affected_hashes.is_empty() {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        let db = state.db.clone();
-        let hashes = affected_hashes.clone();
-        tokio::task::spawn_blocking(move || {
-            for hash in &hashes {
-                let _ = db.update_shared_flag(hash, false);
-            }
-        }).await.ok();
         let _ = state.network_tx.try_send(NetworkCommand::UnannounceFiles {
             file_hashes: affected_hashes,
         });

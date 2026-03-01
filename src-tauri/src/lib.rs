@@ -121,25 +121,12 @@ pub fn run() {
             });
 
             let index_clone = local_index.clone();
-            let db_clone = db.clone();
             let shared_folders = settings.shared_folders.clone();
             let startup_scanning = scanning_count.clone();
             let csf = cached_shared_files.clone();
             let startup_app = app_handle.clone();
             let net_tx = startup_network_tx;
             tauri::async_runtime::spawn(async move {
-                // Pre-populate index from database for fast startup
-                match db_clone.get_shared_files() {
-                    Ok(cached_files) if !cached_files.is_empty() => {
-                        let count = cached_files.len();
-                        let mut index = index_clone.write().await;
-                        index.add_files(cached_files);
-                        info!("Pre-loaded {count} files from database cache");
-                    }
-                    _ => {}
-                }
-                { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
-
                 if shared_folders.is_empty() {
                     info!("Indexed 0 files from 0 shared folders");
                     return;
@@ -170,7 +157,7 @@ pub fn run() {
                 // Phase 2: hash one file at a time (same pattern as addSharedFolder)
                 let total = all_discovered.len();
                 let mut hashed = 0usize;
-                for file in &all_discovered {
+                for (file_idx, file) in all_discovered.iter().enumerate() {
                     let file_path = file.path.clone();
                     let file_temp_id = file.id.clone();
 
@@ -182,18 +169,24 @@ pub fn run() {
                         }
                     }
 
+                    tracing::debug!("Startup hashing {}/{}: {}", file_idx + 1, total, file.name);
+
                     let _ = startup_app.emit("file-hash-progress", serde_json::json!({
                         "current": hashed + 1,
                         "total": total,
                         "file_name": file.name,
                     }));
 
-                    let hash_result = tokio::task::spawn_blocking(move || {
-                        FileIndexer::hash_file(std::path::Path::new(&file_path))
-                    }).await;
+                    let hash_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(300),
+                        tokio::task::spawn_blocking(move || {
+                            FileIndexer::hash_file(std::path::Path::new(&file_path))
+                        }),
+                    ).await;
 
                     match hash_result {
-                        Ok(Ok((ed2k_hash, aich_hash))) => {
+                        Ok(Ok(Ok((ed2k_hash, aich_hash)))) => {
+                            tracing::debug!("Startup hash complete {}/{}: {} -> {}", file_idx + 1, total, file.name, &ed2k_hash[..8]);
                             let mut updated = file.clone();
                             updated.id = ed2k_hash.clone();
                             updated.hash = ed2k_hash;
@@ -203,30 +196,32 @@ pub fn run() {
                                 idx.remove_file_by_id(&file_temp_id);
                                 idx.add_file(updated.clone());
                             }
-                            { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
-                            let db_ref = db_clone.clone();
-                            let announce = updated.clone();
-                            tokio::task::spawn_blocking(move || {
-                                let _ = db_ref.save_shared_file(&announce);
-                            }).await.ok();
                             let _ = net_tx.try_send(network::NetworkCommand::AnnounceFiles {
                                 files: vec![updated],
                             });
+                            { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
+                            tokio::task::yield_now().await;
                             hashed += 1;
                         }
-                        Ok(Err(e)) => {
+                        Ok(Ok(Err(e))) => {
                             tracing::warn!("Startup hash failed for {}: {e}", file.name);
                             let mut idx = index_clone.write().await;
                             idx.remove_file_by_id(&file_temp_id);
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             tracing::error!("Startup hash task panicked for {}: {e}", file.name);
+                            let mut idx = index_clone.write().await;
+                            idx.remove_file_by_id(&file_temp_id);
+                        }
+                        Err(_) => {
+                            tracing::warn!("Startup hash timed out for {} (file may be on cloud storage or locked), skipping", file.name);
                             let mut idx = index_clone.write().await;
                             idx.remove_file_by_id(&file_temp_id);
                         }
                     }
                 }
 
+                { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
                 startup_scanning.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 let _ = net_tx.try_send(network::NetworkCommand::SharedFilesChanged);
                 let _ = startup_app.emit("file-hash-progress", serde_json::json!({
