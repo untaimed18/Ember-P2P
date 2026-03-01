@@ -122,6 +122,7 @@ pub async fn add_shared_folder(
 
         let total_to_hash = files_to_hash.len();
         let mut hashed_count: usize = 0;
+        let mut last_cache_refresh = std::time::Instant::now();
 
         for file in &files_to_hash {
             let file_path = file.path.clone();
@@ -163,7 +164,10 @@ pub async fn add_shared_folder(
                         });
 
                     hashed_count += 1;
-                    refresh_file_cache(&local_index, &file_cache).await;
+                    if last_cache_refresh.elapsed() >= std::time::Duration::from_secs(5) {
+                        refresh_file_cache(&local_index, &file_cache).await;
+                        last_cache_refresh = std::time::Instant::now();
+                    }
                 }
                 Ok(Ok(Err(e))) => {
                     warn!("Failed to hash {}: {e}", file.name);
@@ -183,6 +187,7 @@ pub async fn add_shared_folder(
             }
         }
 
+        refresh_file_cache(&local_index, &file_cache).await;
         let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
         scanning.fetch_sub(1, Ordering::Relaxed);
         let from_known = total_files - total_to_hash;
@@ -347,6 +352,7 @@ pub async fn reload_shared_files(
 
         let total_to_hash = files_to_hash.len();
         let mut hashed_count: usize = 0;
+        let mut last_cache_refresh = std::time::Instant::now();
 
         for file in &files_to_hash {
             let file_path = file.path.clone();
@@ -390,7 +396,10 @@ pub async fn reload_shared_files(
                         });
 
                     hashed_count += 1;
-                    refresh_file_cache(&local_index, &file_cache).await;
+                    if last_cache_refresh.elapsed() >= std::time::Duration::from_secs(5) {
+                        refresh_file_cache(&local_index, &file_cache).await;
+                        last_cache_refresh = std::time::Instant::now();
+                    }
                 }
                 Ok(Ok(Err(e))) => {
                     warn!("Failed to hash {}: {e}", file.name);
@@ -410,6 +419,7 @@ pub async fn reload_shared_files(
             }
         }
 
+        refresh_file_cache(&local_index, &file_cache).await;
         let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
         scanning.fetch_sub(1, Ordering::Relaxed);
         let from_known = total_files - total_to_hash;

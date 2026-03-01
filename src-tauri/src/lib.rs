@@ -188,6 +188,7 @@ pub fn run() {
                 // Phase 2: hash only files not found in known.met
                 let total_to_hash = files_to_hash.len();
                 let mut hashed = 0usize;
+                let mut last_cache_refresh = std::time::Instant::now();
 
                 for file in &files_to_hash {
                     let file_path = file.path.clone();
@@ -224,7 +225,10 @@ pub fn run() {
                                 files: vec![updated],
                             });
                             hashed += 1;
-                            { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
+                            if last_cache_refresh.elapsed() >= std::time::Duration::from_secs(5) {
+                                { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
+                                last_cache_refresh = std::time::Instant::now();
+                            }
                         }
                         Ok(Ok(Err(e))) => {
                             tracing::warn!("Startup hash failed for {}: {e}", file.name);
@@ -244,6 +248,7 @@ pub fn run() {
                     }
                 }
 
+                { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
                 startup_scanning.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 let _ = net_tx.try_send(network::NetworkCommand::SharedFilesChanged);
                 let _ = startup_app.emit("file-hash-progress", serde_json::json!({
