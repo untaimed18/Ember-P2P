@@ -143,7 +143,7 @@ impl Ed2kServerConnection {
             motd_messages: Vec::new(),
         };
 
-        for i in 0..10 {
+        for i in 0..50 {
             let (opcode, payload) = match self.read_packet().await {
                 Ok(p) => p,
                 Err(e) => {
