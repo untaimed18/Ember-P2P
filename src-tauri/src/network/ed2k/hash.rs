@@ -6,13 +6,20 @@
 
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use digest::Digest;
 use md4::Md4;
 
 pub const PARTSIZE: u64 = 9_728_000;
 
+/// Non-cancellable version used by download verification (transfer.rs, multi_source.rs).
 pub fn ed2k_hash_file(path: &Path) -> anyhow::Result<String> {
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    ed2k_hash_file_cancellable(path, &NEVER)
+}
+
+pub fn ed2k_hash_file_cancellable(path: &Path, cancelled: &AtomicBool) -> anyhow::Result<String> {
     let mut file = std::fs::File::open(path)?;
     let file_size = file.metadata()?.len();
 
@@ -30,6 +37,9 @@ pub fn ed2k_hash_file(path: &Path) -> anyhow::Result<String> {
         let mut hasher = Md4::new();
         let mut buf = vec![0u8; 64 * 1024];
         loop {
+            if cancelled.load(Ordering::Relaxed) {
+                anyhow::bail!("cancelled");
+            }
             let n = file.read(&mut buf)?;
             if n == 0 { break; }
             hasher.update(&buf[..n]);
@@ -47,6 +57,9 @@ pub fn ed2k_hash_file(path: &Path) -> anyhow::Result<String> {
         let mut hasher = Md4::new();
         let mut chunk_remaining = chunk_size;
         while chunk_remaining > 0 {
+            if cancelled.load(Ordering::Relaxed) {
+                anyhow::bail!("cancelled");
+            }
             let to_read = (chunk_remaining as usize).min(buf.len());
             let n = file.read(&mut buf[..to_read])?;
             if n == 0 { break; }
@@ -57,7 +70,6 @@ pub fn ed2k_hash_file(path: &Path) -> anyhow::Result<String> {
         remaining -= chunk_size;
     }
 
-    // eMule appends MD4(empty) when file size is an exact multiple of PARTSIZE
     if file_size % PARTSIZE == 0 {
         let empty_hash = Md4::digest([]);
         chunk_hashes.extend_from_slice(&empty_hash);

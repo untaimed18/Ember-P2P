@@ -145,6 +145,7 @@ pub async fn open_file(
     }
     let config = state.config.read().await;
     let file_path = std::path::PathBuf::from(&config.settings.download_folder)
+        .join("Downloads")
         .join(&transfer.file_name);
     if !file_path.exists() {
         return Err("File not found on disk".into());

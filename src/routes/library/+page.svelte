@@ -6,6 +6,8 @@
     getSharedFolders,
     reloadSharedFiles,
     getScanStatus,
+    stopHashing,
+    resumeHashing,
     setFilePriority,
     unshareFile,
     shareFile,
@@ -114,6 +116,24 @@
       if (mounted) error = toErr(e);
     }
   }
+
+  async function handleStopHashing() {
+    try {
+      await stopHashing();
+    } catch (e: unknown) {
+      if (mounted) error = toErr(e);
+    }
+  }
+
+  async function handleResumeHashing() {
+    try {
+      await resumeHashing();
+    } catch (e: unknown) {
+      if (mounted) error = toErr(e);
+    }
+  }
+
+  let hasUnhashedFiles = $derived(files.some(f => !f.hash));
 
   // --- Filtering ---
   let filteredFiles = $derived.by(() => {
@@ -439,11 +459,19 @@
     {#if scanning || hashProgress}
       <div class="scan-banner">
         <span class="scan-spinner"></span>
-        {#if hashProgress}
-          Hashing file {hashProgress.current} of {hashProgress.total}: {hashProgress.file_name}
-        {:else}
-          Scanning files&hellip;
-        {/if}
+        <span class="scan-text">
+          {#if hashProgress}
+            Hashing file {hashProgress.current} of {hashProgress.total}: {hashProgress.file_name}
+          {:else}
+            Scanning files&hellip;
+          {/if}
+        </span>
+        <button class="scan-btn stop-btn" onclick={handleStopHashing}>Stop</button>
+      </div>
+    {:else if hasUnhashedFiles && !scanning}
+      <div class="scan-banner resume-banner">
+        <span class="scan-text">Hashing incomplete &mdash; some files are pending</span>
+        <button class="scan-btn resume-btn" onclick={handleResumeHashing}>Resume</button>
       </div>
     {/if}
     {#if sortedFiles.length === 0 && !scanning}
@@ -606,6 +634,20 @@
     font-size: 12px;
     flex-shrink: 0;
   }
+  .scan-text { flex: 1; }
+  .resume-banner { color: var(--warning, #e0a030); }
+  .scan-btn {
+    padding: 2px 10px;
+    font-size: 11px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .stop-btn { background: var(--danger, #e74c3c); color: #fff; border-color: var(--danger, #e74c3c); }
+  .stop-btn:hover { opacity: 0.85; }
+  .resume-btn { background: var(--accent, #3498db); color: #fff; border-color: var(--accent, #3498db); }
+  .resume-btn:hover { opacity: 0.85; }
 
   .scan-spinner {
     width: 12px;

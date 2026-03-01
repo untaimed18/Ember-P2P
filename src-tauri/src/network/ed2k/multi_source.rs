@@ -99,14 +99,10 @@ impl MultiSourceDownload {
             self.sources.len()
         );
 
-        // Part files go in Temp/, completed files go in download_dir
         let temp_dir = self.download_dir.join("Temp");
-        if !self.download_dir.exists() {
-            std::fs::create_dir_all(&self.download_dir)?;
-        }
-        if !temp_dir.exists() {
-            std::fs::create_dir_all(&temp_dir)?;
-        }
+        let completed_dir = self.download_dir.join("Downloads");
+        std::fs::create_dir_all(&temp_dir)?;
+        std::fs::create_dir_all(&completed_dir)?;
 
         let part_path = temp_dir.join(format!("{}.part", self.transfer_id));
         let mut pt = PartTracker::new(self.file_size, &part_path);
@@ -666,7 +662,7 @@ impl MultiSourceDownload {
                 .await;
 
             let safe_name = crate::security::sanitize_filename(&self.file_name);
-            let final_path = self.download_dir.join(&safe_name);
+            let final_path = self.download_dir.join("Downloads").join(&safe_name);
             if let Err(e) = std::fs::rename(&part_path, &final_path) {
                 if is_cross_device_error(&e) {
                     std::fs::copy(&part_path, &final_path)?;

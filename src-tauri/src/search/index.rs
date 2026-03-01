@@ -115,6 +115,15 @@ impl LocalIndex {
         self.rebuild_indices();
     }
 
+    /// Remove all files that still have a "pending:..." temp id (unhashed).
+    pub fn remove_pending_files(&mut self) {
+        let before = self.files.len();
+        self.files.retain(|f| !f.id.starts_with("pending:"));
+        if self.files.len() != before {
+            self.rebuild_indices();
+        }
+    }
+
     /// Remove a file by its `id` field (handles temporary "pending:..." ids
     /// assigned during the discovery phase before hashing completes).
     pub fn remove_file_by_id(&mut self, id: &str) -> Option<FileInfo> {

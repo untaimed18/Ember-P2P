@@ -1,4 +1,4 @@
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::Emitter;
 
@@ -73,10 +73,12 @@ pub async fn add_shared_folder(
     let file_cache = state.cached_shared_files.clone();
     let network_tx = state.network_tx.clone();
     let scanning = state.scanning_count.clone();
+    let cancel_flags = state.hash_cancel_flags.clone();
 
     scanning.fetch_add(1, Ordering::Relaxed);
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    cancel_flags.write().await.insert(path.clone(), cancel_flag.clone());
 
-    // Everything runs in background -- command returns immediately
     tokio::spawn(async move {
         let discover_path = path.clone();
         let mut discovered = match tokio::task::spawn_blocking(move || {
@@ -88,6 +90,7 @@ pub async fn add_shared_folder(
             Err(e) => {
                 tracing::error!("Discovery failed for {path}: {e}");
                 scanning.fetch_sub(1, Ordering::Relaxed);
+                cancel_flags.write().await.remove(&path);
                 return;
             }
         };
@@ -110,23 +113,21 @@ pub async fn add_shared_folder(
             "phase": "discovered",
         }));
 
-        let known_for_announce: Vec<_> = discovered.iter()
-            .filter(|f| !f.hash.is_empty())
-            .cloned()
-            .collect();
-        if !known_for_announce.is_empty() {
-            let _ = network_tx.try_send(NetworkCommand::AnnounceFiles {
-                files: known_for_announce,
-            });
-        }
-
         let total_to_hash = files_to_hash.len();
         let mut hashed_count: usize = 0;
         let mut last_cache_refresh = std::time::Instant::now();
+        let mut was_cancelled = false;
 
         for file in &files_to_hash {
+            if cancel_flag.load(Ordering::Relaxed) {
+                info!("Hashing cancelled for {path} at {hashed_count}/{total_to_hash}");
+                was_cancelled = true;
+                break;
+            }
+
             let file_path = file.path.clone();
             let file_temp_id = file.id.clone();
+            let cf = cancel_flag.clone();
 
             debug!("Hashing file {}/{}: {}", hashed_count + 1, total_to_hash, file.name);
 
@@ -139,7 +140,7 @@ pub async fn add_shared_folder(
             let hash_result = tokio::time::timeout(
                 std::time::Duration::from_secs(300),
                 tokio::task::spawn_blocking(move || {
-                    FileIndexer::hash_file(std::path::Path::new(&file_path))
+                    FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
                 }),
             )
             .await;
@@ -158,11 +159,6 @@ pub async fn add_shared_folder(
                         index.add_file(updated_file.clone());
                     }
 
-                    let _ = network_tx
-                        .try_send(NetworkCommand::AnnounceFiles {
-                            files: vec![updated_file.clone()],
-                        });
-
                     hashed_count += 1;
                     if last_cache_refresh.elapsed() >= std::time::Duration::from_secs(5) {
                         refresh_file_cache(&local_index, &file_cache).await;
@@ -170,6 +166,14 @@ pub async fn add_shared_folder(
                     }
                 }
                 Ok(Ok(Err(e))) => {
+                    let msg = e.to_string();
+                    if msg.contains("cancelled") {
+                        info!("Hashing cancelled mid-file for {path}");
+                        was_cancelled = true;
+                        let mut index = local_index.write().await;
+                        index.remove_file_by_id(&file_temp_id);
+                        break;
+                    }
                     warn!("Failed to hash {}: {e}", file.name);
                     let mut index = local_index.write().await;
                     index.remove_file_by_id(&file_temp_id);
@@ -187,11 +191,36 @@ pub async fn add_shared_folder(
             }
         }
 
+        if was_cancelled {
+            let mut index = local_index.write().await;
+            index.remove_pending_files();
+        }
+
         refresh_file_cache(&local_index, &file_cache).await;
+
+        if !was_cancelled {
+            let all_files = {
+                let index = local_index.read().await;
+                index.all_files().iter()
+                    .filter(|f| f.path.starts_with(&path) && !f.hash.is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            if !all_files.is_empty() {
+                let _ = network_tx.try_send(NetworkCommand::AnnounceFiles { files: all_files });
+            }
+        }
+
         let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
         scanning.fetch_sub(1, Ordering::Relaxed);
+        cancel_flags.write().await.remove(&path);
+
         let from_known = total_files - total_to_hash;
-        info!("Background hashing complete: {hashed_count}/{total_to_hash} hashed, {from_known} from known.met ({path})");
+        if was_cancelled {
+            info!("Hashing stopped for {path}: {hashed_count}/{total_to_hash} hashed before cancel, {from_known} from known.met");
+        } else {
+            info!("Background hashing complete: {hashed_count}/{total_to_hash} hashed, {from_known} from known.met ({path})");
+        }
 
         let _ = app.emit("file-hash-progress", serde_json::json!({
             "current": total_to_hash,
@@ -209,6 +238,21 @@ pub async fn remove_shared_folder(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
+    // Cancel any in-progress hashing for this folder before cleanup
+    {
+        let flags = state.hash_cancel_flags.read().await;
+        if let Some(flag) = flags.get(&path) {
+            flag.store(true, Ordering::Relaxed);
+        }
+        if let Some(flag) = flags.get("__reload__") {
+            flag.store(true, Ordering::Relaxed);
+        }
+        if let Some(flag) = flags.get("__startup__") {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
     let removed_hashes: Vec<String> = {
         let index = state.local_index.read().await;
         index
@@ -302,10 +346,12 @@ pub async fn reload_shared_files(
     let file_cache = state.cached_shared_files.clone();
     let network_tx = state.network_tx.clone();
     let scanning = state.scanning_count.clone();
+    let cancel_flags = state.hash_cancel_flags.clone();
 
     scanning.fetch_add(1, Ordering::Relaxed);
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    cancel_flags.write().await.insert("__reload__".to_string(), cancel_flag.clone());
 
-    // Everything runs in background -- command returns immediately
     tokio::spawn(async move {
         let mut discovered: Vec<FileInfo> = match tokio::task::spawn_blocking(move || {
             let mut files = Vec::new();
@@ -320,6 +366,7 @@ pub async fn reload_shared_files(
             Err(e) => {
                 tracing::error!("Reload discovery failed: {e}");
                 scanning.fetch_sub(1, Ordering::Relaxed);
+                cancel_flags.write().await.remove("__reload__");
                 return;
             }
         };
@@ -340,23 +387,21 @@ pub async fn reload_shared_files(
             "count": total_files,
         }));
 
-        let known_for_announce: Vec<_> = discovered.iter()
-            .filter(|f| !f.hash.is_empty())
-            .cloned()
-            .collect();
-        if !known_for_announce.is_empty() {
-            let _ = network_tx.try_send(NetworkCommand::AnnounceFiles {
-                files: known_for_announce,
-            });
-        }
-
         let total_to_hash = files_to_hash.len();
         let mut hashed_count: usize = 0;
         let mut last_cache_refresh = std::time::Instant::now();
+        let mut was_cancelled = false;
 
         for file in &files_to_hash {
+            if cancel_flag.load(Ordering::Relaxed) {
+                info!("Reload hashing cancelled at {hashed_count}/{total_to_hash}");
+                was_cancelled = true;
+                break;
+            }
+
             let file_path = file.path.clone();
             let file_temp_id = file.id.clone();
+            let cf = cancel_flag.clone();
 
             debug!("Reload hashing {}/{}: {}", hashed_count + 1, total_to_hash, file.name);
 
@@ -369,7 +414,7 @@ pub async fn reload_shared_files(
             let hash_result = tokio::time::timeout(
                 std::time::Duration::from_secs(300),
                 tokio::task::spawn_blocking(move || {
-                    FileIndexer::hash_file(std::path::Path::new(&file_path))
+                    FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
                 }),
             )
             .await;
@@ -390,11 +435,6 @@ pub async fn reload_shared_files(
                         }
                     }
 
-                    let _ = network_tx
-                        .try_send(NetworkCommand::AnnounceFiles {
-                            files: vec![updated_file.clone()],
-                        });
-
                     hashed_count += 1;
                     if last_cache_refresh.elapsed() >= std::time::Duration::from_secs(5) {
                         refresh_file_cache(&local_index, &file_cache).await;
@@ -402,6 +442,14 @@ pub async fn reload_shared_files(
                     }
                 }
                 Ok(Ok(Err(e))) => {
+                    let msg = e.to_string();
+                    if msg.contains("cancelled") {
+                        info!("Reload hashing cancelled mid-file");
+                        was_cancelled = true;
+                        let mut index = local_index.write().await;
+                        index.remove_file_by_id(&file_temp_id);
+                        break;
+                    }
                     warn!("Failed to hash {}: {e}", file.name);
                     let mut index = local_index.write().await;
                     index.remove_file_by_id(&file_temp_id);
@@ -419,11 +467,32 @@ pub async fn reload_shared_files(
             }
         }
 
+        if was_cancelled {
+            let mut index = local_index.write().await;
+            index.remove_pending_files();
+        }
+
         refresh_file_cache(&local_index, &file_cache).await;
+
+        if !was_cancelled {
+            let all_files = {
+                let index = local_index.read().await;
+                index.all_files().iter()
+                    .filter(|f| !f.hash.is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            if !all_files.is_empty() {
+                let _ = network_tx.try_send(NetworkCommand::AnnounceFiles { files: all_files });
+            }
+        }
+
         let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
         scanning.fetch_sub(1, Ordering::Relaxed);
+        cancel_flags.write().await.remove("__reload__");
+
         let from_known = total_files - total_to_hash;
-        info!("Background reload complete: {hashed_count}/{total_to_hash} hashed, {from_known} from known.met");
+        info!("Reload complete: {hashed_count}/{total_to_hash} hashed, {from_known} from known.met{}", if was_cancelled { " (cancelled)" } else { "" });
 
         let _ = app.emit("file-hash-progress", serde_json::json!({
             "current": total_to_hash,
@@ -441,6 +510,27 @@ pub async fn get_scan_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<bool, String> {
     Ok(state.scanning_count.load(Ordering::Relaxed) > 0)
+}
+
+#[tauri::command]
+pub async fn stop_hashing(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let flags = state.hash_cancel_flags.read().await;
+    let count = flags.len();
+    for flag in flags.values() {
+        flag.store(true, Ordering::Relaxed);
+    }
+    info!("Stop hashing requested, cancelled {count} active tasks");
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn resume_hashing(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    reload_shared_files(app, state).await
 }
 
 #[tauri::command]

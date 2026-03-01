@@ -29,6 +29,14 @@ export async function getScanStatus(): Promise<boolean> {
   return invoke('get_scan_status');
 }
 
+export async function stopHashing(): Promise<void> {
+  return invoke('stop_hashing');
+}
+
+export async function resumeHashing(): Promise<void> {
+  return invoke('resume_hashing');
+}
+
 export async function unshareFile(fileHash: string): Promise<void> {
   return invoke('unshare_file', { fileHash });
 }

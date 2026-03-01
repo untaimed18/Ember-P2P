@@ -1,4 +1,5 @@
-use std::sync::atomic::AtomicUsize;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
@@ -23,6 +24,9 @@ pub struct AppState {
     pub bw_shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// Number of folder scans currently running in the background.
     pub scanning_count: Arc<AtomicUsize>,
+    /// Per-folder cancellation flags for background hashing tasks.
+    /// Key = folder path (or "__reload__" / "__startup__" for special tasks).
+    pub hash_cancel_flags: Arc<RwLock<HashMap<String, Arc<AtomicBool>>>>,
     /// Cached peer list updated by the network loop — read directly by Tauri commands.
     pub cached_peers: Arc<RwLock<Vec<PeerInfo>>>,
     /// Cached network stats updated by the network loop — read directly by Tauri commands.

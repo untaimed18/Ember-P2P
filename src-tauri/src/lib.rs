@@ -90,6 +90,7 @@ pub fn run() {
             let cached_connected_server: Arc<RwLock<Option<crate::types::ServerInfo>>> = Arc::new(RwLock::new(None));
             let cached_transfer_stats: Arc<RwLock<crate::storage::statistics::TransferStats>> = Arc::new(RwLock::new(Default::default()));
             let cached_shared_files: Arc<RwLock<Vec<crate::types::FileInfo>>> = Arc::new(RwLock::new(Vec::new()));
+            let hash_cancel_flags: Arc<RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>> = Arc::new(RwLock::new(std::collections::HashMap::new()));
             let cached_peers_net = cached_peers.clone();
             let cached_stats_net = cached_stats.clone();
             let cached_contacts_net = cached_contacts.clone();
@@ -118,6 +119,7 @@ pub fn run() {
                 cached_connected_server,
                 cached_transfer_stats,
                 cached_shared_files: cached_shared_files.clone(),
+                hash_cancel_flags: hash_cancel_flags.clone(),
             });
 
             let index_clone = local_index.clone();
@@ -126,6 +128,7 @@ pub fn run() {
             let csf = cached_shared_files.clone();
             let startup_app = app_handle.clone();
             let net_tx = startup_network_tx;
+            let startup_cancel_flags = hash_cancel_flags.clone();
             tauri::async_runtime::spawn(async move {
                 if shared_folders.is_empty() {
                     info!("Indexed 0 files from 0 shared folders");
@@ -133,8 +136,9 @@ pub fn run() {
                 }
 
                 startup_scanning.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                startup_cancel_flags.write().await.insert("__startup__".to_string(), cancel_flag.clone());
 
-                // Phase 1: fast discovery (metadata only, no hashing) for all folders
                 let mut all_discovered: Vec<crate::types::FileInfo> = Vec::new();
                 for folder in &shared_folders {
                     let f = folder.clone();
@@ -144,7 +148,6 @@ pub fn run() {
                     all_discovered.extend(discovered);
                 }
 
-                // eMule pattern: check known.met before hashing (CSharedFileList::CheckAndAddSingleFile)
                 let known_list = {
                     let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
                         .map(|d| d.data_dir().to_path_buf())
@@ -175,24 +178,21 @@ pub fn run() {
                     "count": all_discovered.len(),
                 }));
 
-                let known_for_announce: Vec<_> = all_discovered.iter()
-                    .filter(|f| !f.hash.is_empty())
-                    .cloned()
-                    .collect();
-                if !known_for_announce.is_empty() {
-                    let _ = net_tx.try_send(network::NetworkCommand::AnnounceFiles {
-                        files: known_for_announce,
-                    });
-                }
-
-                // Phase 2: hash only files not found in known.met
                 let total_to_hash = files_to_hash.len();
                 let mut hashed = 0usize;
                 let mut last_cache_refresh = std::time::Instant::now();
+                let mut was_cancelled = false;
 
                 for file in &files_to_hash {
+                    if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        info!("Startup hashing cancelled at {hashed}/{total_to_hash}");
+                        was_cancelled = true;
+                        break;
+                    }
+
                     let file_path = file.path.clone();
                     let file_temp_id = file.id.clone();
+                    let cf = cancel_flag.clone();
 
                     tracing::debug!("Startup hashing {}/{}: {}", hashed + 1, total_to_hash, file.name);
 
@@ -205,7 +205,7 @@ pub fn run() {
                     let hash_result = tokio::time::timeout(
                         std::time::Duration::from_secs(300),
                         tokio::task::spawn_blocking(move || {
-                            FileIndexer::hash_file(std::path::Path::new(&file_path))
+                            FileIndexer::hash_file_cancellable(std::path::Path::new(&file_path), &cf)
                         }),
                     ).await;
 
@@ -221,9 +221,6 @@ pub fn run() {
                                 idx.remove_file_by_id(&file_temp_id);
                                 idx.add_file(updated.clone());
                             }
-                            let _ = net_tx.try_send(network::NetworkCommand::AnnounceFiles {
-                                files: vec![updated],
-                            });
                             hashed += 1;
                             if last_cache_refresh.elapsed() >= std::time::Duration::from_secs(5) {
                                 { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
@@ -231,6 +228,13 @@ pub fn run() {
                             }
                         }
                         Ok(Ok(Err(e))) => {
+                            if e.to_string().contains("cancelled") {
+                                info!("Startup hashing cancelled mid-file");
+                                was_cancelled = true;
+                                let mut idx = index_clone.write().await;
+                                idx.remove_file_by_id(&file_temp_id);
+                                break;
+                            }
                             tracing::warn!("Startup hash failed for {}: {e}", file.name);
                             let mut idx = index_clone.write().await;
                             idx.remove_file_by_id(&file_temp_id);
@@ -248,8 +252,25 @@ pub fn run() {
                     }
                 }
 
+                if was_cancelled {
+                    let mut idx = index_clone.write().await;
+                    idx.remove_pending_files();
+                }
+
                 { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
+
+                if !was_cancelled {
+                    let all_hashed: Vec<_> = index_clone.read().await.all_files().iter()
+                        .filter(|f| !f.hash.is_empty())
+                        .cloned()
+                        .collect();
+                    if !all_hashed.is_empty() {
+                        let _ = net_tx.try_send(network::NetworkCommand::AnnounceFiles { files: all_hashed });
+                    }
+                }
+
                 startup_scanning.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                startup_cancel_flags.write().await.remove("__startup__");
                 let _ = net_tx.try_send(network::NetworkCommand::SharedFilesChanged);
                 let _ = startup_app.emit("file-hash-progress", serde_json::json!({
                     "current": total_to_hash,
@@ -342,6 +363,8 @@ pub fn run() {
             commands::sharing::share_file,
             commands::sharing::unshare_folder,
             commands::sharing::get_scan_status,
+            commands::sharing::stop_hashing,
+            commands::sharing::resume_hashing,
             commands::sharing::open_shared_file,
             commands::sharing::open_shared_folder,
             commands::peers::get_peers,

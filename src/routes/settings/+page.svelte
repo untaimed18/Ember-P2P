@@ -217,6 +217,7 @@
               <input id="download-folder" value={settings.download_folder} readonly />
               <button class="folder-btn" onclick={pickDownloadFolder}>Browse</button>
             </div>
+            <span class="field-hint">Completed files: {settings.download_folder}\Downloads &nbsp;&bull;&nbsp; Part files: {settings.download_folder}\Temp</span>
           </div>
           <div class="field-row">
             <div class="field half">
@@ -719,6 +720,13 @@
     color: var(--text-primary);
     outline: none;
     min-width: 0;
+  }
+
+  .field-hint {
+    display: block;
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 4px;
   }
 
   .folder-btn {

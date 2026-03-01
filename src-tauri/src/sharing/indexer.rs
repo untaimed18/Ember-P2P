@@ -1,10 +1,11 @@
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
-use crate::network::ed2k::aich::compute_aich_root;
-use crate::network::ed2k::hash::ed2k_hash_file;
+use crate::network::ed2k::aich::{compute_aich_root, compute_aich_root_cancellable};
+use crate::network::ed2k::hash::{ed2k_hash_file, ed2k_hash_file_cancellable};
 use crate::types::FileInfo;
 
 pub struct FileIndexer;
@@ -114,11 +115,19 @@ impl FileIndexer {
         })
     }
 
-    /// Compute ED2K + AICH hashes for a single file (blocking, CPU-intensive).
-    /// Returns (ed2k_hash_hex, aich_hash_hex).
+    #[allow(dead_code)]
     pub fn hash_file(path: &Path) -> anyhow::Result<(String, String)> {
         let ed2k = ed2k_hash_file(path)?;
         let aich = compute_aich_root(path)
+            .map(|h| hex::encode(h))
+            .unwrap_or_default();
+        Ok((ed2k, aich))
+    }
+
+    /// Cancellable version -- checks `cancelled` between read chunks.
+    pub fn hash_file_cancellable(path: &Path, cancelled: &AtomicBool) -> anyhow::Result<(String, String)> {
+        let ed2k = ed2k_hash_file_cancellable(path, cancelled)?;
+        let aich = compute_aich_root_cancellable(path, cancelled)
             .map(|h| hex::encode(h))
             .unwrap_or_default();
         Ok((ed2k, aich))

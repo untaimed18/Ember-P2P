@@ -1,5 +1,6 @@
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use digest::Digest;
 use sha1::Sha1;
@@ -7,9 +8,13 @@ use sha1::Sha1;
 /// AICH block size: 180 KiB (eMule's EMBLOCKSIZE)
 pub const AICH_BLOCK_SIZE: usize = 184_320;
 
-/// Compute the AICH root hash for a file.
-/// Returns the SHA-1 root of the Merkle hash tree built from 180KB blocks.
+#[allow(dead_code)]
 pub fn compute_aich_root(path: &Path) -> anyhow::Result<[u8; 20]> {
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    compute_aich_root_cancellable(path, &NEVER)
+}
+
+pub fn compute_aich_root_cancellable(path: &Path, cancelled: &AtomicBool) -> anyhow::Result<[u8; 20]> {
     let mut file = std::fs::File::open(path)?;
     let file_size = file.metadata()?.len();
 
@@ -24,6 +29,9 @@ pub fn compute_aich_root(path: &Path) -> anyhow::Result<[u8; 20]> {
     let mut remaining = file_size;
 
     for _ in 0..num_blocks {
+        if cancelled.load(Ordering::Relaxed) {
+            anyhow::bail!("cancelled");
+        }
         let block_size = remaining.min(block_size_u64) as usize;
         let buf_slice = &mut buf[..block_size];
         file.read_exact(buf_slice)?;
