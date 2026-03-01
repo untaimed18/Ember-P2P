@@ -4278,8 +4278,7 @@ async fn handle_command(
             let use_server = method == SearchMethod::Global || method == SearchMethod::Server;
             let use_kad = method == SearchMethod::Global || method == SearchMethod::Kad;
 
-            let index = local_index.read().await;
-            let local_results = index.search(&query);
+            let local_results: Vec<SearchResult> = Vec::new();
 
             if use_server {
                 if state.server_connected {

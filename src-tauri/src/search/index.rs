@@ -55,6 +55,7 @@ impl LocalIndex {
         self.files.push(file);
     }
 
+    #[allow(dead_code)]
     pub fn search(&self, query: &str) -> Vec<SearchResult> {
         let query_lower = query.to_lowercase();
         let query_tokens = tokenize(&query_lower);
