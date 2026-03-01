@@ -977,7 +977,17 @@ pub async fn start_network(
                                 state.dead_sources.remove(0, u32::from(ip), port);
                             }
                         }
-                        if let Ok(hash_bytes) = hex::decode(&t.file_hash) {
+                        let safe_name = crate::security::sanitize_filename(&t.file_name);
+                        let completed_path = PathBuf::from(&settings.download_folder)
+                            .join("Downloads")
+                            .join(&safe_name);
+                        let now = chrono::Utc::now().timestamp();
+                        let file_hash = t.file_hash.clone();
+                        let file_name = t.file_name.clone();
+                        let file_size = t.total_size;
+                        let transferred = t.transferred;
+
+                        if let Ok(hash_bytes) = hex::decode(&file_hash) {
                             if hash_bytes.len() == 16 {
                                 let mut fh = [0u8; 16];
                                 fh.copy_from_slice(&hash_bytes);
@@ -986,12 +996,12 @@ pub async fn start_network(
                                     let record = KnownFileRecord {
                                         file_hash: fh,
                                         part_hashes: Vec::new(),
-                                        file_name: t.file_name.clone(),
-                                        file_size: t.total_size,
-                                        file_path: String::new(),
+                                        file_name: file_name.clone(),
+                                        file_size,
+                                        file_path: completed_path.to_string_lossy().to_string(),
                                         aich_hash: String::new(),
-                                        modified_at: chrono::Utc::now().timestamp(),
-                                        all_time_transferred: t.transferred,
+                                        modified_at: now,
+                                        all_time_transferred: transferred,
                                         all_time_requested: 0,
                                         all_time_accepted: 0,
                                         upload_priority: 0,
@@ -1000,6 +1010,51 @@ pub async fn start_network(
                                     };
                                     known_files.add_or_update(record);
                                 }
+
+                                // Auto-share completed download (eMule: CPartFile::PerformFileCompleteEnd)
+                                let ext = completed_path.extension()
+                                    .map(|e| e.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                let folder = completed_path.parent()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                let shared_file = FileInfo {
+                                    id: file_hash.clone(),
+                                    name: safe_name,
+                                    path: completed_path.to_string_lossy().to_string(),
+                                    size: file_size,
+                                    hash: file_hash,
+                                    aich_hash: String::new(),
+                                    extension: ext,
+                                    modified_at: now,
+                                    priority: "normal".to_string(),
+                                    requests: 0,
+                                    accepted: 0,
+                                    bytes_transferred: 0,
+                                    alltime_requests: 0,
+                                    alltime_accepted: 0,
+                                    alltime_transferred: 0,
+                                    complete_sources: 0,
+                                    folder,
+                                    shared: true,
+                                    shared_kad: false,
+                                    shared_ed2k: false,
+                                };
+                                {
+                                    let mut index = local_index.write().await;
+                                    if index.get_by_hash(&shared_file.hash).is_none() {
+                                        index.add_file(shared_file.clone());
+                                    }
+                                }
+                                {
+                                    let snap = local_index.read().await.all_files().to_vec();
+                                    *shared_files.write().await = snap;
+                                }
+                                let _ = app_handle.emit("shared-files-changed", serde_json::json!({
+                                    "phase": "download-complete",
+                                    "count": 1,
+                                }));
+                                info!("Auto-shared completed download: {}", file_name);
                             }
                         }
                     }
