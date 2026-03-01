@@ -98,6 +98,14 @@ pub async fn add_shared_folder(
         let total_files = discovered.len();
         info!("Discovered {total_files} files in {path}");
 
+        if cancel_flag.load(Ordering::Relaxed) {
+            info!("Hashing cancelled during discovery for {path}");
+            scanning.fetch_sub(1, Ordering::Relaxed);
+            cancel_flags.write().await.remove(&path);
+            let _ = app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
+            return;
+        }
+
         let known_list = load_known_files();
         let files_to_hash = resolve_from_known(&mut discovered, &known_list);
 
@@ -372,6 +380,14 @@ pub async fn reload_shared_files(
         };
 
         let total_files = discovered.len();
+
+        if cancel_flag.load(Ordering::Relaxed) {
+            info!("Reload cancelled during discovery");
+            scanning.fetch_sub(1, Ordering::Relaxed);
+            cancel_flags.write().await.remove("__reload__");
+            let _ = app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
+            return;
+        }
 
         let known_list = load_known_files();
         let files_to_hash = resolve_from_known(&mut discovered, &known_list);

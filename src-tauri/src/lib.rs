@@ -148,6 +148,14 @@ pub fn run() {
                     all_discovered.extend(discovered);
                 }
 
+                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    info!("Startup hashing cancelled during discovery");
+                    startup_scanning.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    startup_cancel_flags.write().await.remove("__startup__");
+                    let _ = startup_app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
+                    return;
+                }
+
                 let known_list = {
                     let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
                         .map(|d| d.data_dir().to_path_buf())
