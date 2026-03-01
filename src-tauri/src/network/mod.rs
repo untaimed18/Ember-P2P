@@ -616,32 +616,8 @@ pub async fn start_network(
             }
         }
 
-        // Send FirewalledReq to detect our external IP + TCP firewall status.
-        state.firewall_checker.start_check();
-        if let Ok(mut probes) = firewall_probe_ips.lock() { probes.clear(); }
-        for contact in boot_contacts.iter().take(3) {
-            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-            let msg = KadMessage::FirewalledReq { tcp_port };
-            if let Ok(packet) = messages::encode_packet(&msg) {
-                state.flood_protection.track_request(addr, 0x50);
-                if let Ok(mut probes) = firewall_probe_ips.lock() { probes.insert(contact.ip); }
-                let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
-                state.firewall_checks_sent += 1;
-                state.firewall_checker.record_tcp_request_sent(contact.ip);
-            }
-        }
-        debug!("Sent {} firewall check requests", state.firewall_checks_sent);
-
-        // Send Ping to detect our external UDP port
-        for contact in boot_contacts.iter().skip(3).take(3) {
-            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-            let msg = KadMessage::Ping;
-            if let Ok(packet) = messages::encode_packet(&msg) {
-                state.flood_protection.track_request(addr, 0x60);
-                let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
-                state.firewall_checker.record_udp_request_sent();
-            }
-        }
+        // Firewall check is deferred to the periodic bootstrap_timer recheck,
+        // which fires once we have verified contacts (table_size >= 10).
     } else {
         info!("KAD auto-connect disabled, skipping bootstrap (use Connect to start KAD)");
     }
@@ -1589,11 +1565,13 @@ pub async fn start_network(
                 }
 
                 if state.firewall_checker.evaluate() {
-                    let was_firewalled = state.firewalled;
+                    let was_udp_fw = state.udp_firewalled;
+                    let was_tcp_fw = state.firewalled;
                     let had_ip = state.external_ip.is_some();
                     state.firewalled = state.firewall_checker.tcp_firewalled();
                     state.udp_firewalled = state.firewall_checker.udp_firewalled();
-                    state.stats.firewalled = state.firewalled;
+                    // KAD uses UDP -- the UI "Firewalled" indicator tracks UDP status.
+                    state.stats.firewalled = state.udp_firewalled;
                     state.firewalled_shared.store(state.firewalled, std::sync::atomic::Ordering::Relaxed);
                     state.publish_manager.firewalled = state.firewalled;
                     if let Some(buddy) = state.buddy_manager.buddy_id().cloned() {
@@ -1613,18 +1591,21 @@ pub async fn start_network(
                     }
                     info!("Firewall check result: TCP={:?} UDP={:?} (ports tcp={} udp={})",
                         tcp_status, udp_status, state.tcp_port, state.udp_port);
-                    if was_firewalled != state.firewalled || (!had_ip && state.external_ip.is_some()) {
+                    let status_changed = was_udp_fw != state.udp_firewalled
+                        || was_tcp_fw != state.firewalled
+                        || (!had_ip && state.external_ip.is_some());
+                    if status_changed {
                         let _ = app_handle.emit("firewall-status", serde_json::json!({
-                            "firewalled": state.firewalled,
+                            "firewalled": state.udp_firewalled,
                             "external_ip": state.stats.external_ip,
                             "tcp_status": format!("{:?}", tcp_status),
                             "udp_status": format!("{:?}", udp_status),
                         }));
                     }
-                    if was_firewalled && !state.firewalled {
+                    if was_tcp_fw && !state.firewalled {
                         if state.buddy_manager.state() == BuddyState::FindingBuddy {
                             state.buddy_manager.find_failed();
-                            info!("Cancelled buddy search: firewall is open, no buddy needed");
+                            info!("Cancelled buddy search: TCP firewall is open, no buddy needed");
                         }
                     }
                 }
@@ -1636,11 +1617,11 @@ pub async fn start_network(
                 // so it doesn't overwrite the FirewallChecker's determination.
                 let fw_from_shared = state.firewalled_shared.load(std::sync::atomic::Ordering::Relaxed);
                 if state.firewalled && !fw_from_shared {
-                    info!("TCP confirmed open (connect-back or UPnP), clearing firewalled status");
+                    info!("TCP confirmed open (connect-back or UPnP), clearing TCP firewalled status");
                     state.firewalled = false;
-                    state.stats.firewalled = false;
                     state.firewall_checker.handle_tcp_connect_back();
                     state.publish_manager.firewalled = false;
+                    state.stats.firewalled = state.udp_firewalled;
                     if let Some(ip) = state.external_ip {
                         state.stats.external_ip = ip.to_string();
                     }
@@ -1648,7 +1629,7 @@ pub async fn start_network(
                     let tcp_status = state.firewall_checker.tcp_status();
                     let udp_status = state.firewall_checker.udp_status();
                     let _ = app_handle.emit("firewall-status", serde_json::json!({
-                        "firewalled": false,
+                        "firewalled": state.udp_firewalled,
                         "external_ip": state.stats.external_ip,
                         "tcp_status": format!("{:?}", tcp_status),
                         "udp_status": format!("{:?}", udp_status),
@@ -1882,7 +1863,9 @@ pub async fn start_network(
 
                 let to_probe = state.routing_table.get_contacts_to_probe();
                 for (_bucket_idx, contact) in to_probe {
-                    let our_options: u8 = if state.firewalled { 0x05 } else { 0x04 };
+                    let our_options: u8 = 0x04
+                        | if state.udp_firewalled { 0x01 } else { 0 }
+                        | if state.firewalled { 0x02 } else { 0 };
                     let mut hello_tags = vec![
                         KadTag {
                             name: TagName::Id(TAG_KADMISCOPTIONS),
@@ -3978,6 +3961,7 @@ async fn handle_udp_packet(
             state.firewall_checker.handle_firewalled_response(external_ip);
             state.firewall_checker.handle_udp_firewall_result(true);
             state.udp_firewalled = false;
+            state.stats.firewalled = false;
 
             if let Some(confirmed) = state.firewall_checker.external_ip() {
                 state.external_ip = Some(confirmed);
@@ -3991,7 +3975,7 @@ async fn handle_udp_packet(
                 let tcp_status = state.firewall_checker.tcp_status();
                 let udp_status = state.firewall_checker.udp_status();
                 let _ = app_handle.emit("firewall-status", serde_json::json!({
-                    "firewalled": state.firewalled,
+                    "firewalled": state.udp_firewalled,
                     "external_ip": state.stats.external_ip,
                     "tcp_status": format!("{:?}", tcp_status),
                     "udp_status": format!("{:?}", udp_status),
@@ -4669,39 +4653,10 @@ async fn handle_command(
                 info!("Sent bootstrap requests to {} existing contacts", contacts.len().min(20));
             }
 
-            // Always send firewall check probes on connect (like eMule).
-            // Don't filter by verified — bootstrap contacts aren't verified yet.
-            state.firewall_checker.start_check();
-            if let Ok(mut probes) = firewall_probe_ips.lock() { probes.clear(); }
-            let fw_contacts: Vec<KadContact> = state.routing_table.all_contacts()
-                .take(4)
-                .cloned()
-                .collect();
-            for contact in &fw_contacts {
-                let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-                let msg = KadMessage::FirewalledReq { tcp_port: state.tcp_port };
-                if let Ok(packet) = messages::encode_packet(&msg) {
-                    state.flood_protection.track_request(addr, 0x50);
-                    if let Ok(mut probes) = firewall_probe_ips.lock() { probes.insert(contact.ip); }
-                    let _ = send_kad_packet(socket, &packet, addr, &state, &contact.id).await;
-                    state.firewall_checks_sent += 1;
-                    state.firewall_checker.record_tcp_request_sent(contact.ip);
-                }
-            }
-            let udp_contacts: Vec<KadContact> = state.routing_table.all_contacts()
-                .skip(4)
-                .take(4)
-                .cloned()
-                .collect();
-            for contact in &udp_contacts {
-                let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-                let msg = KadMessage::Ping;
-                if let Ok(packet) = messages::encode_packet(&msg) {
-                    state.flood_protection.track_request(addr, 0x60);
-                    let _ = send_kad_packet(socket, &packet, addr, &state, &contact.id).await;
-                    state.firewall_checker.record_udp_request_sent();
-                }
-            }
+            // Firewall check is deferred to the periodic bootstrap_timer recheck,
+            // which runs once we have verified contacts (table_size >= 10).
+            // Sending checks here against stale nodes.dat contacts produces
+            // false Firewalled results because those contacts may be offline.
         }
 
         NetworkCommand::KadDisconnect => {

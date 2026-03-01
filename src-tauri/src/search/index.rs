@@ -115,17 +115,6 @@ impl LocalIndex {
         self.rebuild_indices();
     }
 
-    pub fn remove_file_by_hash(&mut self, hash: &str) -> Option<FileInfo> {
-        if let Some(&idx) = self.hash_map.get(hash) {
-            if idx < self.files.len() {
-                let removed = self.files.remove(idx);
-                self.rebuild_indices();
-                return Some(removed);
-            }
-        }
-        None
-    }
-
     /// Remove a file by its `id` field (handles temporary "pending:..." ids
     /// assigned during the discovery phase before hashing completes).
     pub fn remove_file_by_id(&mut self, id: &str) -> Option<FileInfo> {
