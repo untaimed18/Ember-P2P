@@ -17,7 +17,6 @@
   import { onMount } from 'svelte';
 
   import { listen } from '@tauri-apps/api/event';
-  import type { UnlistenFn } from '@tauri-apps/api/event';
 
   let folders: string[] = $state([]);
   let files: FileInfo[] = $state([]);
@@ -28,59 +27,26 @@
   let hashProgress: { current: number; total: number; file_name: string } | null = $state(null);
 
   let mounted = true;
-  let pollBusy = false;
-  let eventUnlisteners: UnlistenFn[] = [];
-  let refreshDebounce: ReturnType<typeof setTimeout> | null = null;
-
-  function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-    return Promise.race([
-      promise,
-      new Promise<T>((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
-    ]);
-  }
-
-  function filesChanged(oldArr: FileInfo[], newArr: FileInfo[]): boolean {
-    if (oldArr.length !== newArr.length) return true;
-    for (let i = 0; i < oldArr.length; i++) {
-      if (oldArr[i].hash !== newArr[i].hash ||
-          oldArr[i].requests !== newArr[i].requests ||
-          oldArr[i].accepted !== newArr[i].accepted ||
-          oldArr[i].bytes_transferred !== newArr[i].bytes_transferred ||
-          oldArr[i].priority !== newArr[i].priority ||
-          oldArr[i].complete_sources !== newArr[i].complete_sources) return true;
-    }
-    return false;
-  }
+  let busy = false;
 
   async function refresh() {
+    if (busy || !mounted) return;
+    busy = true;
     try {
-      const [newFolders, newFiles, isScanning] = await withTimeout(
-        Promise.all([getSharedFolders(), getSharedFiles(), getScanStatus()]),
-        4000,
-      );
+      const [newFolders, newFiles, isScanning] = await Promise.all([
+        getSharedFolders(),
+        getSharedFiles(),
+        getScanStatus(),
+      ]);
       if (!mounted) return;
       folders = newFolders;
       scanning = isScanning;
-      if (filesChanged(files, newFiles)) files = newFiles;
+      files = newFiles;
     } catch (e) {
-      if (e instanceof Error && e.message !== 'timeout')
+      if (mounted && e instanceof Error)
         console.error('Failed to load shared files:', e);
-    }
-  }
-
-  async function refreshFiles() {
-    if (pollBusy || !mounted) return;
-    pollBusy = true;
-    try {
-      const [newFiles, isScanning] = await withTimeout(
-        Promise.all([getSharedFiles(), getScanStatus()]),
-        4000,
-      );
-      if (!mounted) return;
-      scanning = isScanning;
-      if (filesChanged(files, newFiles)) files = newFiles;
-    } catch { /* ignore */ } finally {
-      pollBusy = false;
+    } finally {
+      busy = false;
     }
   }
 
@@ -95,7 +61,6 @@
       const selected = await open({ directory: true, multiple: false });
       if (!mounted || !selected) return;
       await addSharedFolder(selected as string);
-      // Command returns instantly; files appear via shared-files-changed event
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
     }
@@ -117,7 +82,6 @@
     error = null;
     try {
       await reloadSharedFiles();
-      // Command returns instantly; updates come via events
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
     }
@@ -214,7 +178,7 @@
     selectedHash = f.hash;
   }
   function closeCtx() { ctxMenu = null; ctxPrioritySub = false; }
-  function onDocClick() { closeCtx(); }
+  function onDocClick() { if (mounted) closeCtx(); }
 
   async function ctxAction(action: string, extra?: string) {
     if (!ctxMenu) return;
@@ -224,13 +188,13 @@
       switch (action) {
         case 'open_file': await openSharedFile(f.path); break;
         case 'open_folder': await openSharedFolder(f.path); break;
-        case 'priority': if (extra) { await setFilePriority(f.hash, extra); await refreshFiles(); } break;
+        case 'priority': if (extra) { await setFilePriority(f.hash, extra); await refresh(); } break;
         case 'copy_link': {
           const link = await formatEd2kLink(f.name, f.size, f.hash);
           await navigator.clipboard.writeText(link);
           break;
         }
-        case 'unshare': await unshareFile(f.hash); await refreshFiles(); break;
+        case 'unshare': await unshareFile(f.hash); await refresh(); break;
       }
     } catch (e: unknown) { error = toErr(e); }
   }
@@ -270,47 +234,44 @@
       if (!isNaN(val)) sidebarWidth = Math.max(120, Math.min(400, val));
     }
 
-    function debouncedRefresh() {
-      if (!mounted) return;
-      if (refreshDebounce) clearTimeout(refreshDebounce);
-      refreshDebounce = setTimeout(() => { refreshDebounce = null; refreshFiles(); }, 500);
-    }
-
     refresh();
-    const pollInterval = setInterval(refreshFiles, 5000);
+    const pollInterval = setInterval(refresh, 5000);
 
-    listen<{ phase: string; count: number }>('shared-files-changed', () => {
-      debouncedRefresh();
-    }).then((u) => eventUnlisteners.push(u));
+    const unlisteners: Array<() => void> = [];
+    let listenersReady = false;
 
-    listen<{ current: number; total: number; file_name: string; done?: boolean }>(
-      'file-hash-progress',
-      (event) => {
-        if (!mounted) return;
-        if (event.payload.done) {
-          hashProgress = null;
-          debouncedRefresh();
-        } else {
-          hashProgress = {
-            current: event.payload.current,
-            total: event.payload.total,
-            file_name: event.payload.file_name,
-          };
+    (async () => {
+      unlisteners.push(await listen<{ phase: string; count: number }>(
+        'shared-files-changed', () => { if (mounted) refresh(); }
+      ));
+      unlisteners.push(await listen<{ current: number; total: number; file_name: string; done?: boolean }>(
+        'file-hash-progress', (event) => {
+          if (!mounted) return;
+          if (event.payload.done) {
+            hashProgress = null;
+            refresh();
+          } else {
+            hashProgress = {
+              current: event.payload.current,
+              total: event.payload.total,
+              file_name: event.payload.file_name,
+            };
+          }
         }
-      }
-    ).then((u) => eventUnlisteners.push(u));
-
-    listen<{ hash: string; file_name: string }>('file-hashed', () => {
-      debouncedRefresh();
-    }).then((u) => eventUnlisteners.push(u));
+      ));
+      unlisteners.push(await listen<{ hash: string; file_name: string }>(
+        'file-hashed', () => { if (mounted) refresh(); }
+      ));
+      listenersReady = true;
+    })();
 
     return () => {
       mounted = false;
       clearInterval(pollInterval);
-      if (refreshDebounce) clearTimeout(refreshDebounce);
       dragCleanup?.();
-      for (const u of eventUnlisteners) u();
-      eventUnlisteners = [];
+      if (listenersReady) {
+        for (const u of unlisteners) u();
+      }
     };
   });
 </script>
