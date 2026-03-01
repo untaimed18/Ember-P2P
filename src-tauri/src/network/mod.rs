@@ -1302,7 +1302,41 @@ pub async fn start_network(
                             Vec::new()
                         };
                         info!("Source search {} completed: {} sources found", sid.0, sources.len());
-                        let _ = tx.send(sources);
+                        let _ = tx.send(sources.clone());
+
+                        // Connect found sources to any pending download with a
+                        // matching file hash so "Find More Sources" actually
+                        // starts the download instead of discarding results.
+                        if !sources.is_empty() {
+                            if let Some(search) = state.search_manager.get(&sid) {
+                                let raw_hash = kad_id_to_md4_bytes(&search.target);
+                                let hash_hex = hex::encode(raw_hash);
+                                let matching_tid = state.pending_downloads.iter()
+                                    .find(|(_, pd)| pd.file_hash == hash_hex)
+                                    .map(|(tid, _)| tid.clone());
+                                if let Some(transfer_id) = matching_tid {
+                                    // Re-insert as a download_source_searches so
+                                    // the normal download-start logic handles it
+                                    // on the next search completion or trigger an
+                                    // immediate retry by resetting the search timer.
+                                    if let Some(pd) = state.pending_downloads.get_mut(&transfer_id) {
+                                        pd.last_search_at = 0;
+                                        info!(
+                                            "Find More Sources found {} sources for pending download {}, triggering immediate retry",
+                                            sources.len(), transfer_id
+                                        );
+                                        // Register sources in SourceManager so the
+                                        // periodic retry loop picks them up.
+                                        let mut sm = source_manager.write().await;
+                                        for (ip_str, port) in &sources {
+                                            if let Ok(v4) = ip_str.parse::<Ipv4Addr>() {
+                                                sm.register_source(raw_hash, v4, *port);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     } else if let Some(transfer_id) = state.download_source_searches.remove(&sid) {
                         let sources = if let Some(search) = state.search_manager.get(&sid) {
                             extract_sources_from_results(&search.results)
