@@ -282,7 +282,7 @@
     } else if (action === 'copy_ip' && target) {
       try { await navigator.clipboard.writeText(`${target.ip}:${target.port}`); flash('Copied to clipboard'); } catch {}
     } else if (action === 'copy_ed2k' && target) {
-      try { await navigator.clipboard.writeText(`ed2k://|server|${target.ip}|${target.port}|/`); flash('ED2K link copied'); } catch {}
+      try { await navigator.clipboard.writeText(`ed2k://|server|${target.ip}|${target.port}|/`); flash('eD2K link copied'); } catch {}
     }
   }
 
@@ -398,7 +398,7 @@
           </div>
         {:else if servers.length === 0}
           <div class="empty-state compact">
-            <div class="icon-lg">S</div>
+            <div class="icon-lg">⬡</div>
             <p>No servers in list</p>
             <p class="sub">Add a server using the form on the right, or download a server.met file</p>
           </div>
@@ -578,7 +578,7 @@
               <span class="badge disconnected">Disconnected</span>
             </div>
             <div class="info-row muted">
-              <span>Not connected to any ed2k server</span>
+              <span>Not connected to any eD2K server</span>
             </div>
           {/if}
         </div>
@@ -617,7 +617,7 @@
     </button>
     <div class="ctx-sep"></div>
     <button class="ctx-item" onclick={() => ctxAction('copy_ip')}>Copy IP:Port</button>
-    <button class="ctx-item" onclick={() => ctxAction('copy_ed2k')}>Copy ED2K Link</button>
+    <button class="ctx-item" onclick={() => ctxAction('copy_ed2k')}>Copy eD2K Link</button>
   </div>
 {/if}
 

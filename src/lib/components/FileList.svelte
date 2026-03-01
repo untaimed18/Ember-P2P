@@ -93,7 +93,7 @@
             {#if showCopyLink}
               <td>
                 <button class="ghost copy-btn" onclick={(e: MouseEvent) => { e.stopPropagation(); copyLink(file); }}>
-                  {copiedId === file.id ? 'Copied!' : 'Copy ed2k Link'}
+                  {copiedId === file.id ? 'Copied!' : 'Copy eD2K Link'}
                 </button>
               </td>
             {/if}

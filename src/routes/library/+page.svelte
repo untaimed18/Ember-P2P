@@ -381,7 +381,7 @@
               <th class="col-num sortable" onclick={() => toggleSort('accepted')}>Accepted{arrow('accepted')}</th>
               <th class="col-size sortable" onclick={() => toggleSort('bytes_transferred')}>Transferred{arrow('bytes_transferred')}</th>
               <th class="col-folder sortable" onclick={() => toggleSort('folder')}>Folder{arrow('folder')}</th>
-              <th class="col-num sortable" onclick={() => toggleSort('complete_sources')}>Complete Src.{arrow('complete_sources')}</th>
+              <th class="col-num sortable" onclick={() => toggleSort('complete_sources')}>Sources{arrow('complete_sources')}</th>
               <th class="col-shared">Shared</th>
             </tr>
           </thead>
@@ -466,7 +466,7 @@
         {/if}
       </div>
       <div class="ctx-sep"></div>
-      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>Copy eD2k Link</button>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>Copy eD2K Link</button>
       <div class="ctx-sep"></div>
       {#if ctxMenu.file.shared}
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>Unshare File</button>

@@ -465,7 +465,7 @@
                 Load{getSortArrow(searchSortCol, 'load', searchSortAsc)}
               </th>
               <th class="sortable" onclick={() => sortSearches('packets_sent')}>
-                Packets Sent{getSortArrow(searchSortCol, 'packets_sent', searchSortAsc)}
+                Packets{getSortArrow(searchSortCol, 'packets_sent', searchSortAsc)}
               </th>
               <th class="sortable" onclick={() => sortSearches('responses')}>
                 Responses{getSortArrow(searchSortCol, 'responses', searchSortAsc)}
@@ -484,8 +484,8 @@
                     {search.status === 'active' ? 'Active' : 'Stopping'}
                   </span>
                 </td>
-                <td>{search.load} ({search.load_response}|{search.load_total})</td>
-                <td>{search.packets_sent}|{search.request_answer}</td>
+                <td>{search.load} ({search.load_response}/{search.load_total})</td>
+                <td>{search.packets_sent} / {search.request_answer}</td>
                 <td>{search.responses}</td>
               </tr>
             {/each}

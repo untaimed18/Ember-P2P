@@ -373,7 +373,7 @@
           <div class="field toggle-row">
             <div class="toggle-info">
               <span class="toggle-title">Filter Servers by IP</span>
-              <span class="hint">Apply IP filter to ed2k server connections.</span>
+              <span class="hint">Apply IP filter to eD2K server connections.</span>
             </div>
             <ToggleSwitch bind:checked={settings.filter_servers_by_ip} />
           </div>
@@ -386,14 +386,14 @@
           <span class="card-icon">&#9881;</span>
           <div>
             <h3>Server</h3>
-            <p class="card-desc">ed2k server list management</p>
+            <p class="card-desc">eD2K server list management</p>
           </div>
         </div>
         <div class="card-body">
           <div class="field toggle-row">
             <div class="toggle-info">
               <span class="toggle-title">Auto-Connect Server <span class="restart-badge">Restart</span></span>
-              <span class="hint">Automatically connect to an ed2k server on startup. When off, press Connect to start.</span>
+              <span class="hint">Automatically connect to an eD2K server on startup. When off, press Connect to start.</span>
             </div>
             <ToggleSwitch bind:checked={settings.auto_connect_server} />
           </div>
@@ -407,7 +407,7 @@
           <div class="field toggle-row">
             <div class="toggle-info">
               <span class="toggle-title">Update List From Clients</span>
-              <span class="hint">Accept new servers from ed2k peers during transfers.</span>
+              <span class="hint">Accept new servers from eD2K peers during transfers.</span>
             </div>
             <ToggleSwitch bind:checked={settings.add_servers_from_clients} />
           </div>

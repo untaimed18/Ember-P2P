@@ -307,7 +307,7 @@
       class="method-btn"
       class:active={searchMethod === 'server'}
       onclick={() => searchMethod = 'server'}
-      title="Search connected ed2k servers only"
+      title="Search connected eD2K servers only"
     >Server</button>
     <button
       class="method-btn"

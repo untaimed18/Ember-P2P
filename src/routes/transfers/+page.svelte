@@ -560,7 +560,7 @@
                   {#if t.progress > 0}
                     <ProgressBar value={t.progress} color="var(--accent)" />
                   {:else}
-                    <span class="no-bar">\u2014</span>
+                    <span class="no-bar">—</span>
                   {/if}
                 </td>
               </tr>
@@ -576,7 +576,7 @@
                   <td class="num-cell">{formatDuration(t.wait_time)}</td>
                   <td class="num-cell">{formatDuration(t.upload_time)}</td>
                   <td class="status-cell"><span class="status-label st-{t.status}">{ulStatusLabel(t)}</span></td>
-                  <td class="bar-cell"><span class="no-bar">\u2014</span></td>
+                  <td class="bar-cell"><span class="no-bar">—</span></td>
                 </tr>
               {/each}
             {/if}
@@ -629,10 +629,10 @@
                   <td>{src.client_software || '\u2014'}</td>
                   <td class="name-cell">{allDownloads.find(d => d.id === expandedTransferId)?.file_name || '\u2014'}</td>
                   <td class="num-cell">{src.status === 'transferring' ? formatSpeed(src.speed) : '\u2014'}</td>
-                  <td class="num-cell">\u2014</td>
+                  <td class="num-cell">—</td>
                   <td class="num-cell">{src.transferred > 0 ? formatSize(src.transferred) : '\u2014'}</td>
-                  <td class="num-cell">\u2014</td>
-                  <td>ED2K</td>
+                  <td class="num-cell">—</td>
+                  <td>eD2K</td>
                 </tr>
               {/each}
             {:else}
@@ -668,7 +668,7 @@
       <div class="ctx-sep"></div>
       <div class="ctx-submenu-wrap">
         <button class="ctx-item has-sub" onclick={() => ctxPrioritySub = !ctxPrioritySub}>
-          Priority \u25B6
+          Priority ▶
         </button>
         {#if ctxPrioritySub}
           <div class="ctx-submenu">
@@ -680,8 +680,8 @@
         {/if}
       </div>
       <div class="ctx-sep"></div>
-      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy ED2K Link</button>
-      <button class="ctx-item" onclick={() => ctxAction('paste_link')}>Paste ED2K Link</button>
+      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy eD2K Link</button>
+      <button class="ctx-item" onclick={() => ctxAction('paste_link')}>Paste eD2K Link</button>
       <button class="ctx-item" onclick={() => ctxAction('find_sources')}>Find More Sources</button>
       <div class="ctx-sep"></div>
       <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>Clear Completed</button>
@@ -690,13 +690,13 @@
         <button class="ctx-item" onclick={() => ctxAction('open')}>Open File</button>
         <div class="ctx-sep"></div>
       {/if}
-      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy ED2K Link</button>
+      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy eD2K Link</button>
       <div class="ctx-sep"></div>
       <button class="ctx-item danger" onclick={() => ctxAction('remove')}>Remove from List</button>
       <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>Clear Completed</button>
     {:else}
       <!-- Upload context menu (eMule style) -->
-      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy ED2K Link</button>
+      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy eD2K Link</button>
     {/if}
   </div>
 {/if}
