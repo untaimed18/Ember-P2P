@@ -1674,6 +1674,7 @@ pub async fn start_network(
                         let index = local_index.read().await;
                         let files: Vec<PublishableFile> = index.all_files()
                             .iter()
+                            .filter(|f| f.shared)
                             .filter_map(|f| {
                                 let hash_bytes = hex::decode(&f.hash).ok()?;
                                 if hash_bytes.len() < 16 { return None; }
@@ -2209,7 +2210,9 @@ pub async fn start_network(
                                                 alltime_transferred: 0,
                                                 complete_sources: sr.complete_source_count,
                                                 folder: String::new(),
+                                                shared: false,
                                                 shared_kad: false,
+                                                shared_ed2k: false,
                                             },
                                             peer_id: String::new(),
                                             peer_name: String::new(),
@@ -2383,7 +2386,9 @@ pub async fn start_network(
                                             alltime_transferred: 0,
                                             complete_sources: 0,
                                             folder: String::new(),
+                                            shared: false,
                                             shared_kad: false,
+                                            shared_ed2k: false,
                                         },
                                         peer_id: format!("{}:{}", sr.client_id, sr.client_port),
                                         peer_name: String::new(),
@@ -2470,6 +2475,7 @@ pub async fn start_network(
                             let index = local_index.read().await;
                             let offer_files: Vec<ed2k::server::OfferFile> = index.all_files()
                                 .iter()
+                                .filter(|f| f.shared)
                                 .filter_map(|f| {
                                     let hash_bytes = hex::decode(&f.hash).ok()?;
                                     if hash_bytes.len() < 16 { return None; }
@@ -2854,6 +2860,8 @@ pub async fn start_network(
                 let s_files = shared_files.clone();
                 let db_ref = db.clone();
                 let li_ref = local_index.clone();
+                let kad_connected = state.stats.status == NetworkStatus::Connected;
+                let srv_connected = state.server_connected;
                 cache_write_handle = Some(tokio::spawn(async move {
                     // Merge all-time stats from known.met into local_index, then
                     // snapshot the file list for frontend IPC reads.
@@ -2865,7 +2873,12 @@ pub async fn start_network(
                             let hash_hex = hex::encode(file_hash);
                             index.update_alltime_stats(&hash_hex, *reqs, *accepted, *transferred);
                         }
-                        index.all_files().to_vec()
+                        let mut snap = index.all_files().to_vec();
+                        for f in &mut snap {
+                            f.shared_kad = f.shared && kad_connected && !f.hash.is_empty();
+                            f.shared_ed2k = f.shared && srv_connected && !f.hash.is_empty();
+                        }
+                        snap
                     };
                     *s_files.write().await = file_snap;
                     // Do the expensive hex/distance conversions here, off the event loop
@@ -4380,6 +4393,7 @@ async fn handle_command(
 
         NetworkCommand::AnnounceFiles { files } => {
             for file in files {
+                if !file.shared { continue; }
                 if let Ok(raw_bytes) = hex::decode(&file.hash) {
                     let kad_hash = md4_bytes_to_kad_id(&raw_bytes);
                     let publishable = PublishableFile {
@@ -5023,6 +5037,7 @@ async fn handle_command(
             }
             let files: Vec<PublishableFile> = index.all_files()
                 .iter()
+                .filter(|f| f.shared)
                 .filter_map(|f| {
                     let hash_bytes = hex::decode(&f.hash).ok()?;
                     if hash_bytes.len() < 16 { return None; }
@@ -5045,6 +5060,7 @@ async fn handle_command(
                 if let Some(conn) = state.server_connection.as_mut() {
                     let offer_files: Vec<ed2k::server::OfferFile> = index.all_files()
                         .iter()
+                        .filter(|f| f.shared)
                         .filter_map(|f| {
                             let hash_bytes = hex::decode(&f.hash).ok()?;
                             if hash_bytes.len() < 16 { return None; }
@@ -5642,7 +5658,9 @@ fn convert_search_results(
                         alltime_transferred: 0,
                         complete_sources: 0,
                         folder: String::new(),
+                        shared: false,
                         shared_kad: false,
+                        shared_ed2k: false,
                     },
                     peer_id: p.source_addr,
                     peer_name: String::new(),

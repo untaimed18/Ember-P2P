@@ -158,6 +158,27 @@ impl LocalIndex {
         false
     }
 
+    pub fn set_file_shared(&mut self, hash: &str, shared: bool) -> bool {
+        if let Some(&idx) = self.hash_map.get(hash) {
+            if let Some(file) = self.files.get_mut(idx) {
+                file.shared = shared;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn set_shared_by_path_prefix(&mut self, prefix: &str, shared: bool) -> Vec<String> {
+        let mut affected = Vec::new();
+        for file in &mut self.files {
+            if file.path.starts_with(prefix) && !file.hash.is_empty() && file.shared != shared {
+                file.shared = shared;
+                affected.push(file.hash.clone());
+            }
+        }
+        affected
+    }
+
     fn rebuild_indices(&mut self) {
         self.hash_map.clear();
         self.name_tokens.clear();

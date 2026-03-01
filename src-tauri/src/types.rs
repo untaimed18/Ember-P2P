@@ -40,9 +40,19 @@ pub struct FileInfo {
     /// Folder path (directory containing the file)
     #[serde(default)]
     pub folder: String,
-    /// Whether this file is shared on KAD
+    /// Whether this file is actively shared (user can toggle off to stop publishing)
+    #[serde(default = "default_true")]
+    pub shared: bool,
+    /// Whether this file is currently published on KAD (runtime status)
     #[serde(default)]
     pub shared_kad: bool,
+    /// Whether this file is currently offered to an ed2k server (runtime status)
+    #[serde(default)]
+    pub shared_ed2k: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_file_priority() -> String {
@@ -328,10 +338,6 @@ pub struct ServerInfo {
     pub client_id: u32,
     #[serde(default)]
     pub is_low_id: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_max_uploads() -> u32 {

@@ -309,6 +309,8 @@ pub fn run() {
             commands::sharing::set_file_priority,
             commands::sharing::reload_shared_files,
             commands::sharing::unshare_file,
+            commands::sharing::share_file,
+            commands::sharing::unshare_folder,
             commands::sharing::get_scan_status,
             commands::sharing::open_shared_file,
             commands::sharing::open_shared_folder,

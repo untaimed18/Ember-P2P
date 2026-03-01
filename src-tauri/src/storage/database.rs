@@ -140,6 +140,11 @@ impl Database {
             conn.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (?1)", params![3i64])?;
         }
 
+        if version < 4 {
+            Self::add_column_if_missing(&conn, "shared_files", "shared", "INTEGER NOT NULL DEFAULT 1");
+            conn.execute("INSERT OR REPLACE INTO schema_version (version) VALUES (?1)", params![4i64])?;
+        }
+
         Ok(())
     }
 
@@ -165,8 +170,8 @@ impl Database {
     pub fn save_shared_file(&self, file: &FileInfo) -> anyhow::Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         conn.execute(
-            "INSERT OR REPLACE INTO shared_files (id, name, path, size, hash, aich_hash, extension, modified_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR REPLACE INTO shared_files (id, name, path, size, hash, aich_hash, extension, modified_at, shared)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 file.id,
                 file.name,
@@ -176,7 +181,17 @@ impl Database {
                 file.aich_hash,
                 file.extension,
                 file.modified_at,
+                file.shared as i32,
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_shared_flag(&self, hash: &str, shared: bool) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        conn.execute(
+            "UPDATE shared_files SET shared = ?1 WHERE hash = ?2",
+            params![shared as i32, hash],
         )?;
         Ok(())
     }
@@ -184,7 +199,7 @@ impl Database {
     pub fn get_shared_files(&self) -> anyhow::Result<Vec<FileInfo>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, path, size, hash, aich_hash, extension, modified_at FROM shared_files",
+            "SELECT id, name, path, size, hash, aich_hash, extension, modified_at, COALESCE(shared, 1) FROM shared_files",
         )?;
 
         let files = stmt
@@ -212,7 +227,9 @@ impl Database {
                     alltime_transferred: 0,
                     complete_sources: 0,
                     folder,
+                    shared: row.get::<_, i32>(8).unwrap_or(1) != 0,
                     shared_kad: false,
+                    shared_ed2k: false,
                 })
             })?
             .filter_map(|r| match r {

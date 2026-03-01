@@ -429,31 +429,73 @@ pub async fn unshare_file(
     state: tauri::State<'_, AppState>,
     file_hash: String,
 ) -> Result<(), String> {
-    let removed = {
+    let toggled = {
         let mut index = state.local_index.write().await;
-        index.remove_file_by_hash(&file_hash)
+        index.set_file_shared(&file_hash, false)
     };
-    if removed.is_some() {
+    if toggled {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-    }
-
-    if removed.is_some() {
         let db = state.db.clone();
         let hash = file_hash.clone();
         tokio::task::spawn_blocking(move || {
-            let _ = db.remove_shared_file_by_hash(&hash);
-        })
-        .await
-        .map_err(|e| format!("DB error: {e}"))?;
-
-        let _ = state
-            .network_tx
-            .try_send(NetworkCommand::UnannounceFiles {
-                file_hashes: vec![file_hash],
-            });
+            let _ = db.update_shared_flag(&hash, false);
+        }).await.ok();
+        let _ = state.network_tx.try_send(NetworkCommand::UnannounceFiles {
+            file_hashes: vec![file_hash],
+        });
         let _ = state.network_tx.try_send(NetworkCommand::SharedFilesChanged);
     }
+    Ok(())
+}
 
+#[tauri::command]
+pub async fn share_file(
+    state: tauri::State<'_, AppState>,
+    file_hash: String,
+) -> Result<(), String> {
+    let file = {
+        let mut index = state.local_index.write().await;
+        index.set_file_shared(&file_hash, true);
+        index.get_by_hash(&file_hash).cloned()
+    };
+    if let Some(f) = file {
+        refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+        let db = state.db.clone();
+        let hash = file_hash.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = db.update_shared_flag(&hash, true);
+        }).await.ok();
+        let _ = state.network_tx.try_send(NetworkCommand::AnnounceFiles {
+            files: vec![f],
+        });
+        let _ = state.network_tx.try_send(NetworkCommand::SharedFilesChanged);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn unshare_folder(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    let affected_hashes = {
+        let mut index = state.local_index.write().await;
+        index.set_shared_by_path_prefix(&path, false)
+    };
+    if !affected_hashes.is_empty() {
+        refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+        let db = state.db.clone();
+        let hashes = affected_hashes.clone();
+        tokio::task::spawn_blocking(move || {
+            for hash in &hashes {
+                let _ = db.update_shared_flag(hash, false);
+            }
+        }).await.ok();
+        let _ = state.network_tx.try_send(NetworkCommand::UnannounceFiles {
+            file_hashes: affected_hashes,
+        });
+        let _ = state.network_tx.try_send(NetworkCommand::SharedFilesChanged);
+    }
     Ok(())
 }
 

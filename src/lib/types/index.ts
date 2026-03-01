@@ -16,7 +16,9 @@ export interface FileInfo {
   alltime_transferred: number;
   complete_sources: number;
   folder: string;
+  shared: boolean;
   shared_kad: boolean;
+  shared_ed2k: boolean;
 }
 
 export interface PeerInfo {

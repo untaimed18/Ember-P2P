@@ -8,6 +8,8 @@
     getScanStatus,
     setFilePriority,
     unshareFile,
+    shareFile,
+    unshareFolder,
     openSharedFile,
     openSharedFolder,
   } from '$lib/api/sharing';
@@ -195,7 +197,16 @@
           break;
         }
         case 'unshare': await unshareFile(f.hash); await refresh(); break;
+        case 'share': await shareFile(f.hash); await refresh(); break;
+        case 'unshare_folder': if (f.folder) { await unshareFolder(f.folder); await refresh(); } break;
       }
+    } catch (e: unknown) { error = toErr(e); }
+  }
+
+  async function handleUnshareFolder(path: string) {
+    try {
+      await unshareFolder(path);
+      await refresh();
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -320,11 +331,18 @@
           <span class="tree-folder-name" title={folder}>
             {folder.split(/[\\/]/).filter(Boolean).pop() || folder}
           </span>
-          <button
-            class="tree-remove"
-            onclick={(e) => { e.stopPropagation(); handleRemoveFolder(folder); }}
-            title="Remove folder"
-          >&times;</button>
+          <span class="tree-actions">
+            <button
+              class="tree-btn"
+              onclick={(e) => { e.stopPropagation(); handleUnshareFolder(folder); }}
+              title="Unshare all files in this folder"
+            >&#x20E0;</button>
+            <button
+              class="tree-btn tree-remove"
+              onclick={(e) => { e.stopPropagation(); handleRemoveFolder(folder); }}
+              title="Remove folder"
+            >&times;</button>
+          </span>
         </div>
       {/each}
     </div>
@@ -397,10 +415,16 @@
                 <td class="col-shared">
                   {#if !file.hash}
                     <span class="hashing-label">Pending</span>
-                  {:else if file.shared_kad}
-                    eD2K | Kad
+                  {:else if file.shared}
+                    <span class="shared-icon shared-yes" title="Shared">&#x2713;</span>
+                    {#if file.shared_kad || file.shared_ed2k}
+                      <span class="shared-badges">
+                        {#if file.shared_kad}<span class="shared-badge kad">KAD</span>{/if}
+                        {#if file.shared_ed2k}<span class="shared-badge ed2k">eD2K</span>{/if}
+                      </span>
+                    {/if}
                   {:else}
-                    eD2K
+                    <span class="shared-icon shared-no" title="Not shared">&#x2715;</span>
                   {/if}
                 </td>
               </tr>
@@ -411,7 +435,7 @@
     {/if}
 
     <div class="status-bar">
-      <span>{filteredFiles.length} file{filteredFiles.length !== 1 ? 's' : ''} shared</span>
+      <span>{filteredFiles.length} file{filteredFiles.length !== 1 ? 's' : ''} ({filteredFiles.filter(f => f.shared).length} shared)</span>
     </div>
   </div>
 </div>
@@ -448,7 +472,11 @@
       <div class="ctx-sep"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>Copy eD2k Link</button>
       <div class="ctx-sep"></div>
-      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>Unshare</button>
+      {#if ctxMenu.file.shared}
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>Unshare File</button>
+      {:else}
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('share')}>Share File</button>
+      {/if}
     {:else}
       <button class="ctx-item ctx-disabled" role="menuitem" disabled>Hashing in progress&hellip;</button>
     {/if}
@@ -547,18 +575,21 @@
     white-space: nowrap;
     flex: 1;
   }
-  .tree-remove {
+  .tree-actions { display: flex; gap: 2px; flex-shrink: 0; }
+  .tree-btn {
     background: none;
     border: none;
     color: inherit;
-    font-size: 14px;
+    font-size: 12px;
     cursor: pointer;
     padding: 0 2px;
     opacity: 0;
     transition: opacity 0.15s;
+    line-height: 1;
   }
-  .tree-item:hover .tree-remove { opacity: 0.7; }
-  .tree-remove:hover { opacity: 1 !important; }
+  .tree-btn.tree-remove { font-size: 14px; }
+  .tree-item:hover .tree-btn { opacity: 0.7; }
+  .tree-btn:hover { opacity: 1 !important; }
 
   .sidebar-divider {
     width: 4px;
@@ -634,13 +665,36 @@
   .col-hash { min-width: 140px; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
   .col-num { text-align: right; min-width: 60px; }
   .col-folder { max-width: 200px; color: var(--text-muted); }
-  .col-shared { min-width: 80px; color: var(--text-secondary); white-space: nowrap; }
+  .col-shared { min-width: 90px; color: var(--text-secondary); white-space: nowrap; }
   .hashing-label {
     color: var(--warning, #e0a030);
     font-style: italic;
     font-size: 11px;
     animation: pulse 1.5s ease-in-out infinite;
   }
+  .shared-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    font-size: 11px;
+    font-weight: 700;
+    vertical-align: middle;
+  }
+  .shared-yes { background: rgba(46, 204, 113, 0.2); color: #2ecc71; }
+  .shared-no { background: rgba(200, 200, 200, 0.15); color: var(--text-muted); font-size: 9px; }
+  .shared-badges { display: inline-flex; gap: 3px; margin-left: 4px; vertical-align: middle; }
+  .shared-badge {
+    font-size: 9px;
+    font-weight: 600;
+    padding: 0 4px;
+    border-radius: 3px;
+    line-height: 15px;
+  }
+  .shared-badge.kad { background: rgba(52, 152, 219, 0.15); color: #3498db; }
+  .shared-badge.ed2k { background: rgba(155, 89, 182, 0.15); color: #9b59b6; }
   @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.5; }

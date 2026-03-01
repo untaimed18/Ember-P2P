@@ -33,6 +33,14 @@ export async function unshareFile(fileHash: string): Promise<void> {
   return invoke('unshare_file', { fileHash });
 }
 
+export async function shareFile(fileHash: string): Promise<void> {
+  return invoke('share_file', { fileHash });
+}
+
+export async function unshareFolder(path: string): Promise<void> {
+  return invoke('unshare_folder', { path });
+}
+
 export async function openSharedFile(filePath: string): Promise<void> {
   return invoke('open_shared_file', { filePath });
 }

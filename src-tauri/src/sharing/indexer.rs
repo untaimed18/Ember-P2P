@@ -108,7 +108,9 @@ impl FileIndexer {
             alltime_transferred: 0,
             complete_sources: 0,
             folder,
+            shared: true,
             shared_kad: false,
+            shared_ed2k: false,
         })
     }
 
@@ -217,7 +219,9 @@ impl FileIndexer {
             alltime_transferred: 0,
             complete_sources: 0,
             folder,
+            shared: true,
             shared_kad: false,
+            shared_ed2k: false,
         })
     }
 }
