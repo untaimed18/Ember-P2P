@@ -2937,6 +2937,13 @@ pub async fn start_network(
                             SearchType::FindBuddy => "Find Buddy".to_string(),
                             _ => String::new(),
                         };
+                        let is_store = matches!(search.search_type,
+                            SearchType::StoreFile | SearchType::StoreKeyword | SearchType::StoreNotes);
+                        let responses = if is_store {
+                            search.closest.len() as u32
+                        } else {
+                            search.results.len() as u32
+                        };
                         KadSearchInfo {
                             id: sid.0,
                             target: search.target.to_hex(),
@@ -2948,7 +2955,7 @@ pub async fn start_network(
                             load_total: 0,
                             packets_sent: search.queried.len() as u32,
                             request_answer: search.pending.len() as u32,
-                            responses: search.results.len() as u32,
+                            responses,
                         }
                     })
                     .collect();
@@ -3862,7 +3869,7 @@ async fn handle_udp_packet(
         KadMessage::PublishRes { target, load } => {
             if state.publish_pending.remove(&target).is_some() {
                 state.publish_confirmed += 1;
-                debug!("Publish confirmed for {target} (load={load}, total_confirmed={})", state.publish_confirmed);
+                info!("Publish confirmed for {target} (load={load}, total_confirmed={})", state.publish_confirmed);
             }
             if load >= 100 {
                 if let std::net::IpAddr::V4(ipv4) = from.ip() {
