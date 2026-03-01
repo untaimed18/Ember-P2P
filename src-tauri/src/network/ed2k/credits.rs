@@ -94,10 +94,20 @@ impl CreditManager {
     }
 
     /// Queue score for upload slot selection.
-    /// score = wait_time_secs * credit_ratio * file_priority_factor
+    /// score = effective_wait_time * credit_ratio * file_priority
+    /// eMule: unverified clients don't benefit from accumulated wait time.
     pub fn get_queue_score(&self, user_hash: &[u8; 16], wait_secs: u64, file_priority: f64) -> f64 {
         let ratio = self.get_score_ratio(user_hash);
-        wait_secs as f64 * ratio * file_priority
+        let effective_wait = if let Some(record) = self.credits.get(user_hash) {
+            match record.ident_state {
+                IdentState::Failed => (wait_secs as f64 * 0.1).max(1.0),
+                IdentState::Unknown => wait_secs as f64 * 0.5,
+                IdentState::Verified => wait_secs as f64,
+            }
+        } else {
+            wait_secs as f64
+        };
+        effective_wait * ratio * file_priority
     }
 
     pub fn our_public_key(&self) -> &[u8] {

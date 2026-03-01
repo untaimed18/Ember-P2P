@@ -93,10 +93,11 @@ impl ChunkSelector {
                 3 // common
             };
 
-            let active_bonus = if active_parts.contains(&i) { 0u32 } else { 1 };
+            // eMule: prefer parts already in progress (nearest-to-complete bias)
+            let active_bonus = if active_parts.contains(&i) { 0u32 } else { 50 };
 
             // Lower score = higher priority
-            let score = zone * 1000 + active_bonus * 100 + freq;
+            let score = zone * 1000 + active_bonus + freq;
             candidates.push((i, score));
         }
 

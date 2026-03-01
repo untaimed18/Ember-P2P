@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use tracing::debug;
 
-/// eMule: BLOCKTIME — base blocking duration for dead sources (30 minutes in ms)
-const BLOCKTIME_SECS: i64 = 1800;
-/// eMule: BLOCKTIMEFW — longer blocking for firewalled sources (40 minutes)
-const BLOCKTIMEFW_SECS: i64 = 2400;
+/// eMule: BLOCKTIME — base blocking duration for dead sources (15 minutes)
+const BLOCKTIME_SECS: i64 = 900;
+/// eMule: BLOCKTIMEFW — longer blocking for firewalled sources (30 minutes)
+const BLOCKTIMEFW_SECS: i64 = 1800;
 /// eMule: FILEREASKTIME — minimum time between file re-asks (29 minutes)
 pub const FILEREASKTIME_SECS: i64 = 1740;
 /// eMule: SOURCECLIENTREASKS — normal source re-ask interval (40 minutes)

@@ -24,6 +24,9 @@ use super::messages::*;
 use crate::network::kad::buddy::PendingBuddySet;
 use crate::network::kad::ip_filter::SharedIpFilter;
 
+/// Shared set of banned peer IPs (updated by network task on Ban/Unban commands)
+pub type SharedBannedIps = Arc<std::sync::RwLock<std::collections::HashSet<std::net::Ipv4Addr>>>;
+
 /// Shared buddy info for including in Hello tags (updated by network task)
 pub type SharedBuddyInfo = Arc<RwLock<Option<BuddyInfo>>>;
 
@@ -55,6 +58,7 @@ const SESSIONMAXTIME_SECS: u64 = 3600;
 struct QueueEntry {
     addr: SocketAddr,
     user_hash: [u8; 16],
+    file_hash: [u8; 16],
     join_time: std::time::Instant,
 }
 
@@ -112,6 +116,10 @@ struct UploadHandler {
     shared_buddy_info: SharedBuddyInfo,
     /// Shared IP filter snapshot for blocking incoming connections
     shared_ip_filter: SharedIpFilter,
+    /// Shared banned IPs set for rejecting banned peers on TCP
+    banned_ips: SharedBannedIps,
+    /// eMule: dontcompressavi — skip compression for video files
+    skip_compress_video: bool,
     /// IPs we probed with FirewalledReq -- connect-back proves TCP is open
     firewall_probe_ips: FirewallProbeSet,
     /// Shared atomic: set to false when TCP is proven open
@@ -138,6 +146,8 @@ pub async fn start_upload_server(
     buddy_conn_tx: tokio::sync::mpsc::Sender<BuddyConnectionParts>,
     shared_buddy_info: SharedBuddyInfo,
     shared_ip_filter: SharedIpFilter,
+    banned_ips: SharedBannedIps,
+    skip_compress_video: bool,
     firewall_probe_ips: FirewallProbeSet,
     firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
@@ -178,6 +188,8 @@ pub async fn start_upload_server(
         buddy_conn_tx,
         shared_buddy_info,
         shared_ip_filter,
+        banned_ips,
+        skip_compress_video,
         firewall_probe_ips,
         firewalled_shared,
     });
@@ -192,6 +204,17 @@ pub async fn start_upload_server(
                     if let Ok(snap) = server.shared_ip_filter.read() {
                         if snap.is_blocked(ipv4) {
                             debug!("Rejecting TCP connection from blocked IP {peer_addr}");
+                            drop(stream);
+                            continue;
+                        }
+                    }
+                }
+
+                // Ban check: reject connections from banned IPs
+                if let std::net::IpAddr::V4(ipv4) = peer_addr.ip() {
+                    if let Ok(banned) = server.banned_ips.read() {
+                        if banned.contains(&ipv4) {
+                            debug!("Rejecting TCP connection from banned IP {peer_addr}");
                             drop(stream);
                             continue;
                         }
@@ -596,19 +619,39 @@ impl UploadHandler {
                         let hash_hex = hex::encode(hash);
                         let index = self.local_index.read().await;
                         if let Some(file) = index.get_by_hash(&hash_hex) {
-                            // eMule ED2K part count: size / PARTSIZE + 1
                             let ed2k_part_count = (file.size / PARTSIZE + 1) as u16;
                             let bitmap_bytes = ((ed2k_part_count as usize) + 7) / 8;
                             let mut status_payload = Vec::with_capacity(18 + bitmap_bytes);
                             status_payload.extend_from_slice(&hash);
                             status_payload.extend_from_slice(&ed2k_part_count.to_le_bytes());
-                            let full_bytes = bitmap_bytes;
-                            for i in 0..full_bytes {
-                                let remaining_bits = ed2k_part_count as usize - i * 8;
-                                if remaining_bits >= 8 {
-                                    status_payload.push(0xFF);
-                                } else {
-                                    status_payload.push((1u8 << remaining_bits) - 1);
+
+                            // Check if this is a partial download (.part file)
+                            // and build an accurate bitmap from PartTracker
+                            let part_path = std::path::Path::new(&file.path);
+                            let is_partial = part_path.extension()
+                                .map(|e| e == "part")
+                                .unwrap_or(false);
+
+                            if is_partial && file.size > 0 {
+                                let tracker = super::part_tracker::PartTracker::new(file.size, part_path);
+                                for byte_idx in 0..bitmap_bytes {
+                                    let mut byte = 0u8;
+                                    for bit in 0..8 {
+                                        let part_idx = byte_idx * 8 + bit;
+                                        if part_idx < ed2k_part_count as usize && tracker.is_part_complete(part_idx) {
+                                            byte |= 1 << bit;
+                                        }
+                                    }
+                                    status_payload.push(byte);
+                                }
+                            } else {
+                                for i in 0..bitmap_bytes {
+                                    let remaining_bits = ed2k_part_count as usize - i * 8;
+                                    if remaining_bits >= 8 {
+                                        status_payload.push(0xFF);
+                                    } else {
+                                        status_payload.push((1u8 << remaining_bits) - 1);
+                                    }
                                 }
                             }
                             write_packet_async(
@@ -686,11 +729,22 @@ impl UploadHandler {
                         } else {
                             // Credit-weighted selection: find the best-scoring peer
                             let cm = self.credit_manager.read().await;
+                            let idx_snap = self.local_index.read().await;
                             let mut best_idx = 0;
                             let mut best_score = f64::MIN;
                             for (i, entry) in queue.iter().enumerate() {
                                 let wait = entry.join_time.elapsed().as_secs();
-                                let score = cm.get_queue_score(&entry.user_hash, wait, 1.0);
+                                let file_prio = idx_snap.get_by_hash(&hex::encode(entry.file_hash))
+                                    .map(|f| match f.priority.as_str() {
+                                        "release" => 2.5,
+                                        "high" => 1.8,
+                                        "normal" => 1.0,
+                                        "low" => 0.6,
+                                        "verylow" => 0.2,
+                                        _ => 1.0,
+                                    })
+                                    .unwrap_or(1.0);
+                                let score = cm.get_queue_score(&entry.user_hash, wait, file_prio);
                                 if score > best_score {
                                     best_score = score;
                                     best_idx = i;
@@ -718,6 +772,7 @@ impl UploadHandler {
                             queue.push(QueueEntry {
                                 addr: peer_addr,
                                 user_hash: peer_user_hash,
+                                file_hash: current_file_hash.unwrap_or([0u8; 16]),
                                 join_time: std::time::Instant::now(),
                             });
                             queue.len() as u16
@@ -879,8 +934,16 @@ impl UploadHandler {
                         // Apply bandwidth limiting
                         self.acquire_upload_bandwidth(data.len() as u64).await;
 
-                        // Compress the data if it's large enough (e.g. > 1KB) to be worth it
-                        let use_compression = data.len() > 1024;
+                        // Skip compression for video files when configured (eMule: dontcompressavi)
+                        let is_video_ext = file_path.extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| {
+                                let e = e.to_lowercase();
+                                matches!(e.as_str(), "avi" | "mp4" | "mkv" | "wmv" | "mpg" |
+                                    "mpeg" | "mov" | "flv" | "webm" | "m4v" | "divx" | "ts" | "vob")
+                            })
+                            .unwrap_or(false);
+                        let use_compression = data.len() > 1024 && !(is_video_ext && self.skip_compress_video);
                         if use_compression {
                             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
                             if encoder.write_all(&data).is_ok() {
@@ -994,6 +1057,7 @@ impl UploadHandler {
                                 queue.push(QueueEntry {
                                     addr: peer_addr,
                                     user_hash: peer_user_hash,
+                                    file_hash: current_file_hash.unwrap_or([0u8; 16]),
                                     join_time: std::time::Instant::now(),
                                 });
                             }

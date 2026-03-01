@@ -378,6 +378,10 @@ impl Ed2kDownload {
             Err(e) => debug!("No hashset answer (peer may not support it): {e}"),
         }
 
+        // Request source exchange (eMule: OP_REQUESTSOURCES after file handshake)
+        let sx_req = build_file_request(&self.file_hash);
+        write_packet_async(&mut writer, OP_EMULEPROT, OP_REQUESTSOURCES, &sx_req).await?;
+
         // Request upload slot
         let upload_req = build_file_request(&self.file_hash);
         write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_STARTUPLOADREQ, &upload_req).await?;
@@ -457,6 +461,36 @@ impl Ed2kDownload {
                     rank, self.source_addr
                 );
                 self.emit_source_detail(event_tx, "queued", Some(rank), 0, 0).await;
+                continue;
+            }
+
+            // Source exchange response: register discovered sources
+            if proto == OP_EMULEPROT && opcode == OP_ANSWERSOURCES2 && payload.len() >= 19 {
+                let version = payload[0];
+                if version == 2 {
+                    let count = u16::from_le_bytes([payload[17], payload[18]]) as usize;
+                    let mut offset = 19;
+                    let mut sx_count = 0u32;
+                    for _ in 0..count {
+                        if offset + 28 > payload.len() { break; }
+                        let ip = std::net::Ipv4Addr::new(
+                            payload[offset], payload[offset+1],
+                            payload[offset+2], payload[offset+3],
+                        );
+                        let port = u16::from_le_bytes([payload[offset+4], payload[offset+5]]);
+                        offset += 28;
+                        if port > 0 && !ip.is_unspecified() && !ip.is_loopback() {
+                            if let Some(sm) = &self.source_manager {
+                                let mut sm = sm.write().await;
+                                sm.register_source(self.file_hash, ip, port);
+                                sx_count += 1;
+                            }
+                        }
+                    }
+                    if sx_count > 0 {
+                        debug!("Source exchange: registered {sx_count} new sources from {}", self.source_addr);
+                    }
+                }
                 continue;
             }
 
@@ -887,15 +921,19 @@ impl Ed2kDownload {
 
 /// eMule-style adaptive pipelining: number of OP_REQUESTPARTS packets to
 /// keep in flight simultaneously based on observed connection speed.
-/// Ref: eMule DownloadClient.cpp — slow connections get 1 request (3 blocks),
-/// medium get 2 (6 blocks), fast get 3 (9 blocks).
+/// Each request carries up to 3 blocks (EMBLOCKSIZE each).
+/// Ref: eMule DownloadClient.cpp CreateBlockRequests() thresholds.
 fn outstanding_requests_for_speed(speed: u64) -> usize {
     if speed < 4 * 1024 {
         1
-    } else if speed < 36 * 1024 {
+    } else if speed < 9 * 1024 {
         2
-    } else {
+    } else if speed < 75 * 1024 {
         3
+    } else if speed < 150 * 1024 {
+        6
+    } else {
+        9
     }
 }
 

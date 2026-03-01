@@ -1266,10 +1266,14 @@ async fn download_parts_from_source(
 fn outstanding_requests_for_speed_ms(speed: u64) -> usize {
     if speed < 4 * 1024 {
         1
-    } else if speed < 36 * 1024 {
+    } else if speed < 9 * 1024 {
         2
-    } else {
+    } else if speed < 75 * 1024 {
         3
+    } else if speed < 150 * 1024 {
+        6
+    } else {
+        9
     }
 }
 

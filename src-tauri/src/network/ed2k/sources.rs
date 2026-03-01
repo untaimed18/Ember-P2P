@@ -11,6 +11,7 @@ pub struct SourceEntry {
     pub ip: Ipv4Addr,
     pub tcp_port: u16,
     pub last_seen: i64,
+    pub user_hash: [u8; 16],
 }
 
 /// Tracks known sources (peers) per file hash for source exchange responses.
@@ -37,11 +38,18 @@ impl SourceManager {
     }
 
     pub fn register_source(&mut self, file_hash: [u8; 16], ip: Ipv4Addr, tcp_port: u16) {
+        self.register_source_with_hash(file_hash, ip, tcp_port, [0u8; 16]);
+    }
+
+    pub fn register_source_with_hash(&mut self, file_hash: [u8; 16], ip: Ipv4Addr, tcp_port: u16, user_hash: [u8; 16]) {
         let now = chrono::Utc::now().timestamp();
         let entries = self.sources.entry(file_hash).or_default();
 
         if let Some(existing) = entries.iter_mut().find(|e| e.ip == ip && e.tcp_port == tcp_port) {
             existing.last_seen = now;
+            if user_hash != [0u8; 16] {
+                existing.user_hash = user_hash;
+            }
             return;
         }
 
@@ -54,6 +62,7 @@ impl SourceManager {
             ip,
             tcp_port,
             last_seen: now,
+            user_hash,
         });
 
         if self.sources.len() > MAX_TRACKED_FILES {
@@ -96,7 +105,7 @@ impl SourceManager {
             resp.extend_from_slice(&src.tcp_port.to_le_bytes());   // TCP port (2)
             resp.extend_from_slice(&0u32.to_le_bytes());           // server IP (4) - 0=KAD
             resp.extend_from_slice(&0u16.to_le_bytes());           // server port (2)
-            resp.extend_from_slice(&[0u8; 16]);                    // user hash (16) - unknown
+            resp.extend_from_slice(&src.user_hash);                // user hash (16)
         }
 
         resp

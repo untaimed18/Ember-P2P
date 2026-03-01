@@ -532,6 +532,9 @@ pub async fn start_network(
         info!("Loaded {} banned peer IPs", banned_ips.len());
     }
 
+    let shared_banned_ips: ed2k::upload::SharedBannedIps =
+        Arc::new(std::sync::RwLock::new(banned_ips.clone()));
+
     let mut state = NetworkState {
         local_id,
         user_hash,
@@ -696,6 +699,8 @@ pub async fn start_network(
         let ul_buddy_tx = buddy_conn_tx.clone();
         let ul_buddy_info = shared_buddy_info.clone();
         let ul_ip_filter = shared_ip_filter.clone();
+        let ul_banned = shared_banned_ips.clone();
+        let ul_skip_compress = settings.skip_compress_video;
         let ul_fw_probes = firewall_probe_ips.clone();
         let ul_fw_shared = state.firewalled_shared.clone();
         tokio::spawn(async move {
@@ -719,6 +724,8 @@ pub async fn start_network(
                 ul_buddy_tx,
                 ul_buddy_info,
                 ul_ip_filter,
+                ul_banned,
+                ul_skip_compress,
                 ul_fw_probes,
                 ul_fw_shared,
             )
@@ -879,6 +886,7 @@ pub async fn start_network(
                         &mut known_files,
                         &server_udp,
                         &firewall_probe_ips,
+                        &shared_banned_ips,
                     ).await;
                 }
             }
@@ -961,6 +969,7 @@ pub async fn start_network(
                             &mut known_files,
                             &server_udp,
                             &firewall_probe_ips,
+                            &shared_banned_ips,
                         ).await;
                     }
                 }
@@ -1166,6 +1175,7 @@ pub async fn start_network(
                         &mut known_files,
                         &server_udp,
                         &firewall_probe_ips,
+                        &shared_banned_ips,
                     ).await;
                 }
             }
@@ -1218,6 +1228,7 @@ pub async fn start_network(
                         &mut known_files,
                         &server_udp,
                         &firewall_probe_ips,
+                        &shared_banned_ips,
                     ).await;
                 }
             }
@@ -2337,7 +2348,7 @@ pub async fn start_network(
                             _ => continue,
                         };
                         let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
-                        let closest = state.routing_table.find_closest(&kad_hash, SEARCH_INITIAL_CONTACTS);
+                        let closest = state.routing_table.find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
                         if closest.is_empty() {
                             debug!("Routing table empty for retry of {tid}, will try again later");
                             continue;
@@ -2390,8 +2401,12 @@ pub async fn start_network(
                 }
             }
 
-            // Periodic credit save to database
+            // Periodic credit save to database (with stale record cleanup)
             _ = credit_save_timer.tick() => {
+                {
+                    let mut cm_w = credit_manager.write().await;
+                    cm_w.cleanup_stale(90);
+                }
                 let cm = credit_manager.read().await;
                 let records: Vec<(&[u8; 16], u64, u64, i64, &[u8])> = cm.all_records()
                     .iter()
@@ -4552,6 +4567,7 @@ async fn handle_command(
     known_files: &mut KnownFileList,
     server_udp: &ServerUdpSocket,
     firewall_probe_ips: &upload_server::FirewallProbeSet,
+    shared_banned_ips: &upload_server::SharedBannedIps,
 ) {
     match cmd {
         NetworkCommand::SearchFiles { query, method, tx } => {
@@ -4882,6 +4898,9 @@ async fn handle_command(
                         }
                     }
                 }
+                if let Ok(mut shared) = shared_banned_ips.write() {
+                    *shared = state.banned_ips.clone();
+                }
             }
         }
 
@@ -4903,6 +4922,9 @@ async fn handle_command(
                         }
                     }
                 }
+            }
+            if let Ok(mut shared) = shared_banned_ips.write() {
+                *shared = state.banned_ips.clone();
             }
             info!("Unbanned peer {peer_id_hex}");
         }
