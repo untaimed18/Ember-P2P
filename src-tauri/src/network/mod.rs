@@ -801,7 +801,6 @@ pub async fn start_network(
         let count = incomplete.len();
         if count > 0 {
             info!("Resuming {count} incomplete downloads from previous session");
-            let now = chrono::Utc::now().timestamp();
             let dl_folder = settings.download_folder.clone();
             for mut transfer in incomplete {
                 let control = TransferControl::new();
@@ -838,7 +837,7 @@ pub async fn start_network(
                     file_size: transfer.total_size,
                     control,
                     search_count: 0,
-                    last_search_at: now - 60,
+                    last_search_at: 0,
                 });
             }
         }
@@ -2333,9 +2332,6 @@ pub async fn start_network(
                 // Second pass: for remaining pending downloads, start new Kad + server searches
                 for tid in to_retry {
                     if let Some(pd) = state.pending_downloads.get_mut(&tid) {
-                        pd.search_count += 1;
-                        pd.last_search_at = now;
-
                         let hash_bytes = match hex::decode(&pd.file_hash) {
                             Ok(b) if b.len() == 16 => b,
                             _ => continue,
@@ -2346,6 +2342,10 @@ pub async fn start_network(
                             debug!("Routing table empty for retry of {tid}, will try again later");
                             continue;
                         }
+
+                        pd.search_count += 1;
+                        pd.last_search_at = now;
+
                         info!(
                             "Retrying source search for {} (attempt {})",
                             tid, pd.search_count
