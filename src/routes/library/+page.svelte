@@ -7,7 +7,6 @@
     reloadSharedFiles,
     getScanStatus,
     stopHashing,
-    resumeHashing,
     setFilePriority,
     unshareFile,
     shareFile,
@@ -121,27 +120,40 @@
     }
   }
 
-  async function handleStopHashing() {
+  let stopConfirmVisible = $state(false);
+
+  function handleStopRequest() {
+    stopConfirmVisible = true;
+  }
+
+  function handleStopCancel() {
+    stopConfirmVisible = false;
+  }
+
+  async function handleStopConfirm() {
+    stopConfirmVisible = false;
     scanning = false;
     hashProgress = null;
     stoppedByUser = true;
     try {
       await stopHashing();
+      // Remove folders that have unhashed files (incomplete scan)
+      const incompleteFolders = folders.filter(folder =>
+        files.some(f => f.path.startsWith(folder) && !f.hash)
+      );
+      for (const folder of incompleteFolders) {
+        try {
+          await removeSharedFolder(folder);
+        } catch {}
+      }
+      if (mounted) {
+        stoppedByUser = false;
+        await refresh();
+      }
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
     }
   }
-
-  async function handleResumeHashing() {
-    try {
-      stoppedByUser = false;
-      await resumeHashing();
-    } catch (e: unknown) {
-      if (mounted) error = toErr(e);
-    }
-  }
-
-  let hasUnhashedFiles = $derived(files.some(f => !f.hash));
 
   // --- Filtering ---
   let filteredFiles = $derived.by(() => {
@@ -473,12 +485,14 @@
             Scanning files&hellip;
           {/if}
         </span>
-        <button class="scan-btn stop-btn" onclick={handleStopHashing}>Stop</button>
+        <button class="scan-btn stop-btn" onclick={handleStopRequest}>Stop</button>
       </div>
-    {:else if hasUnhashedFiles && !scanning}
-      <div class="scan-banner resume-banner">
-        <span class="scan-text">Hashing incomplete &mdash; some files are pending</span>
-        <button class="scan-btn resume-btn" onclick={handleResumeHashing}>Resume</button>
+    {/if}
+    {#if stopConfirmVisible}
+      <div class="confirm-banner">
+        <span class="confirm-text">Stopping will remove incompletely scanned folders from the Library. Continue?</span>
+        <button class="scan-btn resume-btn" onclick={handleStopCancel}>Cancel</button>
+        <button class="scan-btn stop-btn" onclick={handleStopConfirm}>Remove Folder</button>
       </div>
     {/if}
     {#if sortedFiles.length === 0 && !scanning}
@@ -642,6 +656,18 @@
     flex-shrink: 0;
   }
   .scan-text { flex: 1; }
+  .confirm-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--danger, #e74c3c);
+    color: var(--danger, #e74c3c);
+    font-size: 12px;
+    flex-shrink: 0;
+  }
+  .confirm-text { flex: 1; }
   .resume-banner { color: var(--warning, #e0a030); }
   .scan-btn {
     padding: 2px 10px;
