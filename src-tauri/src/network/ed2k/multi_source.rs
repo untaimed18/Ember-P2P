@@ -667,60 +667,61 @@ impl MultiSourceDownload {
                 })
                 .await;
 
-            let safe_name = crate::security::sanitize_filename(&self.file_name);
-            let final_path = self.download_dir.join("Downloads").join(&safe_name);
-            if let Err(e) = std::fs::rename(&part_path, &final_path) {
-                if is_cross_device_error(&e) {
-                    std::fs::copy(&part_path, &final_path)?;
-                    let _ = std::fs::remove_file(&part_path);
-                } else {
-                    return Err(e.into());
-                }
-            }
-            // Delete .part.met only after rename succeeds to preserve resume data on failure
-            {
-                let t = tracker.read().await;
-                t.delete_met();
-            }
-
-            // Verify final file hash (eMule-style: must match or download fails)
-            let verify_path = final_path.clone();
+            // Verify final file hash on the .part file BEFORE moving it.
+            // This preserves .part and .part.met for resume if verification fails.
+            let verify_path = part_path.clone();
             let expected = hex::encode(self.file_hash);
-            let mut verified_ok = true;
-            match tokio::task::spawn_blocking(move || {
+            let verified_ok = match tokio::task::spawn_blocking(move || {
                 super::hash::ed2k_hash_file(&verify_path)
             }).await {
                 Ok(Ok(actual)) if actual == expected => {
                     info!("Multi-source download complete and verified: {}", self.file_name);
+                    true
                 }
                 Ok(Ok(actual)) => {
                     warn!(
                         "Multi-source download hash mismatch for {}: expected={}, got={}",
                         self.file_name, expected, actual
                     );
-                    verified_ok = false;
+                    false
                 }
                 Ok(Err(e)) => {
                     warn!("Could not verify hash for {}: {e}", self.file_name);
+                    true
                 }
                 Err(e) => {
                     warn!("Hash verification task failed for {}: {e}", self.file_name);
+                    true
                 }
-            }
+            };
 
             if verified_ok {
+                // Verification passed — safe to move file and clean up resume state
+                let safe_name = crate::security::sanitize_filename(&self.file_name);
+                let final_path = self.download_dir.join("Downloads").join(&safe_name);
+                if let Err(e) = std::fs::rename(&part_path, &final_path) {
+                    if is_cross_device_error(&e) {
+                        std::fs::copy(&part_path, &final_path)?;
+                        let _ = std::fs::remove_file(&part_path);
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+                {
+                    let t = tracker.read().await;
+                    t.delete_met();
+                }
                 let _ = event_tx
                     .send(DownloadEvent::Completed {
                         transfer_id: self.transfer_id.clone(),
                     })
                     .await;
             } else {
-                // Delete corrupt file from download directory
-                let _ = std::fs::remove_file(&final_path);
+                // Hash failed — keep .part and .part.met intact for retry
                 let _ = event_tx
                     .send(DownloadEvent::Failed {
                         transfer_id: self.transfer_id.clone(),
-                        error: "Final hash verification failed".to_string(),
+                        error: "Final hash verification failed — .part preserved for retry".to_string(),
                     })
                     .await;
             }

@@ -884,7 +884,41 @@ impl Ed2kDownload {
             })
             .await;
 
-        // Clean up part.met and rename to final filename
+        // Verify the final file hash on the .part file BEFORE moving it.
+        // This preserves .part and .part.met for resume if verification fails.
+        let verify_path = part_path.clone();
+        let expected_hash = hex::encode(self.file_hash);
+        let verified_ok = match tokio::task::spawn_blocking(move || {
+            super::hash::ed2k_hash_file(&verify_path)
+        }).await {
+            Ok(Ok(actual_hash)) if actual_hash == expected_hash => {
+                info!("Download complete and verified: {}", self.file_name);
+                true
+            }
+            Ok(Ok(actual_hash)) => {
+                warn!(
+                    "Download hash mismatch for {}: expected={}, got={}",
+                    self.file_name, expected_hash, actual_hash
+                );
+                false
+            }
+            Ok(Err(e)) => {
+                warn!("Could not verify hash for {}: {e}", self.file_name);
+                true
+            }
+            Err(e) => {
+                warn!("Hash verification task failed for {}: {e}", self.file_name);
+                true
+            }
+        };
+
+        if !verified_ok {
+            anyhow::bail!(
+                "Final hash verification failed — .part and .part.met preserved for retry"
+            );
+        }
+
+        // Verification passed — safe to move file and clean up resume state
         tracker.delete_met();
         if let Err(e) = std::fs::rename(&part_path, &final_path) {
             if is_cross_device_error(&e) {
@@ -892,33 +926,6 @@ impl Ed2kDownload {
                 let _ = std::fs::remove_file(&part_path);
             } else {
                 return Err(e.into());
-            }
-        }
-
-        // Verify the final file hash (eMule-style: must match or download fails)
-        let output_path = final_path.clone();
-        let expected_hash = hex::encode(self.file_hash);
-        match tokio::task::spawn_blocking(move || {
-            super::hash::ed2k_hash_file(&output_path)
-        }).await {
-            Ok(Ok(actual_hash)) if actual_hash == expected_hash => {
-                info!("Download complete and verified: {}", self.file_name);
-            }
-            Ok(Ok(actual_hash)) => {
-                warn!(
-                    "Download hash mismatch for {}: expected={}, got={}",
-                    self.file_name, expected_hash, actual_hash
-                );
-                anyhow::bail!(
-                    "Final hash verification failed: expected={}, got={}",
-                    expected_hash, actual_hash
-                );
-            }
-            Ok(Err(e)) => {
-                warn!("Could not verify hash for {}: {e}", self.file_name);
-            }
-            Err(e) => {
-                warn!("Hash verification task failed for {}: {e}", self.file_name);
             }
         }
 
