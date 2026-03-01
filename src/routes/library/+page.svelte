@@ -30,6 +30,12 @@
 
   let mounted = true;
   let busy = false;
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function debouncedRefresh() {
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, 300);
+  }
 
   async function refresh() {
     if (busy || !mounted) return;
@@ -252,14 +258,14 @@
 
     (async () => {
       unlisteners.push(await listen<{ phase: string; count: number }>(
-        'shared-files-changed', () => { if (mounted) refresh(); }
+        'shared-files-changed', () => { if (mounted) debouncedRefresh(); }
       ));
       unlisteners.push(await listen<{ current: number; total: number; file_name: string; done?: boolean }>(
         'file-hash-progress', (event) => {
           if (!mounted) return;
           if (event.payload.done) {
             hashProgress = null;
-            refresh();
+            debouncedRefresh();
           } else {
             hashProgress = {
               current: event.payload.current,
@@ -270,13 +276,14 @@
         }
       ));
       unlisteners.push(await listen<{ hash: string; file_name: string }>(
-        'file-hashed', () => { if (mounted) refresh(); }
+        'file-hashed', () => { if (mounted) debouncedRefresh(); }
       ));
     })();
 
     return () => {
       mounted = false;
       clearInterval(pollInterval);
+      if (refreshTimer) clearTimeout(refreshTimer);
       dragCleanup?.();
       for (const u of unlisteners) u();
     };
