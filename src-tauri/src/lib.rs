@@ -8,6 +8,8 @@ mod sharing;
 mod storage;
 mod types;
 
+use tauri::Emitter;
+
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::{mpsc, RwLock};
@@ -120,6 +122,7 @@ pub fn run() {
             let shared_folders = settings.shared_folders.clone();
             let startup_scanning = scanning_count.clone();
             let csf = cached_shared_files.clone();
+            let startup_app = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 // Pre-populate index from database for fast startup
                 match db_clone.get_shared_files() {
@@ -131,42 +134,98 @@ pub fn run() {
                     }
                     _ => {}
                 }
-                // Snapshot for frontend reads
                 { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
 
-                if !shared_folders.is_empty() {
-                    startup_scanning.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if shared_folders.is_empty() {
+                    info!("Indexed 0 files from 0 shared folders");
+                    return;
                 }
 
+                startup_scanning.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                // Phase 1: fast discovery (metadata only, no hashing) for all folders
+                let mut all_discovered: Vec<crate::types::FileInfo> = Vec::new();
                 for folder in &shared_folders {
-                    let folder = folder.clone();
-                    let files = tokio::task::spawn_blocking(move || {
-                        FileIndexer::scan_directory(&folder)
-                    })
-                    .await
-                    .unwrap_or_default();
+                    let f = folder.clone();
+                    let discovered = tokio::task::spawn_blocking(move || {
+                        FileIndexer::discover_directory(&f)
+                    }).await.unwrap_or_default();
+                    all_discovered.extend(discovered);
+                }
+                {
+                    let mut index = index_clone.write().await;
+                    index.add_files(all_discovered.clone());
+                }
+                { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
+
+                let _ = startup_app.emit("shared-files-changed", serde_json::json!({
+                    "phase": "discovered",
+                    "count": all_discovered.len(),
+                }));
+
+                // Phase 2: hash one file at a time (same pattern as addSharedFolder)
+                let total = all_discovered.len();
+                let mut hashed = 0usize;
+                for file in &all_discovered {
+                    let file_path = file.path.clone();
+                    let file_temp_id = file.id.clone();
 
                     {
-                        let mut index = index_clone.write().await;
-                        index.add_files(files.clone());
-                    }
-                    // Update snapshot after each folder
-                    { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
-
-                    let db_ref = db_clone.clone();
-                    let db_files = files.clone();
-                    tokio::task::spawn_blocking(move || {
-                        for file in &db_files {
-                            let _ = db_ref.save_shared_file(file);
+                        let idx = index_clone.read().await;
+                        if idx.all_files().iter().any(|f| f.path == file.path && !f.hash.is_empty()) {
+                            hashed += 1;
+                            continue;
                         }
-                    })
-                    .await
-                    .ok();
+                    }
+
+                    let _ = startup_app.emit("file-hash-progress", serde_json::json!({
+                        "current": hashed + 1,
+                        "total": total,
+                        "file_name": file.name,
+                    }));
+
+                    let hash_result = tokio::task::spawn_blocking(move || {
+                        FileIndexer::hash_file(std::path::Path::new(&file_path))
+                    }).await;
+
+                    match hash_result {
+                        Ok(Ok((ed2k_hash, aich_hash))) => {
+                            let mut updated = file.clone();
+                            updated.id = ed2k_hash.clone();
+                            updated.hash = ed2k_hash;
+                            updated.aich_hash = aich_hash;
+                            {
+                                let mut idx = index_clone.write().await;
+                                idx.remove_file_by_id(&file_temp_id);
+                                idx.add_file(updated.clone());
+                            }
+                            { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
+                            let db_ref = db_clone.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _ = db_ref.save_shared_file(&updated);
+                            }).await.ok();
+                            hashed += 1;
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!("Startup hash failed for {}: {e}", file.name);
+                            let mut idx = index_clone.write().await;
+                            idx.remove_file_by_id(&file_temp_id);
+                        }
+                        Err(e) => {
+                            tracing::error!("Startup hash task panicked for {}: {e}", file.name);
+                            let mut idx = index_clone.write().await;
+                            idx.remove_file_by_id(&file_temp_id);
+                        }
+                    }
                 }
 
-                if !shared_folders.is_empty() {
-                    startup_scanning.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                }
+                startup_scanning.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = startup_app.emit("file-hash-progress", serde_json::json!({
+                    "current": total,
+                    "total": total,
+                    "file_name": "",
+                    "done": true,
+                }));
                 info!(
                     "Indexed {} files from {} shared folders",
                     index_clone.read().await.file_count(),

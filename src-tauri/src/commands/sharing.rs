@@ -42,6 +42,16 @@ pub async fn add_shared_folder(
         }).await.map_err(|e| format!("Config save error: {e}"))?.map_err(|e| format!("Config save error: {e}"))?;
     }
 
+    // Don't re-scan if a startup scan is already running for this folder
+    if state.scanning_count.load(Ordering::Relaxed) > 0 {
+        let index = state.local_index.read().await;
+        let already_has_files = index.all_files().iter().any(|f| f.path.starts_with(&path));
+        if already_has_files {
+            info!("Folder {path} is already being scanned, skipping duplicate");
+            return Ok(());
+        }
+    }
+
     let local_index = state.local_index.clone();
     let file_cache = state.cached_shared_files.clone();
     let db = state.db.clone();
