@@ -29,6 +29,7 @@
   let selectedHash: string | null = $state(null);
   let filterFolder: string | null = $state(null);
   let hashProgress: { current: number; total: number; file_name: string } | null = $state(null);
+  let stoppedByUser = $state(false);
 
   let mounted = true;
   let busy = false;
@@ -120,6 +121,10 @@
   async function handleStopHashing() {
     try {
       await stopHashing();
+      scanning = false;
+      hashProgress = null;
+      stoppedByUser = true;
+      await refresh();
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
     }
@@ -127,6 +132,7 @@
 
   async function handleResumeHashing() {
     try {
+      stoppedByUser = false;
       await resumeHashing();
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
@@ -339,7 +345,11 @@
       try {
         const isScanning = await getScanStatus();
         if (!mounted) return;
-        if (scanning && !isScanning) {
+        if (stoppedByUser && !isScanning) {
+          stoppedByUser = false;
+        } else if (stoppedByUser) {
+          // Backend still winding down after stop -- don't re-set scanning
+        } else if (scanning && !isScanning) {
           scanning = false;
           hashProgress = null;
           await refresh();
@@ -360,7 +370,7 @@
       ));
       unlisteners.push(await listen<{ current: number; total: number; file_name: string; done?: boolean }>(
         'file-hash-progress', (event) => {
-          if (!mounted) return;
+          if (!mounted || stoppedByUser) return;
           if (event.payload.done) {
             hashProgress = null;
             scanning = false;
