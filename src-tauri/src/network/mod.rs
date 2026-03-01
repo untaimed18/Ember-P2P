@@ -1087,7 +1087,7 @@ pub async fn start_network(
                                             name: shared_file.name.clone(),
                                             size: shared_file.size,
                                         }];
-                                        if let Err(e) = conn.offer_files(&offer).await {
+                                        if let Err(e) = conn.offer_files(&offer, state.tcp_port).await {
                                             warn!("Failed to offer completed download to server: {e}");
                                         }
                                     }
@@ -2908,7 +2908,7 @@ pub async fn start_network(
                                 })
                                 .collect();
                             if !offer_files.is_empty() {
-                                if let Err(e) = conn.offer_files(&offer_files).await {
+                                if let Err(e) = conn.offer_files(&offer_files, settings.tcp_port).await {
                                     warn!("Failed to send OP_OFFERFILES: {e}");
                                 }
                             }
@@ -4687,16 +4687,22 @@ async fn handle_command(
             }
 
             if !use_kad {
-                // For server-only search: store the pending tx so poll_messages()
-                // can deliver the OP_SEARCHRESULT when it arrives.
+                // Server-only search: store the pending tx so poll_messages()
+                // delivers the OP_SEARCHRESULT when it arrives.
                 if use_server && state.server_connected {
                     state.pending_server_search = Some((tx, local_results, method));
+                    state.server_search_age = 0;
                 } else {
                     let _ = tx.send(local_results);
                     app_handle.emit("search-complete", ()).ok();
                 }
                 return;
             }
+
+            // Global search: KAD gets the oneshot tx; server TCP results
+            // arrive via poll_messages() and are emitted as "search-results"
+            // events which the frontend merges into the result list.
+            state.server_search_age = 0;
 
             let keywords = kad::publish::extract_keywords(&query);
             if keywords.is_empty() {
@@ -5573,7 +5579,7 @@ async fn handle_command(
                         })
                         .collect();
                     if !offer_files.is_empty() {
-                        if let Err(e) = conn.offer_files(&offer_files).await {
+                        if let Err(e) = conn.offer_files(&offer_files, settings.tcp_port).await {
                             warn!("Failed to re-send OP_OFFERFILES: {e}");
                         }
                     }

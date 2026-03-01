@@ -317,9 +317,8 @@ impl Ed2kServerConnection {
 
     /// Send OP_OFFERFILES to the server with our shared file list.
     /// eMule sends this after login (OP_IDCHANGE) and when shared files change.
-    pub async fn offer_files(&mut self, files: &[OfferFile]) -> anyhow::Result<()> {
+    pub async fn offer_files(&mut self, files: &[OfferFile], tcp_port: u16) -> anyhow::Result<()> {
         let client_id = self.our_client_id().unwrap_or(0);
-        let tcp_port = self.session.as_ref().map(|_| 0u16).unwrap_or(0);
         let mut payload = Vec::with_capacity(4 + files.len() * 64);
         payload.extend_from_slice(&(files.len() as u32).to_le_bytes());
         for file in files {
