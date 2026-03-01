@@ -67,7 +67,7 @@
       );
       if (!mounted) return;
       folders = newFolders;
-      scanning = isScanning;
+      if (!stoppedByUser) scanning = isScanning;
       files = newFiles;
     } catch (e) {
       if (mounted && e instanceof Error && e.message !== 'timeout')
@@ -91,7 +91,10 @@
       const { open } = await import('@tauri-apps/plugin-dialog');
       const selected = await open({ directory: true, multiple: false });
       if (!mounted || !selected) return;
+      stoppedByUser = false;
+      scanning = true;
       await addSharedFolder(selected as string);
+      if (mounted) await refresh();
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
     }
