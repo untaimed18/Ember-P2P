@@ -38,6 +38,13 @@
     refreshTimer = setTimeout(() => { refreshTimer = null; refresh(); }, 300);
   }
 
+  function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
+    ]);
+  }
+
   async function refresh() {
     if (!mounted) return;
     if (busy) {
@@ -47,17 +54,20 @@
     busy = true;
     pendingRefresh = false;
     try {
-      const [newFolders, newFiles, isScanning] = await Promise.all([
-        getSharedFolders(),
-        getSharedFiles(),
-        getScanStatus(),
-      ]);
+      const [newFolders, newFiles, isScanning] = await withTimeout(
+        Promise.all([
+          getSharedFolders(),
+          getSharedFiles(),
+          getScanStatus(),
+        ]),
+        5000,
+      );
       if (!mounted) return;
       folders = newFolders;
       scanning = isScanning;
       files = newFiles;
     } catch (e) {
-      if (mounted && e instanceof Error)
+      if (mounted && e instanceof Error && e.message !== 'timeout')
         console.error('Failed to load shared files:', e);
     } finally {
       busy = false;
@@ -263,29 +273,45 @@
 
     refresh();
 
+    // Poll every 3s: refresh file list while scanning, detect completion as fallback.
+    const scanPoll = setInterval(async () => {
+      if (!mounted) return;
+      try {
+        const isScanning = await getScanStatus();
+        if (!mounted) return;
+        if (scanning && !isScanning) {
+          scanning = false;
+          hashProgress = null;
+          await refresh();
+        } else if (isScanning) {
+          scanning = true;
+          await refresh();
+        } else {
+          scanning = isScanning;
+        }
+      } catch {}
+    }, 3000);
+
     const unlisteners: Array<() => void> = [];
 
     (async () => {
       unlisteners.push(await listen<{ phase: string; count: number }>(
         'shared-files-changed', () => { if (mounted) debouncedRefresh(); }
       ));
-      unlisteners.push(await listen<FileInfo[]>(
-        'shared-files-snapshot', (event) => {
-          if (!mounted) return;
-          files = event.payload;
-        }
-      ));
       unlisteners.push(await listen<{ current: number; total: number; file_name: string; done?: boolean }>(
         'file-hash-progress', (event) => {
           if (!mounted) return;
           if (event.payload.done) {
             hashProgress = null;
+            scanning = false;
+            refresh();
           } else {
             hashProgress = {
               current: event.payload.current,
               total: event.payload.total,
               file_name: event.payload.file_name,
             };
+            scanning = true;
           }
         }
       ));
@@ -293,6 +319,7 @@
 
     return () => {
       mounted = false;
+      clearInterval(scanPoll);
       if (refreshTimer) clearTimeout(refreshTimer);
       dragCleanup?.();
       for (const u of unlisteners) u();

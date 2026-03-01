@@ -9,12 +9,35 @@ use crate::app_state::AppState;
 use crate::network::NetworkCommand;
 use crate::search::index::LocalIndex;
 use crate::sharing::indexer::FileIndexer;
+use crate::storage::known_files::KnownFileList;
 use crate::types::*;
 use tracing::{debug, info, warn};
 
 async fn refresh_file_cache(index: &Arc<RwLock<LocalIndex>>, cache: &Arc<RwLock<Vec<FileInfo>>>) {
     let snap = index.read().await.all_files().to_vec();
     *cache.write().await = snap;
+}
+
+fn load_known_files() -> KnownFileList {
+    let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
+        .map(|d| d.data_dir().to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    KnownFileList::load(&data_dir.join("known.met"))
+}
+
+fn resolve_from_known(files: &mut Vec<FileInfo>, known: &KnownFileList) -> Vec<FileInfo> {
+    let mut needs_hashing = Vec::new();
+    for file in files.iter_mut() {
+        if let Some(record) = known.find_by_path_and_meta(&file.path, file.size, file.modified_at) {
+            let hash = hex::encode(record.file_hash);
+            file.id = hash.clone();
+            file.hash = hash;
+            file.aich_hash = record.aich_hash.clone();
+        } else {
+            needs_hashing.push(file.clone());
+        }
+    }
+    needs_hashing
 }
 
 /// eMule-style shared folder addition -- returns IMMEDIATELY.
@@ -55,9 +78,8 @@ pub async fn add_shared_folder(
 
     // Everything runs in background -- command returns immediately
     tokio::spawn(async move {
-        // Phase 1: instant file discovery (no hashing)
         let discover_path = path.clone();
-        let discovered = match tokio::task::spawn_blocking(move || {
+        let mut discovered = match tokio::task::spawn_blocking(move || {
             FileIndexer::discover_directory(&discover_path)
         })
         .await
@@ -71,7 +93,10 @@ pub async fn add_shared_folder(
         };
 
         let total_files = discovered.len();
-        info!("Discovered {total_files} files in {path}, starting background hashing");
+        info!("Discovered {total_files} files in {path}");
+
+        let known_list = load_known_files();
+        let files_to_hash = resolve_from_known(&mut discovered, &known_list);
 
         {
             let mut index = local_index.write().await;
@@ -85,27 +110,28 @@ pub async fn add_shared_folder(
             "phase": "discovered",
         }));
 
-        // Phase 2: hash files one at a time (eMule style)
+        let known_for_announce: Vec<_> = discovered.iter()
+            .filter(|f| !f.hash.is_empty())
+            .cloned()
+            .collect();
+        if !known_for_announce.is_empty() {
+            let _ = network_tx.try_send(NetworkCommand::AnnounceFiles {
+                files: known_for_announce,
+            });
+        }
+
+        let total_to_hash = files_to_hash.len();
         let mut hashed_count: usize = 0;
 
-        for (file_idx, file) in discovered.iter().enumerate() {
+        for file in &files_to_hash {
             let file_path = file.path.clone();
             let file_temp_id = file.id.clone();
 
-            {
-                let index = local_index.read().await;
-                let already_hashed = index.all_files().iter().any(|f| f.path == file.path && !f.hash.is_empty());
-                if already_hashed {
-                    hashed_count += 1;
-                    continue;
-                }
-            }
-
-            debug!("Hashing file {}/{}: {}", file_idx + 1, total_files, file.name);
+            debug!("Hashing file {}/{}: {}", hashed_count + 1, total_to_hash, file.name);
 
             let _ = app.emit("file-hash-progress", serde_json::json!({
                 "current": hashed_count + 1,
-                "total": total_files,
+                "total": total_to_hash,
                 "file_name": file.name,
             }));
 
@@ -119,7 +145,7 @@ pub async fn add_shared_folder(
 
             match hash_result {
                 Ok(Ok(Ok((ed2k_hash, aich_hash)))) => {
-                    debug!("Hash complete {}/{}: {} -> {}", file_idx + 1, total_files, file.name, &ed2k_hash[..8]);
+                    debug!("Hash complete: {} -> {}", file.name, &ed2k_hash[..8]);
                     let mut updated_file = file.clone();
                     updated_file.id = ed2k_hash.clone();
                     updated_file.hash = ed2k_hash;
@@ -137,6 +163,7 @@ pub async fn add_shared_folder(
                         });
 
                     hashed_count += 1;
+                    refresh_file_cache(&local_index, &file_cache).await;
                 }
                 Ok(Ok(Err(e))) => {
                     warn!("Failed to hash {}: {e}", file.name);
@@ -156,20 +183,14 @@ pub async fn add_shared_folder(
             }
         }
 
-        refresh_file_cache(&local_index, &file_cache).await;
         let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
         scanning.fetch_sub(1, Ordering::Relaxed);
-        info!("Background hashing complete: {hashed_count}/{total_files} files from {path}");
-
-        let final_files = {
-            let index = local_index.read().await;
-            index.all_files().to_vec()
-        };
-        let _ = app.emit("shared-files-snapshot", serde_json::to_value(&final_files).unwrap_or_default());
+        let from_known = total_files - total_to_hash;
+        info!("Background hashing complete: {hashed_count}/{total_to_hash} hashed, {from_known} from known.met ({path})");
 
         let _ = app.emit("file-hash-progress", serde_json::json!({
-            "current": total_files,
-            "total": total_files,
+            "current": total_to_hash,
+            "total": total_to_hash,
             "file_name": "",
             "done": true,
         }));
@@ -281,8 +302,7 @@ pub async fn reload_shared_files(
 
     // Everything runs in background -- command returns immediately
     tokio::spawn(async move {
-        // Phase 1: instant discovery across all folders
-        let discovered: Vec<FileInfo> = match tokio::task::spawn_blocking(move || {
+        let mut discovered: Vec<FileInfo> = match tokio::task::spawn_blocking(move || {
             let mut files = Vec::new();
             for folder in &folders {
                 files.extend(FileIndexer::discover_directory(folder));
@@ -300,6 +320,10 @@ pub async fn reload_shared_files(
         };
 
         let total_files = discovered.len();
+
+        let known_list = load_known_files();
+        let files_to_hash = resolve_from_known(&mut discovered, &known_list);
+
         {
             let mut index = local_index.write().await;
             index.add_files(discovered.clone());
@@ -311,27 +335,28 @@ pub async fn reload_shared_files(
             "count": total_files,
         }));
 
-        // Phase 2: hash one at a time
+        let known_for_announce: Vec<_> = discovered.iter()
+            .filter(|f| !f.hash.is_empty())
+            .cloned()
+            .collect();
+        if !known_for_announce.is_empty() {
+            let _ = network_tx.try_send(NetworkCommand::AnnounceFiles {
+                files: known_for_announce,
+            });
+        }
+
+        let total_to_hash = files_to_hash.len();
         let mut hashed_count: usize = 0;
 
-        for (file_idx, file) in discovered.iter().enumerate() {
+        for file in &files_to_hash {
             let file_path = file.path.clone();
             let file_temp_id = file.id.clone();
 
-            {
-                let index = local_index.read().await;
-                let already_hashed = index.all_files().iter().any(|f| f.path == file.path && !f.hash.is_empty());
-                if already_hashed {
-                    hashed_count += 1;
-                    continue;
-                }
-            }
-
-            debug!("Reload hashing {}/{}: {}", file_idx + 1, total_files, file.name);
+            debug!("Reload hashing {}/{}: {}", hashed_count + 1, total_to_hash, file.name);
 
             let _ = app.emit("file-hash-progress", serde_json::json!({
                 "current": hashed_count + 1,
-                "total": total_files,
+                "total": total_to_hash,
                 "file_name": file.name,
             }));
 
@@ -345,7 +370,7 @@ pub async fn reload_shared_files(
 
             match hash_result {
                 Ok(Ok(Ok((ed2k_hash, aich_hash)))) => {
-                    debug!("Reload hash complete {}/{}: {} -> {}", file_idx + 1, total_files, file.name, &ed2k_hash[..8]);
+                    debug!("Reload hash complete: {} -> {}", file.name, &ed2k_hash[..8]);
                     let mut updated_file = file.clone();
                     updated_file.id = ed2k_hash.clone();
                     updated_file.hash = ed2k_hash;
@@ -365,6 +390,7 @@ pub async fn reload_shared_files(
                         });
 
                     hashed_count += 1;
+                    refresh_file_cache(&local_index, &file_cache).await;
                 }
                 Ok(Ok(Err(e))) => {
                     warn!("Failed to hash {}: {e}", file.name);
@@ -384,20 +410,14 @@ pub async fn reload_shared_files(
             }
         }
 
-        refresh_file_cache(&local_index, &file_cache).await;
         let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
         scanning.fetch_sub(1, Ordering::Relaxed);
-        info!("Background reload hashing complete: {hashed_count}/{total_files} files");
-
-        let final_files = {
-            let index = local_index.read().await;
-            index.all_files().to_vec()
-        };
-        let _ = app.emit("shared-files-snapshot", serde_json::to_value(&final_files).unwrap_or_default());
+        let from_known = total_files - total_to_hash;
+        info!("Background reload complete: {hashed_count}/{total_to_hash} hashed, {from_known} from known.met");
 
         let _ = app.emit("file-hash-progress", serde_json::json!({
-            "current": total_files,
-            "total": total_files,
+            "current": total_to_hash,
+            "total": total_to_hash,
             "file_name": "",
             "done": true,
         }));

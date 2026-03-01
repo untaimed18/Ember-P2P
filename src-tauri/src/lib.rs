@@ -143,6 +143,27 @@ pub fn run() {
                     }).await.unwrap_or_default();
                     all_discovered.extend(discovered);
                 }
+
+                // eMule pattern: check known.met before hashing (CSharedFileList::CheckAndAddSingleFile)
+                let known_list = {
+                    let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
+                        .map(|d| d.data_dir().to_path_buf())
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    storage::known_files::KnownFileList::load(&data_dir.join("known.met"))
+                };
+
+                let mut files_to_hash: Vec<crate::types::FileInfo> = Vec::new();
+                for file in &mut all_discovered {
+                    if let Some(record) = known_list.find_by_path_and_meta(&file.path, file.size, file.modified_at) {
+                        let hash = hex::encode(record.file_hash);
+                        file.id = hash.clone();
+                        file.hash = hash;
+                        file.aich_hash = record.aich_hash.clone();
+                    } else {
+                        files_to_hash.push(file.clone());
+                    }
+                }
+
                 {
                     let mut index = index_clone.write().await;
                     index.add_files(all_discovered.clone());
@@ -154,26 +175,29 @@ pub fn run() {
                     "count": all_discovered.len(),
                 }));
 
-                // Phase 2: hash one file at a time (same pattern as addSharedFolder)
-                let total = all_discovered.len();
+                let known_for_announce: Vec<_> = all_discovered.iter()
+                    .filter(|f| !f.hash.is_empty())
+                    .cloned()
+                    .collect();
+                if !known_for_announce.is_empty() {
+                    let _ = net_tx.try_send(network::NetworkCommand::AnnounceFiles {
+                        files: known_for_announce,
+                    });
+                }
+
+                // Phase 2: hash only files not found in known.met
+                let total_to_hash = files_to_hash.len();
                 let mut hashed = 0usize;
-                for (file_idx, file) in all_discovered.iter().enumerate() {
+
+                for file in &files_to_hash {
                     let file_path = file.path.clone();
                     let file_temp_id = file.id.clone();
 
-                    {
-                        let idx = index_clone.read().await;
-                        if idx.all_files().iter().any(|f| f.path == file.path && !f.hash.is_empty()) {
-                            hashed += 1;
-                            continue;
-                        }
-                    }
-
-                    tracing::debug!("Startup hashing {}/{}: {}", file_idx + 1, total, file.name);
+                    tracing::debug!("Startup hashing {}/{}: {}", hashed + 1, total_to_hash, file.name);
 
                     let _ = startup_app.emit("file-hash-progress", serde_json::json!({
                         "current": hashed + 1,
-                        "total": total,
+                        "total": total_to_hash,
                         "file_name": file.name,
                     }));
 
@@ -186,7 +210,7 @@ pub fn run() {
 
                     match hash_result {
                         Ok(Ok(Ok((ed2k_hash, aich_hash)))) => {
-                            tracing::debug!("Startup hash complete {}/{}: {} -> {}", file_idx + 1, total, file.name, &ed2k_hash[..8]);
+                            tracing::debug!("Startup hash complete: {} -> {}", file.name, &ed2k_hash[..8]);
                             let mut updated = file.clone();
                             updated.id = ed2k_hash.clone();
                             updated.hash = ed2k_hash;
@@ -200,6 +224,7 @@ pub fn run() {
                                 files: vec![updated],
                             });
                             hashed += 1;
+                            { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
                         }
                         Ok(Ok(Err(e))) => {
                             tracing::warn!("Startup hash failed for {}: {e}", file.name);
@@ -219,21 +244,21 @@ pub fn run() {
                     }
                 }
 
-                let final_snap = index_clone.read().await.all_files().to_vec();
-                *csf.write().await = final_snap.clone();
                 startup_scanning.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 let _ = net_tx.try_send(network::NetworkCommand::SharedFilesChanged);
-                let _ = startup_app.emit("shared-files-snapshot", serde_json::to_value(&final_snap).unwrap_or_default());
                 let _ = startup_app.emit("file-hash-progress", serde_json::json!({
-                    "current": total,
-                    "total": total,
+                    "current": total_to_hash,
+                    "total": total_to_hash,
                     "file_name": "",
                     "done": true,
                 }));
+                let from_known = all_discovered.len() - total_to_hash;
                 info!(
-                    "Indexed {} files from {} shared folders",
+                    "Indexed {} files from {} shared folders ({} from known.met, {} hashed)",
                     index_clone.read().await.file_count(),
-                    shared_folders.len()
+                    shared_folders.len(),
+                    from_known,
+                    hashed,
                 );
             });
 

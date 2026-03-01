@@ -184,13 +184,33 @@ impl KnownFileList {
 
     /// Look up a known file by path, size, and mtime to skip re-hashing.
     pub fn find_by_path_and_meta(&self, path: &str, size: u64, mtime: i64) -> Option<&KnownFileRecord> {
-        let hash = self.path_index.get(path)?;
-        let record = self.files.get(hash)?;
-        if record.file_size == size && record.modified_at == mtime {
-            Some(record)
-        } else {
-            None
+        if let Some(hash) = self.path_index.get(path) {
+            if let Some(record) = self.files.get(hash) {
+                if record.file_size == size && record.modified_at == mtime {
+                    return Some(record);
+                }
+            }
         }
+        // Fallback: match by name + size + mtime (eMule's FindKnownFile approach).
+        // The known.met format doesn't persist file paths, so after a restart
+        // the path_index is empty and we must match by metadata instead.
+        self.find_by_name_and_meta(
+            std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default()
+                .as_ref(),
+            size,
+            mtime,
+        )
+    }
+
+    /// eMule-compatible lookup: match by filename, size, and modified time.
+    /// Used when file paths aren't available (e.g. after loading from known.met).
+    pub fn find_by_name_and_meta(&self, name: &str, size: u64, mtime: i64) -> Option<&KnownFileRecord> {
+        self.files.values().find(|r| {
+            r.file_name == name && r.file_size == size && r.modified_at == mtime
+        })
     }
 
     pub fn find_by_hash(&self, hash: &[u8; 16]) -> Option<&KnownFileRecord> {
