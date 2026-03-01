@@ -253,8 +253,8 @@
         case 'pause': await pauseTransfer(t.id); break;
         case 'stop': await stopTransfer(t.id); break;
         case 'resume': await resumeTransfer(t.id); break;
-        case 'cancel': await cancelTransfer(t.id); break;
-        case 'remove': await removeTransfer(t.id); break;
+        case 'cancel': await cancelTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id)); break;
+        case 'remove': await removeTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id)); break;
         case 'open': await openFile(t.id); break;
         case 'priority': if (extra) await setTransferPriority(t.id, extra); break;
         case 'find_sources': await findSources(t.file_hash, t.total_size); break;
@@ -264,7 +264,7 @@
           transferError = `Archive recovered: ${path}`;
           break;
         }
-        case 'clear_completed': await clearCompleted(); break;
+        case 'clear_completed': await clearCompleted(); transfers.update((list) => list.filter((x) => x.status !== 'completed' && x.status !== 'failed')); break;
         case 'copy_link': {
           const link = `ed2k://|file|${encodeURIComponent(t.file_name)}|${t.total_size}|${t.file_hash}|/`;
           await navigator.clipboard.writeText(link);
@@ -290,7 +290,7 @@
     try { await resumeAllTransfers(); } catch (e: unknown) { transferError = toErrorMsg(e); }
   }
   async function handleClearCompleted() {
-    try { await clearCompleted(); } catch (e: unknown) { transferError = toErrorMsg(e); }
+    try { await clearCompleted(); transfers.update((list) => list.filter((x) => x.status !== 'completed' && x.status !== 'failed')); } catch (e: unknown) { transferError = toErrorMsg(e); }
   }
 
   // --- Splitter ---
