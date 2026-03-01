@@ -119,12 +119,11 @@
   }
 
   async function handleStopHashing() {
+    scanning = false;
+    hashProgress = null;
+    stoppedByUser = true;
     try {
       await stopHashing();
-      scanning = false;
-      hashProgress = null;
-      stoppedByUser = true;
-      await refresh();
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
     }
@@ -339,25 +338,20 @@
       if (scrollContainer) { resizeObs.observe(scrollContainer); clearInterval(checkContainer); }
     }, 100);
 
-    // Poll every 3s: refresh file list while scanning, detect completion as fallback.
+    // Poll every 3s: detect scan completion and refresh data while scanning.
+    // The poll never INITIATES the scanning UI state -- only progress events do that.
+    // This prevents the banner from reappearing after Stop or page re-navigation.
     const scanPoll = setInterval(async () => {
-      if (!mounted) return;
+      if (!mounted || stoppedByUser) return;
       try {
         const isScanning = await getScanStatus();
         if (!mounted) return;
-        if (stoppedByUser && !isScanning) {
-          stoppedByUser = false;
-        } else if (stoppedByUser) {
-          // Backend still winding down after stop -- don't re-set scanning
-        } else if (scanning && !isScanning) {
+        if (scanning && !isScanning) {
           scanning = false;
           hashProgress = null;
           await refresh();
-        } else if (isScanning) {
-          scanning = true;
+        } else if (scanning && isScanning) {
           await refresh();
-        } else {
-          scanning = isScanning;
         }
       } catch {}
     }, 3000);
