@@ -30,6 +30,7 @@
 
   let mounted = true;
   let busy = false;
+  let pendingRefresh = false;
   let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
   function debouncedRefresh() {
@@ -38,8 +39,13 @@
   }
 
   async function refresh() {
-    if (busy || !mounted) return;
+    if (!mounted) return;
+    if (busy) {
+      pendingRefresh = true;
+      return;
+    }
     busy = true;
+    pendingRefresh = false;
     try {
       const [newFolders, newFiles, isScanning] = await Promise.all([
         getSharedFolders(),
@@ -55,6 +61,10 @@
         console.error('Failed to load shared files:', e);
     } finally {
       busy = false;
+      if (pendingRefresh && mounted) {
+        pendingRefresh = false;
+        debouncedRefresh();
+      }
     }
   }
 
@@ -259,12 +269,17 @@
       unlisteners.push(await listen<{ phase: string; count: number }>(
         'shared-files-changed', () => { if (mounted) debouncedRefresh(); }
       ));
+      unlisteners.push(await listen<FileInfo[]>(
+        'shared-files-snapshot', (event) => {
+          if (!mounted) return;
+          files = event.payload;
+        }
+      ));
       unlisteners.push(await listen<{ current: number; total: number; file_name: string; done?: boolean }>(
         'file-hash-progress', (event) => {
           if (!mounted) return;
           if (event.payload.done) {
             hashProgress = null;
-            debouncedRefresh();
           } else {
             hashProgress = {
               current: event.payload.current,

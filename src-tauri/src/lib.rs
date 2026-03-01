@@ -219,9 +219,11 @@ pub fn run() {
                     }
                 }
 
-                { let snap = index_clone.read().await.all_files().to_vec(); *csf.write().await = snap; }
+                let final_snap = index_clone.read().await.all_files().to_vec();
+                *csf.write().await = final_snap.clone();
                 startup_scanning.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 let _ = net_tx.try_send(network::NetworkCommand::SharedFilesChanged);
+                let _ = startup_app.emit("shared-files-snapshot", serde_json::to_value(&final_snap).unwrap_or_default());
                 let _ = startup_app.emit("file-hash-progress", serde_json::json!({
                     "current": total,
                     "total": total,

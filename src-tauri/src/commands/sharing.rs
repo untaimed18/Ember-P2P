@@ -161,6 +161,12 @@ pub async fn add_shared_folder(
         scanning.fetch_sub(1, Ordering::Relaxed);
         info!("Background hashing complete: {hashed_count}/{total_files} files from {path}");
 
+        let final_files = {
+            let index = local_index.read().await;
+            index.all_files().to_vec()
+        };
+        let _ = app.emit("shared-files-snapshot", serde_json::to_value(&final_files).unwrap_or_default());
+
         let _ = app.emit("file-hash-progress", serde_json::json!({
             "current": total_files,
             "total": total_files,
@@ -382,6 +388,12 @@ pub async fn reload_shared_files(
         let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
         scanning.fetch_sub(1, Ordering::Relaxed);
         info!("Background reload hashing complete: {hashed_count}/{total_files} files");
+
+        let final_files = {
+            let index = local_index.read().await;
+            index.all_files().to_vec()
+        };
+        let _ = app.emit("shared-files-snapshot", serde_json::to_value(&final_files).unwrap_or_default());
 
         let _ = app.emit("file-hash-progress", serde_json::json!({
             "current": total_files,
