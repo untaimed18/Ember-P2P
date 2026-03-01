@@ -8,6 +8,7 @@
 
   onDestroy(() => {
     if (searchTimeout) { clearTimeout(searchTimeout); searchTimeout = null; }
+    if (filterDebounceTimer) { clearTimeout(filterDebounceTimer); filterDebounceTimer = null; }
   });
 
   let searchMethod: SearchMethod = $state('global');
@@ -49,6 +50,73 @@
   let filterMaxUnit = $state(1024 * 1024 * 1024);
   let filterExtension = $state('');
   let filterMinSources = $state('');
+
+  // Text filter (eMule-style: space-separated AND tokens, "-" prefix = NOT)
+  type FilterColumn = 'name' | 'size' | 'type' | 'sources' | 'hash' | 'all';
+  let filterColumn: FilterColumn = $state('name');
+  let filterTextInput = $state('');
+  let filterText = $state('');
+  let filterDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const FILTER_COLUMNS: { value: FilterColumn; label: string }[] = [
+    { value: 'name', label: 'Name' },
+    { value: 'type', label: 'Type' },
+    { value: 'size', label: 'Size' },
+    { value: 'sources', label: 'Sources' },
+    { value: 'hash', label: 'Hash' },
+    { value: 'all', label: 'All Fields' },
+  ];
+
+  function onFilterTextInput() {
+    if (filterDebounceTimer) clearTimeout(filterDebounceTimer);
+    filterDebounceTimer = setTimeout(() => {
+      filterText = filterTextInput;
+    }, 400);
+  }
+
+  function clearFilterText() {
+    filterTextInput = '';
+    filterText = '';
+    if (filterDebounceTimer) clearTimeout(filterDebounceTimer);
+  }
+
+  function getColumnText(result: SearchResult, column: FilterColumn): string {
+    switch (column) {
+      case 'name': return result.file.name;
+      case 'size': return formatSize(result.file.size);
+      case 'type': return result.file_type || result.file.extension || '';
+      case 'sources': return String(result.availability);
+      case 'hash': return result.file.hash;
+      case 'all':
+        return [
+          result.file.name,
+          formatSize(result.file.size),
+          result.file_type || result.file.extension || '',
+          String(result.availability),
+          result.file.hash,
+        ].join(' ');
+    }
+  }
+
+  function isFilteredByText(result: SearchResult): boolean {
+    if (!filterText.trim()) return false;
+
+    const tokens = filterText.trim().split(/\s+/).filter(t => t !== '' && t !== '-');
+    if (tokens.length === 0) return false;
+
+    const target = getColumnText(result, filterColumn).toLowerCase();
+
+    for (const token of tokens) {
+      const isNot = token.startsWith('-');
+      const term = (isNot ? token.slice(1) : token).toLowerCase();
+      if (!term) continue;
+
+      const found = target.includes(term);
+      if (isNot === found) return true;
+    }
+
+    return false;
+  }
 
   type SortField = 'name' | 'size' | 'type' | 'sources';
   type SortDir = 'asc' | 'desc';
@@ -101,6 +169,8 @@
         results = results.filter(r => r.availability >= minSrc);
       }
     }
+
+    results = results.filter(r => !isFilteredByText(r));
 
     results.sort((a, b) => {
       let cmp = 0;
@@ -268,6 +338,7 @@
     filterMaxSize = '';
     filterExtension = '';
     filterMinSources = '';
+    clearFilterText();
   }
 
   function clearResults() {
@@ -282,7 +353,8 @@
     filterMinSize !== '' ||
     filterMaxSize !== '' ||
     filterExtension !== '' ||
-    filterMinSources !== ''
+    filterMinSources !== '' ||
+    filterText !== ''
   );
 </script>
 
@@ -341,6 +413,30 @@
 </div>
 
 <div class="filter-bar">
+  <div class="filter-group filter-text-group">
+    <label for="filter-text">Filter</label>
+    <div class="filter-text-wrap">
+      <select bind:value={filterColumn} class="column-select" aria-label="Filter column">
+        {#each FILTER_COLUMNS as col}
+          <option value={col.value}>{col.label}</option>
+        {/each}
+      </select>
+      <input
+        id="filter-text"
+        type="text"
+        placeholder="e.g. rock -live"
+        bind:value={filterTextInput}
+        oninput={onFilterTextInput}
+        class="filter-text-input"
+      />
+      {#if filterTextInput}
+        <button class="filter-text-clear" onclick={clearFilterText} title="Clear filter text">✕</button>
+      {/if}
+    </div>
+  </div>
+
+  <div class="filter-separator"></div>
+
   <div class="filter-group">
     <label for="filter-type">Type</label>
     <select id="filter-type" bind:value={filterType}>
@@ -644,6 +740,85 @@
     align-items: flex-end;
     flex-wrap: wrap;
     border-bottom: 1px solid var(--border);
+  }
+
+  .filter-text-group {
+    flex: 1;
+    min-width: 200px;
+    max-width: 400px;
+  }
+
+  .filter-text-wrap {
+    display: flex;
+    align-items: center;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    background: var(--bg-surface);
+    transition: border-color 0.15s;
+  }
+
+  .filter-text-wrap:focus-within {
+    border-color: var(--accent);
+  }
+
+  .column-select {
+    border: none;
+    border-right: 1px solid var(--border);
+    border-radius: 0;
+    background: var(--bg-secondary);
+    font-size: 12px;
+    padding: 5px 6px;
+    min-width: 0;
+    width: auto;
+    color: var(--text-secondary);
+    cursor: pointer;
+    outline: none;
+  }
+
+  .column-select:hover {
+    background: var(--bg-hover);
+  }
+
+  .filter-text-input {
+    flex: 1;
+    border: none;
+    outline: none;
+    font-size: 13px;
+    padding: 5px 8px;
+    background: transparent;
+    color: var(--text-primary);
+    min-width: 0;
+  }
+
+  .filter-text-input::placeholder {
+    color: var(--text-muted);
+    font-style: italic;
+  }
+
+  .filter-text-clear {
+    border: none;
+    background: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    padding: 4px 8px;
+    font-size: 12px;
+    line-height: 1;
+    flex-shrink: 0;
+    border-radius: 0;
+  }
+
+  .filter-text-clear:hover {
+    color: var(--text-primary);
+  }
+
+  .filter-separator {
+    width: 1px;
+    height: 28px;
+    background: var(--border);
+    align-self: flex-end;
+    margin-bottom: 2px;
+    flex-shrink: 0;
   }
 
   .filter-group {
