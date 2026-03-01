@@ -985,6 +985,17 @@ pub async fn start_network(
                                 state.dead_sources.remove(0, u32::from(ip), port);
                             }
                         }
+                        // Clear all per-file dead source entries for this completed file
+                        if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
+                            if fh_bytes.len() == 16 {
+                                let mut fh = [0u8; 16];
+                                fh.copy_from_slice(&fh_bytes);
+                                let sm = source_manager.read().await;
+                                for (ip, port) in sm.get_sources(&fh) {
+                                    state.dead_sources.remove_for_file(&fh, u32::from(ip), port);
+                                }
+                            }
+                        }
                         let safe_name = crate::security::sanitize_filename(&t.file_name);
                         let completed_path = PathBuf::from(&settings.download_folder)
                             .join("Downloads")
