@@ -52,11 +52,13 @@ pub struct MultiSourceDownload {
     pub source_manager: Option<Arc<RwLock<SourceManager>>>,
     pub credit_manager: Option<Arc<RwLock<CreditManager>>>,
     pub shared_buddy_info: Option<super::upload::SharedBuddyInfo>,
+    /// Channel for receiving new sources discovered during the download
+    pub new_source_rx: Option<mpsc::Receiver<DownloadSource>>,
 }
 
 impl MultiSourceDownload {
     /// Run the multi-source download. If only one source, falls back to single-source.
-    pub async fn run(self, event_tx: mpsc::Sender<DownloadEvent>) -> anyhow::Result<()> {
+    pub async fn run(mut self, event_tx: mpsc::Sender<DownloadEvent>) -> anyhow::Result<()> {
         if self.sources.is_empty() {
             anyhow::bail!("no sources available");
         }
@@ -387,11 +389,161 @@ impl MultiSourceDownload {
         // Drop our copy of progress_tx so the aggregator can finish
         drop(progress_tx);
 
-        // Wait for all sources to complete
-        for handle in handles {
-            if let Ok((_src_idx, _parts, result)) = handle.await {
-                if result.is_err() {
-                    // Parts from failed sources remain incomplete in tracker
+        // Wait for all initial sources and accept new sources as they arrive
+        let mut pending_handles: Vec<tokio::task::JoinHandle<(usize, Vec<usize>, anyhow::Result<()>)>> = handles;
+        let mut next_src_idx = self.sources.len();
+
+        if let Some(mut new_source_rx) = self.new_source_rx.take() {
+            // Concurrent loop: wait for handles to complete while accepting new sources.
+            // When all initial sources finish but parts remain, keep listening for
+            // injected sources (from ongoing KAD/server discovery) for up to 60 seconds
+            // before falling through to retry rounds.
+            let mut injection_deadline: Option<tokio::time::Instant> = None;
+            loop {
+                let all_done = {
+                    let t = tracker.read().await;
+                    t.all_complete()
+                };
+                if all_done {
+                    break;
+                }
+                if pending_handles.is_empty() {
+                    if injection_deadline.is_none() {
+                        info!("All source tasks done, waiting up to 60s for new sources via injection");
+                        injection_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(60));
+                    }
+                    if let Some(deadline) = injection_deadline {
+                        if tokio::time::Instant::now() >= deadline {
+                            info!("Source injection deadline reached, proceeding to retry rounds");
+                            break;
+                        }
+                    }
+                }
+
+                tokio::select! {
+                    // Wait for any source task to complete (or short sleep if no handles)
+                    result = async {
+                        if let Some(h) = pending_handles.first_mut() {
+                            Some(h.await)
+                        } else {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            None
+                        }
+                    } => {
+                        if result.is_some() {
+                            pending_handles.remove(0);
+                        }
+                    }
+                    // Accept new source from the injection channel
+                    new_src = new_source_rx.recv() => {
+                        if let Some(source) = new_src {
+                            let src_idx = next_src_idx;
+                            next_src_idx += 1;
+                            // Assign parts to the new source using ChunkSelector
+                            let parts = {
+                                let cs = chunk_selector.read().await;
+                                let t = tracker.read().await;
+                                let completed = t.completed_parts().to_vec();
+                                let in_prog = t.in_progress.clone();
+                                let avail = if source.available_parts.is_empty() {
+                                    vec![true; t.part_count]
+                                } else {
+                                    source.available_parts.clone()
+                                };
+                                let pp = self.control.is_preview_priority();
+                                if let Some(p) = cs.select_part(&completed, &in_prog, &avail, &[], pp) {
+                                    vec![p]
+                                } else {
+                                    Vec::new()
+                                }
+                            };
+                            if parts.is_empty() {
+                                continue;
+                            }
+                            info!("Injecting new source {}:{} (idx {src_idx}) into active download", source.peer_ip, source.peer_port);
+                            let src = source.clone();
+                            let trk = tracker.clone();
+                            let pp = part_path.clone();
+                            let fh = self.file_hash;
+                            let fs = self.file_size;
+                            let uh = self.user_hash;
+                            let nn = self.nickname.clone();
+                            let tp = self.tcp_port;
+                            let up = self.udp_port;
+                            let bw = self.bandwidth_limiter.clone();
+                            let _ptx = event_tx.clone();
+                            let ph = part_hashes.clone();
+                            let sa = active_count.clone();
+                            let sq = queued_count.clone();
+                            let sm = self.source_manager.clone();
+                            let cm = self.credit_manager.clone();
+                            let cs = chunk_selector.clone();
+                            let avail = source.available_parts.clone();
+                            let etx = event_tx.clone();
+                            let tid = self.transfer_id.clone();
+                            let bi = self.shared_buddy_info.clone();
+                            let ctrl = self.control.clone();
+                            let sem = conn_semaphore.clone();
+
+                            let fail_etx = event_tx.clone();
+                            let fail_tid = self.transfer_id.clone();
+                            let fail_ip = source.peer_ip.clone();
+                            let fail_port = source.peer_port;
+
+                            // Create a progress sender that goes through the event channel
+                            let (inj_progress_tx, mut inj_progress_rx) = mpsc::channel::<(usize, i64)>(64);
+                            let progress_etx = event_tx.clone();
+                            let progress_tid = self.transfer_id.clone();
+                            let progress_fs = self.file_size;
+                            tokio::spawn(async move {
+                                while let Some((_idx, bytes)) = inj_progress_rx.recv().await {
+                                    // Forward as DownloadEvent::Progress (approximate)
+                                    let _ = progress_etx.send(DownloadEvent::Progress {
+                                        transfer_id: progress_tid.clone(),
+                                        downloaded: bytes.max(0) as u64,
+                                        total: progress_fs,
+                                    }).await;
+                                }
+                            });
+
+                            let handle = tokio::spawn(async move {
+                                let _permit = sem.acquire().await.expect("semaphore closed");
+                                let result = download_parts_from_source(
+                                    src_idx, &src, &parts, trk, &pp, &fh, fs, &uh, &nn,
+                                    tp, up, bw, inj_progress_tx, ph, sa, sq, sm, cm,
+                                    Some(cs), avail, None, Some(etx), tid, bi, ctrl,
+                                ).await;
+                                if let Err(e) = &result {
+                                    warn!("Injected source {} ({}) failed: {e}", src_idx, fail_ip);
+                                    let _ = fail_etx.send(DownloadEvent::SourceDetail {
+                                        transfer_id: fail_tid,
+                                        ip: fail_ip,
+                                        port: fail_port,
+                                        status: "failed".to_string(),
+                                        queue_rank: None,
+                                        speed: 0,
+                                        transferred: 0,
+                                        client_software: String::new(),
+                                    }).await;
+                                }
+                                (src_idx, parts, result)
+                            });
+                            pending_handles.push(handle);
+                        }
+                    }
+                }
+            }
+            // Drain remaining handles
+            for handle in pending_handles {
+                let _ = handle.await;
+            }
+        } else {
+            // No injection channel — wait for all sources to complete (original behavior)
+            for handle in pending_handles {
+                if let Ok((_src_idx, _parts, result)) = handle.await {
+                    if result.is_err() {
+                        // Parts from failed sources remain incomplete in tracker
+                    }
                 }
             }
         }

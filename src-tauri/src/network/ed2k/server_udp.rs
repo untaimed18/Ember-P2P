@@ -125,7 +125,8 @@ pub enum ServerUdpResponse {
     },
     FoundSources {
         file_hash: [u8; 16],
-        sources: Vec<(Ipv4Addr, u16)>,
+        /// (ip, port, client_id) — client_id > 0 means LowID source
+        sources: Vec<(Ipv4Addr, u16, u32)>,
     },
     SearchResult {
         results: Vec<ServerSearchResult>,
@@ -175,8 +176,13 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
             for _ in 0..source_count {
                 let id = cursor.read_u32::<LittleEndian>().ok()?;
                 let port = cursor.read_u16::<LittleEndian>().ok()?;
-                let ip = Ipv4Addr::from(id.to_be_bytes());
-                sources.push((ip, port));
+                if id < super::server::LOWID_THRESHOLD {
+                    // LowID: store with client_id, IP is unspecified
+                    sources.push((Ipv4Addr::UNSPECIFIED, port, id));
+                } else {
+                    let ip = Ipv4Addr::from(id.to_be_bytes());
+                    sources.push((ip, port, 0));
+                }
             }
             Some(ServerUdpResponse::FoundSources { file_hash, sources })
         }

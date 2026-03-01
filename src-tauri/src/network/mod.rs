@@ -302,6 +302,8 @@ struct NetworkState {
     _a4af_placeholder: (),
     /// Dead source tracking (prevents reconnecting to failing sources)
     dead_sources: DeadSourceList,
+    /// Senders for injecting new sources into active multi-source downloads
+    active_source_senders: HashMap<String, mpsc::Sender<DownloadSource>>,
     /// Comment/rating manager
     comment_manager: CommentManager,
     firewall_checker: FirewallChecker,
@@ -591,6 +593,7 @@ pub async fn start_network(
         server_addr: None,
         _a4af_placeholder: (),
         dead_sources: DeadSourceList::new(),
+        active_source_senders: HashMap::new(),
         comment_manager: CommentManager::new(),
         firewall_checker: FirewallChecker::new(),
         low_id: false,
@@ -990,6 +993,7 @@ pub async fn start_network(
             // Download progress events
             Some(event) = dl_event_rx.recv() => {
                 if let DownloadEvent::Completed { ref transfer_id } = event {
+                    state.active_source_senders.remove(transfer_id);
                     let mgr = transfer_manager.read().await;
                     if let Some(t) = mgr.get_transfer(transfer_id) {
                         if let Some((ip_str, port_str)) = t.peer_id.split_once(':') {
@@ -1116,6 +1120,7 @@ pub async fn start_network(
                     drop(mgr);
                 }
                 if let DownloadEvent::Failed { ref transfer_id, ref error } = event {
+                    state.active_source_senders.remove(transfer_id);
                     let mgr = transfer_manager.read().await;
                     if let Some(t) = mgr.get_transfer(transfer_id) {
                         if let Some((ip_str, port_str)) = t.peer_id.split_once(':') {
@@ -1525,6 +1530,7 @@ pub async fn start_network(
                                             }
                                         }
                                     }
+                                    let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
                                     let ms_download = MultiSourceDownload {
                                         transfer_id: pending.transfer_id,
                                         file_hash: hash_bytes,
@@ -1541,9 +1547,11 @@ pub async fn start_network(
                                         source_manager: Some(source_manager.clone()),
                                         credit_manager: Some(credit_manager.clone()),
                                         shared_buddy_info: Some(state.shared_buddy_info.clone()),
+                                        new_source_rx: Some(src_inject_rx),
                                     };
-                                    let tx = dl_event_tx.clone();
                                     let tid = ms_download.transfer_id.clone();
+                                    state.active_source_senders.insert(tid.clone(), src_inject_tx);
+                                    let tx = dl_event_tx.clone();
                                     let tx2 = tx.clone();
                                     tokio::spawn(async move {
                                         if let Err(e) = ms_download.run(tx).await {
@@ -2355,6 +2363,7 @@ pub async fn start_network(
                                     }
                                 }
                             }
+                            let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
                             let ms_download = MultiSourceDownload {
                                 transfer_id: pending.transfer_id,
                                 file_hash: hash_bytes,
@@ -2371,9 +2380,11 @@ pub async fn start_network(
                                 source_manager: Some(source_manager.clone()),
                                 credit_manager: Some(credit_manager.clone()),
                                 shared_buddy_info: Some(state.shared_buddy_info.clone()),
+                                new_source_rx: Some(src_inject_rx),
                             };
-                            let tx = dl_event_tx.clone();
                             let dl_tid = ms_download.transfer_id.clone();
+                            state.active_source_senders.insert(dl_tid.clone(), src_inject_tx);
+                            let tx = dl_event_tx.clone();
                             let tx2 = tx.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = ms_download.run(tx).await {
@@ -2469,12 +2480,18 @@ pub async fn start_network(
 
                         // Request callbacks for LowID sources if we have HighID
                         if !state.low_id && state.server_connected {
-                            let _ = ed2k::server::OP_CALLBACKREQUEST;
-                            if let Some(conn) = &mut state.server_connection {
-                                if let Some(client_id) = conn.our_client_id() {
-                                    if client_id >= ed2k::server::LOWID_THRESHOLD {
-                                        let _ = conn.request_callback(client_id).await;
+                            let lowid_sources = {
+                                let sm = source_manager.read().await;
+                                let mut fh = [0u8; 16];
+                                fh.copy_from_slice(&hash_bytes);
+                                sm.get_lowid_sources(&fh)
+                            };
+                            if !lowid_sources.is_empty() {
+                                if let Some(conn) = &mut state.server_connection {
+                                    for (cid, _port) in &lowid_sources {
+                                        let _ = conn.request_callback(*cid).await;
                                     }
+                                    debug!("Sent {} LowID callback requests for pending download", lowid_sources.len());
                                 }
                             }
                         }
@@ -2564,6 +2581,7 @@ pub async fn start_network(
             // ed2k server keep-alive, message polling, and auto-reconnect (non-blocking)
             _ = server_timer.tick() => {
                 if state.server_connected {
+                    let mut pending_lowid_callbacks: Vec<u32> = Vec::new();
                     if let Some(conn) = &mut state.server_connection {
                         // Poll for incoming messages (OP_SERVERLIST responses, status updates, etc.)
                         let events = conn.poll_messages().await;
@@ -2641,15 +2659,49 @@ pub async fn start_network(
                                 }
                                 ed2k::server::ServerEvent::FoundSources { file_hash, sources } => {
                                     if !sources.is_empty() {
-                                        info!("Server found {} sources for file {} via poll", sources.len(), hex::encode(file_hash));
+                                        let highid_count = sources.iter().filter(|s| s.client_id == 0).count();
+                                        let lowid_count = sources.iter().filter(|s| s.client_id > 0).count();
+                                        info!("Server found {} sources ({} HighID, {} LowID) for file {} via poll",
+                                            sources.len(), highid_count, lowid_count, hex::encode(file_hash));
                                         let mut sm = source_manager.write().await;
                                         for src in &sources {
-                                            if let Ok(v4) = src.ip.parse::<Ipv4Addr>() {
-                                                sm.register_source(file_hash, v4, src.port);
+                                            if src.client_id == 0 {
+                                                if let Ok(v4) = src.ip.parse::<Ipv4Addr>() {
+                                                    sm.register_source(file_hash, v4, src.port);
+                                                }
+                                            } else {
+                                                sm.register_lowid_source(file_hash, src.client_id, src.port);
                                             }
                                         }
                                         drop(sm);
+                                        // Collect LowID client IDs for callback requests after the borrow ends
+                                        let lowid_ids: Vec<u32> = sources.iter()
+                                            .filter(|s| s.client_id > 0)
+                                            .map(|s| s.client_id)
+                                            .collect();
+                                        if !lowid_ids.is_empty() {
+                                            pending_lowid_callbacks.extend(lowid_ids);
+                                        }
                                         let hash_hex = hex::encode(file_hash);
+                                        // Inject HighID sources into active multi-source downloads
+                                        for src in &sources {
+                                            if src.client_id == 0 && !src.ip.is_empty() {
+                                                for (tid, sender) in &state.active_source_senders {
+                                                    let mgr = transfer_manager.read().await;
+                                                    let matches = mgr.get_transfer(tid)
+                                                        .map(|t| t.file_hash == hash_hex)
+                                                        .unwrap_or(false);
+                                                    drop(mgr);
+                                                    if matches {
+                                                        let _ = sender.try_send(DownloadSource {
+                                                            peer_ip: src.ip.clone(),
+                                                            peer_port: src.port,
+                                                            available_parts: Vec::new(),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
                                         for pd in state.pending_downloads.values_mut() {
                                             if pd.file_hash == hash_hex {
                                                 pd.last_search_at = 0;
@@ -2664,6 +2716,14 @@ pub async fn start_network(
                                 }
                                 ed2k::server::ServerEvent::CallbackRequested { ip, port } => {
                                     info!("Server callback requested: peer at {ip}:{port}");
+                                    // Inject callback source into active downloads
+                                    for (_tid, sender) in &state.active_source_senders {
+                                        let _ = sender.try_send(DownloadSource {
+                                            peer_ip: ip.clone(),
+                                            peer_port: port,
+                                            available_parts: Vec::new(),
+                                        });
+                                    }
                                     if let Ok(peer_ip) = ip.parse::<std::net::Ipv4Addr>() {
                                         let mut sm = source_manager.write().await;
                                         for (_hash, pd) in &state.pending_downloads {
@@ -2676,7 +2736,11 @@ pub async fn start_network(
                                             }
                                         }
                                         drop(sm);
-                                        info!("Registered callback peer {ip}:{port} as potential source for {} pending downloads", state.pending_downloads.len());
+                                        // Trigger immediate retry for matching pending downloads
+                                        for pd in state.pending_downloads.values_mut() {
+                                            pd.last_search_at = 0;
+                                        }
+                                        info!("Registered callback peer {ip}:{port} as source, triggered immediate retry for {} pending downloads", state.pending_downloads.len());
                                     }
                                 }
                                 ed2k::server::ServerEvent::CallbackFailed => {
@@ -2694,6 +2758,16 @@ pub async fn start_network(
                                 state.server_connection = None;
                                 state.server_addr = None;
                             }
+                        }
+                    }
+                    // Send callback requests for LowID sources found during poll
+                    // (done outside the conn borrow to avoid double-mutable-borrow)
+                    if !pending_lowid_callbacks.is_empty() && !state.low_id {
+                        if let Some(conn) = &mut state.server_connection {
+                            for cid in &pending_lowid_callbacks {
+                                let _ = conn.request_callback(*cid).await;
+                            }
+                            debug!("Sent {} LowID callback requests from server poll", pending_lowid_callbacks.len());
                         }
                     }
                 }
@@ -2772,10 +2846,45 @@ pub async fn start_network(
                                 let hash_hex = hex::encode(file_hash);
                                 debug!("UDP found {} sources for {}", sources.len(), hash_hex);
                                 let mut sm = source_manager.write().await;
-                                for (ip, port) in &sources {
-                                    sm.register_source(file_hash, *ip, *port);
+                                for (ip, port, client_id) in &sources {
+                                    if *client_id > 0 {
+                                        sm.register_lowid_source(file_hash, *client_id, *port);
+                                    } else {
+                                        sm.register_source(file_hash, *ip, *port);
+                                    }
+                                }
+                                // Request callbacks for LowID sources
+                                let lowid_ids: Vec<u32> = sources.iter()
+                                    .filter(|(_, _, cid)| *cid > 0)
+                                    .map(|(_, _, cid)| *cid)
+                                    .collect();
+                                if !lowid_ids.is_empty() && state.server_connected && !state.low_id {
+                                    if let Some(conn) = &mut state.server_connection {
+                                        for cid in &lowid_ids {
+                                            let _ = conn.request_callback(*cid).await;
+                                        }
+                                    }
                                 }
                                 drop(sm);
+                                // Inject HighID sources into active downloads
+                                for (ip, port, client_id) in &sources {
+                                    if *client_id == 0 && !ip.is_unspecified() {
+                                        for (tid, sender) in &state.active_source_senders {
+                                            let mgr = transfer_manager.read().await;
+                                            let matches = mgr.get_transfer(tid)
+                                                .map(|t| t.file_hash == hash_hex)
+                                                .unwrap_or(false);
+                                            drop(mgr);
+                                            if matches {
+                                                let _ = sender.try_send(DownloadSource {
+                                                    peer_ip: ip.to_string(),
+                                                    peer_port: *port,
+                                                    available_parts: Vec::new(),
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
                                 for pd in state.pending_downloads.values_mut() {
                                     if pd.file_hash == hash_hex {
                                         pd.last_search_at = 0;

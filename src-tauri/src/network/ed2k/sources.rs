@@ -13,6 +13,8 @@ pub struct SourceEntry {
     pub udp_port: u16,
     pub last_seen: i64,
     pub user_hash: [u8; 16],
+    /// LowID server-assigned client ID (0 = HighID, connectable directly)
+    pub client_id: u32,
 }
 
 /// Tracks known sources (peers) per file hash for source exchange responses.
@@ -72,6 +74,7 @@ impl SourceManager {
             udp_port,
             last_seen: now,
             user_hash,
+            client_id: 0,
         });
 
         if self.sources.len() > MAX_TRACKED_FILES {
@@ -147,7 +150,7 @@ impl SourceManager {
             .unwrap_or_default()
     }
 
-    /// Return non-expired sources for a file, suitable for starting downloads.
+    /// Return non-expired HighID sources for a file (directly connectable).
     pub fn get_sources(&self, file_hash: &[u8; 16]) -> Vec<(Ipv4Addr, u16)> {
         let now = chrono::Utc::now().timestamp();
         self.sources
@@ -155,8 +158,49 @@ impl SourceManager {
             .map(|entries| {
                 entries
                     .iter()
-                    .filter(|e| (now - e.last_seen) < SOURCE_EXPIRY_SECS)
+                    .filter(|e| (now - e.last_seen) < SOURCE_EXPIRY_SECS && e.client_id == 0 && !e.ip.is_unspecified())
                     .map(|e| (e.ip, e.tcp_port))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Register a LowID source (behind NAT, needs server callback to reach).
+    pub fn register_lowid_source(&mut self, file_hash: [u8; 16], client_id: u32, port: u16) {
+        let now = chrono::Utc::now().timestamp();
+        let entries = self.sources.entry(file_hash).or_default();
+
+        if let Some(existing) = entries.iter_mut().find(|e| e.client_id == client_id && client_id > 0) {
+            existing.last_seen = now;
+            existing.tcp_port = port;
+            return;
+        }
+
+        if entries.len() >= self.max_per_file {
+            entries.sort_by_key(|e| e.last_seen);
+            entries.remove(0);
+        }
+
+        entries.push(SourceEntry {
+            ip: Ipv4Addr::UNSPECIFIED,
+            tcp_port: port,
+            udp_port: 0,
+            last_seen: now,
+            user_hash: [0u8; 16],
+            client_id,
+        });
+    }
+
+    /// Return non-expired LowID sources that need server callbacks.
+    pub fn get_lowid_sources(&self, file_hash: &[u8; 16]) -> Vec<(u32, u16)> {
+        let now = chrono::Utc::now().timestamp();
+        self.sources
+            .get(file_hash)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| (now - e.last_seen) < SOURCE_EXPIRY_SECS && e.client_id > 0)
+                    .map(|e| (e.client_id, e.tcp_port))
                     .collect()
             })
             .unwrap_or_default()

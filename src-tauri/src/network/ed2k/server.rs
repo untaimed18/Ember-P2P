@@ -49,6 +49,8 @@ pub struct ServerSearchResult {
 pub struct ServerSource {
     pub ip: String,
     pub port: u16,
+    /// LowID client_id from the server (0 = HighID, use ip:port directly)
+    pub client_id: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -821,13 +823,25 @@ fn parse_found_sources(payload: &[u8]) -> anyhow::Result<([u8; 16], Vec<ServerSo
     let mut sources = Vec::with_capacity(count);
 
     for _ in 0..count {
-        let ip_bytes = ReadBytesExt::read_u32::<LittleEndian>(&mut cursor)?;
+        let id = ReadBytesExt::read_u32::<LittleEndian>(&mut cursor)?;
         let port = ReadBytesExt::read_u16::<LittleEndian>(&mut cursor)?;
-        let ip = std::net::Ipv4Addr::from(ip_bytes.to_be_bytes());
-        sources.push(ServerSource {
-            ip: ip.to_string(),
-            port,
-        });
+        if id < LOWID_THRESHOLD {
+            // LowID source: client_id is a server-assigned ID, not an IP.
+            // Must use OP_CALLBACKREQUEST to reach this peer.
+            sources.push(ServerSource {
+                ip: String::new(),
+                port,
+                client_id: id,
+            });
+        } else {
+            // HighID source: ID is the peer's public IP
+            let ip = std::net::Ipv4Addr::from(id.to_be_bytes());
+            sources.push(ServerSource {
+                ip: ip.to_string(),
+                port,
+                client_id: 0,
+            });
+        }
     }
 
     Ok((file_hash, sources))
