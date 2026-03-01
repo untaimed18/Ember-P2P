@@ -348,10 +348,14 @@ impl Ed2kServerConnection {
     }
 
     pub async fn poll_messages(&mut self) -> Vec<ServerEvent> {
-        match self.poll_read_packet().await {
-            Some((opcode, payload)) => parse_server_event(opcode, &payload),
-            None => Vec::new(),
+        let mut events = Vec::new();
+        loop {
+            match self.poll_read_packet().await {
+                Some((opcode, payload)) => events.extend(parse_server_event(opcode, &payload)),
+                None => break,
+            }
         }
+        events
     }
 
     pub fn is_low_id(&self) -> bool {
