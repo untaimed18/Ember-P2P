@@ -744,7 +744,7 @@ impl RoutingTable {
         for (idx, bucket) in self.buckets.iter_mut().enumerate() {
             let before = bucket.contacts.len();
             bucket.contacts.retain(|c| {
-                if c.is_dead() && c.expires_at > 0 && now > c.expires_at {
+                if c.is_dead() && (c.expires_at == 0 || now > c.expires_at) {
                     ips_to_remove.push(c.ip);
                     false
                 } else {
