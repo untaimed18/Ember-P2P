@@ -1084,7 +1084,7 @@ pub async fn start_network(
                     }
                     drop(mgr);
                 }
-                if let DownloadEvent::Failed { ref transfer_id, .. } = event {
+                if let DownloadEvent::Failed { ref transfer_id, ref error } = event {
                     let mgr = transfer_manager.read().await;
                     if let Some(t) = mgr.get_transfer(transfer_id) {
                         if let Some((ip_str, port_str)) = t.peer_id.split_once(':') {
@@ -1095,6 +1095,44 @@ pub async fn start_network(
                         }
                     }
                     drop(mgr);
+
+                    // eMule-style: downloads never auto-fail. Re-queue for source
+                    // retry unless the user explicitly cancelled.
+                    let is_user_cancel = error.to_lowercase().contains("cancelled");
+                    if !is_user_cancel {
+                        let transfer_info = {
+                            let mgr = transfer_manager.read().await;
+                            mgr.get_transfer(transfer_id).cloned()
+                        };
+                        if let Some(t) = transfer_info {
+                            let control = TransferControl::new();
+                            {
+                                let mut mgr = transfer_manager.write().await;
+                                if let Some(active_t) = mgr.active.get_mut(transfer_id) {
+                                    active_t.status = TransferStatus::Searching;
+                                    active_t.speed = 0;
+                                    active_t.failure_reason = Some(error.clone());
+                                }
+                                mgr.register_control(transfer_id, control.clone());
+                            }
+                            let now = chrono::Utc::now().timestamp();
+                            state.pending_downloads.insert(transfer_id.clone(), PendingDownload {
+                                transfer_id: transfer_id.clone(),
+                                file_hash: t.file_hash.clone(),
+                                file_name: t.file_name.clone(),
+                                file_size: t.total_size,
+                                control,
+                                search_count: 0,
+                                last_search_at: now - (ed2k::dead_sources::FILEREASKTIME_SECS - 120),
+                            });
+                            info!("Re-queued failed download {} for source retry: {}", transfer_id, error);
+                            let _ = app_handle.emit("transfer-status", serde_json::json!({
+                                "id": transfer_id,
+                                "status": "searching",
+                            }));
+                            continue;
+                        }
+                    }
                 }
                 let mut promoted = Vec::new();
                 handle_download_event(event, &app_handle, &transfer_manager, &db, &bandwidth_limiter, &mut promoted, &mut stats_manager, settings.remove_finished_downloads).await;
@@ -1360,11 +1398,26 @@ pub async fn start_network(
                                         }
                                     });
                                 } else {
+                                    let live_sources: Vec<&(String, u16)> = sources
+                                        .iter()
+                                        .filter(|(ip, port)| {
+                                            if let Ok(v4) = ip.parse::<Ipv4Addr>() {
+                                                !state.dead_sources.is_dead_source(0, u32::from(v4), *port)
+                                            } else {
+                                                true
+                                            }
+                                        })
+                                        .collect();
+                                    if live_sources.is_empty() {
+                                        debug!("All {} sources are dead for {transfer_id}, re-queuing", sources.len());
+                                        state.pending_downloads.insert(transfer_id, pending);
+                                        continue;
+                                    }
                                     info!(
-                                        "Starting multi-source download {transfer_id} from {} sources",
-                                        sources.len()
+                                        "Starting multi-source download {transfer_id} from {} sources ({} dead filtered)",
+                                        live_sources.len(), sources.len() - live_sources.len()
                                     );
-                                    let download_sources: Vec<DownloadSource> = sources
+                                    let download_sources: Vec<DownloadSource> = live_sources
                                         .iter()
                                         .map(|(ip, port)| DownloadSource {
                                             peer_ip: ip.clone(),
@@ -2097,6 +2150,153 @@ pub async fn start_network(
                     }
                 }
 
+                // First pass: check if SourceManager has accumulated sources for
+                // any pending download (from server TCP/UDP responses). If so, start
+                // the download immediately instead of waiting for a new Kad search.
+                let mut started_from_sm: Vec<String> = Vec::new();
+                {
+                    let sm = source_manager.read().await;
+                    for tid in &to_retry {
+                        if let Some(pd) = state.pending_downloads.get(tid) {
+                            if let Ok(hash_bytes) = hex::decode(&pd.file_hash) {
+                                if hash_bytes.len() == 16 {
+                                    let mut fh = [0u8; 16];
+                                    fh.copy_from_slice(&hash_bytes);
+                                    let sm_sources = sm.get_sources(&fh);
+                                    let live_sources: Vec<(String, u16)> = sm_sources.into_iter()
+                                        .filter(|(ip, port)| !state.dead_sources.is_dead_source(0, u32::from(*ip), *port))
+                                        .map(|(ip, port)| (ip.to_string(), port))
+                                        .collect();
+                                    if !live_sources.is_empty() {
+                                        started_from_sm.push(tid.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for tid in &started_from_sm {
+                    if let Some(pending) = state.pending_downloads.remove(tid) {
+                        let hash_bytes = match hex::decode(&pending.file_hash) {
+                            Ok(b) if b.len() == 16 => {
+                                let mut arr = [0u8; 16];
+                                arr.copy_from_slice(&b);
+                                arr
+                            }
+                            _ => {
+                                state.pending_downloads.insert(tid.clone(), pending);
+                                continue;
+                            }
+                        };
+                        let sm_sources = {
+                            let sm = source_manager.read().await;
+                            sm.get_sources(&hash_bytes)
+                        };
+                        let live_sources: Vec<(String, u16)> = sm_sources.into_iter()
+                            .filter(|(ip, port)| !state.dead_sources.is_dead_source(0, u32::from(*ip), *port))
+                            .map(|(ip, port)| (ip.to_string(), port))
+                            .collect();
+                        if live_sources.is_empty() {
+                            state.pending_downloads.insert(tid.clone(), pending);
+                            continue;
+                        }
+                        let source_count = live_sources.len() as u32;
+                        {
+                            let mut mgr = transfer_manager.write().await;
+                            mgr.update_status(tid, TransferStatus::Active);
+                            mgr.update_sources(tid, source_count, 0, 0);
+                        }
+                        let _ = app_handle.emit("transfer-status", serde_json::json!({
+                            "id": tid,
+                            "status": "active",
+                            "sources": source_count,
+                        }));
+                        info!("Starting download {} from {} accumulated sources", tid, source_count);
+                        if live_sources.len() == 1 {
+                            let (src_ip, src_port) = live_sources[0].clone();
+                            let source_addr: SocketAddr = match format!("{src_ip}:{src_port}").parse() {
+                                Ok(a) => a,
+                                Err(_) => {
+                                    state.pending_downloads.insert(tid.clone(), pending);
+                                    continue;
+                                }
+                            };
+                            let download = Ed2kDownload {
+                                transfer_id: pending.transfer_id,
+                                file_hash: hash_bytes,
+                                file_name: pending.file_name,
+                                file_size: pending.file_size,
+                                source_addr,
+                                download_dir: PathBuf::from(&settings.download_folder),
+                                user_hash: state.user_hash,
+                                nickname: settings.nickname.clone(),
+                                tcp_port: settings.tcp_port,
+                                udp_port: settings.udp_port,
+                                bandwidth_limiter: bandwidth_limiter.clone(),
+                                control: pending.control,
+                                source_manager: Some(source_manager.clone()),
+                                credit_manager: Some(credit_manager.clone()),
+                                shared_buddy_info: Some(state.shared_buddy_info.clone()),
+                            };
+                            let tx = dl_event_tx.clone();
+                            let dl_tid = download.transfer_id.clone();
+                            let tx2 = tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = download.run(tx).await {
+                                    error!("Download failed: {e}");
+                                    let _ = tx2.send(DownloadEvent::Failed { transfer_id: dl_tid, error: e.to_string() }).await;
+                                }
+                            });
+                        } else {
+                            let download_sources: Vec<DownloadSource> = live_sources.iter()
+                                .map(|(ip, port)| DownloadSource {
+                                    peer_ip: ip.clone(),
+                                    peer_port: *port,
+                                    available_parts: Vec::new(),
+                                })
+                                .collect();
+                            {
+                                let mut sm = source_manager.write().await;
+                                for (ip, port) in &live_sources {
+                                    if let Ok(v4) = ip.parse::<Ipv4Addr>() {
+                                        sm.register_source(hash_bytes, v4, *port);
+                                    }
+                                }
+                            }
+                            let ms_download = MultiSourceDownload {
+                                transfer_id: pending.transfer_id,
+                                file_hash: hash_bytes,
+                                file_name: pending.file_name,
+                                file_size: pending.file_size,
+                                sources: download_sources,
+                                download_dir: PathBuf::from(&settings.download_folder),
+                                user_hash: state.user_hash,
+                                nickname: settings.nickname.clone(),
+                                tcp_port: settings.tcp_port,
+                                udp_port: settings.udp_port,
+                                bandwidth_limiter: bandwidth_limiter.clone(),
+                                control: pending.control,
+                                source_manager: Some(source_manager.clone()),
+                                credit_manager: Some(credit_manager.clone()),
+                                shared_buddy_info: Some(state.shared_buddy_info.clone()),
+                            };
+                            let tx = dl_event_tx.clone();
+                            let dl_tid = ms_download.transfer_id.clone();
+                            let tx2 = tx.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = ms_download.run(tx).await {
+                                    error!("Multi-source download failed: {e}");
+                                    let _ = tx2.send(DownloadEvent::Failed { transfer_id: dl_tid, error: e.to_string() }).await;
+                                }
+                            });
+                        }
+                    }
+                }
+                let to_retry: Vec<String> = to_retry.into_iter()
+                    .filter(|tid| !started_from_sm.contains(tid))
+                    .collect();
+
+                // Second pass: for remaining pending downloads, start new Kad + server searches
                 for tid in to_retry {
                     if let Some(pd) = state.pending_downloads.get_mut(&tid) {
                         pd.search_count += 1;
@@ -2126,7 +2326,7 @@ pub async fn start_network(
                             state.download_source_searches.insert(sid, tid);
                         }
 
-                        // Send UDP source requests to all servers (spawned to avoid blocking)
+                        // Send UDP source requests to all servers
                         {
                             let mut fh = [0u8; 16];
                             fh.copy_from_slice(&hash_bytes);
@@ -2318,6 +2518,14 @@ pub async fn start_network(
                                                 sm.register_source(file_hash, v4, src.port);
                                             }
                                         }
+                                        drop(sm);
+                                        let hash_hex = hex::encode(file_hash);
+                                        for pd in state.pending_downloads.values_mut() {
+                                            if pd.file_hash == hash_hex {
+                                                pd.last_search_at = 0;
+                                                debug!("Marked pending download {} for immediate retry (server sources)", pd.transfer_id);
+                                            }
+                                        }
                                     }
                                 }
                                 ed2k::server::ServerEvent::Message(msg) => {
@@ -2436,6 +2644,13 @@ pub async fn start_network(
                                 let mut sm = source_manager.write().await;
                                 for (ip, port) in &sources {
                                     sm.register_source(file_hash, *ip, *port);
+                                }
+                                drop(sm);
+                                for pd in state.pending_downloads.values_mut() {
+                                    if pd.file_hash == hash_hex {
+                                        pd.last_search_at = 0;
+                                        debug!("Marked pending download {} for immediate retry (UDP sources)", pd.transfer_id);
+                                    }
                                 }
                             }
                         }

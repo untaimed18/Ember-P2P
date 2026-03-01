@@ -113,4 +113,19 @@ impl SourceManager {
     pub fn source_count(&self, file_hash: &[u8; 16]) -> usize {
         self.sources.get(file_hash).map(|v| v.len()).unwrap_or(0)
     }
+
+    /// Return non-expired sources for a file, suitable for starting downloads.
+    pub fn get_sources(&self, file_hash: &[u8; 16]) -> Vec<(Ipv4Addr, u16)> {
+        let now = chrono::Utc::now().timestamp();
+        self.sources
+            .get(file_hash)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| (now - e.last_seen) < SOURCE_EXPIRY_SECS)
+                    .map(|e| (e.ip, e.tcp_port))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
