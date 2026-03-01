@@ -1050,6 +1050,30 @@ pub async fn start_network(
                                     let snap = local_index.read().await.all_files().to_vec();
                                     *shared_files.write().await = snap;
                                 }
+
+                                // Publish to KAD
+                                state.publish_manager.add_file(PublishableFile {
+                                    file_hash: md4_bytes_to_kad_id(&hash_bytes[..16]),
+                                    file_name: shared_file.name.clone(),
+                                    file_size: shared_file.size,
+                                    file_type: shared_file.extension.clone(),
+                                    complete_sources: 0,
+                                });
+
+                                // Offer to eD2K server
+                                if state.server_connected {
+                                    if let Some(conn) = state.server_connection.as_mut() {
+                                        let offer = vec![ed2k::server::OfferFile {
+                                            hash: fh,
+                                            name: shared_file.name.clone(),
+                                            size: shared_file.size,
+                                        }];
+                                        if let Err(e) = conn.offer_files(&offer).await {
+                                            warn!("Failed to offer completed download to server: {e}");
+                                        }
+                                    }
+                                }
+
                                 let _ = app_handle.emit("shared-files-changed", serde_json::json!({
                                     "phase": "download-complete",
                                     "count": 1,
