@@ -81,6 +81,7 @@ async fn try_connect_server(ip: &str, port: u16, obf_port: u16, app: &tauri::App
     }
     let addr: SocketAddr = format!("{ip}:{port}").parse()?;
     let conn = Ed2kServerConnection::connect(addr).await?;
+    info!("Plain TCP connection to server {ip}:{port} established");
     emit_server_log(app, "TCP connection established");
     Ok(conn)
 }
@@ -856,6 +857,17 @@ pub async fn start_network(
     }
 
     ed2k::preview::cleanup_previews();
+
+    // Remove servers blocked by IP filter (eMule: FilterServerByIP on startup)
+    if settings.filter_servers_by_ip {
+        let removed = state.server_list.remove_filtered(&mut state.ip_filter);
+        if removed > 0 {
+            let met_path = state.data_dir.join("server.met");
+            let _ = state.server_list.save_server_met(&met_path);
+            info!("Removed {removed} IP-filtered servers from server list");
+        }
+    }
+
     info!("Network event loop starting");
 
     loop {
@@ -4661,10 +4673,51 @@ async fn handle_command(
             if use_server {
                 if state.server_connected {
                     if let Some(conn) = &mut state.server_connection {
-                        if let Err(e) = conn.send_search(&query).await {
-                            debug!("Server search send failed: {e}");
-                        } else {
-                            info!("Sent search request to server");
+                        match conn.send_search(&query).await {
+                            Ok(results) if !results.is_empty() => {
+                                info!("Server TCP search returned {} results", results.len());
+                                let search_results: Vec<SearchResult> = results.iter().map(|sr| {
+                                    let hash_hex = hex::encode(sr.file_hash);
+                                    SearchResult {
+                                        file: FileInfo {
+                                            id: hash_hex.clone(),
+                                            name: sr.file_name.clone(),
+                                            path: String::new(),
+                                            size: sr.file_size,
+                                            hash: hash_hex,
+                                            aich_hash: String::new(),
+                                            extension: String::new(),
+                                            modified_at: 0,
+                                            priority: "normal".to_string(),
+                                            requests: 0,
+                                            accepted: 0,
+                                            bytes_transferred: 0,
+                                            alltime_requests: 0,
+                                            alltime_accepted: 0,
+                                            alltime_transferred: 0,
+                                            complete_sources: sr.complete_source_count,
+                                            folder: String::new(),
+                                            shared: false,
+                                            shared_kad: false,
+                                            shared_ed2k: false,
+                                        },
+                                        peer_id: String::new(),
+                                        peer_name: String::new(),
+                                        availability: sr.source_count,
+                                        file_type: String::new(),
+                                        source_addresses: Vec::new(),
+                                        rating: None,
+                                        comment: None,
+                                    }
+                                }).collect();
+                                let _ = app_handle.emit("search-results", &search_results);
+                            }
+                            Ok(_) => {
+                                info!("Server TCP search returned 0 results");
+                            }
+                            Err(e) => {
+                                debug!("Server search failed: {e}");
+                            }
                         }
                     }
                 }
@@ -5119,6 +5172,15 @@ async fn handle_command(
                 "Reloaded IP filter: {} ranges",
                 state.ip_filter.range_count(),
             );
+            // Purge servers now blocked by the updated filter
+            if settings.filter_servers_by_ip {
+                let removed = state.server_list.remove_filtered(&mut state.ip_filter);
+                if removed > 0 {
+                    let met_path = state.data_dir.join("server.met");
+                    let _ = state.server_list.save_server_met(&met_path);
+                    info!("Removed {removed} servers blocked by updated IP filter");
+                }
+            }
         }
 
         NetworkCommand::GetIpFilterStats { tx } => {
@@ -5711,6 +5773,15 @@ async fn handle_command(
                 info!("Reloaded IP filter from updated ipfilter.dat ({loaded} ranges)");
                 *ip_filter_ref = new_filter;
                 ip_filter_ref.update_shared_snapshot(&shared_filter_ref);
+                // Purge servers blocked by the updated filter
+                if settings.filter_servers_by_ip {
+                    let removed = state.server_list.remove_filtered(ip_filter_ref);
+                    if removed > 0 {
+                        let met_path = state.data_dir.join("server.met");
+                        let _ = state.server_list.save_server_met(&met_path);
+                        info!("Removed {removed} servers blocked by updated IP filter");
+                    }
+                }
             }
             let _ = tx.send(result);
         }

@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use byteorder::{LittleEndian, ReadBytesExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::messages::*;
 
@@ -223,6 +223,11 @@ impl Ed2kServerConnection {
                 wire.extend_from_slice(&((1 + payload.len()) as u32).to_le_bytes());
                 wire.push(opcode);
                 wire.extend_from_slice(payload);
+                info!(
+                    "Server write_packet: opcode=0x{opcode:02X}, wire={} bytes, plaintext_head={:02X?}",
+                    wire.len(),
+                    &wire[..wire.len().min(20)]
+                );
                 let mut encrypted = vec![0u8; wire.len()];
                 stream.send_key.process(&wire, &mut encrypted);
                 stream.writer.write_all(&encrypted).await?;
@@ -253,8 +258,15 @@ impl Ed2kServerConnection {
                     std::time::Duration::from_secs(5),
                     read_server_packet(reader),
                 ).await {
-                    Ok(Ok(pkt)) => Some(pkt),
-                    _ => None,
+                    Ok(Ok(pkt)) => {
+                        info!("Server packet: opcode=0x{:02X}, {} bytes", pkt.0, pkt.1.len());
+                        Some(pkt)
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Server packet read error: {e}");
+                        None
+                    }
+                    Err(_) => None,
                 }
             }
             ServerTransport::Encrypted(stream) => {
@@ -273,8 +285,15 @@ impl Ed2kServerConnection {
                     std::time::Duration::from_secs(5),
                     stream.read_packet(),
                 ).await {
-                    Ok(Ok(pkt)) => Some(pkt),
-                    _ => None,
+                    Ok(Ok(pkt)) => {
+                        info!("Server packet (encrypted): opcode=0x{:02X}, {} bytes", pkt.0, pkt.1.len());
+                        Some(pkt)
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Server packet read error (encrypted): {e}");
+                        None
+                    }
+                    Err(_) => None,
                 }
             }
         }
@@ -282,10 +301,61 @@ impl Ed2kServerConnection {
 
     /// Send a search request to the server (non-blocking).
     /// The result will arrive later via `poll_messages()` as `ServerEvent::SearchResult`.
-    pub async fn send_search(&mut self, query: &str) -> anyhow::Result<()> {
+    pub async fn send_search(&mut self, query: &str) -> anyhow::Result<Vec<ServerSearchResult>> {
         let payload = build_search_request(query);
+        info!(
+            "Sending OP_SEARCHREQUEST ({} bytes payload) for query '{}'",
+            payload.len(), query
+        );
         self.write_packet(OP_SEARCHREQUEST, &payload).await?;
-        Ok(())
+
+        // Wait for the search response directly instead of relying on polling.
+        // eMule servers typically respond within 2-5 seconds.
+        for attempt in 1..=5 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.read_packet(),
+            ).await {
+                Ok(Ok((opcode, resp_payload))) => {
+                    info!("Search response attempt {attempt}: opcode=0x{opcode:02X}, {} bytes", resp_payload.len());
+                    match opcode {
+                        OP_SEARCHRESULT => {
+                            match parse_search_result(&resp_payload) {
+                                Ok(results) => {
+                                    info!("Server returned {} search results", results.len());
+                                    return Ok(results);
+                                }
+                                Err(e) => {
+                                    warn!("Failed to parse search results: {e}");
+                                    return Ok(Vec::new());
+                                }
+                            }
+                        }
+                        OP_SERVERMESSAGE => {
+                            if resp_payload.len() >= 2 {
+                                let len = u16::from_le_bytes([resp_payload[0], resp_payload[1]]) as usize;
+                                if resp_payload.len() >= 2 + len {
+                                    let msg = String::from_utf8_lossy(&resp_payload[2..2 + len]);
+                                    info!("Server message during search: {msg}");
+                                }
+                            }
+                        }
+                        _ => {
+                            info!("Non-search opcode 0x{opcode:02X} during search wait, continuing...");
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!("Search response read error: {e}");
+                    return Ok(Vec::new());
+                }
+                Err(_) => {
+                    info!("Search response timeout (attempt {attempt}/5)");
+                }
+            }
+        }
+        info!("No search response after 25 seconds");
+        Ok(Vec::new())
     }
 
     /// Send a source request to the server (non-blocking).
@@ -350,7 +420,10 @@ impl Ed2kServerConnection {
         let mut events = Vec::new();
         loop {
             match self.poll_read_packet().await {
-                Some((opcode, payload)) => events.extend(parse_server_event(opcode, &payload)),
+                Some((opcode, payload)) => {
+                    info!("Server poll received opcode=0x{opcode:02X}, {} bytes", payload.len());
+                    events.extend(parse_server_event(opcode, &payload));
+                }
                 None => break,
             }
         }

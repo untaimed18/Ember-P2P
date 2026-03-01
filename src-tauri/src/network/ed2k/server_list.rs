@@ -92,6 +92,22 @@ impl ServerList {
         }
     }
 
+    /// Remove all servers whose IP is blocked by the IP filter.
+    /// Returns the number of servers removed.
+    pub fn remove_filtered(&mut self, ip_filter: &mut crate::network::kad::ip_filter::IpFilter) -> usize {
+        let before = self.servers.len();
+        self.servers.retain(|s| {
+            if let Ok(addr) = s.ip.parse::<Ipv4Addr>() {
+                if ip_filter.is_blocked(addr) {
+                    info!("Removing server {}:{} — blocked by IP filter", s.ip, s.port);
+                    return false;
+                }
+            }
+            true
+        });
+        before - self.servers.len()
+    }
+
     /// Check if a server IP is blocked by the IP filter, matching eMule's FilterServerByIP.
     pub fn is_ip_filtered(ip_str: &str, ip_filter: &mut crate::network::kad::ip_filter::IpFilter) -> bool {
         if let Ok(addr) = ip_str.parse::<Ipv4Addr>() {
