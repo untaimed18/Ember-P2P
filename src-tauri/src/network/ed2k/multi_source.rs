@@ -22,6 +22,10 @@ const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
 /// Maximum allowed file size for downloads (4 TiB)
 const MAX_DOWNLOAD_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024 * 1024;
 
+/// Maximum simultaneous source connections per download.
+/// eMule typically has ~10 active connections per file.
+const MAX_CONCURRENT_SOURCES: usize = 10;
+
 /// A source that can provide parts of a file.
 #[derive(Debug, Clone)]
 pub struct DownloadSource {
@@ -293,6 +297,10 @@ impl MultiSourceDownload {
             }
         });
 
+        // Semaphore to limit concurrent source connections (avoids overwhelming
+        // the network with dozens of simultaneous TCP handshakes to unreachable peers)
+        let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SOURCES));
+
         // Spawn per-source download tasks
         let mut handles = Vec::new();
         for (src_idx, parts) in source_parts.into_iter().enumerate() {
@@ -321,12 +329,14 @@ impl MultiSourceDownload {
             let tid_clone = self.transfer_id.clone();
             let bi_clone = self.shared_buddy_info.clone();
             let ctrl_clone = self.control.clone();
+            let sem_clone = conn_semaphore.clone();
 
             let fail_etx = event_tx.clone();
             let fail_tid = self.transfer_id.clone();
             let fail_ip = source.peer_ip.clone();
             let fail_port = source.peer_port;
             let handle = tokio::spawn(async move {
+                let _permit = sem_clone.acquire().await.expect("semaphore closed");
                 let result = download_parts_from_source(
                     src_idx,
                     &source,
@@ -802,7 +812,7 @@ async fn download_parts_from_source(
     emit_source!("connecting", None, 0u64);
 
     let stream = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(10),
         TcpStream::connect(addr),
     )
     .await??;

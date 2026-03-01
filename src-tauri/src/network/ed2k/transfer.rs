@@ -205,7 +205,7 @@ impl Ed2kDownload {
         self.emit_source_detail(event_tx, "connecting", None, 0, 0).await;
 
         let stream = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(10),
             TcpStream::connect(self.source_addr),
         )
         .await??;

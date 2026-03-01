@@ -1172,6 +1172,24 @@ pub async fn start_network(
                         }
                     }
                 }
+                // Mark failed per-source connections dead so they're not retried
+                if let DownloadEvent::SourceDetail { ref transfer_id, ref ip, port, ref status, .. } = event {
+                    if status == "failed" {
+                        if let Ok(v4) = ip.parse::<Ipv4Addr>() {
+                            state.dead_sources.add_dead_source(0, u32::from(v4), port, state.firewalled);
+                            let mgr = transfer_manager.read().await;
+                            if let Some(t) = mgr.get_transfer(transfer_id) {
+                                if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
+                                    if fh_bytes.len() == 16 {
+                                        let mut fh = [0u8; 16];
+                                        fh.copy_from_slice(&fh_bytes);
+                                        state.dead_sources.add_dead_source_for_file(fh, u32::from(v4), port);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 let mut promoted = Vec::new();
                 handle_download_event(event, &app_handle, &transfer_manager, &db, &bandwidth_limiter, &mut promoted, &mut stats_manager, settings.remove_finished_downloads).await;
                 for t in promoted {
