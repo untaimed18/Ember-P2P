@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getSettings, updateSettings, downloadNodesDat, downloadIpfilter } from '$lib/api/settings';
+  import { invoke } from '@tauri-apps/api/core';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
   import { theme, applyTheme, type Theme } from '$lib/stores/theme';
@@ -13,6 +14,35 @@
   let downloadingNodes = $state(false);
   let nodesResult: string | null = $state(null);
   let nodesError: string | null = $state(null);
+
+  let speedTesting = $state(false);
+  let speedResult: { download_speed: number; upload_speed: number; recommended_upload_limit: number; recommended_download_limit: number } | null = $state(null);
+  let speedError: string | null = $state(null);
+
+  async function runSpeedTest() {
+    speedTesting = true;
+    speedResult = null;
+    speedError = null;
+    try {
+      speedResult = await invoke('run_speed_test');
+    } catch (e: unknown) {
+      speedError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Speed test failed';
+    } finally {
+      speedTesting = false;
+    }
+  }
+
+  function applyRecommended() {
+    if (!settings || !speedResult) return;
+    settings.max_upload_speed = speedResult.recommended_upload_limit;
+    settings.max_download_speed = speedResult.recommended_download_limit;
+  }
+
+  function formatSpeed(bytesPerSec: number): string {
+    if (bytesPerSec >= 1_000_000) return `${(bytesPerSec / 1_000_000).toFixed(1)} MB/s`;
+    if (bytesPerSec >= 1_000) return `${(bytesPerSec / 1_000).toFixed(1)} KB/s`;
+    return `${bytesPerSec} B/s`;
+  }
   let downloadingFilter = $state(false);
   let filterResult: string | null = $state(null);
   let filterError: string | null = $state(null);
@@ -261,6 +291,35 @@
               <span class="hint">Automatically adjusts upload speed based on network latency to prevent congestion. Requires an upload speed limit to be set.</span>
             </div>
             <ToggleSwitch bind:checked={settings.uss_enabled} />
+          </div>
+          <div class="field speed-test-section">
+            <div class="speed-test-header">
+              <span class="toggle-title">Speed Test</span>
+              <button class="speed-test-btn" onclick={runSpeedTest} disabled={speedTesting}>
+                {speedTesting ? 'Testing...' : 'Run Speed Test'}
+              </button>
+            </div>
+            <span class="hint">Measures your connection speed and calculates recommended limits. Upload is set to 80% of measured speed to keep your connection stable.</span>
+            {#if speedResult}
+              <div class="speed-results">
+                <div class="speed-row">
+                  <span>Download:</span>
+                  <span class="speed-value">{formatSpeed(speedResult.download_speed)}</span>
+                </div>
+                <div class="speed-row">
+                  <span>Upload:</span>
+                  <span class="speed-value">{formatSpeed(speedResult.upload_speed)}</span>
+                </div>
+                <div class="speed-row recommended">
+                  <span>Recommended upload limit:</span>
+                  <span class="speed-value">{formatSpeed(speedResult.recommended_upload_limit)}</span>
+                </div>
+                <button class="apply-btn" onclick={applyRecommended}>Apply Recommended</button>
+              </div>
+            {/if}
+            {#if speedError}
+              <span class="speed-error">{speedError}</span>
+            {/if}
           </div>
         </div>
       </section>
@@ -821,5 +880,89 @@
     font-weight: 500;
     color: var(--text-secondary);
     padding: 6px 0 8px;
+  }
+
+  .speed-test-section {
+    border-top: 1px solid var(--border);
+    padding-top: 12px;
+    margin-top: 4px;
+  }
+
+  .speed-test-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 4px;
+  }
+
+  .speed-test-btn {
+    padding: 4px 12px;
+    font-size: 12px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+
+  .speed-test-btn:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
+
+  .speed-test-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .speed-results {
+    margin-top: 8px;
+    padding: 8px 12px;
+    background: var(--bg-tertiary);
+    border-radius: 6px;
+    font-size: 13px;
+  }
+
+  .speed-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 2px 0;
+    color: var(--text-secondary);
+  }
+
+  .speed-row.recommended {
+    border-top: 1px solid var(--border);
+    margin-top: 4px;
+    padding-top: 6px;
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+
+  .speed-value {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .apply-btn {
+    margin-top: 8px;
+    width: 100%;
+    padding: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    border-radius: 6px;
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    cursor: pointer;
+  }
+
+  .apply-btn:hover {
+    opacity: 0.9;
+  }
+
+  .speed-error {
+    display: block;
+    margin-top: 6px;
+    color: var(--danger);
+    font-size: 12px;
   }
 </style>

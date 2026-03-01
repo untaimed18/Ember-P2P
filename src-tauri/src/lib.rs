@@ -357,6 +357,7 @@ pub fn run() {
             commands::collections::create_collection,
             commands::collections::download_collection_files,
             commands::preview::preview_file,
+            commands::speed_test::run_speed_test,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
