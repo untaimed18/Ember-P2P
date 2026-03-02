@@ -115,8 +115,8 @@ impl Ed2kServerConnection {
             | SRVCAP_SUPPORTCRYPT | SRVCAP_REQUESTCRYPT;
         let payload = build_login_request(user_hash, tcp_port, nickname);
         let is_encrypted = matches!(self.transport, ServerTransport::Encrypted(_));
-        info!("Sending OP_LOGINREQUEST ({} bytes, encrypted={}): port={}, nick={}, flags=0x{:04X}",
-            payload.len(), is_encrypted, tcp_port, nickname, flags);
+        info!("Sending OP_LOGINREQUEST ({} bytes, encrypted={}): port={}, flags=0x{:04X}",
+            payload.len(), is_encrypted, tcp_port, flags);
 
         // Build the full wire packet: [protocol(1)][length(4)][opcode(1)][payload]
         let mut wire_packet = Vec::with_capacity(6 + payload.len());

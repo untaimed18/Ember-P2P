@@ -3,6 +3,141 @@ pub mod firewall;
 
 use std::path::{Component, Path, PathBuf};
 
+const DANGEROUS_EXTENSIONS: &[&str] = &[
+    "exe", "bat", "cmd", "com", "scr", "pif", "msi", "msp", "mst",
+    "cpl", "hta", "inf", "ins", "isp", "jse", "lnk", "reg", "rgs",
+    "sct", "shb", "shs", "vbe", "vbs", "wsc", "wsf", "wsh", "ws",
+    "ps1", "ps1xml", "ps2", "ps2xml", "psc1", "psc2", "psm1",
+    "application", "gadget", "msh", "msh1", "msh2", "mshxml",
+    "msh1xml", "msh2xml", "dll", "sys", "drv",
+];
+
+/// Returns true if the file extension is potentially dangerous (executable).
+pub fn is_dangerous_extension(filename: &str) -> bool {
+    let ext = Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    DANGEROUS_EXTENSIONS.contains(&ext.as_str())
+}
+
+/// Validate a URL for safe fetching. Blocks non-HTTP schemes and private IPs.
+pub fn validate_fetch_url(url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("URL is empty".into());
+    }
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err("Only http:// and https:// URLs are allowed".into());
+    }
+
+    let host_part = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or("");
+    let host = host_part
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+
+    if host.is_empty() {
+        return Err("URL has no host".into());
+    }
+    if host == "localhost"
+        || host == "127.0.0.1"
+        || host == "[::1]"
+        || host == "0.0.0.0"
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host.starts_with("169.254.")
+    {
+        return Err("URLs pointing to private/loopback addresses are blocked".into());
+    }
+    if host.starts_with("172.") {
+        if let Some(second_octet) = host.strip_prefix("172.").and_then(|s| s.split('.').next()) {
+            if let Ok(n) = second_octet.parse::<u8>() {
+                if (16..=31).contains(&n) {
+                    return Err("URLs pointing to private addresses are blocked".into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check whether a canonical path is within one of the allowed directories.
+pub fn is_path_within_dirs(canonical: &Path, allowed_dirs: &[String]) -> bool {
+    allowed_dirs.iter().any(|dir| {
+        if let Ok(canon_dir) = std::fs::canonicalize(dir) {
+            canonical.starts_with(&canon_dir)
+        } else {
+            false
+        }
+    })
+}
+
+/// Restrict file permissions to the current user only (platform-specific).
+pub fn restrict_file_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let path_str = path.to_string_lossy().to_string();
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("icacls")
+            .args([
+                &path_str,
+                "/inheritance:r",
+                "/grant:r",
+                &format!("{}:(F)", whoami()),
+                "/q",
+            ])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn whoami() -> String {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("whoami")
+        .creation_flags(0x08000000)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s: String| s.trim().to_string())
+        .unwrap_or_else(|| "%USERNAME%".to_string())
+}
+
+/// Clean up log files older than the given number of days.
+pub fn cleanup_old_logs(log_dir: &Path, max_age_days: u64) {
+    let Ok(entries) = std::fs::read_dir(log_dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.starts_with("nexus.log.") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(age) = modified.elapsed() {
+                    if age.as_secs() > max_age_days * 86400 {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Sanitize a filename received from the network to prevent path traversal attacks.
 /// Removes directory separators, parent references (..), and null bytes.
 /// Returns a safe filename that can be used for file creation.

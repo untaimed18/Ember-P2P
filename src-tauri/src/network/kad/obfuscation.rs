@@ -5,6 +5,7 @@
 // It is retained solely for interoperability with the existing eMule/KAD network.
 
 use rand::Rng;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::types::KadId;
 use digest::Digest;
@@ -20,6 +21,7 @@ const VALID_INNER_HEADERS: [u8; 6] = [
     0xD4, // OP_PACKEDPROT
 ];
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct Rc4State {
     s: [u8; 256],
     i: u8,

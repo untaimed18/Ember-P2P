@@ -3063,7 +3063,7 @@ pub async fn start_network(
                                 if state.external_ip.is_none() || state.external_ip == Some(ext_ip) {
                                     state.external_ip = Some(ext_ip);
                                     state.stats.external_ip = ext_ip.to_string();
-                                    info!("External IP from HighID: {ext_ip}");
+                                    debug!("External IP updated from HighID");
                                 }
                                 state.firewall_checker.handle_firewalled_response(ext_ip);
                             }
@@ -4719,7 +4719,7 @@ async fn handle_udp_packet(
                 return;
             }
             let external_ip = Ipv4Addr::from(ip.to_be_bytes());
-            info!("FirewalledRes from {from}: our external IP is {external_ip}");
+            debug!("FirewalledRes received, external IP updated");
             state.firewall_checker.handle_firewalled_response(external_ip);
             state.firewall_checker.handle_udp_firewall_result(true);
             state.udp_firewalled = false;
@@ -4977,7 +4977,7 @@ async fn handle_command(
 
             let primary_keyword = keywords.iter().max_by_key(|k| k.len()).unwrap();
             let keyword_hash = kad::publish::keyword_to_kad_id(primary_keyword);
-            info!("Searching KAD for keyword '{}' (longest of {}) -> hash {}", primary_keyword, keywords.len(), keyword_hash);
+            info!("Searching KAD ({} keywords) -> hash {}", keywords.len(), keyword_hash);
 
             let closest = state
                 .routing_table

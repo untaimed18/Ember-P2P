@@ -173,9 +173,7 @@ pub async fn update_ipfilter_from_url(
     state: tauri::State<'_, AppState>,
     url: String,
 ) -> Result<String, String> {
-    if url.is_empty() || !url.contains("://") {
-        return Err("Invalid URL".into());
-    }
+    crate::security::validate_fetch_url(&url)?;
 
     info!("Updating IP filter from URL: {url}");
 
@@ -226,6 +224,16 @@ pub async fn import_ipfilter_file(
     if !path.exists() {
         return Err("File does not exist".into());
     }
+    let canonical = path.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
+    if canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("dat".to_string())
+        && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("txt".to_string())
+        && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("gz".to_string())
+        && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("zip".to_string())
+        && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("p2p".to_string())
+    {
+        return Err("IP filter file must be a .dat, .txt, .gz, .zip, or .p2p file".into());
+    }
+    let path = canonical;
 
     state
         .network_tx

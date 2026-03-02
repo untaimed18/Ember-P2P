@@ -50,6 +50,23 @@ pub async fn add_shared_folder(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() || !p.is_dir() {
+        return Err("Path does not exist or is not a directory".into());
+    }
+    let canonical = p.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
+    let canonical_str = canonical.to_string_lossy().to_lowercase();
+    let blocked = [
+        "\\windows", "\\program files", "\\program files (x86)",
+        "\\programdata", "\\.ssh", "\\.gnupg", "\\appdata\\local\\temp",
+        "/etc", "/usr", "/bin", "/sbin", "/var", "/root",
+    ];
+    for prefix in &blocked {
+        if canonical_str.contains(&prefix.to_lowercase()) {
+            return Err(format!("Cannot share system directory: {}", canonical.display()));
+        }
+    }
+
     let save_data = {
         let mut config = state.config.write().await;
         if !config.settings.shared_folders.contains(&path) {
@@ -608,13 +625,31 @@ pub async fn unshare_folder(
 }
 
 #[tauri::command]
-pub async fn open_shared_file(file_path: String) -> Result<(), String> {
+pub async fn open_shared_file(
+    state: tauri::State<'_, AppState>,
+    file_path: String,
+) -> Result<(), String> {
+    let config = state.config.read().await;
+    let mut allowed_dirs = config.settings.shared_folders.clone();
+    let download_dir = std::path::PathBuf::from(&config.settings.download_folder)
+        .join("Downloads")
+        .to_string_lossy()
+        .to_string();
+    allowed_dirs.push(download_dir);
+    drop(config);
+
     tokio::task::spawn_blocking(move || {
         let path = std::path::Path::new(&file_path);
         if !path.exists() {
             return Err("File does not exist".to_string());
         }
         let canonical = path.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
+        if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
+            return Err("File is not within a shared or download folder".to_string());
+        }
+        if crate::security::is_dangerous_extension(&canonical.to_string_lossy()) {
+            return Err("Cannot open potentially dangerous file types".to_string());
+        }
         opener::open(&canonical).map_err(|e| format!("Failed to open file: {e}"))?;
         Ok(())
     })
@@ -623,7 +658,20 @@ pub async fn open_shared_file(file_path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn open_shared_folder(file_path: String) -> Result<(), String> {
+pub async fn open_shared_folder(
+    state: tauri::State<'_, AppState>,
+    file_path: String,
+) -> Result<(), String> {
+    let config = state.config.read().await;
+    let mut allowed_dirs = config.settings.shared_folders.clone();
+    let download_dir = std::path::PathBuf::from(&config.settings.download_folder)
+        .join("Downloads")
+        .to_string_lossy()
+        .to_string();
+    allowed_dirs.push(download_dir);
+    allowed_dirs.push(config.settings.download_folder.clone());
+    drop(config);
+
     tokio::task::spawn_blocking(move || {
         let path = std::path::Path::new(&file_path);
         let folder = path.parent().unwrap_or(path);
@@ -631,6 +679,9 @@ pub async fn open_shared_folder(file_path: String) -> Result<(), String> {
             return Err("Folder does not exist".to_string());
         }
         let canonical = folder.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
+        if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
+            return Err("Folder is not within a shared or download directory".to_string());
+        }
         opener::open(&canonical).map_err(|e| format!("Failed to open folder: {e}"))?;
         Ok(())
     })

@@ -144,14 +144,23 @@ pub async fn open_file(
     if transfer.status != TransferStatus::Completed {
         return Err("File is not completed".into());
     }
+    let safe_name = crate::security::sanitize_filename(&transfer.file_name);
+    if crate::security::is_dangerous_extension(&safe_name) {
+        return Err("Cannot open potentially dangerous file types. Please use a dedicated application.".into());
+    }
     let config = state.config.read().await;
-    let file_path = std::path::PathBuf::from(&config.settings.download_folder)
-        .join("Downloads")
-        .join(&transfer.file_name);
+    let download_dir = std::path::PathBuf::from(&config.settings.download_folder)
+        .join("Downloads");
+    let file_path = download_dir.join(&safe_name);
     if !file_path.exists() {
         return Err("File not found on disk".into());
     }
-    let path_str = file_path.to_string_lossy().to_string();
+    let canonical = file_path.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
+    let canonical_base = download_dir.canonicalize().map_err(|e| format!("Invalid base: {e}"))?;
+    if !canonical.starts_with(&canonical_base) {
+        return Err("File path escapes download directory".into());
+    }
+    let path_str = canonical.to_string_lossy().to_string();
     tokio::task::spawn_blocking(move || {
         let _ = opener::open(&path_str);
     }).await.map_err(|e| format!("Failed to open file: {e}"))?;

@@ -385,7 +385,7 @@ impl Default for AppSettings {
             tcp_port: DEFAULT_TCP_PORT,
             udp_port: DEFAULT_UDP_PORT,
             nodes_dat_path: String::new(),
-            upnp_enabled: true,
+            upnp_enabled: false,
             obfuscation_enabled: true,
             ip_filter_enabled: true,
             block_private_ips: true,

@@ -3,13 +3,14 @@ use std::path::Path;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tracing::info;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::network::kad::types::KadId;
 
 /// Persistent node identity, equivalent to eMule's preferencesKad.dat + preferences.dat.
 /// The KAD ID and user hash are generated once and reused across sessions so other
 /// nodes recognize us in their routing tables and credit systems.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct NodeIdentity {
     pub kad_id: [u8; 16],
     pub user_hash: [u8; 16],
@@ -48,11 +49,7 @@ impl NodeIdentity {
             let data = std::fs::read_to_string(&path)?;
             match serde_json::from_str::<NodeIdentity>(&data) {
                 Ok(id) => {
-                    info!(
-                        "Loaded persistent identity: KAD ID={}…, user_hash={}…",
-                        &hex::encode(id.kad_id)[..8],
-                        &hex::encode(id.user_hash)[..8],
-                    );
+                    info!("Loaded persistent identity (KAD ID={}…)", &hex::encode(id.kad_id)[..4]);
                     return Ok(id);
                 }
                 Err(e) => {
@@ -67,16 +64,8 @@ impl NodeIdentity {
         let tmp_path = path.with_extension("json.tmp");
         std::fs::write(&tmp_path, &data)?;
         std::fs::rename(&tmp_path, &path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-        info!(
-            "Generated new identity: KAD ID={}…, user_hash={}…",
-            &hex::encode(id.kad_id)[..8],
-            &hex::encode(id.user_hash)[..8],
-        );
+        crate::security::restrict_file_permissions(&path);
+        info!("Generated new identity (KAD ID={}…)", &hex::encode(id.kad_id)[..4]);
         Ok(id)
     }
 }

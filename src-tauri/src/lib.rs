@@ -32,6 +32,7 @@ pub fn run() {
         .map(|d| d.data_dir().to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let _ = std::fs::create_dir_all(&log_dir);
+    security::cleanup_old_logs(&log_dir, 7);
     let file_appender = tracing_appender::rolling::daily(&log_dir, "nexus.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
@@ -420,6 +421,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
+                network::ed2k::preview::cleanup_previews();
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     state.bw_shutdown.store(true, std::sync::atomic::Ordering::Release);
                     let tx = state.network_tx.clone();

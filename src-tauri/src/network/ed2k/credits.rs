@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use zeroize::ZeroizeOnDrop;
 
 const MAX_CREDIT_RATIO: f64 = 10.0;
 const MIN_CREDIT_RATIO: f64 = 1.0;
@@ -33,8 +34,11 @@ impl CreditRecord {
     }
 }
 
+#[derive(ZeroizeOnDrop)]
 pub struct CreditManager {
+    #[zeroize(skip)]
     credits: HashMap<[u8; 16], CreditRecord>,
+    #[zeroize(skip)]
     our_public_key: Vec<u8>,
     our_private_key: Vec<u8>,
 }

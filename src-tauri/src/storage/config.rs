@@ -89,14 +89,7 @@ impl AppConfig {
     pub fn write_to_disk(data: &str, tmp_path: &std::path::Path, final_path: &std::path::Path) -> anyhow::Result<()> {
         std::fs::write(tmp_path, data)?;
         std::fs::rename(tmp_path, final_path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                final_path,
-                std::fs::Permissions::from_mode(0o600),
-            );
-        }
+        crate::security::restrict_file_permissions(final_path);
         info!("Config saved");
         Ok(())
     }

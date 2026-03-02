@@ -54,12 +54,12 @@ where
     }
 
     // --- Obfuscated connection ---
-    info!("TCP negotiation: obfuscated (first byte 0x{first_byte:02X}), user_hash={}", hex::encode(user_hash));
+    debug!("TCP negotiation: obfuscated (first byte 0x{first_byte:02X})");
 
     // Step 1: Read the 4-byte random key part (unencrypted)
     let random_key_part_bytes = reader.read_u32_le().await?;
     let rkp = random_key_part_bytes.to_le_bytes();
-    info!("TCP obfuscation: random_key_part=0x{random_key_part_bytes:08X}");
+    debug!("TCP obfuscation: negotiating keys");
 
     // Step 2: Derive RC4 keys using MD5(userHash[16] || magicByte[1] || randomKeyPart[4])
     let mut key_buf = [0u8; 21];

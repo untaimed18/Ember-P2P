@@ -112,9 +112,7 @@ pub fn launch_preview(file_path: &Path) -> anyhow::Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", &file_path.to_string_lossy()])
-            .spawn()?;
+        opener::open(file_path)?;
     }
 
     #[cfg(target_os = "macos")]
@@ -134,22 +132,15 @@ pub fn launch_preview(file_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Clean up old preview temp files.
+/// Clean up preview temp files. Removes all files in the preview directory.
 pub fn cleanup_previews() {
     let temp_dir = std::env::temp_dir().join("nexus_preview");
     if temp_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&temp_dir) {
             for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    if let Ok(modified) = meta.modified() {
-                        if let Ok(age) = modified.elapsed() {
-                            if age.as_secs() > 3600 {
-                                let _ = std::fs::remove_file(entry.path());
-                            }
-                        }
-                    }
-                }
+                let _ = std::fs::remove_file(entry.path());
             }
         }
+        let _ = std::fs::remove_dir(&temp_dir);
     }
 }

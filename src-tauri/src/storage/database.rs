@@ -20,12 +20,7 @@ impl Database {
         std::fs::create_dir_all(&app_dir)?;
         let db_path = app_dir.join("nexus.db");
         let conn = Connection::open(&db_path)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
-        }
+        crate::security::restrict_file_permissions(&db_path);
 
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;\

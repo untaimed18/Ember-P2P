@@ -115,9 +115,7 @@ pub async fn kad_bootstrap_url(
     state: tauri::State<'_, AppState>,
     url: String,
 ) -> Result<(), String> {
-    if url.is_empty() || !url.contains("://") {
-        return Err("Invalid URL".into());
-    }
+    crate::security::validate_fetch_url(&url)?;
 
     state
         .network_tx

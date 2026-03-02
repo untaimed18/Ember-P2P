@@ -98,12 +98,11 @@ pub async fn download_server_met(
     state: tauri::State<'_, AppState>,
     url: String,
 ) -> Result<String, String> {
-    if url.is_empty() {
-        return Err("URL is required".into());
-    }
+    crate::security::validate_fetch_url(&url)?;
 
-    info!("Downloading server.met from {url}");
+    info!("Downloading server.met");
 
+    const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
     let response = reqwest::get(&url)
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?;
@@ -113,11 +112,17 @@ pub async fn download_server_met(
         .await
         .map_err(|e| format!("Failed to read response: {e}"))?;
 
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        return Err("Response too large".into());
+    }
+
     let data = if bytes.starts_with(&[0x1f, 0x8b]) {
         use std::io::Read;
-        let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        const MAX_DECOMPRESSED: u64 = 50 * 1024 * 1024;
+        let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+        let mut limited = decoder.take(MAX_DECOMPRESSED);
         let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed)
+        limited.read_to_end(&mut decompressed)
             .map_err(|e| format!("Failed to decompress gzip: {e}"))?;
         decompressed
     } else {

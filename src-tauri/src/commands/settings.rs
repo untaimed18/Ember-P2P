@@ -97,12 +97,17 @@ pub async fn download_nodes_dat(
 ) -> Result<String, String> {
     info!("Downloading nodes.dat from {NODES_DAT_URL}");
 
-    let bytes = reqwest::get(NODES_DAT_URL)
+    const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+    let response = reqwest::get(NODES_DAT_URL)
         .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?
+        .map_err(|e| format!("HTTP request failed: {e}"))?;
+    let bytes = response
         .bytes()
         .await
         .map_err(|e| format!("Failed to read response body: {e}"))?;
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        return Err("Response too large".into());
+    }
 
     let data_dir = app.path().app_data_dir()
         .map_err(|e| format!("Failed to get app data dir: {e}"))?;
@@ -141,12 +146,17 @@ pub async fn download_ipfilter(
 ) -> Result<String, String> {
     info!("Downloading ipfilter.dat from {IPFILTER_URL}");
 
-    let bytes = reqwest::get(IPFILTER_URL)
+    const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
+    let response = reqwest::get(IPFILTER_URL)
         .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?
+        .map_err(|e| format!("HTTP request failed: {e}"))?;
+    let bytes = response
         .bytes()
         .await
         .map_err(|e| format!("Failed to read response body: {e}"))?;
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        return Err("Response too large".into());
+    }
 
     let data_dir = app.path().app_data_dir()
         .map_err(|e| format!("Failed to get app data dir: {e}"))?;
