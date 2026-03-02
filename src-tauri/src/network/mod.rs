@@ -809,9 +809,7 @@ pub async fn start_network(
     buddy_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut flood_cleanup_timer = tokio::time::interval(std::time::Duration::from_secs(30));
     flood_cleanup_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut source_retry_timer = tokio::time::interval(std::time::Duration::from_secs(
-        ed2k::dead_sources::FILEREASKTIME_SECS.min(ed2k::dead_sources::SOURCECLIENTREASKS_SECS) as u64 / 30,
-    ));
+    let mut source_retry_timer = tokio::time::interval(std::time::Duration::from_secs(10));
     source_retry_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut nodes_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
     nodes_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1205,8 +1203,8 @@ pub async fn start_network(
                                 file_name: t.file_name.clone(),
                                 file_size: t.total_size,
                                 control,
-                                search_count: 0,
-                                last_search_at: now - (ed2k::dead_sources::FILEREASKTIME_SECS - 120),
+                                search_count: 1,
+                                last_search_at: now,
                             });
                             info!("Re-queued failed download {} for source retry: {}", transfer_id, error);
                             let _ = app_handle.emit("transfer-status", serde_json::json!({
@@ -1960,6 +1958,55 @@ pub async fn start_network(
                         state.publish_manager.add_files_batch(files);
                         info!("Populated publish manager with {count} shared files after bootstrap");
                     }
+
+                    // Immediately start source searches for all pending downloads
+                    // (eMule: CDownloadQueue starts source finding right after bootstrap)
+                    if !state.pending_downloads.is_empty() {
+                        let pending_count = state.pending_downloads.len();
+                        info!("KAD connected: triggering immediate source search for {pending_count} pending downloads");
+                        let now = chrono::Utc::now().timestamp();
+                        let tids: Vec<String> = state.pending_downloads.keys().cloned().collect();
+                        for tid in tids {
+                            if let Some(pd) = state.pending_downloads.get_mut(&tid) {
+                                if pd.control.is_cancelled() { continue; }
+                                let hash_bytes = match hex::decode(&pd.file_hash) {
+                                    Ok(b) if b.len() == 16 => b,
+                                    _ => continue,
+                                };
+                                let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
+                                let closest = state.routing_table.find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
+                                if closest.is_empty() { continue; }
+
+                                pd.search_count += 1;
+                                pd.last_search_at = now;
+
+                                let sid = state.search_manager.start_search(
+                                    kad_hash,
+                                    SearchType::FindSource { file_size: pd.file_size },
+                                    closest,
+                                );
+                                if sid != SearchId(0) {
+                                    state.download_source_searches.insert(sid, tid.clone());
+                                    info!("Started immediate source search {} for resumed download {}", sid.0, tid);
+                                }
+
+                                // Also request from servers via UDP
+                                {
+                                    let mut fh = [0u8; 16];
+                                    fh.copy_from_slice(&hash_bytes);
+                                    let packets: Vec<_> = state.server_list.servers().iter()
+                                        .filter_map(|srv| ServerUdpSocket::build_get_sources_packet(srv, &fh, pd.file_size))
+                                        .collect();
+                                    if !packets.is_empty() {
+                                        let sock = server_udp.socket_handle();
+                                        tokio::spawn(async move {
+                                            ServerUdpSocket::send_packets(&sock, packets).await;
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 state.stats.connected_peers = count;
             }
@@ -2262,7 +2309,6 @@ pub async fn start_network(
             _ = source_retry_timer.tick() => {
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
                 let now = chrono::Utc::now().timestamp();
-                let retry_interval = ed2k::dead_sources::FILEREASKTIME_SECS;
 
                 let mut to_retry = Vec::new();
                 let mut to_cancel = Vec::new();
@@ -2272,6 +2318,16 @@ pub async fn start_network(
                         to_cancel.push(tid.clone());
                         continue;
                     }
+                    // Adaptive retry: search more aggressively when few attempts
+                    // have been made, then back off to FILEREASKTIME_SECS.
+                    // FILEREASKTIME is for per-source re-ask; source *discovery*
+                    // can safely run more often without protocol violations.
+                    let retry_interval = match pd.search_count {
+                        0 => 0,
+                        1..=3 => 120,
+                        4..=10 => 300,
+                        _ => ed2k::dead_sources::FILEREASKTIME_SECS,
+                    };
                     if now - pd.last_search_at >= retry_interval {
                         to_retry.push(tid.clone());
                     }
@@ -3117,6 +3173,25 @@ pub async fn start_network(
                                     warn!("Failed to send OP_OFFERFILES: {e}");
                                 }
                             }
+                        }
+
+                        // eMule: request sources for all pending downloads after server login
+                        if !state.pending_downloads.is_empty() {
+                            let pd_count = state.pending_downloads.len();
+                            let mut sent = 0u32;
+                            for pd in state.pending_downloads.values() {
+                                if pd.control.is_cancelled() { continue; }
+                                if let Ok(hash_bytes) = hex::decode(&pd.file_hash) {
+                                    if hash_bytes.len() == 16 {
+                                        let mut fh = [0u8; 16];
+                                        fh.copy_from_slice(&hash_bytes);
+                                        if conn.send_get_sources(&fh).await.is_ok() {
+                                            sent += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            info!("Sent OP_GETSOURCES to server for {sent}/{pd_count} pending downloads");
                         }
 
                         state.server_connection = Some(conn);
