@@ -118,9 +118,9 @@ fn build_hello_inner(user_hash: &[u8; 16], client_id: u32, tcp_port: u16, nickna
     tags.push((&[0x11], Ed2kTagValue::Uint32(0x3C))); // CT_VERSION = EDONKEYVERSION
     tags.push((&[0x0F], Ed2kTagValue::Uint32(tcp_port as u32))); // CT_PORT
 
-    // CT_EMULE_VERSION (0xFB): identifies us as an eMule 0.50a compatible client
+    // CT_EMULE_VERSION (0xFB): identifies us as eMule 0.70b compatible
     // Format: (compat_client << 24) | (major << 17) | (minor << 10) | (update << 7)
-    let emule_version: u32 = (0u32 << 24) | (0u32 << 17) | (50u32 << 10) | (0u32 << 7);
+    let emule_version: u32 = (0u32 << 24) | (0u32 << 17) | (70u32 << 10) | (1u32 << 7);
     tags.push((&[0xFB], Ed2kTagValue::Uint32(emule_version)));
 
     // CT_MOD_VERSION (0x55): identifies our client name to other peers

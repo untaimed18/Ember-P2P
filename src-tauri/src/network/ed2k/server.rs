@@ -575,9 +575,9 @@ fn build_login_request(user_hash: &[u8; 16], tcp_port: u16, nickname: &str) -> V
         | SRVCAP_SUPPORTCRYPT | SRVCAP_REQUESTCRYPT;
     write_uint32_tag(&mut buf, CT_SERVER_FLAGS, flags);
 
-    // Tag 4: CT_EMULE_VERSION (0xFB) - (major << 17) | (minor << 10) | (update << 7)
-    // Identify as eMule 0.50a compatible
-    let emule_version: u32 = (0u32 << 17) | (50u32 << 10) | (0u32 << 7);
+    // Tag 4: CT_EMULE_VERSION (0xFB) - (compat << 24) | (major << 17) | (minor << 10) | (update << 7)
+    // Report as eMule 0.70b (current Community release) for server compatibility
+    let emule_version: u32 = (0u32 << 24) | (0u32 << 17) | (70u32 << 10) | (1u32 << 7);
     write_uint32_tag(&mut buf, CT_EMULE_VERSION, emule_version);
 
     buf
