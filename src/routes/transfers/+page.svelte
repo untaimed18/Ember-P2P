@@ -424,40 +424,83 @@
               <tr class="source-detail-row">
                 <td colspan={DL_COL_COUNT}>
                   <div class="source-panel">
-                    <div class="source-panel-header">Sources for {t.file_name}</div>
+                    <!-- File info header -->
+                    <div class="sp-header">
+                      <div class="sp-file-info">
+                        <span class="sp-filename" title={t.file_name}>{t.file_name}</span>
+                        <div class="sp-meta">
+                          <span class="sp-meta-item">{formatSize(t.total_size)}</span>
+                          <span class="sp-meta-sep">&middot;</span>
+                          <span class="sp-meta-item">{t.progress.toFixed(1)}%</span>
+                          <span class="sp-meta-sep">&middot;</span>
+                          <span class="sp-meta-item st-{t.status}">{dlStatusLabel(t)}</span>
+                          {#if t.sources > 0}
+                            <span class="sp-meta-sep">&middot;</span>
+                            <span class="sp-meta-item">{sourcesLabel(t)} sources</span>
+                          {/if}
+                        </div>
+                        <div class="sp-hash" title={t.file_hash}>{t.file_hash}</div>
+                      </div>
+                      <div class="sp-actions">
+                        <button class="sp-btn" onclick={() => findSources(t.file_hash, t.total_size).catch(() => {})}>Find Sources</button>
+                        <button class="sp-btn" onclick={() => previewFile(t.id).catch(() => {})}>Preview</button>
+                        <button class="sp-btn sp-close" onclick={() => { expandedTransferId = null; expandedSources = []; }} title="Close">&times;</button>
+                      </div>
+                    </div>
+
+                    <!-- Source summary -->
+                    {#if !loadingSources && expandedSources.length > 0}
+                      {@const transferring = expandedSources.filter(s => s.status === 'transferring').length}
+                      {@const queued = expandedSources.filter(s => s.status === 'queued').length}
+                      {@const connecting = expandedSources.filter(s => s.status === 'connecting').length}
+                      {@const totalXfer = expandedSources.reduce((acc, s) => acc + s.transferred, 0)}
+                      <div class="sp-summary">
+                        {#if transferring > 0}
+                          <span class="sp-sum-chip active">{transferring} transferring</span>
+                        {/if}
+                        {#if queued > 0}
+                          <span class="sp-sum-chip queued">{queued} queued</span>
+                        {/if}
+                        {#if connecting > 0}
+                          <span class="sp-sum-chip connecting">{connecting} connecting</span>
+                        {/if}
+                        {#if totalXfer > 0}
+                          <span class="sp-sum-chip total">{formatSize(totalXfer)} received</span>
+                        {/if}
+                      </div>
+                    {/if}
+
+                    <!-- Source list -->
                     {#if loadingSources}
-                      <div class="source-loading">Loading sources...</div>
+                      <div class="sp-loading"><div class="spinner"></div> Loading source details...</div>
                     {:else if expandedSources.length === 0}
-                      <div class="source-empty">No source details available yet</div>
+                      <div class="sp-empty">
+                        <span>No source details available yet.</span>
+                        <button class="sp-btn" onclick={() => findSources(t.file_hash, t.total_size).catch(() => {})}>Search for Sources</button>
+                      </div>
                     {:else}
-                      <table class="source-table">
-                        <thead>
-                          <tr>
-                            <th>IP</th>
-                            <th>Port</th>
-                            <th>Status</th>
-                            <th>Queue Rank</th>
-                            <th>Speed</th>
-                            <th>Transferred</th>
-                            <th>Client</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {#each expandedSources as src}
-                            <tr class="src-row src-{src.status}">
-                              <td>{src.ip}</td>
-                              <td>{src.port}</td>
-                              <td>
-                                <span class="src-status src-st-{src.status}">{sourceStatusLabel(src)}</span>
-                              </td>
-                              <td class="num-cell">{src.queue_rank ?? '\u2014'}</td>
-                              <td class="num-cell">{src.status === 'transferring' ? formatSpeed(src.speed) : '\u2014'}</td>
-                              <td class="num-cell">{src.transferred > 0 ? formatSize(src.transferred) : '\u2014'}</td>
-                              <td>{src.client_software || '\u2014'}</td>
-                            </tr>
-                          {/each}
-                        </tbody>
-                      </table>
+                      <div class="sp-source-list">
+                        {#each expandedSources as src, idx}
+                          <div class="sp-source sp-src-{src.status}">
+                            <div class="sp-src-status-dot"></div>
+                            <div class="sp-src-main">
+                              <span class="sp-src-client">{src.client_software || 'Unknown'}</span>
+                              <span class="sp-src-addr">{src.ip}:{src.port}</span>
+                            </div>
+                            <div class="sp-src-detail">
+                              <span class="sp-src-stat src-st-{src.status}">{sourceStatusLabel(src)}</span>
+                            </div>
+                            <div class="sp-src-metrics">
+                              {#if src.status === 'transferring' && src.speed > 0}
+                                <span class="sp-src-speed">{formatSpeed(src.speed)}</span>
+                              {/if}
+                              {#if src.transferred > 0}
+                                <span class="sp-src-xfer">{formatSize(src.transferred)}</span>
+                              {/if}
+                            </div>
+                          </div>
+                        {/each}
+                      </div>
                     {/if}
                   </div>
                 </td>
@@ -1062,7 +1105,7 @@
     min-width: 100px;
   }
 
-  /* --- Source detail panel (eMule-style) --- */
+  /* --- Source detail panel --- */
   .dl-row.expanded {
     background: color-mix(in srgb, var(--accent) 8%, transparent);
   }
@@ -1071,59 +1114,224 @@
   }
   .source-detail-row td {
     padding: 0 !important;
-    border-bottom: 2px solid var(--accent);
+    border-bottom: none;
   }
   .source-panel {
-    background: color-mix(in srgb, var(--bg-secondary) 80%, var(--bg-primary));
-    padding: 6px 12px 8px;
+    background: var(--bg-surface, var(--bg-primary));
+    border-top: 2px solid var(--accent);
+    border-bottom: 2px solid var(--accent);
+    padding: 0;
   }
-  .source-panel-header {
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--text-secondary);
-    margin-bottom: 4px;
-    padding-bottom: 3px;
+
+  .sp-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px 8px;
     border-bottom: 1px solid var(--border);
+    background: var(--bg-secondary);
   }
-  .source-loading, .source-empty {
+  .sp-file-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+  }
+  .sp-filename {
+    font-weight: 600;
+    font-size: 12px;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sp-meta {
+    display: flex;
+    align-items: center;
+    gap: 5px;
     font-size: 11px;
+    flex-wrap: wrap;
+  }
+  .sp-meta-item {
+    color: var(--text-secondary);
+    font-weight: 500;
+  }
+  .sp-meta-sep {
     color: var(--text-muted);
-    padding: 8px 0;
-    text-align: center;
-    font-style: italic;
+    font-size: 9px;
   }
-  .source-table {
-    width: 100%;
-    border-collapse: collapse;
+  .sp-hash {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    margin-top: 1px;
+    cursor: text;
+    user-select: all;
+  }
+  .sp-actions {
+    display: flex;
+    gap: 4px;
+    flex-shrink: 0;
+    align-items: flex-start;
+  }
+  .sp-btn {
     font-size: 11px;
-    table-layout: auto;
+    padding: 3px 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.1s;
   }
-  .source-table th {
-    background: color-mix(in srgb, var(--bg-secondary) 60%, transparent);
-    padding: 3px 8px;
+  .sp-btn:hover { background: var(--bg-hover); }
+  .sp-close {
+    font-size: 16px;
+    line-height: 1;
+    padding: 2px 7px;
+    font-weight: 400;
+    color: var(--text-muted);
+  }
+  .sp-close:hover { color: var(--text-primary); }
+
+  .sp-summary {
+    display: flex;
+    gap: 6px;
+    padding: 6px 14px;
+    flex-wrap: wrap;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  }
+  .sp-sum-chip {
     font-size: 10px;
     font-weight: 600;
-    text-align: left;
-    color: var(--text-muted);
-    border-bottom: 1px solid var(--border);
-    white-space: nowrap;
+    padding: 2px 8px;
+    border-radius: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
   }
-  .source-table td {
-    padding: 3px 8px;
-    white-space: nowrap;
+  .sp-sum-chip.active {
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    color: var(--accent);
+  }
+  .sp-sum-chip.queued {
+    background: color-mix(in srgb, var(--text-muted) 15%, transparent);
     color: var(--text-secondary);
+  }
+  .sp-sum-chip.connecting {
+    background: color-mix(in srgb, var(--warning) 15%, transparent);
+    color: var(--warning);
+  }
+  .sp-sum-chip.total {
+    background: color-mix(in srgb, var(--success) 15%, transparent);
+    color: var(--success);
+  }
+
+  .sp-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 16px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+  .sp-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 20px 16px;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .sp-source-list {
+    display: flex;
+    flex-direction: column;
+  }
+  .sp-source {
+    display: grid;
+    grid-template-columns: 8px 1fr auto auto;
+    gap: 10px;
+    align-items: center;
+    padding: 5px 14px;
     border-bottom: 1px solid color-mix(in srgb, var(--border) 30%, transparent);
+    transition: background 0.1s;
   }
-  .source-table tbody tr:hover {
-    background: color-mix(in srgb, var(--accent) 6%, transparent);
+  .sp-source:hover {
+    background: color-mix(in srgb, var(--accent) 5%, transparent);
   }
-  .src-status {
-    font-weight: 600;
+  .sp-source:last-child {
+    border-bottom: none;
+  }
+
+  .sp-src-status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    flex-shrink: 0;
+  }
+  .sp-src-transferring .sp-src-status-dot { background: var(--accent); }
+  .sp-src-queued .sp-src-status-dot { background: var(--text-muted); }
+  .sp-src-connecting .sp-src-status-dot { background: var(--warning); }
+  .sp-src-completed .sp-src-status-dot { background: var(--success); }
+  .sp-src-failed .sp-src-status-dot { background: var(--danger); }
+
+  .sp-src-main {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .sp-src-client {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .sp-src-addr {
     font-size: 10px;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+  }
+
+  .sp-src-detail {
+    text-align: right;
+  }
+  .sp-src-stat {
+    font-size: 11px;
+    font-weight: 600;
   }
   .src-st-connecting { color: var(--warning); }
   .src-st-queued { color: var(--text-muted); }
   .src-st-transferring { color: var(--accent); }
   .src-st-completed { color: var(--success, #2ecc71); }
   .src-st-failed { color: var(--danger, #e74c3c); }
+
+  .sp-src-metrics {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 1px;
+    min-width: 70px;
+  }
+  .sp-src-speed {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+  }
+  .sp-src-xfer {
+    font-size: 10px;
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+  }
 </style>
