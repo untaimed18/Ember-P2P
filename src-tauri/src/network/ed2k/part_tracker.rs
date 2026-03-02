@@ -33,6 +33,8 @@ pub struct PartTracker {
     met_path: PathBuf,
     file_hash: [u8; 16],
     file_name: String,
+    /// MD4 hashes for each part (stored in .part.met for eMule compatibility)
+    part_hashes: Vec<[u8; 16]>,
 }
 
 impl PartTracker {
@@ -53,6 +55,7 @@ impl PartTracker {
             met_path,
             file_hash: [0u8; 16],
             file_name: String::new(),
+            part_hashes: Vec::new(),
         };
 
         tracker.load();
@@ -65,6 +68,14 @@ impl PartTracker {
 
     pub fn set_file_name(&mut self, name: &str) {
         self.file_name = name.to_string();
+    }
+
+    pub fn set_part_hashes(&mut self, hashes: Vec<[u8; 16]>) {
+        self.part_hashes = hashes;
+    }
+
+    pub fn part_hashes(&self) -> &[[u8; 16]] {
+        &self.part_hashes
     }
 
     pub fn is_part_complete(&self, part_idx: usize) -> bool {
@@ -148,10 +159,11 @@ impl PartTracker {
         let date = chrono::Utc::now().timestamp() as u32;
         file.write_u32::<LittleEndian>(date)?;
 
-        // MD4 hash (16 bytes) — eMule writes the hashset here but for
-        // compatibility we write the file hash + 0 part hashes.
         file.write_all(&self.file_hash)?;
-        file.write_u16::<LittleEndian>(0)?; // 0 part hashes
+        file.write_u16::<LittleEndian>(self.part_hashes.len() as u16)?;
+        for ph in &self.part_hashes {
+            file.write_all(ph)?;
+        }
 
         // Tag count placeholder (will seek back to fill)
         let tag_count_pos = 5 + 16 + 2; // version(1) + date(4) + hash(16) + part_hash_count(2)
@@ -324,14 +336,17 @@ impl PartTracker {
             self.file_hash = hash;
         }
 
-        // Part hash count (may be 0)
         let part_hash_count = cursor.read_u16::<LittleEndian>()? as usize;
-        // Skip part hashes (16 bytes each)
-        let skip = part_hash_count * 16;
-        if cursor.position() as usize + skip > data.len() {
+        let skip_bytes = part_hash_count * 16;
+        if cursor.position() as usize + skip_bytes > data.len() {
             anyhow::bail!("truncated part hashes in part.met");
         }
-        cursor.set_position(cursor.position() + skip as u64);
+        self.part_hashes = Vec::with_capacity(part_hash_count);
+        for _ in 0..part_hash_count {
+            let mut ph = [0u8; 16];
+            cursor.read_exact(&mut ph)?;
+            self.part_hashes.push(ph);
+        }
 
         // Tag count
         let tag_count = cursor.read_u32::<LittleEndian>()?;

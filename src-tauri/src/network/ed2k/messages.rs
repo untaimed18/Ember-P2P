@@ -48,7 +48,9 @@ pub const OP_QUEUERANK: u8 = 0x5C;
 
 // Source exchange opcodes (OP_EMULEPROT)
 pub const OP_REQUESTSOURCES: u8 = 0x81;
+pub const OP_REQUESTSOURCES2: u8 = 0x83;
 pub const OP_ANSWERSOURCES2: u8 = 0x84;
+pub const SOURCEEXCHANGE2_VERSION: u8 = 4;
 
 // UDP reask opcodes (OP_EMULEPROT, peer-to-peer UDP)
 pub const OP_REASKFILEPING: u8 = 0x90;

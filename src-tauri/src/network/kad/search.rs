@@ -125,15 +125,15 @@ impl SearchState {
     }
 
     /// Get the next batch of contacts to query (up to ALPHA).
+    /// eMule Search.cpp: NODE searches use batch size 1, all others use ALPHA (3).
     pub fn next_to_query(&mut self) -> Vec<KadContact> {
         let now = chrono::Utc::now().timestamp();
         let mut batch = Vec::new();
+        let max_batch = if matches!(self.search_type, SearchType::FindNode) { 1 } else { ALPHA };
 
         match self.phase {
             SearchPhase::Lookup => {
-                // eMule m_mapBest: drain priority contacts first (discovered in
-                // ProcessResponse as closer-than-responder top-ALPHA contacts).
-                while !self.priority_queries.is_empty() && batch.len() < ALPHA {
+                while !self.priority_queries.is_empty() && batch.len() < max_batch {
                     let c = self.priority_queries.remove(0);
                     if !self.queried.contains(&c.id) && !self.pending.contains(&c.id) {
                         batch.push(c);
@@ -141,7 +141,7 @@ impl SearchState {
                 }
 
                 for contact in &self.closest {
-                    if batch.len() >= ALPHA {
+                    if batch.len() >= max_batch {
                         break;
                     }
                     if !self.queried.contains(&contact.id) && !self.pending.contains(&contact.id) {

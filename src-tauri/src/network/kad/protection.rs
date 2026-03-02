@@ -2,20 +2,41 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
-// eMule/KAD traffic is bursty (especially during bootstrap/lookups).
-// Keep flood protection, but allow realistic bursts from known peers.
-const MAX_PACKETS_PER_SEC_UNKNOWN: u32 = 60;
-const MAX_PACKETS_PER_SEC_KNOWN: u32 = 180;
+/// eMule PacketTracking.cpp: per-opcode limits within a 15-second window.
+/// Global per-IP caps remain as a second layer of defense.
+const OPCODE_WINDOW_SECS: u64 = 15;
+const DEFAULT_OPCODE_LIMIT: u32 = 5;
 const TRACKER_EXPIRY_SECS: u64 = 30;
-/// Max outgoing packets per IP per second
 const MAX_OUTGOING_PER_IP_PER_SEC: u32 = 30;
+
+/// Per-IP global cap (second-level, matching eMule's "massive flood" detection).
+const MAX_PACKETS_PER_SEC_UNKNOWN: u32 = 20;
+const MAX_PACKETS_PER_SEC_KNOWN: u32 = 40;
+
+fn opcode_limit(opcode: u8) -> u32 {
+    match opcode {
+        0x01 => 2,   // BootstrapReq
+        0x11 => 3,   // HelloReq
+        0x21 => 10,  // KadReq (searches generate bursts)
+        0x33 => 5,   // SearchKeyReq
+        0x34 => 5,   // SearchSourceReq
+        0x35 => 5,   // SearchNotesReq
+        0x43 => 8,   // PublishKeyReq
+        0x44 => 8,   // PublishSourceReq
+        0x45 => 8,   // PublishNotesReq
+        0x50 => 3,   // FirewalledReq
+        0x60 => 3,   // Ping
+        _ => DEFAULT_OPCODE_LIMIT,
+    }
+}
 
 pub struct FloodProtection {
     ip_counters: HashMap<IpAddr, (u32, Instant)>,
+    /// Per-(IP, opcode) tracking within OPCODE_WINDOW_SECS
+    opcode_counters: HashMap<(IpAddr, u8), (u32, Instant)>,
     outgoing_requests: HashSet<(SocketAddr, u8)>,
     request_times: HashMap<(SocketAddr, u8), Instant>,
     outgoing_counters: HashMap<IpAddr, (u32, Instant)>,
-    /// O(1) lookup for recently communicated IPs (updated on track_request)
     recent_ips: HashMap<IpAddr, Instant>,
 }
 
@@ -23,6 +44,7 @@ impl FloodProtection {
     pub fn new() -> Self {
         FloodProtection {
             ip_counters: HashMap::new(),
+            opcode_counters: HashMap::new(),
             outgoing_requests: HashSet::new(),
             request_times: HashMap::new(),
             outgoing_counters: HashMap::new(),
@@ -31,16 +53,34 @@ impl FloodProtection {
     }
 
     /// Returns true if the packet should be dropped (rate exceeded).
-    /// Known/recent peers are allowed a higher burst budget.
+    /// Checks both per-opcode limits (eMule PacketTracking style) and
+    /// global per-IP caps.
     pub fn check_rate_limit(&mut self, ip: IpAddr, known_peer: bool) -> bool {
-        let now = Instant::now();
-        let entry = self.ip_counters.entry(ip).or_insert((0, now));
-        let max_packets = if known_peer {
-            MAX_PACKETS_PER_SEC_KNOWN
-        } else {
-            MAX_PACKETS_PER_SEC_UNKNOWN
-        };
+        self.check_rate_limit_with_opcode(ip, known_peer, 0xFF)
+    }
 
+    /// Rate-limit with opcode awareness matching eMule PacketTracking.cpp.
+    pub fn check_rate_limit_with_opcode(&mut self, ip: IpAddr, known_peer: bool, opcode: u8) -> bool {
+        let now = Instant::now();
+
+        // Layer 1: per-(IP, opcode) within OPCODE_WINDOW_SECS
+        let op_key = (ip, opcode);
+        let op_entry = self.opcode_counters.entry(op_key).or_insert((0, now));
+        if now.duration_since(op_entry.1).as_secs() >= OPCODE_WINDOW_SECS {
+            op_entry.0 = 1;
+            op_entry.1 = now;
+        } else {
+            op_entry.0 += 1;
+            let limit = opcode_limit(opcode);
+            let effective = if known_peer { limit * 2 } else { limit };
+            if op_entry.0 > effective {
+                return true;
+            }
+        }
+
+        // Layer 2: global per-IP per-second cap
+        let entry = self.ip_counters.entry(ip).or_insert((0, now));
+        let max_packets = if known_peer { MAX_PACKETS_PER_SEC_KNOWN } else { MAX_PACKETS_PER_SEC_UNKNOWN };
         if now.duration_since(entry.1).as_secs() >= 1 {
             entry.0 = 1;
             entry.1 = now;
@@ -155,6 +195,10 @@ impl FloodProtection {
 
         self.ip_counters.retain(|_, (_, last)| {
             now.duration_since(*last).as_secs() < 60
+        });
+
+        self.opcode_counters.retain(|_, (_, last)| {
+            now.duration_since(*last).as_secs() < OPCODE_WINDOW_SECS * 2
         });
 
         self.outgoing_counters.retain(|_, (_, last)| {

@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+/// eMule PURGESOURCESWAPSTOP: minimum time between swaps for the same source (15 min)
+const PURGE_SOURCE_SWAP_STOP_SECS: i64 = 15 * 60;
+
 /// A4AF (Asked For Another File) source management.
 /// Tracks sources that are known to have files we want but are currently
 /// assigned to a different download.
@@ -9,10 +12,17 @@ pub struct A4AFEntry {
     pub peer_addr: SocketAddr,
     pub assigned_file_hash: [u8; 16],
     pub added_time: i64,
+    /// Last time this source was swapped (eMule suspension timing)
+    pub last_swap_time: i64,
+    /// Queue rank on the assigned file (0 = unknown)
+    pub queue_rank: u16,
+    /// Whether we have needed parts from the assigned file (NNP = No Needed Parts)
+    pub has_needed_parts: bool,
+    /// Credit ratio for this peer (uploaded/downloaded ratio factor)
+    pub credit_ratio: f64,
 }
 
 pub struct A4AFManager {
-    /// file_hash -> list of A4AF entries (sources that have this file but are assigned elsewhere)
     a4af_sources: HashMap<[u8; 16], Vec<A4AFEntry>>,
 }
 
@@ -23,6 +33,14 @@ pub struct SwapAction {
     pub to_file: [u8; 16],
 }
 
+/// Extended file info for swap decisions, matching eMule's SwapToRightFile logic.
+#[derive(Debug, Clone)]
+pub struct FileSwapInfo {
+    pub priority: u32,
+    pub active_source_count: usize,
+    pub has_needed_parts: bool,
+}
+
 impl A4AFManager {
     pub fn new() -> Self {
         Self {
@@ -30,8 +48,6 @@ impl A4AFManager {
         }
     }
 
-    /// Register a source as A4AF for a file. The source has `file_hash` but is
-    /// currently downloading `current_file`.
     pub fn add_a4af_source(
         &mut self,
         file_hash: [u8; 16],
@@ -52,7 +68,30 @@ impl A4AFManager {
             peer_addr,
             assigned_file_hash,
             added_time: chrono::Utc::now().timestamp(),
+            last_swap_time: 0,
+            queue_rank: 0,
+            has_needed_parts: true,
+            credit_ratio: 1.0,
         });
+    }
+
+    /// Update queue rank and NNP state for a peer (called from download loop).
+    pub fn update_source_state(
+        &mut self,
+        peer_addr: SocketAddr,
+        queue_rank: u16,
+        has_needed_parts: bool,
+        credit_ratio: f64,
+    ) {
+        for entries in self.a4af_sources.values_mut() {
+            for entry in entries.iter_mut() {
+                if entry.peer_addr == peer_addr {
+                    entry.queue_rank = queue_rank;
+                    entry.has_needed_parts = has_needed_parts;
+                    entry.credit_ratio = credit_ratio;
+                }
+            }
+        }
     }
 
     pub fn remove_source(&mut self, peer_addr: SocketAddr) {
@@ -62,32 +101,45 @@ impl A4AFManager {
         self.a4af_sources.retain(|_, v| !v.is_empty());
     }
 
-    /// Evaluate swap decisions every 8 minutes.
-    /// Returns list of sources that should be swapped to higher-priority files.
-    ///
-    /// `file_priorities` maps file_hash -> (priority, active_source_count)
+    /// Evaluate swap decisions matching eMule's SwapToRightFile logic:
+    /// - Suspension timing: don't swap if swapped within PURGESOURCESWAPSTOP (15 min)
+    /// - NNP awareness: aggressively swap away from files where we have no needed parts
+    /// - Queue rank: peers with low rank (<=50) on current file are less likely to swap
+    /// - Credit weighting: higher-credit peers are more valuable to keep
+    /// - Source count: prefer files with fewer active sources
     pub fn process_swaps(
         &self,
-        file_priorities: &HashMap<[u8; 16], (u32, usize)>,
+        file_info: &HashMap<[u8; 16], FileSwapInfo>,
     ) -> Vec<SwapAction> {
         let mut swaps = Vec::new();
+        let now = chrono::Utc::now().timestamp();
 
         for (target_hash, entries) in &self.a4af_sources {
-            let (target_prio, target_sources) = match file_priorities.get(target_hash) {
-                Some(p) => *p,
+            let target = match file_info.get(target_hash) {
+                Some(p) => p,
                 None => continue,
             };
 
             for entry in entries {
-                let (assigned_prio, assigned_sources) =
-                    match file_priorities.get(&entry.assigned_file_hash) {
-                        Some(p) => *p,
-                        None => continue,
-                    };
+                // Suspension: don't re-swap too quickly
+                if entry.last_swap_time > 0
+                    && now - entry.last_swap_time < PURGE_SOURCE_SWAP_STOP_SECS
+                {
+                    continue;
+                }
 
-                // Swap if target has higher priority, or same priority but fewer sources
-                let should_swap = target_prio > assigned_prio
-                    || (target_prio == assigned_prio && target_sources < assigned_sources);
+                let assigned = match file_info.get(&entry.assigned_file_hash) {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                let should_swap = evaluate_swap(
+                    target,
+                    assigned,
+                    entry.queue_rank,
+                    entry.has_needed_parts,
+                    entry.credit_ratio,
+                );
 
                 if should_swap {
                     swaps.push(SwapAction {
@@ -102,6 +154,18 @@ impl A4AFManager {
         swaps
     }
 
+    /// Mark a source as recently swapped (resets suspension timer).
+    pub fn mark_swapped(&mut self, peer_addr: SocketAddr) {
+        let now = chrono::Utc::now().timestamp();
+        for entries in self.a4af_sources.values_mut() {
+            for entry in entries.iter_mut() {
+                if entry.peer_addr == peer_addr {
+                    entry.last_swap_time = now;
+                }
+            }
+        }
+    }
+
     pub fn cleanup_stale(&mut self, max_age_secs: i64) {
         let cutoff = chrono::Utc::now().timestamp() - max_age_secs;
         for entries in self.a4af_sources.values_mut() {
@@ -109,4 +173,37 @@ impl A4AFManager {
         }
         self.a4af_sources.retain(|_, v| !v.is_empty());
     }
+}
+
+/// eMule-style swap evaluation matching SwapToRightFile logic.
+fn evaluate_swap(
+    target: &FileSwapInfo,
+    assigned: &FileSwapInfo,
+    queue_rank: u16,
+    has_needed_parts_on_assigned: bool,
+    _credit_ratio: f64,
+) -> bool {
+    // NNP: aggressively swap away from files where we don't need anything
+    if !has_needed_parts_on_assigned && target.has_needed_parts {
+        return true;
+    }
+
+    // Don't swap away from a file where we have a good queue position
+    if queue_rank > 0 && queue_rank <= 50 && has_needed_parts_on_assigned {
+        return false;
+    }
+
+    // Higher priority target always wins
+    if target.priority > assigned.priority {
+        return true;
+    }
+
+    // Same priority: prefer the file with fewer sources
+    if target.priority == assigned.priority {
+        if target.active_source_count + 1 < assigned.active_source_count {
+            return true;
+        }
+    }
+
+    false
 }

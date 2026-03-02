@@ -762,8 +762,37 @@ impl UploadHandler {
 
                     if !should_accept {
                         let mut queue = self.upload_queue.lock().await;
-                        let rank = if let Some(pos) = queue.iter().position(|e| e.addr == peer_addr) {
-                            (pos + 1) as u16
+                        let rank = if let Some(_pos) = queue.iter().position(|e| e.addr == peer_addr) {
+                            // Compute credit-weighted rank: count how many
+                            // peers ahead of us have a higher score.
+                            let cm = self.credit_manager.read().await;
+                            let idx_snap = self.local_index.read().await;
+                            let my_wait = queue.iter()
+                                .find(|e| e.addr == peer_addr)
+                                .map(|e| e.join_time.elapsed().as_secs())
+                                .unwrap_or(0);
+                            let my_fh = current_file_hash.unwrap_or([0u8; 16]);
+                            let my_prio = idx_snap.get_by_hash(&hex::encode(my_fh))
+                                .map(|f| match f.priority.as_str() {
+                                    "release" => 2.5, "high" => 1.8, "normal" => 1.0,
+                                    "low" => 0.6, "verylow" => 0.2, _ => 1.0,
+                                }).unwrap_or(1.0);
+                            let my_score = cm.get_queue_score(&peer_user_hash, my_wait, my_prio);
+                            let mut rank_val = 1u16;
+                            for entry in queue.iter() {
+                                if entry.addr == peer_addr { continue; }
+                                let ew = entry.join_time.elapsed().as_secs();
+                                let ep = idx_snap.get_by_hash(&hex::encode(entry.file_hash))
+                                    .map(|f| match f.priority.as_str() {
+                                        "release" => 2.5, "high" => 1.8, "normal" => 1.0,
+                                        "low" => 0.6, "verylow" => 0.2, _ => 1.0,
+                                    }).unwrap_or(1.0);
+                                let es = cm.get_queue_score(&entry.user_hash, ew, ep);
+                                if es > my_score { rank_val += 1; }
+                            }
+                            drop(cm);
+                            drop(idx_snap);
+                            rank_val
                         } else if queue.len() >= MAX_UPLOAD_QUEUE_SIZE {
                             debug!("Upload queue full ({MAX_UPLOAD_QUEUE_SIZE}), rejecting {peer_addr}");
                             drop(queue);

@@ -14,18 +14,9 @@ const BIG_TIMER_INITIAL_SECS: i64 = 10;
 /// eMule MIN2S(1): per-zone small timer fires every minute for liveness probing.
 const SMALL_TIMER_INTERVAL_SECS: i64 = 60;
 
-/// Distant buckets (low indices) cover a huge portion of the ID space.
-/// Bucket 0 alone covers 50%. Giving them more capacity improves lookup
-/// diversity without requiring eMule's dynamic tree structure.
-const DISTANT_BUCKET_THRESHOLD: usize = 8;
-const DISTANT_BUCKET_SIZE: usize = 20;
-
-fn bucket_capacity(bucket_idx: usize) -> usize {
-    if bucket_idx < DISTANT_BUCKET_THRESHOLD {
-        DISTANT_BUCKET_SIZE
-    } else {
-        K_BUCKET_SIZE
-    }
+/// All buckets use K=10 matching eMule's RoutingBin.cpp fixed capacity.
+fn bucket_capacity(_bucket_idx: usize) -> usize {
+    K_BUCKET_SIZE
 }
 
 /// Return a human-readable KAD version name for logging.
@@ -566,10 +557,9 @@ impl RoutingTable {
         self.buckets
             .iter()
             .enumerate()
-            .filter(|(i, b)| {
+            .filter(|(_, b)| {
                 if b.is_full() { return false; }
                 if b.next_big_timer > now { return false; }
-                if *i < DISTANT_BUCKET_THRESHOLD { return true; }
                 b.contacts.len() < b.capacity / 3
             })
             .map(|(i, _)| i)

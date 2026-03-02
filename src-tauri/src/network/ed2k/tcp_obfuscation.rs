@@ -136,6 +136,86 @@ where
     Ok(NegotiationResult::Obfuscated { recv_key, send_key })
 }
 
+/// Initiate an outgoing obfuscated connection. Matches eMule's
+/// `EncryptedStreamSocket::StartNegotiation(true)` (client/initiator side).
+///
+/// The initiator generates a random key part, derives RC4 keys from the
+/// **remote peer's** user hash, encrypts the magic+method+padding, then
+/// reads the peer's encrypted response.
+pub async fn negotiate_outgoing<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    remote_user_hash: &[u8; 16],
+) -> io::Result<NegotiationResult>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let random_key_part: u32 = rand::random();
+    let rkp = random_key_part.to_le_bytes();
+
+    // Derive keys from remote_user_hash (initiator uses MAGICVALUE_SERVER for send,
+    // MAGICVALUE_REQUESTER for recv -- reversed from the receiver's perspective)
+    let mut key_buf = [0u8; 21];
+    key_buf[..16].copy_from_slice(remote_user_hash);
+
+    // SendKey: magic = MAGICVALUE_SERVER (0xCB) -- we are the "server" in initiator role
+    key_buf[16] = MAGICVALUE_SERVER;
+    key_buf[17..21].copy_from_slice(&rkp);
+    let send_md5 = md5::Md5::digest(&key_buf);
+    let mut send_key = Rc4State::new(&send_md5);
+    send_key.skip(RC4_DROP_BYTES);
+
+    // RecvKey: magic = MAGICVALUE_REQUESTER (0x22)
+    key_buf[16] = MAGICVALUE_REQUESTER;
+    let recv_md5 = md5::Md5::digest(&key_buf);
+    let mut recv_key = Rc4State::new(&recv_md5);
+    recv_key.skip(RC4_DROP_BYTES);
+
+    // Send: random_key_part(4, unencrypted) + encrypted(magic(4) + method_sup(1) + method_pref(1) + padding_len(1) + padding)
+    writer.write_u32_le(random_key_part).await?;
+
+    let padding_len = (rand::random::<u8>() % 16) as usize;
+    let mut plain = Vec::with_capacity(4 + 3 + padding_len);
+    plain.extend_from_slice(&MAGICVALUE_SYNC.to_le_bytes());
+    plain.push(ENM_OBFUSCATION); // supported method
+    plain.push(ENM_OBFUSCATION); // preferred method
+    plain.push(padding_len as u8);
+    for _ in 0..padding_len {
+        plain.push(rand::random::<u8>());
+    }
+    let mut encrypted = vec![0u8; plain.len()];
+    send_key.process(&plain, &mut encrypted);
+    writer.write_all(&encrypted).await?;
+    writer.flush().await?;
+
+    // Read peer's encrypted response: magic(4) + selected_method(1) + padding_len(1) + padding
+    let mut enc_resp = [0u8; 6];
+    reader.read_exact(&mut enc_resp).await?;
+    let mut dec_resp = [0u8; 6];
+    recv_key.process(&enc_resp, &mut dec_resp);
+
+    let resp_magic = u32::from_le_bytes([dec_resp[0], dec_resp[1], dec_resp[2], dec_resp[3]]);
+    if resp_magic != MAGICVALUE_SYNC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("outgoing obfuscation: bad response magic 0x{resp_magic:08X}"),
+        ));
+    }
+
+    let _selected_method = dec_resp[4];
+    let resp_pad_len = dec_resp[5] as usize;
+    if resp_pad_len > 0 {
+        let mut enc_pad = vec![0u8; resp_pad_len];
+        reader.read_exact(&mut enc_pad).await?;
+        let mut dec_pad = vec![0u8; resp_pad_len];
+        recv_key.process(&enc_pad, &mut dec_pad);
+    }
+
+    info!("Outgoing TCP obfuscation handshake complete (padding_out={padding_len}, padding_in={resp_pad_len})");
+    Ok(NegotiationResult::Obfuscated { recv_key, send_key })
+}
+
 /// Wraps a tokio AsyncRead with transparent RC4 decryption.
 pub struct Rc4Reader<R> {
     inner: R,

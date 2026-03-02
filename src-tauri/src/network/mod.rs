@@ -2563,8 +2563,7 @@ pub async fn start_network(
             // A4AF swap evaluation every 8 minutes
             _ = a4af_timer.tick() => {
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
-                // Build file priority map from pending downloads
-                let mut file_priorities: HashMap<[u8; 16], (u32, usize)> = HashMap::new();
+                let mut file_priorities: HashMap<[u8; 16], ed2k::a4af::FileSwapInfo> = HashMap::new();
                 let mut dl_hashes_vec: Vec<[u8; 16]> = Vec::new();
                 for (_tid, pd) in &state.pending_downloads {
                     let hash_hex = &pd.file_hash;
@@ -2572,13 +2571,16 @@ pub async fn start_network(
                         if raw.len() >= 16 {
                             let mut hash = [0u8; 16];
                             hash.copy_from_slice(&raw[..16]);
-                            file_priorities.insert(hash, (1u32, 0));
+                            file_priorities.insert(hash, ed2k::a4af::FileSwapInfo {
+                                priority: 1,
+                                active_source_count: 0,
+                                has_needed_parts: true,
+                            });
                             dl_hashes_vec.push(hash);
                         }
                     }
                 }
 
-                // Update shared pending download hashes for upload handler A4AF registration
                 {
                     let mut pdh = pending_dl_hashes.write().await;
                     *pdh = dl_hashes_vec;

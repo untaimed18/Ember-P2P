@@ -38,7 +38,7 @@ pub fn compute_aich_root_cancellable(path: &Path, cancelled: &AtomicBool) -> any
         let block_size = remaining.min(block_size_u64) as usize;
         let buf_slice = &mut buf[..block_size];
         file.read_exact(buf_slice)?;
-        leaf_hashes.push(Sha1::digest(buf_slice).into());
+        leaf_hashes.push(hash_leaf(buf_slice));
         remaining -= block_size as u64;
     }
 
@@ -55,17 +55,34 @@ pub fn compute_aich_part(data: &[u8]) -> [u8; 20] {
     let mut leaf_hashes: Vec<[u8; 20]> = Vec::with_capacity(num_blocks);
 
     for chunk in data.chunks(AICH_BLOCK_SIZE) {
-        leaf_hashes.push(Sha1::digest(chunk).into());
+        leaf_hashes.push(hash_leaf(chunk));
     }
 
     merkle_root(&leaf_hashes)
+}
+
+/// eMule AICH domain separation: leaf nodes are SHA1(0x00 || data)
+fn hash_leaf(data: &[u8]) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update([0x00u8]);
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// eMule AICH domain separation: internal nodes are SHA1(0x01 || left || right)
+fn hash_internal(left: &[u8; 20], right: &[u8; 20]) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update([0x01u8]);
+    hasher.update(left);
+    hasher.update(right);
+    hasher.finalize().into()
 }
 
 /// Build a Merkle tree root using eMule's top-down recursive split algorithm.
 /// This matches eMule's CAICHHashTree::ReCalculateHash.
 fn merkle_root(leaves: &[[u8; 20]]) -> [u8; 20] {
     if leaves.is_empty() {
-        return Sha1::digest([]).into();
+        return hash_leaf(&[]);
     }
     if leaves.len() == 1 {
         return leaves[0];
@@ -75,16 +92,13 @@ fn merkle_root(leaves: &[[u8; 20]]) -> [u8; 20] {
 
 fn build_tree_recursive(leaves: &[[u8; 20]], is_left_branch: bool) -> [u8; 20] {
     if leaves.len() <= 1 {
-        return leaves.first().copied().unwrap_or_else(|| Sha1::digest([]).into());
+        return leaves.first().copied().unwrap_or_else(|| hash_leaf(&[]));
     }
     // eMule: nLeft = (nBlocks + bIsLeftBranch) / 2
     let n_left = (leaves.len() + if is_left_branch { 1 } else { 0 }) / 2;
     let left_hash = build_tree_recursive(&leaves[..n_left], true);
     let right_hash = build_tree_recursive(&leaves[n_left..], false);
-    let mut hasher = Sha1::new();
-    hasher.update(left_hash);
-    hasher.update(right_hash);
-    hasher.finalize().into()
+    hash_internal(&left_hash, &right_hash)
 }
 
 /// AICH Recovery HashSet: stores the full Merkle tree for a file.
@@ -124,7 +138,7 @@ impl AICHRecoveryHashSet {
             let block_size = remaining.min(block_size_u64) as usize;
             let buf_slice = &mut buf[..block_size];
             file.read_exact(buf_slice)?;
-            leaf_hashes.push(Sha1::digest(buf_slice).into());
+            leaf_hashes.push(hash_leaf(buf_slice));
             remaining -= block_size as u64;
         }
 
@@ -142,7 +156,7 @@ impl AICHRecoveryHashSet {
         let mut leaf_hashes: Vec<[u8; 20]> = Vec::with_capacity(num_blocks);
 
         for chunk in data.chunks(AICH_BLOCK_SIZE) {
-            leaf_hashes.push(Sha1::digest(chunk).into());
+            leaf_hashes.push(hash_leaf(chunk));
         }
 
         let root_hash = merkle_root(&leaf_hashes);
@@ -191,7 +205,7 @@ impl AICHRecoveryHashSet {
             if block_idx >= self.leaf_hashes.len() {
                 break;
             }
-            let computed: [u8; 20] = Sha1::digest(chunk).into();
+            let computed = hash_leaf(chunk);
             if computed != self.leaf_hashes[block_idx] {
                 corrupt.push(i);
             }
@@ -264,20 +278,17 @@ mod tests {
 
     #[test]
     fn test_merkle_single_leaf() {
-        let leaf: [u8; 20] = Sha1::digest(b"hello").into();
+        let leaf = hash_leaf(b"hello");
         let root = merkle_root(&[leaf]);
         assert_eq!(root, leaf);
     }
 
     #[test]
     fn test_merkle_two_leaves() {
-        let a: [u8; 20] = Sha1::digest(b"hello").into();
-        let b: [u8; 20] = Sha1::digest(b"world").into();
+        let a = hash_leaf(b"hello");
+        let b = hash_leaf(b"world");
         let root = merkle_root(&[a, b]);
-        let mut expected_hasher = Sha1::new();
-        expected_hasher.update(a);
-        expected_hasher.update(b);
-        let expected: [u8; 20] = expected_hasher.finalize().into();
+        let expected = hash_internal(&a, &b);
         assert_eq!(root, expected);
     }
 }

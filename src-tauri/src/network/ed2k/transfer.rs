@@ -393,9 +393,13 @@ impl Ed2kDownload {
             Err(e) => debug!("No hashset answer (peer may not support it): {e}"),
         }
 
-        // Request source exchange (eMule: OP_REQUESTSOURCES after file handshake)
-        let sx_req = build_file_request(&self.file_hash);
-        write_packet_async(&mut writer, OP_EMULEPROT, OP_REQUESTSOURCES, &sx_req).await?;
+        // Request source exchange v2 (eMule: OP_REQUESTSOURCES2 after file handshake)
+        // Format: Version(1) + Options(2) + Hash(16) = 19 bytes
+        let mut sx2_req = Vec::with_capacity(19);
+        sx2_req.push(SOURCEEXCHANGE2_VERSION);
+        sx2_req.extend_from_slice(&0u16.to_le_bytes()); // options: 0 = no special flags
+        sx2_req.extend_from_slice(&self.file_hash);
+        write_packet_async(&mut writer, OP_EMULEPROT, OP_REQUESTSOURCES2, &sx2_req).await?;
 
         // Request upload slot
         let upload_req = build_file_request(&self.file_hash);
