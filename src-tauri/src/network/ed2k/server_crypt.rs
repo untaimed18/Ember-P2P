@@ -163,7 +163,7 @@ pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServer
     let g_a_mod_p = g.modpow(&a, &p);
     let g_a_bytes = biguint_to_be_padded(&g_a_mod_p, PRIMESIZE_BYTES);
 
-    let pad_len = (rand::random::<u8>() % 128) as usize;
+    let pad_len = (rand::random::<u8>() % 16) as usize;
     let mut msg1 = Vec::with_capacity(1 + PRIMESIZE_BYTES + 1 + pad_len);
     msg1.push(semi_random_marker());
     msg1.extend_from_slice(&g_a_bytes);
@@ -238,7 +238,7 @@ pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServer
     }
 
     // --- Build Message 3 (buffered, sent with first write) ---
-    let resp_pad_len = (rand::random::<u8>() % 128) as usize;
+    let resp_pad_len = (rand::random::<u8>() % 16) as usize;
     let mut resp_plain = Vec::with_capacity(6 + resp_pad_len);
     resp_plain.extend_from_slice(&MAGICVALUE_SYNC.to_le_bytes());
     resp_plain.push(ENM_OBFUSCATION);

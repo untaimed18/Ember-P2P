@@ -113,7 +113,8 @@ where
 
     // Step 6: Send our response (encrypted with send_key)
     if send_response {
-        let response_pad_len = (rand::random::<u8>() % 128) as usize;
+        // eMule default: CryptTCPPaddingLength=128, so % (128+1) = 0..128
+        let response_pad_len = (rand::random::<u8>() as u16 % 129) as usize;
         let resp_len = 4 + 1 + 1 + response_pad_len;
         let mut resp_plain = Vec::with_capacity(resp_len);
         resp_plain.extend_from_slice(&MAGICVALUE_SYNC.to_le_bytes());
@@ -151,22 +152,27 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    // eMule: regenerate until first byte doesn't match a plain protocol marker
-    let mut random_key_part: u32 = rand::random();
-    loop {
-        let first_byte = (random_key_part & 0xFF) as u8;
-        if !PLAIN_PROTOCOL_MARKERS.contains(&first_byte) {
-            break;
-        }
-        random_key_part = rand::random();
-    }
+    let random_key_part: u32 = rand::random();
     let rkp = random_key_part.to_le_bytes();
+
+    // eMule: generate a semi-random first byte that doesn't match protocol markers
+    // (EncryptedStreamSocket.cpp:737 GetSemiRandomNotProtocolMarker)
+    let semi_random = {
+        let mut b: u8;
+        loop {
+            b = rand::random();
+            if !PLAIN_PROTOCOL_MARKERS.contains(&b) {
+                break b;
+            }
+        }
+    };
 
     // Derive keys from remote_user_hash (eMule: initiator = "requester")
     let mut key_buf = [0u8; 21];
     key_buf[..16].copy_from_slice(remote_user_hash);
 
     // SendKey: magic = MAGICVALUE_REQUESTER (0x22) -- we are the requester/initiator
+    // (EncryptedStreamSocket.cpp:349)
     key_buf[16] = MAGICVALUE_REQUESTER;
     key_buf[17..21].copy_from_slice(&rkp);
     let send_md5 = md5::Md5::digest(&key_buf);
@@ -174,15 +180,20 @@ where
     send_key.skip(RC4_DROP_BYTES);
 
     // RecvKey: magic = MAGICVALUE_SERVER (0xCB) -- peer is the "server"/receiver
+    // (EncryptedStreamSocket.cpp:353)
     key_buf[16] = MAGICVALUE_SERVER;
     let recv_md5 = md5::Md5::digest(&key_buf);
     let mut recv_key = Rc4State::new(&recv_md5);
     recv_key.skip(RC4_DROP_BYTES);
 
-    // Send: random_key_part(4, unencrypted) + encrypted(magic(4) + method_sup(1) + method_pref(1) + padding_len(1) + padding)
+    // Send: semi_random(1) + random_key_part(4) unencrypted,
+    // then encrypted(magic(4) + method_sup(1) + method_pref(1) + padding_len(1) + padding)
+    // (EncryptedStreamSocket.cpp:393-410)
+    writer.write_u8(semi_random).await?;
     writer.write_u32_le(random_key_part).await?;
 
-    let padding_len = (rand::random::<u8>() % 128) as usize;
+    // eMule default: CryptTCPPaddingLength=128, so % (128+1) = 0..128
+    let padding_len = (rand::random::<u8>() as u16 % 129) as usize;
     let mut plain = Vec::with_capacity(4 + 3 + padding_len);
     plain.extend_from_slice(&MAGICVALUE_SYNC.to_le_bytes());
     plain.push(ENM_OBFUSCATION); // supported method

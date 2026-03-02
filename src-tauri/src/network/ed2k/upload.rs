@@ -48,8 +48,8 @@ const MAX_CONNECTIONS_PER_IP: usize = 3;
 const MAX_TOTAL_CONNECTIONS: usize = 100;
 /// Maximum number of peers waiting in the upload queue
 const MAX_UPLOAD_QUEUE_SIZE: usize = 500;
-/// eMule SESSIONMAXTRANS: max bytes uploaded per session before rotating slots.
-const SESSIONMAXTRANS: u64 = PARTSIZE;
+/// eMule SESSIONMAXTRANS: max bytes uploaded per session before rotating slots (opcodes.h:97).
+const SESSIONMAXTRANS: u64 = PARTSIZE + 20 * 1024;
 /// eMule SESSIONMAXTIME: max duration of a single upload session (1 hour).
 const SESSIONMAXTIME_SECS: u64 = 3600;
 
@@ -742,7 +742,8 @@ impl UploadHandler {
                         let hash_hex = hex::encode(hash);
                         let index = self.local_index.read().await;
                         if let Some(file) = index.get_by_hash(&hash_hex) {
-                            let ed2k_part_count = if file.size == 0 { 0u16 } else { ((file.size + PARTSIZE - 1) / PARTSIZE) as u16 };
+                            // eMule m_iED2KPartCount (KnownFile.cpp:709): floor(size/PARTSIZE) + 1
+                            let ed2k_part_count = if file.size == 0 { 0u16 } else { (file.size / PARTSIZE + 1) as u16 };
                             let bitmap_bytes = ((ed2k_part_count as usize) + 7) / 8;
                             let mut status_payload = Vec::with_capacity(18 + bitmap_bytes);
                             status_payload.extend_from_slice(&hash);
@@ -934,7 +935,10 @@ impl UploadHandler {
                             queue.len() as u16
                         };
                         drop(queue);
-                        let qr_payload = rank.to_le_bytes().to_vec();
+                        // eMule OP_QUEUERANKING (UploadClient.cpp:633): 12 bytes = rank(u16) + 10 zeros
+                        let mut qr_payload = Vec::with_capacity(12);
+                        qr_payload.extend_from_slice(&rank.to_le_bytes());
+                        qr_payload.resize(12, 0);
                         write_packet_async(
                             &mut writer,
                             OP_EMULEPROT,

@@ -528,14 +528,11 @@ impl Ed2kDownload {
                             _ => 4 + 2 + 4 + 2 + 16,
                         };
                         if offset + entry_size > payload.len() { break; }
-                        // Type 6 (KAD): UserHash(16) + IP(4) + Port(2)
-                        // Other types: IP(4) + Port(2) + ...
-                        let ip_off = if src_type == 6 { offset + 16 } else { offset };
                         let ip = std::net::Ipv4Addr::new(
-                            payload[ip_off], payload[ip_off+1],
-                            payload[ip_off+2], payload[ip_off+3],
+                            payload[offset], payload[offset+1],
+                            payload[offset+2], payload[offset+3],
                         );
-                        let port = u16::from_le_bytes([payload[ip_off+4], payload[ip_off+5]]);
+                        let port = u16::from_le_bytes([payload[offset+4], payload[offset+5]]);
                         offset += entry_size;
                         if port > 0 && !ip.is_unspecified() && !ip.is_loopback() {
                             if let Some(sm) = &self.source_manager {
