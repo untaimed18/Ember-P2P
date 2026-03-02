@@ -4495,7 +4495,7 @@ async fn handle_udp_packet(
             }
         }
 
-        KadMessage::SearchKeyReq { target, start_position } => {
+        KadMessage::SearchKeyReq { target, start_position, search_terms } => {
             let mut results = state.dht_store.search_keywords(&target);
 
             {
@@ -4529,11 +4529,11 @@ async fn handle_udp_packet(
                 }
             }
 
-            let start = start_position as usize;
+            let _ = &search_terms;
+            let start = (start_position & 0x7FFF) as usize;
             let end = results.len().min(start + 200);
             let page = if start < results.len() { results[start..end].to_vec() } else { Vec::new() };
 
-            // eMule behavior: do not send SearchRes when there are no results.
             if !page.is_empty() {
                 let res = KadMessage::SearchRes {
                     sender_id: state.local_id,
@@ -4997,6 +4997,8 @@ async fn handle_command(
                 return;
             }
 
+            let search_terms = kad::messages::build_search_expression(&keywords);
+
             stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::Kad, crate::storage::statistics::OverheadDirection::Upload, 64);
             let sid = state.search_manager.start_search(
                 keyword_hash,
@@ -5007,6 +5009,9 @@ async fn handle_command(
             if sid == SearchId(0) {
                 let _ = tx.send(local_results);
                 return;
+            }
+            if let Some(search) = state.search_manager.get_mut(&sid) {
+                search.search_terms_data = search_terms;
             }
             state.pending_keyword_searches.insert(sid, (tx, local_results, keywords));
         }

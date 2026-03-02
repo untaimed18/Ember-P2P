@@ -101,6 +101,7 @@ pub enum KadMessage {
     SearchKeyReq {
         target: KadId,
         start_position: u16,
+        search_terms: Vec<u8>,
     },
     SearchSourceReq {
         target: KadId,
@@ -355,9 +356,17 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
             } else {
                 0
             };
+            let search_terms = if start_position & 0x8000 != 0 {
+                let mut terms = Vec::new();
+                cursor.read_to_end(&mut terms).unwrap_or(0);
+                terms
+            } else {
+                Vec::new()
+            };
             Ok(KadMessage::SearchKeyReq {
                 target,
                 start_position,
+                search_terms,
             })
         }
 
@@ -670,10 +679,16 @@ fn encode_message(msg: &KadMessage, out: &mut Vec<u8>) -> io::Result<()> {
         KadMessage::SearchKeyReq {
             target,
             start_position,
+            search_terms,
         } => {
             out.write_u8(KADEMLIA2_SEARCH_KEY_REQ)?;
             target.write_to(out)?;
-            out.write_u16::<LittleEndian>(*start_position)?;
+            if search_terms.is_empty() {
+                out.write_u16::<LittleEndian>(*start_position)?;
+            } else {
+                out.write_u16::<LittleEndian>(*start_position | 0x8000)?;
+                out.write_all(search_terms)?;
+            }
         }
 
         KadMessage::SearchSourceReq {
@@ -821,4 +836,46 @@ pub fn build_hello_req(
         version,
         tags: tags.to_vec(),
     })
+}
+
+/// Build a binary KAD search expression for multiple keywords (eMule AND tree format).
+///
+/// For N keywords, builds a left-leaning AND tree:
+///   AND(AND(kw1, kw2), kw3) for 3 keywords, etc.
+///
+/// Wire format:
+///   0x00 0x00 = AND operator (followed by left child, right child)
+///   0x01      = String leaf  (followed by UTF-8 length-prefixed string)
+pub fn build_search_expression(keywords: &[String]) -> Vec<u8> {
+    if keywords.len() <= 1 {
+        return Vec::new();
+    }
+
+    let mut buf = Vec::with_capacity(64);
+
+    fn write_string_leaf(buf: &mut Vec<u8>, s: &str) {
+        buf.push(0x01);
+        let bytes = s.as_bytes();
+        buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(bytes);
+    }
+
+    fn write_and_tree(buf: &mut Vec<u8>, keywords: &[String], idx: usize) {
+        if idx == keywords.len() - 1 {
+            write_string_leaf(buf, &keywords[idx]);
+            return;
+        }
+        buf.push(0x00); // operator
+        buf.push(0x00); // AND
+        if idx == keywords.len() - 2 {
+            write_string_leaf(buf, &keywords[idx]);
+            write_string_leaf(buf, &keywords[idx + 1]);
+        } else {
+            write_and_tree(buf, keywords, idx + 1);
+            write_string_leaf(buf, &keywords[idx]);
+        }
+    }
+
+    write_and_tree(&mut buf, keywords, 0);
+    buf
 }

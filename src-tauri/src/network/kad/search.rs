@@ -86,6 +86,9 @@ pub struct SearchState {
     /// sent a query to. Used for reliable sender identification in KadRes
     /// responses, even if the contact was evicted from the routing table.
     pub tried: HashMap<(Ipv4Addr, u16), KadId>,
+    /// Binary search expression for keyword searches (eMule AND tree format).
+    /// Sent in KADEMLIA2_SEARCH_KEY_REQ so remote nodes filter results server-side.
+    pub search_terms_data: Vec<u8>,
 }
 
 impl SearchState {
@@ -112,6 +115,7 @@ impl SearchState {
             lookup_reask_more_done: false,
             priority_queries: Vec::new(),
             tried: HashMap::new(),
+            search_terms_data: Vec::new(),
         }
     }
 
@@ -504,6 +508,7 @@ impl SearchState {
                 SearchType::FindKeyword => KadMessage::SearchKeyReq {
                     target: self.target,
                     start_position: 0,
+                    search_terms: self.search_terms_data.clone(),
                 },
                 SearchType::StoreKeyword | SearchType::StoreFile | SearchType::StoreNotes => {
                     // Store searches don't fetch -- they complete immediately
