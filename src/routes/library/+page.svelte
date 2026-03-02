@@ -201,18 +201,44 @@
   // --- File type display ---
   function fileType(ext: string): string {
     const lower = ext.toLowerCase();
-    const audio = ['mp3', 'ogg', 'wav', 'wma', 'flac', 'aac', 'm4a', 'opus'];
-    const video = ['avi', 'mkv', 'mp4', 'wmv', 'mov', 'mpg', 'mpeg', 'flv', 'webm'];
-    const image = ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg'];
-    const archive = ['zip', 'rar', '7z', 'tar', 'gz'];
-    const doc = ['doc', 'docx', 'pdf', 'txt', 'xls', 'xlsx', 'ppt', 'pptx'];
-    const iso = ['iso', 'bin', 'img', 'nrg'];
-    if (audio.includes(lower)) return 'Audio';
-    if (video.includes(lower)) return 'Video';
-    if (image.includes(lower)) return 'Image';
-    if (archive.includes(lower)) return 'Archive';
-    if (doc.includes(lower)) return 'Document';
-    if (iso.includes(lower)) return 'CD/DVD';
+    const audio = new Set([
+      'aac','ac3','aif','aifc','aiff','amr','ape','au','aud','audio','cda',
+      'dmf','dsm','dts','far','flac','it','m1a','m2a','m4a','mdl','med',
+      'mid','midi','mka','mod','mp1','mp2','mp3','mpa','mpc','mtm','ogg',
+      'opus','psm','ptm','ra','rmi','s3m','snd','stm','umx','wav','wma','xm',
+    ]);
+    const video = new Set([
+      '3g2','3gp','3gp2','3gpp','amv','asf','avi','bik','divx','dvr-ms',
+      'flc','fli','flic','flv','hdmov','ifo','m1v','m2t','m2ts','m2v',
+      'm4b','m4v','mkv','mov','movie','mp1v','mp2v','mp4','mpe','mpeg',
+      'mpg','mpv','mpv1','mpv2','ogm','pva','qt','ram','ratdvd','rm',
+      'rmm','rmvb','rv','smil','smk','swf','tp','ts','vid','video','vob',
+      'vp6','webm','wm','wmv','xvid',
+    ]);
+    const image = new Set([
+      'bmp','emf','gif','ico','jfif','jpe','jpeg','jpg','pct','pcx','pic',
+      'pict','png','psd','psp','svg','tga','tif','tiff','webp','wmf','wmp','xif',
+    ]);
+    const archive = new Set([
+      '7z','ace','alz','arc','arj','bz2','cab','cbr','cbz','gz','hqx',
+      'lha','lzh','msi','pak','par','par2','rar','sit','sitx','tar',
+      'tbz2','tgz','xpi','xz','z','zip',
+    ]);
+    const doc = new Set([
+      'chm','css','diz','doc','docx','dot','djvu','epub','hlp','htm',
+      'html','lit','mobi','azw','nfo','ods','odt','odp','pdf','pps',
+      'ppt','pptx','ps','rtf','text','txt','wri','xls','xlsx','xml',
+    ]);
+    const iso = new Set([
+      'bin','bwa','bwi','bws','bwt','ccd','cue','dmg','img','iso',
+      'mdf','mds','nrg','sub','toast',
+    ]);
+    if (audio.has(lower)) return 'Audio';
+    if (video.has(lower)) return 'Video';
+    if (image.has(lower)) return 'Image';
+    if (archive.has(lower)) return 'Archive';
+    if (doc.has(lower)) return 'Document';
+    if (iso.has(lower)) return 'CD/DVD';
     return ext ? ext.toUpperCase() : '\u2014';
   }
 

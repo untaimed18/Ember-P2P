@@ -199,21 +199,59 @@ fn tokenize(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Categorize a file by its extension, matching eMule's g_aED2KFileTypes table
+/// from otherfunctions.cpp. Modern formats (webm, opus, svg, etc.) that postdate
+/// eMule are included in the appropriate category.
 pub fn infer_file_type(extension: &str) -> String {
     match extension.to_lowercase().as_str() {
-        "mp3" | "ogg" | "wav" | "wma" | "flac" | "aac" | "m4a" | "ape" | "mpc" | "opus" => "Audio".into(),
-        "avi" | "mkv" | "mp4" | "wmv" | "mov" | "mpg" | "mpeg" | "flv" | "m4v" | "rmvb"
-        | "rm" | "divx" | "ogm" | "vob" | "webm" | "ts" => "Video".into(),
-        "jpg" | "jpeg" | "png" | "gif" | "bmp" | "tiff" | "tif" | "svg" | "webp" | "ico"
-        | "psd" => "Image".into(),
-        "exe" | "msi" | "apk" | "dmg" | "app" | "deb" | "rpm" | "bat" | "cmd" | "com"
-        | "scr" => "Pro".into(),
-        "doc" | "docx" | "pdf" | "txt" | "rtf" | "xls" | "xlsx" | "ppt" | "pptx" | "odt"
-        | "ods" | "odp" | "epub" | "djvu" | "chm" | "lit" | "mobi" | "azw" | "cbr"
-        | "cbz" => "Doc".into(),
-        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "ace" | "cab" | "lzh"
-        | "arj" => "Arc".into(),
-        "iso" | "bin" | "cue" | "img" | "nrg" | "mdf" | "mds" | "ccd" | "sub" => "Iso".into(),
+        // Audio -- eMule ED2KFT_AUDIO + modern additions (opus)
+        "aac" | "ac3" | "aif" | "aifc" | "aiff" | "amr" | "ape" | "au" | "aud"
+        | "audio" | "cda" | "dmf" | "dsm" | "dts" | "far" | "flac" | "it"
+        | "m1a" | "m2a" | "m4a" | "mdl" | "med" | "mid" | "midi" | "mka"
+        | "mod" | "mp1" | "mp2" | "mp3" | "mpa" | "mpc" | "mtm" | "ogg"
+        | "opus" | "psm" | "ptm" | "ra" | "rmi" | "s3m" | "snd" | "stm"
+        | "umx" | "wav" | "wma" | "xm" => "Audio".into(),
+
+        // Video -- eMule ED2KFT_VIDEO + modern additions (webm)
+        "3g2" | "3gp" | "3gp2" | "3gpp" | "amv" | "asf" | "avi" | "bik"
+        | "divx" | "dvr-ms" | "flc" | "fli" | "flic" | "flv" | "hdmov"
+        | "ifo" | "m1v" | "m2t" | "m2ts" | "m2v" | "m4b" | "m4v" | "mkv"
+        | "mov" | "movie" | "mp1v" | "mp2v" | "mp4" | "mpe" | "mpeg"
+        | "mpg" | "mpv" | "mpv1" | "mpv2" | "ogm" | "pva" | "qt" | "ram"
+        | "ratdvd" | "rm" | "rmm" | "rmvb" | "rv" | "smil" | "smk" | "swf"
+        | "tp" | "ts" | "vid" | "video" | "vob" | "vp6" | "webm" | "wm"
+        | "wmv" | "xvid" => "Video".into(),
+
+        // Image -- eMule ED2KFT_IMAGE + modern additions (svg, webp)
+        "bmp" | "emf" | "gif" | "ico" | "jfif" | "jpe" | "jpeg" | "jpg"
+        | "pct" | "pcx" | "pic" | "pict" | "png" | "psd" | "psp" | "svg"
+        | "tga" | "tif" | "tiff" | "webp" | "wmf" | "wmp" | "xif" => "Image".into(),
+
+        // Program -- eMule ED2KFT_PROGRAM + modern additions (apk, deb, rpm, scr, app)
+        "bat" | "cmd" | "com" | "exe" | "hta" | "js" | "jse" | "msc"
+        | "vbe" | "vbs" | "wsf" | "wsh"
+        | "apk" | "app" | "deb" | "rpm" | "scr" => "Pro".into(),
+
+        // Document -- eMule ED2KFT_DOCUMENT + modern additions (docx, xlsx, pptx, odt, etc.)
+        "chm" | "css" | "diz" | "doc" | "dot" | "hlp" | "htm" | "html"
+        | "nfo" | "pdf" | "pps" | "ppt" | "ps" | "rtf" | "text" | "txt"
+        | "wri" | "xls" | "xml"
+        | "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp" | "epub"
+        | "djvu" | "lit" | "mobi" | "azw" => "Doc".into(),
+
+        // Archive -- eMule ED2KFT_ARCHIVE + modern additions (xz)
+        "7z" | "ace" | "alz" | "arc" | "arj" | "bz2" | "cab" | "cbr"
+        | "cbz" | "gz" | "hqx" | "lha" | "lzh" | "msi" | "pak" | "par"
+        | "par2" | "rar" | "sit" | "sitx" | "tar" | "tbz2" | "tgz"
+        | "xpi" | "xz" | "z" | "zip" => "Arc".into(),
+
+        // CD-Image -- eMule ED2KFT_CDIMAGE
+        "bin" | "bwa" | "bwi" | "bws" | "bwt" | "ccd" | "cue" | "dmg"
+        | "img" | "iso" | "mdf" | "mds" | "nrg" | "sub" | "toast" => "Iso".into(),
+
+        // Collection
+        "emulecollection" => "EmuleCollection".into(),
+
         _ => String::new(),
     }
 }
