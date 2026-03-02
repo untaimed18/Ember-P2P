@@ -44,6 +44,9 @@ pub struct Ed2kDownload {
     pub source_manager: Option<Arc<tokio::sync::RwLock<SourceManager>>>,
     pub credit_manager: Option<Arc<tokio::sync::RwLock<CreditManager>>>,
     pub shared_buddy_info: Option<super::upload::SharedBuddyInfo>,
+    /// Remote peer's user hash (if known from source exchange / KAD).
+    /// When set, outgoing TCP obfuscation will be attempted.
+    pub peer_user_hash: Option<[u8; 16]>,
 }
 
 #[derive(Debug, Clone)]
@@ -210,7 +213,6 @@ impl Ed2kDownload {
         )
         .await??;
 
-        // Register this source with the source manager
         if let Some(sm) = &self.source_manager {
             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                 let mut sm = sm.write().await;
@@ -218,9 +220,31 @@ impl Ed2kDownload {
             }
         }
 
-        let (reader, writer) = stream.into_split();
-        let mut reader = tokio::io::BufReader::new(reader);
-        let mut writer = tokio::io::BufWriter::new(writer);
+        let (raw_r, raw_w) = stream.into_split();
+        let mut buf_r = tokio::io::BufReader::new(raw_r);
+        let mut buf_w = tokio::io::BufWriter::new(raw_w);
+
+        // Attempt outgoing TCP obfuscation if we know the peer's user hash
+        use super::tcp_obfuscation::{self as tcp_obf, NegotiationResult, Rc4Reader, Rc4Writer};
+        type DynRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+        type DynWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+
+        let (mut reader, mut writer): (DynRead, DynWrite) = match &self.peer_user_hash {
+            Some(remote_hash) => {
+                match tcp_obf::negotiate_outgoing(&mut buf_r, &mut buf_w, remote_hash).await {
+                    Ok(NegotiationResult::Obfuscated { recv_key, send_key }) => {
+                        debug!("Outgoing obfuscation established with {}", self.source_addr);
+                        (Box::new(Rc4Reader::new(buf_r, recv_key)),
+                         Box::new(Rc4Writer::new(buf_w, send_key)))
+                    }
+                    _ => {
+                        debug!("Outgoing obfuscation not available for {}, continuing plain", self.source_addr);
+                        (Box::new(buf_r), Box::new(buf_w))
+                    }
+                }
+            }
+            None => (Box::new(buf_r), Box::new(buf_w)),
+        };
 
         // Send Hello (include buddy tags if we have a buddy, so peers know our relay)
         let buddy = match &self.shared_buddy_info {
@@ -556,6 +580,9 @@ impl Ed2kDownload {
         let mut tracker = PartTracker::new(self.file_size, &part_path);
         tracker.set_file_hash(self.file_hash);
         tracker.set_file_name(&self.file_name);
+        if !part_hashes.is_empty() {
+            tracker.set_part_hashes(part_hashes.clone());
+        }
 
         let mut output = if part_path.exists() && tracker.completed_count() > 0 {
             info!(

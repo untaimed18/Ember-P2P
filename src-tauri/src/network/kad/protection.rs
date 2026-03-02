@@ -52,13 +52,6 @@ impl FloodProtection {
         }
     }
 
-    /// Returns true if the packet should be dropped (rate exceeded).
-    /// Checks both per-opcode limits (eMule PacketTracking style) and
-    /// global per-IP caps.
-    pub fn check_rate_limit(&mut self, ip: IpAddr, known_peer: bool) -> bool {
-        self.check_rate_limit_with_opcode(ip, known_peer, 0xFF)
-    }
-
     /// Rate-limit with opcode awareness matching eMule PacketTracking.cpp.
     pub fn check_rate_limit_with_opcode(&mut self, ip: IpAddr, known_peer: bool, opcode: u8) -> bool {
         let now = Instant::now();

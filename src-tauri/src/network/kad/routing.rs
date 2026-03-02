@@ -25,11 +25,13 @@ pub fn kad_version_name(version: u8) -> &'static str {
         KADEMLIA_VERSION1_46C => "Kad1 (0.46c)",
         KADEMLIA_VERSION2_47A => "Kad2 (0.47a)",
         KADEMLIA_VERSION3_47B => "Kad2 (0.47b)",
+        KADEMLIA_VERSION4_47C => "Kad2 (0.47c)",
         KADEMLIA_VERSION5_48A => "Kad2 (0.48a)",
         KADEMLIA_VERSION6_49ABETA => "Kad2 (0.49a-beta)",
         KADEMLIA_VERSION7_49A => "Kad2 (0.49a)",
         KADEMLIA_VERSION8_49B => "Kad2 (0.49b)",
         KADEMLIA_VERSION9_50A => "Kad2 (0.50a+)",
+        KADEMLIA_VERSION => "Kad2 (current)",
         _ => "Unknown",
     }
 }

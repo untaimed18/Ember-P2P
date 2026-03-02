@@ -74,6 +74,7 @@ impl PartTracker {
         self.part_hashes = hashes;
     }
 
+    #[allow(dead_code)]
     pub fn part_hashes(&self) -> &[[u8; 16]] {
         &self.part_hashes
     }

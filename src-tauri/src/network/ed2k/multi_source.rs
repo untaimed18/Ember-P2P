@@ -95,6 +95,7 @@ impl MultiSourceDownload {
                 source_manager: self.source_manager.clone(),
                 credit_manager: self.credit_manager.clone(),
                 shared_buddy_info: self.shared_buddy_info.clone(),
+                peer_user_hash: None,
             };
             return download.run(event_tx).await;
         }

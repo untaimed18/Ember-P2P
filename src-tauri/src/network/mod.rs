@@ -955,6 +955,11 @@ pub async fn start_network(
                 }
                 match result {
                     Ok((len, from)) => {
+                        stats_manager.add_overhead(
+                            crate::storage::statistics::OverheadCategory::Kad,
+                            crate::storage::statistics::OverheadDirection::Download,
+                            len as u64,
+                        );
                         handle_udp_packet(
                             &udp_socket,
                             &udp_buf[..len],
@@ -1231,7 +1236,7 @@ pub async fn start_network(
                     }
                 }
                 let mut promoted = Vec::new();
-                handle_download_event(event, &app_handle, &transfer_manager, &db, &bandwidth_limiter, &mut promoted, &mut stats_manager, settings.remove_finished_downloads).await;
+                handle_download_event(event, &app_handle, &transfer_manager, &db, &bandwidth_limiter, &mut promoted, &mut stats_manager, settings.remove_finished_downloads, &a4af_shared).await;
                 for t in promoted {
                     let control = TransferControl::new();
                     {
@@ -1519,6 +1524,7 @@ pub async fn start_network(
                                         source_manager: Some(source_manager.clone()),
                                         credit_manager: Some(credit_manager.clone()),
                                         shared_buddy_info: Some(state.shared_buddy_info.clone()),
+                                        peer_user_hash: None,
                                     };
                                     let tx = dl_event_tx.clone();
                                     let tid = download.transfer_id.clone();
@@ -2372,6 +2378,7 @@ pub async fn start_network(
                                 source_manager: Some(source_manager.clone()),
                                 credit_manager: Some(credit_manager.clone()),
                                 shared_buddy_info: Some(state.shared_buddy_info.clone()),
+                                peer_user_hash: None,
                             };
                             let tx = dl_event_tx.clone();
                             let dl_tid = download.transfer_id.clone();
@@ -2606,6 +2613,7 @@ pub async fn start_network(
                     }
                     let mut a4af = a4af_shared.write().await;
                     for swap in &swaps {
+                        a4af.mark_swapped(swap.peer_addr);
                         a4af.remove_source(swap.peer_addr);
                     }
                 }
@@ -2867,10 +2875,20 @@ pub async fn start_network(
                     let server = state.server_list.servers()[idx].clone();
                     if let Err(e) = server_udp.send_status_ping(&server).await {
                         debug!("Server UDP ping to {}:{} failed: {e}", server.ip, server.port);
+                    } else {
+                        stats_manager.add_overhead(
+                            crate::storage::statistics::OverheadCategory::Server,
+                            crate::storage::statistics::OverheadDirection::Upload,
+                            32,
+                        );
                     }
                 }
-                // Drain all pending UDP responses
                 while let Some(resp) = server_udp.try_recv().await {
+                    stats_manager.add_overhead(
+                        crate::storage::statistics::OverheadCategory::Server,
+                        crate::storage::statistics::OverheadDirection::Download,
+                        64,
+                    );
                     match resp {
                         ServerUdpResponse::StatusResponse { addr, user_count, file_count } => {
                             let tcp_port = addr.port().saturating_sub(4);
@@ -2882,6 +2900,11 @@ pub async fn start_network(
                             if !sources.is_empty() {
                                 let hash_hex = hex::encode(file_hash);
                                 debug!("UDP found {} sources for {}", sources.len(), hash_hex);
+                                stats_manager.add_overhead(
+                                    crate::storage::statistics::OverheadCategory::SourceExchange,
+                                    crate::storage::statistics::OverheadDirection::Download,
+                                    (sources.len() * 10) as u64,
+                                );
                                 let mut sm = source_manager.write().await;
                                 for (ip, port, client_id) in &sources {
                                     if *client_id > 0 {
@@ -3165,6 +3188,7 @@ pub async fn start_network(
                                     source_manager: Some(sm),
                                     credit_manager: Some(cm),
                                     shared_buddy_info: Some(state.shared_buddy_info.clone()),
+                                    peer_user_hash: None,
                                 };
                                 let dl_tx2 = dl_tx.clone();
                                 tokio::spawn(async move {
@@ -3787,8 +3811,9 @@ async fn handle_udp_packet(
         }
         _ => state.flood_protection.has_recent_ip(from.ip()),
     };
-    if state.flood_protection.check_rate_limit(from.ip(), known_peer) {
-        debug!("Rate limit exceeded for {from}, dropping packet");
+    let opcode_hint = data.get(1).copied().unwrap_or(0xFF);
+    if state.flood_protection.check_rate_limit_with_opcode(from.ip(), known_peer, opcode_hint) {
+        debug!("Rate limit exceeded for {from} (opcode 0x{opcode_hint:02X}), dropping packet");
         return;
     }
 
@@ -5042,6 +5067,7 @@ async fn handle_command(
                     source_manager: Some(source_manager.clone()),
                     credit_manager: Some(credit_manager.clone()),
                     shared_buddy_info: Some(state.shared_buddy_info.clone()),
+                    peer_user_hash: None,
                 };
 
                 let tx = dl_event_tx.clone();
@@ -5986,6 +6012,7 @@ async fn handle_download_event(
     promoted_out: &mut Vec<Transfer>,
     stats_manager: &mut StatsManager,
     remove_finished: bool,
+    a4af: &Arc<RwLock<ed2k::a4af::A4AFManager>>,
 ) {
     match event {
         DownloadEvent::Progress {
@@ -6084,6 +6111,17 @@ async fn handle_download_event(
                         client_software: client_software.clone(),
                     },
                 );
+            }
+            if status == "queued" || status == "transferring" {
+                if let Ok(addr) = format!("{ip}:{port}").parse::<std::net::SocketAddr>() {
+                    let mut a4af_lock = a4af.write().await;
+                    a4af_lock.update_source_state(
+                        addr,
+                        queue_rank.unwrap_or(0) as u16,
+                        status != "queued" || queue_rank.unwrap_or(u32::MAX) < 500,
+                        1.0,
+                    );
+                }
             }
             let _ = app_handle.emit(
                 "transfer-source-detail",
