@@ -9,6 +9,7 @@ function getInitialTheme(): Theme {
   if (browser) {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored === 'light' || stored === 'dark') return stored;
+    if (window.matchMedia('(prefers-color-scheme: dark)').matches) return 'dark';
   }
   return 'light';
 }
@@ -33,4 +34,16 @@ export function initTheme() {
   const t = getInitialTheme();
   applyTheme(t);
   theme.set(t);
+
+  if (browser) {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    mq.addEventListener('change', (e) => {
+      const stored = localStorage.getItem(STORAGE_KEY);
+      if (!stored) {
+        const next: Theme = e.matches ? 'dark' : 'light';
+        applyTheme(next);
+        theme.set(next);
+      }
+    });
+  }
 }

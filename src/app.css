@@ -33,6 +33,13 @@
   --shadow-sm: 0 1px 2px rgba(0,0,0,0.06);
   --shadow-md: 0 2px 6px rgba(0,0,0,0.08);
 
+  --transition-fast: 0.1s;
+  --transition-normal: 0.15s;
+  --transition-slow: 0.3s;
+
+  --bg-disabled: #e8ecf4;
+  --text-disabled: #8890a8;
+
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   font-size: 14px;
   line-height: 1.5;
@@ -68,6 +75,9 @@
 
   --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
   --shadow-md: 0 2px 6px rgba(0,0,0,0.4);
+
+  --bg-disabled: #1e2746;
+  --text-disabled: #4a5270;
 }
 
 *, *::before, *::after {
@@ -80,6 +90,11 @@ body {
   overflow: hidden;
   height: 100vh;
   width: 100vw;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-light) var(--bg-primary);
 }
 
 ::-webkit-scrollbar {
@@ -103,10 +118,22 @@ body {
 a {
   color: var(--accent);
   text-decoration: none;
+  transition: color var(--transition-normal);
 }
 
 a:hover {
   color: var(--accent-hover);
+}
+
+a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+::selection {
+  background: var(--accent-dim);
+  color: var(--text-primary);
 }
 
 button {
@@ -133,6 +160,18 @@ button:hover {
 
 button:active {
   opacity: 0.85;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button:disabled {
+  background: var(--bg-disabled);
+  color: var(--text-disabled);
+  cursor: not-allowed;
+  opacity: 0.7;
 }
 
 button.danger {
@@ -168,6 +207,13 @@ input, select, textarea {
 
 input:focus, select:focus, textarea:focus {
   border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-dim);
+}
+
+input:disabled, select:disabled, textarea:disabled {
+  background: var(--bg-disabled);
+  color: var(--text-disabled);
+  cursor: not-allowed;
 }
 
 input::placeholder {
@@ -197,6 +243,12 @@ th.sortable {
 
 th.sortable:hover {
   color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+th.sortable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 td {
@@ -296,4 +348,112 @@ tr:hover td {
   font-size: 12px;
   color: var(--text-secondary);
   margin-top: 2px;
+}
+
+/* Heading scale */
+h1 { font-size: 24px; font-weight: 700; color: var(--text-primary); }
+h2 { font-size: 18px; font-weight: 600; color: var(--text-primary); }
+h3 { font-size: 16px; font-weight: 600; color: var(--text-primary); }
+h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
+
+/* Screen reader only utility */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+/* Shared spinner animation */
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinner {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+.spinner.lg { width: 32px; height: 32px; border-width: 3px; }
+
+/* Toast / snackbar for undo actions */
+.toast-container {
+  position: fixed;
+  bottom: 48px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 10px 18px;
+  box-shadow: var(--shadow-md);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+  animation: toast-in 0.25s ease;
+}
+.toast button {
+  padding: 3px 10px;
+  font-size: 12px;
+}
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Confirm dialog overlay */
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+  animation: fade-in 0.15s ease;
+}
+.confirm-dialog {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  min-width: 340px;
+  max-width: 450px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.24);
+  animation: dialog-in 0.2s ease;
+}
+.confirm-dialog h3 {
+  margin-bottom: 10px;
+}
+.confirm-dialog p {
+  color: var(--text-secondary);
+  font-size: 13px;
+  margin-bottom: 20px;
+  line-height: 1.5;
+}
+.confirm-dialog .dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes dialog-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: scale(1); }
 }

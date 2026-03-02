@@ -137,9 +137,19 @@
     }
   }
 
+  function isValidIpv4(ip: string): boolean {
+    const parts = ip.split('.');
+    if (parts.length !== 4) return false;
+    return parts.every(p => { const n = Number(p); return Number.isInteger(n) && n >= 0 && n <= 255 && p === String(n); });
+  }
+
   async function handleAddRange() {
     if (!newStartIp || !newEndIp) {
       error = 'Both start and end IP are required';
+      return;
+    }
+    if (!isValidIpv4(newStartIp.trim()) || !isValidIpv4(newEndIp.trim())) {
+      error = 'Invalid IP address format. Use dotted decimal (e.g. 192.168.1.0)';
       return;
     }
     error = null;

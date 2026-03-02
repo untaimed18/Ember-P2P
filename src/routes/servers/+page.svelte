@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import {
     getServerList,
     getConnectedServer,
@@ -17,6 +18,7 @@
   let loading = $state(true);
   let error: string | null = $state(null);
   let successMsg: string | null = $state(null);
+  let confirmRemoveAll = $state(false);
   let logMessages: string[] = $state([]);
 
   // Add server form
@@ -182,6 +184,10 @@
   }
 
   async function handleRemoveAll() {
+    confirmRemoveAll = true;
+  }
+
+  async function doRemoveAll() {
     error = null;
     await Promise.allSettled(
       [...servers].map(s => removeServer(s.ip, s.port))
@@ -620,6 +626,15 @@
     <button class="ctx-item" onclick={() => ctxAction('copy_ed2k')}>Copy eD2K Link</button>
   </div>
 {/if}
+
+<ConfirmDialog
+  bind:open={confirmRemoveAll}
+  title="Remove All Servers"
+  message="Remove all {servers.length} servers from the list? This cannot be undone."
+  confirmLabel="Remove All"
+  danger={true}
+  onconfirm={doRemoveAll}
+/>
 
 <style>
   .header-actions {

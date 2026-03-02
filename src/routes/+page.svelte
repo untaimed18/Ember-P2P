@@ -169,15 +169,19 @@
     return 'Connect';
   }
 
+  const CONTACT_TYPE_NAMES: Record<number, string> = {
+    0: 'Active',
+    1: 'Verified',
+    2: 'Expiring',
+    3: 'New',
+    4: 'Dead',
+  };
+
   function getContactTypeLabel(contact: KadContact): string {
     if (contact.bootstrap) return 'Bootstrap';
-    const v = contact.version ? `(${contact.version})` : '';
-    if (contact.type === 0) return `0${v}`;
-    if (contact.type === 1) return `1${v}`;
-    if (contact.type === 2) return `2${v}`;
-    if (contact.type === 3) return `3${v}`;
-    if (contact.type === 4) return `4${v}`;
-    return `${contact.type}${v}`;
+    const name = CONTACT_TYPE_NAMES[contact.type] || `Type ${contact.type}`;
+    const v = contact.version ? ` v${contact.version}` : '';
+    return `${name}${v}`;
   }
 
   let sortedContacts = $derived.by(() => {
@@ -285,6 +289,7 @@
       <div class="panel-content scrollable">
         {#if loading}
           <div class="empty-state compact">
+            <div class="spinner"></div>
             <p>Loading contacts...</p>
           </div>
         {:else if contacts.length === 0}
@@ -296,13 +301,13 @@
           <table class="compact-table">
             <thead>
               <tr>
-                <th class="sortable" onclick={() => sortContacts('id')}>
+                <th class="sortable" tabindex="0" role="columnheader" aria-sort={contactSortCol === 'id' ? (contactSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortContacts('id')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && sortContacts('id')}>
                   ID{getSortArrow(contactSortCol, 'id', contactSortAsc)}
                 </th>
-                <th class="sortable" onclick={() => sortContacts('type')}>
+                <th class="sortable" tabindex="0" role="columnheader" aria-sort={contactSortCol === 'type' ? (contactSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortContacts('type')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && sortContacts('type')}>
                   Type{getSortArrow(contactSortCol, 'type', contactSortAsc)}
                 </th>
-                <th class="sortable" onclick={() => sortContacts('distance')}>
+                <th class="sortable" tabindex="0" role="columnheader" aria-sort={contactSortCol === 'distance' ? (contactSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortContacts('distance')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && sortContacts('distance')}>
                   Distance{getSortArrow(contactSortCol, 'distance', contactSortAsc)}
                 </th>
               </tr>

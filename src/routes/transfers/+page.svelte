@@ -1,5 +1,6 @@
 <script lang="ts">
   import ProgressBar from '$lib/components/ProgressBar.svelte';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { transfers, startTransferPoll } from '$lib/stores/transfers';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, cancelTransfer, removeTransfer,
@@ -45,6 +46,8 @@
   onDestroy(() => { sourceUnlisten?.(); });
 
   let transferError: string | null = $state(null);
+  let confirmCancel: { open: boolean; id: string; name: string } = $state({ open: false, id: '', name: '' });
+  let confirmClearCompleted = $state(false);
 
   // --- Source detail panel (eMule-style) ---
   let expandedTransferId: string | null = $state(null);
@@ -253,7 +256,7 @@
         case 'pause': await pauseTransfer(t.id); break;
         case 'stop': await stopTransfer(t.id); break;
         case 'resume': await resumeTransfer(t.id); break;
-        case 'cancel': await cancelTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id)); break;
+        case 'cancel': confirmCancel = { open: true, id: t.id, name: t.file_name }; return;
         case 'remove': await removeTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id)); break;
         case 'open': await openFile(t.id); break;
         case 'priority': if (extra) await setTransferPriority(t.id, extra); break;
@@ -265,7 +268,7 @@
           transferError = `Archive recovered: ${path}`;
           break;
         }
-        case 'clear_completed': await clearCompleted(); transfers.update((list) => list.filter((x) => x.status !== 'completed' && x.status !== 'failed')); break;
+        case 'clear_completed': confirmClearCompleted = true; return;
         case 'copy_link': {
           const link = `ed2k://|file|${encodeURIComponent(t.file_name)}|${t.total_size}|${t.file_hash}|/`;
           await navigator.clipboard.writeText(link);
@@ -493,7 +496,7 @@
             {/each}
           {/if}
           {#if allDownloads.length === 0}
-            <tr><td colspan={DL_COL_COUNT} class="empty-cell">No downloads. Start one from the Search page.</td></tr>
+            <tr><td colspan={DL_COL_COUNT} class="empty-cell">No downloads yet. <a href="/search">Start a search</a> to find files.</td></tr>
           {/if}
         </tbody>
       </table>
@@ -704,6 +707,23 @@
     {/if}
   </div>
 {/if}
+
+<ConfirmDialog
+  bind:open={confirmCancel.open}
+  title="Cancel Download"
+  message="Cancel download of &quot;{confirmCancel.name}&quot;? The partial file will be deleted."
+  confirmLabel="Cancel Download"
+  danger={true}
+  onconfirm={async () => { await cancelTransfer(confirmCancel.id); transfers.update((list) => list.filter((x) => x.id !== confirmCancel.id)); }}
+/>
+
+<ConfirmDialog
+  bind:open={confirmClearCompleted}
+  title="Clear Completed"
+  message="Remove all completed and failed transfers from the list?"
+  confirmLabel="Clear"
+  onconfirm={async () => { await clearCompleted(); transfers.update((list) => list.filter((x) => x.status !== 'completed' && x.status !== 'failed')); }}
+/>
 
 <style>
   /* --- Layout --- */

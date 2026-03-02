@@ -145,8 +145,9 @@
     padding: 10px 16px;
     color: var(--text-secondary);
     text-decoration: none;
-    transition: all 0.15s;
+    transition: background-color var(--transition-normal), color var(--transition-normal), border-color var(--transition-normal);
     font-size: 14px;
+    border-right: 3px solid transparent;
   }
 
   .nav-list li a:hover {
@@ -154,10 +155,16 @@
     color: var(--text-primary);
   }
 
+  .nav-list li a:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    background: var(--bg-hover);
+  }
+
   .nav-list li a.active {
     background: var(--bg-tertiary);
     color: var(--accent);
-    border-right: 3px solid var(--accent);
+    border-right-color: var(--accent);
   }
 
   .nav-icon {

@@ -208,6 +208,7 @@
       if ($isSearching) {
         $isSearching = false;
         $searchProgress = null;
+        searchError = 'Search timed out after 90 seconds. Try a more specific query.';
       }
     }, 90_000);
     try {

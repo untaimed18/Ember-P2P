@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getStatistics, type TransferStats } from '$lib/api/statistics';
+  import { formatBytes, formatSpeed as formatRate, formatDurationSecs as formatDuration } from '$lib/utils';
   import { onMount, onDestroy } from 'svelte';
 
   let stats = $state<TransferStats | null>(null);
@@ -7,31 +8,7 @@
   let error: string | null = $state(null);
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
   let refreshBusy = false;
-
-  function formatBytes(bytes: number): string {
-    if (bytes === 0) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`;
-  }
-
-  function formatRate(bytesPerSec: number): string {
-    return `${formatBytes(bytesPerSec)}/s`;
-  }
-
-  function formatDuration(seconds: number): string {
-    if (seconds <= 0) return '0s';
-    const d = Math.floor(seconds / 86400);
-    const h = Math.floor((seconds % 86400) / 3600);
-    const m = Math.floor((seconds % 3600) / 60);
-    const s = seconds % 60;
-    const parts = [];
-    if (d > 0) parts.push(`${d}d`);
-    if (h > 0) parts.push(`${h}h`);
-    if (m > 0) parts.push(`${m}m`);
-    if (parts.length === 0 || s > 0) parts.push(`${s}s`);
-    return parts.join(' ');
-  }
+  let tickCounter = $state(0);
 
   async function loadStats() {
     if (refreshBusy) return;
@@ -51,34 +28,44 @@
     }
   }
 
+  let tickInterval: ReturnType<typeof setInterval> | null = null;
+
   onMount(() => {
     loadStats();
     refreshInterval = setInterval(loadStats, 2000);
+    tickInterval = setInterval(() => tickCounter++, 1000);
   });
 
   onDestroy(() => {
     if (refreshInterval) clearInterval(refreshInterval);
+    if (tickInterval) clearInterval(tickInterval);
   });
 
-  let sessionTime = $derived(
-    stats ? Math.floor(Date.now() / 1000 - stats.session_start_time) : 0
-  );
+  let sessionTime = $derived.by(() => {
+    const _ = tickCounter;
+    return stats ? Math.floor(Date.now() / 1000 - stats.session_start_time) : 0;
+  });
 
   let cumConnTime = $derived(
     stats ? stats.cum_conn_time + sessionTime : 0
   );
 </script>
 
-<div class="page-container">
-  <div class="page-header">
-    <h1>Statistics</h1>
-    <p class="subtitle">Session and cumulative transfer statistics</p>
-  </div>
+<div class="page-header">
+  <h2>Statistics</h2>
+</div>
 
+<div class="page-content">
   {#if loading}
-    <div class="loading">Loading statistics...</div>
+    <div class="empty-state">
+      <div class="spinner lg"></div>
+      <p>Loading statistics...</p>
+    </div>
   {:else if error}
-    <div class="error-msg">{error}</div>
+    <div class="empty-state">
+      <p style="color: var(--danger)">{error}</p>
+      <button onclick={loadStats}>Retry</button>
+    </div>
   {:else if stats}
     <div class="stats-grid">
       <div class="stats-section">
@@ -169,25 +156,6 @@
 </div>
 
 <style>
-  .page-container {
-    padding: 1.5rem;
-    max-width: 1200px;
-    margin: 0 auto;
-  }
-  .page-header {
-    margin-bottom: 1.5rem;
-  }
-  .page-header h1 {
-    font-size: 1.5rem;
-    font-weight: 600;
-    color: var(--text-primary, #e0e0e0);
-    margin: 0;
-  }
-  .subtitle {
-    font-size: 0.85rem;
-    color: var(--text-secondary, #888);
-    margin: 0.25rem 0 0 0;
-  }
   .loading, .error-msg {
     padding: 2rem;
     text-align: center;

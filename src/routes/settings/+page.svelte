@@ -8,9 +8,11 @@
   import SpeedInput from '$lib/components/SpeedInput.svelte';
 
   let settings: AppSettings | null = $state(null);
+  let originalSettings: string = $state('');
   let saving = $state(false);
   let saveMessage: string | null = $state(null);
   let saveIsWarning = $state(false);
+  let loadError: string | null = $state(null);
   let downloadingNodes = $state(false);
   let nodesResult: string | null = $state(null);
   let nodesError: string | null = $state(null);
@@ -47,12 +49,18 @@
   let filterResult: string | null = $state(null);
   let filterError: string | null = $state(null);
 
-  onMount(async () => {
-    try {
-      settings = await getSettings();
-    } catch (e) {
-      console.error('Failed to load settings:', e);
-    }
+  let hasUnsavedChanges = $derived(settings ? JSON.stringify(settings) !== originalSettings : false);
+
+  onMount(() => {
+    getSettings()
+      .then((s) => { settings = s; originalSettings = JSON.stringify(s); })
+      .catch((e) => { loadError = e instanceof Error ? e.message : 'Failed to load settings'; });
+
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      if (hasUnsavedChanges) e.preventDefault();
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   });
 
   async function handleSave() {
@@ -61,6 +69,7 @@
     saveMessage = null;
     try {
       const result = await updateSettings(settings);
+      originalSettings = JSON.stringify(settings);
       saveIsWarning = result.includes('restart');
       saveMessage = result;
       setTimeout(() => (saveMessage = null), saveIsWarning ? 8000 : 3000);
@@ -129,6 +138,9 @@
     {#if saveMessage}
       <span class="toast" class:warning={saveIsWarning}>{saveMessage}</span>
     {/if}
+    {#if hasUnsavedChanges}
+      <span class="unsaved-indicator">Unsaved changes</span>
+    {/if}
     <button class="save-btn" onclick={handleSave} disabled={saving || !settings}>
       {#if saving}
         <span class="spinner"></span> Saving...
@@ -140,8 +152,14 @@
 </div>
 
 <div class="page-content">
-  {#if !settings}
+  {#if loadError}
     <div class="empty-state">
+      <p style="color: var(--danger)">{loadError}</p>
+      <button onclick={() => { loadError = null; location.reload(); }}>Retry</button>
+    </div>
+  {:else if !settings}
+    <div class="empty-state">
+      <div class="spinner lg"></div>
       <p>Loading settings...</p>
     </div>
   {:else}
@@ -510,6 +528,18 @@
     font-weight: 600;
     font-size: 13px;
     border-radius: var(--radius-md);
+  }
+
+  .unsaved-indicator {
+    font-size: 12px;
+    color: var(--warning);
+    font-weight: 500;
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
   }
 
   .spinner {

@@ -1,12 +1,17 @@
 /**
  * Format a byte count as a human-readable string (e.g. "1.5 MB").
- * Handles zero, negative, and NaN inputs safely.
+ * Uses iterative division to avoid floating-point edge cases.
  */
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
+  let i = 0;
+  let val = bytes;
+  while (val >= 1024 && i < units.length - 1) {
+    val /= 1024;
+    i++;
+  }
+  return `${val.toFixed(1)} ${units[i]}`;
 }
 
 /** Alias for formatBytes -- used in file-size contexts. */
@@ -40,7 +45,7 @@ export function formatDate(ts: number): string {
 
 /**
  * Format milliseconds as HH:MM (eMule CastSecondsToHM style).
- * Returns "—" for zero or invalid values.
+ * Returns "\u2014" for zero or invalid values.
  */
 export function formatDuration(ms: number): string {
   if (!ms || ms <= 0) return '\u2014';
@@ -49,6 +54,17 @@ export function formatDuration(ms: number): string {
   const mins = Math.floor((totalSecs % 3600) / 60);
   if (hrs > 0) return `${hrs}:${String(mins).padStart(2, '0')}`;
   return `${mins} min`;
+}
+
+/** Format seconds as a human-readable duration (e.g. "2h 15m"). */
+export function formatDurationSecs(secs: number): string {
+  if (!secs || secs <= 0) return '\u2014';
+  const days = Math.floor(secs / 86400);
+  const hrs = Math.floor((secs % 86400) / 3600);
+  const mins = Math.floor((secs % 3600) / 60);
+  if (days > 0) return `${days}d ${hrs}h`;
+  if (hrs > 0) return `${hrs}h ${mins}m`;
+  return `${mins}m`;
 }
 
 /** Format remaining size + ETA combined (eMule Remaining column style). */
@@ -75,4 +91,32 @@ export function formatRemaining(totalSize: number, transferred: number, speed: n
 export function formatSpeedSetting(bytesPerSec: number): string {
   if (bytesPerSec === 0) return 'Unlimited';
   return formatSpeed(bytesPerSec);
+}
+
+/** Format a percentage with smart decimal handling. */
+export function formatPercent(value: number, decimals = 1): string {
+  if (value <= 0) return '0%';
+  if (value >= 100) return '100%';
+  return `${value.toFixed(decimals)}%`;
+}
+
+/** Truncate a hex hash with ellipsis. */
+export function truncateHash(hash: string, len = 16): string {
+  if (hash.length <= len) return hash;
+  return `${hash.slice(0, len)}\u2026`;
+}
+
+/** Pluralize a noun based on count. */
+export function pluralize(count: number, singular: string, plural?: string): string {
+  return count === 1 ? `${count} ${singular}` : `${count} ${plural || singular + 's'}`;
+}
+
+/** Copy text to clipboard with fallback. */
+export async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
 }
