@@ -362,6 +362,14 @@ pub async fn start_network(
     uss_rtt_queue: crate::bandwidth::UssRttQueue,
     uss_enabled_flag: crate::bandwidth::UssEnabledFlag,
 ) -> anyhow::Result<()> {
+    // #region agent log
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("debug-ecb6dd.log") {
+            let _ = writeln!(f, "{{\"id\":\"log_{}\",\"timestamp\":{},\"location\":\"src-tauri/src/network/mod.rs:346\",\"message\":\"start_network called\",\"data\":{{}},\"runId\":\"run1\",\"hypothesisId\":\"A\"}}", chrono::Utc::now().timestamp_millis(), chrono::Utc::now().timestamp_millis());
+        }
+    }
+    // #endregion
     let data_dir = directories::ProjectDirs::from("com", "nexus", "p2p")
         .map(|d| d.data_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
@@ -393,6 +401,14 @@ pub async fn start_network(
     sock2.set_recv_buffer_size(1024 * 1024)?;
     sock2.set_nonblocking(true)?;
     if let Err(e) = sock2.bind(&socket2::SockAddr::from(udp_addr)) {
+        // #region agent log
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("debug-ecb6dd.log") {
+                let _ = writeln!(f, "{{\"id\":\"log_{}\",\"timestamp\":{},\"location\":\"src-tauri/src/network/mod.rs:395\",\"message\":\"UDP bind failed\",\"data\":{{\"error\":\"{}\"}},\"runId\":\"run1\",\"hypothesisId\":\"A\"}}", chrono::Utc::now().timestamp_millis(), chrono::Utc::now().timestamp_millis(), e);
+            }
+        }
+        // #endregion
         let msg = format!("UDP port {udp_port} is already in use. Is another instance running? Change the port in Settings or close the other application.");
         error!("{msg}: {e}");
         let _ = app_handle.emit("network-error", serde_json::json!({
@@ -452,8 +468,25 @@ pub async fn start_network(
     }
 
     if boot_contacts.is_empty() {
+        // #region agent log
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("debug-ecb6dd.log") {
+                let _ = writeln!(f, "{{\"id\":\"log_{}\",\"timestamp\":{},\"location\":\"src-tauri/src/network/mod.rs:454\",\"message\":\"No bootstrap contacts found, using defaults\",\"data\":{{}},\"runId\":\"run1\",\"hypothesisId\":\"E\"}}", chrono::Utc::now().timestamp_millis(), chrono::Utc::now().timestamp_millis());
+            }
+        }
+        // #endregion
         info!("No nodes.dat found, using hardcoded bootstrap nodes");
         boot_contacts = bootstrap::default_bootstrap_contacts();
+    } else {
+        // #region agent log
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("debug-ecb6dd.log") {
+                let _ = writeln!(f, "{{\"id\":\"log_{}\",\"timestamp\":{},\"location\":\"src-tauri/src/network/mod.rs:458\",\"message\":\"Loaded bootstrap contacts\",\"data\":{{\"count\":{}}},\"runId\":\"run1\",\"hypothesisId\":\"E\"}}", chrono::Utc::now().timestamp_millis(), chrono::Utc::now().timestamp_millis(), boot_contacts.len());
+            }
+        }
+        // #endregion
     }
 
     let now = chrono::Utc::now().timestamp();
@@ -3644,6 +3677,14 @@ async fn handle_udp_packet(
     db: &Arc<Database>,
     active_port_tests: &Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, mpsc::Sender<()>>>>,
 ) {
+    // #region agent log
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("debug-ecb6dd.log") {
+            let _ = writeln!(f, "{{\"id\":\"log_{}\",\"timestamp\":{},\"location\":\"src-tauri/src/network/mod.rs:3636\",\"message\":\"Received UDP packet\",\"data\":{{\"from\":\"{}\",\"len\":{}}},\"runId\":\"run1\",\"hypothesisId\":\"B\"}}", chrono::Utc::now().timestamp_millis(), chrono::Utc::now().timestamp_millis(), from, data.len());
+        }
+    }
+    // #endregion
     // Reject oversized packets (max 64 KiB for UDP)
     if data.len() > 65535 {
         debug!("Dropping oversized packet from {from}: {} bytes", data.len());
@@ -3761,6 +3802,14 @@ async fn handle_udp_packet(
             } else {
                 let header = data.first().copied().unwrap_or(0);
                 if header == 0xE4 || header == 0xE5 {
+                    // #region agent log
+                    {
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("debug-ecb6dd.log") {
+                            let _ = writeln!(f, "{{\"id\":\"log_{}\",\"timestamp\":{},\"location\":\"src-tauri/src/network/mod.rs:3764\",\"message\":\"Failed to decode KAD packet\",\"data\":{{\"from\":\"{}\",\"len\":{},\"error\":\"{}\"}},\"runId\":\"run1\",\"hypothesisId\":\"B\"}}", chrono::Utc::now().timestamp_millis(), chrono::Utc::now().timestamp_millis(), from, data.len(), _first_err);
+                        }
+                    }
+                    // #endregion
                     warn!("Failed to decode KAD packet from {from} ({} bytes): {_first_err}", data.len());
                 } else {
                     debug!("Unreadable packet from {from} ({} bytes, header 0x{header:02X})", data.len());
