@@ -12,7 +12,6 @@ const BLOCKTIME_PER_FILE_SECS: i64 = 2700;
 /// eMule: FILEREASKTIME — minimum time between file re-asks (29 minutes)
 pub const FILEREASKTIME_SECS: i64 = 1740;
 /// eMule: SOURCECLIENTREASKS — normal source re-ask interval (40 minutes)
-#[allow(dead_code)]
 pub const SOURCECLIENTREASKS_SECS: i64 = 2400;
 /// eMule: DOWNLOADTIMEOUT — no data timeout (100 seconds)
 #[allow(dead_code)]

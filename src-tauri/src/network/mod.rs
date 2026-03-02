@@ -2498,18 +2498,19 @@ pub async fn start_network(
                     .collect();
 
                 // UDP reask pass: for sources with known UDP ports, send lightweight
-                // OP_REASKFILEPING instead of full TCP/KAD search. This refreshes the
-                // source's last_seen so the next retry tick can start the download.
+                // OP_REASKFILEPING. Only re-ask sources whose last_asked is older
+                // than SOURCECLIENTREASKS_SECS (eMule: 40 min per-source interval).
                 {
-                    let sm = source_manager.read().await;
+                    let reask_interval = ed2k::dead_sources::SOURCECLIENTREASKS_SECS;
+                    let mut sm = source_manager.write().await;
                     for tid in &to_retry {
                         if let Some(pd) = state.pending_downloads.get(tid) {
                             if let Ok(hash_bytes) = hex::decode(&pd.file_hash) {
                                 if hash_bytes.len() == 16 {
                                     let mut fh = [0u8; 16];
                                     fh.copy_from_slice(&hash_bytes);
-                                    let udp_sources = sm.get_udp_sources(&fh);
-                                    for (ip, _tcp_port, udp_port) in &udp_sources {
+                                    let udp_sources = sm.get_udp_sources_due_for_reask(&fh, reask_interval);
+                                    for (ip, tcp_port, udp_port) in &udp_sources {
                                         if state.dead_sources.is_dead_source(0, u32::from(*ip), *udp_port) {
                                             continue;
                                         }
@@ -2517,6 +2518,7 @@ pub async fn start_network(
                                         let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                                         pkt.extend_from_slice(&fh);
                                         let _ = udp_socket.send_to(&pkt, addr).await;
+                                        sm.mark_asked(&fh, *ip, *tcp_port);
                                     }
                                     if !udp_sources.is_empty() {
                                         debug!(

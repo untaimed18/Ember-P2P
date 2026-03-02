@@ -15,6 +15,8 @@ pub struct SourceEntry {
     pub user_hash: [u8; 16],
     /// LowID server-assigned client ID (0 = HighID, connectable directly)
     pub client_id: u32,
+    /// Timestamp of last OP_REASKFILEPING sent to this source (0 = never asked)
+    pub last_asked: i64,
 }
 
 /// Tracks known sources (peers) per file hash for source exchange responses.
@@ -75,6 +77,7 @@ impl SourceManager {
             last_seen: now,
             user_hash,
             client_id: 0,
+            last_asked: 0,
         });
 
         if self.sources.len() > MAX_TRACKED_FILES {
@@ -135,7 +138,8 @@ impl SourceManager {
         self.sources.get(file_hash).map(|v| v.len()).unwrap_or(0)
     }
 
-    /// Return non-expired sources that have UDP ports, for UDP reask pings.
+    /// Return non-expired sources that have UDP ports (without reask gating).
+    #[allow(dead_code)]
     pub fn get_udp_sources(&self, file_hash: &[u8; 16]) -> Vec<(Ipv4Addr, u16, u16)> {
         let now = chrono::Utc::now().timestamp();
         self.sources
@@ -148,6 +152,40 @@ impl SourceManager {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Return UDP sources due for a re-ask (eMule: SOURCECLIENTREASKS interval).
+    /// Only returns sources whose `last_asked` is older than `reask_interval` seconds ago.
+    pub fn get_udp_sources_due_for_reask(
+        &self,
+        file_hash: &[u8; 16],
+        reask_interval: i64,
+    ) -> Vec<(Ipv4Addr, u16, u16)> {
+        let now = chrono::Utc::now().timestamp();
+        self.sources
+            .get(file_hash)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| {
+                        (now - e.last_seen) < SOURCE_EXPIRY_SECS
+                            && e.udp_port > 0
+                            && (now - e.last_asked) >= reask_interval
+                    })
+                    .map(|e| (e.ip, e.tcp_port, e.udp_port))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Mark a source as asked (update `last_asked` timestamp).
+    pub fn mark_asked(&mut self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) {
+        let now = chrono::Utc::now().timestamp();
+        if let Some(entries) = self.sources.get_mut(file_hash) {
+            if let Some(entry) = entries.iter_mut().find(|e| e.ip == ip && e.tcp_port == port) {
+                entry.last_asked = now;
+            }
+        }
     }
 
     /// Return non-expired HighID sources for a file (directly connectable).
@@ -188,6 +226,7 @@ impl SourceManager {
             last_seen: now,
             user_hash: [0u8; 16],
             client_id,
+            last_asked: 0,
         });
     }
 
