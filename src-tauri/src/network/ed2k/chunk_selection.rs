@@ -38,6 +38,8 @@ impl ChunkSelector {
     /// - Common: everything else
     ///
     /// Within each zone: prefer nearest-to-complete, then already-active chunks.
+    /// Ties within the same zone and score are broken randomly to prevent
+    /// all clients from herding onto the same chunk (eMule-style).
     ///
     /// When `preview_priority` is true (eMule's SetPreviewPrio), the first and
     /// last parts are returned before any rarity-based selection so that media
@@ -93,7 +95,6 @@ impl ChunkSelector {
                 3 // common
             };
 
-            // eMule: prefer parts already in progress (nearest-to-complete bias)
             let active_bonus = if active_parts.contains(&i) { 0u32 } else { 50 };
 
             // Lower score = higher priority
@@ -101,7 +102,19 @@ impl ChunkSelector {
             candidates.push((i, score));
         }
 
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Sort by score, then randomize among ties (eMule-style anti-herding)
         candidates.sort_by_key(|&(_, score)| score);
-        candidates.first().map(|&(idx, _)| idx)
+        let best_score = candidates[0].1;
+        let tie_count = candidates.iter().take_while(|&&(_, s)| s == best_score).count();
+        if tie_count > 1 {
+            let pick = (rand::random::<u32>() as usize) % tie_count;
+            Some(candidates[pick].0)
+        } else {
+            Some(candidates[0].0)
+        }
     }
 }

@@ -45,11 +45,55 @@ pub struct CreditManager {
 
 impl CreditManager {
     pub fn new() -> Self {
-        let (public_key, private_key) = generate_rsa_keypair();
         Self {
             credits: HashMap::new(),
-            our_public_key: public_key,
-            our_private_key: private_key,
+            our_public_key: Vec::new(),
+            our_private_key: Vec::new(),
+        }
+    }
+
+    /// Load or generate the RSA keypair for secure identification.
+    /// eMule persists this in cryptkey.dat; we use a data_dir file.
+    pub fn load_or_create_keypair(&mut self, data_dir: &std::path::Path) {
+        let key_path = data_dir.join("cryptkey.dat");
+        if let Ok(data) = std::fs::read(&key_path) {
+            if data.len() >= 8 {
+                let pub_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                if data.len() >= 4 + pub_len + 4 {
+                    let pub_key = data[4..4 + pub_len].to_vec();
+                    let priv_off = 4 + pub_len;
+                    let priv_len = u32::from_le_bytes([
+                        data[priv_off], data[priv_off + 1], data[priv_off + 2], data[priv_off + 3],
+                    ]) as usize;
+                    if data.len() >= priv_off + 4 + priv_len {
+                        let priv_key = data[priv_off + 4..priv_off + 4 + priv_len].to_vec();
+                        if !pub_key.is_empty() && !priv_key.is_empty() {
+                            self.our_public_key = pub_key;
+                            self.our_private_key = priv_key;
+                            tracing::info!("Loaded RSA keypair from {}", key_path.display());
+                            return;
+                        }
+                    }
+                }
+            }
+            tracing::warn!("Corrupt cryptkey.dat, regenerating keypair");
+        }
+
+        let (public_key, private_key) = generate_rsa_keypair();
+        self.our_public_key = public_key;
+        self.our_private_key = private_key;
+
+        if !self.our_public_key.is_empty() {
+            let mut out = Vec::new();
+            out.extend_from_slice(&(self.our_public_key.len() as u32).to_le_bytes());
+            out.extend_from_slice(&self.our_public_key);
+            out.extend_from_slice(&(self.our_private_key.len() as u32).to_le_bytes());
+            out.extend_from_slice(&self.our_private_key);
+            if let Err(e) = std::fs::write(&key_path, &out) {
+                tracing::warn!("Failed to save RSA keypair: {e}");
+            } else {
+                tracing::info!("Generated and saved new RSA keypair to {}", key_path.display());
+            }
         }
     }
 

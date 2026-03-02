@@ -24,11 +24,16 @@ const TAGTYPE_UINT32: u8 = 0x03;
 const TAGTYPE_UINT64: u8 = 0x0B;
 const TAGTYPE_STRING: u8 = 0x02;
 
+/// Byte-level gap list matching eMule's CPartFile::m_gaplist.
+/// Each gap is a (start, end_exclusive) byte range that has NOT been received.
+/// A file with no gaps is complete.
 #[derive(Debug, Clone)]
 pub struct PartTracker {
     pub file_size: u64,
     pub part_count: usize,
-    completed: Vec<bool>,
+    /// Byte-level gap list: missing ranges (start, end_exclusive).
+    /// An empty list means the file is fully downloaded.
+    gaps: Vec<(u64, u64)>,
     pub in_progress: Vec<bool>,
     met_path: PathBuf,
     file_hash: [u8; 16],
@@ -50,7 +55,7 @@ impl PartTracker {
         let mut tracker = PartTracker {
             file_size,
             part_count,
-            completed: vec![false; part_count],
+            gaps: if file_size > 0 { vec![(0, file_size)] } else { Vec::new() },
             in_progress: vec![false; part_count],
             met_path,
             file_hash: [0u8; 16],
@@ -79,34 +84,74 @@ impl PartTracker {
         &self.part_hashes
     }
 
+    /// Check if a part (9.28 MB chunk) is fully downloaded.
     pub fn is_part_complete(&self, part_idx: usize) -> bool {
-        self.completed.get(part_idx).copied().unwrap_or(false)
+        let (start, end) = self.part_range(part_idx);
+        !self.gaps.iter().any(|&(gs, ge)| gs < end && ge > start)
     }
 
+    /// Mark an entire part as complete (removes any gaps in the part's range).
     pub fn mark_complete(&mut self, part_idx: usize) {
-        if part_idx < self.part_count {
-            self.completed[part_idx] = true;
-        }
+        let (start, end) = self.part_range(part_idx);
+        self.fill_range(start, end);
     }
 
+    /// Mark an entire part as incomplete (adds a gap for the part's full range).
     pub fn mark_incomplete(&mut self, part_idx: usize) {
-        if part_idx < self.part_count {
-            self.completed[part_idx] = false;
+        let (start, end) = self.part_range(part_idx);
+        self.add_gap(start, end);
+    }
+
+    /// Record that bytes in [start, end) have been received.
+    pub fn fill_range(&mut self, start: u64, end: u64) {
+        if start >= end { return; }
+        let mut new_gaps = Vec::with_capacity(self.gaps.len());
+        for &(gs, ge) in &self.gaps {
+            if ge <= start || gs >= end {
+                new_gaps.push((gs, ge));
+            } else {
+                if gs < start {
+                    new_gaps.push((gs, start));
+                }
+                if ge > end {
+                    new_gaps.push((end, ge));
+                }
+            }
         }
+        self.gaps = new_gaps;
+    }
+
+    /// Add a gap (mark bytes in [start, end) as missing). Merges with adjacent gaps.
+    fn add_gap(&mut self, start: u64, end: u64) {
+        if start >= end { return; }
+        let mut merged_start = start;
+        let mut merged_end = end;
+        let mut new_gaps = Vec::with_capacity(self.gaps.len() + 1);
+        for &(gs, ge) in &self.gaps {
+            if ge < merged_start || gs > merged_end {
+                new_gaps.push((gs, ge));
+            } else {
+                merged_start = merged_start.min(gs);
+                merged_end = merged_end.max(ge);
+            }
+        }
+        new_gaps.push((merged_start, merged_end));
+        new_gaps.sort_by_key(|&(s, _)| s);
+        self.gaps = new_gaps;
     }
 
     pub fn all_complete(&self) -> bool {
-        self.completed.iter().all(|&c| c)
+        self.gaps.is_empty()
     }
 
     pub fn completed_count(&self) -> usize {
-        self.completed.iter().filter(|&&c| c).count()
+        (0..self.part_count).filter(|&i| self.is_part_complete(i)).count()
     }
 
     pub fn needed_parts(&self, available: &[bool]) -> Vec<usize> {
         (0..self.part_count)
             .filter(|&i| {
-                !self.completed[i]
+                !self.is_part_complete(i)
                     && (available.is_empty() || available.get(i).copied().unwrap_or(false))
             })
             .collect()
@@ -119,25 +164,35 @@ impl PartTracker {
     }
 
     /// Return byte ranges that are fully downloaded (inverse of gap list).
-    /// Used for archive recovery which needs to know which bytes are available.
     pub fn filled_ranges(&self) -> Vec<(u64, u64)> {
-        let mut ranges = Vec::new();
-        let mut range_start: Option<u64> = None;
-
-        for i in 0..self.part_count {
-            let (ps, pe) = self.part_range(i);
-            if self.completed[i] {
-                if range_start.is_none() {
-                    range_start = Some(ps);
-                }
-                if i + 1 >= self.part_count || !self.completed[i + 1] {
-                    ranges.push((range_start.unwrap(), pe));
-                    range_start = None;
-                }
+        let mut filled = Vec::new();
+        let mut pos: u64 = 0;
+        for &(gs, ge) in &self.gaps {
+            if gs > pos {
+                filled.push((pos, gs));
             }
+            pos = ge;
         }
+        if pos < self.file_size {
+            filled.push((pos, self.file_size));
+        }
+        filled
+    }
 
-        ranges
+    /// Total completed bytes.
+    pub fn completed_bytes(&self) -> u64 {
+        let gap_bytes: u64 = self.gaps.iter().map(|(s, e)| e - s).sum();
+        self.file_size.saturating_sub(gap_bytes)
+    }
+
+    /// Return a boolean bitmap of completed parts (for OP_FILESTATUS compatibility).
+    pub fn completed_parts(&self) -> Vec<bool> {
+        (0..self.part_count).map(|i| self.is_part_complete(i)).collect()
+    }
+
+    /// Return the raw gap list.
+    pub fn gap_list(&self) -> &[(u64, u64)] {
+        &self.gaps
     }
 
     pub fn save(&self) {
@@ -147,8 +202,6 @@ impl PartTracker {
     }
 
     /// Save in eMule-compatible .part.met format.
-    /// Format: version(1) + date(4) + hash(16) + tag_count(4) + tags...
-    /// Gaps are stored as FT_GAPSTART/FT_GAPEND tag pairs.
     fn save_emule_format(&self) -> anyhow::Result<()> {
         let tmp_path = self.met_path.with_extension("met.tmp");
         let mut file = std::fs::File::create(&tmp_path)?;
@@ -196,11 +249,10 @@ impl PartTracker {
         }
         tag_count += 1;
 
-        // Gap list: convert completed bitmap to gap ranges
-        let gaps = self.compute_gaps();
-        for (i, (gap_start, gap_end)) in gaps.iter().enumerate() {
-            write_gap_tag(&mut file, FT_GAPSTART, i, *gap_start, use_large)?;
-            write_gap_tag(&mut file, FT_GAPEND, i, *gap_end, use_large)?;
+        // Gap list: write directly from byte-level gap list
+        for (i, &(gap_start, gap_end)) in self.gaps.iter().enumerate() {
+            write_gap_tag(&mut file, FT_GAPSTART, i, gap_start, use_large)?;
+            write_gap_tag(&mut file, FT_GAPEND, i, gap_end, use_large)?;
             tag_count += 2;
         }
 
@@ -215,40 +267,6 @@ impl PartTracker {
         Ok(())
     }
 
-    /// Compute gap ranges (missing byte ranges) from the completed bitmap.
-    /// Each gap is (start_offset, end_offset_exclusive) matching eMule's convention.
-    fn compute_gaps(&self) -> Vec<(u64, u64)> {
-        let mut gaps = Vec::new();
-        let mut gap_start: Option<u64> = None;
-
-        for i in 0..self.part_count {
-            let (ps, pe) = self.part_range(i);
-            if !self.completed[i] {
-                if gap_start.is_none() {
-                    gap_start = Some(ps);
-                }
-                // Extend gap to end of this part
-                if i + 1 >= self.part_count || self.completed[i + 1] {
-                    gaps.push((gap_start.unwrap(), pe));
-                    gap_start = None;
-                }
-            }
-        }
-
-        gaps
-    }
-
-    /// Total completed bytes (sum of completed part sizes).
-    fn completed_bytes(&self) -> u64 {
-        (0..self.part_count)
-            .filter(|&i| self.completed[i])
-            .map(|i| {
-                let (s, e) = self.part_range(i);
-                e - s
-            })
-            .sum()
-    }
-
     fn load(&mut self) {
         if let Err(e) = self.load_inner() {
             if self.met_path.exists() {
@@ -257,7 +275,7 @@ impl PartTracker {
                     self.met_path.display()
                 );
             }
-            self.completed = vec![false; self.part_count];
+            self.gaps = if self.file_size > 0 { vec![(0, self.file_size)] } else { Vec::new() };
         }
         self.in_progress = vec![false; self.part_count];
     }
@@ -306,8 +324,13 @@ impl PartTracker {
             anyhow::bail!("truncated bitmap in legacy part.met");
         }
 
+        // Start with all gaps, then fill completed parts
+        self.gaps = vec![(0, self.file_size)];
         for i in 0..self.part_count {
-            self.completed[i] = (data[pos + i / 8] >> (i % 8)) & 1 != 0;
+            if (data[pos + i / 8] >> (i % 8)) & 1 != 0 {
+                let (start, end) = self.part_range(i);
+                self.fill_range(start, end);
+            }
         }
 
         tracing::info!(
@@ -316,7 +339,6 @@ impl PartTracker {
             self.completed_count()
         );
 
-        // Re-save in eMule format immediately
         if let Err(e) = self.save_emule_format() {
             tracing::warn!("Failed to migrate part.met to eMule format: {e}");
         }
@@ -331,7 +353,6 @@ impl PartTracker {
 
         let _date = cursor.read_u32::<LittleEndian>()?;
 
-        // Read file hash (16 bytes)
         let mut hash = [0u8; 16];
         cursor.read_exact(&mut hash)?;
         if self.file_hash == [0u8; 16] {
@@ -339,8 +360,7 @@ impl PartTracker {
         }
 
         let part_hash_count = cursor.read_u16::<LittleEndian>()? as usize;
-        let skip_bytes = part_hash_count * 16;
-        if cursor.position() as usize + skip_bytes > data.len() {
+        if cursor.position() as usize + part_hash_count * 16 > data.len() {
             anyhow::bail!("truncated part hashes in part.met");
         }
         self.part_hashes = Vec::with_capacity(part_hash_count);
@@ -350,15 +370,12 @@ impl PartTracker {
             self.part_hashes.push(ph);
         }
 
-        // Tag count
         let tag_count = cursor.read_u32::<LittleEndian>()?;
 
         let use_large = version == PARTFILE_VERSION_LARGEFILE;
-        let mut gaps: Vec<(usize, u64, bool)> = Vec::new(); // (index, value, is_start)
+        let mut gap_starts: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+        let mut gap_ends: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
         let mut file_size_from_tags: Option<u64> = None;
-
-        // Start with all parts complete; gaps will mark missing ranges
-        self.completed = vec![true; self.part_count];
 
         for _ in 0..tag_count {
             if cursor.position() as usize >= data.len() {
@@ -368,8 +385,8 @@ impl PartTracker {
                 Ok(tag) => match tag {
                     MetTag::FileSize(s) => { file_size_from_tags = Some(s); }
                     MetTag::FileName(n) => { self.file_name = n; }
-                    MetTag::GapStart(idx, val) => { gaps.push((idx, val, true)); }
-                    MetTag::GapEnd(idx, val) => { gaps.push((idx, val, false)); }
+                    MetTag::GapStart(idx, val) => { gap_starts.insert(idx, val); }
+                    MetTag::GapEnd(idx, val) => { gap_ends.insert(idx, val); }
                     MetTag::Unknown => {}
                 },
                 Err(e) => {
@@ -379,7 +396,6 @@ impl PartTracker {
             }
         }
 
-        // Verify file size if we got it from tags
         if let Some(s) = file_size_from_tags {
             if s != self.file_size && self.file_size > 0 {
                 tracing::warn!(
@@ -389,36 +405,37 @@ impl PartTracker {
             }
         }
 
-        // Build gap map from paired start/end tags
-        let mut gap_starts: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
-        let mut gap_ends: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
-        for (idx, val, is_start) in gaps {
-            if is_start {
-                gap_starts.insert(idx, val);
-            } else {
-                gap_ends.insert(idx, val);
-            }
-        }
-
-        // Apply gaps: mark parts that overlap with any gap as incomplete
+        // Build byte-level gap list from paired start/end tags
+        self.gaps = Vec::new();
         for (&idx, &start) in &gap_starts {
             if let Some(&end) = gap_ends.get(&idx) {
-                // end is exclusive (eMule stores gap.end + 1)
-                for p in 0..self.part_count {
-                    let (ps, pe) = self.part_range(p);
-                    // Part overlaps gap if part_start < gap_end && part_end > gap_start
-                    if ps < end && pe > start {
-                        self.completed[p] = false;
-                    }
+                if start < end && end <= self.file_size {
+                    self.gaps.push((start, end));
                 }
             }
         }
+        self.gaps.sort_by_key(|&(s, _)| s);
+
+        // Merge overlapping gaps
+        let mut merged = Vec::new();
+        for &(s, e) in &self.gaps {
+            if let Some(last) = merged.last_mut() {
+                let (_, ref mut le): &mut (u64, u64) = last;
+                if s <= *le {
+                    *le = (*le).max(e);
+                    continue;
+                }
+            }
+            merged.push((s, e));
+        }
+        self.gaps = merged;
 
         tracing::info!(
-            "Loaded eMule part.met: {} parts, {} completed, {} gaps",
+            "Loaded eMule part.met: {} parts, {} completed, {} gaps ({} bytes remaining)",
             self.part_count,
             self.completed_count(),
-            gap_starts.len()
+            self.gaps.len(),
+            self.file_size - self.completed_bytes(),
         );
 
         Ok(())
@@ -432,10 +449,6 @@ impl PartTracker {
         if part_idx < self.part_count {
             self.in_progress[part_idx] = value;
         }
-    }
-
-    pub fn completed_parts(&self) -> &[bool] {
-        &self.completed
     }
 
     pub fn delete_met(&self) {
@@ -460,7 +473,6 @@ fn read_emule_tag(cursor: &mut Cursor<&[u8]>, _use_large: bool) -> anyhow::Resul
     let mut name_buf = vec![0u8; name_len];
     cursor.read_exact(&mut name_buf)?;
 
-    // Read value based on type
     let value: u64 = match tag_type {
         TAGTYPE_UINT32 => cursor.read_u32::<LittleEndian>()? as u64,
         TAGTYPE_UINT64 | 0x09 => cursor.read_u64::<LittleEndian>()?,
@@ -470,7 +482,6 @@ fn read_emule_tag(cursor: &mut Cursor<&[u8]>, _use_large: bool) -> anyhow::Resul
             cursor.read_exact(&mut sbuf)?;
             let s = String::from_utf8_lossy(&sbuf).to_string();
 
-            // Check if this is a known named tag
             if name_len == 1 {
                 match name_buf[0] {
                     FT_FILENAME => return Ok(MetTag::FileName(s)),
@@ -480,22 +491,19 @@ fn read_emule_tag(cursor: &mut Cursor<&[u8]>, _use_large: bool) -> anyhow::Resul
             return Ok(MetTag::Unknown);
         }
         0x01 => {
-            // Hash (16 bytes)
             let mut hash = [0u8; 16];
             cursor.read_exact(&mut hash)?;
             return Ok(MetTag::Unknown);
         }
         0x07 => {
-            // Blob
             let blen = cursor.read_u32::<LittleEndian>()? as usize;
             let pos = cursor.position();
             cursor.set_position(pos + blen as u64);
             return Ok(MetTag::Unknown);
         }
-        0x04 => cursor.read_u8()? as u64,       // uint8
-        0x05 => cursor.read_u16::<LittleEndian>()? as u64, // uint16
+        0x04 => cursor.read_u8()? as u64,
+        0x05 => cursor.read_u16::<LittleEndian>()? as u64,
         0x06 => {
-            // float32
             let _ = cursor.read_u32::<LittleEndian>()?;
             return Ok(MetTag::Unknown);
         }
@@ -512,7 +520,6 @@ fn read_emule_tag(cursor: &mut Cursor<&[u8]>, _use_large: bool) -> anyhow::Resul
         }
     }
 
-    // Gap tags have name format: [FT_GAPSTART|FT_GAPEND][index_as_ascii...]
     if name_len >= 2 {
         let tag_id = name_buf[0];
         if tag_id == FT_GAPSTART || tag_id == FT_GAPEND {
@@ -532,7 +539,7 @@ fn read_emule_tag(cursor: &mut Cursor<&[u8]>, _use_large: bool) -> anyhow::Resul
 
 fn write_uint32_tag(w: &mut impl Write, tag_id: u8, value: u32) -> anyhow::Result<()> {
     w.write_u8(TAGTYPE_UINT32)?;
-    w.write_u16::<LittleEndian>(1)?; // name length
+    w.write_u16::<LittleEndian>(1)?;
     w.write_u8(tag_id)?;
     w.write_u32::<LittleEndian>(value)?;
     Ok(())
@@ -540,7 +547,7 @@ fn write_uint32_tag(w: &mut impl Write, tag_id: u8, value: u32) -> anyhow::Resul
 
 fn write_uint64_tag(w: &mut impl Write, tag_id: u8, value: u64) -> anyhow::Result<()> {
     w.write_u8(TAGTYPE_UINT64)?;
-    w.write_u16::<LittleEndian>(1)?; // name length
+    w.write_u16::<LittleEndian>(1)?;
     w.write_u8(tag_id)?;
     w.write_u64::<LittleEndian>(value)?;
     Ok(())
@@ -548,7 +555,7 @@ fn write_uint64_tag(w: &mut impl Write, tag_id: u8, value: u64) -> anyhow::Resul
 
 fn write_string_tag(w: &mut impl Write, tag_id: u8, value: &str) -> anyhow::Result<()> {
     w.write_u8(TAGTYPE_STRING)?;
-    w.write_u16::<LittleEndian>(1)?; // name length
+    w.write_u16::<LittleEndian>(1)?;
     w.write_u8(tag_id)?;
     let bytes = value.as_bytes();
     w.write_u16::<LittleEndian>(bytes.len() as u16)?;

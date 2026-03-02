@@ -69,7 +69,8 @@ fn apply_server_int_tag(entry: &mut ServerEntry, name_id: u8, v: u32) {
         0x87 => entry.max_users = v,
         0x88 => entry.soft_files = v,
         0x89 => entry.hard_files = v,
-        0x97 => entry.obfuscation_port_tcp = v as u16,
+        0x8A => entry.is_static = v != 0,
+        0x97 | 0xF1 => entry.obfuscation_port_tcp = v as u16,
         _ => {}
     }
 }
@@ -405,10 +406,10 @@ impl ServerList {
         }
     }
 
-    /// Save server list in server.met format.
+    /// Save server list in server.met format (eMule-compatible, persists all metadata).
     pub fn save_server_met(&self, path: &Path) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.write_u8(0x0E)?; // version
+        buf.write_u8(0x0E)?; // MET_HEADER
         buf.write_u32::<LittleEndian>(self.servers.len() as u32)?;
 
         for entry in &self.servers {
@@ -416,16 +417,83 @@ impl ServerList {
             buf.write_u32::<LittleEndian>(u32::from_le_bytes(ip.octets()))?;
             buf.write_u16::<LittleEndian>(entry.port)?;
 
-            // Tags: name + priority
             let mut tag_count: u32 = 0;
             let mut tag_buf = Vec::new();
 
+            // CT_NAME (0x01) - string
             if !entry.name.is_empty() {
-                tag_buf.push(0x02); // STRING
-                tag_buf.extend_from_slice(&1u16.to_le_bytes());
-                tag_buf.push(0x01); // CT_NAME
-                tag_buf.extend_from_slice(&(entry.name.len() as u16).to_le_bytes());
-                tag_buf.extend_from_slice(entry.name.as_bytes());
+                write_met_string_tag(&mut tag_buf, 0x01, &entry.name);
+                tag_count += 1;
+            }
+
+            // CT_DESCRIPTION (0x0B) - string
+            if !entry.description.is_empty() {
+                write_met_string_tag(&mut tag_buf, 0x0B, &entry.description);
+                tag_count += 1;
+            }
+
+            // CT_SERVERPRIORITY (0x0E) - uint32 (eMule: 0=normal, 1=high, 2=low)
+            {
+                let prio_val: u32 = match entry.priority {
+                    ServerPriority::Normal => 0,
+                    ServerPriority::High => 1,
+                    ServerPriority::Low => 2,
+                };
+                write_met_uint32_tag(&mut tag_buf, 0x0E, prio_val);
+                tag_count += 1;
+            }
+
+            // CT_FAILCOUNT (0x0D / 0x85) - uint32
+            if entry.fail_count > 0 {
+                write_met_uint32_tag(&mut tag_buf, 0x85, entry.fail_count);
+                tag_count += 1;
+            }
+
+            // CT_USERS (0x83) - uint32
+            if entry.user_count > 0 {
+                write_met_uint32_tag(&mut tag_buf, 0x83, entry.user_count);
+                tag_count += 1;
+            }
+
+            // CT_FILES (0x84) - uint32
+            if entry.file_count > 0 {
+                write_met_uint32_tag(&mut tag_buf, 0x84, entry.file_count);
+                tag_count += 1;
+            }
+
+            // CT_LASTPING (0x86) - uint32
+            if entry.last_ping > 0 {
+                write_met_uint32_tag(&mut tag_buf, 0x86, entry.last_ping as u32);
+                tag_count += 1;
+            }
+
+            // CT_MAXUSERS (0x87) - uint32
+            if entry.max_users > 0 {
+                write_met_uint32_tag(&mut tag_buf, 0x87, entry.max_users);
+                tag_count += 1;
+            }
+
+            // CT_SOFTFILES (0x88) - uint32
+            if entry.soft_files > 0 {
+                write_met_uint32_tag(&mut tag_buf, 0x88, entry.soft_files);
+                tag_count += 1;
+            }
+
+            // CT_HARDFILES (0x89) - uint32
+            if entry.hard_files > 0 {
+                write_met_uint32_tag(&mut tag_buf, 0x89, entry.hard_files);
+                tag_count += 1;
+            }
+
+            // CT_PREFERENCE (0x0E via is_static flag)
+            if entry.is_static {
+                write_met_uint32_tag(&mut tag_buf, 0x8A, 1);
+                tag_count += 1;
+            }
+
+            // Obfuscation TCP port (0xF1)
+            if entry.obfuscation_port_tcp > 0 {
+                write_met_uint32_tag(&mut tag_buf, 0xF1, entry.obfuscation_port_tcp as u32);
                 tag_count += 1;
             }
 
@@ -436,4 +504,19 @@ impl ServerList {
         std::fs::write(path, &buf)?;
         Ok(())
     }
+}
+
+fn write_met_string_tag(buf: &mut Vec<u8>, tag_id: u8, value: &str) {
+    buf.push(0x02); // TAGTYPE_STRING
+    buf.extend_from_slice(&1u16.to_le_bytes()); // name length = 1
+    buf.push(tag_id);
+    buf.extend_from_slice(&(value.len() as u16).to_le_bytes());
+    buf.extend_from_slice(value.as_bytes());
+}
+
+fn write_met_uint32_tag(buf: &mut Vec<u8>, tag_id: u8, value: u32) {
+    buf.push(0x03); // TAGTYPE_UINT32
+    buf.extend_from_slice(&1u16.to_le_bytes()); // name length = 1
+    buf.push(tag_id);
+    buf.extend_from_slice(&value.to_le_bytes());
 }

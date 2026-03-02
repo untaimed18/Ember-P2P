@@ -697,9 +697,10 @@ pub async fn start_network(
         Arc::new(RwLock::new(sm))
     };
 
-    // Load credits from DB
+    // Load credits from DB and persist RSA keypair
     let credit_manager: Arc<RwLock<CreditManager>> = {
         let mut cm = CreditManager::new();
+        cm.load_or_create_keypair(&data_dir);
         if let Ok(records) = db.load_credits() {
             for (hash, uploaded, downloaded, last_seen, public_key) in records {
                 let record = cm.get_or_create(hash);

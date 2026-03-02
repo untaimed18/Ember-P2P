@@ -123,6 +123,113 @@ struct UploadHandler {
     firewall_probe_ips: FirewallProbeSet,
     /// Shared atomic: set to false when TCP is proven open
     firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
+    /// eMule-style abuse tracking: per-IP request counts for auto-ban
+    abuse_tracker: Arc<tokio::sync::Mutex<AbuseTracker>>,
+}
+
+/// eMule-style automatic abusive-client detection (CBanList equivalent).
+/// Tracks per-IP request rates and auto-bans IPs that exceed thresholds.
+struct AbuseTracker {
+    /// (request_count, first_request_time, last_request_time, banned_until)
+    entries: HashMap<std::net::IpAddr, AbuseEntry>,
+    last_cleanup: std::time::Instant,
+}
+
+struct AbuseEntry {
+    request_count: u32,
+    window_start: std::time::Instant,
+    file_not_found_count: u32,
+    banned_until: Option<std::time::Instant>,
+}
+
+/// eMule: BAN_TIMEOUT = 2 hours
+const BAN_DURATION_SECS: u64 = 7200;
+/// Max requests per 5-minute window before auto-ban
+const MAX_REQUESTS_PER_WINDOW: u32 = 40;
+/// Window size for tracking request rate
+const ABUSE_WINDOW_SECS: u64 = 300;
+/// Max "file not found" hits before ban (prevents hash-probing)
+const MAX_FILE_NOT_FOUND: u32 = 10;
+
+impl AbuseTracker {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            last_cleanup: std::time::Instant::now(),
+        }
+    }
+
+    /// Check if an IP is currently banned. Returns true if banned.
+    fn is_banned(&self, ip: &std::net::IpAddr) -> bool {
+        if let Some(entry) = self.entries.get(ip) {
+            if let Some(until) = entry.banned_until {
+                return std::time::Instant::now() < until;
+            }
+        }
+        false
+    }
+
+    /// Record a request from this IP. Returns true if the IP should be banned.
+    fn record_request(&mut self, ip: std::net::IpAddr) -> bool {
+        let now = std::time::Instant::now();
+
+        // Periodic cleanup of expired entries
+        if now.duration_since(self.last_cleanup).as_secs() > 600 {
+            self.entries.retain(|_, e| {
+                e.banned_until.map_or(true, |u| now < u)
+                    || now.duration_since(e.window_start).as_secs() < ABUSE_WINDOW_SECS * 2
+            });
+            self.last_cleanup = now;
+        }
+
+        let entry = self.entries.entry(ip).or_insert_with(|| AbuseEntry {
+            request_count: 0,
+            window_start: now,
+            file_not_found_count: 0,
+            banned_until: None,
+        });
+
+        if let Some(until) = entry.banned_until {
+            return now < until;
+        }
+
+        // Reset window if expired
+        if now.duration_since(entry.window_start).as_secs() > ABUSE_WINDOW_SECS {
+            entry.request_count = 0;
+            entry.window_start = now;
+        }
+
+        entry.request_count += 1;
+
+        if entry.request_count > MAX_REQUESTS_PER_WINDOW {
+            entry.banned_until = Some(now + std::time::Duration::from_secs(BAN_DURATION_SECS));
+            tracing::warn!("Auto-banned {ip}: {} requests in {}s window", entry.request_count, ABUSE_WINDOW_SECS);
+            return true;
+        }
+
+        false
+    }
+
+    /// Record a "file not found" response to this IP. Returns true if should ban.
+    fn record_file_not_found(&mut self, ip: std::net::IpAddr) -> bool {
+        let now = std::time::Instant::now();
+        let entry = self.entries.entry(ip).or_insert_with(|| AbuseEntry {
+            request_count: 0,
+            window_start: now,
+            file_not_found_count: 0,
+            banned_until: None,
+        });
+
+        entry.file_not_found_count += 1;
+
+        if entry.file_not_found_count > MAX_FILE_NOT_FOUND {
+            entry.banned_until = Some(now + std::time::Duration::from_secs(BAN_DURATION_SECS));
+            tracing::warn!("Auto-banned {ip}: {} file-not-found requests (hash probing)", entry.file_not_found_count);
+            return true;
+        }
+
+        false
+    }
 }
 
 pub async fn start_upload_server(
@@ -191,6 +298,7 @@ pub async fn start_upload_server(
         skip_compress_video,
         firewall_probe_ips,
         firewalled_shared,
+        abuse_tracker: Arc::new(tokio::sync::Mutex::new(AbuseTracker::new())),
     });
 
     loop {
@@ -209,7 +317,7 @@ pub async fn start_upload_server(
                     }
                 }
 
-                // Ban check: reject connections from banned IPs
+                // Ban check: reject connections from banned IPs or auto-banned abusers
                 if let std::net::IpAddr::V4(ipv4) = peer_addr.ip() {
                     if let Ok(banned) = server.banned_ips.read() {
                         if banned.contains(&ipv4) {
@@ -217,6 +325,14 @@ pub async fn start_upload_server(
                             drop(stream);
                             continue;
                         }
+                    }
+                }
+                {
+                    let tracker = server.abuse_tracker.lock().await;
+                    if tracker.is_banned(&peer_addr.ip()) {
+                        debug!("Rejecting TCP connection from auto-banned IP {peer_addr}");
+                        drop(stream);
+                        continue;
                     }
                 }
 
@@ -290,6 +406,14 @@ impl UploadHandler {
         stream: TcpStream,
         peer_addr: SocketAddr,
     ) -> anyhow::Result<()> {
+        // eMule-style abuse tracking: record request and reject if auto-banned
+        {
+            let mut tracker = self.abuse_tracker.lock().await;
+            if tracker.record_request(peer_addr.ip()) {
+                anyhow::bail!("auto-banned for excessive requests");
+            }
+        }
+
         let (reader, writer) = stream.into_split();
         let mut raw_reader = tokio::io::BufReader::new(reader);
         let mut raw_writer = tokio::io::BufWriter::new(writer);
@@ -681,6 +805,10 @@ impl UploadHandler {
                                 &hash,
                             )
                             .await?;
+                            {
+                                let mut tracker = self.abuse_tracker.lock().await;
+                                tracker.record_file_not_found(peer_addr.ip());
+                            }
                             current_file_hash = None;
                         }
                     }
