@@ -51,6 +51,7 @@ num-traits = "0.2"
 opener = "0.8.4"
 crc32fast = "1.5.0"
 zeroize = { version = "1", features = ["derive"] }
+strsim = "0.11"
 
 [profile.release]
 strip = true

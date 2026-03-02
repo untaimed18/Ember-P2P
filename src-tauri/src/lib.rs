@@ -64,6 +64,14 @@ pub fn run() {
             let config = AppConfig::load(&app_handle).expect("Failed to load config");
             let settings = config.settings.clone();
 
+            let spam_data_dir = app_handle
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let spam_filter = Arc::new(RwLock::new(
+                search::spam::SpamFilter::load(&spam_data_dir),
+            ));
+
             let (network_tx, network_rx) = mpsc::channel(256);
 
             let local_index = Arc::new(RwLock::new(LocalIndex::new()));
@@ -121,6 +129,7 @@ pub fn run() {
                 cached_transfer_stats,
                 cached_shared_files: cached_shared_files.clone(),
                 hash_cancel_flags: hash_cancel_flags.clone(),
+                spam_filter,
             });
 
             let index_clone = local_index.clone();
@@ -348,6 +357,9 @@ pub fn run() {
             commands::search::publish_note,
             commands::search::format_ed2k_link,
             commands::search::parse_ed2k_link,
+            commands::search::mark_spam,
+            commands::search::mark_not_spam,
+            commands::search::get_spam_stats,
             commands::transfers::start_download,
             commands::transfers::pause_transfer,
             commands::transfers::resume_transfer,

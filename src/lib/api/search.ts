@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SearchResult } from '$lib/types';
+import type { SearchResult, SpamStats } from '$lib/types';
 
 export type SearchMethod = 'global' | 'server' | 'kad';
 
@@ -29,4 +29,22 @@ export async function findNotes(fileHash: string, fileSize: number): Promise<Sea
 
 export async function publishNote(fileHash: string, rating: number, comment: string): Promise<void> {
   return invoke('publish_note', { fileHash, rating, comment });
+}
+
+export async function markSpam(
+  fileHash: string,
+  fileName: string,
+  fileSize: number,
+  sourceAddresses: string[],
+  searchKeywords: string[],
+): Promise<void> {
+  return invoke('mark_spam', { fileHash, fileName, fileSize, sourceAddresses, searchKeywords });
+}
+
+export async function markNotSpam(fileHash: string): Promise<void> {
+  return invoke('mark_not_spam', { fileHash });
+}
+
+export async function getSpamStats(): Promise<SpamStats> {
+  return invoke('get_spam_stats');
 }

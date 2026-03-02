@@ -2691,6 +2691,9 @@ pub async fn start_network(
                                             source_addresses: Vec::new(),
                                             rating: None,
                                             comment: None,
+                                            spam_rating: 0,
+                                            is_spam: false,
+                                            clean_name: String::new(),
                                         }
                                     }).collect();
 
@@ -2988,6 +2991,9 @@ pub async fn start_network(
                                         source_addresses: Vec::new(),
                                         rating: None,
                                         comment: None,
+                                        spam_rating: 0,
+                                        is_spam: false,
+                                        clean_name: String::new(),
                                     }
                                 }).collect();
                                 let _ = app_handle.emit("search-results", &search_results);
@@ -4920,6 +4926,9 @@ async fn handle_command(
                                         source_addresses: Vec::new(),
                                         rating: None,
                                         comment: None,
+                                        spam_rating: 0,
+                                        is_spam: false,
+                                        clean_name: String::new(),
                                     }
                                 }).collect();
                                 let _ = app_handle.emit("search-results", &search_results);
@@ -6288,6 +6297,16 @@ async fn handle_upload_event(
     }
 }
 
+fn name_spam_penalty(name: &str) -> usize {
+    let lower = name.to_lowercase();
+    let mut score = 0;
+    for pat in ["http://", "https://", "www.", ".com/", ".org/", ".net/", "download at", "powered by"] {
+        if lower.contains(pat) { score += 10; }
+    }
+    score += name.matches('[').count().saturating_sub(1) * 3;
+    score
+}
+
 fn convert_search_results(
     entries: &[kad::messages::SearchResultEntry],
 ) -> Vec<SearchResult> {
@@ -6426,7 +6445,7 @@ fn convert_search_results(
             *acc += effective_sources;
             existing.availability = (*acc).max(existing.source_addresses.len() as u32);
 
-            if existing.file.name.len() < p.name.len() {
+            if name_spam_penalty(&p.name) < name_spam_penalty(&existing.file.name) {
                 existing.file.name = p.name;
             }
             if existing.file_type.is_empty() && !p.file_type.is_empty() {
@@ -6471,6 +6490,9 @@ fn convert_search_results(
                     source_addresses,
                     rating: p.rating,
                     comment: p.comment,
+                    spam_rating: 0,
+                    is_spam: false,
+                    clean_name: String::new(),
                 },
             );
         }

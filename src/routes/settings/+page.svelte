@@ -288,6 +288,28 @@
         </div>
       </section>
 
+      <!-- Search -->
+      <section class="card">
+        <div class="card-header">
+          <span class="card-icon">&#x1F50D;</span>
+          <h2>Search</h2>
+        </div>
+        <div class="card-body">
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Search Spam Filter</span>
+              <span class="hint">Score search results against known spam patterns (eMule-compatible).</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.spam_filter_enabled} />
+          </div>
+          <div class="field">
+            <label for="filename-cleanups">Filename Cleanup Strings</label>
+            <span class="hint">Pipe-separated substrings to remove from filenames for display. Leave empty to disable cleanup.</span>
+            <input id="filename-cleanups" type="text" bind:value={settings.filename_cleanups} placeholder="http|www.|.com|.de|.org|.net" />
+          </div>
+        </div>
+      </section>
+
       <!-- Bandwidth -->
       <section class="card">
         <div class="card-header">

@@ -102,6 +102,17 @@ export interface SearchResult {
   source_addresses: string[];
   rating?: number;
   comment?: string;
+  spam_rating: number;
+  is_spam: boolean;
+  clean_name: string;
+}
+
+export interface SpamStats {
+  spam_hashes: number;
+  not_spam_hashes: number;
+  spam_filenames: number;
+  spam_server_ips: number;
+  spam_source_ips: number;
 }
 
 export interface NetworkStats {
@@ -162,4 +173,6 @@ export interface AppSettings {
   remove_finished_downloads: boolean;
   skip_compress_video: boolean;
   uss_enabled: boolean;
+  filename_cleanups: string;
+  spam_filter_enabled: boolean;
 }

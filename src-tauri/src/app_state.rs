@@ -6,6 +6,7 @@ use tokio::sync::{mpsc, RwLock};
 use crate::bandwidth::limiter::BandwidthLimiter;
 use crate::network::NetworkCommand;
 use crate::search::index::LocalIndex;
+use crate::search::spam::SpamFilter;
 use crate::sharing::manager::TransferManager;
 use crate::storage::config::AppConfig;
 use crate::storage::database::Database;
@@ -45,4 +46,6 @@ pub struct AppState {
     /// loop's background task so `get_shared_files` never contends with
     /// `local_index` writers (hashing, scanning, stats merge).
     pub cached_shared_files: Arc<RwLock<Vec<FileInfo>>>,
+    /// Search spam filter for scoring and marking spam results.
+    pub spam_filter: Arc<RwLock<SpamFilter>>,
 }

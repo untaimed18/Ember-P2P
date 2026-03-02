@@ -55,6 +55,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_filename_cleanups() -> String {
+    crate::search::cleanup::DEFAULT_CLEANUP_STRINGS.to_string()
+}
+
 fn default_file_priority() -> String {
     "normal".to_string()
 }
@@ -194,6 +198,12 @@ pub struct SearchResult {
     pub rating: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    #[serde(default)]
+    pub spam_rating: u32,
+    #[serde(default)]
+    pub is_spam: bool,
+    #[serde(default)]
+    pub clean_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,6 +335,12 @@ pub struct AppSettings {
     /// Upload Speed Sense: dynamically adjust upload limit based on network latency
     #[serde(default)]
     pub uss_enabled: bool,
+    /// Pipe-separated substrings to remove from filenames for display cleanup
+    #[serde(default = "default_filename_cleanups")]
+    pub filename_cleanups: String,
+    /// Enable the search spam filter (eMule-compatible multi-signal scoring)
+    #[serde(default = "default_true")]
+    pub spam_filter_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -401,6 +417,8 @@ impl Default for AppSettings {
             remove_finished_downloads: false,
             skip_compress_video: false,
             uss_enabled: false,
+            filename_cleanups: default_filename_cleanups(),
+            spam_filter_enabled: true,
         }
     }
 }

@@ -1,6 +1,6 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles, cancelSearch, parseEd2kLink, findNotes, publishNote, type SearchMethod } from '$lib/api/search';
+  import { searchFiles, cancelSearch, parseEd2kLink, findNotes, publishNote, markSpam, markNotSpam, type SearchMethod } from '$lib/api/search';
   import { startDownload } from '$lib/api/transfers';
   import { searchResults, searchQuery, isSearching, searchProgress, newSearchNonce } from '$lib/stores/search';
   import { onDestroy } from 'svelte';
@@ -50,6 +50,9 @@
   let filterMaxUnit = $state(1024 * 1024 * 1024);
   let filterExtension = $state('');
   let filterMinSources = $state('');
+  let hideSpam = $state(true);
+  let contextMenu: { x: number; y: number; result: SearchResult } | null = $state(null);
+  let lastSearchQuery = $state('');
 
   // Text filter (eMule-style: space-separated AND tokens, "-" prefix = NOT)
   type FilterColumn = 'name' | 'size' | 'type' | 'sources' | 'hash' | 'all';
@@ -137,8 +140,14 @@
     return sortDir === 'asc' ? ' \u25B2' : ' \u25BC';
   }
 
+  let spamHiddenCount = $derived($searchResults.filter(r => r.is_spam).length);
+
   let filteredResults: SearchResult[] = $derived.by(() => {
     let results = [...$searchResults];
+
+    if (hideSpam) {
+      results = results.filter(r => !r.is_spam);
+    }
 
     if (filterType) {
       results = results.filter(r => r.file_type === filterType);
@@ -199,6 +208,7 @@
   async function handleSearch(query: string) {
     if (!query.trim()) return;
     $searchQuery = query;
+    lastSearchQuery = query;
     $isSearching = true;
     $searchResults = [];
     searchError = null;
@@ -340,6 +350,36 @@
     filterExtension = '';
     filterMinSources = '';
     clearFilterText();
+  }
+
+  function showContextMenu(e: MouseEvent, result: SearchResult) {
+    e.preventDefault();
+    contextMenu = { x: e.clientX, y: e.clientY, result };
+  }
+
+  function closeContextMenu() {
+    contextMenu = null;
+  }
+
+  async function handleMarkSpam(result: SearchResult) {
+    const keywords = lastSearchQuery.split(/\s+/).filter(w => w.length > 0);
+    try {
+      await markSpam(result.file.hash, result.file.name, result.file.size, result.source_addresses, keywords);
+      searchResults.update(list => list.map(r =>
+        r.file.hash === result.file.hash ? { ...r, is_spam: true, spam_rating: 60 } : r
+      ));
+    } catch (e) { console.error('Failed to mark spam:', e); }
+    contextMenu = null;
+  }
+
+  async function handleMarkNotSpam(result: SearchResult) {
+    try {
+      await markNotSpam(result.file.hash);
+      searchResults.update(list => list.map(r =>
+        r.file.hash === result.file.hash ? { ...r, is_spam: false, spam_rating: 0 } : r
+      ));
+    } catch (e) { console.error('Failed to unmark spam:', e); }
+    contextMenu = null;
   }
 
   function clearResults() {
@@ -509,6 +549,16 @@
     />
   </div>
 
+  <div class="filter-group spam-toggle-group">
+    <label>
+      <input type="checkbox" bind:checked={hideSpam} />
+      Hide spam
+    </label>
+    {#if spamHiddenCount > 0}
+      <span class="spam-count">{spamHiddenCount} hidden</span>
+    {/if}
+  </div>
+
   {#if hasActiveFilters}
     <button class="ghost clear-filters" onclick={clearFilters}>Clear Filters</button>
   {/if}
@@ -574,9 +624,9 @@
       </thead>
       <tbody>
         {#each filteredResults as result, i (result.file.hash + ':' + i)}
-          <tr>
+          <tr class:spam-row={result.is_spam} oncontextmenu={(e) => showContextMenu(e, result)}>
             <td class="col-name" title={result.file.name}>
-              <button class="ghost link-btn" onclick={() => showFileDetails(result)}>{result.file.name}</button>
+              <button class="ghost link-btn" onclick={() => showFileDetails(result)}>{result.clean_name || result.file.name}</button>
             </td>
             <td class="col-size">{formatSize(result.file.size)}</td>
             <td class="col-type">{result.file_type || result.file.extension || '\u2014'}</td>
@@ -602,6 +652,20 @@
       <div class="empty-state">
         <p>No results match the current filters</p>
         <button class="ghost" onclick={clearFilters}>Clear Filters</button>
+      </div>
+    {/if}
+
+    {#if contextMenu}
+      <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+      <div class="context-menu-backdrop" onclick={closeContextMenu} oncontextmenu={(e) => { e.preventDefault(); closeContextMenu(); }}></div>
+      <div class="context-menu" style="left: {contextMenu.x}px; top: {contextMenu.y}px;">
+        {#if contextMenu.result.is_spam}
+          <button onclick={() => handleMarkNotSpam(contextMenu!.result)}>Mark as Not Spam</button>
+        {:else}
+          <button onclick={() => handleMarkSpam(contextMenu!.result)}>Mark as Spam</button>
+        {/if}
+        <button onclick={() => { if (contextMenu) download(contextMenu.result); closeContextMenu(); }}>Download</button>
+        <button onclick={() => { if (contextMenu) showFileDetails(contextMenu.result); closeContextMenu(); }}>Details</button>
       </div>
     {/if}
     {#if selectedResult}
@@ -1084,5 +1148,61 @@
   .link-btn:hover {
     color: var(--accent);
     text-decoration: underline;
+  }
+
+  .spam-toggle-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .spam-toggle-group label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .spam-count {
+    font-size: 0.75rem;
+    color: var(--text-muted, #999);
+    white-space: nowrap;
+  }
+
+  :global(tr.spam-row) {
+    opacity: 0.45;
+  }
+  :global(tr.spam-row td) {
+    text-decoration: line-through;
+  }
+
+  .context-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 999;
+  }
+  .context-menu {
+    position: fixed;
+    z-index: 1000;
+    background: var(--bg-secondary, #2a2a2a);
+    border: 1px solid var(--border, #444);
+    border-radius: 6px;
+    padding: 4px 0;
+    min-width: 160px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  }
+  .context-menu button {
+    display: block;
+    width: 100%;
+    padding: 6px 14px;
+    background: none;
+    border: none;
+    color: var(--text, #eee);
+    font-size: 0.85rem;
+    text-align: left;
+    cursor: pointer;
+  }
+  .context-menu button:hover {
+    background: var(--bg-hover, #3a3a3a);
   }
 </style>

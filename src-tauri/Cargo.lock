@@ -2354,6 +2354,7 @@ dependencies = [
  "sha1",
  "signature",
  "socket2 0.5.10",
+ "strsim",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
