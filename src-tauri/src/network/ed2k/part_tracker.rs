@@ -167,7 +167,8 @@ impl PartTracker {
         }
 
         // Tag count placeholder (will seek back to fill)
-        let tag_count_pos = 5 + 16 + 2; // version(1) + date(4) + hash(16) + part_hash_count(2)
+        // version(1) + date(4) + hash(16) + part_hash_count(2) + part_hashes(N*16)
+        let tag_count_pos = 5 + 16 + 2 + self.part_hashes.len() * 16;
         file.write_u32::<LittleEndian>(0)?;
 
         let mut tag_count: u32 = 0;

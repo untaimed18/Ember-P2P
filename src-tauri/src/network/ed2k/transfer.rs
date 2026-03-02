@@ -528,11 +528,14 @@ impl Ed2kDownload {
                             _ => 4 + 2 + 4 + 2 + 16,
                         };
                         if offset + entry_size > payload.len() { break; }
+                        // Type 6 (KAD): UserHash(16) + IP(4) + Port(2)
+                        // Other types: IP(4) + Port(2) + ...
+                        let ip_off = if src_type == 6 { offset + 16 } else { offset };
                         let ip = std::net::Ipv4Addr::new(
-                            payload[offset], payload[offset+1],
-                            payload[offset+2], payload[offset+3],
+                            payload[ip_off], payload[ip_off+1],
+                            payload[ip_off+2], payload[ip_off+3],
                         );
-                        let port = u16::from_le_bytes([payload[offset+4], payload[offset+5]]);
+                        let port = u16::from_le_bytes([payload[ip_off+4], payload[ip_off+5]]);
                         offset += entry_size;
                         if port > 0 && !ip.is_unspecified() && !ip.is_loopback() {
                             if let Some(sm) = &self.source_manager {
@@ -1010,19 +1013,16 @@ fn is_cross_device_error(e: &std::io::Error) -> bool {
 }
 
 /// Verify that combining part hashes reproduces the file hash (eMule CFileIdentifier::SetMD4HashSet).
-/// Rules: if file_size % PARTSIZE == 0, an empty trailing MD4 hash is appended.
-fn verify_hashset(file_hash: &[u8; 16], part_hashes: &[[u8; 16]], file_size: u64) -> bool {
+/// The peer's hashset already includes the trailing MD4("") for PARTSIZE-multiple files,
+/// so we simply concatenate and hash without appending anything extra.
+pub(super) fn verify_hashset(file_hash: &[u8; 16], part_hashes: &[[u8; 16]], _file_size: u64) -> bool {
     use md4::{Md4, Digest};
     if part_hashes.len() <= 1 {
         return true;
     }
-    let mut combined = Vec::with_capacity((part_hashes.len() + 1) * 16);
+    let mut combined = Vec::with_capacity(part_hashes.len() * 16);
     for h in part_hashes {
         combined.extend_from_slice(h);
-    }
-    if file_size % PARTSIZE == 0 {
-        let empty_hash = Md4::digest([]);
-        combined.extend_from_slice(&empty_hash);
     }
     let computed: [u8; 16] = Md4::digest(&combined).into();
     computed == *file_hash

@@ -58,8 +58,9 @@ fn apply_server_int_tag(entry: &mut ServerEntry, name_id: u8, v: u32) {
     match name_id {
         0x0D | 0x85 => entry.fail_count = v,
         0x0E => entry.priority = match v {
-            0 => ServerPriority::Low,
-            2 => ServerPriority::High,
+            0 => ServerPriority::Normal,
+            1 => ServerPriority::High,
+            2 => ServerPriority::Low,
             _ => ServerPriority::Normal,
         },
         0x83 => entry.user_count = v,

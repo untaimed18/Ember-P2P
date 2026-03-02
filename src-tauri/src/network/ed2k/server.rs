@@ -168,6 +168,9 @@ impl Ed2kServerConnection {
                 OP_IDCHANGE => {
                     if payload.len() >= 4 {
                         session.client_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                        if session.client_id == 0 {
+                            return Err(anyhow::anyhow!("server rejected login (client_id=0)"));
+                        }
                         if payload.len() >= 8 {
                             session.server_flags = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
                         }
@@ -184,8 +187,41 @@ impl Ed2kServerConnection {
                     }
                 }
                 OP_SERVERIDENT => {
-                    // Server identification (hash + IP + port + tags)
-                    debug!("Got server identification");
+                    // eMule: server_hash(16) + server_ip(4) + server_port(2) + tag_count(4) + tags
+                    if payload.len() >= 26 {
+                        let tag_count = u32::from_le_bytes([payload[22], payload[23], payload[24], payload[25]]) as usize;
+                        let mut offset = 26;
+                        for _ in 0..tag_count.min(32) {
+                            if offset >= payload.len() { break; }
+                            let tag_type = payload[offset];
+                            offset += 1;
+                            if offset + 3 > payload.len() { break; }
+                            let name_len = u16::from_le_bytes([payload[offset], payload[offset+1]]) as usize;
+                            offset += 2;
+                            if offset + name_len > payload.len() { break; }
+                            let name_id = if name_len == 1 { Some(payload[offset]) } else { None };
+                            offset += name_len;
+                            match tag_type {
+                                0x02 => {
+                                    if offset + 2 > payload.len() { break; }
+                                    let slen = u16::from_le_bytes([payload[offset], payload[offset+1]]) as usize;
+                                    offset += 2;
+                                    if offset + slen > payload.len() { break; }
+                                    if let Ok(s) = std::str::from_utf8(&payload[offset..offset+slen]) {
+                                        if name_id == Some(0x01) {
+                                            session.server_name = s.to_string();
+                                            debug!("Server name: {}", s);
+                                        }
+                                    }
+                                    offset += slen;
+                                }
+                                0x03 => { offset += 4; }
+                                0x08 => { offset += 2; }
+                                0x09 => { offset += 1; }
+                                _ => break,
+                            }
+                        }
+                    }
                 }
                 OP_SERVERLIST => {
                     debug!("Got server list from server ({} bytes)", payload.len());
@@ -402,14 +438,15 @@ impl Ed2kServerConnection {
             write_string_tag(&mut tags, 0x01, &file.name); // FT_FILENAME
             tag_count += 1;
             if file.size > u32::MAX as u64 {
-                tags.push(0x0B); // TAGTYPE_UINT64
-                tags.extend_from_slice(&1u16.to_le_bytes());
-                tags.push(0x02); // FT_FILESIZE
-                tags.extend_from_slice(&file.size.to_le_bytes());
+                // eMule: large files use two UINT32 tags (FT_FILESIZE + FT_FILESIZE_HI)
+                write_uint32_tag(&mut tags, 0x02, file.size as u32); // FT_FILESIZE (low 32 bits)
+                tag_count += 1;
+                write_uint32_tag(&mut tags, 0x3A, (file.size >> 32) as u32); // FT_FILESIZE_HI
+                tag_count += 1;
             } else {
                 write_uint32_tag(&mut tags, 0x02, file.size as u32); // FT_FILESIZE
+                tag_count += 1;
             }
-            tag_count += 1;
             payload.extend_from_slice(&tag_count.to_le_bytes());
             payload.extend_from_slice(&tags);
         }
@@ -477,9 +514,9 @@ fn parse_server_event(opcode: u8, payload: &[u8]) -> Vec<ServerEvent> {
     match opcode {
         OP_CALLBACKREQUESTED => {
             if payload.len() >= 6 {
-                let ip = std::net::Ipv4Addr::from(u32::from_le_bytes([
+                let ip = std::net::Ipv4Addr::new(
                     payload[0], payload[1], payload[2], payload[3],
-                ]).to_be_bytes());
+                );
                 let port = u16::from_le_bytes([payload[4], payload[5]]);
                 info!("Callback requested: connect to {ip}:{port}");
                 events.push(ServerEvent::CallbackRequested { ip: ip.to_string(), port });
@@ -834,8 +871,8 @@ fn parse_found_sources(payload: &[u8]) -> anyhow::Result<([u8; 16], Vec<ServerSo
                 client_id: id,
             });
         } else {
-            // HighID source: ID is the peer's public IP
-            let ip = std::net::Ipv4Addr::from(id.to_be_bytes());
+            // HighID source: ID is the peer's public IP (LE u32 → raw octets)
+            let ip = std::net::Ipv4Addr::from(id.to_le_bytes());
             sources.push(ServerSource {
                 ip: ip.to_string(),
                 port,

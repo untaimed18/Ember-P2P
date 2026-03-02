@@ -28,6 +28,8 @@ pub const SOURCE_UDP_INTERVAL_SECS: i64 = 2;
 pub struct ServerUdpSocket {
     socket: Arc<UdpSocket>,
     last_ping_times: std::collections::HashMap<SocketAddr, i64>,
+    /// Pending UDP challenge values per server (eMule: anti-spoof)
+    pending_challenges: std::collections::HashMap<SocketAddr, u32>,
 }
 
 impl ServerUdpSocket {
@@ -35,6 +37,7 @@ impl ServerUdpSocket {
         Self {
             socket: Arc::new(socket),
             last_ping_times: std::collections::HashMap::new(),
+            pending_challenges: std::collections::HashMap::new(),
         }
     }
 
@@ -88,13 +91,17 @@ impl ServerUdpSocket {
             }
         }
 
-        let mut packet = Vec::with_capacity(2);
+        // eMule: send 4-byte random challenge with status ping (anti-spoof)
+        let challenge = 0x55AA0000u32 | (rand::random::<u16>() as u32);
+        let mut packet = Vec::with_capacity(6);
         packet.push(OP_EDONKEYPROT);
         packet.push(OP_GLOBSERVSTATREQ);
+        packet.extend_from_slice(&challenge.to_le_bytes());
 
         self.socket.send_to(&packet, addr).await?;
         self.last_ping_times.insert(addr, now);
-        debug!("Sent status ping to {}:{}", server.ip, server.port);
+        self.pending_challenges.insert(addr, challenge);
+        debug!("Sent status ping to {}:{} (challenge=0x{challenge:08X})", server.ip, server.port);
         Ok(())
     }
 
@@ -152,10 +159,12 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
 
     match opcode {
         OP_GLOBSERVSTATRES => {
-            if payload.len() < 8 {
+            // eMule: response begins with echoed 4-byte challenge, then user_count + file_count
+            if payload.len() < 12 {
                 return None;
             }
             let mut cursor = Cursor::new(payload);
+            let _challenge = cursor.read_u32::<LittleEndian>().ok()?;
             let user_count = cursor.read_u32::<LittleEndian>().ok()?;
             let file_count = cursor.read_u32::<LittleEndian>().ok()?;
             Some(ServerUdpResponse::StatusResponse {
@@ -180,7 +189,7 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
                     // LowID: store with client_id, IP is unspecified
                     sources.push((Ipv4Addr::UNSPECIFIED, port, id));
                 } else {
-                    let ip = Ipv4Addr::from(id.to_be_bytes());
+                    let ip = Ipv4Addr::from(id.to_le_bytes());
                     sources.push((ip, port, 0));
                 }
             }

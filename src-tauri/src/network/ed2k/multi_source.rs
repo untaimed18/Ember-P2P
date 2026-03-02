@@ -912,7 +912,7 @@ async fn download_parts_from_source(
     tracker: Arc<RwLock<PartTracker>>,
     part_path: &std::path::Path,
     file_hash: &[u8; 16],
-    _file_size: u64,
+    file_size: u64,
     user_hash: &[u8; 16],
     nickname: &str,
     tcp_port: u16,
@@ -1066,9 +1066,13 @@ async fn download_parts_from_source(
                 {
                     if let Ok((_h, hashes)) = parse_hashset_answer(&payload) {
                         debug!("Got hashset with {} part hashes from source {}", hashes.len(), _src_idx);
-                        let mut ph = shared_part_hashes.write().await;
-                        if ph.is_empty() {
-                            *ph = hashes;
+                        if super::transfer::verify_hashset(&file_hash, &hashes, file_size) {
+                            let mut ph = shared_part_hashes.write().await;
+                            if ph.is_empty() {
+                                *ph = hashes;
+                            }
+                        } else {
+                            warn!("Hashset from source {} failed verification, discarding", _src_idx);
                         }
                     }
                 }
@@ -1239,7 +1243,7 @@ async fn download_parts_from_source(
                         parse_sending_part_32(&payload)?
                     };
 
-                    if start >= end || end > _file_size || data.len() != (end - start) as usize {
+                    if start >= end || end > file_size || data.len() != (end - start) as usize {
                         tracing::warn!("Invalid block offsets from source {_src_idx}: start={start}, end={end}, data={}", data.len());
                         continue;
                     }
@@ -1282,7 +1286,7 @@ async fn download_parts_from_source(
                     }
 
                     let piece_len = decompressed.len() as u64;
-                    if start + piece_len > _file_size {
+                    if start + piece_len > file_size {
                         tracing::warn!("Compressed block exceeds file size from source {_src_idx}");
                         continue;
                     }

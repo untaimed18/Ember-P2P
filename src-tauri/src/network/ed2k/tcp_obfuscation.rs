@@ -113,7 +113,7 @@ where
 
     // Step 6: Send our response (encrypted with send_key)
     if send_response {
-        let response_pad_len = (rand::random::<u8>() % 16) as usize;
+        let response_pad_len = (rand::random::<u8>() % 128) as usize;
         let resp_len = 4 + 1 + 1 + response_pad_len;
         let mut resp_plain = Vec::with_capacity(resp_len);
         resp_plain.extend_from_slice(&MAGICVALUE_SYNC.to_le_bytes());
@@ -151,23 +151,30 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let random_key_part: u32 = rand::random();
+    // eMule: regenerate until first byte doesn't match a plain protocol marker
+    let mut random_key_part: u32 = rand::random();
+    loop {
+        let first_byte = (random_key_part & 0xFF) as u8;
+        if !PLAIN_PROTOCOL_MARKERS.contains(&first_byte) {
+            break;
+        }
+        random_key_part = rand::random();
+    }
     let rkp = random_key_part.to_le_bytes();
 
-    // Derive keys from remote_user_hash (initiator uses MAGICVALUE_SERVER for send,
-    // MAGICVALUE_REQUESTER for recv -- reversed from the receiver's perspective)
+    // Derive keys from remote_user_hash (eMule: initiator = "requester")
     let mut key_buf = [0u8; 21];
     key_buf[..16].copy_from_slice(remote_user_hash);
 
-    // SendKey: magic = MAGICVALUE_SERVER (0xCB) -- we are the "server" in initiator role
-    key_buf[16] = MAGICVALUE_SERVER;
+    // SendKey: magic = MAGICVALUE_REQUESTER (0x22) -- we are the requester/initiator
+    key_buf[16] = MAGICVALUE_REQUESTER;
     key_buf[17..21].copy_from_slice(&rkp);
     let send_md5 = md5::Md5::digest(&key_buf);
     let mut send_key = Rc4State::new(&send_md5);
     send_key.skip(RC4_DROP_BYTES);
 
-    // RecvKey: magic = MAGICVALUE_REQUESTER (0x22)
-    key_buf[16] = MAGICVALUE_REQUESTER;
+    // RecvKey: magic = MAGICVALUE_SERVER (0xCB) -- peer is the "server"/receiver
+    key_buf[16] = MAGICVALUE_SERVER;
     let recv_md5 = md5::Md5::digest(&key_buf);
     let mut recv_key = Rc4State::new(&recv_md5);
     recv_key.skip(RC4_DROP_BYTES);
@@ -175,7 +182,7 @@ where
     // Send: random_key_part(4, unencrypted) + encrypted(magic(4) + method_sup(1) + method_pref(1) + padding_len(1) + padding)
     writer.write_u32_le(random_key_part).await?;
 
-    let padding_len = (rand::random::<u8>() % 16) as usize;
+    let padding_len = (rand::random::<u8>() % 128) as usize;
     let mut plain = Vec::with_capacity(4 + 3 + padding_len);
     plain.extend_from_slice(&MAGICVALUE_SYNC.to_le_bytes());
     plain.push(ENM_OBFUSCATION); // supported method
