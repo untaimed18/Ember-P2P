@@ -99,8 +99,10 @@ impl Collection {
                         }
                     }
                     FT_FILESIZE => {
-                        if let TagValue::Uint32(v) = tag_value {
-                            fsize = v as u64;
+                        match tag_value {
+                            TagValue::Uint32(v) => fsize = v as u64,
+                            TagValue::Uint64(v) => fsize = v,
+                            _ => {}
                         }
                     }
                     FT_FILEHASH => {
@@ -178,7 +180,11 @@ impl Collection {
                 write_string_tag(&mut file_buf, FT_FILENAME, &file.name)?;
                 file_tags += 1;
             }
-            write_u32_tag(&mut file_buf, FT_FILESIZE, file.size as u32)?;
+            if file.size > u32::MAX as u64 {
+                write_u64_tag(&mut file_buf, FT_FILESIZE, file.size)?;
+            } else {
+                write_u32_tag(&mut file_buf, FT_FILESIZE, file.size as u32)?;
+            }
             file_tags += 1;
             if !file.hash.is_empty() {
                 if let Ok(hash_bytes) = hex::decode(&file.hash) {
@@ -234,6 +240,7 @@ fn parse_ed2k_link(link: &str) -> Option<CollectionFile> {
 enum TagValue {
     String(String),
     Uint32(u32),
+    Uint64(u64),
     Hash([u8; 16]),
     Blob(Vec<u8>),
     Unknown,
@@ -241,12 +248,18 @@ enum TagValue {
 
 fn read_tag(cursor: &mut Cursor<&Vec<u8>>) -> anyhow::Result<(u8, TagValue)> {
     let tag_type = cursor.read_u8()?;
-    let name_len = cursor.read_u16::<LittleEndian>()? as usize;
-    let mut name_buf = vec![0u8; name_len];
-    cursor.read_exact(&mut name_buf)?;
-    let name_id = if name_len == 1 { name_buf[0] } else { 0 };
 
-    let value = match tag_type {
+    let name_id = if tag_type & 0x80 != 0 {
+        cursor.read_u8()?
+    } else {
+        let name_len = cursor.read_u16::<LittleEndian>()? as usize;
+        let mut name_buf = vec![0u8; name_len];
+        cursor.read_exact(&mut name_buf)?;
+        if name_len == 1 { name_buf[0] } else { 0 }
+    };
+
+    let real_type = tag_type & 0x7F;
+    let value = match real_type {
         TAG_STRING => {
             let slen = cursor.read_u16::<LittleEndian>()? as usize;
             let mut sbuf = vec![0u8; slen.min(4096)];
@@ -276,6 +289,16 @@ fn read_tag(cursor: &mut Cursor<&Vec<u8>>) -> anyhow::Result<(u8, TagValue)> {
             let _ = cursor.read_u8();
             TagValue::Unknown
         }
+        0x0B => {
+            let v = cursor.read_u64::<LittleEndian>()?;
+            TagValue::Uint64(v)
+        }
+        t if (0x11..=0x20).contains(&t) => {
+            let len = (t - 0x11 + 1) as usize;
+            let mut sbuf = vec![0u8; len];
+            cursor.read_exact(&mut sbuf)?;
+            TagValue::String(String::from_utf8_lossy(&sbuf).to_string())
+        }
         _ => TagValue::Unknown,
     };
 
@@ -296,6 +319,14 @@ fn write_u32_tag(buf: &mut Vec<u8>, name_id: u8, value: u32) -> anyhow::Result<(
     buf.write_u16::<LittleEndian>(1)?;
     buf.push(name_id);
     buf.write_u32::<LittleEndian>(value)?;
+    Ok(())
+}
+
+fn write_u64_tag(buf: &mut Vec<u8>, name_id: u8, value: u64) -> anyhow::Result<()> {
+    buf.write_u8(0x0B)?; // TAGTYPE_UINT64
+    buf.write_u16::<LittleEndian>(1)?;
+    buf.push(name_id);
+    buf.write_u64::<LittleEndian>(value)?;
     Ok(())
 }
 

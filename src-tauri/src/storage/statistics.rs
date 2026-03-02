@@ -135,11 +135,16 @@ impl StatsManager {
         }
     }
 
-    pub fn add_overhead(&mut self, category: OverheadCategory, bytes: u64) {
-        self.stats.session_down_overhead += bytes;
+    pub fn add_overhead(&mut self, category: OverheadCategory, direction: OverheadDirection, bytes: u64) {
+        match direction {
+            OverheadDirection::Download => self.stats.session_down_overhead += bytes,
+            OverheadDirection::Upload => self.stats.session_up_overhead += bytes,
+        }
         match category {
             OverheadCategory::Kad => self.stats.overhead_kad += bytes,
             OverheadCategory::FileRequest => self.stats.overhead_file_request += bytes,
+            OverheadCategory::Server => self.stats.overhead_server += bytes,
+            OverheadCategory::SourceExchange => self.stats.overhead_source_exchange += bytes,
         }
     }
 
@@ -160,4 +165,12 @@ impl StatsManager {
 pub enum OverheadCategory {
     Kad,
     FileRequest,
+    Server,
+    SourceExchange,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum OverheadDirection {
+    Download,
+    Upload,
 }

@@ -174,15 +174,21 @@ impl<R: AsyncRead + Unpin> AsyncRead for Rc4Reader<R> {
 }
 
 /// Wraps a tokio AsyncWrite with transparent RC4 encryption.
+///
+/// Buffers encrypted data internally so that partial writes from the inner
+/// transport don't desynchronize the RC4 keystream. Data is encrypted once
+/// and retried until fully sent.
 pub struct Rc4Writer<W> {
     inner: W,
     rc4: Rc4State,
+    pending: Vec<u8>,
+    pending_offset: usize,
 }
 
 impl<W> Rc4Writer<W> {
     #[allow(dead_code)]
     pub fn new(inner: W, rc4: Rc4State) -> Self {
-        Self { inner, rc4 }
+        Self { inner, rc4, pending: Vec::new(), pending_offset: 0 }
     }
 }
 
@@ -192,9 +198,39 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Rc4Writer<W> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if self.pending_offset < self.pending.len() {
+            let chunk = self.pending[self.pending_offset..].to_vec();
+            match Pin::new(&mut self.inner).poll_write(cx, &chunk) {
+                Poll::Ready(Ok(n)) => {
+                    self.pending_offset += n;
+                    if self.pending_offset >= self.pending.len() {
+                        let original_len = self.pending.len();
+                        self.pending.clear();
+                        self.pending_offset = 0;
+                        return Poll::Ready(Ok(original_len));
+                    }
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                other => return other,
+            }
+        }
+
         let mut encrypted = vec![0u8; buf.len()];
         self.rc4.process(buf, &mut encrypted);
-        Pin::new(&mut self.inner).poll_write(cx, &encrypted)
+
+        match Pin::new(&mut self.inner).poll_write(cx, &encrypted) {
+            Poll::Ready(Ok(n)) => {
+                if n < buf.len() {
+                    self.pending = encrypted;
+                    self.pending_offset = n;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

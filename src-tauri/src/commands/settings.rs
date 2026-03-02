@@ -52,7 +52,7 @@ pub async fn update_settings(
 
     state
         .bandwidth_limiter
-        .set_limits(settings.max_upload_speed, settings.max_download_speed);
+        .set_configured_limits(settings.max_upload_speed, settings.max_download_speed);
 
     let old_settings = {
         let config = state.config.read().await;

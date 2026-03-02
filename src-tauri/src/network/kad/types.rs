@@ -8,7 +8,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 pub const KAD_ID_SIZE: usize = 16;
-pub const KADEMLIA_VERSION: u8 = 0x09;
+pub const KADEMLIA_VERSION: u8 = 0x0a;
 pub const K_BUCKET_SIZE: usize = 10;
 pub const ALPHA: usize = 3;
 pub const DEFAULT_TCP_PORT: u16 = 4662;
@@ -21,6 +21,7 @@ pub const SEARCH_TOLERANCE: u32 = 0x0100_0000;
 pub const KADEMLIA_VERSION1_46C: u8 = 0x01;
 pub const KADEMLIA_VERSION2_47A: u8 = 0x02;
 pub const KADEMLIA_VERSION3_47B: u8 = 0x03;
+pub const KADEMLIA_VERSION4_47C: u8 = 0x04;
 pub const KADEMLIA_VERSION5_48A: u8 = 0x05;
 pub const KADEMLIA_VERSION6_49ABETA: u8 = 0x06;
 pub const KADEMLIA_VERSION7_49A: u8 = 0x07;
@@ -32,10 +33,12 @@ pub const KBASE: usize = 4;
 pub const KK: usize = 5;
 pub const LOG_BASE_EXPONENT: usize = 5;
 
-/// TAG_KADMISCOPTIONS carries firewall/ACK status bits
-pub const TAG_KADMISCOPTIONS: u8 = 0xF7;
-/// TAG_KADUDPKEY carries the sender's UDP verify key for the receiver
-pub const TAG_KADUDPKEY: u8 = 0xF8;
+/// TAG_KADMISCOPTIONS carries firewall/ACK status bits (eMule opcodes.h: 0xF2)
+pub const TAG_KADMISCOPTIONS: u8 = 0xF2;
+/// TAG_KADUDPKEY carries the sender's UDP verify key for the receiver.
+/// Not a standard eMule tag (eMule uses packet-level obfuscation for key exchange),
+/// but used by Nexus peers. 0xE0 chosen to avoid collision with any eMule tag ID.
+pub const TAG_KADUDPKEY: u8 = 0xE0;
 
 /// KAD contact types -- matching eMule semantics (lower = better)
 /// In eMule: type 0 = best (2+h proven), type 3 = unknown, type 4 = dead
@@ -375,7 +378,7 @@ pub const TAG_SOURCEUPORT: u8 = 0xFC;
 pub const TAG_SOURCETYPE: u8 = 0xFF;
 pub const TAG_SERVERIP: u8 = 0xFB;
 pub const TAG_SERVERPORT: u8 = 0xFA;
-pub const TAG_BUDDYHASH: u8 = 0xF9;
+pub const TAG_BUDDYHASH: u8 = 0xF8;
 
 #[derive(Debug, Clone)]
 pub enum TagName {

@@ -527,7 +527,7 @@ fn parse_ipfilter_line(line: &str) -> Option<IpRange> {
     if parts.len() < 2 { return None; }
 
     let access_level: u32 = parts[1].trim().parse().ok()?;
-    if access_level >= 128 { return None; }
+    if access_level >= 100 { return None; }
 
     let description = if parts.len() >= 3 {
         parts[2].trim().to_string()

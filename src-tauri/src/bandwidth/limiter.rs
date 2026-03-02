@@ -10,6 +10,8 @@ use std::time::Duration;
 pub struct BandwidthLimiter {
     max_upload_rate: AtomicU64,
     max_download_rate: AtomicU64,
+    /// User-configured upload limit, not modified by USS
+    configured_upload_rate: AtomicU64,
     upload_tokens: AtomicU64,
     download_tokens: AtomicU64,
     total_uploaded: AtomicU64,
@@ -25,6 +27,7 @@ impl BandwidthLimiter {
         Self {
             max_upload_rate: AtomicU64::new(max_upload),
             max_download_rate: AtomicU64::new(max_download),
+            configured_upload_rate: AtomicU64::new(max_upload),
             upload_tokens: AtomicU64::new(max_upload),
             download_tokens: AtomicU64::new(max_download),
             total_uploaded: AtomicU64::new(0),
@@ -135,6 +138,15 @@ impl BandwidthLimiter {
         self.max_download_rate.store(download, Ordering::Relaxed);
     }
 
+    pub fn set_configured_limits(&self, upload: u64, download: u64) {
+        self.configured_upload_rate.store(upload, Ordering::Relaxed);
+        self.set_limits(upload, download);
+    }
+
+    pub fn configured_upload_rate(&self) -> u64 {
+        self.configured_upload_rate.load(Ordering::Relaxed)
+    }
+
     pub fn total_uploaded(&self) -> u64 {
         self.total_uploaded.load(Ordering::Relaxed)
     }
@@ -208,9 +220,9 @@ pub async fn start_token_refill(
 
         // Sync USS enabled state from user settings
         let want_enabled = uss_enabled_flag.load(Ordering::Relaxed)
-            && limiter.max_upload_rate.load(Ordering::Relaxed) > 0;
+            && limiter.configured_upload_rate() > 0;
         if want_enabled && !uss.is_enabled() {
-            let max = limiter.max_upload_rate.load(Ordering::Relaxed);
+            let max = limiter.configured_upload_rate();
             uss.set_limits(1024, max);
             uss.enable();
         } else if !want_enabled && uss.is_enabled() {
@@ -230,9 +242,9 @@ pub async fn start_token_refill(
 
             if uss.is_enabled() {
                 if let Some(new_limit) = uss.compute_limit() {
-                    limiter.set_limits(new_limit, limiter.max_download_rate.load(Ordering::Relaxed));
+                    limiter.max_upload_rate.store(new_limit, Ordering::Relaxed);
                 }
-                let configured_max = limiter.max_upload_rate.load(Ordering::Relaxed);
+                let configured_max = limiter.configured_upload_rate();
                 if configured_max > 0 {
                     uss.set_limits(1024, configured_max);
                 }

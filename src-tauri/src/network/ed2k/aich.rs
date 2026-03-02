@@ -7,6 +7,9 @@ use sha1::Sha1;
 
 /// AICH block size: 180 KiB (eMule's EMBLOCKSIZE)
 pub const AICH_BLOCK_SIZE: usize = 184_320;
+const PARTSIZE: usize = 9_728_000;
+/// Blocks per full part (used to compute global block offsets)
+const BLOCKS_PER_FULL_PART: usize = (PARTSIZE + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE;
 
 #[allow(dead_code)]
 pub fn compute_aich_root(path: &Path) -> anyhow::Result<[u8; 20]> {
@@ -178,10 +181,9 @@ impl AICHRecoveryHashSet {
         &self,
         part_index: usize,
         part_data: &[u8],
-        part_size: usize,
+        _part_size: usize,
     ) -> Vec<usize> {
-        let blocks_per_part = (part_size + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE;
-        let start_block = part_index * blocks_per_part;
+        let start_block = part_index * BLOCKS_PER_FULL_PART;
         let mut corrupt = Vec::new();
 
         for (i, chunk) in part_data.chunks(AICH_BLOCK_SIZE).enumerate() {
@@ -199,10 +201,9 @@ impl AICHRecoveryHashSet {
     }
 
     /// Create recovery data for a part (serialize the leaf hashes needed).
-    pub fn create_part_recovery_data(&self, part_index: usize, part_size: usize) -> Vec<u8> {
-        let blocks_per_part = (part_size + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE;
-        let start_block = part_index * blocks_per_part;
-        let end_block = (start_block + blocks_per_part).min(self.leaf_hashes.len());
+    pub fn create_part_recovery_data(&self, part_index: usize, _part_size: usize) -> Vec<u8> {
+        let start_block = part_index * BLOCKS_PER_FULL_PART;
+        let end_block = (start_block + BLOCKS_PER_FULL_PART).min(self.leaf_hashes.len());
 
         let mut data = Vec::new();
         data.extend_from_slice(&(end_block - start_block).to_le_bytes()[..2]);
@@ -213,7 +214,7 @@ impl AICHRecoveryHashSet {
     }
 
     /// Read recovery data received from a peer.
-    pub fn read_recovery_data(&mut self, data: &[u8], part_index: usize, part_size: usize) -> bool {
+    pub fn read_recovery_data(&mut self, data: &[u8], part_index: usize, _part_size: usize) -> bool {
         if data.len() < 2 {
             return false;
         }
@@ -223,8 +224,7 @@ impl AICHRecoveryHashSet {
             return false;
         }
 
-        let blocks_per_part = (part_size + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE;
-        let start_block = part_index * blocks_per_part;
+        let start_block = part_index * BLOCKS_PER_FULL_PART;
 
         while self.leaf_hashes.len() < start_block + block_count {
             self.leaf_hashes.push([0u8; 20]);

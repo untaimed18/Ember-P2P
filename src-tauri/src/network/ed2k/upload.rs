@@ -619,7 +619,7 @@ impl UploadHandler {
                         let hash_hex = hex::encode(hash);
                         let index = self.local_index.read().await;
                         if let Some(file) = index.get_by_hash(&hash_hex) {
-                            let ed2k_part_count = (file.size / PARTSIZE + 1) as u16;
+                            let ed2k_part_count = if file.size == 0 { 0u16 } else { (file.size / PARTSIZE + 1) as u16 };
                             let bitmap_bytes = ((ed2k_part_count as usize) + 7) / 8;
                             let mut status_payload = Vec::with_capacity(18 + bitmap_bytes);
                             status_payload.extend_from_slice(&hash);

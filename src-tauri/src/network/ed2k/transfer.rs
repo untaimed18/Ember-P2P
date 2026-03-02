@@ -377,8 +377,12 @@ impl Ed2kDownload {
                 if proto == OP_EDONKEYHEADER && opcode == OP_HASHSETANSWER {
                     match parse_hashset_answer(&payload) {
                         Ok((_hash, hashes)) => {
-                            debug!("Got hashset with {} part hashes", hashes.len());
-                            part_hashes = hashes;
+                            if verify_hashset(&self.file_hash, &hashes, self.file_size) {
+                                debug!("Got verified hashset with {} part hashes", hashes.len());
+                                part_hashes = hashes;
+                            } else {
+                                warn!("Hashset verification failed - combined hash doesn't match file hash");
+                            }
                         }
                         Err(e) => debug!("Failed to parse hashset answer: {e}"),
                     }
@@ -476,20 +480,32 @@ impl Ed2kDownload {
             }
 
             // Source exchange response: register discovered sources
+            // SX2v4 format: version(1) + hash(16) + count(2) + entries...
+            // Each entry: SrcExchangeInfo(1) + IP(4) + Port(2) + ServerIP(4) + ServerPort(2) + UserHash(16) = 29 bytes
             if proto == OP_EMULEPROT && opcode == OP_ANSWERSOURCES2 && payload.len() >= 19 {
                 let version = payload[0];
-                if version == 2 {
+                if version >= 2 {
                     let count = u16::from_le_bytes([payload[17], payload[18]]) as usize;
                     let mut offset = 19;
                     let mut sx_count = 0u32;
                     for _ in 0..count {
-                        if offset + 28 > payload.len() { break; }
+                        if offset >= payload.len() { break; }
+                        let src_exchange_info = payload[offset];
+                        offset += 1;
+                        let src_type = src_exchange_info & 0x0F;
+                        let entry_size: usize = match src_type {
+                            1 | 3 => 4 + 2 + 4 + 2,
+                            2 | 4 => 4 + 2 + 4 + 2 + 16,
+                            6 => 16 + 4 + 2,
+                            _ => 4 + 2 + 4 + 2 + 16,
+                        };
+                        if offset + entry_size > payload.len() { break; }
                         let ip = std::net::Ipv4Addr::new(
                             payload[offset], payload[offset+1],
                             payload[offset+2], payload[offset+3],
                         );
                         let port = u16::from_le_bytes([payload[offset+4], payload[offset+5]]);
-                        offset += 28;
+                        offset += entry_size;
                         if port > 0 && !ip.is_unspecified() && !ip.is_loopback() {
                             if let Some(sm) = &self.source_manager {
                                 let mut sm = sm.write().await;
@@ -956,7 +972,29 @@ fn outstanding_requests_for_speed(speed: u64) -> usize {
 }
 
 fn is_cross_device_error(e: &std::io::Error) -> bool {
-    matches!(e.raw_os_error(), Some(17) | Some(18))
+    #[cfg(windows)]
+    { matches!(e.raw_os_error(), Some(17)) } // ERROR_NOT_SAME_DEVICE
+    #[cfg(not(windows))]
+    { matches!(e.raw_os_error(), Some(18)) } // EXDEV
+}
+
+/// Verify that combining part hashes reproduces the file hash (eMule CFileIdentifier::SetMD4HashSet).
+/// Rules: if file_size % PARTSIZE == 0, an empty trailing MD4 hash is appended.
+fn verify_hashset(file_hash: &[u8; 16], part_hashes: &[[u8; 16]], file_size: u64) -> bool {
+    use md4::{Md4, Digest};
+    if part_hashes.len() <= 1 {
+        return true;
+    }
+    let mut combined = Vec::with_capacity((part_hashes.len() + 1) * 16);
+    for h in part_hashes {
+        combined.extend_from_slice(h);
+    }
+    if file_size % PARTSIZE == 0 {
+        let empty_hash = Md4::digest([]);
+        combined.extend_from_slice(&empty_hash);
+    }
+    let computed: [u8; 16] = Md4::digest(&combined).into();
+    computed == *file_hash
 }
 
 fn parse_sending_part_32(payload: &[u8]) -> std::io::Result<([u8; 16], u64, u64, &[u8])> {

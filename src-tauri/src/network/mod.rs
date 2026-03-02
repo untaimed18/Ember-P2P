@@ -833,6 +833,8 @@ pub async fn start_network(
     stats_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut known_met_save_timer = tokio::time::interval(std::time::Duration::from_secs(660));
     known_met_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut upnp_renew_timer = tokio::time::interval(std::time::Duration::from_secs(50 * 60));
+    upnp_renew_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut dead_source_timer = tokio::time::interval(std::time::Duration::from_secs(300));
     dead_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut uss_ping_timer = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -3266,6 +3268,13 @@ pub async fn start_network(
                 }
             }
 
+            // Renew UPnP port mappings before the 1-hour lease expires
+            _ = upnp_renew_timer.tick() => {
+                if upnp_enabled && upnp_mappings.is_mapped() {
+                    upnp_mappings.renew().await;
+                }
+            }
+
             // Statistics rate recording (every second)
             _ = stats_timer.tick() => {
                 stats_manager.record_rate();
@@ -4952,7 +4961,7 @@ async fn handle_command(
                 return;
             }
 
-            stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::Kad, 64);
+            stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::Kad, crate::storage::statistics::OverheadDirection::Upload, 64);
             let sid = state.search_manager.start_search(
                 keyword_hash,
                 SearchType::FindKeyword,
@@ -5116,7 +5125,7 @@ async fn handle_command(
                     );
                     if sid != SearchId(0) {
                         state.download_source_searches.insert(sid, transfer_id.clone());
-                        stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::FileRequest, 48);
+                        stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::FileRequest, crate::storage::statistics::OverheadDirection::Upload, 48);
                         info!("Started source search {} for download {}", sid.0, transfer_id);
                     }
                 }

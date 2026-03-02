@@ -6,7 +6,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use tracing::{info, warn};
 
 const MET_HEADER: u8 = 0x0E;
-const MET_HEADER_I64TAGS: u8 = 0x0C;
+const MET_HEADER_I64TAGS: u8 = 0x0F;
 
 const FT_FILENAME: u8 = 0x01;
 const FT_FILESIZE: u8 = 0x02;
@@ -132,17 +132,23 @@ impl KnownFileList {
 
         for _ in 0..tag_count.min(100) {
             let tag_type = cursor.read_u8()?;
-            let name_len = cursor.read_u16::<LittleEndian>()? as usize;
-            let mut name_buf = vec![0u8; name_len];
-            cursor.read_exact(&mut name_buf)?;
-            let name_id = if name_len == 1 { name_buf[0] } else { 0 };
+            let name_id = if tag_type & 0x80 != 0 {
+                cursor.read_u8()?
+            } else {
+                let name_len = cursor.read_u16::<LittleEndian>()? as usize;
+                let mut name_buf = vec![0u8; name_len];
+                cursor.read_exact(&mut name_buf)?;
+                if name_len == 1 { name_buf[0] } else { 0 }
+            };
 
-            match tag_type {
+            let real_type = if tag_type & 0x80 != 0 { tag_type & 0x7F } else { tag_type };
+            match real_type {
                 TAG_STRING => {
                     let slen = cursor.read_u16::<LittleEndian>()? as usize;
+                    let clamped = slen.min(4096);
                     let mut sbuf = vec![0u8; slen];
                     cursor.read_exact(&mut sbuf)?;
-                    let s = String::from_utf8_lossy(&sbuf[..slen.min(4096)]).to_string();
+                    let s = String::from_utf8_lossy(&sbuf[..clamped]).to_string();
                     match name_id {
                         FT_FILENAME => record.file_name = s,
                         FT_AICH_HASH => record.aich_hash = s,
@@ -171,9 +177,35 @@ impl KnownFileList {
                 }
                 0x08 => { let _ = cursor.read_u16::<LittleEndian>(); }
                 0x09 => { let _ = cursor.read_u8(); }
-                0x0B => { let _ = cursor.read_u64::<LittleEndian>(); }
+                0x0B => {
+                    let v = cursor.read_u64::<LittleEndian>()?;
+                    if name_id == FT_FILESIZE {
+                        record.file_size = v;
+                    }
+                }
+                0x01 => {
+                    let mut skip = [0u8; 16];
+                    cursor.read_exact(&mut skip)?;
+                }
+                0x04 => { let _ = cursor.read_f32::<LittleEndian>(); }
+                0x05 => { let _ = cursor.read_u8(); }
+                0x07 => {
+                    let blen = cursor.read_u32::<LittleEndian>()? as usize;
+                    let mut skip = vec![0u8; blen.min(262144)];
+                    cursor.read_exact(&mut skip)?;
+                }
+                0x0A => {
+                    let blen = cursor.read_u8()? as usize;
+                    let mut skip = vec![0u8; blen];
+                    cursor.read_exact(&mut skip)?;
+                }
+                t if (0x11..=0x20).contains(&t) => {
+                    let len = (t - 0x11 + 1) as usize;
+                    let mut skip = vec![0u8; len];
+                    cursor.read_exact(&mut skip)?;
+                }
                 _ => {
-                    tracing::trace!("Skipping unknown known.met tag type 0x{:02X}", tag_type);
+                    tracing::warn!("Unknown known.met tag type 0x{:02X}, stopping record parse", tag_type);
                     break;
                 }
             }
@@ -246,8 +278,9 @@ impl KnownFileList {
     }
 
     pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
+        let needs_i64 = self.files.values().any(|r| r.file_size > u32::MAX as u64);
         let mut buf = Vec::new();
-        buf.write_u8(MET_HEADER)?;
+        buf.write_u8(if needs_i64 { MET_HEADER_I64TAGS } else { MET_HEADER })?;
         buf.write_u32::<LittleEndian>(self.files.len() as u32)?;
 
         for record in self.files.values() {
@@ -266,7 +299,11 @@ impl KnownFileList {
                 write_string_tag(&mut tags, FT_FILENAME, &record.file_name)?;
                 tag_count += 1;
             }
-            write_u32_tag(&mut tags, FT_FILESIZE, record.file_size as u32)?;
+            if record.file_size > u32::MAX as u64 {
+                write_u64_tag(&mut tags, FT_FILESIZE, record.file_size)?;
+            } else {
+                write_u32_tag(&mut tags, FT_FILESIZE, record.file_size as u32)?;
+            }
             tag_count += 1;
 
             if !record.aich_hash.is_empty() {
@@ -338,5 +375,13 @@ fn write_u32_tag(buf: &mut Vec<u8>, name_id: u8, value: u32) -> anyhow::Result<(
     buf.write_u16::<LittleEndian>(1)?;
     buf.push(name_id);
     buf.write_u32::<LittleEndian>(value)?;
+    Ok(())
+}
+
+fn write_u64_tag(buf: &mut Vec<u8>, name_id: u8, value: u64) -> anyhow::Result<()> {
+    buf.write_u8(0x0B)?; // TAGTYPE_UINT64
+    buf.write_u16::<LittleEndian>(1)?;
+    buf.push(name_id);
+    buf.write_u64::<LittleEndian>(value)?;
     Ok(())
 }
