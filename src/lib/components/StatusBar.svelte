@@ -3,7 +3,7 @@
   import { formatBytes, formatSpeed, pluralize } from '$lib/utils';
 </script>
 
-<footer class="statusbar" role="contentinfo">
+<footer class="statusbar">
   <div class="status-left" role="status" aria-live="polite">
     <span class="status-indicator badge {$networkStats.status}">
       {#if $networkStats.status === 'connected'}<span aria-hidden="true">●</span>

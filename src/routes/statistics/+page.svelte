@@ -156,13 +156,6 @@
 </div>
 
 <style>
-  .loading, .error-msg {
-    padding: 2rem;
-    text-align: center;
-    color: var(--text-secondary, #888);
-  }
-  .error-msg { color: #e74c3c; }
-
   .stats-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));

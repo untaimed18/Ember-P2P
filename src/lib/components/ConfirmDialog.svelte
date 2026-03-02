@@ -45,6 +45,7 @@
     role="dialog"
     aria-modal="true"
     aria-labelledby="confirm-title"
+    tabindex="-1"
     onkeydown={handleKeydown}
     onclick={handleOverlayClick}
   >
