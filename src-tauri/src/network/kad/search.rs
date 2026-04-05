@@ -172,7 +172,9 @@ impl SearchState {
 
     pub fn seed(&mut self, contacts: Vec<KadContact>) {
         for c in contacts {
-            if !self.queried.contains(&c.id) {
+            if !self.queried.contains(&c.id)
+                && !self.closest.iter().any(|existing| existing.id == c.id)
+            {
                 self.in_use_ids.push(c.id);
                 self.closest.push(c);
             }
@@ -226,6 +228,7 @@ impl SearchState {
                             && !self.pending.contains(&c.id)
                     }) {
                         self.lookup_reask_more_done = true;
+                        self.lookup_reask_more_target = Some(contact.id);
                         batch.push(contact.clone());
                     }
                 }

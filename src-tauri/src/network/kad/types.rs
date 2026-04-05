@@ -601,35 +601,29 @@ impl KadTag {
     }
 
     pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        let (type_byte, use_short_name) = match &self.value {
-            TagValue::Hash(_) => (TAGTYPE_HASH, true),
+        let type_byte = match &self.value {
+            TagValue::Hash(_) => TAGTYPE_HASH,
             TagValue::String(s) => {
                 let len = s.len();
                 if (1..=16).contains(&len) {
-                    (TAGTYPE_STR1 + len as u8 - 1, true)
+                    TAGTYPE_STR1 + len as u8 - 1
                 } else {
-                    (TAGTYPE_STRING, true)
+                    TAGTYPE_STRING
                 }
             }
-            TagValue::Uint64(_) => (TAGTYPE_UINT64, true),
-            TagValue::Uint32(_) => (TAGTYPE_UINT32, true),
-            TagValue::Uint16(_) => (TAGTYPE_UINT16, true),
-            TagValue::Uint8(_) => (TAGTYPE_UINT8, true),
-            TagValue::Float32(_) => (TAGTYPE_FLOAT32, true),
-            TagValue::Bool(_) => (TAGTYPE_BOOL, true),
-            TagValue::Blob(_) => (TAGTYPE_BLOB, true),
+            TagValue::Uint64(_) => TAGTYPE_UINT64,
+            TagValue::Uint32(_) => TAGTYPE_UINT32,
+            TagValue::Uint16(_) => TAGTYPE_UINT16,
+            TagValue::Uint8(_) => TAGTYPE_UINT8,
+            TagValue::Float32(_) => TAGTYPE_FLOAT32,
+            TagValue::Bool(_) => TAGTYPE_BOOL,
+            TagValue::Blob(_) => TAGTYPE_BLOB,
         };
 
         match &self.name {
             TagName::Id(id) => {
-                if use_short_name {
-                    writer.write_u8(type_byte | 0x80)?;
-                    writer.write_u8(*id)?;
-                } else {
-                    writer.write_u8(type_byte)?;
-                    writer.write_u16::<LittleEndian>(1)?;
-                    writer.write_u8(*id)?;
-                }
+                writer.write_u8(type_byte | 0x80)?;
+                writer.write_u8(*id)?;
             }
             TagName::Str(s) => {
                 writer.write_u8(type_byte)?;

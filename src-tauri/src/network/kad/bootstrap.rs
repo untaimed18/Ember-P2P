@@ -194,8 +194,8 @@ fn read_contact_v2(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<KadContact> {
 
     let udp_key = if kad_udp_key_raw != 0 {
         Some(KadUDPKey {
-            key: (kad_udp_key_raw & 0xFFFFFFFF) as u32,
-            ip: (kad_udp_key_raw >> 32) as u32,
+            key: (kad_udp_key_raw >> 32) as u32,
+            ip: (kad_udp_key_raw & 0xFFFFFFFF) as u32,
         })
     } else {
         None
@@ -247,7 +247,7 @@ pub fn save_nodes_dat(path: &Path, contacts: &[KadContact]) -> anyhow::Result<()
         buf.write_u16::<LittleEndian>(c.udp_port)?;
         buf.write_u16::<LittleEndian>(c.tcp_port)?;
         buf.write_u8(c.version)?;
-        let key_val = c.udp_key.map_or(0u64, |k| (k.ip as u64) << 32 | k.key as u64);
+        let key_val = c.udp_key.map_or(0u64, |k| (k.key as u64) << 32 | k.ip as u64);
         buf.write_u64::<LittleEndian>(key_val)?;
         buf.write_u8(if c.verified { 1 } else { 0 })?;
     }
@@ -257,14 +257,16 @@ pub fn save_nodes_dat(path: &Path, contacts: &[KadContact]) -> anyhow::Result<()
     }
 
     let tmp_path = path.with_extension("dat.tmp");
-    std::fs::write(&tmp_path, &buf)?;
+    {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        std::io::Write::write_all(&mut f, &buf)?;
+        f.sync_all()?;
+    }
     if let Err(e) = std::fs::rename(&tmp_path, path) {
-        // On Windows, rename can fail if the target is held open; fall back
-        // to remove-then-rename so nodes.dat is still updated.
         if cfg!(windows) {
-            let _ = std::fs::remove_file(path);
-            std::fs::rename(&tmp_path, path)
-                .map_err(|e2| anyhow::anyhow!("rename failed after remove: {e2} (original: {e})"))?;
+            std::fs::copy(&tmp_path, path)
+                .map_err(|e2| anyhow::anyhow!("copy fallback failed: {e2} (original rename: {e})"))?;
+            let _ = std::fs::remove_file(&tmp_path);
         } else {
             return Err(e.into());
         }
