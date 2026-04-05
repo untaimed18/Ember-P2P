@@ -1,6 +1,6 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles, cancelSearch, parseEd2kLink, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, type SearchMethod } from '$lib/api/search';
+  import { searchFiles, cancelSearch, parseEd2kLink, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, clearDownloadHistory, type SearchMethod } from '$lib/api/search';
   import { getSettings } from '$lib/api/settings';
   import { startDownload } from '$lib/api/transfers';
   import { transfers } from '$lib/stores/transfers';
@@ -39,6 +39,28 @@
   });
 
   let searchResultsList = $derived(activeTab?.results ?? []);
+
+  let downloadHistoryMap = $state<Record<string, string>>({});
+  let historyFetchedHashes = new Set<string>();
+
+  async function fetchDownloadHistory(hashes: string[]) {
+    const newHashes = hashes.filter(h => h && !historyFetchedHashes.has(h));
+    if (newHashes.length === 0) return;
+    for (const h of newHashes) historyFetchedHashes.add(h);
+    try {
+      const result = await getDownloadHistory(newHashes);
+      if (Object.keys(result).length > 0) {
+        downloadHistoryMap = { ...downloadHistoryMap, ...result };
+      }
+    } catch (e) {
+      console.error('Failed to fetch download history:', e);
+    }
+  }
+
+  $effect(() => {
+    const hashes = searchResultsList.map(r => r.file.hash).filter(Boolean);
+    if (hashes.length > 0) fetchDownloadHistory(hashes);
+  });
 
   let selectedResultKey = $state<string | null>(null);
   let checkedKeys = $state(new Set<string>());
@@ -1254,6 +1276,7 @@
           <th class="sortable col-sources" role="columnheader" aria-sort={sortField === 'sources' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('sources')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('sources'))}>
             Sources{sortIndicator('sources')}
           </th>
+          <th class="col-history">History</th>
         </tr>
       </thead>
       <tbody title="Double-click a row to download. Right-click for more options. Shift+click checkboxes to select a range.">
@@ -1264,6 +1287,8 @@
             class="{dlRowClass(dlTransfer)}"
             class:spam-row={result.is_spam}
             class:row-checked={checkedKeys.has(rKey)}
+            class:history-completed-row={downloadHistoryMap[result.file.hash] === 'completed'}
+            class:history-cancelled-row={downloadHistoryMap[result.file.hash] === 'cancelled'}
             oncontextmenu={(e) => showContextMenu(e, result)}
             ondblclick={() => download(result)}
           >
@@ -1327,6 +1352,13 @@
               <span class="source-count" class:high-sources={result.availability >= 10}>
                 {result.availability}
               </span>
+            </td>
+            <td class="col-history">
+              {#if downloadHistoryMap[result.file.hash] === 'completed'}
+                <span class="history-badge history-completed" title="Previously downloaded">Downloaded</span>
+              {:else if downloadHistoryMap[result.file.hash] === 'cancelled'}
+                <span class="history-badge history-cancelled" title="Previously cancelled">Cancelled</span>
+              {/if}
             </td>
           </tr>
         {/each}
@@ -1944,23 +1976,23 @@
   }
 
   .col-name {
-    width: 52%;
+    width: 42%;
     max-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
   }
 
   .col-size {
-    width: 12%;
+    width: 10%;
     text-align: right;
   }
 
   .col-type {
-    width: 10%;
+    width: 9%;
   }
 
   .col-origin {
-    width: 14%;
+    width: 12%;
     max-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1969,8 +2001,36 @@
   }
 
   .col-sources {
-    width: 8%;
+    width: 7%;
     text-align: center;
+  }
+
+  .col-history {
+    width: 10%;
+    text-align: center;
+  }
+
+  .history-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: var(--radius-sm, 3px);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+
+  .history-completed {
+    background: color-mix(in srgb, var(--success, #22c55e) 20%, transparent);
+    color: var(--success, #22c55e);
+  }
+
+  .history-cancelled {
+    background: color-mix(in srgb, var(--warning, #f59e0b) 20%, transparent);
+    color: var(--warning, #f59e0b);
+  }
+
+  :global(tr.history-cancelled-row:not(.row-checked):not(:hover) td) {
+    color: var(--warning, #f59e0b);
   }
 
   .search-results-table th {

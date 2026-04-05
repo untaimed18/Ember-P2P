@@ -628,11 +628,16 @@ impl RoutingZone {
     }
 
     /// Remove dead+expired contacts from all bins. Returns IPs removed.
-    fn remove_dead(&mut self, now: i64, ips_removed: &mut Vec<Ipv4Addr>) -> usize {
+    /// Contacts referenced by active searches (`in_use_contacts`) are kept
+    /// even if dead+expired, matching eMule's InUse protection.
+    fn remove_dead(&mut self, now: i64, ips_removed: &mut Vec<Ipv4Addr>, in_use: &HashMap<KadId, u32>) -> usize {
         if let Some(bin) = &mut self.bin {
             let before = bin.len();
             bin.contacts.retain(|c| {
                 if c.is_dead() && (c.expires_at == 0 || now > c.expires_at) {
+                    if in_use.get(&c.id).copied().unwrap_or(0) > 0 {
+                        return true;
+                    }
                     ips_removed.push(c.ip);
                     false
                 } else {
@@ -641,8 +646,8 @@ impl RoutingZone {
             });
             before - bin.len()
         } else if let Some(children) = &mut self.children {
-            children.0.remove_dead(now, ips_removed)
-                + children.1.remove_dead(now, ips_removed)
+            children.0.remove_dead(now, ips_removed, in_use)
+                + children.1.remove_dead(now, ips_removed, in_use)
         } else {
             0
         }
@@ -1152,7 +1157,7 @@ impl RoutingTable {
     pub fn remove_dead_contacts(&mut self) -> usize {
         let now = chrono::Utc::now().timestamp();
         let mut ips_removed = Vec::new();
-        let removed = self.root.remove_dead(now, &mut ips_removed);
+        let removed = self.root.remove_dead(now, &mut ips_removed, &self.in_use_contacts);
         for ip in ips_removed {
             self.track_ip_remove(ip);
         }

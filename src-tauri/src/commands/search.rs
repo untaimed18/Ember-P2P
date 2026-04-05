@@ -26,6 +26,7 @@ pub async fn enrich_results(
     results: &mut [SearchResult],
     state: &AppState,
     search_keywords: &[String],
+    server_ip: Option<&str>,
 ) {
     let (config, spam) = tokio::join!(
         state.config.read(),
@@ -38,7 +39,7 @@ pub async fn enrich_results(
 
     for result in results.iter_mut() {
         if spam_enabled {
-            result.spam_rating = spam.rate_result(result, search_keywords, None, spam_profile);
+            result.spam_rating = spam.rate_result(result, search_keywords, server_ip, spam_profile);
             result.is_spam = SpamFilter::is_spam(result.spam_rating, spam_profile);
         }
         result.clean_name = cleanup_filename(&result.file.name, &cleanup_strings);
@@ -131,7 +132,7 @@ pub async fn search_files(
             result_type == *ft
         });
     }
-    enrich_results(&mut results, &state, &keywords).await;
+    enrich_results(&mut results, &state, &keywords, None).await;
     merge::sort_search_results(&mut results);
     Ok(results)
 }
@@ -166,7 +167,7 @@ pub async fn find_notes(
         .await
         .map_err(|_| format!("Notes search timed out after {timeout_secs}s"))?
         .map_err(|e| format!("Notes search failed: {e}"))?;
-    enrich_results(&mut results, &state, &[]).await;
+    enrich_results(&mut results, &state, &[], None).await;
     Ok(results)
 }
 
@@ -288,6 +289,7 @@ pub async fn mark_spam(
     file_size: u64,
     source_addresses: Vec<String>,
     search_keywords: Vec<String>,
+    server_ip: Option<String>,
 ) -> Result<(), String> {
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err("Invalid file hash".into());
@@ -328,7 +330,7 @@ pub async fn mark_spam(
         result_origin: String::new(),
     };
     let mut spam = state.spam_filter.write().await;
-    spam.mark_spam(&result, &search_keywords);
+    spam.mark_spam(&result, &search_keywords, server_ip.as_deref());
     Ok(())
 }
 
@@ -433,4 +435,38 @@ pub async fn reset_spam_filter(
     let mut spam = state.spam_filter.write().await;
     spam.reset();
     Ok("Spam filter learning data cleared.".to_string())
+}
+
+/// Look up download history for a batch of file hashes.
+/// Returns a map of hash → status ("completed" or "cancelled").
+#[tauri::command]
+pub async fn get_download_history(
+    state: tauri::State<'_, AppState>,
+    hashes: Vec<String>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    state.db.get_download_history_batch(&hashes).map_err(|e| e.to_string())
+}
+
+/// Clear download history entries by status ("completed", "cancelled", or "all").
+#[tauri::command]
+pub async fn clear_download_history(
+    state: tauri::State<'_, AppState>,
+    status: String,
+) -> Result<(), String> {
+    if status == "all" {
+        state.db.clear_download_history("completed").map_err(|e| e.to_string())?;
+        state.db.clear_download_history("cancelled").map_err(|e| e.to_string())?;
+    } else {
+        state.db.clear_download_history(&status).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Remove a single file hash from download history.
+#[tauri::command]
+pub async fn remove_download_history_entry(
+    state: tauri::State<'_, AppState>,
+    file_hash: String,
+) -> Result<(), String> {
+    state.db.remove_download_history(&file_hash).map_err(|e| e.to_string())
 }

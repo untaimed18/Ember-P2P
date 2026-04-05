@@ -3286,6 +3286,8 @@ fn outstanding_requests_for_speed_ms(
     remaining_gap_bytes: u64,
 ) -> usize {
     use super::messages::PARTSIZE;
+    // Extended with higher tiers for modern broadband connections.
+    // Safe because eMule upload side queues all incoming block requests.
     let mut n = if remaining_parts <= 4 {
         if speed < 600 {
             1
@@ -3310,8 +3312,12 @@ fn outstanding_requests_for_speed_ms(
         3
     } else if speed < 150 * 1024 {
         6
-    } else {
+    } else if speed < 300 * 1024 {
         9
+    } else if speed < 1024 * 1024 {
+        12
+    } else {
+        15
     };
     if remaining_parts <= 2 || remaining_gap_bytes <= PARTSIZE {
         n = n.min(1);
