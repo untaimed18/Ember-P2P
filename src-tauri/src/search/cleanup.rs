@@ -73,6 +73,9 @@ pub fn strip_comment_urls(comment: &str) -> String {
             let Some(lower_start) = lower.find(&pat_lower) else { break };
             let char_offset = lower[..lower_start].chars().count();
             let start: usize = result.chars().take(char_offset).map(|c| c.len_utf8()).sum();
+            if start >= result.len() {
+                break;
+            }
             let end = result[start..]
                 .find(|c: char| c.is_whitespace())
                 .map(|pos| start + pos)

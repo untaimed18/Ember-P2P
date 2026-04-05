@@ -128,7 +128,10 @@ impl KnownFileList {
             cursor.read_exact(&mut skip)?;
         }
 
-        let tag_count = (cursor.read_u32::<LittleEndian>()? as usize).min(500);
+        let tag_count = cursor.read_u32::<LittleEndian>()? as usize;
+        if tag_count > 5000 {
+            anyhow::bail!("implausible tag count {tag_count} in known.met record");
+        }
 
         let mut record = KnownFileRecord {
             file_hash,
@@ -290,7 +293,11 @@ impl KnownFileList {
         if !new_path.is_empty() {
             if let Some(&old_hash) = self.path_index.get(&new_path) {
                 if old_hash != hash {
-                    self.files.remove(&old_hash);
+                    let other_refs = self.path_index.iter()
+                        .any(|(p, h)| *h == old_hash && *p != new_path);
+                    if !other_refs {
+                        self.files.remove(&old_hash);
+                    }
                 }
             }
             // Remove stale path_index entry if this hash was previously at a different path

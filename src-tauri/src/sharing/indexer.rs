@@ -45,7 +45,7 @@ impl FileIndexer {
                 }
                 if e.file_type().is_dir() {
                     let name = e.file_name().to_string_lossy();
-                    return name != "Temp" && name != "temp";
+                    return !name.eq_ignore_ascii_case("temp");
                 }
                 true
             })
@@ -81,7 +81,10 @@ impl FileIndexer {
     /// Collect file metadata WITHOUT hashing (instant).
     /// The file gets a temporary id derived from its path until hashing completes.
     pub fn discover_file(path: &Path) -> anyhow::Result<FileInfo> {
-        let metadata = std::fs::metadata(path)?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.is_symlink() {
+            anyhow::bail!("refusing to index symlink: {}", path.display());
+        }
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())

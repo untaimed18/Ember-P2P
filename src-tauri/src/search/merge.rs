@@ -14,7 +14,7 @@ fn result_key(r: &SearchResult) -> String {
     if !r.file.hash.is_empty() {
         r.file.hash.clone()
     } else {
-        format!("nohash:{}:{}:{}", r.result_origin, r.file.name, r.file.size)
+        format!("nohash:{}:{}", r.file.name, r.file.size)
     }
 }
 
