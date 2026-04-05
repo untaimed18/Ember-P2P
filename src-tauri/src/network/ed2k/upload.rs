@@ -365,6 +365,10 @@ struct UploadHandler {
     slot_rates: SlotRateRegistry,
     /// Active Ember friend sessions: ember_hash -> outbound packet sender
     ember_sessions: EmberSessionMap,
+    /// Set to true when the network is disconnected; upload handlers check
+    /// this to reject new file requests and terminate active sessions (eMule
+    /// behavior: all upload activity stops on disconnect).
+    network_disconnected: Arc<std::sync::atomic::AtomicBool>,
 }
 
 const MAX_AICH_CACHE_ENTRIES: usize = 50;
@@ -596,6 +600,7 @@ pub async fn start_upload_server(
     geoip: crate::geoip::GeoIpReader,
     ember_sessions: EmberSessionMap,
     ember_hash: [u8; 16],
+    network_disconnected: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     let listener = match TcpListener::bind(addr).await {
@@ -659,6 +664,7 @@ pub async fn start_upload_server(
         slot_notify,
         slot_rates,
         ember_sessions,
+        network_disconnected,
     });
 
     let mut slot_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -732,6 +738,14 @@ pub async fn start_upload_server(
                                 drop(stream);
                                 continue;
                             }
+                        }
+
+                        // eMule: reject new upload connections while network is disconnected.
+                        // Firewall probes (handled above) still pass through.
+                        if server.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+                            debug!("Rejecting connection from {peer_addr}: network disconnected");
+                            drop(stream);
+                            continue;
                         }
 
                         // Enforce global connection limit
@@ -1520,6 +1534,12 @@ impl UploadHandler {
         let mut epx_packets_received: u8 = 0;
 
         loop {
+            // eMule: terminate upload sessions when the network is disconnected.
+            if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+                debug!("Terminating upload session with {peer_addr}: network disconnected");
+                break;
+            }
+
             let (proto, opcode, payload) = if let Some(pkt) = deferred_packet.take() {
                 pkt
             } else {
