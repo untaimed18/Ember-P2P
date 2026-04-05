@@ -425,8 +425,8 @@ fn recover_rar(
             }
 
             let pack_size = u32::from_le_bytes([header_data[7], header_data[8], header_data[9], header_data[10]]) as u64;
-            let method = header_data[18];
-            let name_size = u16::from_le_bytes([header_data[19], header_data[20]]) as usize;
+            let method = header_data[25];
+            let name_size = u16::from_le_bytes([header_data[26], header_data[27]]) as usize;
 
             // Validate compression method (0x30-0x35 = store to best)
             if method < 0x30 || method > 0x35 {
@@ -460,8 +460,8 @@ fn recover_rar(
                 continue;
             }
 
-            // Check if it's a directory entry (skip those for count)
-            let is_dir = (header_data[21] & 0xE0) == 0xE0;
+            // Directory check: eMule uses HEAD_FLAGS bits 5-7 (0xE0)
+            let is_dir = (head_flags & 0xE0) == 0xE0;
 
             // Write header + data to output
             output.write_all(&header_data)?;
@@ -557,13 +557,13 @@ fn recover_ace(
                 continue;
             }
 
-            if header_body.len() < 21 {
+            if header_body.len() < 31 {
                 pos += 1;
                 continue;
             }
 
             let pack_size = u32::from_le_bytes([
-                header_body[5], header_body[6], header_body[7], header_body[8],
+                header_body[3], header_body[4], header_body[5], header_body[6],
             ]) as u64;
 
             let data_start = pos + 4 + head_size;

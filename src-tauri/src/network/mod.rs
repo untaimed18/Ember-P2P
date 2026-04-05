@@ -11798,6 +11798,70 @@ async fn handle_command(
             state.online_friends.clear();
             state.outbound_session_tasks.clear();
 
+            // Abort all active download tasks — they hold open TCP connections
+            // to peers and will keep transferring data even though the network
+            // is logically disconnected.  Re-queue each as a pending download
+            // so they resume automatically when the user reconnects.
+            {
+                let mgr = transfer_manager.read().await;
+                for tid in state.download_handles.keys() {
+                    if let Some(control) = mgr.get_control(tid) {
+                        control.cancel();
+                    }
+                }
+            }
+            for (tid, handle) in state.download_handles.drain() {
+                handle.abort();
+                let _ = handle.await;
+                debug!("Aborted download task {tid} on KAD disconnect");
+            }
+            state.active_source_senders.clear();
+            state.active_source_overflow.clear();
+            state.active_kad_search_state.clear();
+
+            // Move all active downloads back to pending so they can be
+            // restarted when the network is reconnected.
+            {
+                let mgr = transfer_manager.read().await;
+                let active_tids: Vec<String> = mgr.get_all().iter()
+                    .filter(|t| t.status == TransferStatus::Active && t.direction == TransferDirection::Download)
+                    .map(|t| t.id.clone())
+                    .collect();
+                for tid in &active_tids {
+                    if state.pending_downloads.contains_key(tid) {
+                        continue;
+                    }
+                    if let Some(t) = mgr.get_transfer(tid) {
+                        if let Some(control) = mgr.get_control(tid) {
+                            if !control.is_cancelled() {
+                                let fh_bytes = hex::decode(&t.file_hash).unwrap_or_default();
+                                state.pending_downloads.insert(tid.clone(), PendingDownload {
+                                    transfer_id: tid.clone(),
+                                    file_hash: t.file_hash.clone(),
+                                    file_name: t.file_name.clone(),
+                                    file_size: t.total_size,
+                                    control: control.clone(),
+                                    search_count: 0,
+                                    last_search_at: 0,
+                                    priority: priority_str_to_u32(&t.priority),
+                                });
+                                if fh_bytes.len() == 16 {
+                                    if let Some(pfs) = state.per_file_sources.get_mut(tid) {
+                                        pfs.reset_active_states();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            {
+                let mut mgr = transfer_manager.write().await;
+                for tid in state.pending_downloads.keys() {
+                    mgr.update_status(tid, TransferStatus::Queued);
+                }
+            }
+
             state.stats.status = NetworkStatus::Disconnected;
             state.stats.connected_peers = 0;
             state.stats.external_ip = String::new();

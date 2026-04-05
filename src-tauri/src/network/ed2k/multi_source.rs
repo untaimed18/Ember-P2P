@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
-use futures::future::select_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
@@ -672,11 +672,13 @@ impl MultiSourceDownload {
         }
 
         // Wait for all initial sources and accept new sources as they arrive
-        let mut pending_handles: Vec<tokio::task::JoinHandle<(usize, Vec<usize>, anyhow::Result<()>)>> = handles;
         let mut next_src_idx = self.sources.len();
         let mut injected_sources: Vec<DownloadSource> = Vec::new();
 
         if let Some(mut new_source_rx) = self.new_source_rx.take() {
+            let abort_handles: Vec<tokio::task::AbortHandle> = handles.iter().map(|h| h.abort_handle()).collect();
+            let mut pending_futs: FuturesUnordered<tokio::task::JoinHandle<(usize, Vec<usize>, anyhow::Result<()>)>> = handles.into_iter().collect();
+            let mut injected_abort_handles: Vec<tokio::task::AbortHandle> = Vec::new();
             // Concurrent loop: wait for handles to complete while accepting new sources.
             // When all initial sources finish but parts remain, keep listening for
             // injected sources (from ongoing KAD/server discovery) for up to 60 seconds
@@ -695,7 +697,7 @@ impl MultiSourceDownload {
                     .map(|deadline| tokio::time::Instant::now() >= deadline)
                     .unwrap_or(false);
                 match injection_wait_action(
-                    pending_handles.is_empty(),
+                    pending_futs.is_empty(),
                     injection_channel_open,
                     injection_deadline.is_some(),
                     deadline_elapsed,
@@ -720,13 +722,11 @@ impl MultiSourceDownload {
 
                 tokio::select! {
                     result = async {
-                        if pending_handles.is_empty() {
+                        if pending_futs.is_empty() {
                             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                             None
                         } else {
-                            let (res, _idx, remaining) = select_all(pending_handles.drain(..)).await;
-                            pending_handles = remaining.into_iter().collect();
-                            Some(res)
+                            pending_futs.next().await
                         }
                     } => {
                         let _ = result;
@@ -885,10 +885,11 @@ impl MultiSourceDownload {
                                 }
                                 (src_idx, parts, result)
                             });
-                            pending_handles.push(handle);
+                            injected_abort_handles.push(handle.abort_handle());
+                            pending_futs.push(handle);
                         } else {
                             injection_channel_open = false;
-                            if pending_handles.is_empty() {
+                            if pending_futs.is_empty() {
                                 info!("Source injection channel closed with no active source tasks left; proceeding to retry rounds");
                                 break;
                             }
@@ -902,27 +903,22 @@ impl MultiSourceDownload {
                 t.all_complete()
             };
             if all_parts_done {
-                for handle in pending_handles {
-                    handle.abort();
-                    let _ = handle.await;
-                }
-            } else {
-                for handle in pending_handles {
-                    let _ = handle.await;
-                }
+                for ah in &abort_handles { ah.abort(); }
+                for ah in &injected_abort_handles { ah.abort(); }
             }
+            while let Some(_) = pending_futs.next().await {}
         } else {
             let all_parts_done = {
                 let t = tracker.read().await;
                 t.all_complete()
             };
             if all_parts_done {
-                for handle in pending_handles {
+                for handle in handles {
                     handle.abort();
                     let _ = handle.await;
                 }
             } else {
-                for handle in pending_handles {
+                for handle in handles {
                     if let Ok((_src_idx, _parts, result)) = handle.await {
                         if result.is_err() {
                             // Parts from failed sources remain incomplete in tracker
@@ -1070,7 +1066,12 @@ impl MultiSourceDownload {
                 let r_ext = self.external_ip;
                 let r_geo = self.geoip.clone();
                 let r_fh = self.friend_hashes.clone();
+                let r_sem = conn_semaphore.clone();
                 retry_handles.push(tokio::spawn(async move {
+                    let _permit = match r_sem.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
                     if let Err(e) = download_parts_from_source(
                         src_idx, &source, &parts, tracker, &part_path,
                         &file_hash, file_size, &user_hash, &nickname,
@@ -3291,9 +3292,9 @@ fn outstanding_requests_for_speed_ms(
     remaining_gap_bytes: u64,
 ) -> usize {
     use super::messages::PARTSIZE;
-    // Extended with higher tiers for modern broadband connections.
-    // Safe because eMule upload side queues all incoming block requests.
-    let mut n = if remaining_parts <= 4 {
+    // eMule block counts per speed tier (DownloadClient.cpp:804-810),
+    // extended with higher tiers for modern broadband connections.
+    let mut blocks = if remaining_parts <= 4 {
         if speed < 600 {
             1
         } else if speed < 1200 {
@@ -3325,11 +3326,12 @@ fn outstanding_requests_for_speed_ms(
         15
     };
     if remaining_parts <= 2 || remaining_gap_bytes <= PARTSIZE {
-        n = n.min(1);
+        blocks = blocks.min(3);
     } else if remaining_parts <= 4 || remaining_gap_bytes <= PARTSIZE.saturating_mul(3) {
-        n = n.min(2);
+        blocks = blocks.min(6);
     }
-    n.max(1)
+    // Convert block count to packet count (3 blocks per packet), min 1
+    ((blocks + 2) / 3).max(1)
 }
 
 fn parse_sending_part_32(payload: &[u8]) -> std::io::Result<([u8; 16], u64, u64, &[u8])> {
@@ -3475,8 +3477,10 @@ async fn write_packet_async_ms<W: AsyncWriteExt + Unpin + ?Sized>(
     opcode: u8,
     payload: &[u8],
 ) -> std::io::Result<()> {
+    let pkt_len = u32::try_from(1 + payload.len())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "packet payload too large"))?;
     writer.write_u8(protocol).await?;
-    writer.write_u32_le((1 + payload.len()) as u32).await?;
+    writer.write_u32_le(pkt_len).await?;
     writer.write_u8(opcode).await?;
     writer.write_all(payload).await?;
     writer.flush().await?;

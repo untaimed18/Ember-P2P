@@ -1513,6 +1513,7 @@ impl UploadHandler {
         let mut pending_secident_challenge: Option<u32> = None;
         let queue_identity = QueueIdentity::from_peer(peer_user_hash, peer_addr);
         let mut queued_identity: Option<QueueIdentity> = None;
+        let queue_join_time: std::time::Instant = std::time::Instant::now();
         // Deduplicate ShareInterest "request" per file hash on this TCP session.
         let mut recorded_share_request: Option<[u8; 16]> = None;
         let mut last_preempt_check: std::time::Instant = std::time::Instant::now();
@@ -2251,9 +2252,6 @@ impl UploadHandler {
                             }
                         };
 
-                        // Apply bandwidth limiting
-                        self.acquire_upload_bandwidth(data.len() as u64).await;
-
                         // Skip compression for video files when configured (eMule: dontcompressavi)
                         let is_video_ext = file_path.extension()
                             .and_then(|e| e.to_str())
@@ -2284,6 +2282,7 @@ impl UploadHandler {
                                         part_payload.extend_from_slice(&packed_size.to_le_bytes());
                                         part_payload.extend_from_slice(&compressed);
 
+                                        self.acquire_upload_bandwidth(compressed.len() as u64).await;
                                         write_packet_async(
                                             &mut writer,
                                             OP_EMULEPROT,
@@ -2328,6 +2327,7 @@ impl UploadHandler {
                         }
                         part_payload.extend_from_slice(&data);
 
+                        self.acquire_upload_bandwidth(data.len() as u64).await;
                         write_packet_async(
                             &mut writer,
                             if use_i64 { OP_EMULEPROT } else { OP_EDONKEYHEADER },
@@ -2447,6 +2447,7 @@ impl UploadHandler {
                                 kind: UploadEventKind::Completed,
                             }).await;
                         }
+                        transfer_id = None;
 
                         slot_guard.deactivate();
                         session_start = None;
@@ -2472,7 +2473,7 @@ impl UploadHandler {
                                     current_addr: Some(peer_addr),
                                     user_hash: peer_user_hash,
                                     file_hash: current_file_hash.unwrap_or([0u8; 16]),
-                                    join_time: std::time::Instant::now(),
+                                    join_time: queue_join_time,
                                     add_next_connect: false,
                                     emule_version: hello_caps.emule_version_min,
                                     is_friend_slot: is_friend,
@@ -2510,7 +2511,7 @@ impl UploadHandler {
                                         current_addr: Some(peer_addr),
                                         user_hash: peer_user_hash,
                                         file_hash: current_file_hash.unwrap_or([0u8; 16]),
-                                        join_time: std::time::Instant::now(),
+                                        join_time: queue_join_time,
                                         add_next_connect: false,
                                         emule_version: hello_caps.emule_version_min,
                                         is_friend_slot: is_friend,

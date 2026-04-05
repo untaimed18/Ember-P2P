@@ -574,14 +574,23 @@ enum MetTag {
 }
 
 fn read_emule_tag(cursor: &mut Cursor<&[u8]>, _use_large: bool) -> anyhow::Result<MetTag> {
-    let tag_type = cursor.read_u8()?;
-    let name_len = cursor.read_u16::<LittleEndian>()? as usize;
-    if name_len > 4096 {
-        anyhow::bail!("part.met tag name too long: {name_len}");
-    }
+    let raw_type = cursor.read_u8()?;
 
-    let mut name_buf = vec![0u8; name_len];
-    cursor.read_exact(&mut name_buf)?;
+    // eMule new-style tags: bit 7 set means compact format (single-byte name, no length prefix)
+    let (tag_type, name_buf) = if raw_type & 0x80 != 0 {
+        let actual_type = raw_type & 0x7F;
+        let name_id = cursor.read_u8()?;
+        (actual_type, vec![name_id])
+    } else {
+        let name_len = cursor.read_u16::<LittleEndian>()? as usize;
+        if name_len > 4096 {
+            anyhow::bail!("part.met tag name too long: {name_len}");
+        }
+        let mut buf = vec![0u8; name_len];
+        cursor.read_exact(&mut buf)?;
+        (raw_type, buf)
+    };
+    let name_len = name_buf.len();
 
     let value: u64 = match tag_type {
         TAGTYPE_UINT32 => cursor.read_u32::<LittleEndian>()? as u64,
