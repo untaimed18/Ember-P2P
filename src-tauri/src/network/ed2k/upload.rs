@@ -134,7 +134,8 @@ const MIN_UP_CLIENTS_ALLOWED: usize = 2;
 const MAX_UP_CLIENTS_ALLOWED: usize = 100;
 /// m7: Hard queue limit = soft + max(soft, 800) / 4.  Between soft and hard,
 /// only clients with above-average score are admitted; above hard, all rejected.
-const HARD_UPLOAD_QUEUE_SIZE: usize = MAX_UPLOAD_QUEUE_SIZE + 200; // 500 + max(500,800)/4
+const HARD_UPLOAD_QUEUE_SIZE: usize = MAX_UPLOAD_QUEUE_SIZE
+    + (if MAX_UPLOAD_QUEUE_SIZE > 800 { MAX_UPLOAD_QUEUE_SIZE } else { 800 }) / 4;
 /// m6: Score multiplier for peers we are simultaneously downloading from.
 const DOWNLOAD_BONUS_MULTIPLIER: f64 = 1.5;
 
@@ -206,8 +207,6 @@ struct QueueEntry {
     emule_version: u8,
     /// True if this peer is a friend with an active friend slot.
     is_friend_slot: bool,
-    /// m6: True if we are currently downloading from this peer (score bonus).
-    download_bonus: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -558,6 +557,75 @@ fn priority_weight(priority: &str) -> f64 {
         "verylow" => 0.2,   // maps to eMule VeryLow (2/10)
         _ => 0.7,
     }
+}
+
+/// Consistent eMule-style queue score for a single entry.
+/// All code paths that compare or rank queue entries MUST use this function
+/// to avoid scoring asymmetry (eMule version penalty, friend slot, download
+/// bonus).  `cm` provides credit ratio; `idx` provides file priority.
+fn score_queue_entry(
+    cm: &CreditManager,
+    idx: &LocalIndex,
+    user_hash: &[u8; 16],
+    file_hash: [u8; 16],
+    wait_secs: u64,
+    current_addr: Option<SocketAddr>,
+    emule_version: u8,
+    is_friend_slot: bool,
+) -> f64 {
+    let file_prio = idx
+        .get_by_hash(&hex::encode(file_hash))
+        .map(|f| priority_weight(&f.priority))
+        .unwrap_or(0.7);
+    let peer_ip = current_addr
+        .map(|a| match a.ip() {
+            IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
+            _ => 0,
+        })
+        .unwrap_or(0);
+    let mut score = cm.get_queue_score(user_hash, wait_secs, file_prio, peer_ip);
+    if cm.has_download_bonus(user_hash) {
+        score *= DOWNLOAD_BONUS_MULTIPLIER;
+    }
+    if emule_version > 0 && emule_version <= 0x19 {
+        score *= 0.5;
+    }
+    if is_friend_slot {
+        score = 268_435_455.0;
+    }
+    score
+}
+
+/// Compute score-based queue rank: 1 + count of entries with strictly higher
+/// score.  Ties are broken by earlier join_time (lower = better rank).
+fn compute_queue_rank(
+    cm: &CreditManager,
+    idx: &LocalIndex,
+    queue: &[QueueEntry],
+    my_identity: &QueueIdentity,
+    my_score: f64,
+    my_join_time: std::time::Instant,
+) -> u16 {
+    let mut rank: u16 = 1;
+    for entry in queue.iter() {
+        if entry.identity == *my_identity {
+            continue;
+        }
+        let es = score_queue_entry(
+            cm,
+            idx,
+            &entry.user_hash,
+            entry.file_hash,
+            entry.join_time.elapsed().as_secs(),
+            entry.current_addr,
+            entry.emule_version,
+            entry.is_friend_slot,
+        );
+        if es > my_score || (es == my_score && entry.join_time < my_join_time) {
+            rank += 1;
+        }
+    }
+    rank
 }
 
 /// eMule MAX_PURGEQUEUETIME: 1 hour in seconds
@@ -1528,6 +1596,9 @@ impl UploadHandler {
         let queue_identity = QueueIdentity::from_peer(peer_user_hash, peer_addr);
         let mut queued_identity: Option<QueueIdentity> = None;
         let queue_join_time: std::time::Instant = std::time::Instant::now();
+        let mut queue_wait_at_grant: u64 = 0;
+        let mut last_rank_sent: Option<u16> = None;
+        let mut last_rank_resend = std::time::Instant::now();
         // Deduplicate ShareInterest "request" per file hash on this TCP session.
         let mut recorded_share_request: Option<[u8; 16]> = None;
         let mut last_preempt_check: std::time::Instant = std::time::Instant::now();
@@ -1573,7 +1644,7 @@ impl UploadHandler {
                                 let queue_snapshot: Vec<_> = {
                                     let queue = self.upload_queue.lock().await;
                                     queue.iter().enumerate().map(|(i, e)| {
-                                        (i, e.identity.clone(), e.current_addr, e.join_time, e.file_hash, e.user_hash, e.download_bonus, e.is_friend_slot)
+                                        (i, e.identity.clone(), e.current_addr, e.join_time, e.file_hash, e.user_hash, e.emule_version, e.is_friend_slot)
                                     }).collect()
                                 };
                                 let cm = self.credit_manager.read().await;
@@ -1581,27 +1652,15 @@ impl UploadHandler {
                                 let mut best_idx: Option<usize> = None;
                                 let mut best_identity = None;
                                 let mut best_score = f64::MIN;
-                                for &(i, ref identity, current_addr, join_time, file_hash, ref user_hash, download_bonus, is_friend_slot) in &queue_snapshot {
+                                for &(i, ref identity, current_addr, join_time, file_hash, ref user_hash, emule_version, is_friend_slot) in &queue_snapshot {
                                     if current_addr.is_none() {
                                         continue;
                                     }
-                                    let wait = join_time.elapsed().as_secs();
-                                    let file_prio = idx_snap
-                                        .get_by_hash(&hex::encode(file_hash))
-                                        .map(|f| priority_weight(&f.priority))
-                                        .unwrap_or(1.0);
-                                    let peer_ip = current_addr.map(|a| match a.ip() {
-                                        IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-                                        _ => 0,
-                                    }).unwrap_or(0);
-                                    let mut score =
-                                        cm.get_queue_score(user_hash, wait, file_prio, peer_ip);
-                                    if download_bonus {
-                                        score *= DOWNLOAD_BONUS_MULTIPLIER;
-                                    }
-                                    if is_friend_slot {
-                                        score = 268_435_455.0;
-                                    }
+                                    let score = score_queue_entry(
+                                        &cm, &idx_snap, user_hash, file_hash,
+                                        join_time.elapsed().as_secs(), current_addr,
+                                        emule_version, is_friend_slot,
+                                    );
                                     if score > best_score {
                                         best_score = score;
                                         best_idx = Some(i);
@@ -1634,6 +1693,7 @@ impl UploadHandler {
                                         slot_guard.activate();
                                         queued_identity = None;
                                         uploaded = 0;
+                                        queue_wait_at_grant = queue_join_time.elapsed().as_secs();
                                         session_start = Some(std::time::Instant::now());
                                         rate_tracker = SessionRateTracker::new();
 
@@ -1665,6 +1725,37 @@ impl UploadHandler {
                                         }
                                         continue;
                                     }
+                                }
+                            }
+
+                            // Re-send OP_QUEUERANKING if rank changed, rate-limited to once per 5 min
+                            if last_rank_resend.elapsed().as_secs() >= 300 {
+                                last_rank_resend = std::time::Instant::now();
+                                let cm = self.credit_manager.read().await;
+                                let idx_snap = self.local_index.read().await;
+                                let queue = self.upload_queue.lock().await;
+                                let my_score = score_queue_entry(
+                                    &cm, &idx_snap, &peer_user_hash,
+                                    current_file_hash.unwrap_or([0u8; 16]),
+                                    queue_join_time.elapsed().as_secs(),
+                                    Some(peer_addr), hello_caps.emule_version_min,
+                                    is_friend,
+                                );
+                                let rank = compute_queue_rank(
+                                    &cm, &idx_snap, &queue,
+                                    &queue_identity, my_score, queue_join_time,
+                                );
+                                drop(queue);
+                                drop(idx_snap);
+                                drop(cm);
+                                if last_rank_sent != Some(rank) {
+                                    last_rank_sent = Some(rank);
+                                    let mut qr_payload = Vec::with_capacity(12);
+                                    qr_payload.extend_from_slice(&rank.to_le_bytes());
+                                    qr_payload.resize(12, 0);
+                                    let _ = write_packet_async(
+                                        &mut writer, OP_EMULEPROT, OP_QUEUERANKING, &qr_payload,
+                                    ).await;
                                 }
                             }
                             continue;
@@ -1921,7 +2012,7 @@ impl UploadHandler {
                             let empty = queue.is_empty();
                             let snap: Vec<_> = queue.iter().enumerate().map(|(i, e)| {
                                 (i, e.identity.clone(), e.current_addr, e.join_time, e.file_hash,
-                                 e.user_hash, e.download_bonus, e.is_friend_slot, e.emule_version, e.add_next_connect)
+                                 e.user_hash, e.emule_version, e.is_friend_slot, e.add_next_connect)
                             }).collect();
                             (empty, snap)
                         };
@@ -1934,25 +2025,12 @@ impl UploadHandler {
                             let mut best_score = f64::MIN;
                             let mut best_low_idx: Option<usize> = None;
                             let mut best_low_score = f64::MIN;
-                            for &(i, ref _identity, current_addr, join_time, file_hash, ref user_hash, download_bonus, is_friend_slot, emule_version, add_next_connect) in &queue_snapshot {
-                                let wait = join_time.elapsed().as_secs();
-                                let file_prio = idx_snap.get_by_hash(&hex::encode(file_hash))
-                                    .map(|f| priority_weight(&f.priority))
-                                    .unwrap_or(0.7);
-                                let peer_ip = current_addr.map(|a| match a.ip() {
-                                    IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-                                    _ => 0,
-                                }).unwrap_or(0);
-                                let mut score = cm.get_queue_score(user_hash, wait, file_prio, peer_ip);
-                                if download_bonus {
-                                    score *= DOWNLOAD_BONUS_MULTIPLIER;
-                                }
-                                if emule_version > 0 && emule_version <= 0x19 {
-                                    score *= 0.5;
-                                }
-                                if is_friend_slot {
-                                    score = 268_435_455.0;
-                                }
+                            for &(i, ref _identity, current_addr, join_time, file_hash, ref user_hash, emule_version, is_friend_slot, add_next_connect) in &queue_snapshot {
+                                let score = score_queue_entry(
+                                    &cm, &idx_snap, user_hash, file_hash,
+                                    join_time.elapsed().as_secs(), current_addr,
+                                    emule_version, is_friend_slot,
+                                );
                                 if current_addr.is_some() {
                                     if score > best_score {
                                         best_score = score;
@@ -1997,36 +2075,19 @@ impl UploadHandler {
                             queue[pos].current_addr = Some(peer_addr);
                             queue[pos].user_hash = peer_user_hash;
                             queue[pos].file_hash = current_file_hash.unwrap_or([0u8; 16]);
-                            // Compute credit-weighted rank: count how many
-                            // peers ahead of us have a higher score.
                             let cm = self.credit_manager.read().await;
                             let idx_snap = self.local_index.read().await;
-                            let my_wait = queue[pos].join_time.elapsed().as_secs();
-                            let my_fh = current_file_hash.unwrap_or([0u8; 16]);
-                            let my_prio = idx_snap.get_by_hash(&hex::encode(my_fh))
-                                .map(|f| priority_weight(&f.priority))
-                                .unwrap_or(0.7);
-                            let my_ip = match peer_addr.ip() { IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()), _ => 0 };
-                            let mut my_score = cm.get_queue_score(&peer_user_hash, my_wait, my_prio, my_ip);
-                            if queue[pos].download_bonus {
-                                my_score *= DOWNLOAD_BONUS_MULTIPLIER;
-                            }
-                            let mut rank_val = 1u16;
-                            for entry in queue.iter() {
-                                if entry.identity == queue_identity {
-                                    continue;
-                                }
-                                let ew = entry.join_time.elapsed().as_secs();
-                                let ep = idx_snap.get_by_hash(&hex::encode(entry.file_hash))
-                                    .map(|f| priority_weight(&f.priority))
-                                    .unwrap_or(0.7);
-                                let eip = entry.current_addr.map(|a| match a.ip() { IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()), _ => 0 }).unwrap_or(0);
-                                let mut es = cm.get_queue_score(&entry.user_hash, ew, ep, eip);
-                                if entry.download_bonus {
-                                    es *= DOWNLOAD_BONUS_MULTIPLIER;
-                                }
-                                if es > my_score { rank_val += 1; }
-                            }
+                            let my_score = score_queue_entry(
+                                &cm, &idx_snap, &peer_user_hash,
+                                current_file_hash.unwrap_or([0u8; 16]),
+                                queue[pos].join_time.elapsed().as_secs(),
+                                Some(peer_addr), hello_caps.emule_version_min,
+                                is_friend,
+                            );
+                            let rank_val = compute_queue_rank(
+                                &cm, &idx_snap, &queue,
+                                &queue_identity, my_score, queue[pos].join_time,
+                            );
                             drop(cm);
                             drop(idx_snap);
                             rank_val
@@ -2039,64 +2100,76 @@ impl UploadHandler {
                             // m7: Soft-to-hard zone – only admit if above-average score
                             let cm = self.credit_manager.read().await;
                             let idx_snap = self.local_index.read().await;
-                            let dl_bonus = cm.has_download_bonus(&peer_user_hash);
                             let new_fh = current_file_hash.unwrap_or([0u8; 16]);
-                            let new_prio = idx_snap.get_by_hash(&hex::encode(new_fh))
-                                .map(|f| priority_weight(&f.priority))
-                                .unwrap_or(0.7);
-                            let new_ip = match peer_addr.ip() { IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()), _ => 0 };
-                            let new_score = cm.get_queue_score(&peer_user_hash, 0, new_prio, new_ip);
+                            let new_score = score_queue_entry(
+                                &cm, &idx_snap, &peer_user_hash, new_fh,
+                                0, Some(peer_addr), hello_caps.emule_version_min,
+                                is_friend,
+                            );
                             let avg_score = if queue.is_empty() { 0.0 } else {
                                 let total: f64 = queue.iter().map(|e| {
-                                    let ew = e.join_time.elapsed().as_secs();
-                                    let ep = idx_snap.get_by_hash(&hex::encode(e.file_hash))
-                                        .map(|f| priority_weight(&f.priority))
-                                        .unwrap_or(0.7);
-                                    let eip = e.current_addr.map(|a| match a.ip() { IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()), _ => 0 }).unwrap_or(0);
-                                    let mut s = cm.get_queue_score(&e.user_hash, ew, ep, eip);
-                                    if e.download_bonus { s *= DOWNLOAD_BONUS_MULTIPLIER; }
-                                    s
+                                    score_queue_entry(
+                                        &cm, &idx_snap, &e.user_hash, e.file_hash,
+                                        e.join_time.elapsed().as_secs(), e.current_addr,
+                                        e.emule_version, e.is_friend_slot,
+                                    )
                                 }).sum();
                                 total / queue.len() as f64
                             };
-                            drop(cm);
-                            drop(idx_snap);
                             if new_score >= avg_score {
+                                let join_time = std::time::Instant::now();
                                 queue.push(QueueEntry {
                                     identity: queue_identity.clone(),
                                     current_addr: Some(peer_addr),
                                     user_hash: peer_user_hash,
-                                    file_hash: current_file_hash.unwrap_or([0u8; 16]),
-                                    join_time: std::time::Instant::now(),
+                                    file_hash: new_fh,
+                                    join_time,
                                     add_next_connect: false,
                                     emule_version: hello_caps.emule_version_min,
                                     is_friend_slot: is_friend,
-                                    download_bonus: dl_bonus,
                                 });
-                                queue.len() as u16
+                                let rank_val = compute_queue_rank(
+                                    &cm, &idx_snap, &queue,
+                                    &queue_identity, new_score, join_time,
+                                );
+                                drop(cm);
+                                drop(idx_snap);
+                                rank_val
                             } else {
                                 debug!("Upload queue in soft-hard zone, peer score {new_score:.1} below avg {avg_score:.1}, rejecting {peer_addr}");
+                                drop(cm);
+                                drop(idx_snap);
                                 drop(queue);
                                 write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[]).await?;
                                 break;
                             }
                         } else {
-                            let dl_bonus = {
-                                let cm = self.credit_manager.read().await;
-                                cm.has_download_bonus(&peer_user_hash)
-                            };
+                            let cm = self.credit_manager.read().await;
+                            let idx_snap = self.local_index.read().await;
+                            let new_fh = current_file_hash.unwrap_or([0u8; 16]);
+                            let join_time = std::time::Instant::now();
                             queue.push(QueueEntry {
                                 identity: queue_identity.clone(),
                                 current_addr: Some(peer_addr),
                                 user_hash: peer_user_hash,
-                                file_hash: current_file_hash.unwrap_or([0u8; 16]),
-                                join_time: std::time::Instant::now(),
+                                file_hash: new_fh,
+                                join_time,
                                 add_next_connect: false,
                                 emule_version: hello_caps.emule_version_min,
                                 is_friend_slot: is_friend,
-                                download_bonus: dl_bonus,
                             });
-                            queue.len() as u16
+                            let my_score = score_queue_entry(
+                                &cm, &idx_snap, &peer_user_hash, new_fh,
+                                0, Some(peer_addr), hello_caps.emule_version_min,
+                                is_friend,
+                            );
+                            let rank_val = compute_queue_rank(
+                                &cm, &idx_snap, &queue,
+                                &queue_identity, my_score, join_time,
+                            );
+                            drop(cm);
+                            drop(idx_snap);
+                            rank_val
                         };
                         drop(queue);
                         // eMule OP_QUEUERANKING (UploadClient.cpp:633): 12 bytes = rank(u16) + 10 zeros
@@ -2110,6 +2183,7 @@ impl UploadHandler {
                             &qr_payload,
                         )
                         .await?;
+                        last_rank_sent = Some(rank);
                         queued_identity = Some(queue_identity.clone());
                         continue;
                     }
@@ -2130,6 +2204,7 @@ impl UploadHandler {
                     slot_guard.activate();
                     queued_identity = None;
                     uploaded = 0;
+                    queue_wait_at_grant = queue_join_time.elapsed().as_secs();
                     session_start = Some(std::time::Instant::now());
                     rate_tracker = SessionRateTracker::new();
 
@@ -2401,38 +2476,22 @@ impl UploadHandler {
                             let cm = self.credit_manager.read().await;
                             let idx_snap = self.local_index.read().await;
                             let my_fh = current_file_hash.unwrap_or([0u8; 16]);
-                            let my_wait = session_start.map(|t| t.elapsed().as_secs()).unwrap_or(1);
-                            let my_prio = idx_snap
-                                .get_by_hash(&hex::encode(my_fh))
-                                .map(|f| priority_weight(&f.priority))
-                                .unwrap_or(0.7);
-                            let my_ip = match peer_addr.ip() {
-                                IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-                                _ => 0,
-                            };
-                            let my_score = cm.get_queue_score(&peer_user_hash, my_wait, my_prio, my_ip);
+                            let my_score = score_queue_entry(
+                                &cm, &idx_snap, &peer_user_hash, my_fh,
+                                queue_wait_at_grant, Some(peer_addr),
+                                hello_caps.emule_version_min, is_friend,
+                            );
 
                             let mut best_queued_score = f64::MIN;
                             for entry in queue.iter() {
                                 if entry.current_addr.is_none() {
                                     continue;
                                 }
-                                let ew = entry.join_time.elapsed().as_secs();
-                                let ep = idx_snap
-                                    .get_by_hash(&hex::encode(entry.file_hash))
-                                    .map(|f| priority_weight(&f.priority))
-                                    .unwrap_or(0.7);
-                                let eip = entry.current_addr.map(|a| match a.ip() {
-                                    IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-                                    _ => 0,
-                                }).unwrap_or(0);
-                                let mut score = cm.get_queue_score(&entry.user_hash, ew, ep, eip);
-                                if entry.download_bonus {
-                                    score *= DOWNLOAD_BONUS_MULTIPLIER;
-                                }
-                                if entry.is_friend_slot {
-                                    score = 268_435_455.0;
-                                }
+                                let score = score_queue_entry(
+                                    &cm, &idx_snap, &entry.user_hash, entry.file_hash,
+                                    entry.join_time.elapsed().as_secs(), entry.current_addr,
+                                    entry.emule_version, entry.is_friend_slot,
+                                );
                                 if score > best_queued_score {
                                     best_queued_score = score;
                                 }
@@ -2484,10 +2543,6 @@ impl UploadHandler {
                                 entry.user_hash = peer_user_hash;
                                 entry.file_hash = current_file_hash.unwrap_or([0u8; 16]);
                             } else if queue.len() < MAX_UPLOAD_QUEUE_SIZE {
-                                let dl_bonus = {
-                                    let cm = self.credit_manager.read().await;
-                                    cm.has_download_bonus(&peer_user_hash)
-                                };
                                 queue.push(QueueEntry {
                                     identity: queue_identity.clone(),
                                     current_addr: Some(peer_addr),
@@ -2497,29 +2552,24 @@ impl UploadHandler {
                                     add_next_connect: false,
                                     emule_version: hello_caps.emule_version_min,
                                     is_friend_slot: is_friend,
-                                    download_bonus: dl_bonus,
                                 });
                             } else if queue.len() < HARD_UPLOAD_QUEUE_SIZE {
                                 // m7: Soft-to-hard zone – re-admit after session with score check
                                 let cm = self.credit_manager.read().await;
                                 let idx_snap = self.local_index.read().await;
-                                let dl_bonus = cm.has_download_bonus(&peer_user_hash);
                                 let new_fh = current_file_hash.unwrap_or([0u8; 16]);
-                                let new_prio = idx_snap.get_by_hash(&hex::encode(new_fh))
-                                    .map(|f| priority_weight(&f.priority))
-                                    .unwrap_or(0.7);
-                                let new_ip = match peer_addr.ip() { IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()), _ => 0 };
-                                let new_score = cm.get_queue_score(&peer_user_hash, 0, new_prio, new_ip);
+                                let new_score = score_queue_entry(
+                                    &cm, &idx_snap, &peer_user_hash, new_fh,
+                                    0, Some(peer_addr), hello_caps.emule_version_min,
+                                    is_friend,
+                                );
                                 let avg_score = if queue.is_empty() { 0.0 } else {
                                     let total: f64 = queue.iter().map(|e| {
-                                        let ew = e.join_time.elapsed().as_secs();
-                                        let ep = idx_snap.get_by_hash(&hex::encode(e.file_hash))
-                                            .map(|f| priority_weight(&f.priority))
-                                            .unwrap_or(0.7);
-                                        let eip = e.current_addr.map(|a| match a.ip() { IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()), _ => 0 }).unwrap_or(0);
-                                        let mut s = cm.get_queue_score(&e.user_hash, ew, ep, eip);
-                                        if e.download_bonus { s *= DOWNLOAD_BONUS_MULTIPLIER; }
-                                        s
+                                        score_queue_entry(
+                                            &cm, &idx_snap, &e.user_hash, e.file_hash,
+                                            e.join_time.elapsed().as_secs(), e.current_addr,
+                                            e.emule_version, e.is_friend_slot,
+                                        )
                                     }).sum();
                                     total / queue.len() as f64
                                 };
@@ -2530,12 +2580,11 @@ impl UploadHandler {
                                         identity: queue_identity.clone(),
                                         current_addr: Some(peer_addr),
                                         user_hash: peer_user_hash,
-                                        file_hash: current_file_hash.unwrap_or([0u8; 16]),
+                                        file_hash: new_fh,
                                         join_time: queue_join_time,
                                         add_next_connect: false,
                                         emule_version: hello_caps.emule_version_min,
                                         is_friend_slot: is_friend,
-                                        download_bonus: dl_bonus,
                                     });
                                 }
                             }
