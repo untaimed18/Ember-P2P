@@ -18,7 +18,6 @@
     { href: '/library', label: 'Library', id: 'library' },
     { href: '/friends', label: 'Friends', id: 'friends' },
     { href: '/statistics', label: 'Statistics', id: 'statistics' },
-    { href: '/servers', label: 'Servers', id: 'servers' },
     { href: '/security', label: 'Security', id: 'security' },
     { href: '/settings', label: 'Settings', id: 'settings' },
   ];
