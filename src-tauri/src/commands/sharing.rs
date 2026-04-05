@@ -1,10 +1,19 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tauri::Emitter;
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+struct ScanGuard(Arc<AtomicUsize>);
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+static RELOAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 use crate::app_state::AppState;
 use crate::network::NetworkCommand;
@@ -181,9 +190,12 @@ pub async fn add_shared_folder(
 
     scanning.fetch_add(1, Ordering::Relaxed);
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    cancel_flags.write().await.insert(path.clone(), cancel_flag.clone());
+    let cancel_key = canonical_str.clone();
+    cancel_flags.write().await.insert(cancel_key.clone(), cancel_flag.clone());
 
     tokio::spawn(async move {
+        let _scan_guard = ScanGuard(scanning.clone());
+
         let discover_path = path.clone();
         let mut discovered = match tokio::task::spawn_blocking(move || {
             FileIndexer::discover_directory(&discover_path)
@@ -193,8 +205,7 @@ pub async fn add_shared_folder(
             Ok(files) => files,
             Err(e) => {
                 tracing::error!("Discovery failed for {path}: {e}");
-                scanning.fetch_sub(1, Ordering::Relaxed);
-                cancel_flags.write().await.remove(&path);
+                cancel_flags.write().await.remove(&cancel_key);
                 return;
             }
         };
@@ -208,8 +219,7 @@ pub async fn add_shared_folder(
         };
         if cancel_flag.load(Ordering::Relaxed) || !still_shared {
             info!("Hashing cancelled during discovery for {path}");
-            scanning.fetch_sub(1, Ordering::Relaxed);
-            cancel_flags.write().await.remove(&path);
+            cancel_flags.write().await.remove(&cancel_key);
             let _ = app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
             return;
         }
@@ -342,8 +352,7 @@ pub async fn add_shared_folder(
         }
 
         let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
-        scanning.fetch_sub(1, Ordering::Relaxed);
-        cancel_flags.write().await.remove(&path);
+        cancel_flags.write().await.remove(&cancel_key);
 
         let from_known = total_files.saturating_sub(total_to_hash);
         if was_cancelled {
@@ -358,6 +367,7 @@ pub async fn add_shared_folder(
             "file_name": "",
             "done": true,
         }));
+        drop(_scan_guard);
     });
 
     Ok(())
@@ -365,6 +375,7 @@ pub async fn add_shared_folder(
 
 #[tauri::command]
 pub async fn remove_shared_folder(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
@@ -405,10 +416,8 @@ pub async fn remove_shared_folder(
     }
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
 
-    let network_tx = state.network_tx.clone();
-    tokio::spawn(async move {
-        let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
-    });
+    let _ = state.network_tx.try_send(NetworkCommand::SharedFilesChanged);
+    let _ = app.emit("shared-files-changed", serde_json::json!({ "folder": path, "removed": true }));
 
     Ok(())
 }
@@ -470,9 +479,12 @@ pub async fn reload_shared_files(
 
     scanning.fetch_add(1, Ordering::Relaxed);
     let cancel_flag = Arc::new(AtomicBool::new(false));
-    cancel_flags.write().await.insert("__reload__".to_string(), cancel_flag.clone());
+    let reload_key = format!("__reload_{}__", RELOAD_COUNTER.fetch_add(1, Ordering::Relaxed));
+    cancel_flags.write().await.insert(reload_key.clone(), cancel_flag.clone());
 
     tokio::spawn(async move {
+        let _scan_guard = ScanGuard(scanning.clone());
+
         let mut discovered: Vec<FileInfo> = match tokio::task::spawn_blocking(move || {
             let mut files = Vec::new();
             for folder in &discovery_folders {
@@ -485,8 +497,7 @@ pub async fn reload_shared_files(
             Ok(files) => files,
             Err(e) => {
                 tracing::error!("Reload discovery failed: {e}");
-                scanning.fetch_sub(1, Ordering::Relaxed);
-                cancel_flags.write().await.remove("__reload__");
+                cancel_flags.write().await.remove(&reload_key);
                 return;
             }
         };
@@ -506,8 +517,7 @@ pub async fn reload_shared_files(
 
         if cancel_flag.load(Ordering::Relaxed) {
             info!("Reload cancelled during discovery");
-            scanning.fetch_sub(1, Ordering::Relaxed);
-            cancel_flags.write().await.remove("__reload__");
+            cancel_flags.write().await.remove(&reload_key);
             let _ = app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
             return;
         }
@@ -639,8 +649,7 @@ pub async fn reload_shared_files(
         }
 
         let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
-        scanning.fetch_sub(1, Ordering::Relaxed);
-        cancel_flags.write().await.remove("__reload__");
+        cancel_flags.write().await.remove(&reload_key);
 
         let from_known = total_files.saturating_sub(total_to_hash);
         info!("Reload complete: {hashed_count}/{total_to_hash} hashed, {from_known} from known.met{}", if was_cancelled { " (cancelled)" } else { "" });
@@ -651,6 +660,7 @@ pub async fn reload_shared_files(
             "file_name": "",
             "done": true,
         }));
+        drop(_scan_guard);
     });
 
     Ok(())
@@ -761,6 +771,7 @@ pub async fn share_file(
 
 #[tauri::command]
 pub async fn unshare_folder(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
@@ -771,12 +782,14 @@ pub async fn unshare_folder(
     if !affected_hashes.is_empty() {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
         let _ = state.network_tx.try_send(NetworkCommand::SharedFilesChanged);
+        let _ = app.emit("shared-files-changed", serde_json::json!({ "folder": path, "unshared": true }));
     }
     Ok(())
 }
 
 #[tauri::command]
 pub async fn delete_shared_file(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     file_path: String,
     file_hash: Option<String>,
@@ -819,6 +832,7 @@ pub async fn delete_shared_file(
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
 
     let _ = state.network_tx.try_send(NetworkCommand::SharedFilesChanged);
+    let _ = app.emit("shared-files-changed", serde_json::json!({ "file_deleted": true }));
 
     info!(
         "Deleted shared file {}{}{}",
