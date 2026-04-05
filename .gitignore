@@ -7,6 +7,9 @@ dist/
 .svelte-kit/
 out/
 
+# Generated flag SVGs (copied from circle-flags via postinstall)
+static/flags/
+
 # Rust build
 src-tauri/target/
 

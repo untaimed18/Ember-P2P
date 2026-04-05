@@ -17,13 +17,9 @@
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import type { Transfer, SourceInfo } from '$lib/types';
 
-  function countryFlag(code: string | undefined): string {
-    if (!code || code.length !== 2) return '';
-    const offset = 0x1F1E5;
-    return String.fromCodePoint(
-      code.codePointAt(0)! - 0x40 + offset,
-      code.codePointAt(1)! - 0x40 + offset
-    );
+  function countryFlagSrc(code: string | undefined): string | null {
+    if (!code || code.length !== 2) return null;
+    return `/flags/${code.toLowerCase()}.svg`;
   }
 
   let sourceUnlisten: UnlistenFn | null = null;
@@ -1552,7 +1548,7 @@
                     <td class="source-child-cell" colspan={dlColCount}>
                       <span class="source-fields">
                         <span class="source-status-dot src-dot-{src.status}" title={src.status}></span>
-                        <span class="source-flag" title={src.country_code ?? ''}>{countryFlag(src.country_code)}</span>
+                        <span class="source-flag" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</span>
                         <span class="source-client" title={src.peer_name || src.client_software || 'Unknown Client'}>{src.peer_name || src.client_software || 'Unknown Client'}</span>
                         <span class="source-sep"></span>
                         <span class="source-addr" title="{src.ip}:{src.port}">{src.ip}:{src.port}</span>
@@ -1770,7 +1766,7 @@
               <tr class="ul-row" oncontextmenu={(e) => onCtx(e, t, 'upload')}>
                 {#each visibleUploadColumns as column (column.key)}
                   {#if column.key === 'country'}
-                    <td class="flag-cell" title={t.country_code ?? ''}>{countryFlag(t.country_code)}</td>
+                    <td class="flag-cell" title={t.country_code ?? ''}>{#if countryFlagSrc(t.country_code)}<img src={countryFlagSrc(t.country_code)} alt={t.country_code ?? ''} class="flag-img" />{/if}</td>
                   {:else if column.key === 'peer_name'}
                     <td class="client-cell" title={t.peer_name || t.peer_id}>{t.peer_name || t.peer_id || '\u2014'}</td>
                   {:else if column.key === 'file_name'}
@@ -1805,7 +1801,7 @@
                 <tr class="ul-row completed-row">
                   {#each visibleUploadColumns as column (column.key)}
                     {#if column.key === 'country'}
-                      <td class="flag-cell" title={t.country_code ?? ''}>{countryFlag(t.country_code)}</td>
+                      <td class="flag-cell" title={t.country_code ?? ''}>{#if countryFlagSrc(t.country_code)}<img src={countryFlagSrc(t.country_code)} alt={t.country_code ?? ''} class="flag-img" />{/if}</td>
                     {:else if column.key === 'peer_name'}
                       <td class="client-cell" title={t.peer_name || t.peer_id}>{t.peer_name || t.peer_id || '\u2014'}</td>
                     {:else if column.key === 'file_name'}
@@ -1954,7 +1950,7 @@
                     {#if column.key === 'peer_name'}
                       <td class="client-cell" title={src.peer_name || src.ip}>{src.peer_name || src.ip}</td>
                     {:else if column.key === 'country'}
-                      <td class="flag-cell" title={src.country_code ?? ''}>{countryFlag(src.country_code)}</td>
+                      <td class="flag-cell" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</td>
                     {:else if column.key === 'client_software'}
                       <td title={src.client_software}>{src.client_software || '\u2014'}</td>
                     {:else if column.key === 'file_name'}
@@ -2721,11 +2717,20 @@
   .src-dot-completed { background: var(--success, #2ecc71); box-shadow: 0 0 3px color-mix(in srgb, var(--success) 50%, transparent); }
   .src-dot-failed { background: var(--danger, #e74c3c); }
   .source-flag {
-    font-size: 13px;
     line-height: 1;
     width: 18px;
     text-align: center;
     flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .flag-img {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    object-fit: cover;
+    vertical-align: middle;
   }
   .source-client {
     color: var(--text-primary);
