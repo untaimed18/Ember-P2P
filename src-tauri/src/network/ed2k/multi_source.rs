@@ -1005,22 +1005,17 @@ impl MultiSourceDownload {
             let tid = self.transfer_id.clone();
             let fs = self.file_size;
             let etx = event_tx.clone();
-            let retry_initial: u64 = {
-                let t = tracker.read().await;
-                t.completed_bytes()
-            };
+            let retry_agg_tracker = tracker.clone();
             let retry_agg = tokio::spawn(async move {
-                let mut total: u64 = retry_initial;
-                while let Some((_, bytes)) = retry_rx.recv().await {
-                    if bytes >= 0 {
-                        total = total.saturating_add(bytes as u64);
-                    } else {
-                        total = total.saturating_sub((-bytes) as u64);
-                    }
+                while let Some((_source_idx, _bytes)) = retry_rx.recv().await {
+                    let capped = {
+                        let t = retry_agg_tracker.read().await;
+                        t.completed_bytes().min(fs)
+                    };
                     let _ = etx
                         .send(DownloadEvent::Progress {
                             transfer_id: tid.clone(),
-                            downloaded: total.min(fs),
+                            downloaded: capped,
                             total: fs,
                         })
                         .await;
@@ -1227,7 +1222,7 @@ impl MultiSourceDownload {
                 // Hash failed — re-open all parts as incomplete so retries
                 // can re-download them (we can't identify which parts are
                 // corrupt without per-part hashes).
-                {
+                let corrected_bytes = {
                     let mut t = tracker.write().await;
                     for i in 0..t.part_count {
                         t.mark_incomplete(i);
@@ -1237,7 +1232,15 @@ impl MultiSourceDownload {
                         "Final hash failed for {} — re-opened all {} parts for retry",
                         self.file_name, t.part_count
                     );
-                }
+                    t.completed_bytes()
+                };
+                let _ = event_tx
+                    .send(DownloadEvent::Progress {
+                        transfer_id: self.transfer_id.clone(),
+                        downloaded: corrected_bytes.min(self.file_size),
+                        total: self.file_size,
+                    })
+                    .await;
                 let _ = event_tx
                     .send(DownloadEvent::Failed {
                         transfer_id: self.transfer_id.clone(),
@@ -3201,7 +3204,9 @@ async fn download_parts_from_source(
                 t.mark_incomplete(part_idx);
                 t.set_in_progress(part_idx, false);
                 t.save();
+                drop(t);
                 ip_guard.unmark(part_idx);
+                let _ = progress_tx.send((_src_idx, 0i64)).await;
                 if let Some(ref etx) = event_tx {
                     let _ = etx
                         .send(DownloadEvent::PartCorrupted {

@@ -2391,7 +2391,7 @@ pub async fn start_network(
                         transfer.total_size, &part_path,
                     );
                     let completed_bytes = tracker.completed_bytes();
-                    transfer.transferred = transfer.transferred.max(completed_bytes);
+                    transfer.transferred = completed_bytes;
                     transfer.completed_size = transfer.transferred;
                     transfer.progress = ((transfer.transferred as f64 / transfer.total_size as f64) * 100.0)
                         .min(100.0);
