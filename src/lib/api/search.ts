@@ -1,0 +1,89 @@
+import { invoke } from '@tauri-apps/api/core';
+import type { SearchResult, SpamExplanation, SpamStats } from '$lib/types';
+
+export type SearchMethod = 'global' | 'server' | 'kad';
+
+export interface SearchFilters {
+  fileType?: string;
+  fileExtension?: string;
+  minSize?: number;
+  maxSize?: number;
+  minAvailability?: number;
+}
+
+export async function searchFiles(query: string, method: SearchMethod = 'global', requestId: number, fileType?: string, filters?: SearchFilters): Promise<SearchResult[]> {
+  return invoke('search_files', {
+    query,
+    method,
+    requestId,
+    file_type: fileType || filters?.fileType || null,
+    file_extension: filters?.fileExtension || null,
+    min_size: filters?.minSize ?? null,
+    max_size: filters?.maxSize ?? null,
+    min_availability: filters?.minAvailability ?? null,
+  });
+}
+
+export async function cancelSearch(requestId: number): Promise<void> {
+  return invoke('cancel_search', { requestId });
+}
+
+export async function formatEd2kLink(name: string, size: number, fileHash: string): Promise<string> {
+  return invoke('format_ed2k_link', { name, size, fileHash });
+}
+
+export async function parseEd2kLink(link: string): Promise<{ name: string; size: number; hash: string }> {
+  return invoke('parse_ed2k_link', { link });
+}
+
+export async function findSources(fileHash: string, fileSize: number): Promise<[string, number][]> {
+  return invoke('find_sources', { fileHash, fileSize });
+}
+
+export async function findNotes(fileHash: string, fileSize: number): Promise<SearchResult[]> {
+  return invoke('find_notes', { fileHash, fileSize });
+}
+
+export async function publishNote(fileHash: string, rating: number, comment: string): Promise<string> {
+  return invoke('publish_note', { fileHash, rating, comment });
+}
+
+export async function markSpam(
+  fileHash: string,
+  fileName: string,
+  fileSize: number,
+  sourceAddresses: string[],
+  searchKeywords: string[],
+): Promise<void> {
+  return invoke('mark_spam', { fileHash, fileName, fileSize, sourceAddresses, searchKeywords });
+}
+
+export async function markNotSpam(fileHash: string): Promise<void> {
+  return invoke('mark_not_spam', { fileHash });
+}
+
+export async function getSpamStats(): Promise<SpamStats> {
+  return invoke('get_spam_stats');
+}
+
+export async function explainSpamResult(
+  fileHash: string,
+  fileName: string,
+  fileSize: number,
+  sourceAddresses: string[],
+  searchKeywords: string[],
+  serverIp?: string,
+): Promise<SpamExplanation> {
+  return invoke('explain_spam_result', {
+    fileHash,
+    fileName,
+    fileSize,
+    sourceAddresses,
+    searchKeywords,
+    serverIp,
+  });
+}
+
+export async function resetSpamFilter(): Promise<string> {
+  return invoke('reset_spam_filter');
+}

@@ -1,0 +1,1285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ember — Decentralized P2P File Sharing</title>
+  <meta name="description" content="Ember is a modern, open-source P2P file sharing application built on the eMule KAD network. No spyware, no ads, no nonsense.">
+  <meta name="theme-color" content="#f5f6fa">
+  <link rel="icon" type="image/png" href="favicon.png">
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg-primary: #f5f6fa;
+      --bg-secondary: #ffffff;
+      --bg-tertiary: #e8ecf4;
+      --bg-surface: #f0f2f8;
+      --bg-hover: #eceef5;
+
+      --text-primary: #1a1c24;
+      --text-secondary: #4a5068;
+      --text-muted: #8890a8;
+
+      --accent: #1a73e8;
+      --accent-hover: #1565d8;
+      --accent-dim: #d2e3fc;
+      --accent-glow: rgba(26, 115, 232, 0.08);
+
+      --success: #34a853;
+      --warning: #ea8600;
+      --danger: #d93025;
+
+      --border: #dadce0;
+      --border-light: #c4c9d4;
+
+      --radius: 8px;
+      --sidebar-w: 260px;
+      --header-h: 56px;
+
+      --shadow-sm: 0 1px 2px rgba(0,0,0,0.06);
+      --shadow-md: 0 2px 8px rgba(0,0,0,0.08);
+    }
+
+    html { scroll-behavior: smooth; scroll-padding-top: calc(var(--header-h) + 20px); }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.7;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    a { color: var(--accent); text-decoration: none; transition: color 0.2s; }
+    a:hover { color: var(--accent-hover); }
+
+    code {
+      background: var(--bg-tertiary);
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-size: 0.88em;
+      font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+      color: var(--accent-hover);
+    }
+
+    pre {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      overflow-x: auto;
+      margin: 16px 0;
+      font-size: 13px;
+      line-height: 1.6;
+      box-shadow: var(--shadow-sm);
+    }
+    pre code { background: none; padding: 0; color: var(--text-secondary); }
+
+    /* ---- HEADER ---- */
+    .site-header {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 200;
+      height: var(--header-h);
+      background: rgba(255, 255, 255, 0.92);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      border-bottom: 1px solid var(--border);
+    }
+    .header-inner {
+      max-width: 100%;
+      margin: 0 auto;
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      height: 100%;
+      gap: 16px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      color: var(--text-primary);
+      flex-shrink: 0;
+    }
+    .brand:hover { color: var(--text-primary); }
+    .brand-icon {
+      width: 30px;
+      height: 30px;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .brand-icon img {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .brand-text {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+    }
+    .header-nav {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      margin-left: auto;
+    }
+    .header-nav a {
+      color: var(--text-secondary);
+      font-size: 14px;
+      font-weight: 500;
+      transition: color 0.2s;
+    }
+    .header-nav a:hover { color: var(--text-primary); }
+    .header-nav .gh-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .header-nav .gh-link svg { fill: currentColor; }
+
+    .mobile-toggle {
+      display: none;
+      background: none;
+      border: none;
+      color: var(--text-secondary);
+      cursor: pointer;
+      padding: 4px;
+    }
+
+    /* ---- LAYOUT ---- */
+    .layout {
+      display: flex;
+      min-height: 100vh;
+      padding-top: var(--header-h);
+    }
+
+    /* ---- SIDEBAR ---- */
+    .sidebar {
+      position: fixed;
+      top: var(--header-h);
+      left: 0;
+      width: var(--sidebar-w);
+      height: calc(100vh - var(--header-h));
+      overflow-y: auto;
+      background: var(--bg-secondary);
+      border-right: 1px solid var(--border);
+      padding: 20px 0;
+      z-index: 100;
+    }
+    .sidebar::-webkit-scrollbar { width: 4px; }
+    .sidebar::-webkit-scrollbar-track { background: transparent; }
+    .sidebar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+    .toc-section { margin-bottom: 6px; }
+    .toc-heading {
+      display: block;
+      padding: 8px 20px 4px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      color: var(--text-muted);
+    }
+    .toc-link {
+      display: block;
+      padding: 5px 20px 5px 24px;
+      font-size: 13.5px;
+      color: var(--text-secondary);
+      border-left: 2px solid transparent;
+      transition: all 0.15s;
+    }
+    .toc-link:hover { color: var(--text-primary); background: var(--bg-hover); }
+    .toc-link.active {
+      color: var(--accent);
+      border-left-color: var(--accent);
+      background: var(--accent-glow);
+      font-weight: 500;
+    }
+    .toc-child {
+      padding-left: 36px;
+      font-size: 12.5px;
+    }
+
+    /* ---- MAIN ---- */
+    .main {
+      margin-left: var(--sidebar-w);
+      flex: 1;
+      min-width: 0;
+      max-width: 880px;
+      padding: 36px 48px 80px;
+    }
+
+    /* ---- CONTENT STYLES ---- */
+    .main h1 {
+      font-size: 34px;
+      font-weight: 800;
+      margin-bottom: 8px;
+      letter-spacing: 0.3px;
+      color: var(--text-primary);
+    }
+    .main h2 {
+      font-size: 24px;
+      font-weight: 700;
+      margin-top: 52px;
+      margin-bottom: 16px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text-primary);
+    }
+    .main h3 {
+      font-size: 18px;
+      font-weight: 600;
+      margin-top: 32px;
+      margin-bottom: 10px;
+      color: var(--text-primary);
+    }
+    .main h4 {
+      font-size: 15px;
+      font-weight: 600;
+      margin-top: 24px;
+      margin-bottom: 8px;
+      color: var(--text-secondary);
+    }
+    .main p {
+      margin-bottom: 14px;
+      color: var(--text-secondary);
+    }
+    .main > p:first-of-type {
+      font-size: 17px;
+      line-height: 1.7;
+    }
+
+    .main ul, .main ol {
+      margin: 8px 0 16px 24px;
+      color: var(--text-secondary);
+    }
+    .main li { margin-bottom: 6px; }
+    .main li strong { color: var(--text-primary); }
+    .main strong { color: var(--text-primary); }
+
+    .main hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 40px 0;
+    }
+
+    /* ---- HIGHLIGHT CARDS ---- */
+    .highlight-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 14px;
+      margin: 20px 0 28px;
+    }
+    .hl-card {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px 18px;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      box-shadow: var(--shadow-sm);
+    }
+    .hl-card:hover {
+      border-color: var(--accent);
+      box-shadow: 0 2px 12px rgba(26, 115, 232, 0.1);
+    }
+    .hl-card h4 {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-primary);
+      margin: 0 0 6px;
+    }
+    .hl-card p {
+      font-size: 13.5px;
+      color: var(--text-secondary);
+      margin: 0;
+      line-height: 1.6;
+    }
+    .hl-card .hl-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      background: var(--accent-dim);
+      margin-bottom: 10px;
+      font-size: 18px;
+    }
+
+    /* ---- TABLE ---- */
+    .doc-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0 24px;
+      font-size: 14px;
+      box-shadow: var(--shadow-sm);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .doc-table th {
+      text-align: left;
+      padding: 10px 14px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      font-weight: 600;
+      color: var(--text-primary);
+      font-size: 13px;
+    }
+    .doc-table td {
+      padding: 10px 14px;
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+    }
+    .doc-table tr:hover td {
+      background: var(--bg-hover);
+    }
+
+    /* ---- CALLOUT ---- */
+    .callout {
+      border-left: 3px solid var(--accent);
+      background: var(--accent-glow);
+      padding: 14px 18px;
+      border-radius: 0 var(--radius) var(--radius) 0;
+      margin: 18px 0;
+    }
+    .callout p { margin: 0; color: var(--text-secondary); }
+    .callout strong { color: var(--accent); }
+
+    .callout-info {
+      border-left-color: #38bdf8;
+      background: rgba(56, 189, 248, 0.06);
+    }
+    .callout-info strong { color: #0284c7; }
+
+    .callout-warn {
+      border-left-color: var(--danger);
+      background: rgba(217, 48, 37, 0.05);
+    }
+    .callout-warn strong { color: var(--danger); }
+
+    /* ---- DOWNLOAD SECTION ---- */
+    .download-box {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 32px;
+      text-align: center;
+      margin: 24px 0;
+      box-shadow: var(--shadow-md);
+    }
+    .download-box h3 {
+      margin-top: 0;
+      font-size: 22px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 28px;
+      border-radius: var(--radius);
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      transition: all 0.2s;
+      text-decoration: none;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+      box-shadow: 0 2px 8px rgba(26, 115, 232, 0.25);
+    }
+    .btn-primary:hover {
+      background: var(--accent-hover);
+      color: #fff;
+      box-shadow: 0 4px 16px rgba(26, 115, 232, 0.3);
+      transform: translateY(-1px);
+    }
+    .btn-secondary {
+      background: var(--bg-surface);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:hover {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+      border-color: var(--border-light);
+    }
+    .btn svg { flex-shrink: 0; }
+    .btn-group {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin-top: 20px;
+    }
+
+    /* ---- PROMISE ROW ---- */
+    .promise-row {
+      display: flex;
+      gap: 28px;
+      flex-wrap: wrap;
+      margin: 20px 0;
+    }
+    .promise-item {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--success);
+    }
+
+    /* ---- FAQ ---- */
+    .faq-item {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin-bottom: 10px;
+      overflow: hidden;
+      box-shadow: var(--shadow-sm);
+    }
+    .faq-q {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 13px 16px;
+      background: var(--bg-secondary);
+      border: none;
+      color: var(--text-primary);
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      text-align: left;
+      transition: background 0.15s;
+    }
+    .faq-q:hover { background: var(--bg-hover); }
+    .faq-q .faq-chevron {
+      transition: transform 0.2s;
+      flex-shrink: 0;
+      color: var(--text-muted);
+    }
+    .faq-item.open .faq-chevron { transform: rotate(180deg); }
+    .faq-a {
+      display: none;
+      padding: 0 16px 14px;
+      background: var(--bg-secondary);
+      font-size: 13.5px;
+      color: var(--text-secondary);
+      line-height: 1.7;
+    }
+    .faq-item.open .faq-a { display: block; }
+
+    /* ---- STEPS ---- */
+    .steps-list {
+      counter-reset: step;
+      list-style: none;
+      margin: 16px 0 24px;
+      padding: 0;
+    }
+    .steps-list li {
+      counter-increment: step;
+      padding: 12px 0 12px 48px;
+      position: relative;
+      border-left: 2px solid var(--border);
+      margin-left: 16px;
+    }
+    .steps-list li::before {
+      content: counter(step);
+      position: absolute;
+      left: -15px;
+      top: 10px;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 700;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .steps-list li:last-child { border-left-color: transparent; }
+
+    /* ---- BACK TO TOP ---- */
+    .back-to-top {
+      position: fixed;
+      bottom: 28px;
+      right: 28px;
+      width: 38px;
+      height: 38px;
+      border-radius: 8px;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      cursor: pointer;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s;
+      z-index: 50;
+      box-shadow: var(--shadow-md);
+    }
+    .back-to-top:hover { border-color: var(--accent); color: var(--accent); }
+    .back-to-top.visible { display: flex; }
+
+    /* ---- FOOTER ---- */
+    .site-footer {
+      margin-left: var(--sidebar-w);
+      padding: 24px 48px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+    .site-footer a { color: var(--text-secondary); }
+    .site-footer a:hover { color: var(--text-primary); }
+    .footer-links { display: flex; gap: 20px; }
+
+    /* ---- RESPONSIVE ---- */
+    @media (max-width: 960px) {
+      .sidebar {
+        transform: translateX(-100%);
+        transition: transform 0.25s;
+        z-index: 300;
+        box-shadow: none;
+      }
+      .sidebar.open {
+        transform: translateX(0);
+        box-shadow: 4px 0 16px rgba(0,0,0,0.1);
+      }
+      .main { margin-left: 0; padding: 28px 20px 60px; }
+      .site-footer { margin-left: 0; padding: 24px 20px; }
+      .highlight-grid { grid-template-columns: 1fr; }
+      .mobile-toggle { display: block; }
+      .header-nav { display: none; }
+      .overlay {
+        position: fixed;
+        inset: 0;
+        top: var(--header-h);
+        background: rgba(0,0,0,0.25);
+        z-index: 250;
+        display: none;
+      }
+      .overlay.open { display: block; }
+    }
+    @media (max-width: 600px) {
+      .promise-row { flex-direction: column; gap: 10px; }
+      .main h1 { font-size: 26px; }
+      .main h2 { font-size: 20px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        transition-duration: 0.01ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Header -->
+<header class="site-header">
+  <div class="header-inner">
+    <button class="mobile-toggle" onclick="toggleSidebar()" aria-label="Toggle navigation">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 7h18M3 12h18M3 17h18"/></svg>
+    </button>
+    <a href="#" class="brand">
+      <span class="brand-icon"><img src="favicon.png" alt="Ember icon"></span>
+      <span class="brand-text">EMBER</span>
+    </a>
+    <nav class="header-nav">
+      <a href="#highlights">Features</a>
+      <a href="#download">Download</a>
+      <a href="#epx">EPX</a>
+      <a href="#faq">FAQ</a>
+      <a href="https://github.com/untaimed18/Ember-KAD" target="_blank" rel="noopener" class="gh-link">
+        <svg width="18" height="18" viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        GitHub
+      </a>
+    </nav>
+  </div>
+</header>
+
+<!-- Sidebar Overlay (mobile) -->
+<div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
+
+<!-- Sidebar -->
+<aside class="sidebar" id="sidebar">
+
+  <div class="toc-section">
+    <span class="toc-heading">Overview</span>
+    <a href="#introduction" class="toc-link">Introduction</a>
+    <a href="#highlights" class="toc-link">Highlights</a>
+    <a href="#download" class="toc-link">Download &amp; Installation</a>
+    <a href="#getting-started" class="toc-link">Getting Started</a>
+    <a href="#features" class="toc-link">Features</a>
+  </div>
+
+  <div class="toc-section">
+    <span class="toc-heading">EPX Protocol</span>
+    <a href="#epx" class="toc-link">What it is</a>
+    <a href="#epx-wire" class="toc-link toc-child">Wire Protocol</a>
+    <a href="#epx-limits" class="toc-link toc-child">Safety Limits</a>
+    <a href="#epx-compat" class="toc-link toc-child">Backward Compatibility</a>
+  </div>
+
+  <div class="toc-section">
+    <span class="toc-heading">Friends</span>
+    <a href="#friends" class="toc-link">Ember Friends</a>
+    <a href="#friends-features" class="toc-link toc-child">Features</a>
+    <a href="#friends-privacy" class="toc-link toc-child">Privacy</a>
+  </div>
+
+  <div class="toc-section">
+    <span class="toc-heading">Network</span>
+    <a href="#network" class="toc-link">Network Compatibility</a>
+    <a href="#ports" class="toc-link">Port Forwarding</a>
+    <a href="#highid" class="toc-link">High ID vs Low ID</a>
+  </div>
+
+  <div class="toc-section">
+    <span class="toc-heading">Technical</span>
+    <a href="#tech-stack" class="toc-link">Tech Stack</a>
+    <a href="#developers" class="toc-link">For Developers</a>
+  </div>
+
+  <div class="toc-section">
+    <span class="toc-heading">Support</span>
+    <a href="#faq" class="toc-link">FAQ</a>
+    <a href="#support" class="toc-link">Report an Issue</a>
+  </div>
+
+</aside>
+
+<!-- Main Content -->
+<div class="layout">
+<main class="main" id="top">
+
+  <!-- Introduction -->
+  <section id="introduction">
+    <h1>Ember</h1>
+    <p>A modern, open-source P2P file sharing client built on the <strong>eMule KAD network</strong>. Ground-up rewrite with Rust &amp; Tauri for speed, safety, and simplicity.</p>
+
+    <div class="promise-row">
+      <div class="promise-item">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+        No Spyware
+      </div>
+      <div class="promise-item">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+        No Ads
+      </div>
+      <div class="promise-item">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+        No Nonsense
+      </div>
+      <div class="promise-item">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+        GPLv3 Licensed
+      </div>
+    </div>
+
+    <p>Ember is not a fork or reskin of eMule. It is a complete reimplementation of the eMule protocol stack in safe Rust, paired with a lightweight Tauri + Svelte shell. It speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.), participates in the same network, finds the same sources, and respects the same credit system. Ember also automatically connects to the eMule Security server for ED2K peer exchange while downloading, requiring no configuration.</p>
+    <p>Ember also introduces <a href="#epx">EPX (Ember Peer Exchange)</a>, an Ember-exclusive extension that accelerates source discovery between Ember peers without affecting compatibility with other clients.</p>
+  </section>
+
+  <hr>
+
+  <!-- Highlights -->
+  <section id="highlights">
+    <h2>Highlights</h2>
+    <div class="highlight-grid">
+      <div class="hl-card">
+        <div class="hl-icon">&#x1F9F1;</div>
+        <h4>Modern Foundation</h4>
+        <p>Built in Rust with Tokio async networking. No buffer overflows, no dangling pointers, no data races. The entire protocol stack runs in safe, memory-managed code.</p>
+      </div>
+      <div class="hl-card">
+        <div class="hl-icon">&#x1F310;</div>
+        <h4>Full Protocol Compliance</h4>
+        <p>Wire-compatible with eMule 0.50a and the broader eMule ecosystem. KAD v8/v9, automatic ED2K peer exchange, credits, SecIdent, obfuscation, and AICH all work out of the box.</p>
+      </div>
+      <div class="hl-card">
+        <div class="hl-icon">&#x1F504;</div>
+        <h4>EPX Source Exchange</h4>
+        <p>Ember peers share compact source lists with each other for faster downloads. Non-Ember clients silently ignore the extension&mdash;zero compatibility impact.</p>
+      </div>
+      <div class="hl-card">
+        <div class="hl-icon">&#x1F50D;</div>
+        <h4>Advanced Search</h4>
+        <p>Multi-tab keyword search with type, size, source, and extension filters. Built-in spam detection with configurable profiles surfaces quality results.</p>
+      </div>
+      <div class="hl-card">
+        <div class="hl-icon">&#x1F6E1;</div>
+        <h4>Security &amp; Privacy</h4>
+        <p>RC4 protocol obfuscation, IP filtering with automatic updates and configurable incoming filter for VPN compatibility, private IP blocking, path traversal protection, and strict CSP headers.</p>
+      </div>
+      <div class="hl-card">
+        <div class="hl-icon">&#x26A1;</div>
+        <h4>Lightweight Shell</h4>
+        <p>Tauri v2 produces a small, fast desktop app (~15 MB installed) without bundling a full browser engine. Responsive UI powered by Svelte 5.</p>
+      </div>
+      <div class="hl-card">
+        <div class="hl-icon">&#x1F4E6;</div>
+        <h4>Smart Transfers</h4>
+        <p>Multi-source downloading with intelligent source management, real-time progress, health monitoring, queue tracking, and archive recovery.</p>
+      </div>
+      <div class="hl-card">
+        <div class="hl-icon">&#x1F4DA;</div>
+        <h4>Library Management</h4>
+        <p>Virtual-scrolling tables that handle thousands of files. Sort, filter, bulk-edit priorities, add comments and ratings, and create collections.</p>
+      </div>
+      <div class="hl-card">
+        <div class="hl-icon">&#x1F465;</div>
+        <h4>Ember Friends</h4>
+        <p>Add other Ember users as friends by sharing your Friend ID. Ember finds them instantly through its rendezvous server. Once mutual, enjoy real-time online status, direct chat, remote file browsing, and priority upload slots.</p>
+      </div>
+    </div>
+  </section>
+
+  <hr>
+
+  <!-- Download & Installation -->
+  <section id="download">
+    <h2>Download &amp; Installation</h2>
+
+    <div class="download-box">
+      <img src="icon.png" alt="Ember" width="80" height="80" style="border-radius: 16px; margin-bottom: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.12);">
+      <h3>Get Ember</h3>
+      <p>Download the latest release from GitHub.</p>
+      <div class="btn-group">
+        <a href="https://github.com/untaimed18/Ember-KAD/releases/latest" class="btn btn-primary" target="_blank" rel="noopener">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Download for Windows
+        </a>
+        <a href="https://github.com/untaimed18/Ember-KAD" class="btn btn-secondary" target="_blank" rel="noopener">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          View Source
+        </a>
+      </div>
+    </div>
+
+    <h3>Supported Operating Systems</h3>
+    <p>Windows 10 and Windows 11.</p>
+
+    <h3>Requirements</h3>
+    <p>No external runtimes needed. No Java, no .NET, no browser engine download. Ember ships everything it needs in a single installer.</p>
+  </section>
+
+  <hr>
+
+  <!-- Getting Started -->
+  <section id="getting-started">
+    <h2>Getting Started</h2>
+
+    <ol class="steps-list">
+      <li>
+        <strong>Install</strong><br>
+        <span style="color: var(--text-secondary)">Download the latest release from the <a href="https://github.com/untaimed18/Ember-KAD/releases" target="_blank" rel="noopener">Releases page</a> and run the installer.</span>
+      </li>
+      <li>
+        <strong>Setup Wizard</strong><br>
+        <span style="color: var(--text-secondary)">On first launch, the Setup Wizard walks you through essential settings &mdash; nickname, download folder, ports, speed limits, KAD auto-connect, and theme.</span>
+      </li>
+      <li>
+        <strong>Connect</strong><br>
+        <span style="color: var(--text-secondary)">Ember automatically connects to the KAD network on launch. It also connects to the eMule Security server for ED2K peer exchange automatically while downloading &mdash; no configuration needed.</span>
+      </li>
+      <li>
+        <strong>Share &amp; Download</strong><br>
+        <span style="color: var(--text-secondary)">Add folders to your library, search for files across the network, and start downloading. Ember handles multi-source transfers, queue management, and source discovery automatically.</span>
+      </li>
+    </ol>
+
+    <div class="callout">
+      <p><strong>Tip:</strong> For best performance (High ID), forward your TCP and UDP ports on your router or enable UPnP in Settings &gt; Network. See the <a href="#highid">High ID vs Low ID</a> section for details.</p>
+    </div>
+  </section>
+
+  <hr>
+
+  <!-- Features -->
+  <section id="features">
+    <h2>Features</h2>
+
+    <h3>Networking</h3>
+    <ul>
+      <li><strong>KAD Network &amp; ED2K Peer Exchange</strong> &mdash; Connect to the decentralized KAD DHT for peer discovery and search. Automatically connects to the eMule Security server for ED2K peer exchange while downloading.</li>
+      <li><strong>EPX Source Exchange</strong> &mdash; Ember peers share source lists with each other for faster downloads. Non-Ember clients are unaffected.</li>
+      <li><strong>NAT Traversal</strong> &mdash; UPnP automatic port mapping, firewall detection, and KAD buddy relay for LowID peers.</li>
+      <li><strong>Protocol Obfuscation</strong> &mdash; RC4-based TCP and UDP header encryption to help with ISP throttling.</li>
+    </ul>
+
+    <h3>Transfers</h3>
+    <ul>
+      <li><strong>Multi-Source Downloads</strong> &mdash; Download from multiple peers simultaneously with part-level hash verification, automatic source rotation, and queue management.</li>
+      <li><strong>Transfer Monitoring</strong> &mdash; Real-time progress bars, per-source detail drawers, upload tracking, health indicators, and archive recovery.</li>
+      <li><strong>AICH</strong> &mdash; Advanced Intelligent Corruption Handling for part-level hash verification and recovery.</li>
+    </ul>
+
+    <h3>Search &amp; Library</h3>
+    <ul>
+      <li><strong>Advanced Search</strong> &mdash; Multi-tab keyword search with type, size, source, and extension filters.</li>
+      <li><strong>Spam Detection</strong> &mdash; Built-in spam detection with balanced and aggressive profiles. Configurable spam threshold and automatic result hiding.</li>
+      <li><strong>Library Management</strong> &mdash; Virtual-scrolling tables that handle thousands of files. Sort, filter, bulk-edit priorities, and create collections.</li>
+      <li><strong>Comments &amp; Ratings</strong> &mdash; Add metadata to your shared files for other peers to see.</li>
+    </ul>
+
+    <h3>Social</h3>
+    <ul>
+      <li><strong>Ember Friends</strong> &mdash; Ember-exclusive friend system powered by a rendezvous server for instant discovery. Add other Ember users by their Friend ID, exchange friend requests, and once mutual enjoy real-time online status, direct chat, remote file browsing, and priority upload slots. See the <a href="#friends">Friends section</a> for details.</li>
+      <li><strong>Credits &amp; SecIdent</strong> &mdash; RSA-based Secure Identification prevents credit theft. Upload priority follows the standard credit ratio formula.</li>
+    </ul>
+
+    <h3>Security</h3>
+    <ul>
+      <li><strong>IP Filtering</strong> &mdash; Load ipfilter.dat / ipfilter.zip with automatic update support. Incoming connection filtering is off by default because VPN IP ranges commonly appear in ipfilter.dat hosting blocks, silently blocking legitimate peers. Outbound filtering remains active regardless of this setting.</li>
+      <li><strong>Private IP Blocking</strong> &mdash; Prevents connections to reserved IP ranges.</li>
+      <li><strong>Content Security Policy</strong> &mdash; Strict CSP headers in the Tauri webview.</li>
+      <li><strong>Path Traversal Protection</strong> &mdash; Sanitized file paths prevent directory escape attacks.</li>
+    </ul>
+
+    <h3>User Experience</h3>
+    <ul>
+      <li><strong>First-Time Setup Wizard</strong> &mdash; Guided configuration on first launch: nickname, download folder, ports, speed limits, KAD auto-connect, and theme.</li>
+      <li><strong>Clean UI</strong> &mdash; Modern, responsive interface with real-time transfer monitoring and inline search filtering.</li>
+      <li><strong>Statistics</strong> &mdash; Session and cumulative transfer statistics, connection uptime, and network health indicators.</li>
+      <li><strong>GeoIP</strong> &mdash; Country identification for connected peers via bundled MaxMind DB.</li>
+    </ul>
+  </section>
+
+  <hr>
+
+  <!-- EPX -->
+  <section id="epx">
+    <h2>EPX &mdash; Ember Peer Exchange</h2>
+
+    <p>EPX is an Ember-exclusive extension to the eMule protocol that accelerates source discovery between Ember peers. It is the primary differentiator that makes downloads faster when multiple Ember clients are present on the network.</p>
+
+    <h3>How it works</h3>
+    <p>When two Ember clients connect (during a download or upload), they exchange compact lists of the files they are currently downloading along with the sources they know about for each file. If the receiving peer is downloading one of those files, it immediately gains new sources it may not have found through KAD or ED2K peer exchange alone.</p>
+
+    <div class="callout-info callout">
+      <p><strong>Key point:</strong> EPX only activates between confirmed Ember peers. Detection uses the <code>ET_MOD_VERSION</code> tag (must start with "Ember") and the Ember capability bit in <code>CT_EMULE_MISCOPTIONS2</code>.</p>
+    </div>
+
+    <h3 id="epx-wire">Wire Protocol</h3>
+    <p>EPX uses opcode <code>0xF0</code> on the eMule extended protocol (<code>OP_EMULEPROT</code>). The current version is <strong>v3</strong>. The payload format:</p>
+    <pre><code>version       (1 byte, currently 0x03)
+file_count    (u16 LE)
+  for each file:
+    ed2k_hash   (16 bytes)
+    file_size   (u64 LE)
+    file_flags  (u8, bit 0 = has AICH root hash)
+    aich_root   (20 bytes, only present if bit 0 of file_flags is set)
+    source_count (u16 LE)
+      for each source:
+        ipv4      (4 bytes, network order)
+        tcp_port  (u16 LE)
+        udp_port  (u16 LE)
+        flags     (u8, bit 0 = firewalled, bit 1 = obfuscation)
+peer_count    (u16 LE)
+  for each peer:
+    ipv4      (4 bytes, network order)
+    tcp_port  (u16 LE)</code></pre>
+    <p>v3 additions over v2: per-file AICH root hashes for corruption recovery, UDP port and capability flags per source, and a peer discovery section for Ember mesh building. v2 payloads are still accepted.</p>
+
+    <h3 id="epx-limits">Safety Limits</h3>
+    <p>These caps prevent abuse from poisoned or malicious payloads. Private/reserved IPs and zero-port entries are silently dropped.</p>
+
+    <table class="doc-table">
+      <thead>
+        <tr><th>Limit</th><th>Value</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Max files per packet</td><td>200</td></tr>
+        <tr><td>Max sources per file</td><td>100</td></tr>
+        <tr><td>Max payload size</td><td>64 KB</td></tr>
+        <tr><td>Max packets per TCP connection</td><td>3</td></tr>
+        <tr><td>Max total sources per event</td><td>2,000</td></tr>
+      </tbody>
+    </table>
+
+    <h3 id="epx-compat">Backward Compatibility</h3>
+    <p>Non-Ember eMule clients silently ignore the <code>0xF0</code> opcode &mdash; it causes no errors, disconnects, or side effects. EPX is only sent to confirmed Ember peers, and the extension uses a dedicated capability bit so it can never be accidentally triggered.</p>
+  </section>
+
+  <hr>
+
+  <!-- Friends -->
+  <section id="friends">
+    <h2>Friends &mdash; Ember-Exclusive Social</h2>
+
+    <p>Ember includes a built-in friend system that works exclusively between Ember users. It is powered by a separate cryptographic identity called the <strong>Ember Hash</strong> (also known as your <strong>Friend ID</strong>), which is distinct from the standard ed2k <code>user_hash</code> used for protocol operations and credits.</p>
+
+    <h3>How it works</h3>
+    <p>Each Ember client generates a unique 16-byte Ember Hash on first launch. This hash serves as your <strong>Friend ID</strong> &mdash; share it with someone and they can find you on the network instantly.</p>
+    <p>Friend discovery is powered by a lightweight <strong>rendezvous server</strong>. When you connect, Ember registers your presence (a SHA-256 hash of your Friend ID &mdash; never the raw ID) with the server. When you search for a friend, Ember queries the server for their hashed ID and gets back their IP and port for a direct connection. The entire lookup takes about 100ms.</p>
+    <p>Once a friend is found, Ember opens a direct TCP connection for the friend request. After both sides accept, a persistent session is established for chat, file browsing, and priority uploads.</p>
+
+    <div class="callout-info callout">
+      <p><strong>Ember-only:</strong> The friend system is completely invisible to non-Ember clients. It uses a separate identity hash, a dedicated rendezvous server, and dedicated protocol tags that other eMule clients silently ignore.</p>
+    </div>
+
+    <h3 id="friends-features">Features</h3>
+    <ul>
+      <li><strong>Add by Friend ID</strong> &mdash; Share your Friend ID with another user (displayed on the Friends page) and add theirs. Ember finds them through the rendezvous server and sends a friend request.</li>
+      <li><strong>Mutual Friend Requests</strong> &mdash; The recipient sees an incoming request notification on the Friends page and can accept or reject it. Chat, file browsing, and priority upload features only activate once both sides have accepted.</li>
+      <li><strong>Real-Time Online Status</strong> &mdash; Ember detects when a friend comes online and shows a live online/offline indicator on their card.</li>
+      <li><strong>Direct Messaging</strong> &mdash; Send and receive chat messages with mutual friends through a slide-out sidebar. Messages are stored locally for conversation history.</li>
+      <li><strong>Remote File Browsing</strong> &mdash; Browse a mutual friend&rsquo;s shared file library while they are online and start downloads directly from the browse results.</li>
+      <li><strong>Priority Upload Slots</strong> &mdash; Mutual friends automatically receive priority in your upload queue, giving them faster access to your shared files.</li>
+      <li><strong>Discoverable Banner</strong> &mdash; The Friends page shows a confirmation banner when your Friend ID is registered and discoverable on the network.</li>
+    </ul>
+
+    <h3 id="friends-privacy">Privacy</h3>
+    <p>The rendezvous server only stores SHA-256 hashes of Friend IDs paired with IP and port &mdash; it never sees raw Friend IDs. Entries expire automatically after 5 minutes without a heartbeat. The Ember Hash is also exchanged between peers during the EmuleInfo handshake, but only to other Ember clients.</p>
+  </section>
+
+  <hr>
+
+  <!-- Network Compatibility -->
+  <section id="network">
+    <h2>Network Compatibility</h2>
+    <p>Ember is a first-class citizen of the eMule network. It implements the full protocol suite required to participate alongside every other eMule-family client.</p>
+
+    <table class="doc-table">
+      <thead>
+        <tr><th>Protocol</th><th>Details</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>KAD (Kademlia DHT)</strong></td>
+          <td>KAD v8/v9 for decentralized peer and file discovery, firewall checks, buddy relay for firewalled peers, keyword publishing, and note publishing.</td>
+        </tr>
+        <tr>
+          <td><strong>ED2K Peer Exchange</strong></td>
+          <td>Automatically connects to the eMule Security server while downloading for peer connection and source finding. No manual server configuration required.</td>
+        </tr>
+        <tr>
+          <td><strong>Credits &amp; SecIdent</strong></td>
+          <td>eMule credit system with RSA-based Secure Identification to prevent credit theft. Upload priority determined by the standard credit ratio formula.</td>
+        </tr>
+        <tr>
+          <td><strong>Obfuscation</strong></td>
+          <td>RC4-based TCP and UDP header encryption matching eMule&rsquo;s implementation, helping with ISP throttling.</td>
+        </tr>
+        <tr>
+          <td><strong>AICH</strong></td>
+          <td>Advanced Intelligent Corruption Handling for part-level hash verification and recovery.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <hr>
+
+  <!-- Port Forwarding -->
+  <section id="ports">
+    <h2>Port Forwarding</h2>
+    <p>Ember uses two ports for peer communication. Both are configurable in <strong>Settings &gt; Network</strong>.</p>
+
+    <table class="doc-table">
+      <thead>
+        <tr><th>Port</th><th>Protocol</th><th>Purpose</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>4662</td><td>TCP</td><td>Peer-to-peer file transfers</td></tr>
+        <tr><td>4672</td><td>UDP</td><td>KAD DHT communication</td></tr>
+      </tbody>
+    </table>
+
+    <p>For best performance (High ID), forward both ports on your router or enable <strong>UPnP</strong> in Settings to have Ember map them automatically.</p>
+
+    <div class="callout">
+      <p><strong>UPnP:</strong> When enabled, Ember uses the IGD protocol to automatically request port mappings from your router. This works with most consumer routers and is the easiest path to High ID.</p>
+    </div>
+  </section>
+
+  <hr>
+
+  <!-- High ID vs Low ID -->
+  <section id="highid">
+    <h2>High ID vs Low ID</h2>
+
+    <p>An ID is a value calculated from the client's IP address and assigned by the ED2K server when Ember connects for peer exchange. It indicates whether proper bidirectional communication is possible.</p>
+
+    <h3>High ID</h3>
+    <p>A High ID means your connection port is open and freely accessible from the internet. Your client is fully reachable by others. This is the optimal state.</p>
+
+    <h3>Low ID</h3>
+    <p>A Low ID means your connection port is blocked or cannot be reached, typically caused by firewalls, routers, or NAT. Any ID value less than <strong>16,777,216</strong> is considered a Low ID.</p>
+
+    <h3>Disadvantages of a Low ID</h3>
+    <ul>
+      <li><strong>Peer Routing</strong> &mdash; Since your IP is not directly reachable, all requests must be routed through the server, increasing overhead.</li>
+      <li><strong>Reduced Sources</strong> &mdash; Two Low ID clients cannot connect to each other, leading to fewer available sources.</li>
+      <li><strong>Lost Messages</strong> &mdash; On busy servers, messages can get lost, causing missed queue progression and slower downloads.</li>
+    </ul>
+
+    <div class="callout-info callout">
+      <p><strong>Note:</strong> The ID only affects control message exchange. Actual data transfer is still handled client-to-client. If your ID is High, there are no extra advantages to a higher numeric value.</p>
+    </div>
+
+    <h3>Troubleshooting Low ID</h3>
+    <p>If you're stuck with a Low ID despite correct settings:</p>
+    <ul>
+      <li>Verify that ports 4662 (TCP) and 4672 (UDP) are forwarded on your router.</li>
+      <li>Check that your OS firewall allows Ember through on both protocols.</li>
+      <li>Restart Ember to reconnect to the ED2K server.</li>
+      <li>Enable UPnP in Settings &gt; Network for automatic port mapping.</li>
+      <li>If behind CGNAT (common with mobile/ISP connections), High ID may not be achievable without a VPN or tunneling solution.</li>
+    </ul>
+  </section>
+
+  <hr>
+
+  <!-- Tech Stack -->
+  <section id="tech-stack">
+    <h2>Tech Stack</h2>
+
+    <table class="doc-table">
+      <thead>
+        <tr><th>Layer</th><th>Technology</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Frontend</td><td>Svelte 5 + TypeScript + Vite</td></tr>
+        <tr><td>App Shell</td><td>Tauri v2</td></tr>
+        <tr><td>Backend</td><td>Rust (2021 edition)</td></tr>
+        <tr><td>Database</td><td>SQLite via rusqlite</td></tr>
+        <tr><td>Networking</td><td>Tokio async runtime</td></tr>
+        <tr><td>Friend Discovery</td><td>Rendezvous server (Axum on Fly.io)</td></tr>
+        <tr><td>GeoIP</td><td>MaxMind DB (dbip-country-lite)</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <hr>
+
+  <!-- For Developers -->
+  <section id="developers">
+    <h2>For Developers</h2>
+
+    <h3>Prerequisites</h3>
+    <ul>
+      <li><a href="https://rustup.rs/" target="_blank" rel="noopener">Rust</a> (1.75+)</li>
+      <li><a href="https://nodejs.org/" target="_blank" rel="noopener">Node.js</a> (18+)</li>
+      <li><strong>Windows:</strong> Visual Studio Build Tools with C++ workload</li>
+    </ul>
+
+    <h3>Development</h3>
+    <pre><code># Install dependencies
+npm install
+
+# Run in development mode
+npm run tauri dev
+
+# Build for production
+npm run tauri build</code></pre>
+    <p>The production build produces an NSIS installer in <code>src-tauri/target/release/bundle/</code>.</p>
+
+    <h3>Project Structure</h3>
+    <table class="doc-table">
+      <thead>
+        <tr><th>Directory</th><th>Description</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>src/</code></td><td>Svelte frontend (components, stores, views)</td></tr>
+        <tr><td><code>src-tauri/src/</code></td><td>Rust backend (protocol stack, networking, storage)</td></tr>
+        <tr><td><code>src-tauri/Cargo.toml</code></td><td>Rust dependencies</td></tr>
+        <tr><td><code>docs/</code></td><td>This documentation site</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Contributing</h3>
+    <p>Ember is licensed under the GPLv3 and welcomes contributions. Visit the <a href="https://github.com/untaimed18/Ember-KAD" target="_blank" rel="noopener">GitHub repository</a> to open issues, submit pull requests, or review the codebase.</p>
+  </section>
+
+  <hr>
+
+  <!-- FAQ -->
+  <section id="faq">
+    <h2>FAQ</h2>
+
+    <div class="faq-item">
+      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+        Is Ember compatible with regular eMule clients?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Yes. Ember speaks the same KAD wire protocol as eMule 0.50a and compatible clients (aMule, eMule Xtreme, etc.). It participates in the same network, finds the same sources, and respects the same credit system. It also automatically connects to the eMule Security server for ED2K peer exchange while downloading. The EPX extension is only activated between Ember peers and is silently ignored by other clients.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+        What is EPX and do I need it?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">EPX (Ember Peer Exchange) is an Ember-exclusive extension that lets Ember peers share source lists with each other, speeding up source discovery. It activates automatically when two Ember clients connect &mdash; no configuration needed. It has zero impact on non-Ember clients.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+        Is ED2K Low ID the same as KAD Firewalled?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">No. ED2K High/Low ID is assigned when Ember connects to the eMule Security server and reflects TCP reachability. KAD Open/Firewalled is KAD's independent assessment of UDP reachability. You can have a High ID on ED2K while being Firewalled on KAD if only your TCP port is open but UDP is blocked.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+        How do I get High ID?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Forward ports 4662 (TCP) and 4672 (UDP) on your router, or enable UPnP in Ember's network settings. Make sure your OS firewall also allows Ember through. If you're behind CGNAT (common with some ISPs and mobile connections), achieving High ID may not be possible without a VPN.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+        How do Friends work? Can I add non-Ember users?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Friends are an Ember-exclusive feature. Each Ember client has a unique Friend ID (shown on the Friends page) that you share with other Ember users. Add their Friend ID, and Ember instantly finds them through its rendezvous server and sends a friend request. Once both sides accept, the friendship becomes mutual and activates online status, chat, file browsing, and priority uploads. Non-Ember clients do not have a Friend ID and cannot participate in the friend system.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+        What are credits and how do they work?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Credits reward users who upload. The transferred amount of data determines the credit you are given with a particular client. They are not global &mdash; they only apply on the client who granted them. Credits are a major modifier when calculating how fast you advance through other users' upload queues. Ember uses RSA-based Secure Identification (SecIdent) to prevent credit theft.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+        Does Ember work on macOS or Linux?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Currently, official releases are Windows-only (Windows 10/11). However, the underlying stack (Tauri + Rust) is cross-platform, and community builds for other platforms may become available in the future.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+        Is Ember open source?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Yes. Ember is released under the GNU General Public License v3 (GPLv3). The full source code is available on <a href="https://github.com/untaimed18/Ember-KAD" target="_blank" rel="noopener">GitHub</a>. This means anyone can use, modify, and distribute it, but derivative works must also be released under the same license.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" onclick="this.parentElement.classList.toggle('open')">
+        Is Ember a fork of eMule?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">No. Ember is a complete ground-up rewrite of the eMule protocol stack in Rust, not a fork or modification of the original C++ codebase. It implements the same protocols from scratch to ensure compatibility while using modern, memory-safe code.</div>
+    </div>
+  </section>
+
+  <hr>
+
+  <!-- Support -->
+  <section id="support">
+    <h2>Support</h2>
+
+    <h3>Report an Issue</h3>
+    <p>To report a bug or suggest an improvement, please use the <a href="https://github.com/untaimed18/Ember-KAD/issues" target="_blank" rel="noopener">GitHub Issues</a> page.</p>
+
+    <h4>What to include in a good report</h4>
+    <ul>
+      <li>The exact Ember version (shown in the About dialog).</li>
+      <li>Your Windows version.</li>
+      <li>Clear step-by-step instructions that reproduce the problem.</li>
+      <li>What you expected to happen and what actually happened instead.</li>
+      <li>Relevant screenshots or log excerpts if applicable.</li>
+    </ul>
+
+    <h3>Community &amp; Source Code</h3>
+    <p>Visit the <a href="https://github.com/untaimed18/Ember-KAD" target="_blank" rel="noopener">Ember GitHub repository</a> to browse source code, review open issues, or contribute. Ember is GPLv3-licensed and contributions are welcome.</p>
+  </section>
+
+</main>
+</div>
+
+<!-- Footer -->
+<footer class="site-footer">
+  <div>&copy; 2025&ndash;2026 Ember. Released under the GPLv3 License.</div>
+  <div class="footer-links">
+    <a href="https://github.com/untaimed18/Ember-KAD" target="_blank" rel="noopener">GitHub</a>
+    <a href="https://github.com/untaimed18/Ember-KAD/releases" target="_blank" rel="noopener">Releases</a>
+    <a href="https://github.com/untaimed18/Ember-KAD/issues" target="_blank" rel="noopener">Issues</a>
+  </div>
+</footer>
+
+<!-- Back to Top -->
+<button class="back-to-top" id="backToTop" onclick="window.scrollTo({top:0})" aria-label="Back to top">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="18 15 12 9 6 15"/></svg>
+</button>
+
+<script>
+(function() {
+  window.toggleSidebar = function() {
+    document.getElementById('sidebar').classList.toggle('open');
+    document.getElementById('overlay').classList.toggle('open');
+  };
+
+  document.querySelectorAll('.toc-link').forEach(function(link) {
+    link.addEventListener('click', function() {
+      document.getElementById('sidebar').classList.remove('open');
+      document.getElementById('overlay').classList.remove('open');
+    });
+  });
+
+  var tocLinks = document.querySelectorAll('.toc-link');
+  var sections = [];
+  tocLinks.forEach(function(link) {
+    var href = link.getAttribute('href');
+    if (href && href.startsWith('#')) {
+      var el = document.getElementById(href.slice(1));
+      if (el) sections.push({ el: el, link: link });
+    }
+  });
+
+  function updateActive() {
+    var scrollY = window.scrollY + 80;
+    var active = null;
+    for (var i = sections.length - 1; i >= 0; i--) {
+      if (sections[i].el.offsetTop <= scrollY) {
+        active = sections[i].link;
+        break;
+      }
+    }
+    tocLinks.forEach(function(l) { l.classList.remove('active'); });
+    if (active) active.classList.add('active');
+  }
+
+  var btt = document.getElementById('backToTop');
+  function updateBTT() {
+    if (window.scrollY > 400) btt.classList.add('visible');
+    else btt.classList.remove('visible');
+  }
+
+  window.addEventListener('scroll', function() {
+    updateActive();
+    updateBTT();
+  }, { passive: true });
+
+  updateActive();
+  updateBTT();
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,105 @@
+use std::path::PathBuf;
+
+use tauri::Manager;
+use tracing::info;
+
+use crate::types::AppSettings;
+
+pub struct AppConfig {
+    pub settings: AppSettings,
+    config_path: PathBuf,
+}
+
+impl AppConfig {
+    pub fn load(app_handle: &tauri::AppHandle) -> anyhow::Result<Self> {
+        let app_dir = app_handle
+            .path()
+            .app_data_dir()
+            .map_err(|e| anyhow::anyhow!("Failed to get app data dir: {e}"))?;
+
+        std::fs::create_dir_all(&app_dir)?;
+        let config_path = app_dir.join("config.json");
+
+        let config_existed = config_path.exists();
+        let mut settings = if config_existed {
+            let data = std::fs::read_to_string(&config_path)?;
+            match serde_json::from_str(&data) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Config file corrupt, using defaults: {e}");
+                    let bak = config_path.with_extension("json.bak");
+                    let _ = std::fs::rename(&config_path, &bak);
+                    AppSettings::default()
+                }
+            }
+        } else {
+            AppSettings::default()
+        };
+
+        let mut config_changed = false;
+
+        // Existing users who upgrade to a version with the wizard should skip it.
+        // Only applies when a real config file existed on disk (not a fresh install).
+        if config_existed && !settings.setup_complete {
+            settings.setup_complete = true;
+            config_changed = true;
+        }
+
+        // Migrate: old configs pointed download_folder directly at the user's
+        // Downloads dir.  It should be a Ember subfolder so we don't pollute it.
+        if !settings.download_folder.is_empty() {
+            let dl = std::path::Path::new(&settings.download_folder);
+            if dl.file_name().map(|n| n != "Ember").unwrap_or(false) {
+                let migrated = dl.join("Ember").to_string_lossy().to_string();
+                tracing::info!("Migrating download_folder: {} -> {}", settings.download_folder, migrated);
+                settings.download_folder = migrated;
+                config_changed = true;
+            }
+        }
+
+        if !settings.download_folder.is_empty() {
+            let completed_path = std::path::Path::new(&settings.download_folder).join("Downloads");
+            let completed_dir = completed_path.to_string_lossy().to_string();
+            let already_shared = settings.shared_folders.iter().any(|f| {
+                let a = std::path::Path::new(f);
+                let b = &completed_path;
+                a == b || a.canonicalize().ok().zip(b.canonicalize().ok()).map_or(false, |(ca, cb)| ca == cb)
+            });
+            if !already_shared {
+                tracing::info!("Adding default shared folder: {completed_dir}");
+                settings.shared_folders.push(completed_dir);
+                config_changed = true;
+            }
+        }
+
+        if config_changed {
+            let data = serde_json::to_string_pretty(&settings)?;
+            let tmp = config_path.with_extension("json.tmp");
+            std::fs::write(&tmp, &data)?;
+            std::fs::rename(&tmp, &config_path)?;
+        }
+
+        info!("Config loaded from {}", config_path.display());
+        Ok(Self {
+            settings,
+            config_path,
+        })
+    }
+
+    /// Serialize settings to JSON and return the data + path for async writing.
+    /// This lets the caller drop the RwLock before doing file I/O.
+    pub fn prepare_save(&self) -> anyhow::Result<(String, std::path::PathBuf, std::path::PathBuf)> {
+        let data = serde_json::to_string_pretty(&self.settings)?;
+        let tmp_path = self.config_path.with_extension(format!("json.{}.tmp", std::process::id()));
+        Ok((data, tmp_path, self.config_path.clone()))
+    }
+
+    /// Blocking file write -- call this OUTSIDE of the RwLock.
+    pub fn write_to_disk(data: &str, tmp_path: &std::path::Path, final_path: &std::path::Path) -> anyhow::Result<()> {
+        std::fs::write(tmp_path, data)?;
+        crate::security::restrict_file_permissions(tmp_path);
+        std::fs::rename(tmp_path, final_path)?;
+        info!("Config saved");
+        Ok(())
+    }
+}

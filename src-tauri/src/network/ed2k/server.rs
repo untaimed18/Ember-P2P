@@ -1,0 +1,1577 @@
+use std::io::{self, Cursor, Read};
+use std::net::SocketAddr;
+
+use byteorder::{LittleEndian, ReadBytesExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tracing::{debug, info, warn};
+
+use super::messages::*;
+
+const SERVER_POLL_READABLE_TIMEOUT_MS: u64 = 5;
+const SERVER_POLL_PACKET_TIMEOUT_SECS: u64 = 1;
+
+// Server protocol opcodes (OP_EDONKEYHEADER)
+pub const OP_LOGINREQUEST: u8 = 0x01;
+pub const OP_SERVERMESSAGE: u8 = 0x38;
+pub const OP_SERVERLIST: u8 = 0x32;
+pub const OP_SERVERSTATUS: u8 = 0x34;
+pub const OP_IDCHANGE: u8 = 0x40;
+pub const OP_SERVERIDENT: u8 = 0x41;
+pub const OP_SEARCHREQUEST: u8 = 0x16;
+pub const OP_SEARCHRESULT: u8 = 0x33;
+pub const OP_GETSOURCES: u8 = 0x19;
+pub const OP_FOUNDSOURCES: u8 = 0x42;
+#[allow(dead_code)]
+pub const OP_GETSERVERLIST: u8 = 0x14;
+pub const OP_REJECT: u8 = 0x05;
+pub const OP_OFFERFILES: u8 = 0x15;
+pub const OP_CALLBACKREQUEST: u8 = 0x1C;
+pub const OP_CALLBACKREQUESTED: u8 = 0x35;
+pub const OP_CALLBACK_FAIL: u8 = 0x36;
+pub const OP_GETSOURCES_OBFU: u8 = 0x23;
+pub const OP_FOUNDSOURCES_OBFU: u8 = 0x44;
+pub const OP_QUERY_MORE_RESULT: u8 = 0x21;
+
+/// SRV_TCPFLG constants: server capability flags from OP_IDCHANGE (eMule Server.h)
+pub const SRV_TCPFLG_COMPRESSION: u32 = 0x0001;
+pub const SRV_TCPFLG_NEWTAGS: u32 = 0x0008;
+pub const SRV_TCPFLG_UNICODE: u32 = 0x0010;
+pub const SRV_TCPFLG_RELATEDSEARCH: u32 = 0x0040;
+pub const SRV_TCPFLG_TYPETAGINTEGER: u32 = 0x0080;
+pub const SRV_TCPFLG_LARGEFILES: u32 = 0x0100;
+pub const SRV_TCPFLG_TCPOBFUSCATION: u32 = 0x0400;
+
+/// LowID threshold: client_id < this means LowID
+pub const LOWID_THRESHOLD: u32 = 0x0100_0000;
+
+/// A file to offer to the ed2k server via OP_OFFERFILES.
+pub struct OfferFile {
+    pub hash: [u8; 16],
+    pub name: String,
+    pub size: u64,
+    pub is_complete: bool,
+    pub file_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerSearchResult {
+    pub file_hash: [u8; 16],
+    pub client_id: u32,
+    pub client_port: u16,
+    pub file_name: String,
+    pub file_size: u64,
+    pub source_count: u32,
+    pub complete_source_count: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerSource {
+    pub ip: String,
+    pub port: u16,
+    /// LowID client_id from the server (0 = HighID, use ip:port directly)
+    pub client_id: u32,
+    pub crypt_options: Option<u8>,
+    pub user_hash: Option<[u8; 16]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServerSession {
+    pub client_id: u32,
+    pub server_flags: u32,
+    pub server_name: String,
+    pub user_count: u32,
+    pub file_count: u32,
+    /// Raw OP_SERVERLIST payload received during login (if any)
+    pub server_list_data: Option<Vec<u8>>,
+    /// MOTD messages received during login (for frontend display)
+    pub motd_messages: Vec<String>,
+    /// Server-reported public IP from OP_IDCHANGE (offset 12, if present).
+    pub server_reported_ip: u32,
+}
+
+enum ServerTransport {
+    Plain {
+        reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>,
+    },
+    Encrypted(super::server_crypt::ObfuscatedServerStream),
+}
+
+pub struct Ed2kServerConnection {
+    transport: ServerTransport,
+    pub session: Option<ServerSession>,
+}
+
+#[derive(Debug)]
+enum PollReadPacketResult {
+    Packet((u8, Vec<u8>)),
+    Idle,
+    Disconnected(io::Error),
+}
+
+fn classify_packet_read_result(
+    result: io::Result<(u8, Vec<u8>)>,
+    encrypted: bool,
+) -> PollReadPacketResult {
+    match result {
+        Ok(pkt) => PollReadPacketResult::Packet(pkt),
+        Err(e) => {
+            if encrypted {
+                warn!("Server packet read error (encrypted): {e}");
+            } else {
+                warn!("Server packet read error: {e}");
+            }
+            PollReadPacketResult::Disconnected(e)
+        }
+    }
+}
+
+fn packet_poll_timeout_result(encrypted: bool) -> PollReadPacketResult {
+    let mode = if encrypted { "encrypted" } else { "plain" };
+    warn!("Server poll read timed out mid-packet ({mode}), stream is corrupt — forcing disconnect");
+    PollReadPacketResult::Disconnected(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("mid-packet read timeout ({mode}), BufReader state corrupted"),
+    ))
+}
+
+impl Ed2kServerConnection {
+    pub async fn connect(addr: SocketAddr) -> anyhow::Result<Self> {
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            TcpStream::connect(addr),
+        )
+        .await??;
+        let _ = stream.set_nodelay(true);
+
+        let (reader, writer) = stream.into_split();
+        Ok(Self {
+            transport: ServerTransport::Plain {
+                reader: tokio::io::BufReader::new(reader),
+                writer: tokio::io::BufWriter::new(writer),
+            },
+            session: None,
+        })
+    }
+
+    pub async fn connect_encrypted(addr: SocketAddr) -> anyhow::Result<Self> {
+        let stream = super::server_crypt::connect_obfuscated(addr).await?;
+        Ok(Self {
+            transport: ServerTransport::Encrypted(stream),
+            session: None,
+        })
+    }
+
+    pub async fn login(
+        &mut self,
+        user_hash: &[u8; 16],
+        nickname: &str,
+        tcp_port: u16,
+    ) -> anyhow::Result<ServerSession> {
+        let is_encrypted = matches!(self.transport, ServerTransport::Encrypted(_));
+        let mut flags: u32 = SRVCAP_ZLIB | SRVCAP_NEWTAGS | SRVCAP_UNICODE | SRVCAP_LARGEFILES;
+        // Only advertise crypto preference when we're actually on an encrypted connection.
+        // Lugdunum servers close plain connections from clients that claim SRVCAP_REQUESTCRYPT,
+        // expecting them to reconnect on the obfuscation port.
+        if is_encrypted {
+            flags |= SRVCAP_SUPPORTCRYPT | SRVCAP_REQUESTCRYPT | SRVCAP_REQUIRECRYPT;
+        }
+        let payload = build_login_request(user_hash, tcp_port, nickname, flags);
+        info!("Sending OP_LOGINREQUEST ({} bytes, encrypted={}): port={}, flags=0x{:04X}",
+            payload.len(), is_encrypted, tcp_port, flags);
+
+        // Build the full wire packet: [protocol(1)][length(4)][opcode(1)][payload]
+        let mut wire_packet = Vec::with_capacity(6 + payload.len());
+        wire_packet.push(OP_EDONKEYHEADER);
+        let wire_len = u32::try_from(1 + payload.len())
+            .map_err(|_| anyhow::anyhow!("login packet too large"))?;
+        wire_packet.extend_from_slice(&wire_len.to_le_bytes());
+        wire_packet.push(OP_LOGINREQUEST);
+        wire_packet.extend_from_slice(&payload);
+
+        match &mut self.transport {
+            ServerTransport::Plain { writer, .. } => {
+                writer.write_all(&wire_packet).await?;
+                writer.flush().await?;
+            }
+            ServerTransport::Encrypted(stream) => {
+                stream.write_login(&wire_packet).await?;
+            }
+        }
+
+        let mut session = ServerSession {
+            client_id: 0,
+            server_flags: 0,
+            server_name: String::new(),
+            user_count: 0,
+            file_count: 0,
+            server_list_data: None,
+            motd_messages: Vec::new(),
+            server_reported_ip: 0,
+        };
+
+        let mut packets_read = 0u32;
+        let mut last_error: Option<String> = None;
+
+        for i in 0..50 {
+            let (opcode, payload) = match self.read_packet().await {
+                Ok(p) => p,
+                Err(e) => {
+                    info!("Server read error on packet {i}: kind={:?} msg={e}", e.kind());
+                    last_error = Some(format!("{} ({})", e, e.kind()));
+                    break;
+                }
+            };
+            packets_read += 1;
+
+            match opcode {
+                OP_SERVERMESSAGE => {
+                    if payload.len() >= 2 {
+                        let len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+                        if payload.len() >= 2 + len {
+                            let msg = String::from_utf8_lossy(&payload[2..2 + len]).to_string();
+                            info!("Server MOTD: {msg}");
+                            session.motd_messages.push(msg);
+                        }
+                    }
+                }
+                OP_IDCHANGE => {
+                    if payload.len() >= 4 {
+                        session.client_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                        if session.client_id == 0 {
+                            return Err(anyhow::anyhow!("server rejected login (client_id=0)"));
+                        }
+                        if payload.len() >= 8 {
+                            session.server_flags = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                            let f = session.server_flags;
+                            info!(
+                                "Server TCP flags: 0x{f:04X} [{}{}{}{}{}{}{}]",
+                                if f & SRV_TCPFLG_COMPRESSION != 0 { "zlib " } else { "" },
+                                if f & SRV_TCPFLG_NEWTAGS != 0 { "newtags " } else { "" },
+                                if f & SRV_TCPFLG_UNICODE != 0 { "unicode " } else { "" },
+                                if f & SRV_TCPFLG_RELATEDSEARCH != 0 { "relsearch " } else { "" },
+                                if f & SRV_TCPFLG_TYPETAGINTEGER != 0 { "typeint " } else { "" },
+                                if f & SRV_TCPFLG_LARGEFILES != 0 { "large " } else { "" },
+                                if f & SRV_TCPFLG_TCPOBFUSCATION != 0 { "obfu " } else { "" },
+                            );
+                        }
+                        if payload.len() >= 16 {
+                            let reported_ip = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
+                            if reported_ip >= LOWID_THRESHOLD {
+                                session.server_reported_ip = reported_ip;
+                            }
+                        }
+                        info!("Server assigned client ID: {}", session.client_id);
+                    }
+                    let ret = session.clone();
+                    self.session = Some(session);
+                    return Ok(ret);
+                }
+                OP_SERVERSTATUS => {
+                    if payload.len() >= 8 {
+                        session.user_count = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                        session.file_count = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                        debug!("Server status: {} users, {} files", session.user_count, session.file_count);
+                    }
+                }
+                OP_SERVERIDENT => {
+                    if let Some(name) = parse_server_ident_name(&payload) {
+                        session.server_name = name;
+                        debug!("Server name: {}", session.server_name);
+                    }
+                }
+                OP_SERVERLIST => {
+                    debug!("Got server list from server ({} bytes)", payload.len());
+                    session.server_list_data = Some(payload);
+                }
+                OP_REJECT => {
+                    anyhow::bail!("Server rejected login");
+                }
+                _ => {
+                    debug!("Login phase: ignoring opcode 0x{opcode:02X}");
+                }
+            }
+        }
+
+        match last_error {
+            Some(err) => anyhow::bail!(
+                "Server closed connection after {packets_read} packet(s): {err}"
+            ),
+            None => anyhow::bail!(
+                "Login sequence did not complete after {packets_read} packets (no IDCHANGE received)"
+            ),
+        }
+    }
+
+    async fn read_packet(&mut self) -> io::Result<(u8, Vec<u8>)> {
+        match &mut self.transport {
+            ServerTransport::Plain { reader, .. } => {
+                read_server_packet_timeout(reader).await
+            }
+            ServerTransport::Encrypted(stream) => {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    stream.read_packet(),
+                )
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "encrypted server read timed out"))?
+            }
+        }
+    }
+
+    /// Write a zlib-compressed packet (eMule header 0xD4 instead of 0xE3).
+    async fn write_packet_compressed(&mut self, opcode: u8, compressed_payload: &[u8]) -> io::Result<()> {
+        const OP_PACKEDPROT: u8 = 0xD4;
+        let wire_len = u32::try_from(1 + compressed_payload.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "compressed packet too large for u32 length field")
+        })?;
+        match &mut self.transport {
+            ServerTransport::Plain { writer, .. } => {
+                use tokio::io::AsyncWriteExt;
+                writer.write_u8(OP_PACKEDPROT).await?;
+                writer.write_all(&wire_len.to_le_bytes()).await?;
+                writer.write_u8(opcode).await?;
+                writer.write_all(compressed_payload).await?;
+                writer.flush().await?;
+                Ok(())
+            }
+            ServerTransport::Encrypted(stream) => {
+                let mut wire = Vec::with_capacity(6 + compressed_payload.len());
+                wire.push(OP_PACKEDPROT);
+                wire.extend_from_slice(&wire_len.to_le_bytes());
+                wire.push(opcode);
+                wire.extend_from_slice(compressed_payload);
+                let mut encrypted = vec![0u8; wire.len()];
+                stream.send_key.process(&wire, &mut encrypted);
+                stream.writer.write_all(&encrypted).await?;
+                stream.writer.flush().await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn write_packet(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
+        match &mut self.transport {
+            ServerTransport::Plain { writer, .. } => {
+                write_server_packet(writer, opcode, payload).await
+            }
+            ServerTransport::Encrypted(stream) => {
+                let wire_len = u32::try_from(1 + payload.len()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "packet payload too large for u32 length field")
+                })?;
+                let mut wire = Vec::with_capacity(6 + payload.len());
+                wire.push(OP_EDONKEYHEADER);
+                wire.extend_from_slice(&wire_len.to_le_bytes());
+                wire.push(opcode);
+                wire.extend_from_slice(payload);
+                debug!(
+                    "Server write_packet: opcode=0x{opcode:02X}, wire={} bytes",
+                    wire.len(),
+                );
+                let mut encrypted = vec![0u8; wire.len()];
+                stream.send_key.process(&wire, &mut encrypted);
+                stream.writer.write_all(&encrypted).await?;
+                stream.writer.flush().await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Poll for a server packet without blocking. Cancel-safe: only starts
+    /// reading after confirming data is available, avoiding mid-read cancellation
+    /// that would corrupt the stream (read_exact is NOT cancel-safe).
+    async fn poll_read_packet(&mut self) -> PollReadPacketResult {
+        match &mut self.transport {
+            ServerTransport::Plain { reader, .. } => {
+                let has_buffered = !reader.buffer().is_empty();
+                if !has_buffered {
+                    let tcp = reader.get_ref();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(SERVER_POLL_READABLE_TIMEOUT_MS),
+                        tcp.readable(),
+                    ).await {
+                        Ok(Ok(_)) => {}
+                        _ => return PollReadPacketResult::Idle,
+                    }
+                }
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(SERVER_POLL_PACKET_TIMEOUT_SECS),
+                    read_server_packet(reader),
+                ).await {
+                    Ok(result) => match classify_packet_read_result(result, false) {
+                        PollReadPacketResult::Packet(pkt) => {
+                            info!("Server packet: opcode=0x{:02X}, {} bytes", pkt.0, pkt.1.len());
+                            PollReadPacketResult::Packet(pkt)
+                        }
+                        other => other,
+                    }
+                    Err(_) => {
+                        if has_buffered {
+                            // BufReader had data and we started reading a packet;
+                            // timing out mid-read means the stream is corrupted.
+                            packet_poll_timeout_result(false)
+                        } else {
+                            // Entered because tcp.readable() indicated readiness, but
+                            // no data arrived within the timeout. This is a spurious
+                            // wakeup (common on Windows), not corruption.
+                            PollReadPacketResult::Idle
+                        }
+                    }
+                }
+            }
+            ServerTransport::Encrypted(stream) => {
+                let has_buffered = !stream.reader.buffer().is_empty();
+                if !has_buffered {
+                    let tcp = stream.reader.get_ref();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(SERVER_POLL_READABLE_TIMEOUT_MS),
+                        tcp.readable(),
+                    ).await {
+                        Ok(Ok(_)) => {}
+                        _ => return PollReadPacketResult::Idle,
+                    }
+                }
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(SERVER_POLL_PACKET_TIMEOUT_SECS),
+                    stream.read_packet(),
+                ).await {
+                    Ok(result) => match classify_packet_read_result(result, true) {
+                        PollReadPacketResult::Packet(pkt) => {
+                            info!("Server packet (encrypted): opcode=0x{:02X}, {} bytes", pkt.0, pkt.1.len());
+                            PollReadPacketResult::Packet(pkt)
+                        }
+                        other => other,
+                    }
+                    Err(_) => {
+                        if has_buffered {
+                            packet_poll_timeout_result(true)
+                        } else {
+                            PollReadPacketResult::Idle
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send a search request to the server (fire-and-forget).
+    /// The result will arrive asynchronously via `poll_messages()` as `ServerEvent::SearchResult`.
+    /// This does NOT block waiting for a response, so other server events continue flowing.
+    pub async fn send_search_async(&mut self, query: &str) -> anyhow::Result<()> {
+        let payload = build_search_request(query);
+        info!(
+            "Sending OP_SEARCHREQUEST ({} bytes payload) for query '{}'",
+            payload.len(), query
+        );
+        self.write_packet(OP_SEARCHREQUEST, &payload).await?;
+        Ok(())
+    }
+
+    /// Send a boolean search expression tree to the server.
+    pub async fn send_search_expression_async(
+        &mut self,
+        expr: &SearchExpression,
+    ) -> anyhow::Result<()> {
+        let payload = build_search_tree(expr);
+        info!(
+            "Sending OP_SEARCHREQUEST boolean tree ({} bytes payload)",
+            payload.len()
+        );
+        self.write_packet(OP_SEARCHREQUEST, &payload).await?;
+        Ok(())
+    }
+
+    /// Send a source request to the server (eMule DownloadQueue.cpp format).
+    /// Uses OP_GETSOURCES_OBFU when server supports TCP obfuscation.
+    pub async fn send_get_sources(&mut self, file_hash: &[u8; 16], file_size: u64) -> anyhow::Result<()> {
+        let mut payload = Vec::with_capacity(28);
+        payload.extend_from_slice(file_hash);
+        let srv_flags = self.session.as_ref().map(|s| s.server_flags).unwrap_or(0);
+        let supports_large = (srv_flags & SRV_TCPFLG_LARGEFILES) != 0;
+        if file_size > 0xFFFF_FFFF && supports_large {
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&file_size.to_le_bytes());
+        } else {
+            payload.extend_from_slice(&(file_size as u32).to_le_bytes());
+        }
+        let opcode = if (srv_flags & SRV_TCPFLG_TCPOBFUSCATION) != 0 {
+            OP_GETSOURCES_OBFU
+        } else {
+            OP_GETSOURCES
+        };
+        self.write_packet(opcode, &payload).await?;
+        Ok(())
+    }
+
+    /// eMule keep-alive: send empty OP_OFFERFILES (file count = 0).
+    pub async fn keep_alive(&mut self) -> anyhow::Result<()> {
+        self.write_packet(OP_OFFERFILES, &0u32.to_le_bytes()).await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn request_server_list(&mut self) -> anyhow::Result<()> {
+        self.write_packet(OP_GETSERVERLIST, &[]).await?;
+        debug!("Sent OP_GETSERVERLIST request to server");
+        Ok(())
+    }
+
+    /// Request additional search results from the server (up to 5 batches).
+    pub async fn request_more_results(&mut self) -> anyhow::Result<()> {
+        self.write_packet(OP_QUERY_MORE_RESULT, &[]).await?;
+        debug!("Sent OP_QUERY_MORE_RESULT to server");
+        Ok(())
+    }
+
+    pub async fn request_callback(&mut self, client_id: u32) -> anyhow::Result<()> {
+        let payload = client_id.to_le_bytes().to_vec();
+        self.write_packet(OP_CALLBACKREQUEST, &payload).await?;
+        info!("Sent callback request for LowID client {client_id}");
+        Ok(())
+    }
+
+    /// Send OP_OFFERFILES to the server matching eMule SharedFileList.cpp.
+    /// Uses magic client ID/port values when server supports SRV_TCPFLG_COMPRESSION.
+    pub async fn offer_files(&mut self, files: &[OfferFile], tcp_port: u16) -> anyhow::Result<()> {
+        let real_client_id = self.our_client_id().unwrap_or(0);
+        let srv_flags = self.session.as_ref().map(|s| s.server_flags).unwrap_or(0);
+        let use_magic_ids = (srv_flags & SRV_TCPFLG_COMPRESSION) != 0;
+
+        let mut payload = Vec::with_capacity(4 + files.len() * 64);
+        payload.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        for file in files {
+            payload.extend_from_slice(&file.hash);
+
+            if use_magic_ids {
+                if file.is_complete {
+                    payload.extend_from_slice(&0xFBFBFBFBu32.to_le_bytes());
+                    payload.extend_from_slice(&0xFBFBu16.to_le_bytes());
+                } else {
+                    payload.extend_from_slice(&0xFCFCFCFCu32.to_le_bytes());
+                    payload.extend_from_slice(&0xFCFCu16.to_le_bytes());
+                }
+            } else {
+                payload.extend_from_slice(&real_client_id.to_le_bytes());
+                payload.extend_from_slice(&tcp_port.to_le_bytes());
+            }
+
+            let mut tag_count: u32 = 0;
+            let mut tags = Vec::new();
+            write_string_tag(&mut tags, 0x01, &file.name); // FT_FILENAME
+            tag_count += 1;
+            if file.size > u32::MAX as u64 {
+                write_uint32_tag(&mut tags, 0x02, 0);
+                tag_count += 1;
+                write_uint32_tag(&mut tags, 0x3A, (file.size >> 32) as u32);
+                tag_count += 1;
+            } else {
+                write_uint32_tag(&mut tags, 0x02, file.size as u32);
+                tag_count += 1;
+            }
+            // FT_FILETYPE (0x03) -- file type string
+            if !file.file_type.is_empty() {
+                write_string_tag(&mut tags, 0x03, &file.file_type);
+                tag_count += 1;
+            }
+            payload.extend_from_slice(&tag_count.to_le_bytes());
+            payload.extend_from_slice(&tags);
+        }
+        // Compress payload if server supports compression (eMule SharedFileList.cpp)
+        if (srv_flags & SRV_TCPFLG_COMPRESSION) != 0 && payload.len() > 100 {
+            use flate2::write::ZlibEncoder;
+            use flate2::Compression;
+            use std::io::Write as _;
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            match encoder.write_all(&payload).and_then(|_| encoder.finish()) {
+                Ok(compressed) if compressed.len() < payload.len() => {
+                    debug!("Compressed OP_OFFERFILES: {} -> {} bytes", payload.len(), compressed.len());
+                    self.write_packet_compressed(OP_OFFERFILES, &compressed).await?;
+                    info!("Sent compressed OP_OFFERFILES with {} shared files to server", files.len());
+                    return Ok(());
+                }
+                Ok(_) => debug!("OP_OFFERFILES compression not smaller, sending uncompressed"),
+                Err(e) => debug!("OP_OFFERFILES compression failed: {e}, sending uncompressed"),
+            }
+        }
+        self.write_packet(OP_OFFERFILES, &payload).await?;
+        info!("Sent OP_OFFERFILES with {} shared files to server", files.len());
+        Ok(())
+    }
+
+    pub async fn poll_messages(&mut self) -> io::Result<Vec<ServerEvent>> {
+        let mut events = Vec::new();
+        loop {
+            match self.poll_read_packet().await {
+                PollReadPacketResult::Packet((opcode, payload)) => {
+                    info!("Server poll received opcode=0x{opcode:02X}, {} bytes", payload.len());
+                    events.extend(parse_server_event(opcode, &payload));
+                }
+                PollReadPacketResult::Idle => break,
+                PollReadPacketResult::Disconnected(err) => return Err(err),
+            }
+        }
+        Ok(events)
+    }
+
+    pub fn is_low_id(&self) -> bool {
+        self.session
+            .as_ref()
+            .map(|s| s.client_id > 0 && s.client_id < LOWID_THRESHOLD)
+            .unwrap_or(false)
+    }
+
+    pub fn our_client_id(&self) -> Option<u32> {
+        self.session.as_ref().map(|s| s.client_id)
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self.transport, ServerTransport::Encrypted(_))
+    }
+
+    pub async fn disconnect(self) {
+        match self.transport {
+            ServerTransport::Plain { mut writer, .. } => {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    writer.shutdown(),
+                ).await;
+            }
+            ServerTransport::Encrypted(mut stream) => {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    stream.writer.shutdown(),
+                ).await;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ServerEvent {
+    CallbackRequested {
+        ip: String,
+        port: u16,
+        crypt_options: Option<u8>,
+        user_hash: Option<[u8; 16]>,
+    },
+    CallbackFailed,
+    Message(String),
+    StatusUpdate { users: u32, files: u32 },
+    ServerIdent { name: String },
+    ServerList {
+        #[allow(dead_code)]
+        data: Vec<u8>,
+    },
+    SearchResult { results: Vec<ServerSearchResult> },
+    FoundSources { file_hash: [u8; 16], sources: Vec<ServerSource> },
+}
+
+fn parse_server_event(opcode: u8, payload: &[u8]) -> Vec<ServerEvent> {
+    let mut events = Vec::new();
+    match opcode {
+        OP_CALLBACKREQUESTED => {
+            if payload.len() >= 6 {
+                let ip = std::net::Ipv4Addr::new(
+                    payload[0], payload[1], payload[2], payload[3],
+                );
+                let port = u16::from_le_bytes([payload[4], payload[5]]);
+                let crypt_options = payload.get(6).copied();
+                let user_hash = if payload.len() >= 23 {
+                    let mut hash = [0u8; 16];
+                    hash.copy_from_slice(&payload[7..23]);
+                    Some(hash)
+                } else {
+                    None
+                };
+                info!("Callback requested: connect to {ip}:{port}");
+                events.push(ServerEvent::CallbackRequested {
+                    ip: ip.to_string(),
+                    port,
+                    crypt_options,
+                    user_hash,
+                });
+            }
+        }
+        OP_CALLBACK_FAIL => {
+            debug!("Server reported callback failure");
+            events.push(ServerEvent::CallbackFailed);
+        }
+        OP_SERVERMESSAGE => {
+            if payload.len() >= 2 {
+                let len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+                if payload.len() >= 2 + len {
+                    let msg = String::from_utf8_lossy(&payload[2..2 + len]).to_string();
+                    events.push(ServerEvent::Message(msg));
+                }
+            }
+        }
+        OP_SERVERSTATUS => {
+            if payload.len() >= 8 {
+                let users = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let files = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                events.push(ServerEvent::StatusUpdate { users, files });
+            }
+        }
+        OP_SERVERIDENT => {
+            if let Some(name) = parse_server_ident_name(payload) {
+                events.push(ServerEvent::ServerIdent { name });
+            }
+        }
+        OP_SERVERLIST => {
+            debug!("Got server list from server ({} bytes)", payload.len());
+            events.push(ServerEvent::ServerList { data: payload.to_vec() });
+        }
+        OP_SEARCHRESULT => {
+            match parse_search_result(payload) {
+                Ok(results) => {
+                    debug!("Server search result: {} files", results.len());
+                    events.push(ServerEvent::SearchResult { results });
+                }
+                Err(e) => {
+                    debug!("Failed to parse search result: {e}");
+                }
+            }
+        }
+        OP_FOUNDSOURCES | OP_FOUNDSOURCES_OBFU => {
+            match parse_found_sources(payload, opcode == OP_FOUNDSOURCES_OBFU) {
+                Ok((file_hash, sources)) => {
+                    debug!("Server found {} sources for file {}", sources.len(), hex::encode(file_hash));
+                    events.push(ServerEvent::FoundSources { file_hash, sources });
+                }
+                Err(e) => {
+                    debug!("Failed to parse found sources: {e}");
+                }
+            }
+        }
+        _ => {
+            debug!("Ignoring server opcode 0x{opcode:02X}");
+        }
+    }
+    events
+}
+
+fn parse_server_ident_name(payload: &[u8]) -> Option<String> {
+    // eMule: server_hash(16) + server_ip(4) + server_port(2) + tag_count(4) + tags
+    if payload.len() < 26 {
+        return None;
+    }
+    let tag_count = u32::from_le_bytes([payload[22], payload[23], payload[24], payload[25]]) as usize;
+    let mut offset = 26;
+    for _ in 0..tag_count.min(32) {
+        if offset >= payload.len() {
+            break;
+        }
+        let tag_type = payload[offset];
+        offset += 1;
+        if offset + 3 > payload.len() {
+            break;
+        }
+        let name_len = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+        if offset + name_len > payload.len() {
+            break;
+        }
+        let name_id = if name_len == 1 {
+            Some(payload[offset])
+        } else {
+            None
+        };
+        offset += name_len;
+
+        match tag_type {
+            0x02 => {
+                if offset + 2 > payload.len() {
+                    break;
+                }
+                let slen = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
+                offset += 2;
+                if offset + slen > payload.len() {
+                    break;
+                }
+                if name_id == Some(0x01) {
+                    if let Ok(s) = std::str::from_utf8(&payload[offset..offset + slen]) {
+                        let trimmed = s.trim();
+                        if !trimmed.is_empty() {
+                            return Some(trimmed.to_string());
+                        }
+                    }
+                }
+                offset += slen;
+            }
+            0x03 => offset += 4,
+            0x08 => offset += 2,
+            0x09 => offset += 1,
+            _ => break,
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    #[test]
+    fn classify_packet_read_timeout_as_disconnect() {
+        let timeout = io::Error::new(io::ErrorKind::TimedOut, "server read timed out");
+        match classify_packet_read_result(Err(timeout), false) {
+            PollReadPacketResult::Disconnected(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+            }
+            other => panic!("expected disconnect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_timeout_is_treated_as_disconnect() {
+        match packet_poll_timeout_result(false) {
+            PollReadPacketResult::Disconnected(e) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+        match packet_poll_timeout_result(true) {
+            PollReadPacketResult::Disconnected(e) => assert_eq!(e.kind(), io::ErrorKind::TimedOut),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_packet_read_eof_as_disconnect() {
+        let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "closed");
+        match classify_packet_read_result(Err(eof), true) {
+            PollReadPacketResult::Disconnected(err) => {
+                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            }
+            other => panic!("expected disconnect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_packet_reads_loopback_server_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let payload = {
+                let mut p = Vec::new();
+                p.extend_from_slice(&2u16.to_le_bytes());
+                p.extend_from_slice(b"hi");
+                p
+            };
+            let mut packet = Vec::new();
+            packet.push(OP_EDONKEYHEADER);
+            packet.extend_from_slice(&((1 + payload.len()) as u32).to_le_bytes());
+            packet.push(OP_SERVERMESSAGE);
+            packet.extend_from_slice(&payload);
+            socket.write_all(&packet).await.unwrap();
+            socket.flush().await.unwrap();
+            let _ = shutdown_rx.await;
+        });
+
+        let mut conn = Ed2kServerConnection::connect(addr).await.unwrap();
+        let (opcode, payload) = conn.read_packet().await.unwrap();
+        let _ = shutdown_tx.send(());
+        let events = parse_server_event(opcode, &payload);
+
+        assert!(matches!(
+            events.as_slice(),
+            [ServerEvent::Message(msg)] if msg == "hi"
+        ));
+    }
+
+    // ---- Boolean search tree tests (L12) ----
+
+    #[test]
+    fn search_tree_simple_string() {
+        let expr = SearchExpression::String("test".into());
+        let buf = build_search_tree(&expr);
+        // SEARCH_LEAF_STRING(0x01) + len(u16 LE) + "test"
+        assert_eq!(buf, vec![0x01, 0x04, 0x00, b't', b'e', b's', b't']);
+    }
+
+    #[test]
+    fn search_tree_and_two_strings() {
+        let expr = SearchExpression::And(
+            Box::new(SearchExpression::String("hello".into())),
+            Box::new(SearchExpression::String("world".into())),
+        );
+        let buf = build_search_tree(&expr);
+        assert_eq!(buf[0], 0x00); // AND
+        // left leaf
+        assert_eq!(buf[1], 0x01); // STRING
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 5);
+        assert_eq!(&buf[4..9], b"hello");
+        // right leaf
+        assert_eq!(buf[9], 0x01); // STRING
+        assert_eq!(u16::from_le_bytes([buf[10], buf[11]]), 5);
+        assert_eq!(&buf[12..17], b"world");
+    }
+
+    #[test]
+    fn search_tree_or_not() {
+        // OR("a", NOT("b", "c"))
+        //  [0]  OR
+        //  [1]  STRING leaf "a": 0x01, len_lo, len_hi, 'a'
+        //  [5]  NOT
+        //  [6]  STRING leaf "b": 0x01, len_lo, len_hi, 'b'
+        // [10]  STRING leaf "c": 0x01, len_lo, len_hi, 'c'
+        let expr = SearchExpression::Or(
+            Box::new(SearchExpression::String("a".into())),
+            Box::new(SearchExpression::Not(
+                Box::new(SearchExpression::String("b".into())),
+                Box::new(SearchExpression::String("c".into())),
+            )),
+        );
+        let buf = build_search_tree(&expr);
+        assert_eq!(buf[0], 0x01); // OR
+        assert_eq!(buf[1], 0x01); // STRING leaf "a"
+        assert_eq!(buf[5], 0x02); // NOT
+        assert_eq!(buf[6], 0x01); // STRING "b"
+        assert_eq!(buf[10], 0x01); // STRING "c"
+    }
+
+    #[test]
+    fn search_tree_min_size() {
+        let expr = SearchExpression::MinSize(1_048_576);
+        let buf = build_search_tree(&expr);
+        assert_eq!(buf[0], 0x03); // META_UINT32
+        assert_eq!(u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]), 1_048_576);
+        assert_eq!(buf[5], 0x03); // GREATER_EQUAL
+        assert_eq!(u16::from_le_bytes([buf[6], buf[7]]), 1);
+        assert_eq!(buf[8], 0x02); // FT_FILESIZE
+    }
+
+    #[test]
+    fn search_tree_max_size() {
+        let expr = SearchExpression::MaxSize(500_000);
+        let buf = build_search_tree(&expr);
+        assert_eq!(buf[0], 0x03);
+        assert_eq!(u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]), 500_000);
+        assert_eq!(buf[5], 0x04); // LESS_EQUAL
+        assert_eq!(buf[8], 0x02); // FT_FILESIZE
+    }
+
+    #[test]
+    fn search_tree_file_type() {
+        let expr = SearchExpression::FileType("Audio".into());
+        let buf = build_search_tree(&expr);
+        assert_eq!(buf[0], 0x02); // META_STRING
+        assert_eq!(u16::from_le_bytes([buf[1], buf[2]]), 5);
+        assert_eq!(&buf[3..8], b"Audio");
+        assert_eq!(u16::from_le_bytes([buf[8], buf[9]]), 1);
+        assert_eq!(buf[10], 0x03); // FT_FILETYPE
+    }
+
+    #[test]
+    fn search_tree_file_extension() {
+        let expr = SearchExpression::FileExtension("mp3".into());
+        let buf = build_search_tree(&expr);
+        assert_eq!(buf[0], 0x02); // META_STRING
+        assert_eq!(u16::from_le_bytes([buf[1], buf[2]]), 3);
+        assert_eq!(&buf[3..6], b"mp3");
+        assert_eq!(u16::from_le_bytes([buf[6], buf[7]]), 1);
+        assert_eq!(buf[8], 0x04); // FT_FILEFORMAT
+    }
+
+    #[test]
+    fn search_tree_min_availability() {
+        let expr = SearchExpression::MinAvailability(5);
+        let buf = build_search_tree(&expr);
+        assert_eq!(buf[0], 0x03);
+        assert_eq!(u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]), 5);
+        assert_eq!(buf[5], 0x03); // GREATER_EQUAL
+        assert_eq!(buf[8], 0x15); // FT_SOURCES
+    }
+
+    #[test]
+    fn search_tree_compound_expression() {
+        // "linux" AND FileType("Archive") AND MinSize(1MB)
+        let expr = SearchExpression::And(
+            Box::new(SearchExpression::And(
+                Box::new(SearchExpression::String("linux".into())),
+                Box::new(SearchExpression::FileType("Archive".into())),
+            )),
+            Box::new(SearchExpression::MinSize(1_048_576)),
+        );
+        let buf = build_search_tree(&expr);
+        // Outer AND
+        assert_eq!(buf[0], 0x00);
+        // Inner AND
+        assert_eq!(buf[1], 0x00);
+        // "linux" string leaf
+        assert_eq!(buf[2], 0x01);
+        assert!(buf.len() > 25);
+    }
+
+    #[test]
+    fn existing_simple_search_unchanged() {
+        let buf = build_search_request("test");
+        assert_eq!(buf, vec![0x01, 0x04, 0x00, b't', b'e', b's', b't']);
+    }
+}
+
+// CT_SERVER_FLAGS capability bits (from eMule Opcodes.h)
+const SRVCAP_ZLIB: u32 = 0x0001;
+const SRVCAP_NEWTAGS: u32 = 0x0008;
+const SRVCAP_UNICODE: u32 = 0x0010;
+const SRVCAP_LARGEFILES: u32 = 0x0100;
+const SRVCAP_SUPPORTCRYPT: u32 = 0x0200;
+const SRVCAP_REQUESTCRYPT: u32 = 0x0400;
+const SRVCAP_REQUIRECRYPT: u32 = 0x0800;
+
+const CT_NAME: u8 = 0x01;
+const CT_VERSION: u8 = 0x11;
+const CT_SERVER_FLAGS: u8 = 0x20;
+const CT_EMULE_VERSION: u8 = 0xFB;
+
+fn build_login_request(user_hash: &[u8; 16], tcp_port: u16, nickname: &str, flags: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(128);
+
+    // eMule: WriteHash16 + WriteUInt32(clientID) + WriteUInt16(port)
+    buf.extend_from_slice(user_hash);
+    buf.extend_from_slice(&0u32.to_le_bytes()); // client ID 0 = request new
+    buf.extend_from_slice(&tcp_port.to_le_bytes());
+
+    // eMule sends exactly 4 tags
+    let tag_count: u32 = 4;
+    buf.extend_from_slice(&tag_count.to_le_bytes());
+
+    // Tag 1: CT_NAME (0x01) - nickname string
+    write_string_tag(&mut buf, CT_NAME, nickname);
+
+    // Tag 2: CT_VERSION (0x11) - EDONKEYVERSION = 0x3C
+    write_uint32_tag(&mut buf, CT_VERSION, 0x3C);
+
+    // Tag 3: CT_SERVER_FLAGS (0x20) - capability flags
+    write_uint32_tag(&mut buf, CT_SERVER_FLAGS, flags);
+
+    // Tag 4: CT_EMULE_VERSION (0xFB) - (compat << 24) | (major << 17) | (minor << 10) | (update << 7)
+    // Claim 0.50a (last official eMule release) — must match build_hello_inner.
+    let emule_version: u32 = (0u32 << 24) | (0u32 << 17) | (50u32 << 10) | (0u32 << 7);
+    write_uint32_tag(&mut buf, CT_EMULE_VERSION, emule_version);
+
+    buf
+}
+
+fn write_string_tag(buf: &mut Vec<u8>, name_id: u8, value: &str) {
+    buf.push(0x02); // TAGTYPE_STRING
+    buf.extend_from_slice(&1u16.to_le_bytes()); // name length = 1
+    buf.push(name_id);
+    let bytes = value.as_bytes();
+    let clamped = &bytes[..bytes.len().min(u16::MAX as usize)];
+    buf.extend_from_slice(&(clamped.len() as u16).to_le_bytes());
+    buf.extend_from_slice(clamped);
+}
+
+fn write_uint32_tag(buf: &mut Vec<u8>, name_id: u8, value: u32) {
+    buf.push(0x03); // TAGTYPE_UINT32
+    buf.extend_from_slice(&1u16.to_le_bytes()); // name length = 1
+    buf.push(name_id);
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+fn build_search_request(query: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.push(0x01); // Search type: string
+    let clamped = &query.as_bytes()[..query.len().min(u16::MAX as usize)];
+    buf.extend_from_slice(&(clamped.len() as u16).to_le_bytes());
+    buf.extend_from_slice(clamped);
+    buf
+}
+
+// ---------------------------------------------------------------------------
+// Boolean search tree support (L12)
+// ---------------------------------------------------------------------------
+
+// ED2K search comparison operators (SearchFile.h)
+#[allow(dead_code)]
+const ED2K_SEARCH_OP_EQUAL: u8 = 0x00;
+#[allow(dead_code)]
+const ED2K_SEARCH_OP_GREATER: u8 = 0x01;
+#[allow(dead_code)]
+const ED2K_SEARCH_OP_LESS: u8 = 0x02;
+const ED2K_SEARCH_OP_GREATER_EQUAL: u8 = 0x03;
+const ED2K_SEARCH_OP_LESS_EQUAL: u8 = 0x04;
+#[allow(dead_code)]
+const ED2K_SEARCH_OP_NOTEQUAL: u8 = 0x05;
+
+// Wire-format node type bytes for the search tree
+const SEARCH_BOOL_AND: u8 = 0x00;
+const SEARCH_BOOL_OR: u8 = 0x01;
+const SEARCH_BOOL_NOT: u8 = 0x02;
+const SEARCH_LEAF_STRING: u8 = 0x01;
+const SEARCH_LEAF_META_STRING: u8 = 0x02;
+const SEARCH_LEAF_META_UINT32: u8 = 0x03;
+
+// Single-byte tag-name IDs used inside search meta constraints
+const FT_FILESIZE_TAG: u8 = 0x02;
+const FT_FILETYPE_TAG: u8 = 0x03;
+const FT_FILEFORMAT_TAG: u8 = 0x04;
+const FT_SOURCES_TAG: u8 = 0x15;
+
+/// A boolean search expression tree matching eMule's OP_SEARCHREQUEST wire format.
+///
+/// Operators carry two children (prefix notation on the wire: operator byte,
+/// then left subtree, then right subtree).  Leaf nodes encode either a plain
+/// search string or a typed meta-constraint (size, type, extension, sources).
+#[derive(Debug, Clone)]
+pub enum SearchExpression {
+    String(String),
+    And(Box<SearchExpression>, Box<SearchExpression>),
+    Or(Box<SearchExpression>, Box<SearchExpression>),
+    Not(Box<SearchExpression>, Box<SearchExpression>),
+    MinSize(u64),
+    MaxSize(u64),
+    FileType(String),
+    FileExtension(String),
+    MinAvailability(u32),
+}
+
+/// Serialize a [`SearchExpression`] tree into the eMule search-request wire
+/// format suitable for use as the payload of an `OP_SEARCHREQUEST` packet.
+pub fn build_search_tree(expr: &SearchExpression) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_search_node(&mut buf, expr);
+    buf
+}
+
+fn write_search_node(buf: &mut Vec<u8>, expr: &SearchExpression) {
+    match expr {
+        SearchExpression::String(s) => {
+            buf.push(SEARCH_LEAF_STRING);
+            let bytes = s.as_bytes();
+            let max_len = bytes.len().min(u16::MAX as usize);
+            let clamped_len = truncate_utf8_safe(bytes, max_len);
+            buf.extend_from_slice(&(clamped_len as u16).to_le_bytes());
+            buf.extend_from_slice(&bytes[..clamped_len]);
+        }
+        SearchExpression::And(left, right) => {
+            buf.push(SEARCH_BOOL_AND);
+            write_search_node(buf, left);
+            write_search_node(buf, right);
+        }
+        SearchExpression::Or(left, right) => {
+            buf.push(SEARCH_BOOL_OR);
+            write_search_node(buf, left);
+            write_search_node(buf, right);
+        }
+        SearchExpression::Not(left, right) => {
+            buf.push(SEARCH_BOOL_NOT);
+            write_search_node(buf, left);
+            write_search_node(buf, right);
+        }
+        SearchExpression::MinSize(size) => {
+            let clamped = (*size).min(u32::MAX as u64) as u32;
+            write_search_meta_uint32(buf, clamped, ED2K_SEARCH_OP_GREATER_EQUAL, FT_FILESIZE_TAG);
+        }
+        SearchExpression::MaxSize(size) => {
+            let clamped = (*size).min(u32::MAX as u64) as u32;
+            write_search_meta_uint32(buf, clamped, ED2K_SEARCH_OP_LESS_EQUAL, FT_FILESIZE_TAG);
+        }
+        SearchExpression::FileType(t) => {
+            write_search_meta_string(buf, t, FT_FILETYPE_TAG);
+        }
+        SearchExpression::FileExtension(ext) => {
+            write_search_meta_string(buf, ext, FT_FILEFORMAT_TAG);
+        }
+        SearchExpression::MinAvailability(avail) => {
+            write_search_meta_uint32(buf, *avail, ED2K_SEARCH_OP_GREATER_EQUAL, FT_SOURCES_TAG);
+        }
+    }
+}
+
+/// Find the largest byte index <= max_len that doesn't split a multi-byte UTF-8 codepoint.
+fn truncate_utf8_safe(bytes: &[u8], max_len: usize) -> usize {
+    let mut len = max_len.min(bytes.len());
+    while len > 0 && (bytes[len - 1] & 0xC0) == 0x80 {
+        len -= 1;
+    }
+    if len > 0 && bytes[len - 1] >= 0xC0 {
+        let start = len - 1;
+        let expected = if bytes[start] < 0xE0 { 2 } else if bytes[start] < 0xF0 { 3 } else { 4 };
+        if start + expected > max_len {
+            len = start;
+        }
+    }
+    len
+}
+
+/// Wire format: `0x03 | value(u32 LE) | comparison_op(u8) | tag_name_len(u16 LE) | tag_name`
+fn write_search_meta_uint32(buf: &mut Vec<u8>, value: u32, op: u8, tag_name_id: u8) {
+    buf.push(SEARCH_LEAF_META_UINT32);
+    buf.extend_from_slice(&value.to_le_bytes());
+    buf.push(op);
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.push(tag_name_id);
+}
+
+/// Wire format: `0x02 | value_len(u16 LE) | value | tag_name_len(u16 LE) | tag_name`
+fn write_search_meta_string(buf: &mut Vec<u8>, value: &str, tag_name_id: u8) {
+    buf.push(SEARCH_LEAF_META_STRING);
+    let bytes = value.as_bytes();
+    buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(bytes);
+    buf.extend_from_slice(&1u16.to_le_bytes());
+    buf.push(tag_name_id);
+}
+
+/// Read one eMule-style tag (supports both old and "new tags" compressed format).
+/// Returns (name_id, tag_type, was read successfully).
+fn read_tag_header(cursor: &mut Cursor<&[u8]>) -> Option<(u8, u8)> {
+    let raw_type = ReadBytesExt::read_u8(cursor).ok()?;
+
+    if raw_type & 0x80 != 0 {
+        // New tag format: high bit set → single-byte name follows, type is low 7 bits
+        let tag_type = raw_type & 0x7F;
+        let name_id = ReadBytesExt::read_u8(cursor).ok()?;
+        Some((name_id, tag_type))
+    } else {
+        // Old format: u16 name length + name bytes
+        let name_len = ReadBytesExt::read_u16::<LittleEndian>(cursor).ok()? as usize;
+        let name_id = if name_len == 1 {
+            ReadBytesExt::read_u8(cursor).ok()?
+        } else {
+            let mut name_buf = vec![0u8; name_len];
+            Read::read_exact(cursor, &mut name_buf).ok()?;
+            0u8
+        };
+        Some((name_id, raw_type))
+    }
+}
+
+/// Read and skip a tag value, extracting file metadata we care about.
+/// Handles all eMule tag types including TAGTYPE_STR1..STR16 (0x11..0x20).
+fn read_tag_value(
+    cursor: &mut Cursor<&[u8]>,
+    tag_type: u8,
+    name_id: u8,
+    file_name: &mut String,
+    file_size: &mut u64,
+    source_count: &mut u32,
+    complete_sources: &mut u32,
+) -> bool {
+    match tag_type {
+        // TAGTYPE_HASH (0x01)
+        0x01 => {
+            let mut buf = [0u8; 16];
+            Read::read_exact(cursor, &mut buf).is_ok()
+        }
+        // TAGTYPE_STRING (0x02)
+        0x02 => {
+            let slen = match ReadBytesExt::read_u16::<LittleEndian>(cursor) {
+                Ok(v) => v as usize,
+                Err(_) => return false,
+            };
+            let start = cursor.position() as usize;
+            let end = start.saturating_add(slen);
+            if end > cursor.get_ref().len() {
+                return false;
+            }
+            let bytes = cursor.get_ref().get(start..end).unwrap_or(&[]);
+            cursor.set_position(end as u64);
+            if name_id == 0x01 { // FT_FILENAME
+                let keep = &bytes[..bytes.len().min(8192)];
+                *file_name = String::from_utf8_lossy(keep).to_string();
+            }
+            true
+        }
+        // TAGTYPE_UINT32 (0x03)
+        0x03 => {
+            let v = match ReadBytesExt::read_u32::<LittleEndian>(cursor) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            match name_id {
+                0x02 => *file_size = v as u64,     // FT_FILESIZE
+                0x15 => *source_count = v,          // FT_SOURCES
+                0x30 => *complete_sources = v,      // FT_COMPLETE_SOURCES
+                _ => {}
+            }
+            true
+        }
+        // TAGTYPE_FLOAT32 (0x04)
+        0x04 => {
+            let mut buf = [0u8; 4];
+            Read::read_exact(cursor, &mut buf).is_ok()
+        }
+        // TAGTYPE_BOOL (0x05)
+        0x05 => {
+            let _ = ReadBytesExt::read_u8(cursor);
+            true
+        }
+        // TAGTYPE_BLOB (0x07)
+        0x07 => {
+            if let Ok(blob_len) = ReadBytesExt::read_u32::<LittleEndian>(cursor) {
+                let skip = blob_len as usize;
+                let pos = cursor.position() as usize;
+                let len = cursor.get_ref().len();
+                if pos + skip <= len {
+                    cursor.set_position((pos + skip) as u64);
+                    return true;
+                }
+            }
+            false
+        }
+        // TAGTYPE_UINT16 (0x08)
+        0x08 => {
+            if let Ok(v) = ReadBytesExt::read_u16::<LittleEndian>(cursor) {
+                match name_id {
+                    0x02 => *file_size = v as u64,
+                    0x15 => *source_count = v as u32,
+                    0x30 => *complete_sources = v as u32,
+                    _ => {}
+                }
+                true
+            } else {
+                false
+            }
+        }
+        // TAGTYPE_UINT8 (0x09)
+        0x09 => {
+            if let Ok(v) = ReadBytesExt::read_u8(cursor) {
+                match name_id {
+                    0x02 => *file_size = v as u64,
+                    0x15 => *source_count = v as u32,
+                    0x30 => *complete_sources = v as u32,
+                    _ => {}
+                }
+                true
+            } else {
+                false
+            }
+        }
+        // TAGTYPE_BSOB (0x0A)
+        0x0A => {
+            if let Ok(bsob_len) = ReadBytesExt::read_u8(cursor) {
+                let skip = bsob_len as usize;
+                let pos = cursor.position() as usize;
+                let len = cursor.get_ref().len();
+                if pos + skip <= len {
+                    cursor.set_position((pos + skip) as u64);
+                    return true;
+                }
+            }
+            false
+        }
+        // TAGTYPE_UINT64 (0x0B)
+        0x0B => {
+            if let Ok(v) = ReadBytesExt::read_u64::<LittleEndian>(cursor) {
+                if name_id == 0x02 { // FT_FILESIZE
+                    *file_size = v;
+                }
+                true
+            } else {
+                false
+            }
+        }
+        // TAGTYPE_STR1..TAGTYPE_STR16 (0x11..0x20) — string with length embedded in type
+        t if (0x11..=0x20).contains(&t) => {
+            let slen = (t - 0x11 + 1) as usize;
+            let mut sbuf = vec![0u8; slen];
+            if Read::read_exact(cursor, &mut sbuf).is_err() {
+                return false;
+            }
+            if name_id == 0x01 { // FT_FILENAME
+                *file_name = String::from_utf8_lossy(&sbuf).to_string();
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn parse_search_result(payload: &[u8]) -> anyhow::Result<Vec<ServerSearchResult>> {
+    let mut cursor = Cursor::new(payload);
+    let count = ReadBytesExt::read_u32::<LittleEndian>(&mut cursor)? as usize;
+    let mut results = Vec::with_capacity(count.min(1000));
+
+    for _ in 0..count.min(1000) {
+        let mut file_hash = [0u8; 16];
+        if Read::read_exact(&mut cursor, &mut file_hash).is_err() {
+            break;
+        }
+        let client_id = match ReadBytesExt::read_u32::<LittleEndian>(&mut cursor) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let client_port = match ReadBytesExt::read_u16::<LittleEndian>(&mut cursor) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+
+        let tag_count = match ReadBytesExt::read_u32::<LittleEndian>(&mut cursor) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let mut file_name = String::new();
+        let mut file_size: u64 = 0;
+        let mut source_count: u32 = 0;
+        let mut complete_sources: u32 = 0;
+
+        for _ in 0..tag_count.min(256) {
+            let (name_id, tag_type) = match read_tag_header(&mut cursor) {
+                Some(v) => v,
+                None => break,
+            };
+            if !read_tag_value(
+                &mut cursor, tag_type, name_id,
+                &mut file_name, &mut file_size, &mut source_count, &mut complete_sources,
+            ) {
+                break;
+            }
+        }
+
+        results.push(ServerSearchResult {
+            file_hash,
+            client_id,
+            client_port,
+            file_name,
+            file_size,
+            source_count,
+            complete_source_count: complete_sources,
+        });
+    }
+
+    Ok(results)
+}
+
+fn parse_found_sources(payload: &[u8], obfuscated: bool) -> anyhow::Result<([u8; 16], Vec<ServerSource>)> {
+    if payload.len() < 17 {
+        anyhow::bail!("found_sources payload too short ({} bytes, need at least 17)", payload.len());
+    }
+    let mut cursor = Cursor::new(payload);
+    let mut file_hash = [0u8; 16];
+    Read::read_exact(&mut cursor, &mut file_hash)?;
+    let count = ReadBytesExt::read_u8(&mut cursor)? as usize;
+    let mut sources = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let id = ReadBytesExt::read_u32::<LittleEndian>(&mut cursor)?;
+        let port = ReadBytesExt::read_u16::<LittleEndian>(&mut cursor)?;
+        let crypt_options = if obfuscated {
+            Some(ReadBytesExt::read_u8(&mut cursor)?)
+        } else {
+            None
+        };
+        let user_hash = if crypt_options.is_some_and(|opts| (opts & 0x80) != 0) {
+            let mut hash = [0u8; 16];
+            Read::read_exact(&mut cursor, &mut hash)?;
+            Some(hash)
+        } else {
+            None
+        };
+        // Strip the 0x80 "hash follows" flag — only bits 0-2 are peer connect options
+        let connect_opts = crypt_options.map(|opts| opts & 0x7F);
+        if id < LOWID_THRESHOLD {
+            sources.push(ServerSource {
+                ip: String::new(),
+                port,
+                client_id: id,
+                crypt_options: connect_opts,
+                user_hash,
+            });
+        } else {
+            let ip = std::net::Ipv4Addr::from(id.to_le_bytes());
+            sources.push(ServerSource {
+                ip: ip.to_string(),
+                port,
+                client_id: 0,
+                crypt_options: connect_opts,
+                user_hash,
+            });
+        }
+    }
+
+    Ok((file_hash, sources))
+}
+
+async fn write_server_packet<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    opcode: u8,
+    payload: &[u8],
+) -> io::Result<()> {
+    let wire_len = u32::try_from(1 + payload.len()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "packet payload too large for u32 length field")
+    })?;
+    writer.write_u8(OP_EDONKEYHEADER).await?;
+    writer.write_u32_le(wire_len).await?;
+    writer.write_u8(opcode).await?;
+    writer.write_all(payload).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+async fn read_server_packet_timeout<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> io::Result<(u8, Vec<u8>)> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        read_server_packet(reader),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "server read timed out"))?
+}
+
+const OP_PACKEDPROT: u8 = 0xD4;
+const MAX_UNCOMPRESSED_SERVER_PACKET: usize = 300_000;
+
+async fn read_server_packet<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> io::Result<(u8, Vec<u8>)> {
+    let protocol = reader.read_u8().await?;
+    if protocol != OP_EDONKEYHEADER && protocol != OP_PACKEDPROT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected server protocol byte: 0x{protocol:02X}"),
+        ));
+    }
+    let length = reader.read_u32_le().await? as usize;
+    if length == 0 || length > 50 * 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid server packet length",
+        ));
+    }
+    let opcode = reader.read_u8().await?;
+    let payload_len = length - 1;
+    let mut payload = vec![0u8; payload_len];
+    if payload_len > 0 {
+        reader.read_exact(&mut payload).await?;
+    }
+
+    if protocol == OP_PACKEDPROT {
+        let decompressed = decompress_server_payload(&payload)?;
+        debug!("Decompressed server packet: opcode=0x{opcode:02X}, {payload_len} -> {} bytes", decompressed.len());
+        Ok((opcode, decompressed))
+    } else {
+        Ok((opcode, payload))
+    }
+}
+
+fn decompress_server_payload(compressed: &[u8]) -> io::Result<Vec<u8>> {
+    use flate2::read::ZlibDecoder;
+    use std::io::Read;
+
+    let mut decoder = ZlibDecoder::new(compressed);
+    let mut decompressed = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = decoder.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        decompressed.extend_from_slice(&buf[..n]);
+        if decompressed.len() > MAX_UNCOMPRESSED_SERVER_PACKET {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decompressed server packet exceeds size limit",
+            ));
+        }
+    }
+    Ok(decompressed)
+}

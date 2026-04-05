@@ -1,0 +1,1204 @@
+<script lang="ts">
+  import { open } from '@tauri-apps/plugin-dialog';
+  import { invoke } from '@tauri-apps/api/core';
+  import { relaunch } from '@tauri-apps/plugin-process';
+  import { theme, applyTheme, type Theme } from '$lib/stores/theme';
+  import type { AppSettings } from '$lib/types';
+  import ToggleSwitch from './ToggleSwitch.svelte';
+  import SpeedInput from './SpeedInput.svelte';
+  import { updateSettings as saveSettings, downloadNodesDat, downloadIpfilter } from '$lib/api/settings';
+
+  let {
+    settings,
+    oncomplete,
+  }: {
+    settings: AppSettings;
+    oncomplete: (updated: AppSettings) => Promise<void>;
+  } = $props();
+
+  const TOTAL_STEPS = 8;
+  let step = $state(1);
+  let transitioning = $state(false);
+
+  const _init = { ...settings };
+  let nickname = $state(_init.nickname);
+  let downloadFolder = $state(_init.download_folder);
+  let tcpPort = $state(_init.tcp_port);
+  let udpPort = $state(_init.udp_port);
+  let upnpEnabled = $state(_init.upnp_enabled);
+  let maxUploadSpeed = $state(_init.max_upload_speed);
+  let maxDownloadSpeed = $state(_init.max_download_speed);
+  let autoConnectKad = $state(_init.auto_connect_kad);
+  let selectedTheme: Theme = $state(
+    (typeof localStorage !== 'undefined' && localStorage.getItem('ember-theme') as Theme) || 'dark'
+  );
+
+  let speedTestRunning = $state(false);
+  let speedTestResult = $state('');
+  let saving = $state(false);
+  let saveError = $state('');
+  let relaunching = $state(false);
+
+  type DlStatus = 'idle' | 'pending' | 'ok' | 'error';
+  let dlNodesStatus = $state<DlStatus>('idle');
+  let dlIpStatus = $state<DlStatus>('idle');
+  let downloading = $state(false);
+
+  function goNext() {
+    if (step >= TOTAL_STEPS) return;
+    transitioning = true;
+    setTimeout(() => {
+      step++;
+      transitioning = false;
+    }, 180);
+  }
+
+  function goBack() {
+    if (step <= 1) return;
+    transitioning = true;
+    setTimeout(() => {
+      step--;
+      transitioning = false;
+    }, 180);
+  }
+
+  async function pickFolder() {
+    const selected = await open({ directory: true, multiple: false, title: 'Choose download folder' });
+    if (selected && typeof selected === 'string') {
+      downloadFolder = selected;
+    }
+  }
+
+  async function runSpeedTest() {
+    speedTestRunning = true;
+    speedTestResult = '';
+    try {
+      const result: { recommended_upload: number; recommended_download: number } = await invoke('run_speed_test');
+      maxUploadSpeed = result.recommended_upload;
+      maxDownloadSpeed = result.recommended_download;
+      const fmtUp = maxUploadSpeed > 0 ? `${Math.round(maxUploadSpeed / 1024)} KB/s` : 'Unlimited';
+      const fmtDl = maxDownloadSpeed > 0 ? `${Math.round(maxDownloadSpeed / 1024)} KB/s` : 'Unlimited';
+      speedTestResult = `Recommended: ${fmtUp} up / ${fmtDl} down`;
+    } catch {
+      speedTestResult = 'Speed test failed. You can set limits manually.';
+    } finally {
+      speedTestRunning = false;
+    }
+  }
+
+  function selectTheme(t: Theme) {
+    selectedTheme = t;
+    applyTheme(t);
+    theme.set(t);
+  }
+
+  async function finish() {
+    if (saving || downloading) return;
+    saving = true;
+    saveError = '';
+    const updated: AppSettings = {
+      ...settings,
+      nickname,
+      download_folder: downloadFolder,
+      tcp_port: tcpPort,
+      udp_port: udpPort,
+      upnp_enabled: upnpEnabled,
+      max_upload_speed: maxUploadSpeed,
+      max_download_speed: maxDownloadSpeed,
+      auto_connect_kad: autoConnectKad,
+      auto_connect_server: false,
+      setup_complete: true,
+    };
+
+    // Save settings first
+    try {
+      await saveSettings(updated);
+    } catch (e) {
+      saveError = e instanceof Error ? e.message : String(e);
+      saving = false;
+      return;
+    }
+    saving = false;
+
+    // Download nodes.dat and IP filter in parallel
+    downloading = true;
+    dlNodesStatus = 'pending';
+    dlIpStatus = 'pending';
+
+    const [nodesResult, ipResult] = await Promise.allSettled([
+      downloadNodesDat(),
+      downloadIpfilter(),
+    ]);
+
+    dlNodesStatus = nodesResult.status === 'fulfilled' ? 'ok' : 'error';
+    dlIpStatus = ipResult.status === 'fulfilled' ? 'ok' : 'error';
+
+    // Brief pause so the user can see the green checkmarks
+    await new Promise(r => setTimeout(r, 900));
+    downloading = false;
+
+    // Relaunch so the network starts with the user's chosen ports/settings.
+    // Settings are saved with setup_complete: true, so the wizard won't reappear.
+    relaunching = true;
+    try {
+      await new Promise(r => setTimeout(r, 600));
+      await relaunch();
+    } catch {
+      relaunching = false;
+      await oncomplete(updated);
+    }
+  }
+
+  const stepLabels = ['Welcome', 'Identity', 'Storage', 'Network', 'Bandwidth', 'Connection', 'Theme', 'Ready'];
+</script>
+
+{#if relaunching}
+<div class="wizard-overlay" role="status" aria-label="Restarting">
+  <div class="relaunch-card">
+    <div class="spinner lg"></div>
+    <h2 class="relaunch-title">Restarting Ember</h2>
+    <p class="relaunch-sub">Applying your settings…</p>
+  </div>
+</div>
+{:else}
+<div class="wizard-overlay" role="dialog" aria-modal="true" aria-label="Setup Wizard">
+  <div class="wizard-card" class:transitioning>
+    <!-- Progress -->
+    <div class="wizard-progress">
+      {#each stepLabels as label, i}
+        <div class="progress-dot" class:active={i + 1 === step} class:done={i + 1 < step}>
+          <div class="dot">
+            {#if i + 1 < step}
+              <svg viewBox="0 0 16 16" fill="currentColor" width="10" height="10"><path d="M6.5 12.5l-4-4 1.4-1.4 2.6 2.6 5.6-5.6 1.4 1.4z"/></svg>
+            {:else}
+              {i + 1}
+            {/if}
+          </div>
+          <span class="dot-label">{label}</span>
+        </div>
+        {#if i < stepLabels.length - 1}
+          <div class="progress-line" class:filled={i + 1 < step}></div>
+        {/if}
+      {/each}
+    </div>
+
+    <!-- Step content -->
+    <div class="wizard-body">
+      {#if step === 1}
+        <div class="step-content">
+          <div class="brand-row">
+            <div class="brand-icon" aria-hidden="true">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="10" cy="4" r="2.5"></circle>
+                <circle cx="4" cy="14" r="2.5"></circle>
+                <circle cx="16" cy="14" r="2.5"></circle>
+                <line x1="10" y1="6.5" x2="5.5" y2="11.5"></line>
+                <line x1="10" y1="6.5" x2="14.5" y2="11.5"></line>
+                <line x1="6.5" y1="14" x2="13.5" y2="14"></line>
+              </svg>
+            </div>
+            <div>
+              <h2 class="step-title welcome-title">Welcome to Ember</h2>
+              <p class="welcome-subtitle">eMule KAD Network Client</p>
+            </div>
+          </div>
+
+          <p class="step-desc">Ember is a modern P2P file sharing client built on the eMule network. It is fully compatible with all eMule-family clients (eMule, aMule, eMule Xtreme, etc.).</p>
+
+          <div class="info-cards">
+            <div class="info-card">
+              <div class="info-icon">
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 2v16M2 10h16"/></svg>
+              </div>
+              <div>
+                <strong>Dual Network</strong>
+                <span>KAD decentralized DHT + eD2K servers for maximum source discovery.</span>
+              </div>
+            </div>
+            <div class="info-card">
+              <div class="info-icon epx">
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 10l4 4 10-10"/></svg>
+              </div>
+              <div>
+                <strong>EPX — Ember Peer Exchange</strong>
+                <span>Ember peers share source lists with each other for faster downloads. Non-Ember clients are unaffected.</span>
+              </div>
+            </div>
+            <div class="info-card">
+              <div class="info-icon">
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="5" width="14" height="10" rx="2"/><path d="M7 9h6M7 12h4"/></svg>
+              </div>
+              <div>
+                <strong>Secure &amp; Private</strong>
+                <span>Protocol obfuscation, IP filtering, and credits-based upload priority.</span>
+              </div>
+            </div>
+          </div>
+
+          <p class="step-hint">Let's configure your preferences. You can change any of these later in Settings.</p>
+        </div>
+
+      {:else if step === 2}
+        <div class="step-content">
+          <h2 class="step-title">Choose a Nickname</h2>
+          <p class="step-desc">This is how you appear to other peers on the network. You can use the generated name or pick your own.</p>
+          <div class="field">
+            <label for="nickname">Nickname</label>
+            <input id="nickname" type="text" bind:value={nickname} maxlength="128" class="text-input" placeholder="Enter a nickname" />
+          </div>
+          <p class="step-hint">Max 128 characters. Visible to peers you connect with.</p>
+        </div>
+
+      {:else if step === 3}
+        <div class="step-content">
+          <h2 class="step-title">Download Folder</h2>
+          <p class="step-desc">Choose where Ember saves downloaded files. Completed files will appear in a "Downloads" subfolder which is automatically shared.</p>
+          <div class="field">
+            <label for="dl-folder">Download location</label>
+            <div class="folder-picker">
+              <input id="dl-folder" type="text" bind:value={downloadFolder} class="text-input folder-input" readonly />
+              <button type="button" class="browse-btn" onclick={pickFolder}>Browse</button>
+            </div>
+          </div>
+        </div>
+
+      {:else if step === 4}
+        <div class="step-content">
+          <h2 class="step-title">Network Ports</h2>
+          <p class="step-desc">Ember needs two ports for peer communication. The defaults work for most users. Enable UPnP to automatically forward ports on your router.</p>
+          <div class="fields-row">
+            <div class="field">
+              <label for="tcp-port">TCP Port</label>
+              <input id="tcp-port" type="number" bind:value={tcpPort} min="1" max="65535" class="text-input port-input" />
+            </div>
+            <div class="field">
+              <label for="udp-port">UDP Port</label>
+              <input id="udp-port" type="number" bind:value={udpPort} min="1" max="65535" class="text-input port-input" />
+            </div>
+          </div>
+          <div class="toggle-row">
+            <ToggleSwitch bind:checked={upnpEnabled} label="Enable UPnP (automatic port forwarding)" />
+          </div>
+          <p class="step-hint">If UPnP is off, you may need to manually forward these ports on your router for best performance (HighID).</p>
+        </div>
+
+      {:else if step === 5}
+        <div class="step-content">
+          <h2 class="step-title">Bandwidth Limits</h2>
+          <p class="step-desc">Set upload and download speed limits to avoid saturating your connection. Leave unlimited if you have plenty of bandwidth.</p>
+          <div class="fields-col">
+            <div class="field">
+              <SpeedInput bind:value={maxUploadSpeed} label="Upload limit" />
+            </div>
+            <div class="field">
+              <SpeedInput bind:value={maxDownloadSpeed} label="Download limit" />
+            </div>
+          </div>
+          <button type="button" class="speed-test-btn" onclick={runSpeedTest} disabled={speedTestRunning}>
+            {speedTestRunning ? 'Testing...' : 'Run Speed Test'}
+          </button>
+          {#if speedTestResult}
+            <p class="speed-result">{speedTestResult}</p>
+          {/if}
+        </div>
+
+      {:else if step === 6}
+        <div class="step-content">
+          <h2 class="step-title">Auto-Connect</h2>
+          <p class="step-desc">Choose whether to automatically connect to the KAD network when Ember starts.</p>
+          <div class="connect-options">
+            <div class="connect-option">
+              <ToggleSwitch bind:checked={autoConnectKad} />
+              <div>
+                <strong>KAD Network</strong>
+                <span>Decentralized peer discovery via the Kademlia DHT. Recommended for most users.</span>
+              </div>
+            </div>
+          </div>
+          <p class="step-hint">You can enable additional network options like eD2K servers later in Settings.</p>
+        </div>
+
+      {:else if step === 7}
+        <div class="step-content">
+          <h2 class="step-title">Theme</h2>
+          <p class="step-desc">Choose your preferred appearance.</p>
+          <div class="theme-options">
+            <button
+              type="button"
+              class="theme-card"
+              class:selected={selectedTheme === 'dark'}
+              onclick={() => selectTheme('dark')}
+            >
+              <div class="theme-preview dark-preview">
+                <div class="tp-sidebar"></div>
+                <div class="tp-main">
+                  <div class="tp-bar"></div>
+                  <div class="tp-row"></div>
+                  <div class="tp-row short"></div>
+                </div>
+              </div>
+              <span>Dark</span>
+            </button>
+            <button
+              type="button"
+              class="theme-card"
+              class:selected={selectedTheme === 'light'}
+              onclick={() => selectTheme('light')}
+            >
+              <div class="theme-preview light-preview">
+                <div class="tp-sidebar"></div>
+                <div class="tp-main">
+                  <div class="tp-bar"></div>
+                  <div class="tp-row"></div>
+                  <div class="tp-row short"></div>
+                </div>
+              </div>
+              <span>Light</span>
+            </button>
+          </div>
+        </div>
+
+      {:else if step === 8}
+        <div class="step-content">
+          <h2 class="step-title">You're All Set</h2>
+          <p class="step-desc">Here's a summary of your configuration. You can change any of these later in Settings.</p>
+          <div class="summary">
+            <div class="summary-row">
+              <span class="summary-label">Nickname</span>
+              <span class="summary-value">{nickname}</span>
+            </div>
+            <div class="summary-row">
+              <span class="summary-label">Download folder</span>
+              <span class="summary-value mono">{downloadFolder}</span>
+            </div>
+            <div class="summary-row">
+              <span class="summary-label">Ports</span>
+              <span class="summary-value">TCP {tcpPort} / UDP {udpPort}{upnpEnabled ? ' (UPnP)' : ''}</span>
+            </div>
+            <div class="summary-row">
+              <span class="summary-label">Upload limit</span>
+              <span class="summary-value">{maxUploadSpeed === 0 ? 'Unlimited' : `${Math.round(maxUploadSpeed / 1024)} KB/s`}</span>
+            </div>
+            <div class="summary-row">
+              <span class="summary-label">Download limit</span>
+              <span class="summary-value">{maxDownloadSpeed === 0 ? 'Unlimited' : `${Math.round(maxDownloadSpeed / 1024)} KB/s`}</span>
+            </div>
+            <div class="summary-row">
+              <span class="summary-label">Auto-connect KAD</span>
+              <span class="summary-value">{autoConnectKad ? 'Yes' : 'No'}</span>
+            </div>
+            <div class="summary-row">
+              <span class="summary-label">Theme</span>
+              <span class="summary-value">{selectedTheme === 'dark' ? 'Dark' : 'Light'}</span>
+            </div>
+          </div>
+          {#if saveError}
+            <p class="save-error">{saveError}</p>
+          {/if}
+
+          {#if downloading || dlNodesStatus !== 'idle' || dlIpStatus !== 'idle'}
+            <div class="dl-progress">
+              <p class="dl-heading">Setting up Ember…</p>
+              <div class="dl-item">
+                {#if dlNodesStatus === 'pending'}
+                  <span class="spinner xs" aria-hidden="true"></span>
+                {:else if dlNodesStatus === 'ok'}
+                  <svg class="dl-icon ok" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6.5 12.5l-4-4 1.4-1.4 2.6 2.6 5.6-5.6 1.4 1.4z"/></svg>
+                {:else if dlNodesStatus === 'error'}
+                  <svg class="dl-icon err" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zm.75 3.5v4h-1.5v-4h1.5zm0 5.5v1.5h-1.5V10h1.5z"/></svg>
+                {:else}
+                  <span class="dl-icon placeholder" aria-hidden="true"></span>
+                {/if}
+                <span>KAD bootstrap nodes (nodes.dat)</span>
+                {#if dlNodesStatus === 'error'}<span class="dl-warn">— skipped, will bootstrap from network</span>{/if}
+              </div>
+              <div class="dl-item">
+                {#if dlIpStatus === 'pending'}
+                  <span class="spinner xs" aria-hidden="true"></span>
+                {:else if dlIpStatus === 'ok'}
+                  <svg class="dl-icon ok" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6.5 12.5l-4-4 1.4-1.4 2.6 2.6 5.6-5.6 1.4 1.4z"/></svg>
+                {:else if dlIpStatus === 'error'}
+                  <svg class="dl-icon err" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zm.75 3.5v4h-1.5v-4h1.5zm0 5.5v1.5h-1.5V10h1.5z"/></svg>
+                {:else}
+                  <span class="dl-icon placeholder" aria-hidden="true"></span>
+                {/if}
+                <span>IP filter (ipfilter.dat)</span>
+                {#if dlIpStatus === 'error'}<span class="dl-warn">— skipped, can be downloaded later in Security settings</span>{/if}
+              </div>
+            </div>
+          {/if}
+        </div>
+      {/if}
+    </div>
+
+    <!-- Footer -->
+    <div class="wizard-footer">
+      {#if step > 1 && !saving}
+        <button type="button" class="btn-back" onclick={goBack}>Back</button>
+      {:else}
+        <div></div>
+      {/if}
+
+      <div class="footer-right">
+        {#if step < TOTAL_STEPS}
+          <button type="button" class="btn-next" onclick={goNext}>
+            {step === 1 ? "Get Started" : "Next"}
+          </button>
+        {:else}
+          <button type="button" class="btn-finish" onclick={finish} disabled={saving || downloading}>
+            {#if saving}
+              <span class="spinner sm"></span> Saving...
+            {:else if downloading}
+              <span class="spinner sm"></span> Downloading...
+            {:else}
+              Launch Ember
+            {/if}
+          </button>
+        {/if}
+      </div>
+    </div>
+  </div>
+</div>
+{/if}
+
+<style>
+  .wizard-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 99999;
+    display: grid;
+    place-items: center;
+    background: var(--bg-primary);
+    padding: 20px;
+  }
+
+  .relaunch-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    animation: wizard-in 400ms ease-out;
+  }
+
+  .relaunch-title {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--accent);
+    margin: 0;
+  }
+
+  .relaunch-sub {
+    font-size: 14px;
+    color: var(--text-muted);
+    margin: 0;
+  }
+
+  .wizard-card {
+    width: min(680px, 100%);
+    max-height: calc(100vh - 40px);
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: var(--shadow-md);
+    animation: wizard-in 400ms ease-out;
+    overflow: hidden;
+  }
+
+  .wizard-card.transitioning .wizard-body {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+
+  /* Progress bar */
+  .wizard-progress {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    padding: 20px 28px 0;
+    flex-shrink: 0;
+  }
+
+  .progress-dot {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+
+  .dot {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: 700;
+    border: 2px solid var(--border);
+    color: var(--text-muted);
+    background: var(--bg-surface);
+    transition: all 0.2s ease;
+  }
+
+  .progress-dot.active .dot {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: #fff;
+  }
+
+  .progress-dot.done .dot {
+    border-color: var(--success);
+    background: var(--success);
+    color: #fff;
+  }
+
+  .dot-label {
+    font-size: 9px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+  }
+
+  .progress-dot.active .dot-label {
+    color: var(--accent);
+  }
+
+  .progress-dot.done .dot-label {
+    color: var(--success);
+  }
+
+  .progress-line {
+    flex: 1;
+    height: 2px;
+    background: var(--border);
+    margin: 0 2px;
+    margin-bottom: 18px;
+    transition: background 0.2s ease;
+  }
+
+  .progress-line.filled {
+    background: var(--success);
+  }
+
+  /* Body */
+  .wizard-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px 28px;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+  }
+
+  .step-content {
+    animation: step-in 0.25s ease-out;
+  }
+
+  .step-title {
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--text-primary);
+    margin: 0 0 6px;
+  }
+
+  .welcome-title {
+    font-size: 24px;
+    color: var(--accent);
+    margin: 0;
+  }
+
+  .welcome-subtitle {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    margin: 2px 0 0;
+  }
+
+  .brand-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 16px;
+  }
+
+  .brand-icon {
+    width: 48px;
+    height: 48px;
+    border-radius: 12px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--border);
+    background: var(--bg-tertiary);
+    color: var(--accent);
+    flex-shrink: 0;
+  }
+
+  .brand-icon svg {
+    width: 28px;
+    height: 28px;
+  }
+
+  .step-desc {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.6;
+    margin: 0 0 16px;
+  }
+
+  .step-hint {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: 12px 0 0;
+  }
+
+  /* Info cards (welcome) */
+  .info-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 8px;
+  }
+
+  .info-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 12px 14px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+
+  .info-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    display: grid;
+    place-items: center;
+    background: var(--accent-dim);
+    color: var(--accent);
+    flex-shrink: 0;
+  }
+
+  .info-icon.epx {
+    background: color-mix(in srgb, var(--success) 20%, transparent);
+    color: var(--success);
+  }
+
+  .info-icon svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .info-card strong {
+    display: block;
+    font-size: 13px;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+  }
+
+  .info-card span {
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+
+  /* Fields */
+  .field {
+    margin-bottom: 14px;
+  }
+
+  .field label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .text-input {
+    width: 100%;
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-input);
+    color: var(--text-primary);
+    font-size: 14px;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.15s;
+    box-sizing: border-box;
+  }
+
+  .text-input:focus {
+    border-color: var(--accent);
+  }
+
+  .port-input {
+    width: 120px;
+  }
+
+  .port-input::-webkit-inner-spin-button,
+  .port-input::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
+  .folder-picker {
+    display: flex;
+    gap: 8px;
+  }
+
+  .folder-input {
+    flex: 1;
+    cursor: pointer;
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  .browse-btn {
+    padding: 0 16px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--accent);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+    white-space: nowrap;
+  }
+
+  .browse-btn:hover {
+    background: var(--accent);
+    color: #fff;
+  }
+
+  .fields-row {
+    display: flex;
+    gap: 16px;
+  }
+
+  .fields-col {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .toggle-row {
+    margin: 14px 0 4px;
+  }
+
+  /* Speed test */
+  .speed-test-btn {
+    margin-top: 12px;
+    padding: 8px 20px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    font-size: 13px;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+  }
+
+  .speed-test-btn:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .speed-test-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  .speed-result {
+    font-size: 12px;
+    color: var(--success);
+    margin: 8px 0 0;
+  }
+
+  /* Connection options */
+  .connect-options {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-top: 4px;
+  }
+
+  .connect-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 14px 16px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+
+  .connect-option strong {
+    display: block;
+    font-size: 13px;
+    color: var(--text-primary);
+    margin-bottom: 2px;
+  }
+
+  .connect-option span {
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+  }
+
+  /* Theme cards */
+  .theme-options {
+    display: flex;
+    gap: 16px;
+    margin-top: 4px;
+  }
+
+  .theme-card {
+    flex: 1;
+    border: 2px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+    background: var(--bg-surface);
+    cursor: pointer;
+    transition: border-color 0.2s, box-shadow 0.2s;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .theme-card:hover {
+    border-color: var(--accent);
+  }
+
+  .theme-card.selected {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+  }
+
+  .theme-preview {
+    width: 100%;
+    height: 80px;
+    border-radius: 6px;
+    display: flex;
+    overflow: hidden;
+    border: 1px solid rgba(128,128,128,0.2);
+  }
+
+  .dark-preview {
+    background: #1a1a2e;
+  }
+
+  .dark-preview .tp-sidebar {
+    width: 30%;
+    background: #16213e;
+    border-right: 1px solid #2a3456;
+  }
+
+  .dark-preview .tp-main {
+    flex: 1;
+    padding: 8px;
+  }
+
+  .dark-preview .tp-bar {
+    height: 8px;
+    border-radius: 3px;
+    background: #0f3460;
+    margin-bottom: 6px;
+  }
+
+  .dark-preview .tp-row {
+    height: 6px;
+    border-radius: 2px;
+    background: #253255;
+    margin-bottom: 4px;
+  }
+
+  .dark-preview .tp-row.short {
+    width: 60%;
+  }
+
+  .light-preview {
+    background: #f5f6fa;
+  }
+
+  .light-preview .tp-sidebar {
+    width: 30%;
+    background: #ffffff;
+    border-right: 1px solid #dadce0;
+  }
+
+  .light-preview .tp-main {
+    flex: 1;
+    padding: 8px;
+  }
+
+  .light-preview .tp-bar {
+    height: 8px;
+    border-radius: 3px;
+    background: #e8ecf4;
+    margin-bottom: 6px;
+  }
+
+  .light-preview .tp-row {
+    height: 6px;
+    border-radius: 2px;
+    background: #eceef5;
+    margin-bottom: 4px;
+  }
+
+  .light-preview .tp-row.short {
+    width: 60%;
+  }
+
+  /* Summary */
+  .summary {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .summary-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .summary-row:last-child {
+    border-bottom: none;
+  }
+
+  .summary-row:nth-child(even) {
+    background: var(--bg-surface);
+  }
+
+  .summary-label {
+    font-size: 13px;
+    color: var(--text-secondary);
+    font-weight: 500;
+  }
+
+  .summary-value {
+    font-size: 13px;
+    color: var(--text-primary);
+    font-weight: 600;
+    text-align: right;
+    max-width: 60%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .summary-value.mono {
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+
+  /* Footer */
+  .wizard-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 28px;
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+
+  .btn-back {
+    padding: 8px 20px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s;
+  }
+
+  .btn-back:hover {
+    border-color: var(--text-primary);
+    color: var(--text-primary);
+  }
+
+  .footer-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .btn-next, .btn-finish {
+    padding: 9px 28px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: var(--accent);
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+
+  .btn-next:hover, .btn-finish:hover {
+    background: var(--accent-hover);
+  }
+
+  .btn-finish {
+    padding: 10px 32px;
+    font-size: 15px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .btn-finish:disabled {
+    opacity: 0.7;
+    cursor: not-allowed;
+  }
+
+  .save-error {
+    margin-top: 12px;
+    padding: 10px 14px;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+    color: var(--danger);
+    font-size: 13px;
+    line-height: 1.4;
+  }
+
+  .dl-progress {
+    margin-top: 14px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .dl-heading {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin: 0 0 2px;
+  }
+
+  .dl-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text-primary);
+  }
+
+  .dl-icon {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+  }
+
+  .dl-icon.ok {
+    color: var(--success);
+  }
+
+  .dl-icon.err {
+    color: var(--danger);
+  }
+
+  .dl-icon.placeholder {
+    display: inline-block;
+  }
+
+  .dl-warn {
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .spinner.xs {
+    width: 14px;
+    height: 14px;
+    border-width: 2px;
+    flex-shrink: 0;
+  }
+
+  /* Animations */
+  @keyframes wizard-in {
+    from {
+      transform: translateY(12px) scale(0.98);
+      opacity: 0;
+    }
+    to {
+      transform: translateY(0) scale(1);
+      opacity: 1;
+    }
+  }
+
+  @keyframes step-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .wizard-card,
+    .step-content {
+      animation: none !important;
+    }
+    .wizard-card.transitioning .wizard-body {
+      transition: none;
+    }
+  }
+
+  @media (max-width: 700px) {
+    .wizard-progress {
+      padding: 16px 16px 0;
+    }
+
+    .dot-label {
+      display: none;
+    }
+
+    .wizard-body {
+      padding: 20px 16px;
+    }
+
+    .wizard-footer {
+      padding: 14px 16px;
+    }
+
+    .fields-row {
+      flex-direction: column;
+      gap: 0;
+    }
+
+    .port-input {
+      width: 100%;
+    }
+
+    .theme-options {
+      flex-direction: column;
+    }
+  }
+</style>

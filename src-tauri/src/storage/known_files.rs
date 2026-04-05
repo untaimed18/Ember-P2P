@@ -1,0 +1,536 @@
+use std::collections::HashMap;
+use std::io::{Cursor, Read, Write};
+use std::path::Path;
+
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use tracing::{info, warn};
+
+const MET_HEADER: u8 = 0x0E;
+const MET_HEADER_I64TAGS: u8 = 0x0F;
+
+const FT_FILENAME: u8 = 0x01;
+const FT_FILESIZE: u8 = 0x02;
+const FT_AICH_HASH: u8 = 0x27;
+const FT_ATTRANSFERRED: u8 = 0x50;
+const FT_ATTRANSFERREDHI: u8 = 0x51;
+const FT_ATREQUESTED: u8 = 0x52;
+const FT_ATACCEPTED: u8 = 0x53;
+const FT_ULPRIORITY: u8 = 0x18;
+const FT_KADLASTPUBLISHSRC: u8 = 0x23;
+const FT_LASTSHARED: u8 = 0x24;
+
+const TAG_STRING: u8 = 0x02;
+const TAG_UINT32: u8 = 0x03;
+
+#[derive(Debug, Clone)]
+pub struct KnownFileRecord {
+    pub file_hash: [u8; 16],
+    pub part_hashes: Vec<[u8; 16]>,
+    pub file_name: String,
+    pub file_size: u64,
+    pub file_path: String,
+    pub aich_hash: String,
+    pub modified_at: i64,
+    pub all_time_transferred: u64,
+    pub all_time_requested: u32,
+    pub all_time_accepted: u32,
+    pub upload_priority: u8,
+    pub last_publish_src: u32,
+    pub last_shared: u32,
+}
+
+pub struct KnownFileList {
+    files: HashMap<[u8; 16], KnownFileRecord>,
+    path_index: HashMap<String, [u8; 16]>,
+    dirty: bool,
+}
+
+impl KnownFileList {
+    pub fn new() -> Self {
+        Self {
+            files: HashMap::new(),
+            path_index: HashMap::new(),
+            dirty: false,
+        }
+    }
+
+    pub fn load(path: &Path) -> Self {
+        let mut list = Self::new();
+        if !path.exists() {
+            return list;
+        }
+        match std::fs::read(path) {
+            Ok(data) => {
+                if let Err(e) = list.parse_known_met(&data) {
+                    warn!("Failed to parse known.met: {e}");
+                }
+            }
+            Err(e) => warn!("Failed to read known.met: {e}"),
+        }
+        list.load_path_index(&path.with_file_name("known_paths.dat"));
+        list
+    }
+
+    fn parse_known_met(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        if data.len() < 5 {
+            return Ok(());
+        }
+        let mut cursor = Cursor::new(data);
+        let version = cursor.read_u8()?;
+        if version != MET_HEADER && version != MET_HEADER_I64TAGS {
+            anyhow::bail!("Unknown known.met version: 0x{version:02X}");
+        }
+        let count = cursor.read_u32::<LittleEndian>()? as usize;
+
+        let mut consecutive_failures = 0u32;
+        for _ in 0..count.min(50_000) {
+            match Self::read_record(&mut cursor, version) {
+                Ok(record) => {
+                    consecutive_failures = 0;
+                    let hash = record.file_hash;
+                    let path = record.file_path.clone();
+                    self.files.insert(hash, record);
+                    if !path.is_empty() {
+                        self.path_index.insert(path, hash);
+                    }
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    warn!("Skipping corrupt record in known.met: {e}");
+                    if consecutive_failures >= 3 {
+                        warn!("Too many consecutive failures, stopping known.met parse");
+                        break;
+                    }
+                }
+            }
+        }
+
+        info!("Loaded {} known files from known.met", self.files.len());
+        Ok(())
+    }
+
+    fn read_record(cursor: &mut Cursor<&[u8]>, _version: u8) -> anyhow::Result<KnownFileRecord> {
+        let modified_at = cursor.read_u32::<LittleEndian>()? as i64;
+
+        let mut file_hash = [0u8; 16];
+        cursor.read_exact(&mut file_hash)?;
+
+        let part_count = cursor.read_u16::<LittleEndian>()? as usize;
+        let clamped_parts = part_count.min(1000);
+        let mut part_hashes = Vec::with_capacity(clamped_parts);
+        for _ in 0..clamped_parts {
+            let mut ph = [0u8; 16];
+            cursor.read_exact(&mut ph)?;
+            part_hashes.push(ph);
+        }
+        for _ in clamped_parts..part_count {
+            let mut skip = [0u8; 16];
+            cursor.read_exact(&mut skip)?;
+        }
+
+        let tag_count = (cursor.read_u32::<LittleEndian>()? as usize).min(500);
+
+        let mut record = KnownFileRecord {
+            file_hash,
+            part_hashes,
+            file_name: String::new(),
+            file_size: 0,
+            file_path: String::new(),
+            aich_hash: String::new(),
+            modified_at,
+            all_time_transferred: 0,
+            all_time_requested: 0,
+            all_time_accepted: 0,
+            upload_priority: 0,
+            last_publish_src: 0,
+            last_shared: 0,
+        };
+
+        for _ in 0..tag_count {
+            let tag_type = cursor.read_u8()?;
+            let name_id = if tag_type & 0x80 != 0 {
+                cursor.read_u8()?
+            } else {
+                let name_len = cursor.read_u16::<LittleEndian>()? as usize;
+                let mut name_buf = vec![0u8; name_len];
+                cursor.read_exact(&mut name_buf)?;
+                if name_len == 1 { name_buf[0] } else { 0 }
+            };
+
+            let real_type = if tag_type & 0x80 != 0 { tag_type & 0x7F } else { tag_type };
+            match real_type {
+                TAG_STRING => {
+                    let slen = cursor.read_u16::<LittleEndian>()? as usize;
+                    let clamped = slen.min(4096);
+                    let mut sbuf = vec![0u8; clamped];
+                    cursor.read_exact(&mut sbuf)?;
+                    if slen > clamped {
+                        let skip = (slen - clamped) as u64;
+                        let new_pos = cursor.position() + skip;
+                        if new_pos > cursor.get_ref().len() as u64 {
+                            anyhow::bail!("string tag length {slen} exceeds data boundary");
+                        }
+                        cursor.set_position(new_pos);
+                    }
+                    let s = String::from_utf8_lossy(&sbuf).to_string();
+                    match name_id {
+                        FT_FILENAME => record.file_name = s,
+                        FT_AICH_HASH => record.aich_hash = s,
+                        _ => {}
+                    }
+                }
+                TAG_UINT32 => {
+                    let v = cursor.read_u32::<LittleEndian>()?;
+                    match name_id {
+                        FT_FILESIZE => record.file_size = v as u64,
+                        FT_ATTRANSFERRED => {
+                            record.all_time_transferred =
+                                (record.all_time_transferred & 0xFFFF_FFFF_0000_0000) | v as u64;
+                        }
+                        FT_ATTRANSFERREDHI => {
+                            record.all_time_transferred =
+                                (record.all_time_transferred & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32);
+                        }
+                        FT_ATREQUESTED => record.all_time_requested = v,
+                        FT_ATACCEPTED => record.all_time_accepted = v,
+                        FT_ULPRIORITY => record.upload_priority = v as u8,
+                        FT_KADLASTPUBLISHSRC => record.last_publish_src = v,
+                        FT_LASTSHARED => record.last_shared = v,
+                        _ => {}
+                    }
+                }
+                0x08 => { cursor.read_u16::<LittleEndian>()?; }
+                0x09 => { cursor.read_u8()?; }
+                0x0B => {
+                    let v = cursor.read_u64::<LittleEndian>()?;
+                    if name_id == FT_FILESIZE {
+                        record.file_size = v;
+                    }
+                }
+                0x01 => {
+                    let mut skip = [0u8; 16];
+                    cursor.read_exact(&mut skip)?;
+                }
+                0x04 => { cursor.read_f32::<LittleEndian>()?; }
+                0x05 => { cursor.read_u8()?; }
+                0x07 => {
+                    let blen = cursor.read_u32::<LittleEndian>()? as u64;
+                    let new_pos = cursor.position().checked_add(blen)
+                        .filter(|&p| p <= cursor.get_ref().len() as u64)
+                        .ok_or_else(|| anyhow::anyhow!("blob tag length {blen} exceeds data"))?;
+                    cursor.set_position(new_pos);
+                }
+                0x0A => {
+                    let blen = cursor.read_u8()? as usize;
+                    let mut skip = vec![0u8; blen];
+                    cursor.read_exact(&mut skip)?;
+                }
+                t if (0x11..=0x20).contains(&t) => {
+                    let len = (t - 0x11 + 1) as usize;
+                    let mut sbuf = vec![0u8; len];
+                    cursor.read_exact(&mut sbuf)?;
+                    let s = String::from_utf8_lossy(&sbuf).to_string();
+                    match name_id {
+                        FT_FILENAME => record.file_name = s,
+                        FT_AICH_HASH => record.aich_hash = s,
+                        _ => {}
+                    }
+                }
+                _ => {
+                    anyhow::bail!(
+                        "Unknown known.met tag type 0x{:02X} at position {}, cannot skip value",
+                        real_type,
+                        cursor.position(),
+                    );
+                }
+            }
+        }
+
+        Ok(record)
+    }
+
+    /// Look up a known file by path, size, and mtime to skip re-hashing.
+    pub fn find_by_path_and_meta(&self, path: &str, size: u64, mtime: i64) -> Option<&KnownFileRecord> {
+        if let Some(hash) = self.path_index.get(path) {
+            if let Some(record) = self.files.get(hash) {
+                if record.file_size == size && record.modified_at == mtime {
+                    return Some(record);
+                }
+            }
+        }
+        // Fallback: match by name + size + mtime (eMule's FindKnownFile approach).
+        // The known.met format doesn't persist file paths, so after a restart
+        // the path_index is empty and we must match by metadata instead.
+        self.find_by_name_and_meta(
+            std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default()
+                .as_ref(),
+            size,
+            mtime,
+        )
+    }
+
+    /// eMule-compatible lookup: match by filename, size, and modified time.
+    /// Used when file paths aren't available (e.g. after loading from known.met).
+    pub fn find_by_name_and_meta(&self, name: &str, size: u64, mtime: i64) -> Option<&KnownFileRecord> {
+        self.files.values().find(|r| {
+            r.file_name == name && r.file_size == size && r.modified_at == mtime
+        })
+    }
+
+    pub fn find_by_hash(&self, hash: &[u8; 16]) -> Option<&KnownFileRecord> {
+        self.files.get(hash)
+    }
+
+    pub fn add_or_update(&mut self, record: KnownFileRecord) {
+        let hash = record.file_hash;
+        let new_path = record.file_path.clone();
+        if !new_path.is_empty() {
+            if let Some(&old_hash) = self.path_index.get(&new_path) {
+                if old_hash != hash {
+                    self.files.remove(&old_hash);
+                }
+            }
+            // Remove stale path_index entry if this hash was previously at a different path
+            if let Some(existing) = self.files.get(&hash) {
+                let old_path = &existing.file_path;
+                if !old_path.is_empty() && *old_path != new_path {
+                    if self.path_index.get(old_path) == Some(&hash) {
+                        self.path_index.remove(old_path);
+                    }
+                }
+            }
+            self.path_index.insert(new_path, hash);
+        }
+        self.files.insert(hash, record);
+        self.dirty = true;
+    }
+
+    /// Increment all-time request/accept counters (eMule-style per-file upload interest).
+    pub fn bump_share_interest(&mut self, hash: &[u8; 16], requested: u32, accepted: u32) {
+        if requested == 0 && accepted == 0 {
+            return;
+        }
+        if let Some(record) = self.files.get_mut(hash) {
+            record.all_time_requested = record.all_time_requested.saturating_add(requested);
+            record.all_time_accepted = record.all_time_accepted.saturating_add(accepted);
+            self.dirty = true;
+        }
+    }
+
+    /// Add payload bytes to all-time uploaded for this file.
+    pub fn add_all_time_transferred(&mut self, hash: &[u8; 16], bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        if let Some(record) = self.files.get_mut(hash) {
+            record.all_time_transferred = record.all_time_transferred.saturating_add(bytes);
+            self.dirty = true;
+        }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
+        let needs_i64 = self.files.values().any(|r| r.file_size > u32::MAX as u64);
+        let mut buf = Vec::new();
+        buf.write_u8(if needs_i64 { MET_HEADER_I64TAGS } else { MET_HEADER })?;
+        buf.write_u32::<LittleEndian>(self.files.len() as u32)?;
+
+        for record in self.files.values() {
+            buf.write_u32::<LittleEndian>((record.modified_at.max(0) as u64).min(u32::MAX as u64) as u32)?;
+
+            buf.write_all(&record.file_hash)?;
+            buf.write_u16::<LittleEndian>(record.part_hashes.len() as u16)?;
+            for ph in &record.part_hashes {
+                buf.write_all(ph)?;
+            }
+
+            let mut tags = Vec::new();
+            let mut tag_count: u32 = 0;
+
+            if !record.file_name.is_empty() {
+                write_string_tag(&mut tags, FT_FILENAME, &record.file_name)?;
+                tag_count += 1;
+            }
+            if record.file_size > u32::MAX as u64 {
+                write_u64_tag(&mut tags, FT_FILESIZE, record.file_size)?;
+            } else {
+                write_u32_tag(&mut tags, FT_FILESIZE, record.file_size as u32)?;
+            }
+            tag_count += 1;
+
+            if !record.aich_hash.is_empty() {
+                write_string_tag(&mut tags, FT_AICH_HASH, &record.aich_hash)?;
+                tag_count += 1;
+            }
+            if record.all_time_transferred > 0 {
+                write_u32_tag(&mut tags, FT_ATTRANSFERRED, record.all_time_transferred as u32)?;
+                tag_count += 1;
+                let hi = (record.all_time_transferred >> 32) as u32;
+                if hi > 0 {
+                    write_u32_tag(&mut tags, FT_ATTRANSFERREDHI, hi)?;
+                    tag_count += 1;
+                }
+            }
+            if record.all_time_requested > 0 {
+                write_u32_tag(&mut tags, FT_ATREQUESTED, record.all_time_requested)?;
+                tag_count += 1;
+            }
+            if record.all_time_accepted > 0 {
+                write_u32_tag(&mut tags, FT_ATACCEPTED, record.all_time_accepted)?;
+                tag_count += 1;
+            }
+            if record.upload_priority > 0 {
+                write_u32_tag(&mut tags, FT_ULPRIORITY, record.upload_priority as u32)?;
+                tag_count += 1;
+            }
+            if record.last_publish_src > 0 {
+                write_u32_tag(&mut tags, FT_KADLASTPUBLISHSRC, record.last_publish_src)?;
+                tag_count += 1;
+            }
+            if record.last_shared > 0 {
+                write_u32_tag(&mut tags, FT_LASTSHARED, record.last_shared)?;
+                tag_count += 1;
+            }
+
+            buf.write_u32::<LittleEndian>(tag_count)?;
+            buf.write_all(&tags)?;
+        }
+
+        let tmp_path = path.with_extension("met.tmp");
+        std::fs::write(&tmp_path, &buf)?;
+        std::fs::rename(&tmp_path, path)?;
+        self.dirty = false;
+        if let Err(e) = self.save_path_index(&path.with_file_name("known_paths.dat")) {
+            warn!("Failed to save known_paths.dat: {e}");
+        }
+        info!("Saved {} known files to known.met", self.files.len());
+        Ok(())
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn all_records(&self) -> impl Iterator<Item = &KnownFileRecord> {
+        self.files.values()
+    }
+
+    /// Load a companion path index so files can be matched by exact path
+    /// after restart (the eMule known.met format only stores filenames).
+    fn load_path_index(&mut self, path: &Path) {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        if data.len() < 9 {
+            return;
+        }
+        let mut cur = Cursor::new(&data[..]);
+        let mut magic = [0u8; 4];
+        if cur.read_exact(&mut magic).is_err() || &magic != b"NXPI" {
+            return;
+        }
+        let version = match cur.read_u8() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if version != 1 {
+            return;
+        }
+        let count = match cur.read_u32::<LittleEndian>() {
+            Ok(c) => c as usize,
+            Err(_) => return,
+        };
+        let mut loaded = 0usize;
+        for _ in 0..count.min(100_000) {
+            let path_len = match cur.read_u16::<LittleEndian>() {
+                Ok(l) => l as usize,
+                Err(_) => break,
+            };
+            if path_len > 32768 {
+                break;
+            }
+            let mut pbuf = vec![0u8; path_len];
+            if cur.read_exact(&mut pbuf).is_err() {
+                break;
+            }
+            let mut hash = [0u8; 16];
+            if cur.read_exact(&mut hash).is_err() {
+                break;
+            }
+            if let Some(record) = self.files.get_mut(&hash) {
+                let fp = String::from_utf8_lossy(&pbuf).to_string();
+                if record.file_path.is_empty() {
+                    record.file_path = fp.clone();
+                }
+                self.path_index.insert(fp, hash);
+                loaded += 1;
+            }
+        }
+        if loaded > 0 {
+            info!("Loaded {loaded} path mappings from known_paths.dat");
+        }
+    }
+
+    fn save_path_index(&self, path: &Path) -> anyhow::Result<()> {
+        if self.path_index.is_empty() {
+            return Ok(());
+        }
+        let mut buf = Vec::with_capacity(9 + self.path_index.len() * 40);
+        buf.write_all(b"NXPI")?;
+        buf.write_u8(1)?;
+        buf.write_u32::<LittleEndian>(self.path_index.len() as u32)?;
+        for (file_path, hash) in &self.path_index {
+            let pb = file_path.as_bytes();
+            let len = pb.len().min(u16::MAX as usize);
+            buf.write_u16::<LittleEndian>(len as u16)?;
+            buf.write_all(&pb[..len])?;
+            buf.write_all(hash)?;
+        }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &buf)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+}
+
+fn write_string_tag(buf: &mut Vec<u8>, name_id: u8, value: &str) -> anyhow::Result<()> {
+    let max_len = 65535;
+    let clamped = if value.len() <= max_len {
+        value
+    } else {
+        let mut end = max_len;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        &value[..end]
+    };
+    buf.write_u8(TAG_STRING)?;
+    buf.write_u16::<LittleEndian>(1)?;
+    buf.push(name_id);
+    buf.write_u16::<LittleEndian>(clamped.len() as u16)?;
+    buf.write_all(clamped.as_bytes())?;
+    Ok(())
+}
+
+fn write_u32_tag(buf: &mut Vec<u8>, name_id: u8, value: u32) -> anyhow::Result<()> {
+    buf.write_u8(TAG_UINT32)?;
+    buf.write_u16::<LittleEndian>(1)?;
+    buf.push(name_id);
+    buf.write_u32::<LittleEndian>(value)?;
+    Ok(())
+}
+
+fn write_u64_tag(buf: &mut Vec<u8>, name_id: u8, value: u64) -> anyhow::Result<()> {
+    buf.write_u8(0x0B)?; // TAGTYPE_UINT64
+    buf.write_u16::<LittleEndian>(1)?;
+    buf.push(name_id);
+    buf.write_u64::<LittleEndian>(value)?;
+    Ok(())
+}
