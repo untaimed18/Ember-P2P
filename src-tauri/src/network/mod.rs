@@ -1157,6 +1157,9 @@ struct NetworkState {
     online_friends: HashMap<[u8; 16], i64>,
     /// Shared Ember session map for sending outbound packets to friend connections
     ember_sessions: upload_server::EmberSessionMap,
+    /// Shared flag: set to true when network is disconnected so the upload
+    /// listener rejects new connections and terminates active sessions.
+    upload_disconnected: Arc<std::sync::atomic::AtomicBool>,
     /// Whether we have successfully registered with the rendezvous server
     rendezvous_registered: bool,
     /// Last time we registered with the rendezvous server (for heartbeat)
@@ -2067,6 +2070,7 @@ pub async fn start_network(
         firewall_connect_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
         online_friends: HashMap::new(),
         ember_sessions: Arc::new(RwLock::new(HashMap::new())),
+        upload_disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         rendezvous_registered: false,
         rendezvous_last_register: None,
         outbound_session_tasks: HashMap::new(),
@@ -2233,6 +2237,7 @@ pub async fn start_network(
         let ul_ember = shared_ember_payload.clone();
         let ul_geoip = geoip.clone();
         let ul_ember_sessions = state.ember_sessions.clone();
+        let ul_disconnected = state.upload_disconnected.clone();
         tokio::spawn(async move {
             if let Err(e) = upload_server::start_upload_server(
                 tcp_port,
@@ -2271,6 +2276,7 @@ pub async fn start_network(
                 ul_geoip,
                 ul_ember_sessions,
                 ember_hash,
+                ul_disconnected,
             )
             .await
             {
@@ -11670,6 +11676,7 @@ async fn handle_command(
 
         NetworkCommand::KadConnect => {
             info!("KAD connect requested");
+            state.upload_disconnected.store(false, std::sync::atomic::Ordering::Relaxed);
             state.stats.status = NetworkStatus::Connecting;
             state.self_lookup_done = false;
             state.last_self_lookup = 0;
@@ -11847,6 +11854,10 @@ async fn handle_command(
                     }
                 }
             }
+
+            // Signal the upload listener to reject new connections and
+            // terminate active upload sessions (eMule: all uploads stop on disconnect).
+            state.upload_disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
 
             state.stats.status = NetworkStatus::Disconnected;
             state.stats.connected_peers = 0;
