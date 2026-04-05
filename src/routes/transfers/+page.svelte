@@ -189,6 +189,7 @@
       }
     }).then((u) => { if (mounted) sourceUnlisten = u; else u(); }).catch((e) => { console.error('Failed to subscribe to transfer-source-detail:', e); });
 
+    const searchUnsubs: (() => void)[] = [];
     listen<{ transfer_id: string; kind: string; count?: number }>('transfer:source-search', (event) => {
       const d = event.payload;
       let msg: string;
@@ -205,17 +206,16 @@
       }
       searchStatus.set(d.transfer_id, msg);
       searchStatus = new Map(searchStatus);
-    }).then((u) => { if (mounted) searchUnlisten = u; else u(); }).catch((e) => { console.error('Failed to subscribe to transfer:source-search:', e); });
+    }).then((u) => { if (mounted) searchUnsubs.push(u); else u(); }).catch((e) => { console.error('Failed to subscribe to transfer:source-search:', e); });
 
     listen<{ transfer_id: string; source: string; kind: string }>('transfer:source-failed', (event) => {
       const d = event.payload;
       const label = d.kind === 'permanent' ? 'rejected' : d.kind === 'timeout' ? 'timed out' : 'failed';
       searchStatus.set(d.transfer_id, `${d.source} ${label}`);
       searchStatus = new Map(searchStatus);
-    }).then((u) => {
-      if (mounted) { const prev = searchUnlisten; searchUnlisten = () => { prev?.(); u(); }; }
-      else u();
-    }).catch((e) => { console.error('Failed to subscribe to transfer:source-failed:', e); });
+    }).then((u) => { if (mounted) searchUnsubs.push(u); else u(); }).catch((e) => { console.error('Failed to subscribe to transfer:source-failed:', e); });
+
+    searchUnlisten = () => { for (const u of searchUnsubs) u(); searchUnsubs.length = 0; };
   });
 
   onDestroy(() => { mounted = false; sourceUnlisten?.(); searchUnlisten?.(); infoTimers.forEach(clearTimeout); });
@@ -224,6 +224,13 @@
   let transferError: string | null = $state(null);
   let transferInfo: string | null = $state(null);
   let infoTimers: ReturnType<typeof setTimeout>[] = [];
+
+  function showInfo(msg: string) {
+    infoTimers.forEach(clearTimeout);
+    infoTimers = [];
+    transferInfo = msg;
+    infoTimers.push(setTimeout(() => (transferInfo = null), 5000));
+  }
   let confirmCancel: { open: boolean; id: string; name: string } = $state({ open: false, id: '', name: '' });
   let confirmClearCompleted = $state(false);
   let completedCollapsed = $state(false);
@@ -685,11 +692,10 @@
         case 'priority': if (extra) await setTransferPriority(t.id, extra as 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto'); break;
         case 'find_sources': await findSources(t.file_hash, t.total_size); break;
         case 'preview': await previewFile(t.id); break;
-        case 'toggle_preview_prio': await setPreviewPriority(t.id, !t.preview_priority); break;
+        case 'toggle_preview_prio': { const live = $transfers.find(x => x.id === t.id); await setPreviewPriority(t.id, !(live ?? t).preview_priority); break; }
         case 'recover_archive': {
           const path = await recoverArchive(t.id);
-          transferInfo = `Archive recovered: ${path}`;
-          infoTimers.push(setTimeout(() => (transferInfo = null), 5000));
+          showInfo(`Archive recovered: ${path}`);
           break;
         }
         case 'clear_completed': confirmClearCompleted = true; return;
@@ -703,10 +709,9 @@
           if (text.startsWith('ed2k://')) {
             const info = await parseEd2kLink(text);
             const res = await startDownload(info.hash, info.name, info.size, '', 0);
-            transferInfo = res.already_queued
+            showInfo(res.already_queued
               ? `Already in download list: ${info.name}`
-              : `Queued from clipboard: ${info.name}`;
-            infoTimers.push(setTimeout(() => (transferInfo = null), 5000));
+              : `Queued from clipboard: ${info.name}`);
           } else {
             transferError = 'Clipboard does not contain an ed2k:// link';
           }
@@ -2080,7 +2085,7 @@
   message="Cancel download of &quot;{confirmCancel.name}&quot;? The partial file will be deleted."
   confirmLabel="Cancel Download"
   danger={true}
-  onconfirm={async () => { try { await cancelTransfer(confirmCancel.id); transfers.update((list) => list.filter((x) => x.id !== confirmCancel.id)); } catch (e: unknown) { transferError = toErrorMsg(e); } }}
+  onconfirm={async () => { try { await cancelTransfer(confirmCancel.id); speedHistory.delete(confirmCancel.id); transfers.update((list) => list.filter((x) => x.id !== confirmCancel.id)); } catch (e: unknown) { transferError = toErrorMsg(e); } }}
 />
 
 <ConfirmDialog
@@ -2088,7 +2093,7 @@
   title="Clear Completed"
   message="Remove all completed transfers from the list?"
   confirmLabel="Clear"
-  onconfirm={async () => { try { await clearCompleted(); transfers.update((list) => list.filter((x) => !(x.direction === 'download' && x.status === 'completed'))); } catch (e: unknown) { transferError = toErrorMsg(e); } }}
+  onconfirm={async () => { try { await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) speedHistory.delete(id); return remaining; }); } catch (e: unknown) { transferError = toErrorMsg(e); } }}
 />
 
 <ConfirmDialog
@@ -2097,7 +2102,7 @@
   message="Cancel {confirmBatchCancel.count} download(s) and delete partial data?"
   confirmLabel="Cancel Downloads"
   danger={true}
-  onconfirm={async () => { const ids = confirmBatchCancel.ids; const idSet = new Set(ids); try { await cancelTransfersBatch(ids); transfers.update((list) => list.filter((x) => !idSet.has(x.id))); selectedDownloadIds = []; } catch (e: unknown) { transferError = toErrorMsg(e); } }}
+  onconfirm={async () => { const ids = confirmBatchCancel.ids; const idSet = new Set(ids); try { await cancelTransfersBatch(ids); for (const id of idSet) speedHistory.delete(id); transfers.update((list) => list.filter((x) => !idSet.has(x.id))); selectedDownloadIds = []; } catch (e: unknown) { transferError = toErrorMsg(e); } }}
 />
 
 <style>

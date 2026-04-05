@@ -62,7 +62,7 @@
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
       list = list.filter(
-        (f) => f.user_hash.includes(q) || f.nickname.toLowerCase().includes(q),
+        (f) => f.user_hash.toLowerCase().includes(q) || f.nickname.toLowerCase().includes(q),
       );
     }
     return list.slice().sort((a, b) => {
@@ -295,7 +295,7 @@
       addError = 'You cannot add yourself as a friend';
       return;
     }
-    if (friends.some((f) => f.user_hash === hash.toLowerCase())) {
+    if (friends.some((f) => f.user_hash.toLowerCase() === hash.toLowerCase())) {
       addError = 'This user is already in your friend list';
       return;
     }

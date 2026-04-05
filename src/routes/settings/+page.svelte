@@ -26,7 +26,7 @@
       await clearDownloadHistory(status);
       const label = status === 'all' ? 'All download history' : status === 'completed' ? 'Completed history' : 'Cancelled history';
       historyClearMsg = `${label} cleared.`;
-      setTimeout(() => { historyClearMsg = null; }, 3000);
+      trackedTimeout(() => { historyClearMsg = null; }, 3000);
     } catch (e) {
       historyClearMsg = `Failed: ${e instanceof Error ? e.message : e}`;
     }

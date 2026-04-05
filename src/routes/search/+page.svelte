@@ -504,11 +504,14 @@
     clearChecked();
     closeContextMenu();
     let timeoutSec = searchTimeoutSecs;
+    const parsedMinSize = filterMinSize !== '' ? parseFloat(filterMinSize) * filterMinUnit : undefined;
+    const parsedMaxSize = filterMaxSize !== '' ? parseFloat(filterMaxSize) * filterMaxUnit : undefined;
+    const parsedMinAvail = filterMinSources !== '' ? parseInt(filterMinSources, 10) : undefined;
     const searchPromise = searchFiles(q, method, requestId, searchFileType || undefined, {
       fileExtension: filterExtension.trim() || undefined,
-      minSize: filterMinSize !== '' ? parseFloat(filterMinSize) * filterMinUnit : undefined,
-      maxSize: filterMaxSize !== '' ? parseFloat(filterMaxSize) * filterMaxUnit : undefined,
-      minAvailability: filterMinSources !== '' ? parseInt(filterMinSources, 10) : undefined,
+      minSize: parsedMinSize !== undefined && !isNaN(parsedMinSize) ? parsedMinSize : undefined,
+      maxSize: parsedMaxSize !== undefined && !isNaN(parsedMaxSize) ? parsedMaxSize : undefined,
+      minAvailability: parsedMinAvail !== undefined && !isNaN(parsedMinAvail) ? parsedMinAvail : undefined,
     });
     clearSearchTimeoutForRequest(requestId);
     searchTimeouts.set(

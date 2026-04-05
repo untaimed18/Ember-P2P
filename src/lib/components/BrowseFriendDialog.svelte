@@ -27,6 +27,7 @@
     }
     return () => {
       listenerGen++;
+      clearTimeout(browseTimeout);
       if (unlisten) { unlisten(); unlisten = null; }
     };
   });
@@ -48,6 +49,7 @@
   async function requestBrowse() {
     loading = true;
     error = null;
+    downloadError = null;
     files = [];
     clearTimeout(browseTimeout);
     try {

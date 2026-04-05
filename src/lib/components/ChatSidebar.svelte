@@ -21,9 +21,12 @@
   let unlisten: UnlistenFn | null = null;
   let listenerGen = 0;
   let loadGen = 0;
+  let msgIdCounter = 0;
 
   $effect(() => {
     if (open && friendHash) {
+      sendError = null;
+      inputText = '';
       loadMessages();
       setupListener();
       markAsRead();
@@ -40,7 +43,7 @@
     const fn = await listen<{ user_hash: string; message: string; direction: string; timestamp: number }>('ember:chat-message', (event) => {
       if (event.payload.user_hash === friendHash) {
         messages = [...messages, {
-          id: Date.now(),
+          id: --msgIdCounter,
           direction: event.payload.direction as 'sent' | 'received',
           message: event.payload.message,
           timestamp: event.payload.timestamp,

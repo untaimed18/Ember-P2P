@@ -47,7 +47,7 @@
   });
 
   let cumConnTime = $derived(
-    stats ? stats.cum_conn_time : 0
+    stats ? stats.cum_conn_time + sessionTime : 0
   );
 
   // cum_ values are loaded from DB at startup and exclude the current session, so adding session_ is correct

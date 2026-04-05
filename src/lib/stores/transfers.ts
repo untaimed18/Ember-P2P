@@ -60,7 +60,7 @@ function flushProgress() {
       if (idx < 0) continue;
       const existing = list[idx];
       if (skipStatuses.includes(existing.status)) continue;
-      const transferred = p.uploaded ?? p.downloaded ?? 0;
+      const transferred = existing.direction === 'upload' ? (p.uploaded ?? p.downloaded ?? 0) : (p.downloaded ?? 0);
       list[idx] = {
         ...existing,
         transferred,
@@ -81,6 +81,7 @@ function flushProgress() {
 
 export async function initTransferStore() {
   if (initialized) return;
+  initialized = true;
 
   const unsubs = await Promise.all([
     listen<Transfer>('transfer-started', (event) => {
@@ -213,7 +214,6 @@ export async function initTransferStore() {
       }
     ),
   ]);
-  initialized = true;
   unlisteners.push(...unsubs);
 
   try {
