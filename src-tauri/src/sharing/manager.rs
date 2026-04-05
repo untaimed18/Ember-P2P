@@ -276,6 +276,7 @@ impl TransferManager {
         if self.active.contains_key(&id) || self.queue.iter().any(|t| t.id == id) {
             return false;
         }
+        self.completed.retain(|t| t.id != id);
         if transfer.direction == TransferDirection::Upload {
             self.active.insert(id, transfer);
             return true;
@@ -330,7 +331,7 @@ impl TransferManager {
                 history.pop_front();
             }
             while history.len() > 1 {
-                let elapsed = now.duration_since(history.front().unwrap().1).as_millis();
+                let elapsed = now.saturating_duration_since(history.front().unwrap().1).as_millis();
                 if elapsed > SPEED_WINDOW_MS {
                     history.pop_front();
                 } else {
@@ -341,7 +342,7 @@ impl TransferManager {
             // Calculate speed from the rolling window
             let speed = if history.len() >= 2 {
                 let (oldest_bytes, oldest_time) = history.front().unwrap();
-                let elapsed_ms = now.duration_since(*oldest_time).as_millis();
+                let elapsed_ms = now.saturating_duration_since(*oldest_time).as_millis();
                 if elapsed_ms > 0 {
                     let bytes_delta = transferred.saturating_sub(*oldest_bytes);
                     (bytes_delta as u128 * 1000 / elapsed_ms) as u64
@@ -562,7 +563,13 @@ impl TransferManager {
             if let Some(control) = self.controls.get(id) {
                 control.resume();
             }
-            if self.active_download_count() < self.max_concurrent as usize && transfer.direction == TransferDirection::Download {
+            if transfer.direction == TransferDirection::Upload {
+                transfer.status = TransferStatus::Active;
+                let promoted = transfer.clone();
+                self.active.insert(transfer.id.clone(), transfer);
+                return vec![promoted];
+            }
+            if self.active_download_count() < self.max_concurrent as usize {
                 let promoted = transfer.clone();
                 self.active.insert(transfer.id.clone(), transfer);
                 return vec![promoted];
