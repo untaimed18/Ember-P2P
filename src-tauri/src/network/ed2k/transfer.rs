@@ -2558,7 +2558,9 @@ fn outstanding_requests_for_speed_with_remaining(
     remaining_parts: usize,
     remaining_gap_bytes: u64,
 ) -> usize {
-    // eMule block counts per speed tier (DownloadClient.cpp:804-810)
+    // eMule block counts per speed tier (DownloadClient.cpp:804-810),
+    // extended with higher tiers for modern broadband connections.
+    // Safe because eMule upload side queues all incoming block requests.
     let mut blocks = if remaining_parts <= 4 {
         if speed < 600 {
             1
@@ -2583,8 +2585,12 @@ fn outstanding_requests_for_speed_with_remaining(
         3
     } else if speed < 150 * 1024 {
         6
-    } else {
+    } else if speed < 300 * 1024 {
         9
+    } else if speed < 1024 * 1024 {
+        12
+    } else {
+        15
     };
     if remaining_parts <= 2 || remaining_gap_bytes <= PARTSIZE {
         blocks = blocks.min(3);

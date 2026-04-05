@@ -19,8 +19,10 @@ const SPAM_UDPSERVERRES_NEARHIT: u32 = 15;
 const SPAM_UDPSERVERRES_FARHIT: u32 = 5;
 const SPAM_ONLYUDPSPAMSERVERS_HIT: u32 = 20;
 const SPAM_SOURCE_HIT: u32 = 10;
+const SPAM_FAKE_PATTERN_HIT: u32 = 25;
 pub const SEARCH_SPAM_THRESHOLD: u32 = 60;
 pub const SEARCH_SPAM_THRESHOLD_AGGRESSIVE: u32 = 45;
+pub const SEARCH_SPAM_THRESHOLD_RELAXED: u32 = 80;
 
 const SMALL_FILENAME_LEN: usize = 10;
 const MIN_SIMILAR_NAME_LEN: usize = 6;
@@ -31,8 +33,21 @@ const MAX_NOT_SPAM_HASHES: usize = 2000;
 
 const TOKEN_DELIMITERS: &[char] = &['.', '[', ']', '(', ')', '!', '-', '\'', '_', ' '];
 
+/// Known fake/spam filename tokens commonly used to pollute ed2k search results.
+/// Matches are case-insensitive against normalized filename tokens.
+const FAKE_FILENAME_TOKENS: &[&str] = &[
+    "password", "serial", "keygen", "crack", "patch",
+    "codec", "install_flash_player", "install_codec",
+];
+
+/// Suspicious URL-like patterns in filenames (case-insensitive substring match).
+const FAKE_URL_PATTERNS: &[&str] = &[
+    "www.", "http:", "https:", ".com/", ".net/", ".org/",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpamFilterProfile {
+    Relaxed,
     Balanced,
     Aggressive,
 }
@@ -41,6 +56,8 @@ impl SpamFilterProfile {
     pub fn from_setting(value: &str) -> Self {
         if value.eq_ignore_ascii_case("aggressive") {
             Self::Aggressive
+        } else if value.eq_ignore_ascii_case("relaxed") {
+            Self::Relaxed
         } else {
             Self::Balanced
         }
@@ -161,6 +178,7 @@ impl SpamFilter {
 
     fn threshold_for_profile(profile: SpamFilterProfile) -> u32 {
         match profile {
+            SpamFilterProfile::Relaxed => SEARCH_SPAM_THRESHOLD_RELAXED,
             SpamFilterProfile::Balanced => SEARCH_SPAM_THRESHOLD,
             SpamFilterProfile::Aggressive => SEARCH_SPAM_THRESHOLD_AGGRESSIVE,
         }
@@ -241,23 +259,34 @@ impl SpamFilter {
             }
         }
 
+        if has_fake_filename_pattern(name) {
+            score += SPAM_FAKE_PATTERN_HIT;
+            reasons.push(format!("Contains known fake/suspicious pattern (+{SPAM_FAKE_PATTERN_HIT})"));
+        }
+
+        let mut spam_source_count = 0u32;
         for addr in &result.source_addresses {
             if let Some(ip) = extract_ip(addr) {
                 if self.db.spam_source_ips.contains(&ip) {
-                    score += SPAM_SOURCE_HIT;
-                    reasons.push(format!("Source IP seen in spam hits (+{SPAM_SOURCE_HIT})"));
-                    break;
+                    spam_source_count += 1;
                 }
             }
         }
+        if spam_source_count > 0 {
+            score += SPAM_SOURCE_HIT;
+            reasons.push(format!("Source IP seen in spam hits (+{SPAM_SOURCE_HIT})"));
+        }
 
-        if let Some(sip) = server_ip.and_then(extract_ip) {
+        if let Some(sip) = server_ip.and_then(|s| extract_ip(s)) {
             if self.db.spam_server_ips.contains(&sip) {
-                let all_from_spam = !result.source_addresses.is_empty()
-                    && result.source_addresses.iter().all(|a| a.is_empty());
-                if all_from_spam {
+                let total_sources = result.source_addresses.iter()
+                    .filter(|a| extract_ip(a).is_some())
+                    .count();
+                let all_sources_spam = total_sources > 0
+                    && total_sources as u32 == spam_source_count;
+                if all_sources_spam || total_sources == 0 {
                     score += SPAM_UDPSERVERRES_HIT;
-                    reasons.push(format!("Result from spam-heavy UDP server (+{SPAM_UDPSERVERRES_HIT})"));
+                    reasons.push(format!("Result from spam-heavy server, all sources spam (+{SPAM_UDPSERVERRES_HIT})"));
                 } else {
                     score += SPAM_UDPSERVERRES_NEARHIT;
                     reasons.push(format!("Result influenced by spam server (+{SPAM_UDPSERVERRES_NEARHIT})"));
@@ -305,7 +334,7 @@ impl SpamFilter {
         self.explain_result(result, search_keywords, server_ip, profile).score
     }
 
-    pub fn mark_spam(&mut self, result: &SearchResult, search_keywords: &[String]) {
+    pub fn mark_spam(&mut self, result: &SearchResult, search_keywords: &[String], server_ip: Option<&str>) {
         const MAX_SPAM_HASHES: usize = 2000;
         let file_hash = normalize_hash(&result.file.hash);
         if !file_hash.is_empty() {
@@ -358,6 +387,28 @@ impl SpamFilter {
             }
         }
 
+        if let Some(sip) = server_ip.and_then(|s| extract_ip(s)) {
+            const MAX_SPAM_SERVER_IPS: usize = 500;
+            if self.db.spam_server_ips.len() >= MAX_SPAM_SERVER_IPS {
+                if let Some(first) = self.db.spam_server_ips.iter().next().cloned() {
+                    self.db.spam_server_ips.remove(&first);
+                }
+            }
+            self.db.spam_server_ips.insert(sip.clone());
+
+            let entry = self.db.udp_server_spam_ratios.entry(sip).or_insert(0.0);
+            *entry = (*entry * 0.9 + 0.1).min(1.0);
+            const MAX_SERVER_RATIOS: usize = 500;
+            if self.db.udp_server_spam_ratios.len() > MAX_SERVER_RATIOS {
+                if let Some(lowest_key) = self.db.udp_server_spam_ratios.iter()
+                    .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(k, _)| k.clone())
+                {
+                    self.db.udp_server_spam_ratios.remove(&lowest_key);
+                }
+            }
+        }
+
         self.dirty = true;
         self.save();
         info!("Marked as spam: {} ({})", name, result.file.hash);
@@ -377,6 +428,27 @@ impl SpamFilter {
         info!("Marked as not spam: {file_hash}");
     }
 
+    /// Silently add a hash to the not-spam whitelist (e.g. on completed download).
+    /// Does not save immediately; caller should ensure periodic save happens.
+    pub fn auto_mark_not_spam(&mut self, file_hash: &str) {
+        let file_hash = normalize_hash(file_hash);
+        if file_hash.is_empty() {
+            return;
+        }
+        if self.db.not_spam_hashes.contains(&file_hash) {
+            return;
+        }
+        if self.db.not_spam_hashes.len() >= MAX_NOT_SPAM_HASHES {
+            if let Some(first) = self.db.not_spam_hashes.iter().next().cloned() {
+                self.db.not_spam_hashes.remove(&first);
+            }
+        }
+        self.db.not_spam_hashes.insert(file_hash.clone());
+        self.db.spam_hashes.remove(&file_hash);
+        self.dirty = true;
+        debug!("Auto-marked completed download as not spam: {file_hash}");
+    }
+
     pub fn is_spam(score: u32, profile: SpamFilterProfile) -> bool {
         let threshold = Self::threshold_for_profile(profile);
         score >= threshold
@@ -385,9 +457,37 @@ impl SpamFilter {
 
 fn profile_name(profile: SpamFilterProfile) -> String {
     match profile {
+        SpamFilterProfile::Relaxed => "relaxed".to_string(),
         SpamFilterProfile::Balanced => "balanced".to_string(),
         SpamFilterProfile::Aggressive => "aggressive".to_string(),
     }
+}
+
+/// Check if a filename contains known fake/spam patterns.
+fn has_fake_filename_pattern(filename: &str) -> bool {
+    let lower = filename.to_ascii_lowercase();
+
+    for pattern in FAKE_URL_PATTERNS {
+        if lower.contains(pattern) {
+            return true;
+        }
+    }
+
+    let tokens: Vec<String> = filename
+        .split(|c: char| TOKEN_DELIMITERS.contains(&c))
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+
+    for token in &tokens {
+        for fake in FAKE_FILENAME_TOKENS {
+            if token == fake {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Remove search keywords from a filename to isolate the non-keyword portion.
@@ -525,13 +625,13 @@ mod tests {
         let hash_a = "a".repeat(32);
         let hash_b = "b".repeat(32);
 
-        filter.mark_spam(&sample_result(&hash_a, "first.bin"), &[]);
+        filter.mark_spam(&sample_result(&hash_a, "first.bin"), &[], None);
         filter.save();
 
         let mut reloaded = SpamFilter::load(&dir);
         assert!(reloaded.db.spam_hashes.contains(&hash_a));
 
-        reloaded.mark_spam(&sample_result(&hash_b, "second.bin"), &[]);
+        reloaded.mark_spam(&sample_result(&hash_b, "second.bin"), &[], None);
         reloaded.save();
 
         let latest = SpamFilter::load(&dir);
@@ -555,7 +655,7 @@ mod tests {
         let dir = temp_dir("hash-case");
         let mut filter = SpamFilter::load(&dir);
         let result = sample_result("ABCDEF0123456789ABCDEF0123456789", "sample.bin");
-        filter.mark_spam(&result, &[]);
+        filter.mark_spam(&result, &[], None);
 
         let score = filter.rate_result(
             &sample_result("abcdef0123456789abcdef0123456789", "other.bin"),

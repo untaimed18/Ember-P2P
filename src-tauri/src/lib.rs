@@ -152,7 +152,7 @@ pub fn run() {
                 cached_transfer_stats,
                 cached_shared_files: cached_shared_files.clone(),
                 hash_cancel_flags: hash_cancel_flags.clone(),
-                spam_filter,
+                spam_filter: spam_filter.clone(),
                 upload_shared_folders: upload_shared_folders.clone(),
                 friend_hashes: friend_hashes.clone(),
             });
@@ -372,6 +372,7 @@ pub fn run() {
             let bw_shutdown_spawn = bw_shutdown.clone();
             let bw_rtt = uss_rtt_queue.clone();
             let bw_uss_flag = uss_enabled_flag.clone();
+            let net_spam = spam_filter.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = network::start_network(
                     net_handle,
@@ -393,6 +394,7 @@ pub fn run() {
                     friend_hashes,
                     uss_rtt_queue,
                     uss_enabled_flag,
+                    net_spam,
                 )
                 .await
                 {
@@ -421,6 +423,9 @@ pub fn run() {
             commands::search::get_spam_stats,
             commands::search::explain_spam_result,
             commands::search::reset_spam_filter,
+            commands::search::get_download_history,
+            commands::search::clear_download_history,
+            commands::search::remove_download_history_entry,
             commands::transfers::start_download,
             commands::transfers::pause_transfers_batch,
             commands::transfers::resume_transfers_batch,

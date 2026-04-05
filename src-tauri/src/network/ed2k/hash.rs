@@ -99,6 +99,99 @@ pub fn ed2k_hash_file_cancellable(path: &Path, cancelled: &AtomicBool) -> anyhow
     let final_hash = Md4::digest(&chunk_hashes);
     Ok(hex::encode(final_hash))
 }
+
+/// Compute both ED2K and AICH hashes in a single pass over the file,
+/// halving disk I/O compared to computing them separately.
+/// Returns (ed2k_hash_hex, aich_hash_hex).
+pub fn hash_file_combined_cancellable(
+    path: &Path,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<(String, String)> {
+    use sha1::Sha1;
+
+    let mut file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+
+    if file_size == 0 {
+        let ed2k = hex::encode(Md4::digest([]));
+        let aich = hex::encode(<[u8; 20]>::from(Sha1::digest([])));
+        return Ok((ed2k, aich));
+    }
+
+    let is_single_part = file_size < PARTSIZE;
+    let aich_block_size = super::aich::AICH_BLOCK_SIZE as u64;
+
+    let mut ed2k_part_hasher = Md4::new();
+    let mut ed2k_part_hashes: Vec<u8> = if is_single_part {
+        Vec::new()
+    } else {
+        let num_parts = file_size.div_ceil(PARTSIZE) as usize;
+        Vec::with_capacity((num_parts + 1) * 16)
+    };
+
+    let mut aich_block_hasher = Sha1::new();
+    let num_aich_blocks = file_size.div_ceil(aich_block_size) as usize;
+    let mut aich_leaf_hashes: Vec<[u8; 20]> = Vec::with_capacity(num_aich_blocks);
+
+    let mut ed2k_part_remaining: u64 = file_size.min(PARTSIZE);
+    let mut aich_block_remaining: u64 = file_size.min(aich_block_size);
+
+    let mut buf = vec![0u8; HASH_BUF_SIZE];
+    let mut file_remaining = file_size;
+
+    while file_remaining > 0 {
+        if cancelled.load(Ordering::Relaxed) {
+            anyhow::bail!("cancelled");
+        }
+        let to_read = (file_remaining as usize).min(buf.len());
+        let n = file.read(&mut buf[..to_read])?;
+        if n == 0 {
+            anyhow::bail!("unexpected EOF: {} bytes remaining", file_remaining);
+        }
+
+        let mut offset = 0;
+        while offset < n {
+            let available = n - offset;
+            let can_take = available
+                .min(ed2k_part_remaining as usize)
+                .min(aich_block_remaining as usize);
+
+            let data = &buf[offset..offset + can_take];
+            ed2k_part_hasher.update(data);
+            aich_block_hasher.update(data);
+
+            ed2k_part_remaining -= can_take as u64;
+            aich_block_remaining -= can_take as u64;
+            file_remaining -= can_take as u64;
+            offset += can_take;
+
+            if ed2k_part_remaining == 0 && !is_single_part {
+                ed2k_part_hashes.extend_from_slice(&ed2k_part_hasher.finalize_reset());
+                ed2k_part_remaining = file_remaining.min(PARTSIZE);
+            }
+
+            if aich_block_remaining == 0 {
+                aich_leaf_hashes.push(aich_block_hasher.finalize_reset().into());
+                aich_block_remaining = file_remaining.min(aich_block_size);
+            }
+        }
+    }
+
+    let ed2k_hash = if is_single_part {
+        hex::encode(ed2k_part_hasher.finalize())
+    } else {
+        if file_size % PARTSIZE == 0 {
+            ed2k_part_hashes.extend_from_slice(&Md4::digest([]));
+        }
+        hex::encode(Md4::digest(&ed2k_part_hashes))
+    };
+
+    let aich_root = super::aich::hierarchical_root(&aich_leaf_hashes, file_size);
+    let aich_hash = hex::encode(aich_root);
+
+    Ok((ed2k_hash, aich_hash))
+}
+
 pub fn ed2k_hash_bytes(data: &[u8]) -> String {
     let file_size = data.len() as u64;
 

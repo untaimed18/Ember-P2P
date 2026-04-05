@@ -1,6 +1,6 @@
 <script lang="ts">
   import { getSettings, updateSettings, downloadNodesDat, downloadIpfilter } from '$lib/api/settings';
-  import { getSpamStats, resetSpamFilter } from '$lib/api/search';
+  import { getSpamStats, resetSpamFilter, clearDownloadHistory } from '$lib/api/search';
   import { invoke } from '@tauri-apps/api/core';
   import type { AppSettings, SpamStats } from '$lib/types';
   import { onMount, untrack } from 'svelte';
@@ -18,6 +18,19 @@
   let downloadingNodes = $state(false);
   let nodesResult: string | null = $state(null);
   let nodesError: string | null = $state(null);
+
+  let historyClearMsg: string | null = $state(null);
+
+  async function handleClearHistory(status: string) {
+    try {
+      await clearDownloadHistory(status);
+      const label = status === 'all' ? 'All download history' : status === 'completed' ? 'Completed history' : 'Cancelled history';
+      historyClearMsg = `${label} cleared.`;
+      setTimeout(() => { historyClearMsg = null; }, 3000);
+    } catch (e) {
+      historyClearMsg = `Failed: ${e instanceof Error ? e.message : e}`;
+    }
+  }
 
   let speedTesting = $state(false);
   let speedResult: { download_speed: number; upload_speed: number; recommended_upload_limit: number; recommended_download_limit: number } | null = $state(null);
@@ -379,6 +392,21 @@
             </div>
             <ToggleSwitch bind:checked={settings.skip_compress_video} />
           </div>
+
+          <div class="field">
+            <span class="toggle-title">Download History</span>
+            <span class="field-hint">
+              Ember remembers previously downloaded and cancelled files and shows them in search results, so you can avoid re-downloading the same content.
+            </span>
+            <div class="btn-row" style="margin-top: 6px; gap: 8px;">
+              <button class="ghost" onclick={() => handleClearHistory('completed')}>Clear Completed</button>
+              <button class="ghost" onclick={() => handleClearHistory('cancelled')}>Clear Cancelled</button>
+              <button class="ghost" onclick={() => handleClearHistory('all')}>Clear All History</button>
+            </div>
+            {#if historyClearMsg}
+              <span class="hint" style="margin-top: 4px;">{historyClearMsg}</span>
+            {/if}
+          </div>
         </div>
       </section>
 
@@ -401,12 +429,13 @@
           </div>
           <div class="field">
             <label for="spam-filter-profile">Spam filter profile</label>
-            <span class="hint">Balanced reduces false positives. Aggressive hides more suspicious results.</span>
+            <span class="hint">Relaxed shows only high-confidence spam. Balanced is recommended for most users. Aggressive hides more suspicious results.</span>
             <select
               id="spam-filter-profile"
               bind:value={settings.spam_filter_profile}
               disabled={!settings.spam_filter_enabled}
             >
+              <option value="relaxed">Relaxed (minimal filtering)</option>
               <option value="balanced">Balanced (recommended)</option>
               <option value="aggressive">Aggressive (stronger filtering)</option>
             </select>

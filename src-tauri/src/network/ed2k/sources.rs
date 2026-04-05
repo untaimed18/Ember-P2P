@@ -231,8 +231,8 @@ impl PerFileSourceList {
     }
 
     /// Sources ready for a new TCP connection attempt (reask timer expired).
-    /// Sorted by queue rank (lower = tried first) to prioritize sources
-    /// closest to getting an upload slot.
+    /// Sorted by quality: queued sources first (by rank), then by fail count
+    /// so that reliable sources are tried before repeatedly-failing ones.
     ///
     /// **Important:** This does not filter against `DeadSourceList`. Callers MUST
     /// filter the returned sources through `DeadSourceList::is_dead_source_for_file`
@@ -245,9 +245,16 @@ impl PerFileSourceList {
                     && !matches!(s.state, DownloadSourceState::Banned | DownloadSourceState::LowToLowIp)
             })
             .collect();
-        ready.sort_by_key(|s| match &s.state {
-            DownloadSourceState::OnQueue { rank } => rank.unwrap_or(u32::MAX),
-            _ => u32::MAX,
+        ready.sort_by(|a, b| {
+            let rank_a = match &a.state {
+                DownloadSourceState::OnQueue { rank } => rank.unwrap_or(u32::MAX),
+                _ => u32::MAX,
+            };
+            let rank_b = match &b.state {
+                DownloadSourceState::OnQueue { rank } => rank.unwrap_or(u32::MAX),
+                _ => u32::MAX,
+            };
+            rank_a.cmp(&rank_b).then_with(|| a.fail_count.cmp(&b.fail_count))
         });
         ready.into_iter().map(|s| (s.ip, s.tcp_port)).collect()
     }

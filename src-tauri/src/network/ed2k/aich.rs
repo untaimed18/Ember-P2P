@@ -81,7 +81,7 @@ fn hash_internal(left: &[u8; 20], right: &[u8; 20]) -> [u8; 20] {
 /// Bottom level (within each part) splits by EMBLOCKSIZE.
 /// Matches eMule's CAICHHashTree where GetBaseSize() transitions from
 /// PARTSIZE to EMBLOCKSIZE when data_size <= PARTSIZE.
-fn hierarchical_root(all_leaves: &[[u8; 20]], file_size: u64) -> [u8; 20] {
+pub(crate) fn hierarchical_root(all_leaves: &[[u8; 20]], file_size: u64) -> [u8; 20] {
     if all_leaves.is_empty() {
         return hash_leaf(&[]);
     }

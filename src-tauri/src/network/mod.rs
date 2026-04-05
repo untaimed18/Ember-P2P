@@ -1731,6 +1731,7 @@ pub async fn start_network(
     friend_hashes: crate::app_state::SharedFriendHashes,
     uss_rtt_queue: crate::bandwidth::UssRttQueue,
     uss_enabled_flag: crate::bandwidth::UssEnabledFlag,
+    spam_filter: Arc<RwLock<crate::search::spam::SpamFilter>>,
 ) -> anyhow::Result<()> {
     let data_dir = directories::ProjectDirs::from("com", "ember", "p2p")
         .map(|d| d.data_dir().to_path_buf())
@@ -3434,9 +3435,20 @@ pub async fn start_network(
                     }
                     drop(mgr);
                 }
-                let was_completed = matches!(&event, DownloadEvent::Completed { .. });
+                let completed_file_hash = if let DownloadEvent::Completed { ref transfer_id } = event {
+                    let mgr = transfer_manager.read().await;
+                    mgr.get_transfer(transfer_id).map(|t| t.file_hash.clone())
+                } else {
+                    None
+                };
+                let was_completed = completed_file_hash.is_some();
                 let mut promoted = Vec::new();
                 handle_download_event(event, &app_handle, &transfer_manager, &db, &bandwidth_limiter, &mut promoted, &mut stats_manager, settings.remove_finished_downloads, &a4af_shared, &settings.download_folder).await;
+
+                if let Some(ref file_hash) = completed_file_hash {
+                    let mut sf = spam_filter.write().await;
+                    sf.auto_mark_not_spam(file_hash);
+                }
                 for t in promoted {
                     let control = TransferControl::new();
                     {
@@ -4242,6 +4254,24 @@ pub async fn start_network(
                                     let mut mgr = transfer_manager.write().await;
                                     mgr.update_status(&transfer_id, TransferStatus::Active);
                                     mgr.update_sources(&transfer_id, source_count, 0, 0);
+                                    for (ip_s, port) in &sources {
+                                        mgr.update_source_detail(
+                                            &transfer_id,
+                                            crate::types::SourceInfo {
+                                                ip: ip_s.clone(),
+                                                port: *port,
+                                                status: crate::types::SourceStatus::Connecting,
+                                                queue_rank: None,
+                                                speed: 0,
+                                                transferred: 0,
+                                                client_software: String::new(),
+                                                peer_name: String::new(),
+                                                available_parts: None,
+                                                total_parts: None,
+                                                country_code: None,
+                                            },
+                                        );
+                                    }
                                 }
                                 let peer_desc = sources.iter()
                                     .map(|(ip, port)| format!("{ip}:{port}"))
@@ -5753,6 +5783,24 @@ pub async fn start_network(
                             let mut mgr = transfer_manager.write().await;
                             mgr.update_status(tid, TransferStatus::Active);
                             mgr.update_sources(tid, source_count, 0, 0);
+                            for (ip_s, port) in &ready_sources {
+                                mgr.update_source_detail(
+                                    tid,
+                                    crate::types::SourceInfo {
+                                        ip: ip_s.clone(),
+                                        port: *port,
+                                        status: crate::types::SourceStatus::Connecting,
+                                        queue_rank: None,
+                                        speed: 0,
+                                        transferred: 0,
+                                        client_software: String::new(),
+                                        peer_name: String::new(),
+                                        available_parts: None,
+                                        total_parts: None,
+                                        country_code: None,
+                                    },
+                                );
+                            }
                         }
                         let _ = app_handle.emit("transfer-status", serde_json::json!({
                             "id": tid,
@@ -5866,6 +5914,24 @@ pub async fn start_network(
                             let mut mgr = transfer_manager.write().await;
                             mgr.update_status(tid, TransferStatus::Active);
                             mgr.update_sources(tid, source_count, 0, 0);
+                            for (ip_s, port) in &live_sources {
+                                mgr.update_source_detail(
+                                    tid,
+                                    crate::types::SourceInfo {
+                                        ip: ip_s.clone(),
+                                        port: *port,
+                                        status: crate::types::SourceStatus::Connecting,
+                                        queue_rank: None,
+                                        speed: 0,
+                                        transferred: 0,
+                                        client_software: String::new(),
+                                        peer_name: String::new(),
+                                        available_parts: None,
+                                        total_parts: None,
+                                        country_code: None,
+                                    },
+                                );
+                            }
                         }
                         let _ = app_handle.emit("transfer-status", serde_json::json!({
                             "id": tid,
@@ -12995,6 +13061,16 @@ async fn handle_download_event(
                 warn!("Completed event for transfer {transfer_id} not found in active set");
             }
             let _ = db.update_transfer_status(&transfer_id, "completed");
+
+            {
+                let mgr = transfer_manager.read().await;
+                if let Some(t) = mgr.get_transfer(&transfer_id) {
+                    if let Err(e) = db.record_download_history(&t.file_hash, &t.file_name, t.total_size, "completed") {
+                        tracing::warn!("Failed to record download history: {e}");
+                    }
+                }
+            }
+
             let _ = app_handle.emit(
                 "transfer-complete",
                 serde_json::json!({ "id": transfer_id }),

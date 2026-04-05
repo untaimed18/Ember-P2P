@@ -54,8 +54,9 @@ export async function markSpam(
   fileSize: number,
   sourceAddresses: string[],
   searchKeywords: string[],
+  serverIp?: string,
 ): Promise<void> {
-  return invoke('mark_spam', { fileHash, fileName, fileSize, sourceAddresses, searchKeywords });
+  return invoke('mark_spam', { fileHash, fileName, fileSize, sourceAddresses, searchKeywords, serverIp: serverIp ?? null });
 }
 
 export async function markNotSpam(fileHash: string): Promise<void> {
@@ -86,4 +87,12 @@ export async function explainSpamResult(
 
 export async function resetSpamFilter(): Promise<string> {
   return invoke('reset_spam_filter');
+}
+
+export async function getDownloadHistory(hashes: string[]): Promise<Record<string, string>> {
+  return invoke('get_download_history', { hashes });
+}
+
+export async function clearDownloadHistory(status: string): Promise<void> {
+  return invoke('clear_download_history', { status });
 }

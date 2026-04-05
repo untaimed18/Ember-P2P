@@ -401,13 +401,19 @@ pub async fn cancel_transfers_batch(
 ) -> Result<(), String> {
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
     for transfer_id in transfer_ids {
-        let promoted = {
+        let (promoted, cancelled_info) = {
             let mut manager = state.transfer_manager.write().await;
+            let info = manager.get_transfer(&transfer_id).map(|t| {
+                (t.file_hash.clone(), t.file_name.clone(), t.total_size)
+            });
             if let Some(control) = manager.get_control(&transfer_id) {
                 control.cancel();
             }
-            manager.cancel(&transfer_id)
+            (manager.cancel(&transfer_id), info)
         };
+        if let Some((file_hash, file_name, file_size)) = cancelled_info {
+            let _ = state.db.record_download_history(&file_hash, &file_name, file_size, "cancelled");
+        }
         for p in promoted {
             promoted_by_id.entry(p.id.clone()).or_insert(p);
         }
@@ -672,13 +678,21 @@ pub async fn cancel_transfer(
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
-    let promoted = {
+    let (promoted, cancelled_info) = {
         let mut manager = state.transfer_manager.write().await;
+        let info = manager.get_transfer(&transfer_id).map(|t| {
+            (t.file_hash.clone(), t.file_name.clone(), t.total_size)
+        });
         if let Some(control) = manager.get_control(&transfer_id) {
             control.cancel();
         }
-        manager.cancel(&transfer_id)
+        (manager.cancel(&transfer_id), info)
     };
+
+    if let Some((file_hash, file_name, file_size)) = cancelled_info {
+        let db = state.db.clone();
+        let _ = db.record_download_history(&file_hash, &file_name, file_size, "cancelled");
+    }
 
     let (_, dl_folder) = tokio::join!(
         async {

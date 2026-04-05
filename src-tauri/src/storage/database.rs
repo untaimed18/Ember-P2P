@@ -231,6 +231,21 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 12 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS download_history (
+                    file_hash TEXT NOT NULL PRIMARY KEY,
+                    file_name TEXT NOT NULL DEFAULT '',
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    timestamp INTEGER NOT NULL
+                );"
+            )?;
+            set_version(&tx, 12)?;
+            tx.commit()?;
+        }
+
         Ok(())
     }
 
@@ -826,5 +841,68 @@ impl Database {
                 tracing::debug!("incremental_vacuum failed: {e}");
             }
         }
+    }
+
+    /// Record a completed or cancelled download in history.
+    pub fn record_download_history(
+        &self,
+        file_hash: &str,
+        file_name: &str,
+        file_size: u64,
+        status: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO download_history (file_hash, file_name, file_size, status, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(file_hash) DO UPDATE SET
+               file_name = excluded.file_name,
+               file_size = excluded.file_size,
+               status = excluded.status,
+               timestamp = excluded.timestamp",
+            params![file_hash, file_name, file_size as i64, status, now],
+        )?;
+        Ok(())
+    }
+
+    /// Look up download history for a batch of file hashes.
+    /// Returns a map of hash → status ("completed" or "cancelled").
+    pub fn get_download_history_batch(
+        &self,
+        hashes: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        if hashes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let placeholders: Vec<String> = (1..=hashes.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT file_hash, status FROM download_history WHERE file_hash IN ({})",
+            placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> = hashes.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Remove a specific file from download history (user override).
+    pub fn remove_download_history(&self, file_hash: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        conn.execute("DELETE FROM download_history WHERE file_hash = ?1", params![file_hash])?;
+        Ok(())
+    }
+
+    /// Clear all download history entries of a given status.
+    pub fn clear_download_history(&self, status: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        conn.execute("DELETE FROM download_history WHERE status = ?1", params![status])?;
+        Ok(())
     }
 }

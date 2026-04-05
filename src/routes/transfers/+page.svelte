@@ -334,9 +334,34 @@
   const priorityOrder: Record<string, number> = { release: 0, auto: 1, high: 2, normal: 3, low: 4, verylow: 5 };
   const statusOrder: Record<string, number> = { active: 0, verifying: 1, completing: 2, searching: 3, queued: 4, paused: 5, stopped: 6, hashing: 7, noneneeded: 8, insufficient: 9, failed: 10, completed: 11 };
 
+  // EWMA speed smoothing for stable ETA estimates (eMule "advanced remaining time")
+  const speedHistory: Map<string, { ewma: number; lastTransferred: number; lastTime: number }> = new Map();
+  const EWMA_ALPHA = 0.3;
+
+  function smoothedSpeed(t: Transfer): number {
+    if (t.speed <= 0) return 0;
+    const now = Date.now();
+    let entry = speedHistory.get(t.id);
+    if (!entry) {
+      entry = { ewma: t.speed, lastTransferred: t.transferred, lastTime: now };
+      speedHistory.set(t.id, entry);
+      return t.speed;
+    }
+    const dt = (now - entry.lastTime) / 1000;
+    if (dt < 1) return entry.ewma > 0 ? entry.ewma : t.speed;
+    const bytesThisPeriod = t.transferred - entry.lastTransferred;
+    const measuredSpeed = Math.max(0, bytesThisPeriod / dt);
+    entry.ewma = EWMA_ALPHA * measuredSpeed + (1 - EWMA_ALPHA) * entry.ewma;
+    entry.lastTransferred = t.transferred;
+    entry.lastTime = now;
+    return entry.ewma;
+  }
+
   function etaSeconds(t: Transfer): number {
     if (t.speed <= 0 || t.transferred >= t.total_size) return Infinity;
-    return (t.total_size - t.transferred) / t.speed;
+    const speed = smoothedSpeed(t);
+    if (speed <= 0) return Infinity;
+    return (t.total_size - t.transferred) / speed;
   }
 
   let sortedActiveDownloads = $derived.by(() => {
@@ -658,7 +683,7 @@
         case 'stop': await stopTransfer(t.id); break;
         case 'resume': await resumeTransfer(t.id); break;
         case 'cancel': confirmCancel = { open: true, id: t.id, name: t.file_name }; return;
-        case 'remove': await removeTransfer(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id)); break;
+        case 'remove': await removeTransfer(t.id); speedHistory.delete(t.id); transfers.update((list) => list.filter((x) => x.id !== t.id)); break;
         case 'open': await openFile(t.id); break;
         case 'open_location': await openTransferFileLocation(t.id); break;
         case 'priority': if (extra) await setTransferPriority(t.id, extra as 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto'); break;
@@ -1468,7 +1493,7 @@
                     <span class="status-label st-{t.status}" title={dlStatusTooltip(t)}>{dlStatusLabel(t)}</span>
                   </td>
                 {:else if column.key === 'remaining'}
-                  <td class="num-cell">{formatRemaining(t.total_size, t.transferred, t.speed)}</td>
+                  <td class="num-cell">{formatRemaining(t.total_size, t.transferred, t.speed > 0 ? smoothedSpeed(t) : 0)}</td>
                 {:else if column.key === 'last_seen_complete'}
                   <td class="date-cell">{t.last_seen_complete ? formatDate(t.last_seen_complete) : '\u2014'}</td>
                 {:else if column.key === 'last_received'}
@@ -1498,7 +1523,7 @@
                 <tr class="source-child-row">
                   <td class="source-child-cell" colspan={dlColCount}>
                     <span class="source-indent">
-                      No source details yet.
+                      {t.sources > 0 ? `Connecting to ${t.sources} source${t.sources !== 1 ? 's' : ''}...` : 'No source details yet.'}
                       <button class="source-inline-btn" onclick={() => findSources(t.file_hash, t.total_size).catch(() => {})}>Find Sources</button>
                     </span>
                   </td>
