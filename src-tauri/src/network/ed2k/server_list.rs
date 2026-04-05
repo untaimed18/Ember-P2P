@@ -489,7 +489,9 @@ impl ServerList {
                 if entry.obfuscation_port_tcp > 0 {
                     existing.obfuscation_port_tcp = entry.obfuscation_port_tcp;
                 }
-                existing.priority = entry.priority;
+                if entry.priority != ServerPriority::Normal {
+                    existing.priority = entry.priority;
+                }
                 stats.updated += 1;
                 continue;
             }

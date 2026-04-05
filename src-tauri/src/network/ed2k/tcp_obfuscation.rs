@@ -300,7 +300,8 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Rc4Writer<W> {
             }
         }
 
-        let mut encrypted = vec![0u8; buf.len()];
+        let plaintext_len = buf.len();
+        let mut encrypted = vec![0u8; plaintext_len];
         self.rc4.process(buf, &mut encrypted);
 
         match Pin::new(&mut self.inner).poll_write(cx, &encrypted) {
@@ -310,9 +311,15 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Rc4Writer<W> {
                     self.pending_offset = n;
                     cx.waker().wake_by_ref();
                 }
-                Poll::Ready(Ok(buf.len()))
+                Poll::Ready(Ok(plaintext_len))
             }
-            other => other,
+            Poll::Pending => {
+                self.pending = encrypted;
+                self.pending_offset = 0;
+                cx.waker().wake_by_ref();
+                Poll::Ready(Ok(plaintext_len))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
         }
     }
 

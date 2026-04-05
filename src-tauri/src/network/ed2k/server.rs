@@ -561,7 +561,7 @@ impl Ed2kServerConnection {
             write_string_tag(&mut tags, 0x01, &file.name); // FT_FILENAME
             tag_count += 1;
             if file.size > u32::MAX as u64 {
-                write_uint32_tag(&mut tags, 0x02, 0);
+                write_uint32_tag(&mut tags, 0x02, file.size as u32);
                 tag_count += 1;
                 write_uint32_tag(&mut tags, 0x3A, (file.size >> 32) as u32);
                 tag_count += 1;
@@ -1287,9 +1287,10 @@ fn read_tag_value(
                 Err(_) => return false,
             };
             match name_id {
-                0x02 => *file_size = v as u64,     // FT_FILESIZE
-                0x15 => *source_count = v,          // FT_SOURCES
-                0x30 => *complete_sources = v,      // FT_COMPLETE_SOURCES
+                0x02 => *file_size = (*file_size & 0xFFFF_FFFF_0000_0000) | v as u64,
+                0x3A => *file_size = (*file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32),
+                0x15 => *source_count = v,
+                0x30 => *complete_sources = v,
                 _ => {}
             }
             true

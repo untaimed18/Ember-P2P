@@ -345,7 +345,7 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
     let mut results = Vec::new();
 
     const MIN_UDP_SEARCH_ENTRY: usize = 16 + 4 + 2 + 4; // hash + client_id + port + tag_count
-    while (cursor.position() as usize) < payload.len().saturating_sub(MIN_UDP_SEARCH_ENTRY) {
+    while (cursor.position() as usize) + MIN_UDP_SEARCH_ENTRY <= payload.len() {
         let mut file_hash = [0u8; 16];
         if std::io::Read::read_exact(&mut cursor, &mut file_hash).is_err() {
             break;
@@ -398,7 +398,11 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
                 }
                 0x03 => { // TAGTYPE_UINT32
                     if let Ok(v) = cursor.read_u32::<LittleEndian>() {
-                        if name_id == 0x02 { file_size = v as u64; }
+                        match name_id {
+                            0x02 => file_size = (file_size & 0xFFFF_FFFF_0000_0000) | v as u64,
+                            0x3A => file_size = (file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32),
+                            _ => {}
+                        }
                         true
                     } else { false }
                 }

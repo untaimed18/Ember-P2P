@@ -253,7 +253,7 @@ impl CreditManager {
     /// meaning we're actively benefiting from their uploads and they deserve
     /// a queue score bonus (eMule download-bonus equivalent).
     pub fn has_download_bonus(&self, user_hash: &[u8; 16]) -> bool {
-        self.credits.get(user_hash).map(|r| r.uploaded > 1_048_576).unwrap_or(false)
+        self.credits.get(user_hash).map(|r| r.downloaded > 1_048_576).unwrap_or(false)
     }
 
     pub fn create_signature_for_peer(
