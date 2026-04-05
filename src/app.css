@@ -412,6 +412,7 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
   padding: 24px;
   min-width: 340px;
   max-width: 450px;
+  overflow: hidden;
   box-shadow: 0 8px 32px rgba(0,0,0,0.24);
   animation: dialog-in 0.2s ease;
 }
@@ -423,6 +424,8 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
   font-size: 13px;
   margin-bottom: 20px;
   line-height: 1.5;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .confirm-dialog .dialog-actions {
   display: flex;
