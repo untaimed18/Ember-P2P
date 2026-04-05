@@ -629,6 +629,7 @@
         commentSaveMessage = '';
       }, 2500);
     } catch (e: unknown) {
+      if (selectedHash !== hash) return;
       error = toErr(e);
       commentSaveState = 'error';
       commentSaveMessage = 'Save failed';

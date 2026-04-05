@@ -56,10 +56,6 @@
       clearInterval(refreshTimer);
       refreshTimer = undefined;
     }
-    return () => {
-      clearInterval(refreshTimer);
-      refreshTimer = undefined;
-    };
   });
 
   $effect(() => {

@@ -69,7 +69,8 @@ export function formatDurationSecs(secs: number): string {
   const mins = Math.floor((secs % 3600) / 60);
   if (days > 0) return `${days}d ${hrs}h`;
   if (hrs > 0) return `${hrs}h ${mins}m`;
-  return `${mins}m`;
+  if (mins > 0) return `${mins}m`;
+  return `${Math.floor(secs)}s`;
 }
 
 /** Format remaining size + ETA combined (eMule Remaining column style). */

@@ -76,8 +76,8 @@ function mergeResult(existing: SearchResult, incoming: SearchResult): SearchResu
     source_addresses: mergedAddresses,
     rating: incoming.rating ?? existing.rating,
     comment: incoming.comment ?? existing.comment,
-    spam_rating: incoming.spam_rating ?? existing.spam_rating ?? 0,
-    is_spam: incoming.is_spam ?? existing.is_spam,
+    spam_rating: Math.max(existing.spam_rating ?? 0, incoming.spam_rating ?? 0),
+    is_spam: existing.is_spam || incoming.is_spam,
     clean_name: incoming.clean_name || existing.clean_name,
     result_origin: combineOrigin(existing.result_origin || '', incoming.result_origin || ''),
   };
@@ -159,10 +159,10 @@ export async function closeSearchTab(tabId: string): Promise<void> {
 export async function initSearchStore() {
   if (initialized) return;
 
-  let u1: UnlistenFn, u2: UnlistenFn, u3: UnlistenFn;
+  initialized = true;
+  const registered: UnlistenFn[] = [];
   try {
-  [u1, u2, u3] = await Promise.all([
-    listen<{ request_id: number; results: SearchResult[] }>('search-results', (event) => {
+    registered.push(await listen<{ request_id: number; results: SearchResult[] }>('search-results', (event) => {
       const requestId = event.payload.request_id;
       const incoming = event.payload.results;
       const origins = new Set(incoming.map((r) => r.result_origin).filter(Boolean));
@@ -175,8 +175,8 @@ export async function initSearchStore() {
           results: mergeSearchResults(t.results, incoming),
         })),
       );
-    }),
-    listen<{ request_id: number }>('search-complete', (event) => {
+    }));
+    registered.push(await listen<{ request_id: number }>('search-complete', (event) => {
       const requestId = event.payload.request_id;
       searchTabs.update((tabs) =>
         updateTabByRequestId(tabs, requestId, (t) => ({
@@ -185,8 +185,8 @@ export async function initSearchStore() {
           progress: null,
         })),
       );
-    }),
-    listen<{ request_id: number; nodes_contacted: number; results_so_far: number; phase: string }>(
+    }));
+    registered.push(await listen<{ request_id: number; nodes_contacted: number; results_so_far: number; phase: string }>(
       'search-progress',
       (event) => {
         const requestId = event.payload.request_id;
@@ -204,14 +204,14 @@ export async function initSearchStore() {
           }),
         );
       },
-    ),
-  ]);
+    ));
   } catch (e) {
+    for (const u of registered) u();
+    initialized = false;
     console.error('Failed to initialize search store listeners:', e);
     throw e;
   }
-  initialized = true;
-  unlisteners.push(u1!, u2!, u3!);
+  unlisteners.push(...registered);
 }
 
 export function cleanupSearchStore() {

@@ -16,11 +16,11 @@ export async function searchFiles(query: string, method: SearchMethod = 'global'
     query,
     method,
     requestId,
-    file_type: fileType || filters?.fileType || null,
-    file_extension: filters?.fileExtension || null,
-    min_size: filters?.minSize ?? null,
-    max_size: filters?.maxSize ?? null,
-    min_availability: filters?.minAvailability ?? null,
+    fileType: fileType || filters?.fileType || null,
+    fileExtension: filters?.fileExtension || null,
+    minSize: filters?.minSize ?? null,
+    maxSize: filters?.maxSize ?? null,
+    minAvailability: filters?.minAvailability ?? null,
   });
 }
 
@@ -81,7 +81,7 @@ export async function explainSpamResult(
     fileSize,
     sourceAddresses,
     searchKeywords,
-    serverIp,
+    serverIp: serverIp ?? null,
   });
 }
 

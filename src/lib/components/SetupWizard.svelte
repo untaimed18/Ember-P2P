@@ -2,6 +2,7 @@
   import { open } from '@tauri-apps/plugin-dialog';
   import { invoke } from '@tauri-apps/api/core';
   import { relaunch } from '@tauri-apps/plugin-process';
+  import { onDestroy } from 'svelte';
   import { theme, applyTheme, type Theme } from '$lib/stores/theme';
   import type { AppSettings } from '$lib/types';
   import ToggleSwitch from './ToggleSwitch.svelte';
@@ -44,10 +45,14 @@
   let dlIpStatus = $state<DlStatus>('idle');
   let downloading = $state(false);
 
+  let stepTimer: ReturnType<typeof setTimeout> | undefined;
+  onDestroy(() => clearTimeout(stepTimer));
+
   function goNext() {
     if (step >= TOTAL_STEPS) return;
     transitioning = true;
-    setTimeout(() => {
+    clearTimeout(stepTimer);
+    stepTimer = setTimeout(() => {
       step++;
       transitioning = false;
     }, 180);
@@ -56,7 +61,8 @@
   function goBack() {
     if (step <= 1) return;
     transitioning = true;
-    setTimeout(() => {
+    clearTimeout(stepTimer);
+    stepTimer = setTimeout(() => {
       step--;
       transitioning = false;
     }, 180);
