@@ -412,7 +412,8 @@ pub async fn cancel_transfers_batch(
             (manager.cancel(&transfer_id), info)
         };
         if let Some((file_hash, file_name, file_size)) = cancelled_info {
-            let _ = state.db.record_download_history(&file_hash, &file_name, file_size, "cancelled");
+            let db = state.db.clone();
+            db_blocking(move || { let _ = db.record_download_history(&file_hash, &file_name, file_size, "cancelled"); }).await;
         }
         for p in promoted {
             promoted_by_id.entry(p.id.clone()).or_insert(p);
@@ -691,7 +692,7 @@ pub async fn cancel_transfer(
 
     if let Some((file_hash, file_name, file_size)) = cancelled_info {
         let db = state.db.clone();
-        let _ = db.record_download_history(&file_hash, &file_name, file_size, "cancelled");
+        db_blocking(move || { let _ = db.record_download_history(&file_hash, &file_name, file_size, "cancelled"); }).await;
     }
 
     let (_, dl_folder) = tokio::join!(
@@ -793,7 +794,7 @@ pub async fn set_transfer_category(
     category: String,
 ) -> Result<(), String> {
     if category.len() > 256 {
-        return Err("Category name too long (max 256 characters)".into());
+        return Err("Category name too long (max 256 bytes)".into());
     }
     {
         let mut manager = state.transfer_manager.write().await;

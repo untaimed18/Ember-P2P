@@ -224,13 +224,12 @@ pub async fn publish_note(
 
     state
         .network_tx
-        .send(NetworkCommand::PublishNote {
+        .try_send(NetworkCommand::PublishNote {
             file_hash: kad_hash,
             rating,
             comment,
         })
-        .await
-        .map_err(|e| format!("Failed to send publish_note command: {e}"))?;
+        .map_err(|_| "Network is busy, please try again".to_string())?;
 
     Ok("Note publish queued".to_string())
 }
@@ -453,11 +452,15 @@ pub async fn clear_download_history(
     state: tauri::State<'_, AppState>,
     status: String,
 ) -> Result<(), String> {
-    if status == "all" {
-        state.db.clear_download_history("completed").map_err(|e| e.to_string())?;
-        state.db.clear_download_history("cancelled").map_err(|e| e.to_string())?;
-    } else {
-        state.db.clear_download_history(&status).map_err(|e| e.to_string())?;
+    match status.as_str() {
+        "all" => {
+            state.db.clear_download_history("completed").map_err(|e| e.to_string())?;
+            state.db.clear_download_history("cancelled").map_err(|e| e.to_string())?;
+        }
+        "completed" | "cancelled" => {
+            state.db.clear_download_history(&status).map_err(|e| e.to_string())?;
+        }
+        _ => return Err(format!("Invalid status: {status}. Must be 'completed', 'cancelled', or 'all'")),
     }
     Ok(())
 }

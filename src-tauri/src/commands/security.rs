@@ -312,6 +312,17 @@ pub async fn update_ipfilter_from_url(
         body
     };
 
+    let is_zip = bytes.len() >= 4 && bytes[0] == 0x50 && bytes[1] == 0x4B && bytes[2] == 0x03 && bytes[3] == 0x04;
+    let filter_bytes = if is_zip {
+        info!("Detected zip archive, extracting ipfilter…");
+        let zb = bytes;
+        tokio::task::spawn_blocking(move || extract_ipfilter_from_zip(&zb))
+            .await
+            .map_err(|e| format!("Extraction task failed: {e}"))??
+    } else {
+        bytes
+    };
+
     let data_dir = app
         .path()
         .app_data_dir()
@@ -321,12 +332,12 @@ pub async fn update_ipfilter_from_url(
         .map_err(|e| format!("Failed to create data dir: {e}"))?;
 
     let filter_path = data_dir.join("ipfilter.dat");
-    tokio::fs::write(&filter_path, &bytes)
+    tokio::fs::write(&filter_path, &filter_bytes)
         .await
         .map_err(|e| format!("Failed to write ipfilter.dat: {e}"))?;
 
-    let byte_count = bytes.len();
-    let line_count = bytes.iter().filter(|&&b| b == b'\n').count();
+    let byte_count = filter_bytes.len();
+    let line_count = filter_bytes.iter().filter(|&&b| b == b'\n').count();
 
     state
         .network_tx
@@ -353,8 +364,9 @@ pub async fn update_ipfilter_from_url(
         }).await.map_err(|e| format!("Save task failed: {e}"))?.map_err(|e| format!("Failed to save config: {e}"))?;
     }
 
+    let extracted_note = if is_zip { " (extracted from zip)" } else { "" };
     let msg = format!(
-        "Downloaded and loaded ipfilter.dat from {url} ({byte_count} bytes, ~{line_count} entries) — filter is now active"
+        "Downloaded and loaded ipfilter.dat from {url}{extracted_note} ({byte_count} bytes, ~{line_count} entries) — filter is now active"
     );
     info!("{msg}");
     Ok(msg)

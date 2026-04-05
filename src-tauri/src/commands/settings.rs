@@ -62,7 +62,7 @@ fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         return Err("Nickname must not be empty".into());
     }
     if settings.nickname.len() > 128 {
-        return Err("Nickname must be 128 characters or fewer".into());
+        return Err("Nickname must be 128 bytes or fewer".into());
     }
     let blocked_segments: &[&str] = &[
         "windows", "program files", "program files (x86)",
@@ -140,10 +140,6 @@ pub async fn update_settings(
     settings.spam_filter_profile = settings.spam_filter_profile.trim().to_ascii_lowercase();
     validate_settings(&settings)?;
 
-    state
-        .bandwidth_limiter
-        .set_configured_limits(settings.max_upload_speed, settings.max_download_speed);
-
     let old_settings = {
         let config = state.config.read().await;
         config.settings.clone()
@@ -152,18 +148,9 @@ pub async fn update_settings(
     let port_changed = settings.tcp_port != old_settings.tcp_port
         || settings.udp_port != old_settings.udp_port;
 
-    {
-        let mut manager = state.transfer_manager.write().await;
-        manager.max_concurrent = settings.max_concurrent_downloads;
-    }
-
-    state.network_tx.try_send(NetworkCommand::UpdateSettings {
-        settings: settings.clone(),
-    }).map_err(|_| "Network is busy, settings saved but not applied until restart".to_string())?;
-
     let save_data = {
         let mut config = state.config.write().await;
-        config.settings = settings;
+        config.settings = settings.clone();
         config.prepare_save().map_err(|e| format!("Failed to serialize settings: {e}"))?
     };
     {
@@ -171,6 +158,21 @@ pub async fn update_settings(
         tokio::task::spawn_blocking(move || {
             crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
         }).await.map_err(|e| format!("Save failed: {e}"))?.map_err(|e| format!("Save failed: {e}"))?;
+    }
+
+    state
+        .bandwidth_limiter
+        .set_configured_limits(settings.max_upload_speed, settings.max_download_speed);
+
+    {
+        let mut manager = state.transfer_manager.write().await;
+        manager.max_concurrent = settings.max_concurrent_downloads;
+    }
+
+    if state.network_tx.try_send(NetworkCommand::UpdateSettings {
+        settings: settings.clone(),
+    }).is_err() {
+        tracing::warn!("Network channel full; settings saved to disk but will apply on restart");
     }
 
     if port_changed {

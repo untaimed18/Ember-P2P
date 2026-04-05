@@ -62,9 +62,11 @@ pub async fn add_friend(
     friends.insert(hash);
     drop(friends);
 
-    state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
+    if state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
         ember_hash: hash,
-    }).map_err(|_| "Network is busy, friend will be discovered on next restart".to_string())?;
+    }).is_err() {
+        tracing::warn!("Network channel full, friend {canonical} will connect on next source exchange");
+    }
 
     Ok(())
 }
@@ -100,7 +102,7 @@ pub async fn update_friend_nickname(
     nickname: String,
 ) -> Result<(), String> {
     if nickname.len() > 256 {
-        return Err("Nickname too long (max 256 characters)".into());
+        return Err("Nickname too long (max 256 bytes)".into());
     }
     let canonical = user_hash_hex.to_lowercase();
     parse_user_hash(&canonical)?;
@@ -164,7 +166,7 @@ pub async fn send_chat_message(
     message: String,
 ) -> Result<(), String> {
     if message.is_empty() || message.len() > 4096 {
-        return Err("Message must be between 1 and 4096 characters".into());
+        return Err("Message must be between 1 and 4096 bytes".into());
     }
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
@@ -276,9 +278,11 @@ pub async fn accept_friend_request(
 
     state.friend_hashes.write().await.insert(hash);
 
-    state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
+    if state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
         ember_hash: hash,
-    }).map_err(|_| "Network is busy, friend will be discovered on next restart".to_string())?;
+    }).is_err() {
+        tracing::warn!("Network channel full, accepted friend {canonical} will connect on next source exchange");
+    }
 
     Ok(())
 }
