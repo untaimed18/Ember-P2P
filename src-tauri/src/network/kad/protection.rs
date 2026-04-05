@@ -13,6 +13,9 @@ const MAX_OUTGOING_PER_IP_PER_SEC: u32 = 30;
 const MAX_PACKETS_PER_SEC_UNKNOWN: u32 = 20;
 const MAX_PACKETS_PER_SEC_KNOWN: u32 = 40;
 
+const MAX_IP_ENTRIES: usize = 10_000;
+const MAX_OPCODE_ENTRIES: usize = 50_000;
+
 fn opcode_limit(opcode: u8) -> u32 {
     match opcode {
         0x01 => 2,   // BootstrapReq
@@ -59,6 +62,9 @@ impl FloodProtection {
 
         // Layer 1: per-(IP, opcode) within OPCODE_WINDOW_SECS
         let op_key = (ip, opcode);
+        if self.opcode_counters.len() >= MAX_OPCODE_ENTRIES && !self.opcode_counters.contains_key(&op_key) {
+            return true;
+        }
         let op_entry = self.opcode_counters.entry(op_key).or_insert((0, now));
         if now.duration_since(op_entry.1).as_secs() >= OPCODE_WINDOW_SECS {
             op_entry.0 = 1;
@@ -73,6 +79,9 @@ impl FloodProtection {
         }
 
         // Layer 2: global per-IP per-second cap
+        if self.ip_counters.len() >= MAX_IP_ENTRIES && !self.ip_counters.contains_key(&ip) {
+            return true;
+        }
         let entry = self.ip_counters.entry(ip).or_insert((0, now));
         let max_packets = if known_peer { MAX_PACKETS_PER_SEC_KNOWN } else { MAX_PACKETS_PER_SEC_UNKNOWN };
         if now.duration_since(entry.1).as_secs() >= 1 {

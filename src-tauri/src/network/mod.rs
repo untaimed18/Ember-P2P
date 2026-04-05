@@ -1822,7 +1822,7 @@ pub async fn start_network(
 
     let mut routing_table = RoutingTable::new(local_id, settings.block_private_ips);
     let search_manager = SearchManager::new();
-    let publish_manager = PublishManager::new(local_id, user_hash, ember_hash, tcp_port, udp_port);
+    let publish_manager = PublishManager::new(local_id, user_hash, tcp_port, udp_port);
 
     // Load bootstrap contacts
     let nodes_dat_path = data_dir.join("nodes.dat");
@@ -1847,9 +1847,9 @@ pub async fn start_network(
                             boot_contacts.push(KadContact {
                                 id: kad_id,
                                 ip,
-                                udp_port: port.saturating_add(3),
+                                udp_port: port.saturating_add(10),
                                 tcp_port: port,
-                                version: 0,
+                                version: KADEMLIA_VERSION,
                                 last_seen: peer.last_seen,
                                 verified: false,
                                 contact_type: CONTACT_TYPE_NEW,
@@ -9438,7 +9438,12 @@ async fn handle_udp_packet(
         }
         _ => state.flood_protection.has_recent_ip(from.ip()),
     };
-    let opcode_hint = data.get(1).copied().unwrap_or(0xFF);
+    let header = data.first().copied().unwrap_or(0);
+    let opcode_hint = if header == 0xE4 || header == 0xE5 {
+        data.get(1).copied().unwrap_or(0xFF)
+    } else {
+        0xFF
+    };
     if state.flood_protection.check_rate_limit_with_opcode(from.ip(), known_peer, opcode_hint) {
         debug!("Rate limit exceeded for {from} (opcode 0x{opcode_hint:02X}), dropping packet");
         return;
@@ -9589,24 +9594,6 @@ async fn handle_udp_packet(
             // The periodic bootstrap timer and self-lookup handle further discovery.
 
             // Send HelloReq only to the bootstrap node itself (not all returned contacts)
-            let mut our_options: u8 = 0;
-            if state.udp_firewalled { our_options |= 0x01; }
-            if state.firewalled { our_options |= 0x02; }
-            // Always request ACK from bootstrap node to verify connectivity
-            our_options |= 0x04;
-
-            let mut hello_tags = vec![
-                KadTag {
-                    name: TagName::Id(TAG_KADMISCOPTIONS),
-                    value: TagValue::Uint8(our_options),
-                },
-            ];
-            if !settings.nickname.is_empty() {
-                hello_tags.push(KadTag {
-                    name: TagName::Id(TAG_FILENAME),
-                    value: TagValue::String(settings.nickname.clone()),
-                });
-            }
             let hello = KadMessage::HelloReq {
                 sender_id: state.local_id,
                 tcp_port: state.tcp_port,
@@ -9627,6 +9614,12 @@ async fn handle_udp_packet(
                         tags.push(KadTag {
                             name: TagName::Id(TAG_KADMISCOPTIONS),
                             value: TagValue::Uint8(our_options),
+                        });
+                    }
+                    if !settings.nickname.is_empty() {
+                        tags.push(KadTag {
+                            name: TagName::Id(TAG_FILENAME),
+                            value: TagValue::String(settings.nickname.clone()),
                         });
                     }
                     tags
@@ -10653,7 +10646,7 @@ async fn handle_udp_packet(
                 state.firewall_checker.handle_udp_firewall_result(true);
                 state.udp_firewalled = false;
                 state.udp_fw_verified = true;
-                state.stats.firewalled = false;
+                state.stats.firewalled = state.firewalled;
                 if udp_port > 0 {
                     state.external_udp_port = Some(udp_port);
                 }
@@ -11651,12 +11644,14 @@ async fn handle_command(
         NetworkCommand::AddIpRange { start_ip, end_ip, description } => {
             if let (Ok(start), Ok(end)) = (start_ip.parse::<Ipv4Addr>(), end_ip.parse::<Ipv4Addr>()) {
                 state.ip_filter.add_range(start, end, description);
+                state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
                 info!("Added IP filter range {start_ip} - {end_ip}, total ranges: {}", state.ip_filter.range_count());
             }
         }
 
         NetworkCommand::RemoveIpRange { start_ip, end_ip } => {
             if state.ip_filter.remove_range(&start_ip, &end_ip) {
+                state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
                 info!("Removed IP filter range {start_ip} - {end_ip}, total ranges: {}", state.ip_filter.range_count());
             }
         }

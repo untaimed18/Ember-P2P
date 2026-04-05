@@ -292,8 +292,8 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
                 match KadContact::read_from(cursor) {
                     Ok(c) => contacts.push(c),
                     Err(e) => {
-                        tracing::debug!("Skipping malformed bootstrap contact ({} parsed so far): {e}", contacts.len());
-                        continue;
+                        tracing::debug!("Stopping bootstrap contact parse ({} parsed so far): {e}", contacts.len());
+                        break;
                     }
                 }
             }
@@ -537,8 +537,8 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
                 match KadContact::read_from(cursor) {
                     Ok(c) => contacts.push(c),
                     Err(e) => {
-                        tracing::debug!("Skipping malformed legacy bootstrap contact ({} parsed so far): {e}", contacts.len());
-                        continue;
+                        tracing::debug!("Stopping legacy bootstrap contact parse ({} parsed so far): {e}", contacts.len());
+                        break;
                     }
                 }
             }

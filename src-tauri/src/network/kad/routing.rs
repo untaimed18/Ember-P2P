@@ -634,7 +634,7 @@ impl RoutingZone {
         if let Some(bin) = &mut self.bin {
             let before = bin.len();
             bin.contacts.retain(|c| {
-                if c.is_dead() && (c.expires_at == 0 || now > c.expires_at) {
+                if c.is_dead() && (c.expires_at == 0 || now >= c.expires_at) {
                     if in_use.get(&c.id).copied().unwrap_or(0) > 0 {
                         return true;
                     }
@@ -836,6 +836,10 @@ impl RoutingTable {
     pub fn insert(&mut self, mut contact: KadContact) -> bool {
         if contact.kad_options & 0x01 != 0 {
             tracing::debug!("RT reject {}: UDP-firewalled contact", contact.id);
+            return false;
+        }
+        if contact.id == KadId::zero() {
+            tracing::debug!("RT reject: zero KadId");
             return false;
         }
         if contact.id == self.local_id {

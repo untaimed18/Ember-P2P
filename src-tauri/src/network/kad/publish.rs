@@ -43,7 +43,7 @@ pub struct PublishManager {
 }
 
 impl PublishManager {
-    pub fn new(local_id: KadId, user_hash: [u8; 16], _ember_hash: [u8; 16], tcp_port: u16, udp_port: u16) -> Self {
+    pub fn new(local_id: KadId, user_hash: [u8; 16], tcp_port: u16, udp_port: u16) -> Self {
         PublishManager {
             local_id,
             user_hash,
