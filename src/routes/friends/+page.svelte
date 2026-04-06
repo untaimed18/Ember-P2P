@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getFriends, addFriend, removeFriend, updateFriendNickname, getMyEmberHash, getUnreadMessageCounts, getFriendRequests, acceptFriendRequest, rejectFriendRequest, isFriendDiscoverable, type FriendInfo, type FriendRequestInfo } from '$lib/api/friends';
+  import { getFriends, addFriend, removeFriend, updateFriendNickname, getMyEmberHash, acceptFriendRequest, rejectFriendRequest, type FriendInfo, type FriendRequestInfo } from '$lib/api/friends';
   import { getNetworkStats, kadRecheckFirewall } from '$lib/api/kad';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import ChatSidebar from '$lib/components/ChatSidebar.svelte';
@@ -7,6 +7,14 @@
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import { toastWarning } from '$lib/stores/toast';
+  import {
+    onlineFriends as onlineFriendsStore,
+    unreadCounts as unreadCountsStore,
+    friendRequests as friendRequestsStore,
+    searchingFriends as searchingFriendsStore,
+    isDiscoverable as isDiscoverableStore,
+    clearUnread,
+  } from '$lib/stores/friends';
 
   let friends: FriendInfo[] = $state([]);
   let loading = $state(true);
@@ -53,6 +61,19 @@
   let processingRequests: Set<string> = $state(new Set());
   let adding = $state(false);
 
+  // Sync global friend stores into local reactive state so the template
+  // picks up events even if they arrived before this page mounted.
+  $effect(() => {
+    const unsubs = [
+      onlineFriendsStore.subscribe(v => { onlineFriends = v; }),
+      unreadCountsStore.subscribe(v => { unreadCounts = v; }),
+      friendRequestsStore.subscribe(v => { friendRequests = v; }),
+      searchingFriendsStore.subscribe(v => { searchingFriends = v; }),
+      isDiscoverableStore.subscribe(v => { isDiscoverable = v; }),
+    ];
+    return () => unsubs.forEach(u => u());
+  });
+
   function autoFocus(node: HTMLElement) {
     node.focus();
   }
@@ -84,8 +105,7 @@
     chatFriendHash = f.user_hash;
     chatFriendName = f.nickname || f.user_hash.slice(0, 8) + '\u2026';
     chatOpen = true;
-    unreadCounts.delete(f.user_hash);
-    unreadCounts = new Map(unreadCounts);
+    clearUnread(f.user_hash);
   }
 
   function closeChat() {
@@ -116,16 +136,11 @@
     return onlineFriends.has(f.user_hash) ? 'online' : 'offline';
   }
 
-  async function loadUnreadCounts() {
+  async function reloadFriendRequests() {
     try {
-      const counts = await getUnreadMessageCounts();
-      unreadCounts = new Map(counts);
-    } catch (_) { /* best-effort */ }
-  }
-
-  async function loadFriendRequests() {
-    try {
-      friendRequests = await getFriendRequests();
+      const { getFriendRequests } = await import('$lib/api/friends');
+      const reqs = await getFriendRequests();
+      friendRequestsStore.set(reqs);
     } catch (_) { /* best-effort */ }
   }
 
@@ -136,7 +151,7 @@
     try {
       await acceptFriendRequest(req.sender_hash);
       flash(`Accepted friend request from ${req.sender_nickname || req.sender_hash.slice(0, 8) + '\u2026'}`);
-      await loadFriendRequests();
+      await reloadFriendRequests();
       await loadFriends();
     } catch (e: unknown) {
       error = toErr(e);
@@ -152,7 +167,7 @@
     processingRequests = new Set(processingRequests);
     try {
       await rejectFriendRequest(req.sender_hash);
-      friendRequests = friendRequests.filter(r => r.sender_hash !== req.sender_hash);
+      friendRequestsStore.update(reqs => reqs.filter(r => r.sender_hash !== req.sender_hash));
     } catch (e: unknown) {
       error = toErr(e);
     } finally {
@@ -175,42 +190,17 @@
   onMount(() => {
     loadFriends();
     loadMyHash();
-    loadUnreadCounts();
-    loadFriendRequests();
     getNetworkStats().then(s => { isFirewalled = s.firewalled; }).catch(() => {});
 
     let destroyed = false;
     const unlistenFns: (() => void)[] = [];
 
+    // Page-local listeners for side effects that need the local friends list
     listen<{ user_hash: string }>('ember:friend-online', (event) => {
-      const hash = event.payload.user_hash;
-      onlineFriends.add(hash);
-      onlineFriends = new Set(onlineFriends);
-      searchingFriends.delete(hash);
-      searchingFriends = new Set(searchingFriends);
-      failedSearchToastsShown.delete(hash);
+      failedSearchToastsShown.delete(event.payload.user_hash);
     }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
 
-    listen<{ user_hash: string }>('ember:friend-offline', (event) => {
-      onlineFriends.delete(event.payload.user_hash);
-      onlineFriends = new Set(onlineFriends);
-    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
-
-    listen<{ user_hash: string; direction: string }>('ember:chat-message', (event) => {
-      if (event.payload.direction === 'received' && !(chatOpen && chatFriendHash === event.payload.user_hash)) {
-        const current = unreadCounts.get(event.payload.user_hash) || 0;
-        unreadCounts.set(event.payload.user_hash, current + 1);
-        unreadCounts = new Map(unreadCounts);
-      }
-    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
-
-    listen<{ sender_hash: string; nickname: string }>('ember:friend-request', () => {
-      loadFriendRequests();
-    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
-
-    listen<{ user_hash: string }>('ember:friend-confirmed', (event) => {
-      searchingFriends.delete(event.payload.user_hash);
-      searchingFriends = new Set(searchingFriends);
+    listen<{ user_hash: string }>('ember:friend-confirmed', () => {
       loadFriends();
     }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
 
@@ -219,22 +209,9 @@
       if (!event.payload.firewalled) recheckingFirewall = false;
     }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
 
-    listen<{ discoverable: boolean; nodes: number }>('ember:friend-discoverable', (event) => {
-      isDiscoverable = event.payload.discoverable;
-    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
-
-    isFriendDiscoverable().then(v => { isDiscoverable = v; }).catch(() => {});
-
-    listen<{ user_hash: string }>('ember:friend-searching', (event) => {
-      searchingFriends.add(event.payload.user_hash);
-      searchingFriends = new Set(searchingFriends);
-    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
-
     listen<{ user_hash: string; reason?: string }>('ember:friend-search-failed', (event) => {
       const hash = event.payload.user_hash;
       const reason = event.payload.reason || 'error';
-      searchingFriends.delete(hash);
-      searchingFriends = new Set(searchingFriends);
       if (failedSearchToastsShown.has(hash)) return;
       failedSearchToastsShown.add(hash);
       const f = friends.find(fr => fr.user_hash === hash);
@@ -345,8 +322,7 @@
     pendingRemove = null;
     try {
       await removeFriend(f.user_hash);
-      onlineFriends.delete(f.user_hash);
-      onlineFriends = new Set(onlineFriends);
+      onlineFriendsStore.update(s => { s.delete(f.user_hash); return new Set(s); });
       flash(`Removed ${f.nickname || f.user_hash.slice(0, 8) + '\u2026'}`);
       await loadFriends();
     } catch (e: unknown) {
