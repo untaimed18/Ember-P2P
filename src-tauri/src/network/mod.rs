@@ -3017,39 +3017,32 @@ pub async fn start_network(
                         }));
                     }
 
-                    // eMule-style: only mark sources dead for permanent protocol
-                    // failures (FNF, hash mismatch).  Transient TCP errors like
-                    // connection resets or EOF are normal -- the source will be
-                    // reasked later.
-                    if *failure_kind == SourceFailureKind::Permanent {
+                    // Dead source marking for individual sources is handled by
+                    // SourceDetail "failed" events (which carry the actual IP/port).
+                    // For single-source downloads that set peer_id, apply a
+                    // belt-and-suspenders mark here as well.
+                    {
                         let mgr = transfer_manager.read().await;
                         if let Some(t) = mgr.get_transfer(transfer_id) {
                             if let Some((ip_str, port_str)) = t.peer_id.split_once(':') {
                                 if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>()) {
-                                    state.dead_sources.add_dead_source(0, u32::from(ip), port, state.firewalled);
-                                    if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
-                                        if fh_bytes.len() == 16 {
-                                            let mut fh = [0u8; 16];
-                                            fh.copy_from_slice(&fh_bytes);
-                                            state.dead_sources.add_dead_source_for_file(fh, u32::from(ip), port);
+                                    if *failure_kind == SourceFailureKind::Permanent {
+                                        state.dead_sources.add_dead_source(0, u32::from(ip), port, state.firewalled);
+                                        if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
+                                            if fh_bytes.len() == 16 {
+                                                let mut fh = [0u8; 16];
+                                                fh.copy_from_slice(&fh_bytes);
+                                                state.dead_sources.add_dead_source_for_file(fh, u32::from(ip), port);
+                                            }
                                         }
-                                    }
-                                    debug!("Marked source {}:{} as dead after permanent failure: {}", ip, port, error);
-                                }
-                            }
-                        }
-                        drop(mgr);
-                    } else {
-                        let mgr = transfer_manager.read().await;
-                        if let Some(t) = mgr.get_transfer(transfer_id) {
-                            if let Some((ip_str, port_str)) = t.peer_id.split_once(':') {
-                                if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>()) {
-                                    if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
-                                        if fh_bytes.len() == 16 {
-                                            let mut fh = [0u8; 16];
-                                            fh.copy_from_slice(&fh_bytes);
-                                            state.dead_sources.add_transient_dead_source_for_file(fh, u32::from(ip), port);
-                                            debug!("Transient cooldown for source {}:{} on file {}", ip, port, t.file_hash);
+                                        debug!("Marked source {}:{} as dead after permanent failure: {}", ip, port, error);
+                                    } else {
+                                        if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
+                                            if fh_bytes.len() == 16 {
+                                                let mut fh = [0u8; 16];
+                                                fh.copy_from_slice(&fh_bytes);
+                                                state.dead_sources.add_transient_dead_source_for_file(fh, u32::from(ip), port);
+                                            }
                                         }
                                     }
                                 }
@@ -3381,9 +3374,9 @@ pub async fn start_network(
                             "source": format!("{}:{}", ip, port),
                             "kind": failure_kind_name,
                         }));
-                        let is_permanent = matches!(failure_kind, Some(SourceFailureKind::Permanent));
-                        if is_permanent {
-                            if let Ok(v4) = ip.parse::<Ipv4Addr>() {
+                        if let Ok(v4) = ip.parse::<Ipv4Addr>() {
+                            let is_permanent = matches!(failure_kind, Some(SourceFailureKind::Permanent));
+                            if is_permanent {
                                 state.dead_sources.add_dead_source(0, u32::from(v4), port, state.firewalled);
                                 let mgr = transfer_manager.read().await;
                                 if let Some(t) = mgr.get_transfer(transfer_id) {
@@ -3396,6 +3389,17 @@ pub async fn start_network(
                                     }
                                 }
                                 debug!("Marked source {}:{} as dead (permanent failure)", ip, port);
+                            } else {
+                                let mgr = transfer_manager.read().await;
+                                if let Some(t) = mgr.get_transfer(transfer_id) {
+                                    if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
+                                        if fh_bytes.len() == 16 {
+                                            let mut fh = [0u8; 16];
+                                            fh.copy_from_slice(&fh_bytes);
+                                            state.dead_sources.add_transient_dead_source_for_file(fh, u32::from(v4), port);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
