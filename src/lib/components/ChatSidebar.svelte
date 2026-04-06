@@ -258,8 +258,8 @@
     height: 28px;
     border: none;
     border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--text-muted);
+    background: var(--bg-hover);
+    color: var(--text-secondary);
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -268,8 +268,8 @@
   }
 
   .chat-close:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
+    background: var(--danger);
+    color: #fff;
   }
 
   .chat-close svg {

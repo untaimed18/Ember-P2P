@@ -66,7 +66,7 @@ impl FloodProtection {
             return true;
         }
         let op_entry = self.opcode_counters.entry(op_key).or_insert((0, now));
-        if now.duration_since(op_entry.1).as_secs() >= OPCODE_WINDOW_SECS {
+        if now.saturating_duration_since(op_entry.1).as_secs() >= OPCODE_WINDOW_SECS {
             op_entry.0 = 1;
             op_entry.1 = now;
         } else {
@@ -84,7 +84,7 @@ impl FloodProtection {
         }
         let entry = self.ip_counters.entry(ip).or_insert((0, now));
         let max_packets = if known_peer { MAX_PACKETS_PER_SEC_KNOWN } else { MAX_PACKETS_PER_SEC_UNKNOWN };
-        if now.duration_since(entry.1).as_secs() >= 1 {
+        if now.saturating_duration_since(entry.1).as_secs() >= 1 {
             entry.0 = 1;
             entry.1 = now;
             false
@@ -103,9 +103,12 @@ impl FloodProtection {
     /// Returns true if we've sent too many packets to this IP recently.
     pub fn check_outgoing_rate(&mut self, ip: IpAddr) -> bool {
         let now = Instant::now();
+        if self.outgoing_counters.len() >= MAX_IP_ENTRIES && !self.outgoing_counters.contains_key(&ip) {
+            return true;
+        }
         let entry = self.outgoing_counters.entry(ip).or_insert((0, now));
 
-        if now.duration_since(entry.1).as_secs() >= 1 {
+        if now.saturating_duration_since(entry.1).as_secs() >= 1 {
             entry.0 = 1;
             entry.1 = now;
             false
@@ -193,7 +196,7 @@ impl FloodProtection {
     /// O(1) check if we've communicated with this IP recently.
     pub fn has_recent_ip(&self, ip: IpAddr) -> bool {
         if let Some(last) = self.recent_ips.get(&ip) {
-            Instant::now().duration_since(*last).as_secs() < TRACKER_EXPIRY_SECS
+            Instant::now().saturating_duration_since(*last).as_secs() < TRACKER_EXPIRY_SECS
         } else {
             false
         }
@@ -204,20 +207,20 @@ impl FloodProtection {
         let now = Instant::now();
 
         self.ip_counters.retain(|_, (_, last)| {
-            now.duration_since(*last).as_secs() < 60
+            now.saturating_duration_since(*last).as_secs() < 60
         });
 
         self.opcode_counters.retain(|_, (_, last)| {
-            now.duration_since(*last).as_secs() < OPCODE_WINDOW_SECS * 2
+            now.saturating_duration_since(*last).as_secs() < OPCODE_WINDOW_SECS * 2
         });
 
         self.outgoing_counters.retain(|_, (_, last)| {
-            now.duration_since(*last).as_secs() < 60
+            now.saturating_duration_since(*last).as_secs() < 60
         });
 
         let stale: Vec<(SocketAddr, u8)> = self.request_times
             .iter()
-            .filter(|(_, time)| now.duration_since(**time).as_secs() > TRACKER_EXPIRY_SECS)
+            .filter(|(_, time)| now.saturating_duration_since(**time).as_secs() > TRACKER_EXPIRY_SECS)
             .map(|(key, _)| *key)
             .collect();
         for key in stale {
@@ -226,7 +229,7 @@ impl FloodProtection {
         }
 
         self.recent_ips.retain(|_, last| {
-            now.duration_since(*last).as_secs() < TRACKER_EXPIRY_SECS
+            now.saturating_duration_since(*last).as_secs() < TRACKER_EXPIRY_SECS
         });
     }
 }
