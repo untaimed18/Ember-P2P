@@ -4320,6 +4320,7 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: None,
+                                                source_origin: Some("kad".into()),
                                             },
                                         );
                                     }
@@ -4338,6 +4339,7 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: None,
+                                                source_origin: Some("kad".into()),
                                             },
                                         );
                                     }
@@ -4358,6 +4360,7 @@ pub async fn start_network(
                                                     available_parts: None,
                                                     total_parts: None,
                                                     country_code: None,
+                                                    source_origin: Some("kad".into()),
                                                 },
                                             );
                                         }
@@ -4407,6 +4410,7 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: None,
+                                                source_origin: Some("kad".into()),
                                             },
                                         );
                                     }
@@ -5939,6 +5943,7 @@ pub async fn start_network(
                                         available_parts: None,
                                         total_parts: None,
                                         country_code: None,
+                                        source_origin: None,
                                     },
                                 );
                             }
@@ -6071,6 +6076,7 @@ pub async fn start_network(
                                         available_parts: None,
                                         total_parts: None,
                                         country_code: None,
+                                        source_origin: None,
                                     },
                                 );
                             }
@@ -6878,6 +6884,7 @@ pub async fn start_network(
                                             let mgr = transfer_manager.read().await;
                                             matching_active_transfer_ids_for_hash(&state, &mgr, &hash_hex)
                                         };
+                                        let mut server_source_ips: Vec<(String, u16)> = Vec::new();
                                         for src in &sources {
                                             if src.client_id == 0 && !src.ip.is_empty() {
                                                 let v4_ip = src.ip.parse::<Ipv4Addr>().ok();
@@ -6886,6 +6893,7 @@ pub async fn start_network(
                                                         continue;
                                                     }
                                                 }
+                                                server_source_ips.push((src.ip.clone(), src.port));
                                                 let (uh, co) = if let Some(v4) = v4_ip {
                                                     let sm = source_manager.read().await;
                                                     (sm.get_user_hash(&file_hash, v4, src.port),
@@ -6919,6 +6927,30 @@ pub async fn start_network(
                                                         stats.dropped_full,
                                                         stats.overflowed,
                                                         stats.dropped_closed,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        if !server_source_ips.is_empty() {
+                                            let mut mgr = transfer_manager.write().await;
+                                            for tid in &matching_transfer_ids {
+                                                for (ip_s, port) in &server_source_ips {
+                                                    mgr.update_source_detail(
+                                                        tid,
+                                                        crate::types::SourceInfo {
+                                                            ip: ip_s.clone(),
+                                                            port: *port,
+                                                            status: crate::types::SourceStatus::Connecting,
+                                                            queue_rank: None,
+                                                            speed: 0,
+                                                            transferred: 0,
+                                                            client_software: String::new(),
+                                                            peer_name: String::new(),
+                                                            available_parts: None,
+                                                            total_parts: None,
+                                                            country_code: None,
+                                                            source_origin: Some("ed2k".into()),
+                                                        },
                                                     );
                                                 }
                                             }
@@ -13279,6 +13311,7 @@ async fn handle_download_event(
                         available_parts,
                         total_parts,
                         country_code: country_code.clone(),
+                        source_origin: None,
                     },
                 );
             }

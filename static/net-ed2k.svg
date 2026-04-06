@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <defs>
+    <linearGradient id="eg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ff9800"/>
+      <stop offset="100%" stop-color="#e65100"/>
+    </linearGradient>
+  </defs>
+  <circle cx="12" cy="12" r="11" fill="url(#eg)" stroke="#bf360c" stroke-width="0.8"/>
+  <!-- Server rack icon -->
+  <rect x="6.5" y="5" width="11" height="5" rx="1.2" fill="#fff3e0" opacity="0.95"/>
+  <circle cx="15" cy="7.5" r="1" fill="#e65100"/>
+  <line x1="8" y1="7.5" x2="12.5" y2="7.5" stroke="#e65100" stroke-width="1" stroke-linecap="round"/>
+  <rect x="6.5" y="11.5" width="11" height="5" rx="1.2" fill="#fff3e0" opacity="0.95"/>
+  <circle cx="15" cy="14" r="1" fill="#e65100"/>
+  <line x1="8" y1="14" x2="12.5" y2="14" stroke="#e65100" stroke-width="1" stroke-linecap="round"/>
+  <!-- Connection lines below -->
+  <line x1="10" y1="17" x2="10" y2="19.5" stroke="#fff3e0" stroke-width="0.9" opacity="0.7"/>
+  <line x1="14" y1="17" x2="14" y2="19.5" stroke="#fff3e0" stroke-width="0.9" opacity="0.7"/>
+  <line x1="8" y1="19.5" x2="16" y2="19.5" stroke="#fff3e0" stroke-width="0.9" opacity="0.7"/>
+</svg>
