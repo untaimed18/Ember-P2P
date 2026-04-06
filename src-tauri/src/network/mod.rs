@@ -138,7 +138,7 @@ async fn handle_epx_sources(
             if state.dead_sources.is_dead_source_for_file(file_hash, u32::from(ip), port) {
                 continue;
             }
-            if ip.is_private() || ip.is_loopback() || ip.is_link_local() {
+            if ip.is_unspecified() || ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_broadcast() || ip.is_multicast() {
                 continue;
             }
             if state.banned_ips.contains(&ip) {
@@ -357,7 +357,7 @@ fn is_eligible_udp_server(server: &ed2k::server_list::ServerEntry, connected_add
     }
     if let Some(conn_addr) = connected_addr {
         if let Ok(addr) = format!("{}:{}", server.ip, server.port).parse::<SocketAddr>() {
-            if addr.ip() == conn_addr.ip() && addr.port() == conn_addr.port() {
+            if addr.ip() == conn_addr.ip() {
                 return false;
             }
         }
@@ -474,6 +474,7 @@ fn inject_source_into_active_transfers(
 
     for transfer_id in &stale_transfer_ids {
         state.active_source_senders.remove(transfer_id);
+        state.active_source_overflow.remove(transfer_id);
         state.active_kad_search_state.remove(transfer_id);
         state.download_source_searches.retain(|_, tid| tid != transfer_id);
     }
@@ -1333,6 +1334,22 @@ async fn handle_server_disconnect(
             }
         }
         maybe_finish_active_search(state, app_handle, request_id);
+    }
+    if let Some(active) = state.active_search_request.as_mut() {
+        let rid = active.request_id;
+        let mut changed = false;
+        if active.udp_pending {
+            active.udp_pending = false;
+            state.server_udp_search_age = 0;
+            changed = true;
+        }
+        if active.server_pending {
+            active.server_pending = false;
+            changed = true;
+        }
+        if changed {
+            maybe_finish_active_search(state, app_handle, rid);
+        }
     }
     state.stats.server_status = "disconnected".to_string();
     let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "disconnected" }));
@@ -2656,6 +2673,11 @@ pub async fn start_network(
                         Ok((len, from)) => {
                             if state.stats.status != NetworkStatus::Disconnected {
                                 last_kad_activity_at = chrono::Utc::now().timestamp();
+                                stats_manager.add_overhead(
+                                    crate::storage::statistics::OverheadCategory::Kad,
+                                    crate::storage::statistics::OverheadDirection::Download,
+                                    len as u64,
+                                );
                                 handle_udp_packet(
                                     &udp_socket,
                                     &udp_buf[..len],
@@ -3396,7 +3418,7 @@ pub async fn start_network(
 
                         if retry_count < 3 {
                             let hash_hex = hex::encode(file_hash);
-                            let candidate = state.per_file_sources.get(&hash_hex).and_then(|pfs| {
+                            let candidate = state.per_file_sources.values().find(|pfs| pfs.file_hash == *file_hash).and_then(|pfs| {
                                 pfs.sources.iter().find(|s| {
                                     !failed_ips.contains(&s.ip)
                                         && matches!(
@@ -3699,10 +3721,11 @@ pub async fn start_network(
                             let idx = local_index.read().await;
                             idx.all_files().to_vec()
                         };
-                        let file_count = files.len().min(5000) as u32;
                         let mut res_payload = Vec::new();
-                        res_payload.extend_from_slice(&file_count.to_le_bytes());
-                        for f in files.iter().take(file_count as usize) {
+                        let count_offset = res_payload.len();
+                        res_payload.extend_from_slice(&0u32.to_le_bytes());
+                        let mut actual_count = 0u32;
+                        for f in files.iter().take(5000) {
                             if let Ok(hash_bytes) = hex::decode(&f.hash) {
                                 if hash_bytes.len() == 16 {
                                     res_payload.extend_from_slice(&hash_bytes);
@@ -3711,9 +3734,12 @@ pub async fn start_network(
                                     let name_len = name_bytes.len().min(u16::MAX as usize) as u16;
                                     res_payload.extend_from_slice(&name_len.to_le_bytes());
                                     res_payload.extend_from_slice(&name_bytes[..name_len as usize]);
+                                    actual_count += 1;
                                 }
                             }
                         }
+                        res_payload[count_offset..count_offset + 4]
+                            .copy_from_slice(&actual_count.to_le_bytes());
                         let mut packet = Vec::with_capacity(6 + res_payload.len());
                         packet.push(OP_EMULEPROT);
                         let size = (1 + res_payload.len()) as u32;
@@ -4045,7 +4071,9 @@ pub async fn start_network(
                         );
                         let _ = app_handle.emit("transfer:source-search", serde_json::json!({
                             "transfer_id": &transfer_id,
-                            "kind": if total_kad_sources == 0 { "kad_empty" } else { "kad_found" },
+                            "kind": if total_kad_sources == 0 { "kad_empty" }
+                                    else if direct_sources.is_empty() { "kad_indirect" }
+                                    else { "kad_found" },
                             "count": total_kad_sources,
                         }));
 
@@ -4232,10 +4260,77 @@ pub async fn start_network(
                             } else if sources.is_empty() {
                                 // Only callback/LowID sources — keep pending; callbacks
                                 // will arrive via kad_callback_rx or server poll.
+                                let indirect_count = callback_sources.len() + effective_lowid + type6_count;
                                 info!(
-                                    "Only indirect sources for {transfer_id}: {} callback, {} lowid — waiting for callbacks",
-                                    callback_sources.len(), effective_lowid
+                                    "Only indirect sources for {transfer_id}: {} callback, {} lowid, {} type6 — waiting for callbacks",
+                                    callback_sources.len(), effective_lowid, type6_count
                                 );
+                                {
+                                    let mut mgr = transfer_manager.write().await;
+                                    mgr.update_sources(&transfer_id, indirect_count as u32, 0, 0);
+                                    for cb_src in &callback_sources {
+                                        mgr.update_source_detail(
+                                            &transfer_id,
+                                            crate::types::SourceInfo {
+                                                ip: cb_src.ip.to_string(),
+                                                port: cb_src.tcp_port,
+                                                status: crate::types::SourceStatus::Connecting,
+                                                queue_rank: None,
+                                                speed: 0,
+                                                transferred: 0,
+                                                client_software: "KAD Callback".to_string(),
+                                                peer_name: String::new(),
+                                                available_parts: None,
+                                                total_parts: None,
+                                                country_code: None,
+                                            },
+                                        );
+                                    }
+                                    for dc_src in &direct_callback_sources {
+                                        mgr.update_source_detail(
+                                            &transfer_id,
+                                            crate::types::SourceInfo {
+                                                ip: dc_src.ip.to_string(),
+                                                port: dc_src.tcp_port,
+                                                status: crate::types::SourceStatus::Connecting,
+                                                queue_rank: None,
+                                                speed: 0,
+                                                transferred: 0,
+                                                client_software: "KAD Direct Callback".to_string(),
+                                                peer_name: String::new(),
+                                                available_parts: None,
+                                                total_parts: None,
+                                                country_code: None,
+                                            },
+                                        );
+                                    }
+                                    for ls in &lowid_sources {
+                                        if state.server_connected {
+                                            let ip_str = Ipv4Addr::from(ls.ed2k_server_ip).to_string();
+                                            mgr.update_source_detail(
+                                                &transfer_id,
+                                                crate::types::SourceInfo {
+                                                    ip: ip_str,
+                                                    port: ls.ed2k_server_port,
+                                                    status: crate::types::SourceStatus::Connecting,
+                                                    queue_rank: None,
+                                                    speed: 0,
+                                                    transferred: 0,
+                                                    client_software: "Low ID (Server Relay)".to_string(),
+                                                    peer_name: String::new(),
+                                                    available_parts: None,
+                                                    total_parts: None,
+                                                    country_code: None,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                                let _ = app_handle.emit("transfer-status", serde_json::json!({
+                                    "id": &transfer_id,
+                                    "status": "searching",
+                                    "sources": indirect_count,
+                                }));
                                 state.pending_downloads.insert(transfer_id, pending);
                             } else {
                                 let hash_bytes = match hex::decode(&pending.file_hash) {
@@ -5087,8 +5182,8 @@ pub async fn start_network(
                 }
 
                 // Limit publishes per cycle; use higher limits for the first burst after connect
-                let max_source_per_cycle: usize = if state.first_publish_done && state.publish_confirmed == 0 { 10 } else { 3 };
-                let max_keyword_per_cycle: usize = if state.first_publish_done && state.publish_confirmed == 0 { 5 } else { 2 };
+                let max_source_per_cycle: usize = if !state.first_publish_done || state.publish_confirmed == 0 { 10 } else { 3 };
+                let max_keyword_per_cycle: usize = if !state.first_publish_done || state.publish_confirmed == 0 { 5 } else { 2 };
 
                 let source_files = state.publish_manager.files_needing_source_publish()
                     .into_iter().take(max_source_per_cycle).cloned().collect::<Vec<_>>();
@@ -7128,8 +7223,8 @@ pub async fn start_network(
                         ServerUdpResponse::StatusResponse { addr, challenge, user_count, file_count, obfuscation_port_tcp, udp_flags } => {
                             // eMule: verify challenge to prevent spoofed status responses
                             let expected = server_udp.take_challenge(&addr);
-                            if expected.is_some() && expected != Some(challenge) {
-                                debug!("Ignoring UDP status from {addr}: challenge mismatch");
+                            if expected != Some(challenge) {
+                                debug!("Ignoring UDP status from {addr}: challenge mismatch or unexpected");
                             } else {
                                 let tcp_port = addr.port().saturating_sub(4);
                                 state.server_list.update_server_stats(
@@ -7722,12 +7817,21 @@ pub async fn start_network(
                     }
                     Some(BuddyEvent::ReaskCallback { dest_ip, dest_port, file_hash }) => {
                         let hash_hex = hex::encode(file_hash);
-                        let file_size = state.pending_downloads.values()
+                        let file_size = match state.pending_downloads.values()
                             .find(|pd| pd.file_hash == hash_hex)
                             .map(|pd| pd.file_size)
-                            .unwrap_or(0);
-                        let complete_sources = state.per_file_sources
-                            .get(&hash_hex)
+                        {
+                            Some(fs) => fs,
+                            None => {
+                                let mgr = transfer_manager.read().await;
+                                mgr.active.values().chain(mgr.queue.iter())
+                                    .find(|t| t.file_hash == hash_hex)
+                                    .map(|t| t.total_size)
+                                    .unwrap_or(0)
+                            }
+                        };
+                        let complete_sources = state.per_file_sources.values()
+                            .find(|pfs| pfs.file_hash == file_hash)
                             .map(|pfs| pfs.complete_source_count())
                             .unwrap_or(0);
                         let addr = SocketAddr::new(dest_ip.into(), dest_port);
@@ -9010,9 +9114,7 @@ async fn send_kad_search_results(
                 results: std::mem::take(&mut batch),
             };
             if let Ok(packet) = messages::encode_packet(&msg) {
-                if packet.len() <= MAX_BATCH {
-                    let _ = send_kad_response(socket, &packet, addr, state, None, peer_udp_key).await;
-                }
+                let _ = send_kad_response(socket, &packet, addr, state, None, peer_udp_key).await;
             }
             batch_est_size = HEADER_OVERHEAD;
         }
@@ -10313,7 +10415,7 @@ async fn handle_udp_packet(
                 .into_iter()
                 .filter(|entry| matches_requested_file_size(entry, file_size))
                 .collect::<Vec<_>>();
-            let start = start_position as usize;
+            let start = (start_position & 0x7FFF) as usize;
             let end = results.len().min(start + 200);
             let page = if start < results.len() { results[start..end].to_vec() } else { Vec::new() };
 
@@ -11425,6 +11527,7 @@ async fn handle_command(
             for file in files {
                 if !file.shared { continue; }
                 if let Ok(raw_bytes) = hex::decode(&file.hash) {
+                    if raw_bytes.len() != 16 { continue; }
                     let kad_hash = md4_bytes_to_kad_id(&raw_bytes);
                     let publishable = PublishableFile {
                         file_hash: kad_hash,
@@ -11910,6 +12013,7 @@ async fn handle_command(
                 let addr = SocketAddr::new(addr_ip.into(), port);
                 let msg = KadMessage::BootstrapReq;
                 if let Ok(packet) = messages::encode_packet(&msg) {
+                    state.flood_protection.track_request(addr, 0x01);
                     let _ = socket.send_to(&packet, addr).await;
                     info!("Sent bootstrap request to {addr}");
                 }
@@ -11970,6 +12074,7 @@ async fn handle_command(
                                             let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                                             let msg = KadMessage::BootstrapReq;
                                             if let Ok(packet) = messages::encode_packet(&msg) {
+                                                state.flood_protection.track_request(addr, 0x01);
                                                 let _ = socket.send_to(&packet, addr).await;
                                             }
                                         }
@@ -12920,20 +13025,21 @@ async fn reverify_complete_part_file(
         .join(format!("{transfer_id}.part"));
     let expected = file_hash.to_string();
     let verify_path = part_path.clone();
-    let verified_ok = tokio::task::spawn_blocking(move || {
+    let computed_hash = tokio::task::spawn_blocking(move || {
         ed2k::hash::ed2k_hash_file(&verify_path)
     })
     .await
-    .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))?
-    .map(|h| h == expected)
-    .unwrap_or(false);
+    .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
 
-    if !verified_ok {
+    if computed_hash != expected {
         anyhow::bail!("Re-verification hash mismatch — .part preserved for retry");
     }
 
     let safe_name = crate::security::sanitize_filename(file_name);
-    let final_target = download_dir.join("Downloads").join(&safe_name);
+    let completed_dir = download_dir.join("Downloads");
+    tokio::fs::create_dir_all(&completed_dir).await
+        .map_err(|e| anyhow::anyhow!("Failed to create Downloads dir: {e}"))?;
+    let final_target = completed_dir.join(&safe_name);
     let pp = part_path.clone();
     tokio::task::spawn_blocking(move || {
         ed2k::transfer::move_part_to_final(&pp, &final_target)
@@ -13079,7 +13185,7 @@ async fn handle_download_event(
                     let mut a4af_lock = a4af.write().await;
                     a4af_lock.update_source_state(
                         addr,
-                        queue_rank.unwrap_or(0) as u16,
+                        queue_rank.unwrap_or(0).min(u16::MAX as u32) as u16,
                         status != "queued" || queue_rank.unwrap_or(u32::MAX) < 500,
                         1.0,
                     );
@@ -13276,9 +13382,10 @@ async fn handle_upload_event(
             );
         }
         UploadEventKind::Progress { uploaded, total } => {
+            let capped_uploaded = if total > 0 { uploaded.min(total) } else { uploaded };
             let (speed, upload_time_ms) = {
                 let mut mgr = transfer_manager.write().await;
-                mgr.update_progress(&event.transfer_id, uploaded, 0);
+                mgr.update_progress(&event.transfer_id, capped_uploaded, 0);
                 let t = mgr.active.get_mut(&event.transfer_id);
                 let speed = t.as_ref().map(|t| t.speed).unwrap_or(0);
                 let ut = t.map(|t| {
@@ -13289,7 +13396,7 @@ async fn handle_upload_event(
                 (speed, ut)
             };
             let progress = if total > 0 {
-                (uploaded as f64 / total as f64) * 100.0
+                ((capped_uploaded as f64 / total as f64) * 100.0).min(100.0)
             } else {
                 0.0
             };
@@ -13298,7 +13405,7 @@ async fn handle_upload_event(
                 serde_json::json!({
                     "id": event.transfer_id,
                     "downloaded": 0,
-                    "uploaded": uploaded,
+                    "uploaded": capped_uploaded,
                     "total": total,
                     "progress": progress,
                     "speed": speed,

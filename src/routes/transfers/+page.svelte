@@ -201,6 +201,7 @@
         case 'udp_empty': msg = 'UDP: 0 sources'; break;
         case 'kad_search': msg = 'Searching KAD...'; break;
         case 'kad_found': msg = `KAD: ${d.count} source${d.count !== 1 ? 's' : ''} found`; break;
+        case 'kad_indirect': msg = `KAD: ${d.count} indirect source${d.count !== 1 ? 's' : ''} (callback)`; break;
         case 'kad_empty': msg = 'KAD: 0 sources'; break;
         default: msg = d.kind; break;
       }
