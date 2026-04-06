@@ -50,6 +50,8 @@
   let browseFriendName = $state('');
 
   let isDiscoverable = $state(false);
+  let processingRequests: Set<string> = $state(new Set());
+  let adding = $state(false);
 
   function autoFocus(node: HTMLElement) {
     node.focus();
@@ -110,6 +112,10 @@
     return new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
   }
 
+  function friendPresence(f: FriendInfo): 'online' | 'offline' {
+    return onlineFriends.has(f.user_hash) ? 'online' : 'offline';
+  }
+
   async function loadUnreadCounts() {
     try {
       const counts = await getUnreadMessageCounts();
@@ -124,6 +130,9 @@
   }
 
   async function handleAcceptRequest(req: FriendRequestInfo) {
+    if (processingRequests.has(req.sender_hash)) return;
+    processingRequests.add(req.sender_hash);
+    processingRequests = new Set(processingRequests);
     try {
       await acceptFriendRequest(req.sender_hash);
       flash(`Accepted friend request from ${req.sender_nickname || req.sender_hash.slice(0, 8) + '\u2026'}`);
@@ -131,15 +140,24 @@
       await loadFriends();
     } catch (e: unknown) {
       error = toErr(e);
+    } finally {
+      processingRequests.delete(req.sender_hash);
+      processingRequests = new Set(processingRequests);
     }
   }
 
   async function handleRejectRequest(req: FriendRequestInfo) {
+    if (processingRequests.has(req.sender_hash)) return;
+    processingRequests.add(req.sender_hash);
+    processingRequests = new Set(processingRequests);
     try {
       await rejectFriendRequest(req.sender_hash);
       friendRequests = friendRequests.filter(r => r.sender_hash !== req.sender_hash);
     } catch (e: unknown) {
       error = toErr(e);
+    } finally {
+      processingRequests.delete(req.sender_hash);
+      processingRequests = new Set(processingRequests);
     }
   }
 
@@ -286,6 +304,7 @@
   }
 
   async function handleAdd() {
+    if (adding) return;
     addError = null;
     const hash = newHash.trim();
     const nick = newNickname.trim();
@@ -299,6 +318,7 @@
       addError = 'This user is already in your friend list';
       return;
     }
+    adding = true;
     try {
       await addFriend(hash, nick || undefined);
       flash(`Added friend ${nick || hash.slice(0, 8) + '\u2026'}`);
@@ -308,6 +328,8 @@
       await loadFriends();
     } catch (e: unknown) {
       addError = toErr(e);
+    } finally {
+      adding = false;
     }
   }
 
@@ -323,6 +345,8 @@
     pendingRemove = null;
     try {
       await removeFriend(f.user_hash);
+      onlineFriends.delete(f.user_hash);
+      onlineFriends = new Set(onlineFriends);
       flash(`Removed ${f.nickname || f.user_hash.slice(0, 8) + '\u2026'}`);
       await loadFriends();
     } catch (e: unknown) {
@@ -339,13 +363,12 @@
     if (!editingHash) return;
     const hash = editingHash;
     const nick = editNickname.trim();
+    editingHash = null;
     try {
       await updateFriendNickname(hash, nick);
-      editingHash = null;
       const idx = friends.findIndex((f) => f.user_hash === hash);
       if (idx !== -1) friends[idx] = { ...friends[idx], nickname: nick };
     } catch (e: unknown) {
-      editingHash = null;
       error = toErr(e);
     }
   }
@@ -528,8 +551,8 @@
               <span class="request-hash" title={req.sender_hash}>{req.sender_hash.slice(0, 8)}&hellip;{req.sender_hash.slice(-6)}</span>
             </div>
             <div class="request-actions">
-              <button class="request-accept" onclick={() => handleAcceptRequest(req)}>Accept</button>
-              <button class="request-reject" onclick={() => handleRejectRequest(req)}>Reject</button>
+              <button class="request-accept" onclick={() => handleAcceptRequest(req)} disabled={processingRequests.has(req.sender_hash)}>Accept</button>
+              <button class="request-reject" onclick={() => handleRejectRequest(req)} disabled={processingRequests.has(req.sender_hash)}>Reject</button>
             </div>
           </div>
         {/each}
@@ -590,7 +613,7 @@
           class="nick-input"
           onkeydown={addFormKeydown}
         />
-        <button onclick={handleAdd} disabled={!newHash.trim()}>Add</button>
+        <button onclick={handleAdd} disabled={!newHash.trim() || adding}>{adding ? 'Adding\u2026' : 'Add'}</button>
       </div>
       {#if addError}
         <div class="field-error">{addError}</div>
@@ -635,14 +658,13 @@
     {#snippet friendCard(f: FriendInfo, isOnline: boolean)}
       <div class="friend-card" class:editing={editingHash === f.user_hash} class:online={isOnline} class:has-unread-card={!!unreadCounts.get(f.user_hash)}>
         <div class="card-header-row">
-          <div class="card-avatar" class:avatar-online={isOnline}>
+          {@const presence = friendPresence(f)}
+          <div class="card-avatar" class:avatar-online={presence === 'online'} class:avatar-offline={presence === 'offline'}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="8" r="4"/>
               <path d="M4 21c0-4.418 3.582-8 8-8s8 3.582 8 8"/>
             </svg>
-            {#if isOnline}
-              <span class="online-dot"></span>
-            {/if}
+            <span class="status-dot" class:dot-online={presence === 'online'} class:dot-offline={presence === 'offline'}></span>
           </div>
           <div class="card-identity">
             {#if editingHash === f.user_hash}
@@ -664,7 +686,7 @@
             <span class="card-status-label">
               {#if !f.mutual}
                 <span class="status-searching">Searching&hellip;</span>
-              {:else if isOnline}
+              {:else if presence === 'online'}
                 <span class="status-online">Online</span>
               {:else if f.last_seen}
                 Last seen {formatLastSeen(f.last_seen)}
@@ -1103,6 +1125,7 @@
     font-weight: 600;
   }
 
+
   .nick-btn {
     border: none;
     background: none;
@@ -1291,15 +1314,27 @@
     border: 2px solid var(--success);
   }
 
-  .online-dot {
+  .avatar-offline {
+    border: 2px solid var(--danger);
+    opacity: 0.7;
+  }
+
+  .status-dot {
     position: absolute;
     bottom: -1px;
     right: -1px;
     width: 10px;
     height: 10px;
     border-radius: 50%;
-    background: var(--success);
     border: 2px solid var(--bg-surface);
+  }
+
+  .dot-online {
+    background: var(--success);
+  }
+
+  .dot-offline {
+    background: var(--danger);
   }
 
   .friend-card.online {
@@ -1340,8 +1375,8 @@
   }
 
   .offline-dot-label {
-    background: var(--text-muted);
-    opacity: 0.4;
+    background: var(--danger);
+    opacity: 0.6;
   }
 
   .section-label {

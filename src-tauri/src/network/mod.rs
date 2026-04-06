@@ -1172,6 +1172,9 @@ struct NetworkState {
     friend_search_initial_done: bool,
     /// When the initial friend search burst started (for 30-min auto-retry cutoff)
     friend_search_started_at: Option<std::time::Instant>,
+    /// Backoff tracker for friend reconnection: ember_hash -> last attempt time.
+    /// Prevents tight reconnect loops when sessions fail immediately.
+    friend_reconnect_last: HashMap<[u8; 16], std::time::Instant>,
 }
 
 /// Filter search results by file type, matching eMule's AddToList behavior:
@@ -2093,6 +2096,7 @@ pub async fn start_network(
         outbound_session_tasks: HashMap::new(),
         friend_search_initial_done: false,
         friend_search_started_at: None,
+        friend_reconnect_last: HashMap::new(),
     };
 
     // Load known files for hash cache
@@ -3202,6 +3206,7 @@ pub async fn start_network(
                     let hash_hex = hex::encode(friend_eh);
                     let now = chrono::Utc::now().timestamp();
                     state.online_friends.insert(friend_eh, now);
+                    state.friend_reconnect_last.remove(&friend_eh);
                     let ip_str = match ip { std::net::IpAddr::V4(v4) => v4.to_string(), std::net::IpAddr::V6(v6) => v6.to_string() };
                     let db2 = db.clone();
                     let h2 = hash_hex.clone();
@@ -3296,7 +3301,11 @@ pub async fn start_network(
                         let db2 = db.clone();
                         let h2 = hash_hex.clone();
                         let msg2 = message.clone();
-                        let _ = tokio::task::spawn_blocking(move || db2.insert_chat_message(&h2, "received", &msg2));
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(e) = db2.insert_chat_message(&h2, "received", &msg2) {
+                                tracing::warn!("Failed to persist received chat message: {e}");
+                            }
+                        });
                         let _ = app_handle.emit("ember:chat-message", serde_json::json!({
                             "user_hash": hash_hex,
                             "message": message,
@@ -3704,7 +3713,11 @@ pub async fn start_network(
                         let db2 = db.clone();
                         let h2 = hash_hex.clone();
                         let msg2 = message.clone();
-                        let _ = tokio::task::spawn_blocking(move || db2.insert_chat_message(&h2, "received", &msg2));
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(e) = db2.insert_chat_message(&h2, "received", &msg2) {
+                                tracing::warn!("Failed to persist received chat message: {e}");
+                            }
+                        });
                         let _ = app_handle.emit("ember:chat-message", serde_json::json!({
                             "user_hash": hash_hex,
                             "message": message,
@@ -3774,18 +3787,33 @@ pub async fn start_network(
                     let _ = app_handle.emit("ember:friend-offline", serde_json::json!({
                         "user_hash": hash_hex,
                     }));
+                    let _ = app_handle.emit("ember:browse-error", serde_json::json!({
+                        "user_hash": hash_hex,
+                        "reason": "Friend disconnected",
+                    }));
 
                     if friend_hashes.read().await.contains(&dc_eh)
                         && !state.ember_sessions.read().await.contains_key(&dc_eh)
                     {
-                        info!("Friend {} disconnected, immediate reconnect via rendezvous", hash_hex);
-                        let _ = app_handle.emit("ember:friend-searching", serde_json::json!({
-                            "user_hash": hash_hex,
-                        }));
-                        spawn_rendezvous_friend_lookup(
-                            &settings, &state, ember_hash, dc_eh,
-                            &db, &app_handle, &friend_hashes, &ul_event_tx,
-                        );
+                        let now_inst = std::time::Instant::now();
+                        let can_reconnect = match state.friend_reconnect_last.get(&dc_eh) {
+                            Some(last) => now_inst.saturating_duration_since(*last).as_secs() >= 60,
+                            None => true,
+                        };
+                        if can_reconnect {
+                            state.friend_reconnect_last.insert(dc_eh, now_inst);
+                            state.outbound_session_tasks.insert(dc_eh, now_inst);
+                            info!("Friend {} disconnected, reconnect via rendezvous", hash_hex);
+                            let _ = app_handle.emit("ember:friend-searching", serde_json::json!({
+                                "user_hash": hash_hex,
+                            }));
+                            spawn_rendezvous_friend_lookup(
+                                &settings, &state, ember_hash, dc_eh,
+                                &db, &app_handle, &friend_hashes, &ul_event_tx,
+                            );
+                        } else {
+                            debug!("Friend {} reconnect skipped (backoff cooldown)", hash_hex);
+                        }
                     }
                 }
 
@@ -5126,6 +5154,7 @@ pub async fn start_network(
                         info!("Initial friend search burst: looking up {} offline friend(s) via rendezvous", search_targets.len());
                     }
                     for target_hash in search_targets.iter().take(3) {
+                        state.outbound_session_tasks.insert(*target_hash, std::time::Instant::now());
                         let _ = app_handle.emit("ember:friend-searching", serde_json::json!({
                             "user_hash": hex::encode(target_hash),
                         }));
@@ -5311,6 +5340,7 @@ pub async fn start_network(
                                 elapsed as f64, retry_targets.len());
                         }
                         for target_hash in retry_targets.iter().take(10) {
+                            state.outbound_session_tasks.insert(*target_hash, std::time::Instant::now());
                             let _ = app_handle.emit("ember:friend-searching", serde_json::json!({
                                 "user_hash": hex::encode(target_hash),
                             }));
@@ -12553,7 +12583,11 @@ async fn handle_command(
                         let hash_hex = hex::encode(friend_eh);
                         let db2 = db.clone();
                         let msg2 = message.clone();
-                        let _ = tokio::task::spawn_blocking(move || db2.insert_chat_message(&hash_hex, "sent", &msg2));
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(e) = db2.insert_chat_message(&hash_hex, "sent", &msg2) {
+                                tracing::warn!("Failed to persist sent chat message: {e}");
+                            }
+                        });
                         let _ = app_handle.emit("ember:chat-message", serde_json::json!({
                             "user_hash": hex::encode(friend_eh),
                             "message": message,
@@ -12610,7 +12644,11 @@ async fn handle_command(
                                         if handle.outbound_tx.try_send(packet).is_ok() {
                                             let hash_hex = hex::encode(friend_eh);
                                             let msg_for_db = msg.clone();
-                                            let _ = tokio::task::spawn_blocking(move || db3.insert_chat_message(&hash_hex, "sent", &msg_for_db));
+                                            tokio::task::spawn_blocking(move || {
+                                                if let Err(e) = db3.insert_chat_message(&hash_hex, "sent", &msg_for_db) {
+                                                    tracing::warn!("Failed to persist sent chat message: {e}");
+                                                }
+                                            });
                                             let _ = app2.emit("ember:chat-message", serde_json::json!({
                                                 "user_hash": hex::encode(friend_eh),
                                                 "message": msg,
@@ -12671,7 +12709,11 @@ async fn handle_command(
                                             if handle.outbound_tx.try_send(packet).is_ok() {
                                                 let hash_hex = hex::encode(friend_eh);
                                                 let msg_for_db = msg.clone();
-                                                let _ = tokio::task::spawn_blocking(move || db3.insert_chat_message(&hash_hex, "sent", &msg_for_db));
+                                                tokio::task::spawn_blocking(move || {
+                                                    if let Err(e) = db3.insert_chat_message(&hash_hex, "sent", &msg_for_db) {
+                                                        tracing::warn!("Failed to persist sent chat message: {e}");
+                                                    }
+                                                });
                                                 let _ = app2.emit("ember:chat-message", serde_json::json!({
                                                     "user_hash": hex::encode(friend_eh),
                                                     "message": msg,
@@ -12760,9 +12802,11 @@ async fn handle_command(
                                             packet.extend_from_slice(&size.to_le_bytes());
                                             packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
                                             let _ = handle.outbound_tx.try_send(packet);
+                                            let _ = tx.send(Ok(()));
                                         }
                                         Err(e) => {
                                             info!("Auto-connect for browse to {} failed: {e}", hex::encode(friend_eh));
+                                            let _ = tx.send(Err(format!("Could not connect: {e}")));
                                             let _ = ul_tx2.send(upload_server::UploadEvent {
                                                 transfer_id: String::new(),
                                                 kind: upload_server::UploadEventKind::EmberFriendDisconnected { ember_hash: friend_eh },
@@ -12770,7 +12814,6 @@ async fn handle_command(
                                         }
                                     }
                                 });
-                                let _ = tx.send(Ok(()));
                             } else {
                                 let _ = tx.send(Err("Invalid friend IP address".into()));
                             }
@@ -12910,13 +12953,16 @@ async fn handle_command(
         }
 
         NetworkCommand::FindFriendAndConnect { ember_hash: target_hash } => {
-            let _ = app_handle.emit("ember:friend-searching", serde_json::json!({
-                "user_hash": hex::encode(target_hash),
-            }));
-            spawn_rendezvous_friend_lookup(
-                &settings, &state, ember_hash, target_hash,
-                &db, &app_handle, &friend_hashes, &ul_event_tx,
-            );
+            if !state.outbound_session_tasks.contains_key(&target_hash) {
+                state.outbound_session_tasks.insert(target_hash, std::time::Instant::now());
+                let _ = app_handle.emit("ember:friend-searching", serde_json::json!({
+                    "user_hash": hex::encode(target_hash),
+                }));
+                spawn_rendezvous_friend_lookup(
+                    &settings, &state, ember_hash, target_hash,
+                    &db, &app_handle, &friend_hashes, &ul_event_tx,
+                );
+            }
         }
 
         NetworkCommand::RetryFriendSearch { ember_hash: target_hash, tx } => {
@@ -12928,6 +12974,7 @@ async fn handle_command(
                 return;
             }
 
+            state.outbound_session_tasks.insert(target_hash, std::time::Instant::now());
             let _ = app_handle.emit("ember:friend-searching", serde_json::json!({
                 "user_hash": hash_hex,
             }));

@@ -426,12 +426,6 @@ pub struct AppSettings {
     /// Max time (seconds) to wait in remote upload queue before giving up (eMule-style; default 1800)
     #[serde(default = "default_download_queue_wait_secs")]
     pub download_queue_wait_secs: u64,
-    /// TCP connection attempts per download before failure (default 3)
-    #[serde(default = "default_download_connection_max_retries")]
-    pub download_connection_max_retries: u32,
-    /// Base delay (seconds) between connection retries, scaled by attempt index (default 10)
-    #[serde(default = "default_download_retry_delay_secs")]
-    pub download_retry_delay_secs: u64,
     /// Extra multi-source retry rounds after initial source tasks (default 3)
     #[serde(default = "default_multisource_retry_rounds")]
     pub multisource_retry_rounds: u32,
@@ -528,14 +522,6 @@ fn default_download_queue_wait_secs() -> u64 {
     1800
 }
 
-fn default_download_connection_max_retries() -> u32 {
-    3
-}
-
-fn default_download_retry_delay_secs() -> u64 {
-    10
-}
-
 fn default_multisource_retry_rounds() -> u32 {
     3
 }
@@ -612,8 +598,6 @@ impl Default for AppSettings {
             spam_filter_enabled: true,
             spam_filter_profile: default_spam_filter_profile(),
             download_queue_wait_secs: default_download_queue_wait_secs(),
-            download_connection_max_retries: default_download_connection_max_retries(),
-            download_retry_delay_secs: default_download_retry_delay_secs(),
             multisource_retry_rounds: default_multisource_retry_rounds(),
             download_part_retry_rounds: default_download_part_retry_rounds(),
             max_download_file_size_gib: default_max_download_file_size_gib(),

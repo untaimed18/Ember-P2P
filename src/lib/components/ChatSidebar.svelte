@@ -18,17 +18,23 @@
   let sending = $state(false);
   let sendError: string | null = $state(null);
   let messagesEnd: HTMLDivElement | undefined = $state();
+  let chatInputEl: HTMLInputElement | undefined = $state();
   let unlisten: UnlistenFn | null = null;
   let listenerGen = 0;
   let loadGen = 0;
   let msgIdCounter = 0;
 
   $effect(() => {
+    if (open && chatInputEl) {
+      requestAnimationFrame(() => chatInputEl?.focus());
+    }
+  });
+
+  $effect(() => {
     if (open && friendHash) {
       sendError = null;
       inputText = '';
-      loadMessages();
-      setupListener();
+      loadMessages().then(() => setupListener());
       markAsRead();
     }
     return () => {
@@ -173,6 +179,7 @@
         type="text"
         class="chat-input"
         bind:value={inputText}
+        bind:this={chatInputEl}
         onkeydown={handleKeydown}
         placeholder="Type a message..."
         maxlength="4096"
@@ -256,25 +263,27 @@
   .chat-close {
     width: 28px;
     height: 28px;
-    border: none;
+    border: 1px solid var(--border);
     border-radius: var(--radius-sm);
-    background: var(--bg-hover);
-    color: var(--text-secondary);
+    background: var(--bg-primary);
+    color: var(--text-primary);
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+    transition: background var(--transition-fast), color var(--transition-fast);
   }
 
   .chat-close:hover {
     background: var(--danger);
+    border-color: var(--danger);
     color: #fff;
   }
 
   .chat-close svg {
-    width: 14px;
-    height: 14px;
+    width: 12px;
+    height: 12px;
   }
 
   .chat-messages {

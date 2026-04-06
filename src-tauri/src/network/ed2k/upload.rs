@@ -3109,7 +3109,9 @@ impl UploadHandler {
 
                 (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend => {
                     if let Some(eh) = peer_ember_hash {
-                        if payload.len() <= 4096 {
+                        if !self.friend_hashes.read().await.contains(&eh) {
+                            debug!("Ignoring chat from removed friend {}", hex::encode(eh));
+                        } else if payload.len() <= 4096 {
                             if let Ok(msg) = std::str::from_utf8(&payload) {
                                 let _ = self.upload_event_tx.send(UploadEvent {
                                     transfer_id: String::new(),
@@ -3125,25 +3127,33 @@ impl UploadHandler {
 
                 (OP_EMULEPROT, OP_EMBER_BROWSE_REQ) if is_ember_friend => {
                     if let Some(eh) = peer_ember_hash {
-                        let _ = self.upload_event_tx.send(UploadEvent {
-                            transfer_id: String::new(),
-                            kind: UploadEventKind::EmberBrowseRequest {
-                                ember_hash: eh,
-                            },
-                        }).await;
+                        if !self.friend_hashes.read().await.contains(&eh) {
+                            debug!("Ignoring browse request from removed friend {}", hex::encode(eh));
+                        } else {
+                            let _ = self.upload_event_tx.send(UploadEvent {
+                                transfer_id: String::new(),
+                                kind: UploadEventKind::EmberBrowseRequest {
+                                    ember_hash: eh,
+                                },
+                            }).await;
+                        }
                     }
                 }
 
                 (OP_EMULEPROT, OP_EMBER_BROWSE_RES) if is_ember_friend => {
                     if let Some(eh) = peer_ember_hash {
-                        let entries = super::multi_source::parse_browse_response(&payload);
-                        let _ = self.upload_event_tx.send(UploadEvent {
-                            transfer_id: String::new(),
-                            kind: UploadEventKind::EmberBrowseResponse {
-                                ember_hash: eh,
-                                entries,
-                            },
-                        }).await;
+                        if !self.friend_hashes.read().await.contains(&eh) {
+                            debug!("Ignoring browse response from removed friend {}", hex::encode(eh));
+                        } else {
+                            let entries = super::multi_source::parse_browse_response(&payload);
+                            let _ = self.upload_event_tx.send(UploadEvent {
+                                transfer_id: String::new(),
+                                kind: UploadEventKind::EmberBrowseResponse {
+                                    ember_hash: eh,
+                                    entries,
+                                },
+                            }).await;
+                        }
                     }
                 }
 

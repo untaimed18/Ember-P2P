@@ -41,14 +41,29 @@ pub async fn add_friend(
     let hash = parse_user_hash(&canonical)?;
     let nick = nickname.unwrap_or_default();
 
+    let our_ember_hash = {
+        let data_dir = directories::ProjectDirs::from("com", "ember", "p2p")
+            .map(|d| d.data_dir().to_path_buf())
+            .ok_or_else(|| "Failed to determine data directory".to_string())?;
+        let id = tokio::task::spawn_blocking(move || NodeIdentity::load_or_create(&data_dir))
+            .await.map_err(|e| format!("Task error: {e}"))?.map_err(|e| format!("{e}"))?;
+        hex::encode(id.ember_hash)
+    };
+    if canonical == our_ember_hash {
+        return Err("You cannot add yourself as a friend".into());
+    }
+
     let max_friends = {
         let config = state.config.read().await;
         config.settings.max_friends
     };
-    let current_count = state.friend_hashes.read().await.len() as u32;
-    if current_count >= max_friends {
+
+    let mut friends = state.friend_hashes.write().await;
+    if friends.len() as u32 >= max_friends {
         return Err(format!("Friend limit reached ({max_friends}). Increase the limit in Settings > Friends."));
     }
+    friends.insert(hash);
+    drop(friends);
 
     let db = state.db.clone();
     let db_hash = canonical.clone();
@@ -57,10 +72,6 @@ pub async fn add_friend(
         .await
         .map_err(|e| format!("Task error: {e}"))?
         .map_err(|e| format!("Failed to save friend: {e}"))?;
-
-    let mut friends = state.friend_hashes.write().await;
-    friends.insert(hash);
-    drop(friends);
 
     if state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
         ember_hash: hash,
@@ -250,14 +261,29 @@ pub async fn accept_friend_request(
     let canonical = sender_hash.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
 
+    let our_ember_hash = {
+        let data_dir = directories::ProjectDirs::from("com", "ember", "p2p")
+            .map(|d| d.data_dir().to_path_buf())
+            .ok_or_else(|| "Failed to determine data directory".to_string())?;
+        let id = tokio::task::spawn_blocking(move || NodeIdentity::load_or_create(&data_dir))
+            .await.map_err(|e| format!("Task error: {e}"))?.map_err(|e| format!("{e}"))?;
+        hex::encode(id.ember_hash)
+    };
+    if canonical == our_ember_hash {
+        return Err("You cannot add yourself as a friend".into());
+    }
+
     let max_friends = {
         let config = state.config.read().await;
         config.settings.max_friends
     };
-    let current_count = state.friend_hashes.read().await.len() as u32;
-    if current_count >= max_friends {
+
+    let mut friends = state.friend_hashes.write().await;
+    if friends.len() as u32 >= max_friends {
         return Err(format!("Friend limit reached ({max_friends}). Increase the limit in Settings > Friends."));
     }
+    friends.insert(hash);
+    drop(friends);
 
     let db = state.db.clone();
     let c2 = canonical.clone();
@@ -275,8 +301,6 @@ pub async fn accept_friend_request(
     .await
     .map_err(|e| format!("Task error: {e}"))?
     .map_err(|e| format!("Failed to accept friend request: {e}"))?;
-
-    state.friend_hashes.write().await.insert(hash);
 
     if state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
         ember_hash: hash,

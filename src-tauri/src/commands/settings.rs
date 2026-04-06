@@ -19,8 +19,8 @@ pub async fn get_settings(
 }
 
 fn validate_settings(settings: &AppSettings) -> Result<(), String> {
-    if settings.spam_filter_profile != "balanced" && settings.spam_filter_profile != "aggressive" {
-        return Err("Spam filter profile must be either 'balanced' or 'aggressive'".into());
+    if settings.spam_filter_profile != "relaxed" && settings.spam_filter_profile != "balanced" && settings.spam_filter_profile != "aggressive" {
+        return Err("Spam filter profile must be 'relaxed', 'balanced', or 'aggressive'".into());
     }
     if settings.tcp_port == 0 {
         return Err("TCP port must be between 1 and 65535".into());

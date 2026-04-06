@@ -646,8 +646,11 @@ impl Database {
 
     pub fn remove_friend(&self, user_hash: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
-        conn.execute("DELETE FROM chat_messages WHERE friend_hash = ?1", params![user_hash])?;
-        conn.execute("DELETE FROM friends WHERE user_hash = ?1", params![user_hash])?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM chat_messages WHERE friend_hash = ?1", params![user_hash])?;
+        tx.execute("DELETE FROM friends WHERE user_hash = ?1", params![user_hash])?;
+        tx.execute("DELETE FROM friend_requests WHERE sender_hash = ?1", params![user_hash])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -701,7 +704,7 @@ impl Database {
             "SELECT COALESCE(last_ip, ''), COALESCE(last_port, 0) FROM friends WHERE user_hash = ?1"
         )?;
         let result = stmt.query_row(params![user_hash], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u16))
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?.clamp(0, u16::MAX as i64) as u16))
         });
         match result {
             Ok((ip, port)) if !ip.is_empty() && port > 0 => Ok(Some((ip, port))),
@@ -723,7 +726,7 @@ impl Database {
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)? as u16,
+                    row.get::<_, i64>(4)?.clamp(0, u16::MAX as i64) as u16,
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)? != 0,
                 ))
@@ -767,7 +770,7 @@ impl Database {
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)? as u16,
+                    row.get::<_, i64>(4)?.clamp(0, u16::MAX as i64) as u16,
                 ))
             })?
             .filter_map(|r| r.ok())
@@ -861,7 +864,7 @@ impl Database {
                file_size = excluded.file_size,
                status = excluded.status,
                timestamp = excluded.timestamp",
-            params![file_hash, file_name, file_size as i64, status, now],
+            params![file_hash, file_name, i64::try_from(file_size).unwrap_or(i64::MAX), status, now],
         )?;
         Ok(())
     }

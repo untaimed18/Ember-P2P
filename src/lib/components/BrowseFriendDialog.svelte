@@ -29,12 +29,16 @@
       listenerGen++;
       clearTimeout(browseTimeout);
       if (unlisten) { unlisten(); unlisten = null; }
+      if (unlistenError) { unlistenError(); unlistenError = null; }
     };
   });
+
+  let unlistenError: UnlistenFn | null = null;
 
   async function setupListener() {
     const gen = ++listenerGen;
     if (unlisten) { unlisten(); unlisten = null; }
+    if (unlistenError) { unlistenError(); unlistenError = null; }
     const fn = await listen<{ user_hash: string; files: BrowseFileEntry[] }>('ember:browse-result', (event) => {
       if (event.payload.user_hash === friendHash) {
         clearTimeout(browseTimeout);
@@ -44,12 +48,23 @@
     });
     if (gen !== listenerGen) { fn(); return; }
     unlisten = fn;
+
+    const errFn = await listen<{ user_hash: string; reason: string }>('ember:browse-error', (event) => {
+      if (event.payload.user_hash === friendHash && loading) {
+        clearTimeout(browseTimeout);
+        error = event.payload.reason || 'Browse failed — friend went offline.';
+        loading = false;
+      }
+    });
+    if (gen !== listenerGen) { errFn(); return; }
+    unlistenError = errFn;
   }
 
   async function requestBrowse() {
     loading = true;
     error = null;
     downloadError = null;
+    downloadedHashes = new Set();
     files = [];
     clearTimeout(browseTimeout);
     try {
@@ -74,8 +89,10 @@
   }
 
   let downloadError: string | null = $state(null);
+  let downloadedHashes: Set<string> = $state(new Set());
 
   async function downloadFile(file: BrowseFileEntry) {
+    if (downloadedHashes.has(file.hash)) return;
     downloadError = null;
     try {
       await invoke('start_download_from_search', {
@@ -84,6 +101,8 @@
         fileSize: file.size,
         sources: [],
       });
+      downloadedHashes.add(file.hash);
+      downloadedHashes = new Set(downloadedHashes);
     } catch (e: unknown) {
       downloadError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Download failed';
     }
@@ -96,6 +115,7 @@
   onDestroy(() => {
     clearTimeout(browseTimeout);
     if (unlisten) { unlisten(); unlisten = null; }
+    if (unlistenError) { unlistenError(); unlistenError = null; }
   });
 </script>
 
@@ -142,11 +162,19 @@
                   <td class="col-name" title={file.name}>{file.name}</td>
                   <td class="col-size">{formatSize(file.size)}</td>
                   <td class="col-action">
-                    <button class="dl-btn" onclick={() => downloadFile(file)} title="Download">
-                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
-                      </svg>
-                    </button>
+                    {#if downloadedHashes.has(file.hash)}
+                      <span class="dl-done" title="Queued">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                          <polyline points="3 8 7 12 13 4"/>
+                        </svg>
+                      </span>
+                    {:else}
+                      <button class="dl-btn" onclick={() => downloadFile(file)} title="Download">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
+                        </svg>
+                      </button>
+                    {/if}
                   </td>
                 </tr>
               {/each}
@@ -309,6 +337,20 @@
   }
 
   .dl-btn svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  .dl-done {
+    width: 28px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--success);
+  }
+
+  .dl-done svg {
     width: 14px;
     height: 14px;
   }

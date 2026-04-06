@@ -67,12 +67,7 @@ pub async fn connect_and_send_friend_request(
         .map_err(|e| {
             tracing::warn!("Failed to parse HelloAnswer from {addr}: {e}");
             e
-        })
-        .unwrap_or_else(|_| {
-            let mut h = [0u8; 16];
-            if data.len() >= 16 { h.copy_from_slice(&data[..16]); }
-            (h, PeerCapabilities::default())
-        });
+        })?;
 
     let emule_payload = build_emule_info(udp_port, false, Some(our_ember_hash));
     write_packet(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
@@ -204,12 +199,7 @@ pub async fn open_and_run_friend_session(
         .map_err(|e| {
             tracing::warn!("Failed to parse HelloAnswer from {addr}: {e}");
             e
-        })
-        .unwrap_or_else(|_| {
-            let mut h = [0u8; 16];
-            if data.len() >= 16 { h.copy_from_slice(&data[..16]); }
-            (h, PeerCapabilities::default())
-        });
+        })?;
 
     let emule_payload = build_emule_info(udp_port, false, Some(&our_ember_hash));
     write_packet(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
@@ -254,6 +244,7 @@ pub async fn open_and_run_friend_session(
 
     let session_ember_sessions = ember_sessions.clone();
     let session_ul_event_tx = ul_event_tx.clone();
+    let session_friend_hashes = friend_hashes.clone();
     tokio::spawn(async move {
         const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(90);
         let mut last_activity = tokio::time::Instant::now();
@@ -334,6 +325,10 @@ pub async fn open_and_run_friend_session(
                     }
                 }
                 _ = keepalive => {
+                    if !session_friend_hashes.read().await.contains(&peer_ember_hash) {
+                        info!("Friend {} removed, terminating outbound session", hex::encode(peer_ember_hash));
+                        break;
+                    }
                     if write_packet(&mut writer, OP_EMULEPROT, OP_EMBER_KEEPALIVE, &[]).await.is_err() {
                         debug!("Friend session keepalive to {addr} failed");
                         break;
