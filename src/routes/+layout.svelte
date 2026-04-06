@@ -9,6 +9,7 @@
   import { initNetworkStore, cleanupNetworkStore, startStatsPoll } from '$lib/stores/network';
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
+  import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { getSettings } from '$lib/api/settings';
   import type { AppSettings } from '$lib/types';
@@ -26,6 +27,14 @@
     showWizard = false;
     wizardSettings = null;
   }
+
+  // Register all event listeners immediately — don't wait for onMount/render.
+  const storeInitPromise = Promise.all([
+    initNetworkStore(),
+    initTransferStore(),
+    initSearchStore(),
+    initFriendsStore(),
+  ]);
 
   onMount(() => {
     initTheme();
@@ -54,7 +63,7 @@
       revealTimer = window.setTimeout(revealApp, waitMs);
     };
 
-    Promise.all([initNetworkStore(), initTransferStore(), initSearchStore()])
+    storeInitPromise
       .then(async () => {
         if (mounted) {
           stopPoll = startStatsPoll();
@@ -86,12 +95,14 @@
           cleanupNetworkStore();
           cleanupTransferStore();
           cleanupSearchStore();
+          cleanupFriendsStore();
         }
       })
       .catch((e) => {
         cleanupNetworkStore();
         cleanupTransferStore();
         cleanupSearchStore();
+        cleanupFriendsStore();
         initError = e instanceof Error ? e.message : 'Failed to initialize. Please restart the app.';
         initialized = true;
         releaseSplashWhenReady();
@@ -107,6 +118,7 @@
       cleanupNetworkStore();
       cleanupTransferStore();
       cleanupSearchStore();
+      cleanupFriendsStore();
     };
   });
 </script>
