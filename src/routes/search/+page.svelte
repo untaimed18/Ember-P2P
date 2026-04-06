@@ -9,6 +9,7 @@
     activeSearchTabId,
     closeSearchTab,
     mergeSearchResults,
+    newSearchNonce,
     openSearchTab,
     patchSearchTabByRequestId,
     searchTabs,
@@ -279,6 +280,7 @@
   let spamThreshold = $derived(spamProfile === 'aggressive' ? 45 : 60);
 
   let serverHintDismissedTabs = $state(new Set<string>());
+  let serverRetryPending = $state(false);
 
   function hasServerOrigin(r: SearchResult): boolean {
     return (r.result_origin || '').includes('Server');
@@ -302,6 +304,44 @@
     }
     return null;
   });
+
+  let serverRetryAllowed = $derived(
+    !!serverNoResultsHint && $serverStatus === 'connected' && !serverRetryPending
+  );
+
+  async function retryServerSearch() {
+    if (!activeTab || serverRetryPending || $serverStatus !== 'connected') return;
+    const tabQuery = activeTab.query;
+    const tabRequestId = activeTab.requestId;
+    if (!tabQuery.trim()) return;
+    serverRetryPending = true;
+    try {
+      const parsedMinSize = filterMinSize !== '' ? parseFloat(filterMinSize) * filterMinUnit : undefined;
+      const parsedMaxSize = filterMaxSize !== '' ? parseFloat(filterMaxSize) * filterMaxUnit : undefined;
+      const parsedMinAvail = filterMinSources !== '' ? parseInt(filterMinSources, 10) : undefined;
+      const retryRequestId = newSearchNonce();
+      const results = await searchFiles(tabQuery, 'server', retryRequestId, searchFileType || undefined, {
+        fileExtension: filterExtension.trim() || undefined,
+        minSize: parsedMinSize !== undefined && !isNaN(parsedMinSize) ? parsedMinSize : undefined,
+        maxSize: parsedMaxSize !== undefined && !isNaN(parsedMaxSize) ? parsedMaxSize : undefined,
+        minAvailability: parsedMinAvail !== undefined && !isNaN(parsedMinAvail) ? parsedMinAvail : undefined,
+      });
+      if (results && results.length > 0) {
+        patchSearchTabByRequestId(tabRequestId, (tab) => ({
+          ...tab,
+          results: mergeSearchResults(tab.results, results),
+        }));
+        addToast('success', `Server returned ${results.length} result${results.length !== 1 ? 's' : ''}`);
+      } else {
+        addToast('info', 'Server returned no results on retry');
+      }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Retry failed';
+      addToast('error', msg);
+    } finally {
+      serverRetryPending = false;
+    }
+  }
 
   const DL_STATUS_PRIORITY: Record<string, number> = {
     active: 6, verifying: 5, completing: 5, hashing: 5,
@@ -1195,7 +1235,14 @@
   {#if serverNoResultsHint}
     <div class="server-hint-banner" role="status">
       <span>{serverNoResultsHint}</span>
-      <button class="ghost" onclick={() => { if (activeTab?.id) { const next = new Set(serverHintDismissedTabs); next.add(activeTab.id); serverHintDismissedTabs = next; } }}>Dismiss</button>
+      <div class="server-hint-actions">
+        {#if serverRetryAllowed}
+          <button class="server-retry-btn" onclick={retryServerSearch}>Retry Server</button>
+        {:else if serverRetryPending}
+          <button class="server-retry-btn" disabled>Retrying...</button>
+        {/if}
+        <button class="ghost" onclick={() => { if (activeTab?.id) { const next = new Set(serverHintDismissedTabs); next.add(activeTab.id); serverHintDismissedTabs = next; } }}>Dismiss</button>
+      </div>
     </div>
   {/if}
   {#if $searchTabs.length === 0}
@@ -2175,6 +2222,35 @@
     color: var(--text-secondary, #aaa);
     font-size: 12px;
     line-height: 1.4;
+  }
+
+  .server-hint-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .server-retry-btn {
+    padding: 3px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    border: 1px solid var(--warning, #f39c12);
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--warning, #f39c12) 15%, transparent);
+    color: var(--warning, #f39c12);
+    cursor: pointer;
+    transition: background 0.15s, opacity 0.15s;
+    white-space: nowrap;
+  }
+
+  .server-retry-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--warning, #f39c12) 25%, transparent);
+  }
+
+  .server-retry-btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
   }
 
   .file-details-panel {
