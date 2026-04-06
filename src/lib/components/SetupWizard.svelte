@@ -2,7 +2,7 @@
   import { open } from '@tauri-apps/plugin-dialog';
   import { invoke } from '@tauri-apps/api/core';
   import { relaunch } from '@tauri-apps/plugin-process';
-  import { onDestroy } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { theme, applyTheme, type Theme } from '$lib/stores/theme';
   import type { AppSettings } from '$lib/types';
   import ToggleSwitch from './ToggleSwitch.svelte';
@@ -21,14 +21,15 @@
   let step = $state(1);
   let transitioning = $state(false);
 
-  let nickname = $state(settings.nickname);
-  let downloadFolder = $state(settings.download_folder);
-  let tcpPort = $state(settings.tcp_port);
-  let udpPort = $state(settings.udp_port);
-  let upnpEnabled = $state(settings.upnp_enabled);
-  let maxUploadSpeed = $state(settings.max_upload_speed);
-  let maxDownloadSpeed = $state(settings.max_download_speed);
-  let autoConnectKad = $state(settings.auto_connect_kad);
+  const _init = untrack(() => ({ ...settings }));
+  let nickname = $state(_init.nickname);
+  let downloadFolder = $state(_init.download_folder);
+  let tcpPort = $state(_init.tcp_port);
+  let udpPort = $state(_init.udp_port);
+  let upnpEnabled = $state(_init.upnp_enabled);
+  let maxUploadSpeed = $state(_init.max_upload_speed);
+  let maxDownloadSpeed = $state(_init.max_download_speed);
+  let autoConnectKad = $state(_init.auto_connect_kad);
   let selectedTheme: Theme = $state(
     (typeof localStorage !== 'undefined' && localStorage.getItem('ember-theme') as Theme) || 'dark'
   );
