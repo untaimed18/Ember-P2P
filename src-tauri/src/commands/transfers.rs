@@ -830,7 +830,10 @@ pub async fn pause_all_transfers(
 ) -> Result<(), String> {
     let (statuses, pause_ids) = {
         let mut manager = state.transfer_manager.write().await;
-        let active_ids: Vec<String> = manager.active.keys().cloned().collect();
+        let active_ids: Vec<String> = manager.active.iter()
+            .filter(|(_, t)| t.direction == TransferDirection::Download)
+            .map(|(id, _)| id.clone())
+            .collect();
         for id in &active_ids {
             if let Some(control) = manager.get_control(id) {
                 control.pause();
@@ -840,7 +843,7 @@ pub async fn pause_all_transfers(
         let queued_ids: Vec<String> = manager
             .queue
             .iter()
-            .filter(|t| t.status != TransferStatus::Paused && t.status != TransferStatus::Stopped)
+            .filter(|t| t.direction == TransferDirection::Download && t.status != TransferStatus::Paused && t.status != TransferStatus::Stopped)
             .map(|t| t.id.clone())
             .collect();
         for id in &queued_ids {
