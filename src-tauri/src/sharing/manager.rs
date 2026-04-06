@@ -467,6 +467,9 @@ impl TransferManager {
             if source.total_parts.is_some() {
                 existing.total_parts = source.total_parts;
             }
+            if source.source_origin.is_some() {
+                existing.source_origin = source.source_origin;
+            }
         } else {
             const MAX_SOURCES_PER_TRANSFER: usize = 500;
             if sources.len() >= MAX_SOURCES_PER_TRANSFER {

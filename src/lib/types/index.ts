@@ -103,6 +103,7 @@ export interface SourceInfo {
   available_parts?: number;
   total_parts?: number;
   country_code?: string;
+  source_origin?: string;
 }
 
 export interface SearchResult {
