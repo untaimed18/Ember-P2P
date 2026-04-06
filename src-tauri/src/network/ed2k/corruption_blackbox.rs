@@ -110,7 +110,7 @@ impl CorruptionBlackBox {
     ) -> Vec<Ipv4Addr> {
         if let Some(blocks) = self.records.get_mut(file_hash) {
             for block in blocks.iter_mut() {
-                if block.start < part_end && block.end > part_start {
+                if !block.verified && block.start < part_end && block.end > part_start {
                     block.corrupt = true;
                 }
             }

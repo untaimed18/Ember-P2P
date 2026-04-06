@@ -43,7 +43,7 @@ impl std::fmt::Debug for IpFilterSnapshot {
 
 impl IpFilterSnapshot {
     pub fn is_blocked(&self, ip: Ipv4Addr) -> bool {
-        if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
+        if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
             self.hit_counter.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -151,7 +151,7 @@ impl IpFilter {
                 let mut count = 0;
                 for line in content.lines() {
                     let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
+                    if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
                         continue;
                     }
                     if let Some(range) = parse_ipfilter_line(line) {
@@ -165,7 +165,7 @@ impl IpFilter {
 
                 self.blocked_ranges.sort_by_key(|r| r.start);
                 self.merge_overlapping();
-                info!("Loaded {count} IP filter ranges from {}", path.display());
+                info!("Loaded {count} IP filter entries ({} ranges after merge) from {}", self.blocked_ranges.len(), path.display());
                 count
             }
         };
@@ -202,7 +202,7 @@ impl IpFilter {
     }
 
     pub fn is_blocked(&mut self, ip: Ipv4Addr) -> bool {
-        if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
+        if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
             self.total_special_hits.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -232,7 +232,7 @@ impl IpFilter {
     /// Check if an IP is blocked without requiring &mut self.
     /// Increments the atomic total hit counter but not per-range counters.
     pub fn is_blocked_readonly(&self, ip: Ipv4Addr) -> bool {
-        if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() {
+        if ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || ip.is_loopback() {
             self.total_special_hits.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -382,7 +382,7 @@ impl IpFilter {
         let mut count = 0;
         for line in content.lines() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
                 continue;
             }
             if let Some(range) = parse_p2p_line(line) {
@@ -393,7 +393,7 @@ impl IpFilter {
 
         self.blocked_ranges.sort_by_key(|r| r.start);
         self.merge_overlapping();
-        info!("Loaded {count} ranges from .p2p file {}", path.display());
+        info!("Loaded {count} entries ({} ranges after merge) from .p2p file {}", self.blocked_ranges.len(), path.display());
         count
     }
 
@@ -457,7 +457,7 @@ impl IpFilter {
 
         self.blocked_ranges.sort_by_key(|r| r.start);
         self.merge_overlapping();
-        info!("Loaded {count} ranges from .p2b file {}", path.display());
+        info!("Loaded {count} entries ({} ranges after merge) from .p2b file {}", self.blocked_ranges.len(), path.display());
         count
     }
 
