@@ -1666,7 +1666,7 @@ impl Ed2kDownload {
         let mut speed_measure_start = std::time::Instant::now();
         let mut speed_measure_bytes: u64 = 0;
         let mut last_periodic_save = std::time::Instant::now();
-        const PERIODIC_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+        const PERIODIC_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
         let mut last_epx_resend = std::time::Instant::now();
         let mut last_epx_generation = self.ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed);
         const EPX_RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);

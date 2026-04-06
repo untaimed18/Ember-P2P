@@ -35,7 +35,7 @@ use self::ed2k::server_list::{ServerEntry, ServerList};
 use self::ed2k::server_udp::{ServerUdpSocket, ServerUdpResponse};
 use self::ed2k::sources::SourceManager;
 use self::ed2k::upload::{self as upload_server, UploadEvent, UploadEventKind};
-use self::ed2k::multi_source::{DownloadSource, MultiSourceDownload};
+use self::ed2k::multi_source::{DownloadSource, MultiSourceDownload, SharedTrackerRegistry};
 use self::ed2k::transfer::{classify_error, DownloadEvent, Ed2kDownload, SourceFailureKind};
 use self::kad::bootstrap;
 use self::kad::buddy::{BuddyManager, BuddyState, BuddyEvent, BuddyWriteStream, PendingBuddySet};
@@ -1175,6 +1175,9 @@ struct NetworkState {
     /// Backoff tracker for friend reconnection: ember_hash -> last attempt time.
     /// Prevents tight reconnect loops when sessions fail immediately.
     friend_reconnect_last: HashMap<[u8; 16], std::time::Instant>,
+    /// Shared registry of active download trackers — the shutdown path iterates
+    /// this to persist `.part.met` files when download tasks are aborted.
+    tracker_registry: SharedTrackerRegistry,
 }
 
 /// Filter search results by file type, matching eMule's AddToList behavior:
@@ -1596,6 +1599,7 @@ async fn try_start_pending_download_from_known_sources(
         external_ip: state.external_ip,
         aich_pending: Some(state.aich_recovery_pending.clone()),
         geoip: geoip.clone(),
+        tracker_registry: Some(state.tracker_registry.clone()),
     };
     let dl_tid = ms_download.transfer_id.clone();
     let dl_tid2 = dl_tid.clone();
@@ -2097,6 +2101,7 @@ pub async fn start_network(
         friend_search_initial_done: false,
         friend_search_started_at: None,
         friend_reconnect_last: HashMap::new(),
+        tracker_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
 
     // Load known files for hash cache
@@ -4513,6 +4518,7 @@ pub async fn start_network(
                                         external_ip: state.external_ip,
                                         aich_pending: Some(state.aich_recovery_pending.clone()),
                                         geoip: geoip.clone(),
+                                        tracker_registry: Some(state.tracker_registry.clone()),
                                     };
                                     let tid = ms_download.transfer_id.clone();
                                     let tid2 = tid.clone();
@@ -5989,6 +5995,7 @@ pub async fn start_network(
                             external_ip: state.external_ip,
                             aich_pending: Some(state.aich_recovery_pending.clone()),
                             geoip: geoip.clone(),
+                            tracker_registry: Some(state.tracker_registry.clone()),
                         };
                         let tx = dl_event_tx.clone();
                         let dl_tid = ms_download.transfer_id.clone();
@@ -6148,6 +6155,7 @@ pub async fn start_network(
                             external_ip: state.external_ip,
                             aich_pending: Some(state.aich_recovery_pending.clone()),
                             geoip: geoip.clone(),
+                            tracker_registry: Some(state.tracker_registry.clone()),
                         };
                         let dl_tid = ms_download.transfer_id.clone();
                         let dl_tid2 = dl_tid.clone();
@@ -7822,6 +7830,7 @@ pub async fn start_network(
                                     external_ip: state.external_ip,
                                     aich_pending: Some(state.aich_recovery_pending.clone()),
                                     geoip: geoip.clone(),
+                                    tracker_registry: Some(state.tracker_registry.clone()),
                                 };
                                 let dl_tid = ms_download.transfer_id.clone();
                                 state.active_source_senders.insert(dl_tid.clone(), src_inject_tx);
@@ -8951,6 +8960,22 @@ pub async fn start_network(
             Ok(Ok(())) => debug!("Download task {tid} shut down cleanly"),
             Ok(Err(_)) => debug!("Download task {tid} cancelled"),
             Err(_) => warn!("Download task {tid} did not finish within timeout"),
+        }
+    }
+
+    // Persist .part.met for any downloads that were in progress when aborted.
+    if let Ok(reg) = state.tracker_registry.lock() {
+        let count = reg.len();
+        if count > 0 {
+            for (tid, tracker) in reg.iter() {
+                if let Ok(t) = tracker.try_read() {
+                    t.save();
+                    debug!("Saved .part.met for aborted download {tid}");
+                } else {
+                    warn!("Could not lock tracker for {tid} to save .part.met on shutdown");
+                }
+            }
+            info!("Saved {count} download tracker(s) on shutdown");
         }
     }
     state.active_source_senders.clear();
@@ -11239,6 +11264,11 @@ async fn handle_command(
             state.active_kad_search_state.remove(&transfer_id);
             state.per_file_sources.remove(&transfer_id);
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
+                if let Ok(reg) = state.tracker_registry.lock() {
+                    if let Some(tracker) = reg.get(&transfer_id) {
+                        if let Ok(t) = tracker.try_read() { t.save(); }
+                    }
+                }
                 handle.abort();
             }
 
@@ -11276,6 +11306,11 @@ async fn handle_command(
             // eMule PauseFile: tear down active network state but keep source
             // knowledge so the download can be resumed quickly.
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
+                if let Ok(reg) = state.tracker_registry.lock() {
+                    if let Some(tracker) = reg.get(&transfer_id) {
+                        if let Ok(t) = tracker.try_read() { t.save(); }
+                    }
+                }
                 handle.abort();
             }
             state.active_source_senders.remove(&transfer_id);
@@ -11391,6 +11426,7 @@ async fn handle_command(
                     external_ip: state.external_ip,
                     aich_pending: Some(state.aich_recovery_pending.clone()),
                     geoip: geoip.clone(),
+                    tracker_registry: Some(state.tracker_registry.clone()),
                 };
 
                 let tx = dl_event_tx.clone();
@@ -11942,10 +11978,25 @@ async fn handle_command(
             // to peers and will keep transferring data even though the network
             // is logically disconnected.  Re-queue each as a pending download
             // so they resume automatically when the user reconnects.
+            // Save .part.met for in-progress downloads before aborting tasks.
+            if let Ok(reg) = state.tracker_registry.lock() {
+                for (tid, tracker) in reg.iter() {
+                    if let Ok(t) = tracker.try_read() {
+                        t.save();
+                        debug!("Saved .part.met for {tid} before disconnect abort");
+                    }
+                }
+            }
+
             for (tid, handle) in state.download_handles.drain() {
                 handle.abort();
                 let _ = handle.await;
                 debug!("Aborted download task {tid} on KAD disconnect");
+            }
+
+            // Clear the registry — tasks are gone, trackers are saved.
+            if let Ok(mut reg) = state.tracker_registry.lock() {
+                reg.clear();
             }
             state.active_source_senders.clear();
             state.active_source_overflow.clear();
