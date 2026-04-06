@@ -4319,7 +4319,7 @@ pub async fn start_network(
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
-                                                country_code: None,
+                                                country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(cb_src.ip)),
                                                 source_origin: Some("kad".into()),
                                             },
                                         );
@@ -4338,7 +4338,7 @@ pub async fn start_network(
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
-                                                country_code: None,
+                                                country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(dc_src.ip)),
                                                 source_origin: Some("kad".into()),
                                             },
                                         );
@@ -4359,7 +4359,7 @@ pub async fn start_network(
                                                     peer_name: String::new(),
                                                     available_parts: None,
                                                     total_parts: None,
-                                                    country_code: None,
+                                                    country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(ls.ip)),
                                                     source_origin: Some("kad".into()),
                                                 },
                                             );
@@ -4396,6 +4396,8 @@ pub async fn start_network(
                                     mgr.update_status(&transfer_id, TransferStatus::Active);
                                     mgr.update_sources(&transfer_id, source_count, 0, 0);
                                     for (ip_s, port) in &sources {
+                                        let cc = ip_s.parse::<std::net::IpAddr>().ok()
+                                            .and_then(|ip| crate::geoip::lookup_country(&geoip, ip));
                                         mgr.update_source_detail(
                                             &transfer_id,
                                             crate::types::SourceInfo {
@@ -4409,7 +4411,7 @@ pub async fn start_network(
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
-                                                country_code: None,
+                                                country_code: cc,
                                                 source_origin: Some("kad".into()),
                                             },
                                         );
@@ -5929,6 +5931,8 @@ pub async fn start_network(
                             mgr.update_status(tid, TransferStatus::Active);
                             mgr.update_sources(tid, source_count, 0, 0);
                             for (ip_s, port) in &ready_sources {
+                                let cc = ip_s.parse::<std::net::IpAddr>().ok()
+                                    .and_then(|ip| crate::geoip::lookup_country(&geoip, ip));
                                 mgr.update_source_detail(
                                     tid,
                                     crate::types::SourceInfo {
@@ -5942,7 +5946,7 @@ pub async fn start_network(
                                         peer_name: String::new(),
                                         available_parts: None,
                                         total_parts: None,
-                                        country_code: None,
+                                        country_code: cc,
                                         source_origin: None,
                                     },
                                 );
@@ -6062,6 +6066,8 @@ pub async fn start_network(
                             mgr.update_status(tid, TransferStatus::Active);
                             mgr.update_sources(tid, source_count, 0, 0);
                             for (ip_s, port) in &live_sources {
+                                let cc = ip_s.parse::<std::net::IpAddr>().ok()
+                                    .and_then(|ip| crate::geoip::lookup_country(&geoip, ip));
                                 mgr.update_source_detail(
                                     tid,
                                     crate::types::SourceInfo {
@@ -6075,7 +6081,7 @@ pub async fn start_network(
                                         peer_name: String::new(),
                                         available_parts: None,
                                         total_parts: None,
-                                        country_code: None,
+                                        country_code: cc,
                                         source_origin: None,
                                     },
                                 );
@@ -6935,6 +6941,8 @@ pub async fn start_network(
                                             let mut mgr = transfer_manager.write().await;
                                             for tid in &matching_transfer_ids {
                                                 for (ip_s, port) in &server_source_ips {
+                                                    let cc = ip_s.parse::<std::net::IpAddr>().ok()
+                                                        .and_then(|ip| crate::geoip::lookup_country(&geoip, ip));
                                                     mgr.update_source_detail(
                                                         tid,
                                                         crate::types::SourceInfo {
@@ -6948,7 +6956,7 @@ pub async fn start_network(
                                                             peer_name: String::new(),
                                                             available_parts: None,
                                                             total_parts: None,
-                                                            country_code: None,
+                                                            country_code: cc,
                                                             source_origin: Some("ed2k".into()),
                                                         },
                                                     );
