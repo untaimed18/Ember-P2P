@@ -11,6 +11,8 @@
   } from '$lib/api/transfers';
   import { findSources, parseEd2kLink, formatEd2kLink } from '$lib/api/search';
   import { previewFile } from '$lib/api/preview';
+  import { addFriend } from '$lib/api/friends';
+  import { banPeer } from '$lib/api/kad';
   import { formatSize, formatSpeed, formatDate, formatDuration, formatRemaining } from '$lib/utils';
   import { onMount, onDestroy } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
@@ -731,6 +733,18 @@
           break;
         }
         case 'set_category': if (extra !== undefined) await setTransferCategory(t.id, extra === 'None' ? '' : extra); break;
+        case 'add_friend': {
+          if (!t.user_hash) { transferError = 'No user hash available for this peer'; break; }
+          await addFriend(t.user_hash, t.peer_name || undefined);
+          showInfo(`Added ${t.peer_name || t.user_hash.slice(0, 8) + '\u2026'} as friend`);
+          break;
+        }
+        case 'ban_user': {
+          if (!t.user_hash) { transferError = 'No user hash available for this peer'; break; }
+          await banPeer(t.user_hash);
+          showInfo(`Banned ${t.peer_name || t.user_hash.slice(0, 8) + '\u2026'}`);
+          break;
+        }
       }
     } catch (e: unknown) { transferError = toErrorMsg(e); }
   }
@@ -2087,8 +2101,16 @@
       <button class="ctx-item danger" onclick={() => ctxAction('remove')}>Remove from List</button>
       <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>Clear Completed</button>
     {:else}
-      <!-- Upload context menu (eMule style) -->
+      <!-- Upload context menu -->
+      {#if ctxTransfer.user_hash && ctxTransfer.client_software?.startsWith('Ember')}
+        <button class="ctx-item" onclick={() => ctxAction('add_friend')}>Add as Friend</button>
+        <div class="ctx-sep"></div>
+      {/if}
       <button class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy eD2K Link</button>
+      {#if ctxTransfer.user_hash}
+        <div class="ctx-sep"></div>
+        <button class="ctx-item danger" onclick={() => ctxAction('ban_user')}>Ban User</button>
+      {/if}
     {/if}
   </div>
 {/if}

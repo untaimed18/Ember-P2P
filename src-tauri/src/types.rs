@@ -147,6 +147,9 @@ pub struct Transfer {
     /// ISO country code of the peer (uploads only, e.g. "DE")
     #[serde(default)]
     pub country_code: Option<String>,
+    /// ED2K user hash of the peer (uploads only, 32 hex chars)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_hash: Option<String>,
 }
 
 fn default_priority() -> String {

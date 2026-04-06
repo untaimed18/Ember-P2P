@@ -181,6 +181,7 @@ pub async fn download_collection_files(
             ember_sources: 0,
             client_software: String::new(),
             country_code: None,
+            user_hash: None,
         };
 
         let (active_now, persisted_transfer) = {

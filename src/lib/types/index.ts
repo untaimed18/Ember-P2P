@@ -89,6 +89,7 @@ export interface Transfer {
   ember_sources: number;
   client_software?: string;
   country_code?: string;
+  user_hash?: string;
 }
 
 export interface SourceInfo {

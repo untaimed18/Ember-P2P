@@ -72,6 +72,10 @@ impl Drop for UploadSlotGuard {
 /// Shared set of banned peer IPs (updated by network task on Ban/Unban commands)
 pub type SharedBannedIps = Arc<std::sync::RwLock<std::collections::HashSet<std::net::Ipv4Addr>>>;
 
+/// Shared set of banned user hashes for upload-only enforcement.
+/// Checked after Hello handshake reveals the peer's identity.
+pub type SharedBannedHashes = Arc<std::sync::RwLock<std::collections::HashSet<[u8; 16]>>>;
+
 /// Shared buddy info for including in Hello tags (updated by network task)
 pub type SharedBuddyInfo = Arc<RwLock<Option<BuddyInfo>>>;
 
@@ -232,6 +236,7 @@ pub enum UploadEventKind {
         peer_name: String,
         client_software: String,
         country_code: Option<String>,
+        user_hash: Option<String>,
     },
     Progress {
         uploaded: u64,
@@ -331,6 +336,8 @@ struct UploadHandler {
     shared_ip_filter: SharedIpFilter,
     /// Shared banned IPs set for rejecting banned peers on TCP
     banned_ips: SharedBannedIps,
+    /// Shared banned user hashes for upload-only enforcement after Hello
+    banned_hashes: SharedBannedHashes,
     /// eMule: dontcompressavi — skip compression for video files
     skip_compress_video: bool,
     /// Apply IP filter to incoming TCP connections (when false, only outbound is filtered)
@@ -654,6 +661,7 @@ pub async fn start_upload_server(
     shared_buddy_info: SharedBuddyInfo,
     shared_ip_filter: SharedIpFilter,
     banned_ips: SharedBannedIps,
+    banned_hashes: SharedBannedHashes,
     skip_compress_video: bool,
     filter_incoming_connections: bool,
     firewall_probe_ips: FirewallProbeSet,
@@ -715,6 +723,7 @@ pub async fn start_upload_server(
         shared_server_addr,
         shared_ip_filter,
         banned_ips,
+        banned_hashes,
         skip_compress_video,
         filter_incoming_connections,
         firewall_probe_ips,
@@ -1350,6 +1359,15 @@ impl UploadHandler {
         let mut ul_client_software = client_software_from_caps(&hello_caps);
         let ul_country_code = crate::geoip::lookup_country(&self.geoip, peer_addr.ip());
 
+        if peer_user_hash != [0u8; 16] {
+            if let Ok(set) = self.banned_hashes.read() {
+                if set.contains(&peer_user_hash) {
+                    info!("Rejecting upload session from banned user {} ({})", hex::encode(peer_user_hash), peer_addr);
+                    return Ok(());
+                }
+            }
+        }
+
         // Check if this is an incoming buddy connection
         {
             let mut pending = self.pending_buddy_hashes.lock().await;
@@ -1719,6 +1737,7 @@ impl UploadHandler {
                                                         peer_name: ul_peer_name.clone(),
                                                         client_software: ul_client_software.clone(),
                                                         country_code: ul_country_code.clone(),
+                                                        user_hash: if peer_user_hash != [0u8; 16] { Some(hex::encode(peer_user_hash)) } else { None },
                                                     },
                                                 })
                                                 .await;
@@ -2228,6 +2247,7 @@ impl UploadHandler {
                                 peer_name: ul_peer_name.clone(),
                                 client_software: ul_client_software.clone(),
                                 country_code: ul_country_code.clone(),
+                                user_hash: if peer_user_hash != [0u8; 16] { Some(hex::encode(peer_user_hash)) } else { None },
                             },
                         }).await;
                     }

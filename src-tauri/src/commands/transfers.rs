@@ -227,6 +227,7 @@ pub async fn start_download(
         ember_sources: 0,
         client_software: String::new(),
         country_code: None,
+        user_hash: None,
     };
 
     let active_now = {
