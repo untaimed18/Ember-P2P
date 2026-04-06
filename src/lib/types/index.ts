@@ -218,10 +218,6 @@ export interface AppSettings {
   spam_filter_profile: SpamFilterProfile;
   /** Seconds to wait in remote upload queue before giving up (60–7200) */
   download_queue_wait_secs: number;
-  /** TCP connection attempts per download before failure (1–50) */
-  download_connection_max_retries: number;
-  /** Base seconds between connection retries, scaled by attempt (1–600) */
-  download_retry_delay_secs: number;
   /** Extra multi-source retry rounds after initial tasks (1–20) */
   multisource_retry_rounds: number;
   /** Per-source part hash failure retries during transfer (1–20) */
