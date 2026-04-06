@@ -316,16 +316,8 @@
     if (!tabQuery.trim()) return;
     serverRetryPending = true;
     try {
-      const parsedMinSize = filterMinSize !== '' ? parseFloat(filterMinSize) * filterMinUnit : undefined;
-      const parsedMaxSize = filterMaxSize !== '' ? parseFloat(filterMaxSize) * filterMaxUnit : undefined;
-      const parsedMinAvail = filterMinSources !== '' ? parseInt(filterMinSources, 10) : undefined;
       const retryRequestId = newSearchNonce();
-      const results = await searchFiles(tabQuery, 'server', retryRequestId, searchFileType || undefined, {
-        fileExtension: filterExtension.trim() || undefined,
-        minSize: parsedMinSize !== undefined && !isNaN(parsedMinSize) ? parsedMinSize : undefined,
-        maxSize: parsedMaxSize !== undefined && !isNaN(parsedMaxSize) ? parsedMaxSize : undefined,
-        minAvailability: parsedMinAvail !== undefined && !isNaN(parsedMinAvail) ? parsedMinAvail : undefined,
-      });
+      const results = await searchFiles(tabQuery, 'server', retryRequestId, activeTab.fileType || undefined, activeTab.filters);
       if (results && results.length > 0) {
         patchSearchTabByRequestId(tabRequestId, (tab) => ({
           ...tab,
@@ -538,21 +530,22 @@
     const q = query.trim();
     const method = searchMethod;
     filterType = searchFileType;
-    const { requestId } = openSearchTab(q, method);
+    const parsedMinSize = filterMinSize !== '' ? parseFloat(filterMinSize) * filterMinUnit : undefined;
+    const parsedMaxSize = filterMaxSize !== '' ? parseFloat(filterMaxSize) * filterMaxUnit : undefined;
+    const parsedMinAvail = filterMinSources !== '' ? parseInt(filterMinSources, 10) : undefined;
+    const searchFilterSnapshot: import('$lib/api/search').SearchFilters = {
+      fileExtension: filterExtension.trim() || undefined,
+      minSize: parsedMinSize !== undefined && !isNaN(parsedMinSize) ? parsedMinSize : undefined,
+      maxSize: parsedMaxSize !== undefined && !isNaN(parsedMaxSize) ? parsedMaxSize : undefined,
+      minAvailability: parsedMinAvail !== undefined && !isNaN(parsedMinAvail) ? parsedMinAvail : undefined,
+    };
+    const { requestId } = openSearchTab(q, method, searchFileType || undefined, searchFilterSnapshot);
     selectedResultKey = null;
     notes = [];
     clearChecked();
     closeContextMenu();
     let timeoutSec = searchTimeoutSecs;
-    const parsedMinSize = filterMinSize !== '' ? parseFloat(filterMinSize) * filterMinUnit : undefined;
-    const parsedMaxSize = filterMaxSize !== '' ? parseFloat(filterMaxSize) * filterMaxUnit : undefined;
-    const parsedMinAvail = filterMinSources !== '' ? parseInt(filterMinSources, 10) : undefined;
-    const searchPromise = searchFiles(q, method, requestId, searchFileType || undefined, {
-      fileExtension: filterExtension.trim() || undefined,
-      minSize: parsedMinSize !== undefined && !isNaN(parsedMinSize) ? parsedMinSize : undefined,
-      maxSize: parsedMaxSize !== undefined && !isNaN(parsedMaxSize) ? parsedMaxSize : undefined,
-      minAvailability: parsedMinAvail !== undefined && !isNaN(parsedMinAvail) ? parsedMinAvail : undefined,
-    });
+    const searchPromise = searchFiles(q, method, requestId, searchFileType || undefined, searchFilterSnapshot);
     clearSearchTimeoutForRequest(requestId);
     searchTimeouts.set(
       requestId,

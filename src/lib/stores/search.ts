@@ -2,7 +2,7 @@ import { get, writable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { SearchResult } from '$lib/types';
 import type { UnlistenFn } from '@tauri-apps/api/event';
-import type { SearchMethod } from '$lib/api/search';
+import type { SearchMethod, SearchFilters } from '$lib/api/search';
 import { cancelSearch } from '$lib/api/search';
 
 export type SearchTab = {
@@ -10,6 +10,8 @@ export type SearchTab = {
   requestId: number;
   query: string;
   method: SearchMethod;
+  fileType?: string;
+  filters?: SearchFilters;
   results: SearchResult[];
   isSearching: boolean;
   progress: { nodes_contacted: number; results_so_far: number; phase: string } | null;
@@ -114,7 +116,7 @@ export function patchSearchTabByRequestId(requestId: number, fn: (tab: SearchTab
 }
 
 /** Start a new search tab and select it. Returns tab id and request id for invoke/searchFiles. */
-export function openSearchTab(query: string, method: SearchMethod): { tabId: string; requestId: number } {
+export function openSearchTab(query: string, method: SearchMethod, fileType?: string, filters?: SearchFilters): { tabId: string; requestId: number } {
   const requestId = newSearchNonce();
   const id = newTabId();
   const tab: SearchTab = {
@@ -122,6 +124,8 @@ export function openSearchTab(query: string, method: SearchMethod): { tabId: str
     requestId,
     query,
     method,
+    fileType,
+    filters,
     results: [],
     isSearching: true,
     progress: null,
