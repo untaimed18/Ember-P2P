@@ -656,9 +656,9 @@
     </div>
   {:else}
     {#snippet friendCard(f: FriendInfo, isOnline: boolean)}
+      {@const presence = friendPresence(f)}
       <div class="friend-card" class:editing={editingHash === f.user_hash} class:online={isOnline} class:has-unread-card={!!unreadCounts.get(f.user_hash)}>
         <div class="card-header-row">
-          {@const presence = friendPresence(f)}
           <div class="card-avatar" class:avatar-online={presence === 'online'} class:avatar-offline={presence === 'offline'}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="8" r="4"/>

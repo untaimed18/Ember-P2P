@@ -21,15 +21,14 @@
   let step = $state(1);
   let transitioning = $state(false);
 
-  const _init = { ...settings };
-  let nickname = $state(_init.nickname);
-  let downloadFolder = $state(_init.download_folder);
-  let tcpPort = $state(_init.tcp_port);
-  let udpPort = $state(_init.udp_port);
-  let upnpEnabled = $state(_init.upnp_enabled);
-  let maxUploadSpeed = $state(_init.max_upload_speed);
-  let maxDownloadSpeed = $state(_init.max_download_speed);
-  let autoConnectKad = $state(_init.auto_connect_kad);
+  let nickname = $state(settings.nickname);
+  let downloadFolder = $state(settings.download_folder);
+  let tcpPort = $state(settings.tcp_port);
+  let udpPort = $state(settings.udp_port);
+  let upnpEnabled = $state(settings.upnp_enabled);
+  let maxUploadSpeed = $state(settings.max_upload_speed);
+  let maxDownloadSpeed = $state(settings.max_download_speed);
+  let autoConnectKad = $state(settings.auto_connect_kad);
   let selectedTheme: Theme = $state(
     (typeof localStorage !== 'undefined' && localStorage.getItem('ember-theme') as Theme) || 'dark'
   );
