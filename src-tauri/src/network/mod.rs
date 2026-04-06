@@ -2407,13 +2407,13 @@ pub async fn start_network(
     dead_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut watchdog_timer = tokio::time::interval(std::time::Duration::from_secs(30));
     watchdog_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // UDP source sweep for active downloads (eMule default 30 min, reduced for faster discovery)
-    let mut server_udp_source_timer = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
+    // UDP source sweep for active downloads (eMule UDPSERVERREASKTIME = 30 min)
+    let mut server_udp_source_timer = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
     server_udp_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut uss_ping_timer = tokio::time::interval(std::time::Duration::from_secs(2));
     uss_ping_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Batch TCP OP_GETSOURCES to connected server (eMule default ~2 min, reduced for faster source discovery)
-    let mut server_tcp_source_timer = tokio::time::interval(std::time::Duration::from_secs(90));
+    // Batch TCP OP_GETSOURCES to connected server (eMule ~4 min ProcessLocalRequests cycle)
+    let mut server_tcp_source_timer = tokio::time::interval(std::time::Duration::from_secs(4 * 60));
     server_tcp_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut ember_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -7471,6 +7471,40 @@ pub async fn start_network(
                                         }
                                     }
                                 }
+                                // Register source details so the frontend shows ed2k origin icons
+                                {
+                                    let matching_transfer_ids = {
+                                        let mgr = transfer_manager.read().await;
+                                        matching_active_transfer_ids_for_hash(&state, &mgr, &hash_hex)
+                                    };
+                                    if !matching_transfer_ids.is_empty() {
+                                        let mut mgr = transfer_manager.write().await;
+                                        for (ip, port, client_id) in &sources {
+                                            if *client_id == 0 && !ip.is_unspecified() {
+                                                let cc = crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(*ip));
+                                                for tid in &matching_transfer_ids {
+                                                    mgr.update_source_detail(
+                                                        tid,
+                                                        crate::types::SourceInfo {
+                                                            ip: ip.to_string(),
+                                                            port: *port,
+                                                            status: crate::types::SourceStatus::Connecting,
+                                                            queue_rank: None,
+                                                            speed: 0,
+                                                            transferred: 0,
+                                                            client_software: String::new(),
+                                                            peer_name: String::new(),
+                                                            available_parts: None,
+                                                            total_parts: None,
+                                                            country_code: cc.clone(),
+                                                            source_origin: Some("ed2k".into()),
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 for pd in state.pending_downloads.values_mut() {
                                     if pd.file_hash == hash_hex {
                                         pd.last_search_at = 0;
@@ -7731,8 +7765,10 @@ pub async fn start_network(
                             }
                         }
 
-                        // eMule: request sources for ALL incomplete downloads after server login
-                        // (both pending and currently active transfers).
+                        // eMule: request sources for incomplete downloads after server login.
+                        // Send a small initial batch immediately (up to 5), then let the
+                        // periodic TCP source timer drain the rest. Sending all at once
+                        // triggers server flood protection.
                         {
                             let mut all_hashes: Vec<([u8; 16], u64)> = Vec::new();
                             for pd in state.pending_downloads.values() {
@@ -7745,7 +7781,6 @@ pub async fn start_network(
                                     }
                                 }
                             }
-                            // Also include active downloads that have left pending_downloads
                             {
                                 let mgr = transfer_manager.read().await;
                                 let seen: std::collections::HashSet<[u8; 16]> =
@@ -7765,13 +7800,19 @@ pub async fn start_network(
                                 }
                             }
                             let total = all_hashes.len();
+                            const LOGIN_BATCH_LIMIT: usize = 5;
+                            let immediate = total.min(LOGIN_BATCH_LIMIT);
                             let mut sent = 0u32;
-                            for (fh, file_size) in &all_hashes {
+                            for (fh, file_size) in all_hashes.iter().take(immediate) {
                                 if conn.send_get_sources(fh, *file_size).await.is_ok() {
                                     sent += 1;
                                 }
                             }
-                            if total > 0 {
+                            let deferred = total - immediate;
+                            if deferred > 0 {
+                                state.server_tcp_getsources_cursor = 0;
+                                info!("Sent OP_GETSOURCES for {sent}/{total} downloads on login ({deferred} deferred to periodic batch)");
+                            } else if total > 0 {
                                 info!("Sent OP_GETSOURCES to server for {sent}/{total} downloads");
                             }
                         }
@@ -8620,7 +8661,7 @@ pub async fn start_network(
             }
 
             // eMule ProcessLocalRequests(): batch TCP OP_GETSOURCES over the
-            // active server connection every ~4 min, up to 15 per frame.
+            // active server connection every 4 min, up to 15 per frame.
             _ = server_tcp_source_timer.tick() => {
                 if !state.server_connected || state.server_connection.is_none() { continue; }
 
