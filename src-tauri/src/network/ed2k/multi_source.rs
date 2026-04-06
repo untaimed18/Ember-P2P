@@ -2540,7 +2540,12 @@ async fn download_parts_from_source(
         const MAX_CONSECUTIVE_BAD_BLOCKS: u32 = 5;
         let data_loop_start = std::time::Instant::now();
         let mut got_any_data = false;
-        const INITIAL_DATA_TIMEOUT_SECS: u64 = 30;
+        // eMule uses DOWNLOADTIMEOUT (100s) as a single timeout for both initial
+        // and mid-transfer stalls.  We use 60s for the initial wait as a
+        // compromise: gives slow uploaders (disk I/O, throttling, busy queue)
+        // enough time to start sending while still cutting off truly dead peers
+        // faster than eMule's full 100s.
+        const INITIAL_DATA_TIMEOUT_SECS: u64 = 60;
         let mut last_epx_resend = std::time::Instant::now();
         let mut last_epx_generation = ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed);
         const EPX_RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
