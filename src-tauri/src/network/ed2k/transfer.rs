@@ -1775,7 +1775,7 @@ impl Ed2kDownload {
                 let mut pending_compressed: HashMap<u64, PendingCompressedBlock> = HashMap::new();
                 let data_loop_start = std::time::Instant::now();
                 let mut got_any_data = false;
-                const INITIAL_DATA_TIMEOUT_SECS: u64 = 30;
+                const INITIAL_DATA_TIMEOUT_SECS: u64 = 60;
 
                 // Receive loop: process blocks and refill pipeline as requests complete
                 while total_received < total_sent_bytes {
