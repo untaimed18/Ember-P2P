@@ -467,6 +467,9 @@ impl TransferManager {
             if source.total_parts.is_some() {
                 existing.total_parts = source.total_parts;
             }
+            if source.country_code.is_some() {
+                existing.country_code = source.country_code;
+            }
             if source.source_origin.is_some() {
                 existing.source_origin = source.source_origin;
             }

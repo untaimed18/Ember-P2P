@@ -190,14 +190,14 @@
     }>('transfer-source-detail', (event) => {
       const d = event.payload;
       if (d.transfer_id !== expandedTransferId) return;
-      expandedSources = expandedSources.map((s) => {
-        if (s.ip === d.ip && s.port === d.port) {
-          return { ...s, status: d.status as SourceInfo['status'], queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software || s.client_software, peer_name: d.peer_name || s.peer_name, available_parts: d.available_parts ?? s.available_parts, total_parts: d.total_parts ?? s.total_parts, country_code: d.country_code ?? s.country_code };
-        }
-        return s;
-      });
-      if (!expandedSources.some((s) => s.ip === d.ip && s.port === d.port)) {
-        expandedSources = [...expandedSources, { ip: d.ip, port: d.port, status: d.status as SourceInfo['status'], queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software, peer_name: d.peer_name || '', available_parts: d.available_parts, total_parts: d.total_parts, country_code: d.country_code }];
+      const idx = expandedSources.findIndex((s) => s.ip === d.ip && s.port === d.port);
+      if (idx >= 0) {
+        const s = expandedSources[idx];
+        const updated: SourceInfo = { ...s, status: d.status as SourceInfo['status'], queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software || s.client_software, peer_name: d.peer_name || s.peer_name, available_parts: d.available_parts ?? s.available_parts, total_parts: d.total_parts ?? s.total_parts, country_code: d.country_code ?? s.country_code };
+        expandedSources[idx] = updated;
+        expandedSources = expandedSources;
+      } else {
+        expandedSources = [...expandedSources, { ip: d.ip, port: d.port, status: d.status as SourceInfo['status'], queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software, peer_name: d.peer_name || '', available_parts: d.available_parts, total_parts: d.total_parts, country_code: d.country_code } as SourceInfo];
       }
     }).then((u) => { if (mounted) sourceUnlisten = u; else u(); }).catch((e) => { console.error('Failed to subscribe to transfer-source-detail:', e); });
 

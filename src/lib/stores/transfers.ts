@@ -205,9 +205,9 @@ export async function initTransferStore() {
     listen<{ transfer_id: string; queue_rank?: number }>(
       'transfer-source-detail',
       (event) => {
-        markEventUpdate();
         const { transfer_id, queue_rank } = event.payload;
         if (queue_rank === undefined || queue_rank === null) return;
+        markEventUpdate();
         transfers.update((list) =>
           list.map((t) => (t.id === transfer_id ? { ...t, queue_rank } : t))
         );
