@@ -464,6 +464,7 @@ impl Database {
                     ember_sources: 0,
                     client_software: String::new(),
                     country_code: None,
+                    user_hash: None,
                 })
             })?
             .filter_map(|r| match r {

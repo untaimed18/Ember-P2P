@@ -1986,13 +1986,36 @@ pub async fn start_network(
             })
         })
         .collect();
+
+    // Extract banned user hashes for upload-only enforcement
+    let banned_hashes: HashSet<[u8; 16]> = saved_db_peers
+        .iter()
+        .filter(|p| p.banned && p.id.len() == 32 && p.id.chars().all(|c| c.is_ascii_hexdigit()))
+        .filter_map(|p| {
+            hex::decode(&p.id).ok().and_then(|bytes| {
+                if bytes.len() == 16 {
+                    let mut arr = [0u8; 16];
+                    arr.copy_from_slice(&bytes);
+                    Some(arr)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
     drop(saved_db_peers);
     if !banned_ips.is_empty() {
         info!("Loaded {} banned peer IPs", banned_ips.len());
     }
+    if !banned_hashes.is_empty() {
+        info!("Loaded {} banned user hashes", banned_hashes.len());
+    }
 
     let shared_banned_ips: ed2k::upload::SharedBannedIps =
         Arc::new(std::sync::RwLock::new(banned_ips.clone()));
+    let shared_banned_hashes: ed2k::upload::SharedBannedHashes =
+        Arc::new(std::sync::RwLock::new(banned_hashes));
 
     let comment_manager = Arc::new(RwLock::new(CommentManager::new()));
 
@@ -2251,6 +2274,7 @@ pub async fn start_network(
         let ul_buddy_info = shared_buddy_info.clone();
         let ul_ip_filter = shared_ip_filter.clone();
         let ul_banned = shared_banned_ips.clone();
+        let ul_banned_hashes = shared_banned_hashes.clone();
         let ul_skip_compress = settings.skip_compress_video;
         let ul_download_folder = settings.download_folder.clone();
         let ul_fw_probes = firewall_probe_ips.clone();
@@ -2288,6 +2312,7 @@ pub async fn start_network(
                 ul_buddy_info,
                 ul_ip_filter,
                 ul_banned,
+                ul_banned_hashes,
                 ul_skip_compress,
                 settings.filter_incoming_connections,
                 ul_fw_probes,
@@ -2629,6 +2654,7 @@ pub async fn start_network(
                         &server_udp,
                         &firewall_probe_ips,
                         &shared_banned_ips,
+                        &shared_banned_hashes,
                         &shared_server_addr,
                         &shared_ember_payload,
                         &ember_payload_generation,
@@ -2731,6 +2757,7 @@ pub async fn start_network(
                             &server_udp,
                             &firewall_probe_ips,
                             &shared_banned_ips,
+                            &shared_banned_hashes,
                             &shared_server_addr,
                             &shared_ember_payload,
                             &ember_payload_generation,
@@ -3527,6 +3554,7 @@ pub async fn start_network(
                         &server_udp,
                         &firewall_probe_ips,
                         &shared_banned_ips,
+                        &shared_banned_hashes,
                         &shared_server_addr,
                         &shared_ember_payload,
                         &ember_payload_generation,
@@ -3860,6 +3888,7 @@ pub async fn start_network(
                         &server_udp,
                         &firewall_probe_ips,
                         &shared_banned_ips,
+                        &shared_banned_hashes,
                         &shared_server_addr,
                         &shared_ember_payload,
                         &ember_payload_generation,
@@ -10138,21 +10167,18 @@ async fn handle_udp_packet(
         KadMessage::KadRes { target, contacts } => {
             debug!("KadRes from {from}: {} contacts for target {target}", contacts.len());
 
-            // eMule Process_KADEMLIA2_RES: validate contact count against what we requested.
+            // eMule Process_KADEMLIA2_RES: verify we have an active search for this target.
             let expected = state.search_manager.get_expected_response_count(&target);
             if expected == 0 {
                 debug!("  No active search for target {target}, ignoring response");
                 return;
             }
-            // Strict: accept up to `expected` contacts, or up to KADEMLIA_FIND_NODE
-            // only when `expected` itself is the higher "more" value (11).
-            let max_allowed = if expected as usize >= KADEMLIA_FIND_NODE as usize {
-                KADEMLIA_FIND_NODE as usize
-            } else {
-                expected as usize
-            };
-            if contacts.len() > max_allowed {
-                warn!("KadRes from {from}: contact count {} exceeds allowed {}, ignoring", contacts.len(), max_allowed);
+            // eMule accepts up to KADEMLIA_FIND_NODE (11) contacts in any response.
+            // GetRequestContactCount controls what we *ask for*, not what we accept.
+            // Peers commonly return more contacts than requested (e.g. 4 for a
+            // FIND_VALUE request asking for 2).
+            if contacts.len() > KADEMLIA_FIND_NODE as usize {
+                warn!("KadRes from {from}: contact count {} exceeds max {}, ignoring", contacts.len(), KADEMLIA_FIND_NODE);
                 return;
             }
 
@@ -10997,6 +11023,7 @@ async fn handle_command(
     _server_udp: &ServerUdpSocket,
     firewall_probe_ips: &upload_server::FirewallProbeSet,
     shared_banned_ips: &upload_server::SharedBannedIps,
+    shared_banned_hashes: &upload_server::SharedBannedHashes,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
     shared_ember_payload: &ember::SharedEmberPayload,
     ember_payload_generation: &ember::EmberPayloadGeneration,
@@ -11547,6 +11574,7 @@ async fn handle_command(
                     ember_sources: 0,
                     client_software: String::new(),
                     country_code: None,
+                    user_hash: None,
                 };
                 {
                     let db_ref = db.clone();
@@ -11709,6 +11737,10 @@ async fn handle_command(
                 if let Ok(mut shared) = shared_banned_ips.write() {
                     *shared = state.banned_ips.clone();
                 }
+                // Also add user hash to upload-only banned set
+                if let Ok(mut set) = shared_banned_hashes.write() {
+                    set.insert(kad_id.0);
+                }
             }
         }
 
@@ -11734,8 +11766,15 @@ async fn handle_command(
             if let Ok(mut shared) = shared_banned_ips.write() {
                 *shared = state.banned_ips.clone();
             }
+            // Also remove from upload-only banned set
+            if let Some(kad_id) = KadId::from_hex(&peer_id_hex) {
+                if let Ok(mut set) = shared_banned_hashes.write() {
+                    set.remove(&kad_id.0);
+                }
+            }
             info!("Unbanned peer {peer_id_hex}");
         }
+
 
         NetworkCommand::GetPeersSnapshot { tx } => {
             let _ = tx.send(peers_snapshot(state, db).await);
@@ -13477,6 +13516,7 @@ async fn handle_upload_event(
             peer_name,
             client_software,
             country_code,
+            user_hash,
         } => {
             let transfer = Transfer {
                 id: event.transfer_id.clone(),
@@ -13514,6 +13554,7 @@ async fn handle_upload_event(
                 ember_sources: 0,
                 client_software,
                 country_code,
+                user_hash,
             };
             {
                 let mut mgr = transfer_manager.write().await;
