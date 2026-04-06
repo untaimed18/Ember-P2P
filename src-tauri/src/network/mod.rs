@@ -11176,7 +11176,8 @@ async fn handle_command(
                     }
                 }
 
-                {
+                // eMule: UDP global search only runs for Global, not Server-only
+                if matches!(method, SearchMethod::Global) {
                     let search_expr = if let Some(ref filters) = search_filters {
                         use crate::network::ed2k::server::{SearchExpression, build_search_tree};
                         let mut expr = SearchExpression::String(query.clone());

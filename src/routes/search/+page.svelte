@@ -996,6 +996,11 @@
     placeholder="Search files across the network..."
     onsubmit={handleSearch}
   />
+  <div class="method-selector" role="radiogroup" aria-label="Search method">
+    <button type="button" class="method-btn" class:active={searchMethod === 'global'} onclick={() => (searchMethod = 'global')}>Global</button>
+    <button type="button" class="method-btn" class:active={searchMethod === 'server'} onclick={() => (searchMethod = 'server')}>Server</button>
+    <button type="button" class="method-btn" class:active={searchMethod === 'kad'} onclick={() => (searchMethod = 'kad')}>Kad</button>
+  </div>
   <select class="type-select" bind:value={searchFileType} title="Filter by file type (sent to servers/KAD)">
     {#each FILE_TYPES as ft}
       <option value={ft.value}>{ft.label}</option>
