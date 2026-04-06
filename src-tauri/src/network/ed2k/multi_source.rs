@@ -23,6 +23,10 @@ use super::sources::SourceManager;
 use super::tcp_obfuscation::{self, Rc4Reader, Rc4Writer};
 use super::transfer::{is_filtered_source_ip, DownloadEvent};
 
+/// Shared registry of active download trackers so the shutdown path can
+/// persist `.part.met` files even when download tasks are aborted.
+pub type SharedTrackerRegistry = Arc<std::sync::Mutex<HashMap<String, Arc<RwLock<PartTracker>>>>>;
+
 /// Maximum decompressed part size (PARTSIZE + margin = 10 MiB)
 const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
 
@@ -167,6 +171,8 @@ pub struct MultiSourceDownload {
     pub aich_pending: Option<super::transfer::SharedAichPending>,
     /// GeoIP reader for country code lookups
     pub geoip: crate::geoip::GeoIpReader,
+    /// Shared registry so the shutdown path can save our tracker
+    pub tracker_registry: Option<SharedTrackerRegistry>,
 }
 
 async fn check_control(control: &TransferControl) -> anyhow::Result<()> {
@@ -260,6 +266,12 @@ impl MultiSourceDownload {
         pt.set_file_hash(self.file_hash);
         pt.set_file_name(&self.file_name);
         let tracker = Arc::new(RwLock::new(pt));
+
+        if let Some(ref registry) = self.tracker_registry {
+            if let Ok(mut reg) = registry.lock() {
+                reg.insert(self.transfer_id.clone(), tracker.clone());
+            }
+        }
 
         // If .part.met shows progress but the .part file is missing, the tracker
         // is stale (e.g. user deleted the file manually).  Reset so we don't get
@@ -1255,6 +1267,10 @@ impl MultiSourceDownload {
                 let t = tracker.read().await;
                 t.part_count - t.completed_count()
             };
+            {
+                let t = tracker.read().await;
+                t.save();
+            }
             let _ = event_tx
                 .send(DownloadEvent::Failed {
                     transfer_id: self.transfer_id.clone(),
@@ -1262,6 +1278,12 @@ impl MultiSourceDownload {
                     failure_kind: super::transfer::SourceFailureKind::Transient,
                 })
                 .await;
+        }
+
+        if let Some(ref registry) = self.tracker_registry {
+            if let Ok(mut reg) = registry.lock() {
+                reg.remove(&self.transfer_id);
+            }
         }
 
         Ok(())
@@ -2409,7 +2431,7 @@ async fn download_parts_from_source(
     let mut part_queue: Vec<usize> = parts.to_vec();
     let mut queue_idx = 0;
     let mut last_periodic_save = std::time::Instant::now();
-    const PERIODIC_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+    const PERIODIC_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
     #[derive(Clone, Copy)]
     enum PartHashOutcome {
