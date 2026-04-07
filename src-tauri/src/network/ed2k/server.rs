@@ -660,7 +660,6 @@ pub enum ServerEvent {
     StatusUpdate { users: u32, files: u32 },
     ServerIdent { name: String },
     ServerList {
-        #[allow(dead_code)]
         data: Vec<u8>,
     },
     SearchResult { results: Vec<ServerSearchResult> },
