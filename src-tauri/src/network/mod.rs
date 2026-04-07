@@ -5956,12 +5956,16 @@ pub async fn start_network(
                         }
                         let source_count = ready_sources.len() as u32;
                         {
+                            let sm = source_manager.read().await;
                             let mut mgr = transfer_manager.write().await;
                             mgr.update_status(tid, TransferStatus::Active);
                             mgr.update_sources(tid, source_count, 0, 0);
                             for (ip_s, port) in &ready_sources {
                                 let cc = ip_s.parse::<std::net::IpAddr>().ok()
                                     .and_then(|ip| crate::geoip::lookup_country(&geoip, ip));
+                                let origin = ip_s.parse::<Ipv4Addr>().ok()
+                                    .and_then(|v4| sm.get_source_origin(&hash_bytes, v4, *port))
+                                    .map(|s| s.to_string());
                                 mgr.update_source_detail(
                                     tid,
                                     crate::types::SourceInfo {
@@ -5976,7 +5980,7 @@ pub async fn start_network(
                                         available_parts: None,
                                         total_parts: None,
                                         country_code: cc,
-                                        source_origin: None,
+                                        source_origin: origin,
                                     },
                                 );
                             }
@@ -6071,13 +6075,18 @@ pub async fn start_network(
                                 continue;
                             }
                         };
-                        let sm_sources = {
+                        let (sm_sources, sm_origins): (Vec<(Ipv4Addr, u16)>, Vec<Option<&str>>) = {
                             let sm = source_manager.read().await;
-                            sm.get_sources(&hash_bytes)
+                            let srcs = sm.get_sources(&hash_bytes);
+                            let origins: Vec<Option<&str>> = srcs.iter()
+                                .map(|(ip, port)| sm.get_source_origin(&hash_bytes, *ip, *port))
+                                .collect();
+                            (srcs, origins)
                         };
-                        let live_sources: Vec<(String, u16)> = sm_sources.into_iter()
-                            .filter(|(ip, port)| !state.dead_sources.is_dead_source_for_file(&hash_bytes, u32::from(*ip), *port))
-                            .map(|(ip, port)| (ip.to_string(), port))
+                        let live_sources: Vec<(String, u16, Option<String>)> = sm_sources.into_iter()
+                            .zip(sm_origins)
+                            .filter(|((ip, port), _)| !state.dead_sources.is_dead_source_for_file(&hash_bytes, u32::from(*ip), *port))
+                            .map(|((ip, port), origin)| (ip.to_string(), port, origin.map(|s| s.to_string())))
                             .collect();
                         if live_sources.is_empty() {
                             state.pending_downloads.insert(tid.clone(), pending);
@@ -6094,7 +6103,7 @@ pub async fn start_network(
                             let mut mgr = transfer_manager.write().await;
                             mgr.update_status(tid, TransferStatus::Active);
                             mgr.update_sources(tid, source_count, 0, 0);
-                            for (ip_s, port) in &live_sources {
+                            for (ip_s, port, origin) in &live_sources {
                                 let cc = ip_s.parse::<std::net::IpAddr>().ok()
                                     .and_then(|ip| crate::geoip::lookup_country(&geoip, ip));
                                 mgr.update_source_detail(
@@ -6111,7 +6120,7 @@ pub async fn start_network(
                                         available_parts: None,
                                         total_parts: None,
                                         country_code: cc,
-                                        source_origin: None,
+                                        source_origin: origin.clone(),
                                     },
                                 );
                             }
@@ -6130,7 +6139,7 @@ pub async fn start_network(
                                 let sm = source_manager.read().await;
                                 sm.get_udp_sources(&hash_bytes)
                             };
-                            for (ip_s, port) in &live_sources {
+                            for (ip_s, port, _) in &live_sources {
                                 if let Ok(v4) = ip_s.parse::<Ipv4Addr>() {
                                     let udp_port = udp_sources
                                         .iter()
@@ -6145,7 +6154,7 @@ pub async fn start_network(
                         }
                         {
                             let mut sm = source_manager.write().await;
-                            for (ip, port) in &live_sources {
+                            for (ip, port, _) in &live_sources {
                                 if let Ok(v4) = ip.parse::<Ipv4Addr>() {
                                     sm.register_source(hash_bytes, v4, *port);
                                 }
@@ -6154,7 +6163,7 @@ pub async fn start_network(
                         let download_sources: Vec<DownloadSource> = {
                             let sm = source_manager.read().await;
                             live_sources.iter()
-                                .map(|(ip, port)| {
+                                .map(|(ip, port, _)| {
                                     let uh = ip.parse::<Ipv4Addr>().ok()
                                         .and_then(|v4| sm.get_user_hash(&hash_bytes, v4, *port));
                                     let co = ip.parse::<Ipv4Addr>().ok()
@@ -7033,13 +7042,21 @@ pub async fn start_network(
                                             Vec::new()
                                         };
 
+                                        let (cb_server_ip, cb_server_port) = state.server_addr.and_then(|a| {
+                                            match a.ip() {
+                                                std::net::IpAddr::V4(v4) => Some((u32::from_le_bytes(v4.octets()), a.port())),
+                                                _ => None,
+                                            }
+                                        }).unwrap_or((0, 0));
                                         let mut sm = source_manager.write().await;
                                         for fh in &matching_hashes {
-                                            sm.register_source_full_opts(
+                                            sm.register_source_full_server(
                                                 *fh,
                                                 peer_ip,
                                                 port,
                                                 0,
+                                                cb_server_ip,
+                                                cb_server_port,
                                                 user_hash.unwrap_or([0u8; 16]),
                                                 crypt_options.unwrap_or(0),
                                             );
@@ -7392,7 +7409,11 @@ pub async fn start_network(
                                                 0,
                                             );
                                         } else {
-                                            sm.register_source(file_hash, *ip, *port);
+                                            sm.register_source_full_server(
+                                                file_hash, *ip, *port, 0,
+                                                udp_server_ip, udp_server_port,
+                                                [0u8; 16], 0,
+                                            );
                                         }
                                     }
                                 }
