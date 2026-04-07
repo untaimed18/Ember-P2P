@@ -3,7 +3,7 @@
   import { goto } from '$app/navigation';
   import AboutDialog from '$lib/components/AboutDialog.svelte';
   import { transfers } from '$lib/stores/transfers';
-  import { networkStats, serverStatus } from '$lib/stores/network';
+  import { networkStats } from '$lib/stores/network';
 
   let aboutOpen = $state(false);
 
@@ -13,7 +13,6 @@
 
   const navItems = [
     { href: '/', label: 'KAD Network', id: 'kad', aliases: ['/kad-network'] },
-    { href: '/servers', label: 'ED2K Network', id: 'servers' },
     { href: '/search', label: 'Search', id: 'search' },
     { href: '/transfers', label: 'Transfers', id: 'transfers' },
     { href: '/library', label: 'Library', id: 'library' },
@@ -117,9 +116,6 @@
           <span class="nav-label">{item.label}</span>
           {#if item.id === 'kad'}
             <span class="nav-dot {$networkStats.status}" title="{$networkStats.status}"></span>
-          {/if}
-          {#if item.id === 'servers'}
-            <span class="nav-dot {$serverStatus}" title="{$serverStatus}"></span>
           {/if}
           {#if item.id === 'transfers' && activeDownloadCount > 0}
             <span class="nav-badge">{activeDownloadCount}</span>
