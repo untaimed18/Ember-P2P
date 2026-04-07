@@ -18,6 +18,7 @@ pub const OP_SERVERLIST: u8 = 0x32;
 pub const OP_SERVERSTATUS: u8 = 0x34;
 pub const OP_IDCHANGE: u8 = 0x40;
 pub const OP_SERVERIDENT: u8 = 0x41;
+#[allow(dead_code)]
 pub const OP_SEARCHREQUEST: u8 = 0x16;
 pub const OP_SEARCHRESULT: u8 = 0x33;
 pub const OP_GETSOURCES: u8 = 0x19;
@@ -458,6 +459,7 @@ impl Ed2kServerConnection {
     /// Send a search request to the server (fire-and-forget).
     /// The result will arrive asynchronously via `poll_messages()` as `ServerEvent::SearchResult`.
     /// This does NOT block waiting for a response, so other server events continue flowing.
+    #[allow(dead_code)]
     pub async fn send_search_async(&mut self, query: &str) -> anyhow::Result<()> {
         let payload = build_search_request(query);
         info!(
@@ -469,6 +471,7 @@ impl Ed2kServerConnection {
     }
 
     /// Send a boolean search expression tree to the server.
+    #[allow(dead_code)]
     pub async fn send_search_expression_async(
         &mut self,
         expr: &SearchExpression,
@@ -1074,6 +1077,7 @@ fn write_uint32_tag(buf: &mut Vec<u8>, name_id: u8, value: u32) {
     buf.extend_from_slice(&value.to_le_bytes());
 }
 
+#[allow(dead_code)]
 fn build_search_request(query: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.push(0x01); // Search type: string
@@ -1094,23 +1098,35 @@ const ED2K_SEARCH_OP_EQUAL: u8 = 0x00;
 const ED2K_SEARCH_OP_GREATER: u8 = 0x01;
 #[allow(dead_code)]
 const ED2K_SEARCH_OP_LESS: u8 = 0x02;
+#[allow(dead_code)]
 const ED2K_SEARCH_OP_GREATER_EQUAL: u8 = 0x03;
+#[allow(dead_code)]
 const ED2K_SEARCH_OP_LESS_EQUAL: u8 = 0x04;
 #[allow(dead_code)]
 const ED2K_SEARCH_OP_NOTEQUAL: u8 = 0x05;
 
 // Wire-format node type bytes for the search tree
+#[allow(dead_code)]
 const SEARCH_BOOL_AND: u8 = 0x00;
+#[allow(dead_code)]
 const SEARCH_BOOL_OR: u8 = 0x01;
+#[allow(dead_code)]
 const SEARCH_BOOL_NOT: u8 = 0x02;
+#[allow(dead_code)]
 const SEARCH_LEAF_STRING: u8 = 0x01;
+#[allow(dead_code)]
 const SEARCH_LEAF_META_STRING: u8 = 0x02;
+#[allow(dead_code)]
 const SEARCH_LEAF_META_UINT32: u8 = 0x03;
 
 // Single-byte tag-name IDs used inside search meta constraints
+#[allow(dead_code)]
 const FT_FILESIZE_TAG: u8 = 0x02;
+#[allow(dead_code)]
 const FT_FILETYPE_TAG: u8 = 0x03;
+#[allow(dead_code)]
 const FT_FILEFORMAT_TAG: u8 = 0x04;
+#[allow(dead_code)]
 const FT_SOURCES_TAG: u8 = 0x15;
 
 /// A boolean search expression tree matching eMule's OP_SEARCHREQUEST wire format.
@@ -1118,6 +1134,7 @@ const FT_SOURCES_TAG: u8 = 0x15;
 /// Operators carry two children (prefix notation on the wire: operator byte,
 /// then left subtree, then right subtree).  Leaf nodes encode either a plain
 /// search string or a typed meta-constraint (size, type, extension, sources).
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum SearchExpression {
     String(String),
@@ -1133,12 +1150,14 @@ pub enum SearchExpression {
 
 /// Serialize a [`SearchExpression`] tree into the eMule search-request wire
 /// format suitable for use as the payload of an `OP_SEARCHREQUEST` packet.
+#[allow(dead_code)]
 pub fn build_search_tree(expr: &SearchExpression) -> Vec<u8> {
     let mut buf = Vec::new();
     write_search_node(&mut buf, expr);
     buf
 }
 
+#[allow(dead_code)]
 fn write_search_node(buf: &mut Vec<u8>, expr: &SearchExpression) {
     match expr {
         SearchExpression::String(s) => {
@@ -1185,6 +1204,7 @@ fn write_search_node(buf: &mut Vec<u8>, expr: &SearchExpression) {
 }
 
 /// Find the largest byte index <= max_len that doesn't split a multi-byte UTF-8 codepoint.
+#[allow(dead_code)]
 fn truncate_utf8_safe(bytes: &[u8], max_len: usize) -> usize {
     let mut len = max_len.min(bytes.len());
     while len > 0 && (bytes[len - 1] & 0xC0) == 0x80 {
@@ -1201,6 +1221,7 @@ fn truncate_utf8_safe(bytes: &[u8], max_len: usize) -> usize {
 }
 
 /// Wire format: `0x03 | value(u32 LE) | comparison_op(u8) | tag_name_len(u16 LE) | tag_name`
+#[allow(dead_code)]
 fn write_search_meta_uint32(buf: &mut Vec<u8>, value: u32, op: u8, tag_name_id: u8) {
     buf.push(SEARCH_LEAF_META_UINT32);
     buf.extend_from_slice(&value.to_le_bytes());
@@ -1210,6 +1231,7 @@ fn write_search_meta_uint32(buf: &mut Vec<u8>, value: u32, op: u8, tag_name_id: 
 }
 
 /// Wire format: `0x02 | value_len(u16 LE) | value | tag_name_len(u16 LE) | tag_name`
+#[allow(dead_code)]
 fn write_search_meta_string(buf: &mut Vec<u8>, value: &str, tag_name_id: u8) {
     buf.push(SEARCH_LEAF_META_STRING);
     let bytes = value.as_bytes();

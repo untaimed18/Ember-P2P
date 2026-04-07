@@ -703,6 +703,7 @@ pub enum SearchMethod {
 }
 
 #[derive(Debug, Default, Clone)]
+#[allow(dead_code)]
 pub struct SearchFilters {
     pub min_size: Option<u64>,
     pub max_size: Option<u64>,
@@ -715,6 +716,7 @@ pub struct SearchFilters {
 pub enum NetworkCommand {
     SearchFiles {
         query: String,
+        #[allow(dead_code)]
         method: SearchMethod,
         request_id: u64,
         tx: oneshot::Sender<Vec<SearchResult>>,
@@ -11125,17 +11127,14 @@ async fn handle_command(
     ul_event_tx: &mpsc::Sender<upload_server::UploadEvent>,
 ) {
     match cmd {
-        NetworkCommand::SearchFiles { query, method, request_id, tx, search_filters } => {
+        NetworkCommand::SearchFiles { query, method: _, request_id, tx, search_filters } => {
             if let Some(active) = state.active_search_request.take() {
                 if active.request_id != request_id {
                     cancel_search_request(state, app_handle, active.request_id);
                 }
             }
-            let use_server = matches!(method, SearchMethod::Server | SearchMethod::Global);
-            let use_kad = matches!(method, SearchMethod::Kad | SearchMethod::Global);
 
             let local_results: Vec<SearchResult> = Vec::new();
-            let mut response_tx = Some(tx);
             let file_type_filter = search_filters.as_ref().and_then(|f| f.file_type.clone());
             let mut active_request = ActiveSearchRequest {
                 request_id,
@@ -11145,194 +11144,26 @@ async fn handle_command(
                 file_type_filter: file_type_filter.clone(),
             };
 
-            if use_server {
-                if state.server_connected {
-                    if let Some(conn) = &mut state.server_connection {
-                        let search_result = if let Some(ref filters) = search_filters {
-                            use crate::network::ed2k::server::SearchExpression;
-                            // Parse query for OR/NOT: split on " OR ", prefix with "-" for NOT
-                            let mut expr: SearchExpression = {
-                                let or_parts: Vec<&str> = query.split(" OR ").collect();
-                                if or_parts.len() > 1 {
-                                    let mut or_expr = SearchExpression::String(or_parts[0].trim().to_string());
-                                    for part in &or_parts[1..] {
-                                        or_expr = SearchExpression::Or(
-                                            Box::new(or_expr),
-                                            Box::new(SearchExpression::String(part.trim().to_string())),
-                                        );
-                                    }
-                                    or_expr
-                                } else {
-                                    let words: Vec<&str> = query.split_whitespace().collect();
-                                    let (pos, neg): (Vec<_>, Vec<_>) = words.iter().partition(|w| !w.starts_with('-'));
-                                    let pos_str: String = pos.iter().copied().collect::<Vec<&&str>>().iter().map(|s| **s).collect::<Vec<&str>>().join(" ");
-                                    let mut base = SearchExpression::String(pos_str);
-                                    for nw in neg {
-                                        let term = nw.trim_start_matches('-');
-                                        if !term.is_empty() {
-                                            base = SearchExpression::Not(
-                                                Box::new(base),
-                                                Box::new(SearchExpression::String(term.to_string())),
-                                            );
-                                        }
-                                    }
-                                    base
-                                }
-                            };
-                            if let Some(min) = filters.min_size {
-                                expr = SearchExpression::And(
-                                    Box::new(expr),
-                                    Box::new(SearchExpression::MinSize(min)),
-                                );
-                            }
-                            if let Some(max) = filters.max_size {
-                                expr = SearchExpression::And(
-                                    Box::new(expr),
-                                    Box::new(SearchExpression::MaxSize(max)),
-                                );
-                            }
-                            if let Some(ref ft) = filters.file_type {
-                                expr = SearchExpression::And(
-                                    Box::new(expr),
-                                    Box::new(SearchExpression::FileType(ft.clone())),
-                                );
-                            }
-                            if let Some(ref ext) = filters.file_extension {
-                                expr = SearchExpression::And(
-                                    Box::new(expr),
-                                    Box::new(SearchExpression::FileExtension(ext.clone())),
-                                );
-                            }
-                            if let Some(avail) = filters.min_availability {
-                                expr = SearchExpression::And(
-                                    Box::new(expr),
-                                    Box::new(SearchExpression::MinAvailability(avail)),
-                                );
-                            }
-                            conn.send_search_expression_async(&expr).await
-                        } else {
-                            conn.send_search_async(&query).await
-                        };
-                        if let Err(e) = search_result {
-                            debug!("Server search send failed: {e}");
-                        } else {
-                            active_request.server_pending = true;
-                            state.pending_server_search = Some(PendingServerSearch {
-                                tx: if use_kad { None } else { response_tx.take() },
-                                results: local_results.clone(),
-                                request_id,
-                            });
-                            state.server_search_age = 0;
-                        }
-                    }
-                }
-
-                // eMule: UDP global search only runs for Global, not Server-only
-                if matches!(method, SearchMethod::Global) {
-                    let search_expr = if let Some(ref filters) = search_filters {
-                        use crate::network::ed2k::server::{SearchExpression, build_search_tree};
-                        let mut expr = SearchExpression::String(query.clone());
-                        if let Some(min) = filters.min_size {
-                            expr = SearchExpression::And(
-                                Box::new(expr),
-                                Box::new(SearchExpression::MinSize(min)),
-                            );
-                        }
-                        if let Some(max) = filters.max_size {
-                            expr = SearchExpression::And(
-                                Box::new(expr),
-                                Box::new(SearchExpression::MaxSize(max)),
-                            );
-                        }
-                        if let Some(ref ft) = filters.file_type {
-                            expr = SearchExpression::And(
-                                Box::new(expr),
-                                Box::new(SearchExpression::FileType(ft.clone())),
-                            );
-                        }
-                        if let Some(ref ext) = filters.file_extension {
-                            expr = SearchExpression::And(
-                                Box::new(expr),
-                                Box::new(SearchExpression::FileExtension(ext.clone())),
-                            );
-                        }
-                        if let Some(avail) = filters.min_availability {
-                            expr = SearchExpression::And(
-                                Box::new(expr),
-                                Box::new(SearchExpression::MinAvailability(avail)),
-                            );
-                        }
-                        build_search_tree(&expr)
-                    } else {
-                        let mut buf = Vec::new();
-                        buf.push(0x01u8);
-                        buf.extend_from_slice(&(query.len() as u16).to_le_bytes());
-                        buf.extend_from_slice(query.as_bytes());
-                        buf
-                    };
-                    // eMule skips the currently connected server (already searched via TCP)
-                    let connected_addr = state.server_addr;
-                    let packets: Vec<_> = state.server_list.servers().iter()
-                        .filter(|srv| {
-                            if let Some(addr) = connected_addr {
-                                let srv_addr: Option<std::net::SocketAddr> = format!("{}:{}", srv.ip, srv.port).parse().ok();
-                                srv_addr.map_or(true, |a| a != addr)
-                            } else {
-                                true
-                            }
-                        })
-                        .filter(|srv| srv.fail_count < 3) // eMule: skip dead servers
-                        .filter_map(|srv| ServerUdpSocket::build_global_search_packet(srv, &search_expr))
-                        .collect();
-                    if !packets.is_empty() {
-                        active_request.udp_pending = true;
-                        state.server_udp_search_age = 0;
-                        info!("Queuing UDP global search to {} servers (750ms/server)", packets.len());
-                        state.udp_search_queue = VecDeque::from(packets);
-                    }
-                }
-            }
-
-            if !use_kad {
-                // Server-only search: store the pending tx so poll_messages()
-                // delivers the OP_SEARCHRESULT when it arrives.
-                if active_request.server_pending || active_request.udp_pending {
-                    state.active_search_request = Some(active_request);
-                } else {
-                    if let Some(tx) = response_tx.take() {
-                        let _ = tx.send(local_results);
-                    }
-                    let _ = app_handle.emit(
-                        "search-complete",
-                        SearchCompleteEvent { request_id },
-                    );
-                }
-                return;
-            }
-
-            // Global search: KAD gets the oneshot tx; server TCP results
-            // arrive via poll_messages() and are emitted as "search-results"
-            // events which the frontend merges into the result list.
-            state.server_search_age = 0;
+            // All searches go through KAD only; ED2K servers are used for
+            // source gathering, not file search.
 
             let keywords = kad::publish::extract_keywords(&query);
             if keywords.is_empty() {
-                if let Some(tx) = response_tx.take() {
-                    let _ = tx.send(local_results);
-                }
-                if active_request.server_pending || active_request.udp_pending {
-                    state.active_search_request = Some(active_request);
-                } else {
-                    let _ = app_handle.emit(
-                        "search-complete",
-                        SearchCompleteEvent { request_id },
-                    );
-                }
+                let _ = tx.send(local_results);
+                let _ = app_handle.emit(
+                    "search-complete",
+                    SearchCompleteEvent { request_id },
+                );
                 return;
             }
 
             let Some(primary_keyword) = keywords.iter().max_by_key(|k| k.len()) else {
                 warn!("KAD search: no keywords after parsing query");
+                let _ = tx.send(local_results);
+                let _ = app_handle.emit(
+                    "search-complete",
+                    SearchCompleteEvent { request_id },
+                );
                 return;
             };
             let keyword_hash = kad::publish::keyword_to_kad_id(primary_keyword);
@@ -11343,17 +11174,11 @@ async fn handle_command(
                 .find_closest_prefer_verified(&keyword_hash, SEARCH_INITIAL_CONTACTS);
 
             if closest.is_empty() {
-                if let Some(tx) = response_tx.take() {
-                    let _ = tx.send(local_results);
-                }
-                if active_request.server_pending || active_request.udp_pending {
-                    state.active_search_request = Some(active_request);
-                } else {
-                    let _ = app_handle.emit(
-                        "search-complete",
-                        SearchCompleteEvent { request_id },
-                    );
-                }
+                let _ = tx.send(local_results);
+                let _ = app_handle.emit(
+                    "search-complete",
+                    SearchCompleteEvent { request_id },
+                );
                 return;
             }
 
@@ -11368,17 +11193,11 @@ async fn handle_command(
             );
 
             if sid == SearchId(0) {
-                if let Some(tx) = response_tx.take() {
-                    let _ = tx.send(local_results);
-                }
-                if active_request.server_pending || active_request.udp_pending {
-                    state.active_search_request = Some(active_request);
-                } else {
-                    let _ = app_handle.emit(
-                        "search-complete",
-                        SearchCompleteEvent { request_id },
-                    );
-                }
+                let _ = tx.send(local_results);
+                let _ = app_handle.emit(
+                    "search-complete",
+                    SearchCompleteEvent { request_id },
+                );
                 return;
             }
             if let Some(search) = state.search_manager.get_mut(&sid) {
@@ -11386,18 +11205,14 @@ async fn handle_command(
             }
             active_request.kad_pending = true;
             state.active_search_request = Some(active_request);
-            if let Some(tx) = response_tx.take() {
-                state.pending_keyword_searches.insert(sid, PendingKeywordSearch {
-                    tx,
-                    local_results,
-                    keywords,
-                    request_id,
-                    last_streamed_count: 0,
-                    file_type_filter,
-                });
-            } else {
-                warn!("search response channel already taken for search {sid:?}");
-            }
+            state.pending_keyword_searches.insert(sid, PendingKeywordSearch {
+                tx,
+                local_results,
+                keywords,
+                request_id,
+                last_streamed_count: 0,
+                file_type_filter,
+            });
         }
 
         NetworkCommand::CancelSearch { request_id } => {

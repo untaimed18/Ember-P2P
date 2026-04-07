@@ -10,8 +10,11 @@ use super::server_list::ServerEntry;
 
 pub const OP_EDONKEYPROT: u8 = 0xE3;
 
+#[allow(dead_code)]
 pub const OP_GLOBSEARCHREQ: u8 = 0x98;
+#[allow(dead_code)]
 pub const OP_GLOBSEARCHREQ2: u8 = 0x92;
+#[allow(dead_code)]
 pub const OP_GLOBSEARCHREQ3: u8 = 0x90;
 pub const OP_GLOBSEARCHRES: u8 = 0x99;
 pub const OP_GLOBGETSOURCES: u8 = 0x9A;
@@ -131,6 +134,7 @@ impl ServerUdpSocket {
     ///  - `OP_GLOBSEARCHREQ3`: server supports EXT_GETFILES + LARGEFILES
     ///  - `OP_GLOBSEARCHREQ2`: server supports EXT_GETFILES
     ///  - `OP_GLOBSEARCHREQ`:  fallback for all other servers
+    #[allow(dead_code)]
     pub fn build_global_search_packet(server: &ServerEntry, search_expr: &[u8]) -> Option<(Vec<u8>, SocketAddr)> {
         let udp_port = server.port.checked_add(4)?;
         let addr: SocketAddr = format!("{}:{}", server.ip, udp_port).parse().ok()?;

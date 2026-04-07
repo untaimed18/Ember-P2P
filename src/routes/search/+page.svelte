@@ -25,7 +25,7 @@
 
   const searchTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
 
-  let searchMethod: SearchMethod = $state('global');
+  let searchMethod: SearchMethod = 'kad';
   let searchFileType: string = $state('');
 
   let ed2kInput = $state('');
@@ -592,8 +592,10 @@
     }
     try {
       const results = await searchPromise;
-      clearSearchTimeoutForRequest(requestId);
-      if (!get(searchTabs).some((t) => t.requestId === requestId)) return;
+      if (!get(searchTabs).some((t) => t.requestId === requestId)) {
+        clearSearchTimeoutForRequest(requestId);
+        return;
+      }
       if (results && results.length > 0) {
         patchSearchTabByRequestId(requestId, (tab) => ({
           ...tab,
@@ -996,12 +998,7 @@
     placeholder="Search files across the network..."
     onsubmit={handleSearch}
   />
-  <div class="method-selector" role="radiogroup" aria-label="Search method">
-    <button type="button" class="method-btn" class:active={searchMethod === 'global'} onclick={() => (searchMethod = 'global')}>Global</button>
-    <button type="button" class="method-btn" class:active={searchMethod === 'server'} onclick={() => (searchMethod = 'server')}>Server</button>
-    <button type="button" class="method-btn" class:active={searchMethod === 'kad'} onclick={() => (searchMethod = 'kad')}>Kad</button>
-  </div>
-  <select class="type-select" bind:value={searchFileType} title="Filter by file type (sent to servers/KAD)">
+  <select class="type-select" bind:value={searchFileType} title="Filter by file type">
     {#each FILE_TYPES as ft}
       <option value={ft.value}>{ft.label}</option>
     {/each}
@@ -1570,48 +1567,6 @@
   .type-select:focus {
     border-color: var(--accent);
     outline: none;
-  }
-
-  .method-selector {
-    display: flex;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    overflow: hidden;
-    flex-shrink: 0;
-    background: var(--bg-surface);
-  }
-
-  .method-btn {
-    padding: 7px 14px;
-    font-size: 12px;
-    font-weight: 600;
-    border: none;
-    border-radius: 0;
-    background: var(--bg-surface);
-    color: var(--text-secondary);
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-    border-right: 1px solid var(--border);
-  }
-
-  .method-btn:last-child {
-    border-right: none;
-  }
-
-  .method-btn:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-
-  .method-btn.active {
-    background: var(--accent);
-    color: #fff;
-    box-shadow: inset 0 -2px 0 color-mix(in srgb, #000 14%, transparent);
-  }
-
-  :global([data-theme="dark"]) .method-btn.active {
-    background: var(--accent-dim);
-    color: var(--text-primary);
   }
 
   .search-tabs {
