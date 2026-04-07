@@ -55,6 +55,13 @@ num-traits = "0.2"
 opener = "0.8.4"
 crc32fast = "1.5.0"
 zeroize = { version = "1", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+snow = "0.9"
+chacha20poly1305 = "0.10"
+lz4_flex = "0.11"
+quinn = "0.11"
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
 strsim = "0.11"
 zip = "2"
 fs2 = "0.4"
