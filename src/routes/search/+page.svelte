@@ -776,9 +776,19 @@
   async function download(result: SearchResult) {
     const key = resultKey(result);
     if (downloadPending[key]) return;
+
+    const networkAddresses = (result.source_addresses ?? []).filter(
+      (a) => a && a !== 'local'
+    );
+
+    if (networkAddresses.length === 0 && result.result_origin?.includes('Local')) {
+      addToast('info', 'This file is already in your library');
+      return;
+    }
+
     downloadPending[key] = true;
     try {
-      const { ip: peerIp, port: peerPort } = parseAddress(result.source_addresses?.[0] ?? '');
+      const { ip: peerIp, port: peerPort } = parseAddress(networkAddresses[0] ?? '');
       const res = await startDownload(
         result.file.hash,
         result.file.name,
@@ -944,18 +954,28 @@
     const toDownload = filteredResults.filter((r) => checkedKeys.has(resultKey(r)));
     let queued = 0;
     let failed = 0;
+    let skippedLocal = 0;
     for (const result of toDownload) {
+      const networkAddrs = (result.source_addresses ?? []).filter(
+        (a) => a && a !== 'local'
+      );
+      if (networkAddrs.length === 0 && result.result_origin?.includes('Local')) {
+        skippedLocal++;
+        continue;
+      }
       try {
-        const { ip: peerIp, port: peerPort } = parseAddress(result.source_addresses?.[0] ?? '');
+        const { ip: peerIp, port: peerPort } = parseAddress(networkAddrs[0] ?? '');
         await startDownload(result.file.hash, result.file.name, result.file.size, peerIp, peerPort);
         queued++;
       } catch {
         failed++;
       }
     }
-    bulkDownloadMessage = failed > 0
-      ? `Queued ${queued}, failed ${failed}`
-      : `Queued ${queued} download${queued !== 1 ? 's' : ''}`;
+    const parts: string[] = [];
+    if (queued > 0) parts.push(`Queued ${queued}`);
+    if (skippedLocal > 0) parts.push(`${skippedLocal} already in library`);
+    if (failed > 0) parts.push(`${failed} failed`);
+    bulkDownloadMessage = parts.join(', ');
     bulkDownloadPending = false;
     safeTimeout(() => {
       bulkDownloadMessage = '';
@@ -1332,8 +1352,9 @@
             class="{dlRowClass(dlTransfer)}"
             class:spam-row={result.is_spam}
             class:row-checked={checkedKeys.has(rKey)}
-            class:history-completed-row={downloadHistoryMap[result.file.hash] === 'completed'}
-            class:history-cancelled-row={downloadHistoryMap[result.file.hash] === 'cancelled'}
+            class:in-library-row={result.result_origin?.includes('Local')}
+            class:history-completed-row={!result.result_origin?.includes('Local') && downloadHistoryMap[result.file.hash] === 'completed'}
+            class:history-cancelled-row={!result.result_origin?.includes('Local') && downloadHistoryMap[result.file.hash] === 'cancelled'}
             oncontextmenu={(e) => showContextMenu(e, result)}
             ondblclick={() => download(result)}
           >
@@ -1399,7 +1420,9 @@
               </span>
             </td>
             <td class="col-history">
-              {#if downloadHistoryMap[result.file.hash] === 'completed'}
+              {#if result.result_origin?.includes('Local')}
+                <span class="history-badge in-library" title="This file is in your library">In Library</span>
+              {:else if downloadHistoryMap[result.file.hash] === 'completed'}
                 <span class="history-badge history-completed" title="Previously downloaded">Downloaded</span>
               {:else if downloadHistoryMap[result.file.hash] === 'cancelled'}
                 <span class="history-badge history-cancelled" title="Previously cancelled">Cancelled</span>
@@ -2022,6 +2045,11 @@
     letter-spacing: 0.02em;
   }
 
+  .in-library {
+    background: color-mix(in srgb, var(--accent, #3b82f6) 20%, transparent);
+    color: var(--accent, #3b82f6);
+  }
+
   .history-completed {
     background: color-mix(in srgb, var(--success, #22c55e) 20%, transparent);
     color: var(--success, #22c55e);
@@ -2030,6 +2058,10 @@
   .history-cancelled {
     background: color-mix(in srgb, var(--warning, #f59e0b) 20%, transparent);
     color: var(--warning, #f59e0b);
+  }
+
+  :global(tr.in-library-row:not(.row-checked):not(:hover) td) {
+    color: var(--accent, #3b82f6);
   }
 
   :global(tr.history-cancelled-row:not(.row-checked):not(:hover) td) {
