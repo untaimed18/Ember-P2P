@@ -6730,8 +6730,21 @@ pub async fn start_network(
                         }
                         for event in events {
                             match event {
-                                ed2k::server::ServerEvent::ServerList { .. } => {
-                                    // Server list is hardcoded; ignore incoming OP_SERVERLIST.
+                                ed2k::server::ServerEvent::ServerList { data } => {
+                                    if settings.add_servers_from_server {
+                                        let added = state.server_list.add_from_server_list_packet(
+                                            &data,
+                                            settings.filter_servers_by_ip,
+                                            &mut state.ip_filter,
+                                        );
+                                        if added > 0 {
+                                            emit_server_log(&app_handle, &format!("Added {added} servers from server list update"));
+                                            let met_path = state.data_dir.join("server.met");
+                                            if let Err(e) = state.server_list.save_server_met(&met_path) {
+                                                warn!("Failed to save server.met after server list update: {e}");
+                                            }
+                                        }
+                                    }
                                 }
                                 ed2k::server::ServerEvent::StatusUpdate { users, files } => {
                                     if let Some(addr) = state.server_addr {
@@ -7708,7 +7721,24 @@ pub async fn start_network(
                             }
                         }
 
-                        // Server list is hardcoded; skip merging login server list.
+                        // eMule: "Update server list when connecting" —
+                        // process OP_SERVERLIST payload received during login handshake.
+                        if settings.add_servers_from_server {
+                            if let Some(ref list_data) = session.server_list_data {
+                                let added = state.server_list.add_from_server_list_packet(
+                                    list_data,
+                                    settings.filter_servers_by_ip,
+                                    &mut state.ip_filter,
+                                );
+                                if added > 0 {
+                                    emit_server_log(&app_handle, &format!("Added {added} servers from connected server"));
+                                    let met_path = state.data_dir.join("server.met");
+                                    if let Err(e) = state.server_list.save_server_met(&met_path) {
+                                        warn!("Failed to save server.met after login server list: {e}");
+                                    }
+                                }
+                            }
+                        }
 
                         // eMule: send OP_OFFERFILES after login to announce shared files.
                         // Include incomplete .part downloads as partial offers (0xFCFC on newer servers).
