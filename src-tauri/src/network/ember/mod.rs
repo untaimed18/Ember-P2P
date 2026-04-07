@@ -1,3 +1,12 @@
+pub mod crypto;
+pub mod dht;
+pub mod friends;
+pub mod nat;
+pub mod quic;
+pub mod reputation;
+pub mod transfer;
+pub mod transport;
+
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read, Write};
 use std::net::Ipv4Addr;
