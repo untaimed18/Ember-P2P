@@ -56,6 +56,8 @@
   let browseOpen = $state(false);
   let browseFriendHash = $state('');
   let browseFriendName = $state('');
+  let browseFriendIp = $state('');
+  let browseFriendPort = $state(0);
 
   let isDiscoverable = $state(false);
   let processingRequests: Set<string> = $state(new Set());
@@ -115,6 +117,8 @@
   function openBrowse(f: FriendInfo) {
     browseFriendHash = f.user_hash;
     browseFriendName = f.nickname || f.user_hash.slice(0, 8) + '\u2026';
+    browseFriendIp = f.last_ip || '';
+    browseFriendPort = f.last_port || 0;
     browseOpen = true;
   }
 
@@ -418,6 +422,8 @@
   bind:open={browseOpen}
   friendHash={browseFriendHash}
   friendName={browseFriendName}
+  friendLastIp={browseFriendIp}
+  friendLastPort={browseFriendPort}
   onclose={closeBrowse}
 />
 
