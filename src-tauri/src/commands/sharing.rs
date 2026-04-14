@@ -355,11 +355,15 @@ pub async fn add_shared_folder(
                     .collect::<Vec<_>>()
             };
             if !all_files.is_empty() {
-                let _ = network_tx.try_send(NetworkCommand::AnnounceFiles { files: all_files });
+                if let Err(e) = network_tx.try_send(NetworkCommand::AnnounceFiles { files: all_files }) {
+                    warn!("Failed to queue AnnounceFiles: {e}");
+                }
             }
         }
 
-        let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
+        if let Err(e) = network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+            warn!("Failed to queue SharedFilesChanged: {e}");
+        }
         cancel_flags.write().await.remove(&cancel_key);
 
         let from_known = total_files.saturating_sub(total_to_hash);
@@ -426,7 +430,9 @@ pub async fn remove_shared_folder(
     }
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
 
-    let _ = state.network_tx.try_send(NetworkCommand::SharedFilesChanged);
+    if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+        warn!("Failed to queue SharedFilesChanged after folder removal: {e}");
+    }
     let _ = app.emit("shared-files-changed", serde_json::json!({ "folder": path, "removed": true }));
 
     Ok(())
@@ -654,11 +660,15 @@ pub async fn reload_shared_files(
                     .collect::<Vec<_>>()
             };
             if !all_files.is_empty() {
-                let _ = network_tx.try_send(NetworkCommand::AnnounceFiles { files: all_files });
+                if let Err(e) = network_tx.try_send(NetworkCommand::AnnounceFiles { files: all_files }) {
+                    warn!("Failed to queue AnnounceFiles on reload: {e}");
+                }
             }
         }
 
-        let _ = network_tx.try_send(NetworkCommand::SharedFilesChanged);
+        if let Err(e) = network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+            warn!("Failed to queue SharedFilesChanged on reload: {e}");
+        }
         cancel_flags.write().await.remove(&reload_key);
 
         let from_known = total_files.saturating_sub(total_to_hash);
@@ -748,7 +758,9 @@ pub async fn unshare_file(
     };
     if file.is_some() {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        let _ = state.network_tx.try_send(NetworkCommand::SharedFilesChanged);
+        if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+            warn!("Failed to queue SharedFilesChanged after unshare: {e}");
+        }
         info!(
             "Unshared file {}{}",
             file_path,
@@ -773,7 +785,9 @@ pub async fn share_file(
     };
     if file.is_some() {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        let _ = state.network_tx.try_send(NetworkCommand::SharedFilesChanged);
+        if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+            warn!("Failed to queue SharedFilesChanged after share: {e}");
+        }
         info!("Shared file {}", file_path);
     }
     Ok(())
@@ -791,7 +805,9 @@ pub async fn unshare_folder(
     };
     if !affected_hashes.is_empty() {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
-        let _ = state.network_tx.try_send(NetworkCommand::SharedFilesChanged);
+        if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+            warn!("Failed to queue SharedFilesChanged after unshare_folder: {e}");
+        }
         let _ = app.emit("shared-files-changed", serde_json::json!({ "folder": path, "unshared": true }));
     }
     Ok(())
@@ -841,7 +857,9 @@ pub async fn delete_shared_file(
     };
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
 
-    let _ = state.network_tx.try_send(NetworkCommand::SharedFilesChanged);
+    if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+        warn!("Failed to queue SharedFilesChanged after file deletion: {e}");
+    }
     let _ = app.emit("shared-files-changed", serde_json::json!({ "file_deleted": true }));
 
     info!(
