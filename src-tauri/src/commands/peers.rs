@@ -73,11 +73,9 @@ pub async fn add_friend(
         .map_err(|e| format!("Task error: {e}"))?
         .map_err(|e| format!("Failed to save friend: {e}"))?;
 
-    if state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
+    state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
         ember_hash: hash,
-    }).is_err() {
-        tracing::warn!("Network channel full, friend {canonical} will connect on next source exchange");
-    }
+    }).map_err(|e| format!("Network busy: {e}"))?;
 
     Ok(())
 }
@@ -100,9 +98,8 @@ pub async fn remove_friend(
     let mut friends = state.friend_hashes.write().await;
     friends.remove(&hash);
     drop(friends);
-    if let Err(_) = state.network_tx.try_send(NetworkCommand::FriendRemoved { ember_hash: hash }) {
-        tracing::warn!("Network channel full when sending FriendRemoved for {}", hex::encode(hash));
-    }
+    state.network_tx.try_send(NetworkCommand::FriendRemoved { ember_hash: hash })
+        .map_err(|e| format!("Network busy: {e}"))?;
     Ok(())
 }
 
@@ -302,11 +299,9 @@ pub async fn accept_friend_request(
     .map_err(|e| format!("Task error: {e}"))?
     .map_err(|e| format!("Failed to accept friend request: {e}"))?;
 
-    if state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
+    state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
         ember_hash: hash,
-    }).is_err() {
-        tracing::warn!("Network channel full, accepted friend {canonical} will connect on next source exchange");
-    }
+    }).map_err(|e| format!("Network busy: {e}"))?;
 
     Ok(())
 }
@@ -437,11 +432,9 @@ pub async fn ban_peer(
         .map_err(|e| format!("Task error: {e}"))?
         .map_err(|e| format!("Failed to ban peer: {e}"))?;
 
-    if let Err(_) = state.network_tx.try_send(NetworkCommand::BanPeer {
+    state.network_tx.try_send(NetworkCommand::BanPeer {
         peer_id_hex: peer_id,
-    }) {
-        tracing::warn!("Network channel full when sending BanPeer");
-    }
+    }).map_err(|e| format!("Network busy: {e}"))?;
 
     Ok(())
 }
@@ -462,11 +455,9 @@ pub async fn unban_peer(
         .map_err(|e| format!("Task error: {e}"))?
         .map_err(|e| format!("Failed to unban peer: {e}"))?;
 
-    if let Err(_) = state.network_tx.try_send(NetworkCommand::UnbanPeer {
+    state.network_tx.try_send(NetworkCommand::UnbanPeer {
         peer_id_hex: peer_id,
-    }) {
-        tracing::warn!("Network channel full when sending UnbanPeer");
-    }
+    }).map_err(|e| format!("Network busy: {e}"))?;
 
     Ok(())
 }

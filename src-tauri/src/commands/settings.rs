@@ -174,11 +174,9 @@ pub async fn update_settings(
         *live = settings.shared_folders.clone();
     }
 
-    if state.network_tx.try_send(NetworkCommand::UpdateSettings {
+    state.network_tx.try_send(NetworkCommand::UpdateSettings {
         settings: settings.clone(),
-    }).is_err() {
-        tracing::warn!("Network channel full; settings saved to disk but will apply on restart");
-    }
+    }).map_err(|e| format!("Network busy: {e}"))?;
 
     if port_changed {
         Ok("Settings saved. Port changes require an application restart to take effect.".into())

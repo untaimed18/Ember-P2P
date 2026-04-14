@@ -4,11 +4,9 @@
 
 ### F2 — Ember Hash Authentication (Protocol Change)
 **Priority:** HIGH (security) | **Effort:** Large
-**Status:** Deferred — requires protocol-level redesign
+**Status:** DONE
 
-The `ember_hash` used to identify friends is entirely self-reported during the EmuleInfo handshake. There is no cryptographic proof of ownership. An attacker who knows a target friend's ember_hash can impersonate them — receiving chat messages, browsing shared files, and having their messages attributed to the real friend.
-
-**Fix:** Add a challenge-response authentication step after EmuleInfo exchange. The remote must sign a random nonce with a private key corresponding to their claimed `ember_hash`. The hash should be derived from the public key (e.g., `ember_hash = truncated_hash(public_key)`). This is a protocol-breaking change that requires coordination between Ember versions.
+Implemented Ed25519 challenge-response authentication for friend sessions. After EmuleInfo exchange, both peers exchange `OP_EMBER_AUTH_CHALLENGE` (32-byte nonce) and `OP_EMBER_AUTH_RESPONSE` (pubkey + signature). Verification confirms `BLAKE3(pubkey)[0..16] == ember_hash` and the signature is valid. The Ed25519 public key is advertised via a new `ET_EMBER_PUBKEY` (0x57) blob tag in EmuleInfo. Authentication is enforced when both sides support it and skipped gracefully for legacy clients.
 
 ### U4 — Pass Friend as Download Source in Browse Dialog
 **Priority:** MEDIUM (performance) | **Effort:** Small

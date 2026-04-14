@@ -654,7 +654,7 @@ impl Ed2kDownload {
         if skip_emule_info || peer_is_new_emule {
             debug!("Skipping EmuleInfo exchange (already done via obfuscation or Hello eMule tags)");
         } else {
-            let emule_payload = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash));
+            let emule_payload = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash), None);
             write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
 
             let (proto2, opcode2, payload2) = read_packet_with_timeout(&mut reader)
@@ -744,7 +744,7 @@ impl Ed2kDownload {
                         }
                     }
                 }
-                let emule_answer = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash));
+                let emule_answer = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash), None);
                 write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_answer).await?;
                 debug!("Received peer OP_EMULEINFO, replied with OP_EMULEINFOANSWER");
                 pending_secident_challenge = maybe_send_secident_challenge(
@@ -877,7 +877,7 @@ impl Ed2kDownload {
                         }
                     }
                     if o == OP_EMULEINFO {
-                        let emule_answer = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash));
+                        let emule_answer = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash), None);
                         let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_answer).await;
                         debug!("Received delayed peer OP_EMULEINFO, replied with OP_EMULEINFOANSWER");
                     } else {
@@ -1116,7 +1116,7 @@ impl Ed2kDownload {
                         }
                     }
                     if opcode == OP_EMULEINFO {
-                        let emule_answer = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash));
+                        let emule_answer = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash), None);
                         let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_answer).await;
                         debug!("Received peer OP_EMULEINFO during file-status wait, replied");
                     } else {

@@ -1229,7 +1229,7 @@ impl UploadHandler {
                         raw_writer.write_all(&enc).await?;
                         raw_writer.flush().await?;
 
-                        let emule_payload = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash));
+                        let emule_payload = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash), None);
                         let mut epkt = Vec::with_capacity(6 + emule_payload.len());
                         epkt.push(OP_EMULEPROT);
                         epkt.extend_from_slice(&((1 + emule_payload.len()) as u32).to_le_bytes());
@@ -1531,7 +1531,7 @@ impl UploadHandler {
             if !hello_caps.peer_name.is_empty() {
                 ul_peer_name = hello_caps.peer_name.clone();
             }
-            let emule_payload = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash));
+            let emule_payload = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash), None);
             write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_payload).await?;
         } else {
             deferred_packet = Some((proto2, opcode2, payload2));

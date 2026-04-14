@@ -560,6 +560,8 @@ fn spawn_rendezvous_friend_lookup(
     app_handle: &tauri::AppHandle,
     friend_hashes: &crate::app_state::SharedFriendHashes,
     ul_event_tx: &mpsc::Sender<upload_server::UploadEvent>,
+    ed25519_pubkey: [u8; 32],
+    ed25519_secret_key: [u8; 32],
 ) {
     let rv_url = settings.rendezvous_url.clone();
     let our_uh = state.user_hash;
@@ -582,6 +584,7 @@ fn spawn_rendezvous_friend_lookup(
                 let addr = std::net::SocketAddr::new(ip.into(), port);
                 match ed2k::friend_connect::connect_and_send_friend_request(
                     addr, &our_uh, &our_eh, &nick, cid, tcp, udp, obfuscate,
+                    Some(ed25519_pubkey), Some(ed25519_secret_key),
                 ).await {
                     Ok(Some(remote_eh)) => {
                         info!("Rendezvous friend connect to {} succeeded, remote={}", addr, hex::encode(remote_eh));
@@ -599,6 +602,7 @@ fn spawn_rendezvous_friend_lookup(
                                 if let Err(e) = ed2k::friend_connect::open_and_run_friend_session(
                                     addr, our_uh, our_eh, nick,
                                     cid, tcp, udp, obfuscate, sess_fc, ultx_fc.clone(), fh_fc,
+                                    Some(ed25519_pubkey), Some(ed25519_secret_key),
                                 ).await {
                                     info!("Persistent session to {} failed: {e}", addr);
                                     let _ = ultx_fc.send(upload_server::UploadEvent {
@@ -1801,6 +1805,8 @@ pub async fn start_network(
     let local_id = identity.kad_id();
     let user_hash = identity.user_hash;
     let ember_hash = identity.ember_hash;
+    let ed25519_pubkey = identity.ed25519_public_key;
+    let ed25519_secret_key = identity.ed25519_secret_key;
     info!("Local KAD ID: {}…", &local_id.to_hex()[..8]);
 
     let tcp_port = settings.tcp_port;
@@ -2692,6 +2698,8 @@ pub async fn start_network(
                         &friend_hashes,
                         ember_hash,
                         &ul_event_tx,
+                        ed25519_pubkey,
+                        ed25519_secret_key,
                     ).await;
                 }
             }
@@ -2795,6 +2803,8 @@ pub async fn start_network(
                             &friend_hashes,
                             ember_hash,
                             &ul_event_tx,
+                            ed25519_pubkey,
+                            ed25519_secret_key,
                         ).await;
                     }
                 }
@@ -3294,6 +3304,7 @@ pub async fn start_network(
                                 if let Err(e) = ed2k::friend_connect::open_and_run_friend_session(
                                     friend_addr, our_uh, our_eh, nick,
                                     cid, tcp, udp, obfs, sess, ultx, fh,
+                                    Some(ed25519_pubkey), Some(ed25519_secret_key),
                                 ).await {
                                     info!("Proactive friend session to {} failed: {e}", hex::encode(friend_eh));
                                     let _ = ultx2.send(upload_server::UploadEvent {
@@ -3608,6 +3619,8 @@ pub async fn start_network(
                         &friend_hashes,
                         ember_hash,
                         &ul_event_tx,
+                        ed25519_pubkey,
+                        ed25519_secret_key,
                     ).await;
                 }
 
@@ -3893,6 +3906,7 @@ pub async fn start_network(
                             spawn_rendezvous_friend_lookup(
                                 &settings, &state, ember_hash, dc_eh,
                                 &db, &app_handle, &friend_hashes, &ul_event_tx,
+                                ed25519_pubkey, ed25519_secret_key,
                             );
                         } else {
                             debug!("Friend {} reconnect skipped (backoff cooldown)", hash_hex);
@@ -3942,6 +3956,8 @@ pub async fn start_network(
                         &friend_hashes,
                         ember_hash,
                         &ul_event_tx,
+                        ed25519_pubkey,
+                        ed25519_secret_key,
                     ).await;
                 }
             }
@@ -5295,6 +5311,7 @@ pub async fn start_network(
                         spawn_rendezvous_friend_lookup(
                             &settings, &state, ember_hash, *target_hash,
                             &db, &app_handle, &friend_hashes, &ul_event_tx,
+                            ed25519_pubkey, ed25519_secret_key,
                         );
                     }
                 }
@@ -5578,17 +5595,7 @@ pub async fn start_network(
                                     };
 
                                     tracing::info!("Broker: attempting QUIC connect to {addr} for {attempt_key_owned}");
-                                    let result = async {
-                                        let conn = endpoint.connect(addr, "ember-punch")
-                                            .map_err(|e| format!("quinn connect error: {e}"))?
-                                            .await
-                                            .map_err(|e| format!("QUIC handshake failed: {e}"))?;
-                                        let (send, recv) = conn.open_bi().await
-                                            .map_err(|e| format!("open_bi failed: {e}"))?;
-                                        Ok::<_, String>((send, recv))
-                                    }.await;
-
-                                    match result {
+                                    match ember::broker::punch_quic(&endpoint, addr).await {
                                         Ok((send, recv)) => {
                                             tracing::info!("Broker: hole-punch succeeded to {addr}");
                                             let _ = broker_tx.send(ember::broker::BrokerEvent::ConnectionReady(
@@ -5598,6 +5605,7 @@ pub async fn start_network(
                                                     source_ip,
                                                     source_port,
                                                     method: ember::broker::ConnectionMethod::HolePunch,
+                                                    relay_addr: None,
                                                     reader: Box::new(recv),
                                                     writer: Box::new(send),
                                                 },
@@ -5663,6 +5671,7 @@ pub async fn start_network(
                                                         source_ip,
                                                         source_port,
                                                         method: ember::broker::ConnectionMethod::PeerRelay,
+                                                        relay_addr: Some((relay_ip, relay_port)),
                                                         reader: Box::new(recv),
                                                         writer: Box::new(send),
                                                     },
@@ -5697,6 +5706,7 @@ pub async fn start_network(
                                                         source_ip,
                                                         source_port,
                                                         method: ember::broker::ConnectionMethod::ServerRelay,
+                                                        relay_addr: None,
                                                         reader: Box::new(reader),
                                                         writer: Box::new(writer),
                                                     },
@@ -5729,6 +5739,11 @@ pub async fn start_network(
                                 if let Some(ref mut broker) = state.connection_broker {
                                     let key = format!("{}:{}:{}", conn.transfer_id, conn.source_ip, conn.source_port);
                                     broker.mark_succeeded(&key);
+                                    if conn.method == ember::broker::ConnectionMethod::PeerRelay {
+                                        if let Some((relay_ip, relay_port)) = conn.relay_addr {
+                                            broker.increment_relay_sessions(relay_ip, relay_port);
+                                        }
+                                    }
                                 }
                             }
                             ember::broker::BrokerEvent::ConnectionFailed { ref transfer_id, source_ip, source_port, ref reason } => {
@@ -5792,6 +5807,7 @@ pub async fn start_network(
                             spawn_rendezvous_friend_lookup(
                                 &settings, &state, ember_hash, *target_hash,
                                 &db, &app_handle, &friend_hashes, &ul_event_tx,
+                                ed25519_pubkey, ed25519_secret_key,
                             );
                         }
                     }
@@ -9905,7 +9921,7 @@ async fn send_udp_firewall_probe_request(
         anyhow::bail!("expected HelloAnswer from {addr}, got proto=0x{proto:02X} op=0x{opcode:02X}");
     }
 
-    let emule_info = ed2k::messages::build_emule_info(udp_port, obfuscation_enabled, None);
+    let emule_info = ed2k::messages::build_emule_info(udp_port, obfuscation_enabled, None, None);
     write_ed2k_packet_simple(&mut writer, OP_EMULEPROT, ed2k::messages::OP_EMULEINFO, &emule_info).await?;
 
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), read_ed2k_packet_simple(&mut reader)).await;
@@ -11534,6 +11550,8 @@ async fn handle_command(
     friend_hashes: &crate::app_state::SharedFriendHashes,
     ember_hash: [u8; 16],
     ul_event_tx: &mpsc::Sender<upload_server::UploadEvent>,
+    ed25519_pubkey: [u8; 32],
+    ed25519_secret_key: [u8; 32],
 ) {
     match cmd {
         NetworkCommand::SearchFiles { query, method: _, request_id, tx, search_filters } => {
@@ -13134,6 +13152,7 @@ async fn handle_command(
                                 match ed2k::friend_connect::open_and_run_friend_session(
                                     addr, our_user_hash, our_ember_hash, nickname,
                                     client_id, tcp, udp, obfs, sessions_clone.clone(), ul_tx, fh,
+                                    Some(ed25519_pubkey), Some(ed25519_secret_key),
                                 ).await {
                                     Ok(handle) => {
                                         let msg_bytes = msg.as_bytes();
@@ -13199,6 +13218,7 @@ async fn handle_command(
                                     let addr = std::net::SocketAddr::new(ip.into(), port);
                                     match ed2k::friend_connect::open_and_run_friend_session(
                                         addr, our_uh, our_eh, nick, cid, tcp, udp, obfs, sess, ultx, fh,
+                                        Some(ed25519_pubkey), Some(ed25519_secret_key),
                                     ).await {
                                         Ok(handle) => {
                                             let msg_bytes = msg.as_bytes();
@@ -13296,6 +13316,7 @@ async fn handle_command(
                                     match ed2k::friend_connect::open_and_run_friend_session(
                                         addr, our_user_hash, our_ember_hash, nickname,
                                         client_id, tcp, udp, obfs, sessions_clone.clone(), ul_tx, fh,
+                                        Some(ed25519_pubkey), Some(ed25519_secret_key),
                                     ).await {
                                         Ok(handle) => {
                                             let mut packet = Vec::with_capacity(6);
@@ -13341,6 +13362,7 @@ async fn handle_command(
                                         let addr = std::net::SocketAddr::new(ip.into(), port);
                                         match ed2k::friend_connect::open_and_run_friend_session(
                                             addr, our_uh, our_eh, nick, cid, tcp, udp, obfs, sess, ultx, fh,
+                                            Some(ed25519_pubkey), Some(ed25519_secret_key),
                                         ).await {
                                             Ok(handle) => {
                                                 let mut packet = Vec::with_capacity(6);
@@ -13408,6 +13430,8 @@ async fn handle_command(
                     tcp,
                     udp,
                     obfs,
+                    Some(ed25519_pubkey),
+                    Some(ed25519_secret_key),
                 ).await {
                     Ok(Some(remote_eh)) => {
                         info!("Friend connect to {} succeeded, remote ember_hash={}", addr, hex::encode(remote_eh));
@@ -13425,6 +13449,7 @@ async fn handle_command(
                                 if let Err(e) = ed2k::friend_connect::open_and_run_friend_session(
                                     addr, our_user_hash, our_ember_hash, nickname,
                                     client_id, tcp, udp, obfs, sess, ultx.clone(), fh,
+                                    Some(ed25519_pubkey), Some(ed25519_secret_key),
                                 ).await {
                                     info!("Persistent session to {} failed: {e}", addr);
                                     let _ = ultx.send(upload_server::UploadEvent {
@@ -13463,6 +13488,7 @@ async fn handle_command(
                 spawn_rendezvous_friend_lookup(
                     &settings, &state, ember_hash, target_hash,
                     &db, &app_handle, &friend_hashes, &ul_event_tx,
+                    ed25519_pubkey, ed25519_secret_key,
                 );
             }
         }
@@ -13484,6 +13510,7 @@ async fn handle_command(
             spawn_rendezvous_friend_lookup(
                 &settings, &state, ember_hash, target_hash,
                 &db, &app_handle, &friend_hashes, &ul_event_tx,
+                ed25519_pubkey, ed25519_secret_key,
             );
 
             let _ = tx.send(Ok(()));
@@ -13530,6 +13557,7 @@ async fn handle_command(
                             addr, our_user_hash, ember_hash, nickname,
                             client_id, tcp, udp, obfs,
                             sessions, ul_tx, fh,
+                            Some(ed25519_pubkey), Some(ed25519_secret_key),
                         ).await {
                             Ok(_handle) => {
                                 info!("Outbound friend session to {} established", hex::encode(target_hash));
@@ -13551,6 +13579,7 @@ async fn handle_command(
                 spawn_rendezvous_friend_lookup(
                     &settings, &state, ember_hash, target_hash,
                     &db, &app_handle, &friend_hashes, &ul_event_tx,
+                    ed25519_pubkey, ed25519_secret_key,
                 );
                 let _ = tx.send(Ok(()));
             }
