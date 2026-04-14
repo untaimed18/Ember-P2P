@@ -221,21 +221,18 @@ impl FirewallChecker {
 
         if self.udp_firewall_succeeded {
             self.udp_status = FirewallStatus::Open;
-        } else if self.udp_firewall_responses_received >= MIN_UDP_FAILURE_CHECKS
-            && self.udp_status != FirewallStatus::Open
-        {
+        } else if self.udp_status != FirewallStatus::Open && self.udp_requests_sent > 0 {
+            // We sent probes but never got a success response.
+            // If we were already confirmed Open, keep that (transient non-response
+            // shouldn't downgrade). Otherwise, conclude Firewalled — including
+            // transitioning out of Unknown, which is the initial state.
             self.udp_status = FirewallStatus::Firewalled;
-            info!("UDP firewall check complete: FIREWALLED");
-        } else if self.udp_requests_sent >= MIN_UDP_FAILURE_CHECKS
-            && self.udp_firewall_responses_received == 0
-        {
-            // No UDP firewall replies at all this cycle (common with transient routing/contact issues).
-            // Preserve current status instead of forcing a false firewalled conclusion.
             info!(
-                "UDP firewall check got no replies (sent {}, recv 0) - keeping previous status {:?}",
-                self.udp_requests_sent,
-                self.udp_status
+                "UDP firewall check complete: FIREWALLED (sent {}, success_replies 0)",
+                self.udp_requests_sent
             );
+        } else if self.udp_requests_sent == 0 && self.udp_status == FirewallStatus::Unknown {
+            info!("UDP firewall check: no probes dispatched, status remains Unknown");
         }
 
         true
