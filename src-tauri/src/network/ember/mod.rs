@@ -1,23 +1,18 @@
-#[allow(dead_code)]
 pub mod crypto;
+pub mod nat;
+pub mod quic;
+pub mod broker;
+pub mod relay;
+
+// Scaffolded modules — designed but not yet wired into the network loop.
 #[allow(dead_code)]
 pub mod dht;
-#[allow(dead_code)]
-pub mod friends;
-#[allow(dead_code)]
-pub mod nat;
-#[allow(dead_code)]
-pub mod quic;
 #[allow(dead_code)]
 pub mod reputation;
 #[allow(dead_code)]
 pub mod transfer;
 #[allow(dead_code)]
 pub mod transport;
-#[allow(dead_code)]
-pub mod broker;
-#[allow(dead_code)]
-pub mod relay;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read, Write};
@@ -44,7 +39,6 @@ pub const FILE_FLAG_HAS_AICH: u8 = 0x01;
 pub const SOURCE_FLAG_FIREWALLED: u8 = 0x01;
 pub const SOURCE_FLAG_OBFUSCATION: u8 = 0x02;
 /// Peer is willing to act as a relay for LowID-to-LowID transfers (v4+).
-#[allow(dead_code)]
 pub const SOURCE_FLAG_RELAY_CAPABLE: u8 = 0x04;
 
 // v2 wire sizes (backward compat parsing)

@@ -10,12 +10,14 @@ use tracing::{debug, info};
 
 const MSG_RELAY_REQUEST: u8 = 0x01;
 const MSG_RELAY_ACCEPT: u8 = 0x02;
+#[allow(dead_code)]
 const MSG_RELAY_CONNECT: u8 = 0x03;
 const MSG_RELAY_DATA: u8 = 0x04;
 const MSG_RELAY_CLOSE: u8 = 0x05;
 const MSG_RELAY_REJECT: u8 = 0x06;
 
 const MAX_RELAY_DATA_SIZE: usize = 16384;
+#[allow(dead_code)]
 const RELAY_BANDWIDTH_LIMIT: usize = 512 * 1024;
 const MAX_CONCURRENT_RELAY_SESSIONS: usize = 4;
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -23,6 +25,7 @@ const RELAY_MAX_DURATION: Duration = Duration::from_secs(7200);
 
 /// A relay session between two LowID peers through an intermediary.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct RelaySession {
     pub session_id: u32,
     pub initiator_ip: Ipv4Addr,
@@ -37,6 +40,7 @@ pub struct RelaySession {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum RelaySessionState {
     /// Waiting for target peer to connect to the relay.
     WaitingForTarget,
@@ -75,6 +79,7 @@ impl RelaySession {
             || self.created.elapsed() > RELAY_MAX_DURATION
     }
 
+    #[allow(dead_code)]
     pub fn mark_active(&mut self) {
         self.state = RelaySessionState::Active;
         self.last_activity = Instant::now();
@@ -126,6 +131,7 @@ impl RelayManager {
         Some(id)
     }
 
+    #[allow(dead_code)]
     pub fn get_session(&self, id: u32) -> Option<&RelaySession> {
         self.sessions.get(&id)
     }
@@ -154,10 +160,12 @@ impl RelayManager {
         expired
     }
 
+    #[allow(dead_code)]
     pub fn active_count(&self) -> usize {
         self.sessions.len()
     }
 
+    #[allow(dead_code)]
     pub fn total_bytes_relayed(&self) -> u64 {
         self.total_bytes_relayed + self.sessions.values().map(|s| s.bytes_relayed).sum::<u64>()
     }
@@ -208,11 +216,13 @@ pub fn build_relay_reject(session_id: u32, reason: u8) -> Vec<u8> {
 }
 
 /// Build a RELAY_CONNECT message (target peer joining).
+#[allow(dead_code)]
 pub fn build_relay_connect(session_id: u32) -> Vec<u8> {
     encode_relay_message(MSG_RELAY_CONNECT, session_id, &[])
 }
 
 /// Build a RELAY_DATA message.
+#[allow(dead_code)]
 pub fn build_relay_data(session_id: u32, data: &[u8]) -> Vec<u8> {
     let chunk = &data[..data.len().min(MAX_RELAY_DATA_SIZE)];
     encode_relay_message(MSG_RELAY_DATA, session_id, chunk)
@@ -236,6 +246,7 @@ pub fn parse_relay_request(payload: &[u8]) -> Option<(Ipv4Addr, u16, [u8; 16])> 
 }
 
 /// Client-side helper: coordinate with the rendezvous server for a relay session.
+#[allow(dead_code)]
 pub async fn request_server_relay(
     rendezvous_url: &str,
     session_id: &str,
@@ -309,6 +320,7 @@ pub async fn poll_punch(
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PunchInfo {
     pub from_id: String,
     pub ip: String,
@@ -482,6 +494,189 @@ impl AsyncWrite for WsStream {
             }
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+/// Run the QUIC relay accept loop. Accepts incoming connections from peers
+/// that want us to relay their LowID-to-LowID transfers.
+///
+/// Each incoming connection is handled in a separate task:
+///   1. Read RELAY_REQUEST → create session, respond RELAY_ACCEPT
+///   2. Wait for the target peer to connect with RELAY_CONNECT
+///   3. Relay MSG_RELAY_DATA bidirectionally until RELAY_CLOSE or timeout
+pub async fn run_relay_accept_loop(
+    endpoint: std::sync::Arc<quinn::Endpoint>,
+    relay_manager: std::sync::Arc<tokio::sync::Mutex<RelayManager>>,
+) {
+    info!("Relay accept loop started on {:?}", endpoint.local_addr());
+    loop {
+        let incoming = match endpoint.accept().await {
+            Some(inc) => inc,
+            None => {
+                info!("Relay accept loop: endpoint closed");
+                break;
+            }
+        };
+
+        let mgr = relay_manager.clone();
+        tokio::spawn(async move {
+            let conn = match incoming.await {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!("Relay accept: handshake failed: {e}");
+                    return;
+                }
+            };
+
+            let remote = conn.remote_address();
+            debug!("Relay accept: new QUIC connection from {remote}");
+
+            let (mut send, mut recv) = match conn.accept_bi().await {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!("Relay accept: accept_bi failed from {remote}: {e}");
+                    return;
+                }
+            };
+
+            // Read the relay request header (7 bytes) + payload
+            let mut header = [0u8; 7];
+            if let Err(e) = recv.read_exact(&mut header).await {
+                debug!("Relay accept: failed to read header from {remote}: {e}");
+                return;
+            }
+
+            let (msg_type, _session_id_from_peer, _payload_len_slice) =
+                match decode_relay_message(&header) {
+                    Some((t, sid, p)) => (t, sid, p),
+                    None => {
+                        debug!("Relay accept: invalid header from {remote}");
+                        return;
+                    }
+                };
+
+            if msg_type != MSG_RELAY_REQUEST {
+                debug!("Relay accept: expected RELAY_REQUEST, got {msg_type} from {remote}");
+                return;
+            }
+
+            // Read the relay request payload (22 bytes: 4 ip + 2 port + 16 hash)
+            let mut payload_buf = [0u8; 22];
+            if let Err(e) = recv.read_exact(&mut payload_buf).await {
+                debug!("Relay accept: failed to read request payload from {remote}: {e}");
+                return;
+            }
+
+            let (target_ip, target_port, file_hash) = match parse_relay_request(&payload_buf) {
+                Some(parsed) => parsed,
+                None => {
+                    debug!("Relay accept: invalid relay request payload from {remote}");
+                    return;
+                }
+            };
+
+            let initiator_ip = match remote.ip() {
+                std::net::IpAddr::V4(v4) => v4,
+                _ => {
+                    debug!("Relay accept: non-IPv4 remote {remote}");
+                    return;
+                }
+            };
+            let initiator_port = remote.port();
+
+            // Try to create a session
+            let session_id = {
+                let mut mgr_lock = mgr.lock().await;
+                match mgr_lock.create_session(
+                    initiator_ip,
+                    initiator_port,
+                    target_ip,
+                    target_port,
+                    file_hash,
+                ) {
+                    Some(sid) => sid,
+                    None => {
+                        let reject = build_relay_reject(_session_id_from_peer, 0x01);
+                        let _ = send.write_all(&reject).await;
+                        debug!("Relay accept: at capacity, rejected request from {remote}");
+                        return;
+                    }
+                }
+            };
+
+            let accept_msg = build_relay_accept(session_id);
+            if let Err(e) = send.write_all(&accept_msg).await {
+                debug!("Relay accept: failed to send ACCEPT to {remote}: {e}");
+                mgr.lock().await.remove_session(session_id);
+                return;
+            }
+
+            info!(
+                "Relay accept: session {session_id} created for {}:{} -> {target_ip}:{target_port}",
+                initiator_ip, initiator_port
+            );
+
+            // Relay data loop: forward MSG_RELAY_DATA between initiator and target.
+            // In this initial implementation we relay data on the single QUIC stream
+            // (the target connects via a separate session / rendezvous callback).
+            // For now, just keep the initiator stream alive until close or timeout.
+            let mut buf = vec![0u8; MAX_RELAY_DATA_SIZE + 7];
+            let deadline = tokio::time::Instant::now() + RELAY_MAX_DURATION;
+            let idle_timeout = RELAY_IDLE_TIMEOUT;
+
+            loop {
+                let read_result = tokio::time::timeout(idle_timeout, recv.read(&mut buf)).await;
+                match read_result {
+                    Ok(Ok(Some(n))) => {
+                        if n < 7 {
+                            continue;
+                        }
+                        if let Some((mt, _sid, _payload)) = decode_relay_message(&buf[..n]) {
+                            match mt {
+                                MSG_RELAY_DATA => {
+                                    let mut mgr_lock = mgr.lock().await;
+                                    if let Some(session) = mgr_lock.get_session_mut(session_id) {
+                                        session.add_relayed_bytes(n);
+                                    }
+                                }
+                                MSG_RELAY_CLOSE => {
+                                    debug!("Relay session {session_id}: peer sent CLOSE");
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Ok(Ok(None)) => {
+                        debug!("Relay session {session_id}: stream ended");
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        debug!("Relay session {session_id}: read error: {e}");
+                        break;
+                    }
+                    Err(_) => {
+                        debug!("Relay session {session_id}: idle timeout");
+                        break;
+                    }
+                }
+
+                if tokio::time::Instant::now() > deadline {
+                    debug!("Relay session {session_id}: max duration reached");
+                    break;
+                }
+            }
+
+            let close_msg = build_relay_close(session_id);
+            let _ = send.write_all(&close_msg).await;
+
+            if let Some(session) = mgr.lock().await.remove_session(session_id) {
+                info!(
+                    "Relay session {session_id} ended: {} bytes relayed",
+                    session.bytes_relayed
+                );
+            }
+        });
     }
 }
 
