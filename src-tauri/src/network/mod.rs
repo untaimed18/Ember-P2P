@@ -5344,13 +5344,66 @@ pub async fn start_network(
                 state.dht_store.cleanup_expired();
 
                 // Prune stale pending KAD callbacks (older than 2 minutes)
+                // and mark the corresponding source details as Failed so the
+                // UI no longer shows them stuck in "Connecting".
                 {
                     let now = chrono::Utc::now().timestamp();
+                    let mut expired_ips: Vec<std::net::Ipv4Addr> = Vec::new();
                     let mut cbs = pending_kad_callbacks.lock().await;
-                    for entries in cbs.values_mut() {
+                    for (ip, entries) in cbs.iter_mut() {
+                        let before = entries.len();
                         entries.retain(|&(_, _, ts)| now - ts < 120);
+                        if entries.len() < before {
+                            expired_ips.push(*ip);
+                        }
                     }
                     cbs.retain(|_, v| !v.is_empty());
+                    drop(cbs);
+
+                    if !expired_ips.is_empty() {
+                        let mut mgr = transfer_manager.write().await;
+                        for ip in &expired_ips {
+                            let ip_str = ip.to_string();
+                            for tid in state.pending_downloads.keys() {
+                                let sources = mgr.get_source_details(tid);
+                                for src in &sources {
+                                    if src.ip == ip_str
+                                        && src.status == crate::types::SourceStatus::Connecting
+                                        && (src.client_software == "KAD Callback"
+                                            || src.client_software == "KAD Direct Callback")
+                                    {
+                                        mgr.update_source_detail(
+                                            tid,
+                                            crate::types::SourceInfo {
+                                                ip: ip_str.clone(),
+                                                port: src.port,
+                                                status: crate::types::SourceStatus::Failed,
+                                                queue_rank: None,
+                                                speed: 0,
+                                                transferred: 0,
+                                                client_software: src.client_software.clone(),
+                                                peer_name: String::new(),
+                                                available_parts: None,
+                                                total_parts: None,
+                                                country_code: None,
+                                                source_origin: src.source_origin.clone(),
+                                            },
+                                        );
+                                        let _ = app_handle.emit(
+                                            "transfer-source-detail",
+                                            serde_json::json!({
+                                                "transfer_id": tid,
+                                                "ip": ip_str,
+                                                "port": src.port,
+                                                "status": "failed",
+                                                "client_software": src.client_software,
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Prune stale outbound session tasks (older than 10 minutes)
