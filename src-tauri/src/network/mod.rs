@@ -132,6 +132,12 @@ async fn handle_epx_sources(
             if total_sources_this_event >= ember::MAX_EPX_TOTAL_SOURCES {
                 break;
             }
+            // Collect relay-capable peers for LowID-to-LowID broker
+            if flags & ember::SOURCE_FLAG_RELAY_CAPABLE != 0 {
+                if let Some(ref mut broker) = state.connection_broker {
+                    broker.add_relay_candidate(ip, port);
+                }
+            }
             if flags & ember::SOURCE_FLAG_FIREWALLED != 0 && (state.firewalled || state.low_id) {
                 continue;
             }
@@ -1180,6 +1186,12 @@ struct NetworkState {
     /// Shared registry of active download trackers — the shutdown path iterates
     /// this to persist `.part.met` files when download tasks are aborted.
     tracker_registry: SharedTrackerRegistry,
+    /// Cached NAT type info for LowID-to-LowID hole-punch decisions
+    nat_info: ember::nat::NatInfo,
+    /// Connection broker for LowID-to-LowID transfers via hole-punch/relay
+    connection_broker: Option<ember::broker::ConnectionBroker>,
+    /// Broker event receiver (fed by ConnectionBroker, consumed in main select loop)
+    broker_event_rx: Option<mpsc::Receiver<ember::broker::BrokerEvent>>,
 }
 
 /// Filter search results by file type, matching eMule's AddToList behavior:
@@ -2127,6 +2139,9 @@ pub async fn start_network(
         friend_search_started_at: None,
         friend_reconnect_last: HashMap::new(),
         tracker_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        nat_info: ember::nat::NatInfo::unknown(),
+        connection_broker: None,
+        broker_event_rx: None,
     };
 
     // Load known files for hash cache
@@ -3385,7 +3400,23 @@ pub async fn start_network(
                                 "wait_callback" => pfs.set_wait_callback(v4, port),
                                 "wait_callback_kad" => pfs.set_wait_callback_kad(v4, port),
                                 "too_many_conns" => pfs.set_too_many_conns(v4, port),
-                                "low_to_low" => pfs.set_low_to_low(v4, port),
+                                "low_to_low" => {
+                                    let file_hash = pfs.file_hash();
+                                    let broker_started = if let Some(ref mut broker) = state.connection_broker {
+                                        let ext = state.nat_info.external_addr;
+                                        broker.attempt_low_to_low(
+                                            transfer_id, file_hash, v4, port,
+                                            state.nat_info.nat_type, ext,
+                                        ).await
+                                    } else {
+                                        false
+                                    };
+                                    if broker_started {
+                                        pfs.set_ember_relay(v4, port);
+                                    } else {
+                                        pfs.set_low_to_low(v4, port);
+                                    }
+                                }
                                 "banned" => pfs.set_banned(v4, port),
                                 _ => {}
                             }
@@ -4230,7 +4261,21 @@ pub async fn start_network(
                                             state.ember_payload_dirty = true;
                                         }
                                         if state.firewalled || state.low_id {
-                                            pfs.set_low_to_low(cb_src.ip, cb_src.tcp_port);
+                                            // Instead of giving up, try broker for LowID-to-LowID
+                                            let broker_started = if let Some(ref mut broker) = state.connection_broker {
+                                                let ext = state.nat_info.external_addr;
+                                                broker.attempt_low_to_low(
+                                                    &transfer_id, fh, cb_src.ip, cb_src.tcp_port,
+                                                    state.nat_info.nat_type, ext,
+                                                ).await
+                                            } else {
+                                                false
+                                            };
+                                            if broker_started {
+                                                pfs.set_ember_relay(cb_src.ip, cb_src.tcp_port);
+                                            } else {
+                                                pfs.set_low_to_low(cb_src.ip, cb_src.tcp_port);
+                                            }
                                         } else {
                                             pfs.set_wait_callback_kad(cb_src.ip, cb_src.tcp_port);
                                         }
@@ -5175,6 +5220,16 @@ pub async fn start_network(
                     });
                     state.rendezvous_registered = true;
                     state.rendezvous_last_register = Some(std::time::Instant::now());
+
+                    // Initialize the LowID-to-LowID connection broker
+                    if state.connection_broker.is_none() {
+                        let (broker_tx, broker_rx) = mpsc::channel(32);
+                        state.connection_broker = Some(ember::broker::ConnectionBroker::new(
+                            settings.rendezvous_url.clone(),
+                            broker_tx,
+                        ));
+                        state.broker_event_rx = Some(broker_rx);
+                    }
                 }
 
                 // Initial friend search burst: look up all offline friends
@@ -5410,6 +5465,52 @@ pub async fn start_network(
                 {
                     let now = std::time::Instant::now();
                     state.outbound_session_tasks.retain(|_, started| now.duration_since(*started).as_secs() < 600);
+                }
+
+                // Tick the connection broker (clean up expired attempts)
+                if let Some(ref mut broker) = state.connection_broker {
+                    broker.tick().await;
+                }
+
+                // Drain broker events (punch/relay coordination)
+                if let Some(ref mut rx) = state.broker_event_rx {
+                    while let Ok(event) = rx.try_recv() {
+                        match event {
+                            ember::broker::BrokerEvent::StartPunch { ref attempt_key, source_ip, source_port, our_external_addr, our_nat_type, .. } => {
+                                tracing::info!("Broker: initiating hole-punch for {} -> {}:{} (ext={})", attempt_key, source_ip, source_port, our_external_addr);
+                                let rv_url = settings.rendezvous_url.clone();
+                                let ember_hash_hex = hex::encode(ember_hash);
+                                let target_hex = format!("{:08x}{:04x}", u32::from(source_ip), source_port);
+                                let target_hex = format!("{:0>64}", target_hex);
+                                let port = our_external_addr.port();
+                                let nat_type_val = our_nat_type.as_u8();
+                                tokio::spawn(async move {
+                                    let _ = ember::relay::register_punch(
+                                        &rv_url, &ember_hash_hex, &target_hex, port, nat_type_val,
+                                    ).await;
+                                });
+                            }
+                            ember::broker::BrokerEvent::StartRelay { ref attempt_key, source_ip, source_port, relay_addr, .. } => {
+                                tracing::info!("Broker: initiating relay for {} -> {}:{} (relay={:?})", attempt_key, source_ip, source_port, relay_addr);
+                            }
+                            ember::broker::BrokerEvent::ConnectionReady(conn) => {
+                                tracing::info!("Broker: connection ready for transfer {} from {}:{} via {:?}", conn.transfer_id, conn.source_ip, conn.source_port, conn.method);
+                            }
+                            ember::broker::BrokerEvent::ConnectionFailed { ref transfer_id, source_ip, source_port, ref reason } => {
+                                tracing::warn!("Broker: all methods failed for {}:{} (transfer {}): {}", source_ip, source_port, transfer_id, reason);
+                                // Fall back to marking as LowToLowIp
+                                if let Some(pfs) = state.per_file_sources.get_mut(transfer_id) {
+                                    pfs.set_low_to_low(source_ip, source_port);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Periodic NAT reprobe (every 5 minutes)
+                if state.nat_info.needs_reprobe() && state.external_ip.is_some() {
+                    let nat_info = ember::nat::probe_nat(&udp_socket).await;
+                    state.nat_info = nat_info;
                 }
 
                 // Auto-retry offline friends via rendezvous for the
