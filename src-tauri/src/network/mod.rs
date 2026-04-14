@@ -11467,7 +11467,8 @@ async fn handle_command(
                 }
             }
 
-            let local_results: Vec<SearchResult> = Vec::new();
+            let mut tx = Some(tx);
+            let mut local_results: Option<Vec<SearchResult>> = Some(Vec::new());
             let file_type_filter = search_filters.as_ref().and_then(|f| f.file_type.clone());
             let mut active_request = ActiveSearchRequest {
                 request_id,
@@ -11477,12 +11478,11 @@ async fn handle_command(
                 file_type_filter: file_type_filter.clone(),
             };
 
-            // All searches go through KAD only; ED2K servers are used for
-            // source gathering, not file search.
-
             let keywords = kad::publish::extract_keywords(&query);
             if keywords.is_empty() {
-                let _ = tx.send(local_results);
+                if let Some(tx) = tx.take() {
+                    let _ = tx.send(local_results.take().unwrap_or_default());
+                }
                 let _ = app_handle.emit(
                     "search-complete",
                     SearchCompleteEvent { request_id },
@@ -11490,62 +11490,113 @@ async fn handle_command(
                 return;
             }
 
-            let Some(primary_keyword) = keywords.iter().max_by_key(|k| k.len()) else {
-                warn!("KAD search: no keywords after parsing query");
-                let _ = tx.send(local_results);
-                let _ = app_handle.emit(
-                    "search-complete",
-                    SearchCompleteEvent { request_id },
-                );
-                return;
-            };
-            let keyword_hash = kad::publish::keyword_to_kad_id(primary_keyword);
-            info!("Searching KAD ({} keywords) -> hash {}", keywords.len(), keyword_hash);
-
-            let closest = state
-                .routing_table
-                .find_closest_prefer_verified(&keyword_hash, SEARCH_INITIAL_CONTACTS);
-
-            if closest.is_empty() {
-                let _ = tx.send(local_results);
-                let _ = app_handle.emit(
-                    "search-complete",
-                    SearchCompleteEvent { request_id },
-                );
-                return;
+            // --- TCP server search ---
+            if state.server_connected {
+                if let Some(mut conn) = state.server_connection.take() {
+                    match conn.send_search_async(&query).await {
+                        Ok(()) => {
+                            active_request.server_pending = true;
+                            state.pending_server_search = Some(PendingServerSearch {
+                                tx: None,
+                                results: Vec::new(),
+                                request_id,
+                            });
+                            state.server_search_age = 0;
+                            info!("TCP server search started for '{query}'");
+                        }
+                        Err(e) => {
+                            warn!("TCP server search failed to send: {e}");
+                        }
+                    }
+                    state.server_connection = Some(conn);
+                }
             }
 
+            // --- UDP global search ---
             let kad_file_type = search_filters.as_ref().and_then(|f| f.file_type.clone());
             let search_terms = kad::messages::build_search_expression(&keywords, kad_file_type.as_deref());
 
-            stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::Kad, crate::storage::statistics::OverheadDirection::Upload, 64);
-            let sid = state.search_manager.start_search(
-                keyword_hash,
-                SearchType::FindKeyword,
-                closest,
-            );
+            let udp_expr = if search_terms.is_empty() {
+                let kw = keywords.first().map(|s| s.as_str()).unwrap_or("");
+                let bytes = kw.as_bytes();
+                let mut buf = Vec::with_capacity(3 + bytes.len());
+                buf.push(0x01);
+                buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(bytes);
+                buf
+            } else {
+                search_terms.clone()
+            };
 
-            if sid == SearchId(0) {
-                let _ = tx.send(local_results);
-                let _ = app_handle.emit(
-                    "search-complete",
-                    SearchCompleteEvent { request_id },
+            let servers = state.server_list.servers();
+            for server in servers {
+                if let Some(pkt) = ServerUdpSocket::build_global_search_packet(server, &udp_expr) {
+                    state.udp_search_queue.push_back(pkt);
+                }
+            }
+            if !state.udp_search_queue.is_empty() {
+                active_request.udp_pending = true;
+                state.server_udp_search_age = 0;
+                info!("UDP global search queued for {} servers", state.udp_search_queue.len());
+            }
+
+            // --- KAD search ---
+            let kad_started = 'kad: {
+                let Some(primary_keyword) = keywords.iter().max_by_key(|k| k.len()) else {
+                    break 'kad false;
+                };
+                let keyword_hash = kad::publish::keyword_to_kad_id(primary_keyword);
+                info!("Searching KAD ({} keywords) -> hash {}", keywords.len(), keyword_hash);
+
+                let closest = state
+                    .routing_table
+                    .find_closest_prefer_verified(&keyword_hash, SEARCH_INITIAL_CONTACTS);
+
+                if closest.is_empty() {
+                    info!("KAD search: no closest contacts in routing table");
+                    break 'kad false;
+                }
+
+                stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::Kad, crate::storage::statistics::OverheadDirection::Upload, 64);
+                let sid = state.search_manager.start_search(
+                    keyword_hash,
+                    SearchType::FindKeyword,
+                    closest,
                 );
-                return;
+
+                if sid == SearchId(0) {
+                    info!("KAD search: rejected (too many active searches)");
+                    break 'kad false;
+                }
+                if let Some(search) = state.search_manager.get_mut(&sid) {
+                    search.search_terms_data = search_terms;
+                }
+                active_request.kad_pending = true;
+                state.pending_keyword_searches.insert(sid, PendingKeywordSearch {
+                    tx: tx.take().unwrap(),
+                    local_results: local_results.take().unwrap_or_default(),
+                    keywords,
+                    request_id,
+                    last_streamed_count: 0,
+                    file_type_filter,
+                });
+                true
+            };
+
+            if !kad_started {
+                if let Some(tx) = tx.take() {
+                    let _ = tx.send(local_results.take().unwrap_or_default());
+                }
+                if !active_request.server_pending && !active_request.udp_pending {
+                    let _ = app_handle.emit(
+                        "search-complete",
+                        SearchCompleteEvent { request_id },
+                    );
+                    return;
+                }
             }
-            if let Some(search) = state.search_manager.get_mut(&sid) {
-                search.search_terms_data = search_terms;
-            }
-            active_request.kad_pending = true;
+
             state.active_search_request = Some(active_request);
-            state.pending_keyword_searches.insert(sid, PendingKeywordSearch {
-                tx,
-                local_results,
-                keywords,
-                request_id,
-                last_streamed_count: 0,
-                file_type_filter,
-            });
         }
 
         NetworkCommand::CancelSearch { request_id } => {
