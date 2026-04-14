@@ -71,6 +71,7 @@
     } catch (e: unknown) {
       toastError(toErr(e));
       loadedCollection = null;
+      collectionsOpen = false;
     } finally {
       collectionLoading = false;
     }
