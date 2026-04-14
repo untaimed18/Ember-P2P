@@ -12,19 +12,18 @@
   );
 
   const navItems = [
-    { href: '/', label: 'KAD Network', id: 'kad', aliases: ['/kad-network'] },
+    { href: '/', label: 'KAD Network', id: 'kad' },
     { href: '/search', label: 'Search', id: 'search' },
     { href: '/transfers', label: 'Transfers', id: 'transfers' },
     { href: '/library', label: 'Library', id: 'library' },
     { href: '/friends', label: 'Friends', id: 'friends' },
     { href: '/statistics', label: 'Statistics', id: 'statistics' },
     { href: '/security', label: 'Security', id: 'security' },
-    { href: '/servers', label: 'Servers', id: 'servers' },
     { href: '/settings', label: 'Settings', id: 'settings' },
   ];
 
   function isActive(item: typeof navItems[0], pathname: string): boolean {
-    return pathname === item.href || (item.aliases?.some((a) => pathname === a) ?? false);
+    return pathname === item.href;
   }
 
   function navigate(e: MouseEvent, href: string) {
@@ -97,15 +96,6 @@
               <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M10 2L3 6v4c0 4.4 3 8.5 7 10 4-1.5 7-5.6 7-10V6l-7-4z"/>
                 <polyline points="7,10 9.5,12.5 13.5,7.5"/>
-              </svg>
-            {:else if item.id === 'servers'}
-              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="3" y="2" width="14" height="5" rx="1"/>
-                <rect x="3" y="9" width="14" height="5" rx="1"/>
-                <circle cx="6" cy="4.5" r="0.75" fill="currentColor" stroke="none"/>
-                <circle cx="6" cy="11.5" r="0.75" fill="currentColor" stroke="none"/>
-                <line x1="10" y1="16" x2="10" y2="18"/>
-                <line x1="7" y1="18" x2="13" y2="18"/>
               </svg>
             {:else if item.id === 'settings'}
               <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
