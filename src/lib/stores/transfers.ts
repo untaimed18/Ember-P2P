@@ -68,9 +68,9 @@ function flushProgress() {
         progress: p.progress,
         speed: p.speed,
         status: existing.status === 'searching' || existing.status === 'queued' ? existing.status : 'active',
-        health: 'healthy',
-        health_reason: undefined,
-        stalled_since: undefined,
+        health: existing.health === 'stalled' ? 'healthy' : existing.health,
+        health_reason: existing.health === 'stalled' ? undefined : existing.health_reason,
+        stalled_since: existing.health === 'stalled' ? undefined : existing.stalled_since,
         ...(p.upload_time != null ? { upload_time: p.upload_time } : {}),
       };
       changed = true;
@@ -83,7 +83,9 @@ export async function initTransferStore() {
   if (initialized) return;
   initialized = true;
 
-  const unsubs = await Promise.all([
+  let unsubs: UnlistenFn[];
+  try {
+    unsubs = await Promise.all([
     listen<Transfer>('transfer-started', (event) => {
       markEventUpdate();
       const t = event.payload;
@@ -213,7 +215,11 @@ export async function initTransferStore() {
         );
       }
     ),
-  ]);
+    ]);
+  } catch (e) {
+    initialized = false;
+    throw e;
+  }
   unlisteners.push(...unsubs);
 
   try {

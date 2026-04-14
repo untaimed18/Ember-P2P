@@ -246,6 +246,16 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 13 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_chat_messages_read ON chat_messages(read);
+                 CREATE INDEX IF NOT EXISTS idx_download_history_status ON download_history(status);",
+            )?;
+            set_version(&tx, 13)?;
+            tx.commit()?;
+        }
+
         Ok(())
     }
 
@@ -880,20 +890,26 @@ impl Database {
             return Ok(std::collections::HashMap::new());
         }
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
-        let placeholders: Vec<String> = (1..=hashes.len()).map(|i| format!("?{i}")).collect();
-        let sql = format!(
-            "SELECT file_hash, status FROM download_history WHERE file_hash IN ({})",
-            placeholders.join(",")
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> = hashes.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
-        let rows = stmt
-            .query_map(params.as_slice(), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(rows)
+        let mut result = std::collections::HashMap::new();
+        const CHUNK_SIZE: usize = 900;
+        for chunk in hashes.chunks(CHUNK_SIZE) {
+            let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "SELECT file_hash, status FROM download_history WHERE file_hash IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> = chunk.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
+            let rows = stmt
+                .query_map(params.as_slice(), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .filter_map(|r| r.ok());
+            for (hash, status) in rows {
+                result.insert(hash, status);
+            }
+        }
+        Ok(result)
     }
 
     /// Remove a specific file from download history (user override).

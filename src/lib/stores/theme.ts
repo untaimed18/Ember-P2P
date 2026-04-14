@@ -16,10 +16,14 @@ function getInitialTheme(): Theme {
 
 export const theme = writable<Theme>(getInitialTheme());
 
-export function applyTheme(t: Theme) {
+function applyThemeToDOM(t: Theme) {
   if (!browser) return;
   document.documentElement.setAttribute('data-theme', t);
-  localStorage.setItem(STORAGE_KEY, t);
+}
+
+export function applyTheme(t: Theme) {
+  applyThemeToDOM(t);
+  if (browser) localStorage.setItem(STORAGE_KEY, t);
 }
 
 export function toggleTheme() {
@@ -33,18 +37,20 @@ export function toggleTheme() {
 let themeCleanup: (() => void) | null = null;
 
 export function initTheme() {
+  const stored = browser ? localStorage.getItem(STORAGE_KEY) : null;
   const t = getInitialTheme();
-  applyTheme(t);
+  applyThemeToDOM(t);
+  if (stored) localStorage.setItem(STORAGE_KEY, stored);
   theme.set(t);
 
   if (browser) {
     if (themeCleanup) themeCleanup();
     const mq = window.matchMedia('(prefers-color-scheme: dark)');
     const handler = (e: MediaQueryListEvent) => {
-      const stored = localStorage.getItem(STORAGE_KEY);
-      if (!stored) {
+      const userChose = localStorage.getItem(STORAGE_KEY);
+      if (!userChose) {
         const next: Theme = e.matches ? 'dark' : 'light';
-        applyTheme(next);
+        applyThemeToDOM(next);
         theme.set(next);
       }
     };

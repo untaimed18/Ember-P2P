@@ -152,11 +152,12 @@ export async function closeSearchTab(tabId: string): Promise<void> {
       /* best effort */
     }
   }
-  const filtered = tabs.filter((t) => t.id !== tabId);
-  searchTabs.set(filtered);
+  searchTabs.update((currentTabs) => currentTabs.filter((t) => t.id !== tabId));
   const active = get(activeSearchTabId);
   if (active === tabId) {
-    activeSearchTabId.set(filtered[Math.max(0, idx - 1)]?.id ?? filtered[0]?.id ?? null);
+    const remaining = get(searchTabs);
+    const newIdx = Math.max(0, idx - 1);
+    activeSearchTabId.set(remaining[newIdx]?.id ?? remaining[0]?.id ?? null);
   }
 }
 

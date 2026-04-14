@@ -377,7 +377,7 @@
           <div class="stat-row">
             <span class="stat-label">Buddy</span>
             <span class="stat-value">
-              {$networkStats.buddy_status === 'none' ? 'None' :
+              {!$networkStats.buddy_status || $networkStats.buddy_status === 'none' ? 'None' :
                $networkStats.buddy_status.startsWith('connected') ? 'Connected' :
                $networkStats.buddy_status.startsWith('connecting') ? 'Connecting' :
                $networkStats.buddy_status.startsWith('serving') ? 'Serving' :

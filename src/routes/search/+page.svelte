@@ -25,7 +25,7 @@
 
   const searchTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
 
-  let searchMethod: SearchMethod = 'kad';
+  let searchMethod: SearchMethod = $state('global');
   let searchFileType: string = $state('');
 
   let ed2kInput = $state('');

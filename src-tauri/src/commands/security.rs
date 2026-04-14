@@ -377,33 +377,37 @@ pub async fn import_ipfilter_file(
     state: tauri::State<'_, AppState>,
     file_path: String,
 ) -> Result<String, String> {
-    let path = std::path::PathBuf::from(&file_path);
-    if !path.exists() {
-        return Err("File does not exist".into());
-    }
-    let canonical = path.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
-    let blocked_segments: &[&str] = &[
-        "windows", "program files", "program files (x86)",
-        "programdata", ".ssh", ".gnupg",
-        "etc", "usr", "bin", "sbin", "var", "root",
-    ];
-    for component in canonical.components() {
-        if let std::path::Component::Normal(seg) = component {
-            let seg_lower = seg.to_string_lossy().to_lowercase();
-            if blocked_segments.contains(&seg_lower.as_str()) {
-                return Err(format!("Cannot import from system directory: {}", canonical.display()));
+    let path = tokio::task::spawn_blocking(move || {
+        let path = std::path::PathBuf::from(&file_path);
+        if !path.exists() {
+            return Err("File does not exist".to_string());
+        }
+        let canonical = path.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
+        let blocked_segments: &[&str] = &[
+            "windows", "program files", "program files (x86)",
+            "programdata", ".ssh", ".gnupg",
+            "etc", "usr", "bin", "sbin", "var", "root",
+        ];
+        for component in canonical.components() {
+            if let std::path::Component::Normal(seg) = component {
+                let seg_lower = seg.to_string_lossy().to_lowercase();
+                if blocked_segments.contains(&seg_lower.as_str()) {
+                    return Err(format!("Cannot import from system directory: {}", canonical.display()));
+                }
             }
         }
-    }
-    if canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("dat".to_string())
-        && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("txt".to_string())
-        && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("gz".to_string())
-        && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("zip".to_string())
-        && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("p2p".to_string())
-    {
-        return Err("IP filter file must be a .dat, .txt, .gz, .zip, or .p2p file".into());
-    }
-    let path = canonical;
+        if canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("dat".to_string())
+            && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("txt".to_string())
+            && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("gz".to_string())
+            && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("zip".to_string())
+            && canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) != Some("p2p".to_string())
+        {
+            return Err("IP filter file must be a .dat, .txt, .gz, .zip, or .p2p file".to_string());
+        }
+        Ok(canonical)
+    })
+    .await
+    .map_err(|e| format!("Task failed: {e}"))??;
 
     state
         .network_tx

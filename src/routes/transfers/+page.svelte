@@ -233,7 +233,7 @@
     searchUnlisten = () => { for (const u of searchUnsubs) u(); searchUnsubs.length = 0; };
   });
 
-  onDestroy(() => { mounted = false; sourceUnlisten?.(); searchUnlisten?.(); infoTimers.forEach(clearTimeout); });
+  onDestroy(() => { mounted = false; sourceUnlisten?.(); searchUnlisten?.(); infoTimers.forEach(clearTimeout); columnDragCleanup?.(); speedHistory.clear(); });
 
   let searchStatus: Map<string, string> = $state(new Map());
   let transferError: string | null = $state(null);
@@ -376,10 +376,11 @@
   }
 
   function etaSeconds(t: Transfer): number {
-    if (t.speed <= 0 || t.transferred >= t.total_size) return Infinity;
+    const completed = t.completed_size ?? t.transferred;
+    if (t.speed <= 0 || completed >= t.total_size) return Infinity;
     const speed = smoothedSpeed(t);
     if (speed <= 0) return Infinity;
-    return (t.total_size - t.transferred) / speed;
+    return (t.total_size - completed) / speed;
   }
 
   let sortedActiveDownloads = $derived.by(() => {
