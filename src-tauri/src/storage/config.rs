@@ -27,8 +27,14 @@ impl AppConfig {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!("Config file corrupt, using defaults: {e}");
-                    let bak = config_path.with_extension("json.bak");
-                    let _ = std::fs::rename(&config_path, &bak);
+                    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
+                    let bak = config_path.with_extension(format!("json.{ts}.bak"));
+                    if !bak.exists() {
+                        let _ = std::fs::rename(&config_path, &bak);
+                    } else {
+                        let bak_fallback = config_path.with_extension("json.bak");
+                        let _ = std::fs::rename(&config_path, &bak_fallback);
+                    }
                     AppSettings::default()
                 }
             }
@@ -49,7 +55,7 @@ impl AppConfig {
         // Downloads dir.  It should be a Ember subfolder so we don't pollute it.
         if !settings.download_folder.is_empty() {
             let dl = std::path::Path::new(&settings.download_folder);
-            if dl.file_name().map(|n| n != "Ember").unwrap_or(false) {
+            if dl.file_name().map(|n| !n.eq_ignore_ascii_case("Ember")).unwrap_or(false) {
                 let migrated = dl.join("Ember").to_string_lossy().to_string();
                 tracing::info!("Migrating download_folder: {} -> {}", settings.download_folder, migrated);
                 settings.download_folder = migrated;

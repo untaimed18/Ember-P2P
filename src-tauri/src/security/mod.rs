@@ -92,11 +92,11 @@ pub async fn validate_fetch_url(url: &str) -> Result<(String, Vec<std::net::Sock
         return Err("Only http:// and https:// URLs are allowed".into());
     }
 
-    let scheme_port: u16 = if url.starts_with("https://") { 443 } else { 80 };
+    let scheme_port: u16 = if url_lower.starts_with("https://") { 443 } else { 80 };
 
-    let host_part = url
+    let host_part = url_lower
         .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
+        .or_else(|| url_lower.strip_prefix("http://"))
         .unwrap_or("");
     let raw_authority = host_part.split('/').next().unwrap_or("");
     if raw_authority.contains('@') {
@@ -196,11 +196,22 @@ pub fn is_path_within_dirs(canonical: &Path, allowed_dirs: &[String]) -> bool {
 
 fn normalize_match_path(path: &str) -> String {
     let replaced = path.replace('\\', "/");
-    let trimmed = replaced.trim_end_matches('/');
+    let parts: Vec<&str> = replaced.split('/').filter(|s| !s.is_empty()).collect();
+    let mut resolved = Vec::new();
+    for part in parts {
+        if part == "." {
+            continue;
+        } else if part == ".." {
+            resolved.pop();
+        } else {
+            resolved.push(part);
+        }
+    }
+    let joined = resolved.join("/");
     if cfg!(target_os = "windows") {
-        trimmed.to_lowercase()
+        joined.to_lowercase()
     } else {
-        trimmed.to_string()
+        joined
     }
 }
 
@@ -213,7 +224,7 @@ pub fn path_matches_dir(path: &str, dir: &str) -> bool {
         return false;
     }
     normalized_path == normalized_dir
-        || normalized_path.starts_with(&(normalized_dir + "/"))
+        || normalized_path.starts_with(&(normalized_dir.clone() + "/"))
 }
 
 /// Restrict file permissions to the current user only (platform-specific).
@@ -257,8 +268,16 @@ pub fn write_file_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, data)?;
-        restrict_file_permissions(path);
+        let dir = path.parent().unwrap_or(path);
+        let tmp = dir.join(format!(".ember_tmp_{}", std::process::id()));
+        std::fs::write(&tmp, data)?;
+        restrict_file_permissions(&tmp);
+        std::fs::rename(&tmp, path).or_else(|_| -> std::io::Result<()> {
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::write(path, data)?;
+            restrict_file_permissions(path);
+            Ok(())
+        })?;
         Ok(())
     }
 }
@@ -357,21 +376,30 @@ pub fn sanitize_filename(name: &str) -> String {
 }
 
 /// Validate that a path stays within the given base directory.
-/// Returns the canonical-ish safe path, or None if it escapes the base.
+/// Returns the safe path, or None if it escapes the base.
 pub fn validate_path_within(base: &Path, relative: &str) -> Option<PathBuf> {
     let sanitized = sanitize_filename(relative);
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        return None;
+    }
+    if sanitized.contains('/') || sanitized.contains('\\') {
+        return None;
+    }
     let full = base.join(&sanitized);
 
     let canonical_base = std::fs::canonicalize(base).ok()?;
-    // Since the file might not exist yet, we canonicalize the parent
-    let parent = full.parent()?;
-    let canonical_parent = std::fs::canonicalize(parent).ok()?;
-
-    if canonical_parent.starts_with(&canonical_base) {
-        Some(full)
-    } else {
-        None
+    if let Ok(canonical_full) = std::fs::canonicalize(&full) {
+        if !canonical_full.starts_with(&canonical_base) {
+            return None;
+        }
+    } else if let Some(parent) = full.parent() {
+        let canonical_parent = std::fs::canonicalize(parent).ok()?;
+        if !canonical_parent.starts_with(&canonical_base) {
+            return None;
+        }
     }
+
+    Some(full)
 }
 
 /// Sanitize a nickname/display name from a peer. Removes control characters

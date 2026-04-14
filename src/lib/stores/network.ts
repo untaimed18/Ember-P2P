@@ -84,16 +84,18 @@ function withDerivedNetworkState(stats: NetworkStats, now = Date.now()): Network
 
 export async function initNetworkStore() {
   if (initialized) return;
+  initialized = true;
 
-  const [u1, u2, u3, u4] = await Promise.all([
-    listen<string>('network-status', (event) => {
+  const registered: UnlistenFn[] = [];
+  try {
+    registered.push(await listen<string>('network-status', (event) => {
       lastEventUpdate = Date.now();
       lastNetworkUpdate = lastEventUpdate;
       networkStats.update((s) =>
         withDerivedNetworkState({ ...s, status: event.payload as NetworkStats['status'] })
       );
-    }),
-    listen<{ firewalled: boolean; external_ip: string; tcp_status?: string; udp_status?: string }>('firewall-status', (event) => {
+    }));
+    registered.push(await listen<{ firewalled: boolean; external_ip: string; tcp_status?: string; udp_status?: string }>('firewall-status', (event) => {
       lastEventUpdate = Date.now();
       lastNetworkUpdate = lastEventUpdate;
       networkStats.update((s) => ({
@@ -105,17 +107,20 @@ export async function initNetworkStore() {
           udp_status: event.payload.udp_status ?? s.udp_status,
         }),
       }));
-    }),
-    listen<{ message: string }>('network-error', (event) => {
+    }));
+    registered.push(await listen<{ message: string }>('network-error', (event) => {
       lastEventUpdate = Date.now();
       networkError.set(event.payload.message);
-    }),
-    listen<{ status: ServerStatus }>('server-status-changed', (event) => {
+    }));
+    registered.push(await listen<{ status: ServerStatus }>('server-status-changed', (event) => {
       serverStatus.set(event.payload.status);
-    }),
-  ]);
-  initialized = true;
-  unlisteners.push(u1, u2, u3, u4);
+    }));
+  } catch (e) {
+    for (const u of registered) u();
+    initialized = false;
+    throw e;
+  }
+  unlisteners.push(...registered);
 
   try {
     const stats = await getNetworkStats();
@@ -147,6 +152,11 @@ export function cleanupNetworkStore() {
   lastEventUpdate = 0;
   lastPollOkAt = 0;
   lastNetworkUpdate = 0;
+  if (statsPollInterval !== null) {
+    clearInterval(statsPollInterval);
+    statsPollInterval = null;
+  }
+  statsPollConsumers = 0;
   serverStatus.set('disconnected');
   networkError.set(null);
   networkStats.set({
@@ -160,8 +170,22 @@ export function cleanupNetworkStore() {
   } as NetworkStats);
 }
 
+let statsPollInterval: ReturnType<typeof setInterval> | null = null;
+let statsPollConsumers = 0;
+
 export function startStatsPoll() {
-  const interval = setInterval(async () => {
+  statsPollConsumers += 1;
+  if (statsPollInterval !== null) {
+    return () => {
+      statsPollConsumers = Math.max(0, statsPollConsumers - 1);
+      if (statsPollConsumers === 0 && statsPollInterval !== null) {
+        clearInterval(statsPollInterval);
+        statsPollInterval = null;
+      }
+    };
+  }
+
+  statsPollInterval = setInterval(async () => {
     if (Date.now() - lastEventUpdate < 5500) return;
     try {
       const stats = await Promise.race([
@@ -173,9 +197,6 @@ export function startStatsPoll() {
       syncServerStatus(stats);
       networkStats.update((current) => {
         const merged = { ...stats };
-        // Don't let a stale poll snapshot regress values already delivered
-        // by real-time events (the backend cache refreshes every 5s, but
-        // events like firewall-status arrive instantly).
         if (!merged.external_ip && current.external_ip) {
           merged.external_ip = current.external_ip;
         }
@@ -198,5 +219,11 @@ export function startStatsPoll() {
     }
   }, 3000);
 
-  return () => clearInterval(interval);
+  return () => {
+    statsPollConsumers = Math.max(0, statsPollConsumers - 1);
+    if (statsPollConsumers === 0 && statsPollInterval !== null) {
+      clearInterval(statsPollInterval);
+      statsPollInterval = null;
+    }
+  };
 }

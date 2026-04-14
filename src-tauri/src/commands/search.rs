@@ -443,7 +443,11 @@ pub async fn get_download_history(
     state: tauri::State<'_, AppState>,
     hashes: Vec<String>,
 ) -> Result<std::collections::HashMap<String, String>, String> {
-    state.db.get_download_history_batch(&hashes).map_err(|e| e.to_string())
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.get_download_history_batch(&hashes))
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+        .map_err(|e| e.to_string())
 }
 
 /// Clear download history entries by status ("completed", "cancelled", or "all").
@@ -452,17 +456,23 @@ pub async fn clear_download_history(
     state: tauri::State<'_, AppState>,
     status: String,
 ) -> Result<(), String> {
-    match status.as_str() {
-        "all" => {
-            state.db.clear_download_history("completed").map_err(|e| e.to_string())?;
-            state.db.clear_download_history("cancelled").map_err(|e| e.to_string())?;
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        match status.as_str() {
+            "all" => {
+                db.clear_download_history("completed")?;
+                db.clear_download_history("cancelled")?;
+            }
+            "completed" | "cancelled" => {
+                db.clear_download_history(&status)?;
+            }
+            _ => return Err(anyhow::anyhow!("Invalid status: {status}. Must be 'completed', 'cancelled', or 'all'")),
         }
-        "completed" | "cancelled" => {
-            state.db.clear_download_history(&status).map_err(|e| e.to_string())?;
-        }
-        _ => return Err(format!("Invalid status: {status}. Must be 'completed', 'cancelled', or 'all'")),
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Task failed: {e}"))?
+    .map_err(|e| e.to_string())
 }
 
 /// Remove a single file hash from download history.
@@ -471,5 +481,9 @@ pub async fn remove_download_history_entry(
     state: tauri::State<'_, AppState>,
     file_hash: String,
 ) -> Result<(), String> {
-    state.db.remove_download_history(&file_hash).map_err(|e| e.to_string())
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.remove_download_history(&file_hash))
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+        .map_err(|e| e.to_string())
 }
