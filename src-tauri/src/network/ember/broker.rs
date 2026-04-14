@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 use super::nat::NatType;
 
 const MAX_ACTIVE_ATTEMPTS: usize = 8;
-const PUNCH_TIMEOUT: Duration = Duration::from_secs(15);
+const PUNCH_TIMEOUT: Duration = Duration::from_secs(20);
 const RELAY_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTEMPT_COOLDOWN: Duration = Duration::from_secs(120);
 const MAX_ATTEMPTS_PER_SOURCE: u32 = 3;
@@ -124,6 +124,16 @@ pub enum BrokerEvent {
         source_port: u16,
         reason: String,
     },
+    /// Spawned punch task reports failure -- broker should escalate to relay.
+    PunchFailed {
+        attempt_key: String,
+        reason: String,
+    },
+    /// Spawned relay task reports failure -- broker should emit ConnectionFailed.
+    RelayFailed {
+        attempt_key: String,
+        reason: String,
+    },
 }
 
 impl ConnectionBroker {
@@ -136,6 +146,11 @@ impl ConnectionBroker {
             rendezvous_url,
             quic_endpoint: None,
         }
+    }
+
+    /// Clone the internal event sender so spawned tasks can report results back.
+    pub fn event_sender(&self) -> mpsc::Sender<BrokerEvent> {
+        self.event_tx.clone()
     }
 
     pub fn set_quic_endpoint(&mut self, endpoint: Arc<quinn::Endpoint>) {

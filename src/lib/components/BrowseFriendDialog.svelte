@@ -2,16 +2,18 @@
   import { onDestroy } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { browseFriend, type BrowseFileEntry } from '$lib/api/friends';
-  import { invoke } from '@tauri-apps/api/core';
+  import { startDownload } from '$lib/api/transfers';
 
   interface Props {
     open: boolean;
     friendHash: string;
     friendName: string;
+    friendLastIp: string;
+    friendLastPort: number;
     onclose: () => void;
   }
 
-  let { open = $bindable(), friendHash, friendName, onclose }: Props = $props();
+  let { open = $bindable(), friendHash, friendName, friendLastIp, friendLastPort, onclose }: Props = $props();
 
   let files: BrowseFileEntry[] = $state([]);
   let loading = $state(false);
@@ -97,12 +99,7 @@
     if (downloadedHashes.has(file.hash)) return;
     downloadError = null;
     try {
-      await invoke('start_download_from_search', {
-        fileHash: file.hash,
-        fileName: file.name,
-        fileSize: file.size,
-        sources: [],
-      });
+      await startDownload(file.hash, file.name, file.size, friendLastIp, friendLastPort);
       downloadedHashes.add(file.hash);
       downloadedHashes = new Set(downloadedHashes);
     } catch (e: unknown) {

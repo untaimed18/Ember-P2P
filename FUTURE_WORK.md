@@ -12,6 +12,6 @@ The `ember_hash` used to identify friends is entirely self-reported during the E
 
 ### U4 — Pass Friend as Download Source in Browse Dialog
 **Priority:** MEDIUM (performance) | **Effort:** Small
-**Status:** Deferred — needs backend source format investigation
+**Status:** DONE
 
-When downloading a file from a friend's browse list in `BrowseFriendDialog.svelte`, the `start_download_from_search` call passes `sources: []`. The friend who owns the file isn't included as a source, forcing re-discovery on the network. The fix requires understanding the exact `Source` struct shape expected by the backend and passing the friend's connection info as a source.
+`BrowseFriendDialog` now receives `friendLastIp`/`friendLastPort` from the friends page and calls `startDownload()` (the real `start_download` command) with the friend as the initial source.

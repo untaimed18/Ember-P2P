@@ -42,7 +42,6 @@ pub const FILE_FLAG_HAS_AICH: u8 = 0x01;
 
 /// Per-source flags (v3+)
 pub const SOURCE_FLAG_FIREWALLED: u8 = 0x01;
-#[allow(dead_code)]
 pub const SOURCE_FLAG_OBFUSCATION: u8 = 0x02;
 /// Peer is willing to act as a relay for LowID-to-LowID transfers (v4+).
 #[allow(dead_code)]
