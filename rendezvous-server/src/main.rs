@@ -27,6 +27,7 @@ const RATE_WINDOW: Duration = Duration::from_secs(60);
 const PUNCH_TTL: Duration = Duration::from_secs(30);
 const MAX_PUNCH_PER_MINUTE: u64 = 10;
 const MAX_RELAY_SESSIONS_PER_IP: usize = 2;
+const MAX_GLOBAL_RELAY_SESSIONS: usize = 200;
 const RELAY_BANDWIDTH_CAP_BYTES: usize = 256 * 1024;
 const RELAY_SESSION_TIMEOUT: Duration = Duration::from_secs(120);
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -70,6 +71,7 @@ struct AppState {
     punch_requests: Arc<RwLock<HashMap<String, PunchEntry>>>,
     relay_sessions: Arc<RwLock<HashMap<String, RelaySessionEntry>>>,
     relay_ip_counts: Arc<RwLock<HashMap<IpAddr, usize>>>,
+    started_at: Instant,
 }
 
 #[derive(Deserialize)]
@@ -358,6 +360,16 @@ async fn handle_relay_ws(
     session_id: String,
     client_ip: IpAddr,
 ) {
+    // Enforce global relay session limit
+    {
+        let relays = state.relay_sessions.read().await;
+        if relays.len() >= MAX_GLOBAL_RELAY_SESSIONS {
+            info!("relay rejected: global cap reached ({} sessions)", relays.len());
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+    }
+
     // Enforce per-IP relay session limit
     {
         let counts = state.relay_ip_counts.read().await;
@@ -523,6 +535,23 @@ async fn cleanup_relay(state: &AppState, session_id: &str, client_ip: IpAddr) {
     }
 }
 
+async fn stats_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let relay_count = state.relay_sessions.read().await.len();
+    let punch_count = state.punch_requests.read().await.len();
+    let relay_ip_count = state.relay_ip_counts.read().await.len();
+    let presence_count = state.store.read().await.len();
+    let uptime_secs = state.started_at.elapsed().as_secs();
+
+    Json(serde_json::json!({
+        "active_relay_sessions": relay_count,
+        "active_punch_requests": punch_count,
+        "relay_ip_count": relay_ip_count,
+        "registered_peers": presence_count,
+        "uptime_seconds": uptime_secs,
+        "max_global_relays": MAX_GLOBAL_RELAY_SESSIONS,
+    }))
+}
+
 async fn health() -> &'static str {
     "ok"
 }
@@ -577,6 +606,7 @@ async fn main() {
         punch_requests: Arc::new(RwLock::new(HashMap::new())),
         relay_sessions: Arc::new(RwLock::new(HashMap::new())),
         relay_ip_counts: Arc::new(RwLock::new(HashMap::new())),
+        started_at: Instant::now(),
     };
 
     tokio::spawn(sweep_expired(state.clone()));
@@ -589,6 +619,7 @@ async fn main() {
         .route("/punch/{id}", get(punch_poll))
         .route("/relay/{session_id}", get(relay_ws))
         .route("/health", get(health))
+        .route("/stats", get(stats_handler))
         .with_state(state);
 
     let port: u16 = std::env::var("PORT")
