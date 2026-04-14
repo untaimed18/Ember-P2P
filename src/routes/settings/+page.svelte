@@ -600,6 +600,17 @@
             </div>
             <span class="hint">Fetch latest bootstrap nodes from emule-security.org</span>
           </div>
+
+          <div class="divider"></div>
+
+          <div class="field">
+            <label for="rendezvous-url">
+              Rendezvous Server
+              <span class="restart-badge">Restart</span>
+            </label>
+            <input id="rendezvous-url" bind:value={settings.rendezvous_url} placeholder="https://ember-rendezvous.fly.dev" />
+            <span class="hint">Ember rendezvous server for friend discovery and NAT traversal. Leave blank for default.</span>
+          </div>
         </div>
       </section>
 

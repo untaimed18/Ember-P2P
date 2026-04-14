@@ -7,6 +7,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tracing::{debug, info};
 
 /// Maximum concurrent QUIC connections.
+#[allow(dead_code)]
 const MAX_CONNECTIONS: u32 = 256;
 
 /// Idle timeout for QUIC connections.
@@ -16,6 +17,7 @@ const IDLE_TIMEOUT_SECS: u64 = 120;
 const KEEP_ALIVE_SECS: u64 = 15;
 
 /// Configuration for the Ember QUIC transport.
+#[allow(dead_code)]
 pub struct QuicConfig {
     pub cert_der: Vec<u8>,
     pub key_der: Vec<u8>,
@@ -128,12 +130,14 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 
 /// An Ember QUIC endpoint that can accept incoming connections and initiate
 /// outgoing ones.
+#[allow(dead_code)]
 pub struct EmberQuicEndpoint {
     endpoint: Endpoint,
     client_config: ClientConfig,
     pub local_addr: SocketAddr,
 }
 
+#[allow(dead_code)]
 impl EmberQuicEndpoint {
     /// Create and bind a new QUIC endpoint.
     pub fn new(bind_addr: SocketAddr, config: &QuicConfig) -> anyhow::Result<Self> {
@@ -182,10 +186,28 @@ impl EmberQuicEndpoint {
 
 /// Create a client-only QUIC endpoint bound to 0.0.0.0:0 for outgoing connections
 /// (used by the connection broker for hole-punching and relay).
+#[allow(dead_code)]
 pub fn build_client_endpoint(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<Endpoint> {
     let client_config = build_client_config(cert_der, key_der)?;
     let mut endpoint = Endpoint::client("0.0.0.0:0".parse::<SocketAddr>()?)?;
     endpoint.set_default_client_config(client_config);
+    Ok(endpoint)
+}
+
+/// Create a QUIC endpoint that can both accept incoming connections (relay server)
+/// and make outgoing ones (hole-punch/relay client). Binds to `0.0.0.0:{bind_port}`
+/// on UDP — this coexists with any TCP listener on the same port number.
+pub fn build_server_client_endpoint(
+    cert_der: &[u8],
+    key_der: &[u8],
+    bind_port: u16,
+) -> anyhow::Result<Endpoint> {
+    let server_config = build_server_config(cert_der, key_der)?;
+    let client_config = build_client_config(cert_der, key_der)?;
+    let bind_addr: SocketAddr = format!("0.0.0.0:{bind_port}").parse()?;
+    let mut endpoint = Endpoint::server(server_config, bind_addr)?;
+    endpoint.set_default_client_config(client_config);
+    info!("QUIC server+client endpoint bound on {}", endpoint.local_addr()?);
     Ok(endpoint)
 }
 

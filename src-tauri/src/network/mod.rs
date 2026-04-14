@@ -1209,6 +1209,8 @@ struct NetworkState {
     connection_broker: Option<ember::broker::ConnectionBroker>,
     /// Broker event receiver (fed by ConnectionBroker, consumed in main select loop)
     broker_event_rx: Option<mpsc::Receiver<ember::broker::BrokerEvent>>,
+    /// Manages relay sessions when this node acts as a relay for other peers
+    relay_manager: Arc<tokio::sync::Mutex<ember::relay::RelayManager>>,
 }
 
 /// Filter search results by file type, matching eMule's AddToList behavior:
@@ -2161,6 +2163,7 @@ pub async fn start_network(
         nat_info: ember::nat::NatInfo::unknown(),
         connection_broker: None,
         broker_event_rx: None,
+        relay_manager: Arc::new(tokio::sync::Mutex::new(ember::relay::RelayManager::new())),
     };
 
     // Load known files for hash cache
@@ -5260,10 +5263,25 @@ pub async fn start_network(
 
                         match ember::quic::generate_self_signed_cert(&ember_hash) {
                             Ok((cert_der, key_der)) => {
-                                match ember::quic::build_client_endpoint(&cert_der, &key_der) {
+                                match ember::quic::build_server_client_endpoint(
+                                    &cert_der,
+                                    &key_der,
+                                    state.tcp_port,
+                                ) {
                                     Ok(ep) => {
-                                        broker.set_quic_endpoint(std::sync::Arc::new(ep));
-                                        tracing::info!("Broker: QUIC client endpoint ready");
+                                        let ep_arc = std::sync::Arc::new(ep);
+                                        broker.set_quic_endpoint(ep_arc.clone());
+                                        tracing::info!("Broker: QUIC server+client endpoint ready on UDP port {}", state.tcp_port);
+
+                                        // Spawn the relay accept loop if we're HighID
+                                        if !state.firewalled && !state.low_id {
+                                            let relay_mgr = state.relay_manager.clone();
+                                            tokio::spawn(ember::relay::run_relay_accept_loop(
+                                                ep_arc,
+                                                relay_mgr,
+                                            ));
+                                            tracing::info!("Relay accept loop spawned");
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::warn!("Broker: failed to create QUIC endpoint: {e}");
@@ -5519,6 +5537,15 @@ pub async fn start_network(
                 // Tick the connection broker (clean up expired attempts)
                 if let Some(ref mut broker) = state.connection_broker {
                     broker.tick().await;
+                }
+
+                // Clean up expired relay sessions
+                {
+                    let mut relay_mgr = state.relay_manager.lock().await;
+                    let expired = relay_mgr.cleanup();
+                    if !expired.is_empty() {
+                        tracing::debug!("Relay cleanup: expired {} sessions", expired.len());
+                    }
                 }
 
                 // Drain broker events (punch/relay coordination)

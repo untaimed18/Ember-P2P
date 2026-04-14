@@ -81,11 +81,13 @@ impl NodeIdentity {
     }
 
     /// Return the Ed25519 signing key reconstructed from stored secret bytes.
+    #[allow(dead_code)]
     pub fn signing_key(&self) -> SigningKey {
         crypto::signing_key_from_bytes(&self.ed25519_secret_key)
     }
 
     /// Return the Ed25519 verifying (public) key reconstructed from stored bytes.
+    #[allow(dead_code)]
     pub fn verifying_key(&self) -> Option<ed25519_dalek::VerifyingKey> {
         crypto::verifying_key_from_bytes(&self.ed25519_public_key)
     }

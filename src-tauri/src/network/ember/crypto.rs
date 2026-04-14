@@ -13,11 +13,13 @@ pub fn node_id_from_public_key(public_key: &VerifyingKey) -> [u8; 16] {
 }
 
 /// Sign an arbitrary message with an Ed25519 signing key.
+#[allow(dead_code)]
 pub fn sign(signing_key: &SigningKey, message: &[u8]) -> [u8; 64] {
     signing_key.sign(message).to_bytes()
 }
 
 /// Verify an Ed25519 signature against a public key and message.
+#[allow(dead_code)]
 pub fn verify(public_key: &VerifyingKey, message: &[u8], signature: &[u8; 64]) -> bool {
     let sig = Signature::from_bytes(signature);
     public_key.verify(message, &sig).is_ok()
@@ -29,6 +31,7 @@ pub fn verifying_key_from_bytes(bytes: &[u8; 32]) -> Option<VerifyingKey> {
 }
 
 /// Reconstruct a [`SigningKey`] from raw 32-byte secret key material.
+#[allow(dead_code)]
 pub fn signing_key_from_bytes(bytes: &[u8; 32]) -> SigningKey {
     SigningKey::from_bytes(bytes)
 }
@@ -37,15 +40,18 @@ pub fn signing_key_from_bytes(bytes: &[u8; 32]) -> SigningKey {
 ///
 /// This is the "Ember file hash" used for file identification on the Ember
 /// network (alongside the legacy ed2k MD4 hash for KAD/ED2K interop).
+#[allow(dead_code)]
 pub fn blake3_hash_file(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
 }
 
 /// Incremental BLAKE3 hasher for large files that cannot be loaded into memory.
+#[allow(dead_code)]
 pub struct Blake3FileHasher {
     hasher: blake3::Hasher,
 }
 
+#[allow(dead_code)]
 impl Blake3FileHasher {
     pub fn new() -> Self {
         Self {

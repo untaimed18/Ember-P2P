@@ -45,6 +45,7 @@ pub enum ConnectionMethod {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 enum AttemptPhase {
     HolePunch,
     FindRelay,
@@ -54,6 +55,7 @@ enum AttemptPhase {
 }
 
 /// Tracks an in-progress LowID-to-LowID connection attempt.
+#[allow(dead_code)]
 struct ConnectionAttempt {
     transfer_id: String,
     file_hash: [u8; 16],
@@ -110,6 +112,7 @@ pub struct ConnectionBroker {
     cooldowns: HashMap<(Ipv4Addr, u16), (Instant, u32)>,
     relay_candidates: Vec<RelayCandidate>,
     event_tx: mpsc::Sender<BrokerEvent>,
+    #[allow(dead_code)]
     rendezvous_url: String,
     quic_endpoint: Option<Arc<quinn::Endpoint>>,
 }
@@ -376,14 +379,17 @@ impl ConnectionBroker {
         self.cooldowns.retain(|_, (ts, _)| ts.elapsed() < Duration::from_secs(600));
     }
 
+    #[allow(dead_code)]
     pub fn active_attempts(&self) -> usize {
         self.attempts.len()
     }
 
+    #[allow(dead_code)]
     pub fn relay_candidate_count(&self) -> usize {
         self.relay_candidates.len()
     }
 
+    #[allow(dead_code)]
     pub fn rendezvous_url(&self) -> &str {
         &self.rendezvous_url
     }

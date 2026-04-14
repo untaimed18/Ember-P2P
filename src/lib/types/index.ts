@@ -241,4 +241,6 @@ export interface AppSettings {
   friend_session_encryption: boolean;
   /** Maximum number of friends allowed (1–500) */
   max_friends: number;
+  /** Rendezvous server URL for Ember friend discovery */
+  rendezvous_url: string;
 }
