@@ -13,7 +13,6 @@ const FIREWALL_CHECK_COUNT: u32 = 8;
 pub const FIREWALL_RECHECK_SECS: i64 = 3600;
 /// How long to wait for firewall responses before concluding
 const RESPONSE_WINDOW_SECS: i64 = 30;
-const MIN_UDP_FAILURE_CHECKS: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirewallStatus {
