@@ -1,3 +1,10 @@
+#[allow(dead_code)]
+pub mod nat;
+#[allow(dead_code)]
+pub mod broker;
+#[allow(dead_code)]
+pub mod relay;
+
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read, Write};
 use std::net::Ipv4Addr;
@@ -5,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::RwLock;
 
-pub const EPX_VERSION: u8 = 3;
+pub const EPX_VERSION: u8 = 4;
 pub const MAX_EPX_FILES: usize = 200;
 pub const MAX_EPX_SOURCES_PER_FILE: usize = 100;
 pub const MAX_EPX_PAYLOAD: usize = 65536;
@@ -23,6 +30,9 @@ pub const FILE_FLAG_HAS_AICH: u8 = 0x01;
 pub const SOURCE_FLAG_FIREWALLED: u8 = 0x01;
 #[allow(dead_code)]
 pub const SOURCE_FLAG_OBFUSCATION: u8 = 0x02;
+/// Peer is willing to act as a relay for LowID-to-LowID transfers (v4+).
+#[allow(dead_code)]
+pub const SOURCE_FLAG_RELAY_CAPABLE: u8 = 0x04;
 
 // v2 wire sizes (backward compat parsing)
 const V2_FILE_ENTRY_HEADER_SIZE: usize = 16 + 8 + 2;

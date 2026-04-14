@@ -42,6 +42,8 @@ pub enum DownloadSourceState {
     TooManyConns,
     /// Both sides are Low-ID, cannot connect (DS_LOWTOLOWIP).
     LowToLowIp,
+    /// Both sides are Low-ID, but Ember relay/hole-punch is being attempted.
+    EmberRelay,
     /// Banned by remote peer (DS_BANNED).
     Banned,
 }
@@ -85,7 +87,7 @@ impl DownloadSourceEntry {
             DownloadSourceState::OnQueue { .. } => FILEREASKTIME_SECS as u64,
             DownloadSourceState::WaitCallback | DownloadSourceState::WaitCallbackKad => FILEREASKTIME_SECS as u64,
             DownloadSourceState::Connecting | DownloadSourceState::Downloading => return u64::MAX,
-            DownloadSourceState::LowToLowIp | DownloadSourceState::Banned => return u64::MAX,
+            DownloadSourceState::LowToLowIp | DownloadSourceState::EmberRelay | DownloadSourceState::Banned => return u64::MAX,
         };
         let elapsed = self.last_asked.elapsed().as_secs();
         interval.saturating_sub(elapsed)
@@ -122,6 +124,10 @@ impl PerFileSourceList {
             file_hash,
             sources: Vec::new(),
         }
+    }
+
+    pub fn file_hash(&self) -> [u8; 16] {
+        self.file_hash
     }
 
     pub fn has_source(&self, ip: Ipv4Addr, tcp_port: u16) -> bool {
@@ -214,6 +220,14 @@ impl PerFileSourceList {
         }
     }
 
+    /// Both sides are Low-ID but Ember relay/hole-punch is being attempted.
+    pub fn set_ember_relay(&mut self, ip: Ipv4Addr, port: u16) {
+        if let Some(s) = self.find_mut(ip, port) {
+            s.state = DownloadSourceState::EmberRelay;
+            s.state_changed = Instant::now();
+        }
+    }
+
     /// Remote peer has banned us.
     pub fn set_banned(&mut self, ip: Ipv4Addr, port: u16) {
         if let Some(s) = self.find_mut(ip, port) {
@@ -242,7 +256,7 @@ impl PerFileSourceList {
             .filter(|s| {
                 s.time_until_reask() == 0
                     && s.can_try_tcp()
-                    && !matches!(s.state, DownloadSourceState::Banned | DownloadSourceState::LowToLowIp)
+                    && !matches!(s.state, DownloadSourceState::Banned | DownloadSourceState::LowToLowIp | DownloadSourceState::EmberRelay)
             })
             .collect();
         ready.sort_by(|a, b| {
