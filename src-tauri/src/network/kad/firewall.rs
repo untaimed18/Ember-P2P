@@ -250,11 +250,16 @@ impl FirewallChecker {
     }
 
     pub fn tcp_firewalled(&self) -> bool {
-        self.tcp_status != FirewallStatus::Open
+        self.tcp_status == FirewallStatus::Firewalled
     }
 
     pub fn udp_firewalled(&self) -> bool {
-        self.udp_status != FirewallStatus::Open
+        self.udp_status == FirewallStatus::Firewalled
+    }
+
+    #[allow(dead_code)]
+    pub fn tcp_status_known(&self) -> bool {
+        self.tcp_status != FirewallStatus::Unknown
     }
 
     pub fn external_ip(&self) -> Option<Ipv4Addr> {

@@ -352,7 +352,8 @@ impl KnownFileList {
             buf.write_u32::<LittleEndian>((record.modified_at.max(0) as u64).min(u32::MAX as u64) as u32)?;
 
             buf.write_all(&record.file_hash)?;
-            buf.write_u16::<LittleEndian>(record.part_hashes.len() as u16)?;
+            let part_count = record.part_hashes.len().min(u16::MAX as usize);
+            buf.write_u16::<LittleEndian>(part_count as u16)?;
             for ph in &record.part_hashes {
                 buf.write_all(ph)?;
             }

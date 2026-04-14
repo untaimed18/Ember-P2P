@@ -335,8 +335,10 @@
     editNickname = f.nickname;
   }
 
+  let saveEditPending = false;
   async function saveEdit() {
-    if (!editingHash) return;
+    if (!editingHash || saveEditPending) return;
+    saveEditPending = true;
     const hash = editingHash;
     const nick = editNickname.trim();
     editingHash = null;
@@ -346,6 +348,8 @@
       if (idx !== -1) friends[idx] = { ...friends[idx], nickname: nick };
     } catch (e: unknown) {
       error = toErr(e);
+    } finally {
+      saveEditPending = false;
     }
   }
 

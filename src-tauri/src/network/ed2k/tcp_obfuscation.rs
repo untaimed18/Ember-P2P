@@ -316,8 +316,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Rc4Writer<W> {
             Poll::Pending => {
                 self.pending = encrypted;
                 self.pending_offset = 0;
-                cx.waker().wake_by_ref();
-                Poll::Ready(Ok(plaintext_len))
+                Poll::Pending
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
         }

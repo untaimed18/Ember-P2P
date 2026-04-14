@@ -169,6 +169,11 @@ pub async fn update_settings(
         manager.max_concurrent = settings.max_concurrent_downloads;
     }
 
+    {
+        let mut live = state.upload_shared_folders.write().await;
+        *live = settings.shared_folders.clone();
+    }
+
     if state.network_tx.try_send(NetworkCommand::UpdateSettings {
         settings: settings.clone(),
     }).is_err() {
