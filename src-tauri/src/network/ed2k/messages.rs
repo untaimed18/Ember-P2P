@@ -1014,6 +1014,7 @@ pub fn merge_caps(base: &mut PeerCapabilities, update: PeerCapabilities) {
     base.is_ember |= update.is_ember;
     base.epx_version = base.epx_version.max(update.epx_version);
     if update.ember_hash.is_some() { base.ember_hash = update.ember_hash; }
+    if update.ember_pubkey.is_some() { base.ember_pubkey = update.ember_pubkey; }
 }
 
 /// Build a human-readable client software string from peer capabilities.
