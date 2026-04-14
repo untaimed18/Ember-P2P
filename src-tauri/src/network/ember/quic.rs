@@ -62,7 +62,7 @@ fn build_server_config(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<Server
 }
 
 /// Create the client-side QUIC configuration.
-fn build_client_config(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<ClientConfig> {
+pub fn build_client_config(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<ClientConfig> {
     let cert = CertificateDer::from(cert_der.to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der.to_vec()));
 
@@ -178,6 +178,15 @@ impl EmberQuicEndpoint {
     pub fn open_connections(&self) -> usize {
         self.endpoint.open_connections()
     }
+}
+
+/// Create a client-only QUIC endpoint bound to 0.0.0.0:0 for outgoing connections
+/// (used by the connection broker for hole-punching and relay).
+pub fn build_client_endpoint(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<Endpoint> {
+    let client_config = build_client_config(cert_der, key_der)?;
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse::<SocketAddr>()?)?;
+    endpoint.set_default_client_config(client_config);
+    Ok(endpoint)
 }
 
 #[cfg(test)]

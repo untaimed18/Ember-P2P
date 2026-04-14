@@ -1,7 +1,11 @@
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use futures::{Sink, Stream};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tracing::{debug, info};
 
 const MSG_RELAY_REQUEST: u8 = 0x01;
@@ -310,6 +314,199 @@ pub struct PunchInfo {
     pub ip: String,
     pub port: u16,
     pub nat_type: u8,
+}
+
+/// Connect to a relay-capable peer over QUIC and negotiate a relay session.
+/// Returns the QUIC streams on success.
+pub async fn connect_to_peer_relay(
+    endpoint: &quinn::Endpoint,
+    relay_addr: SocketAddr,
+    target_ip: Ipv4Addr,
+    target_port: u16,
+    file_hash: &[u8; 16],
+) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+    info!("Relay: connecting to peer relay at {relay_addr}");
+
+    let conn = endpoint
+        .connect(relay_addr, "ember-relay")
+        .map_err(|e| format!("relay connect error: {e}"))?
+        .await
+        .map_err(|e| format!("relay QUIC handshake failed: {e}"))?;
+
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| format!("relay open_bi failed: {e}"))?;
+
+    let session_id = rand::random::<u32>();
+    let request = build_relay_request(session_id, target_ip, target_port, file_hash);
+
+    send.write_all(&request)
+        .await
+        .map_err(|e| format!("relay write request: {e}"))?;
+
+    let mut resp_buf = [0u8; 7];
+    recv.read_exact(&mut resp_buf)
+        .await
+        .map_err(|e| format!("relay read response: {e}"))?;
+
+    let (msg_type, _sid, _payload) = decode_relay_message(&resp_buf)
+        .ok_or_else(|| "invalid relay response".to_string())?;
+
+    if msg_type == MSG_RELAY_REJECT {
+        return Err("relay peer rejected request".to_string());
+    }
+    if msg_type != MSG_RELAY_ACCEPT {
+        return Err(format!("unexpected relay response type: {msg_type}"));
+    }
+
+    info!("Relay: peer relay accepted at {relay_addr}, session {session_id}");
+    Ok((send, recv))
+}
+
+/// WebSocket adapter that implements AsyncRead + AsyncWrite over a
+/// tokio-tungstenite WebSocket stream.
+pub struct WsStream {
+    inner: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    read_buf: Vec<u8>,
+    read_pos: usize,
+}
+
+impl WsStream {
+    pub fn new(
+        ws: tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Self {
+        Self {
+            inner: ws,
+            read_buf: Vec::new(),
+            read_pos: 0,
+        }
+    }
+}
+
+impl AsyncRead for WsStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.read_pos < self.read_buf.len() {
+            let remaining = &self.read_buf[self.read_pos..];
+            let to_copy = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..to_copy]);
+            self.read_pos += to_copy;
+            if self.read_pos >= self.read_buf.len() {
+                self.read_buf.clear();
+                self.read_pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        match Stream::poll_next(Pin::new(&mut self.inner), cx) {
+            Poll::Ready(Some(Ok(msg))) => {
+                use tokio_tungstenite::tungstenite::Message;
+                match msg {
+                    Message::Binary(data) => {
+                        let to_copy = data.len().min(buf.remaining());
+                        buf.put_slice(&data[..to_copy]);
+                        if to_copy < data.len() {
+                            self.read_buf = data[to_copy..].to_vec();
+                            self.read_pos = 0;
+                        }
+                        Poll::Ready(Ok(()))
+                    }
+                    Message::Close(_) => Poll::Ready(Ok(())),
+                    _ => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                }
+            }
+            Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+            }
+            Poll::Ready(None) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for WsStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let msg = Message::Binary(buf.to_vec().into());
+        match Sink::poll_ready(Pin::new(&mut self.inner), cx) {
+            Poll::Ready(Ok(())) => {
+                match Sink::start_send(Pin::new(&mut self.inner), msg) {
+                    Ok(()) => Poll::Ready(Ok(buf.len())),
+                    Err(e) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e))),
+                }
+            }
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match Sink::<tokio_tungstenite::tungstenite::Message>::poll_flush(Pin::new(&mut self.inner), cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match Sink::<tokio_tungstenite::tungstenite::Message>::poll_close(Pin::new(&mut self.inner), cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Connect to the rendezvous server's WebSocket relay endpoint.
+/// Returns a WsStream that implements AsyncRead + AsyncWrite.
+pub async fn connect_server_relay(
+    rendezvous_url: &str,
+    session_id: &str,
+) -> Result<WsStream, String> {
+    let ws_url = format!(
+        "{}/relay/{}",
+        rendezvous_url
+            .replace("https://", "wss://")
+            .replace("http://", "ws://"),
+        session_id
+    );
+
+    info!("Relay: connecting to server relay at {ws_url}");
+
+    let (ws_stream, _response) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .map_err(|e| format!("WS relay connect failed: {e}"))?;
+
+    info!("Relay: server relay connected for session {session_id}");
+    Ok(WsStream::new(ws_stream))
 }
 
 #[cfg(test)]

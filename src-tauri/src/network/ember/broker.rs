@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -92,6 +93,7 @@ pub struct ConnectionBroker {
     relay_candidates: Vec<RelayCandidate>,
     event_tx: mpsc::Sender<BrokerEvent>,
     rendezvous_url: String,
+    quic_endpoint: Option<Arc<quinn::Endpoint>>,
 }
 
 /// Events emitted by the broker for the main network loop to act on.
@@ -132,7 +134,40 @@ impl ConnectionBroker {
             relay_candidates: Vec::new(),
             event_tx,
             rendezvous_url,
+            quic_endpoint: None,
         }
+    }
+
+    pub fn set_quic_endpoint(&mut self, endpoint: Arc<quinn::Endpoint>) {
+        self.quic_endpoint = Some(endpoint);
+    }
+
+    pub fn quic_endpoint(&self) -> Option<&Arc<quinn::Endpoint>> {
+        self.quic_endpoint.as_ref()
+    }
+
+    /// Execute hole-punch: connect via QUIC to the remote peer's external address.
+    /// Returns the opened send/recv streams on success.
+    pub async fn execute_punch(
+        &self,
+        remote_addr: SocketAddr,
+        attempt_key: &str,
+    ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+        let endpoint = self.quic_endpoint.as_ref()
+            .ok_or_else(|| "no QUIC endpoint configured".to_string())?;
+
+        info!("Broker: attempting QUIC hole-punch to {remote_addr} for {attempt_key}");
+
+        let conn = endpoint.connect(remote_addr, "ember-punch")
+            .map_err(|e| format!("quinn connect error: {e}"))?
+            .await
+            .map_err(|e| format!("QUIC handshake failed with {remote_addr}: {e}"))?;
+
+        let (send, recv) = conn.open_bi().await
+            .map_err(|e| format!("QUIC open_bi failed: {e}"))?;
+
+        info!("Broker: QUIC hole-punch succeeded to {remote_addr} for {attempt_key}");
+        Ok((send, recv))
     }
 
     /// Called when a LowToLowIp situation is detected instead of giving up.
@@ -342,6 +377,21 @@ impl ConnectionBroker {
 
     pub fn rendezvous_url(&self) -> &str {
         &self.rendezvous_url
+    }
+
+    /// Look up attempt metadata. Returns (transfer_id, file_hash, source_ip, source_port).
+    pub fn get_attempt_info(&self, attempt_key: &str) -> Option<(String, [u8; 16], Ipv4Addr, u16)> {
+        self.attempts.get(attempt_key).map(|a| {
+            (a.transfer_id.clone(), a.file_hash, a.source_ip, a.source_port)
+        })
+    }
+
+    /// Transition an attempt to the RelayConnect phase.
+    pub fn set_relay_phase(&mut self, attempt_key: &str) {
+        if let Some(attempt) = self.attempts.get_mut(attempt_key) {
+            attempt.phase = AttemptPhase::RelayConnect;
+            attempt.phase_started = Instant::now();
+        }
     }
 }
 
