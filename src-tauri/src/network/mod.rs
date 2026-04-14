@@ -12354,7 +12354,7 @@ async fn handle_command(
 
             // Eagerly dispatch UDP firewall probes (uses previous external port
             // or falls back to settings.udp_port). Pong handler will also retry.
-            dispatch_udp_firewall_probe_requests(&mut state, &settings);
+            dispatch_udp_firewall_probe_requests(state, &settings);
 
             info!("Sent {} firewall checks and {} ping probes", state.firewall_checks_sent, ping_contacts.len());
             let _ = tx.send(if state.firewall_checks_sent > 0 || !ping_contacts.is_empty() {
