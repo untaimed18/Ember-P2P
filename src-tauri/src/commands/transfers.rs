@@ -621,17 +621,16 @@ pub async fn open_file(
     let download_dir = std::path::PathBuf::from(&dl_folder)
         .join("Downloads");
     let file_path = download_dir.join(&safe_name);
-    if !file_path.exists() {
-        return Err("File not found on disk".into());
-    }
-    let canonical = file_path.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
-    let canonical_base = download_dir.canonicalize().map_err(|e| format!("Invalid base: {e}"))?;
-    if !canonical.starts_with(&canonical_base) {
-        return Err("File path escapes download directory".into());
-    }
-    let path_str = canonical.to_string_lossy().to_string();
     tokio::task::spawn_blocking(move || {
-        opener::open(&path_str).map_err(|e| format!("Failed to open file: {e}"))
+        if !file_path.exists() {
+            return Err("File not found on disk".to_string());
+        }
+        let canonical = file_path.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
+        let canonical_base = download_dir.canonicalize().map_err(|e| format!("Invalid base: {e}"))?;
+        if !canonical.starts_with(&canonical_base) {
+            return Err("File path escapes download directory".to_string());
+        }
+        opener::open(&canonical).map_err(|e| format!("Failed to open file: {e}"))
     }).await.map_err(|e| format!("Open task failed: {e}"))??;
     Ok(())
 }

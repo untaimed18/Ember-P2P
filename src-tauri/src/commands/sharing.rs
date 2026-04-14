@@ -23,6 +23,14 @@ use crate::storage::known_files::KnownFileList;
 use crate::types::*;
 use tracing::{debug, info, warn};
 
+fn paths_equal_ignore_case(a: &str, b: &str) -> bool {
+    if cfg!(target_os = "windows") {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
 pub(crate) async fn refresh_file_cache(index: &Arc<RwLock<LocalIndex>>, cache: &Arc<RwLock<Vec<FileInfo>>>) {
     let (snap_raw, previous_flags) = tokio::join!(
         async { index.read().await.all_files().to_vec() },
@@ -196,7 +204,7 @@ pub async fn add_shared_folder(
     tokio::spawn(async move {
         let _scan_guard = ScanGuard(scanning.clone());
 
-        let discover_path = path.clone();
+        let discover_path = canonical_str.clone();
         let mut discovered = match tokio::task::spawn_blocking(move || {
             FileIndexer::discover_directory(&discover_path)
         })
@@ -381,8 +389,10 @@ pub async fn remove_shared_folder(
 ) -> Result<(), String> {
     {
         let flags = state.hash_cancel_flags.read().await;
-        if let Some(flag) = flags.get(&path) {
-            flag.store(true, Ordering::Relaxed);
+        for (key, flag) in flags.iter() {
+            if paths_equal_ignore_case(key, &path) {
+                flag.store(true, Ordering::Relaxed);
+            }
         }
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
@@ -396,12 +406,12 @@ pub async fn remove_shared_folder(
 
     let save_data = {
         let mut config = state.config.write().await;
-        config.settings.shared_folders.retain(|f| f != &path);
+        config.settings.shared_folders.retain(|f| !paths_equal_ignore_case(f, &path));
         config.prepare_save().map_err(|e| format!("Config save error: {e}"))?
     };
     {
         let mut live = state.upload_shared_folders.write().await;
-        live.retain(|f| f != &path);
+        live.retain(|f| !paths_equal_ignore_case(f, &path));
     }
     {
         let (data, tmp, final_path) = save_data;

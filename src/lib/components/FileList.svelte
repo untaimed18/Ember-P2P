@@ -23,7 +23,7 @@
     try {
       const link = await formatEd2kLink(file.name, file.size, file.hash);
       await navigator.clipboard.writeText(link);
-      copiedId = file.id;
+      copiedId = file.hash || file.path;
       if (copyTimer !== undefined) clearTimeout(copyTimer);
       copyTimer = setTimeout(() => { copiedId = null; copyTimer = undefined; }, 2000);
     } catch (e) {
@@ -88,7 +88,7 @@
         </tr>
       </thead>
       <tbody>
-        {#each sorted as file (file.id)}
+        {#each sorted as file (file.hash || file.path)}
           <tr onclick={() => onselect?.(file)} class:clickable={!!onselect}>
             <td title={file.path}>{file.name}</td>
             <td>{file.extension || '—'}</td>
@@ -97,7 +97,7 @@
             {#if showCopyLink}
               <td>
                 <button class="ghost copy-btn" disabled={!file.hash} onclick={(e: MouseEvent) => { e.stopPropagation(); copyLink(file); }}>
-                  {copiedId === file.id ? 'Copied!' : 'Copy eD2K Link'}
+                  {copiedId === (file.hash || file.path) ? 'Copied!' : 'Copy eD2K Link'}
                 </button>
               </td>
             {/if}

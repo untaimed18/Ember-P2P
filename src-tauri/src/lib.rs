@@ -170,7 +170,14 @@ pub fn run() {
                     return;
                 }
 
+                struct StartupScanGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+                impl Drop for StartupScanGuard {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 startup_scanning.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _scan_guard = StartupScanGuard(startup_scanning.clone());
                 let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 startup_cancel_flags.write().await.insert("__startup__".to_string(), cancel_flag.clone());
 
@@ -191,7 +198,6 @@ pub fn run() {
 
                 if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
                     info!("Startup hashing cancelled during discovery");
-                    startup_scanning.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     startup_cancel_flags.write().await.remove("__startup__");
                     let _ = startup_app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
                     return;
@@ -344,7 +350,7 @@ pub fn run() {
                     }
                 }
 
-                startup_scanning.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                drop(_scan_guard);
                 startup_cancel_flags.write().await.remove("__startup__");
                 let _ = net_tx.try_send(network::NetworkCommand::SharedFilesChanged);
                 let _ = startup_app.emit("file-hash-progress", serde_json::json!({

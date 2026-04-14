@@ -45,10 +45,11 @@
   let connecting = $state(false);
   let refreshInProgress = false;
   let pendingRefresh = false;
-  let mounted = true;
+  let mounted = false;
   let logArea: HTMLDivElement | undefined = $state(undefined);
 
   onMount(() => {
+    mounted = true;
     refresh();
     const interval = setInterval(refresh, 5000);
 
