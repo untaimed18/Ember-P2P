@@ -5224,10 +5224,29 @@ pub async fn start_network(
                     // Initialize the LowID-to-LowID connection broker
                     if state.connection_broker.is_none() {
                         let (broker_tx, broker_rx) = mpsc::channel(32);
-                        state.connection_broker = Some(ember::broker::ConnectionBroker::new(
+                        let mut broker = ember::broker::ConnectionBroker::new(
                             settings.rendezvous_url.clone(),
                             broker_tx,
-                        ));
+                        );
+
+                        match ember::quic::generate_self_signed_cert(&ember_hash) {
+                            Ok((cert_der, key_der)) => {
+                                match ember::quic::build_client_endpoint(&cert_der, &key_der) {
+                                    Ok(ep) => {
+                                        broker.set_quic_endpoint(std::sync::Arc::new(ep));
+                                        tracing::info!("Broker: QUIC client endpoint ready");
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Broker: failed to create QUIC endpoint: {e}");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Broker: failed to generate QUIC cert: {e}");
+                            }
+                        }
+
+                        state.connection_broker = Some(broker);
                         state.broker_event_rx = Some(broker_rx);
                     }
                 }
@@ -5479,26 +5498,182 @@ pub async fn start_network(
                             ember::broker::BrokerEvent::StartPunch { ref attempt_key, source_ip, source_port, our_external_addr, our_nat_type, .. } => {
                                 tracing::info!("Broker: initiating hole-punch for {} -> {}:{} (ext={})", attempt_key, source_ip, source_port, our_external_addr);
                                 let rv_url = settings.rendezvous_url.clone();
-                                let ember_hash_hex = hex::encode(ember_hash);
-                                let target_hex = format!("{:08x}{:04x}", u32::from(source_ip), source_port);
-                                let target_hex = format!("{:0>64}", target_hex);
+                                let our_id = hex::encode(ember_hash);
+                                let target_id = format!("{:08x}{:04x}", u32::from(source_ip), source_port);
+                                let target_id = format!("{:0>64}", target_id);
                                 let port = our_external_addr.port();
                                 let nat_type_val = our_nat_type.as_u8();
+                                let attempt_key_owned = attempt_key.clone();
+                                let kad_cb_tx = kad_callback_tx.clone();
+
+                                let quic_ep = state.connection_broker.as_ref()
+                                    .and_then(|b| b.quic_endpoint().cloned());
+
                                 tokio::spawn(async move {
-                                    let _ = ember::relay::register_punch(
-                                        &rv_url, &ember_hash_hex, &target_hex, port, nat_type_val,
-                                    ).await;
+                                    if let Err(e) = ember::relay::register_punch(
+                                        &rv_url, &our_id, &target_id, port, nat_type_val,
+                                    ).await {
+                                        tracing::warn!("Broker: punch register failed for {attempt_key_owned}: {e}");
+                                        return;
+                                    }
+
+                                    // Poll for the remote peer's address (every 2s for 15s)
+                                    let mut remote_addr = None;
+                                    for _ in 0..8 {
+                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                        match ember::relay::poll_punch(&rv_url, &our_id).await {
+                                            Ok(Some(info)) => {
+                                                if let Ok(ip) = info.ip.parse::<std::net::IpAddr>() {
+                                                    remote_addr = Some(SocketAddr::new(ip, info.port));
+                                                    break;
+                                                }
+                                            }
+                                            Ok(None) => {}
+                                            Err(e) => {
+                                                tracing::debug!("Broker: punch poll error: {e}");
+                                            }
+                                        }
+                                    }
+
+                                    let Some(addr) = remote_addr else {
+                                        tracing::info!("Broker: punch timed out waiting for peer {attempt_key_owned}");
+                                        return;
+                                    };
+
+                                    let Some(endpoint) = quic_ep else {
+                                        tracing::warn!("Broker: no QUIC endpoint for punch {attempt_key_owned}");
+                                        return;
+                                    };
+
+                                    tracing::info!("Broker: attempting QUIC connect to {addr} for {attempt_key_owned}");
+                                    match endpoint.connect(addr, "ember-punch") {
+                                        Ok(connecting) => {
+                                            match connecting.await {
+                                                Ok(conn) => {
+                                                    match conn.open_bi().await {
+                                                        Ok((send, recv)) => {
+                                                            tracing::info!("Broker: hole-punch succeeded to {addr}");
+                                                            let parts = upload_server::KadCallbackParts {
+                                                                peer_ip: match addr.ip() {
+                                                                    std::net::IpAddr::V4(v4) => v4,
+                                                                    _ => Ipv4Addr::UNSPECIFIED,
+                                                                },
+                                                                peer_port: addr.port(),
+                                                                peer_user_hash: [0u8; 16],
+                                                                file_hash: [0u8; 16],
+                                                                reader: Box::new(recv),
+                                                                writer: Box::new(send),
+                                                                emule_info_done: true,
+                                                            };
+                                                            let _ = kad_cb_tx.send(parts).await;
+                                                        }
+                                                        Err(e) => tracing::warn!("Broker: open_bi failed: {e}"),
+                                                    }
+                                                }
+                                                Err(e) => tracing::warn!("Broker: QUIC handshake failed: {e}"),
+                                            }
+                                        }
+                                        Err(e) => tracing::warn!("Broker: quinn connect error: {e}"),
+                                    }
                                 });
                             }
-                            ember::broker::BrokerEvent::StartRelay { ref attempt_key, source_ip, source_port, relay_addr, .. } => {
+                            ember::broker::BrokerEvent::StartRelay { ref attempt_key, source_ip, source_port, file_hash, relay_addr, .. } => {
                                 tracing::info!("Broker: initiating relay for {} -> {}:{} (relay={:?})", attempt_key, source_ip, source_port, relay_addr);
+
+                                let attempt_key_owned = attempt_key.clone();
+                                let kad_cb_tx = kad_callback_tx.clone();
+                                let rv_url = settings.rendezvous_url.clone();
+
+                                if let Some(ref mut broker) = state.connection_broker {
+                                    broker.set_relay_phase(&attempt_key_owned);
+                                }
+
+                                if let Some((relay_ip, relay_port)) = relay_addr {
+                                    // Peer relay via QUIC
+                                    let quic_ep = state.connection_broker.as_ref()
+                                        .and_then(|b| b.quic_endpoint().cloned());
+
+                                    tokio::spawn(async move {
+                                        let Some(endpoint) = quic_ep else {
+                                            tracing::warn!("Broker: no QUIC endpoint for relay {attempt_key_owned}");
+                                            return;
+                                        };
+
+                                        let relay_addr = SocketAddr::new(
+                                            std::net::IpAddr::V4(relay_ip), relay_port,
+                                        );
+
+                                        match ember::relay::connect_to_peer_relay(
+                                            &endpoint, relay_addr, source_ip, source_port, &file_hash,
+                                        ).await {
+                                            Ok((send, recv)) => {
+                                                tracing::info!("Broker: peer relay connected via {relay_addr}");
+                                                let parts = upload_server::KadCallbackParts {
+                                                    peer_ip: source_ip,
+                                                    peer_port: source_port,
+                                                    peer_user_hash: [0u8; 16],
+                                                    file_hash,
+                                                    reader: Box::new(recv),
+                                                    writer: Box::new(send),
+                                                    emule_info_done: true,
+                                                };
+                                                let _ = kad_cb_tx.send(parts).await;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("Broker: peer relay failed: {e}");
+                                            }
+                                        }
+                                    });
+                                } else {
+                                    // Server WebSocket relay fallback
+                                    let session_id = format!(
+                                        "{}-{}", hex::encode(ember_hash),
+                                        hex::encode(file_hash),
+                                    );
+
+                                    tokio::spawn(async move {
+                                        match ember::relay::connect_server_relay(&rv_url, &session_id).await {
+                                            Ok(ws_stream) => {
+                                                tracing::info!("Broker: server relay connected for {attempt_key_owned}");
+                                                let (reader, writer) = tokio::io::split(ws_stream);
+                                                let parts = upload_server::KadCallbackParts {
+                                                    peer_ip: source_ip,
+                                                    peer_port: source_port,
+                                                    peer_user_hash: [0u8; 16],
+                                                    file_hash,
+                                                    reader: Box::new(reader),
+                                                    writer: Box::new(writer),
+                                                    emule_info_done: true,
+                                                };
+                                                let _ = kad_cb_tx.send(parts).await;
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("Broker: server relay failed: {e}");
+                                            }
+                                        }
+                                    });
+                                }
                             }
                             ember::broker::BrokerEvent::ConnectionReady(conn) => {
                                 tracing::info!("Broker: connection ready for transfer {} from {}:{} via {:?}", conn.transfer_id, conn.source_ip, conn.source_port, conn.method);
+                                // Feed into the callback download pipeline
+                                let parts = upload_server::KadCallbackParts {
+                                    peer_ip: conn.source_ip,
+                                    peer_port: conn.source_port,
+                                    peer_user_hash: [0u8; 16],
+                                    file_hash: conn.file_hash,
+                                    reader: conn.reader,
+                                    writer: conn.writer,
+                                    emule_info_done: true,
+                                };
+                                let _ = kad_callback_tx.send(parts).await;
+                                if let Some(ref mut broker) = state.connection_broker {
+                                    let key = format!("{}:{}:{}", conn.transfer_id, conn.source_ip, conn.source_port);
+                                    broker.mark_succeeded(&key);
+                                }
                             }
                             ember::broker::BrokerEvent::ConnectionFailed { ref transfer_id, source_ip, source_port, ref reason } => {
                                 tracing::warn!("Broker: all methods failed for {}:{} (transfer {}): {}", source_ip, source_port, transfer_id, reason);
-                                // Fall back to marking as LowToLowIp
                                 if let Some(pfs) = state.per_file_sources.get_mut(transfer_id) {
                                     pfs.set_low_to_low(source_ip, source_port);
                                 }
@@ -8594,6 +8769,8 @@ pub async fn start_network(
                                             | ed2k::sources::DownloadSourceState::LowToLowIp
                                         ) {
                                             flags |= ember::SOURCE_FLAG_FIREWALLED;
+                                        } else if !s.ip.is_private() {
+                                            flags |= ember::SOURCE_FLAG_RELAY_CAPABLE;
                                         }
                                         ember::EmberSource {
                                             ip: s.ip,
@@ -8653,6 +8830,8 @@ pub async fn start_network(
                                             | ed2k::sources::DownloadSourceState::LowToLowIp
                                         ) {
                                             flags |= ember::SOURCE_FLAG_FIREWALLED;
+                                        } else if !s.ip.is_private() {
+                                            flags |= ember::SOURCE_FLAG_RELAY_CAPABLE;
                                         }
                                         ember::EmberSource {
                                             ip: s.ip,
