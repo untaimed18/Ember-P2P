@@ -12,6 +12,7 @@ static/flags/
 
 # Rust build
 src-tauri/target/
+rendezvous-server/target/
 
 # Tauri generated files
 src-tauri/gen/schemas
