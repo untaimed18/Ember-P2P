@@ -22,8 +22,10 @@
 
   $effect(() => {
     if (open && friendHash) {
-      requestBrowse();
-      setupListener();
+      (async () => {
+        await setupListener();
+        requestBrowse();
+      })();
     }
     return () => {
       listenerGen++;

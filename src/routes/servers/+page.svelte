@@ -65,7 +65,7 @@
             if (logArea) logArea.scrollTop = logArea.scrollHeight;
           });
         }),
-        listen<{ connected: boolean }>('server-status-changed', (event) => {
+        listen<{ status: string }>('server-status-changed', (event) => {
           if (!mounted) return;
           refresh();
         }),
