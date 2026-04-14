@@ -5047,6 +5047,11 @@ pub async fn start_network(
                     }
                     info!("Firewall check result: TCP={:?} UDP={:?} (ports tcp={} udp={})",
                         tcp_status, udp_status, state.tcp_port, state.udp_port);
+                    // Initial NAT probe as soon as we learn our external IP
+                    if !had_ip && state.external_ip.is_some() && state.nat_info.nat_type == ember::nat::NatType::Unknown {
+                        info!("External IP discovered via firewall check — running initial NAT probe");
+                        state.nat_info = ember::nat::probe_nat(&udp_socket).await;
+                    }
                     let status_changed = was_udp_fw != state.udp_firewalled
                         || was_tcp_fw != state.firewalled
                         || (!had_ip && state.external_ip.is_some());
@@ -5713,7 +5718,7 @@ pub async fn start_network(
                                             }
                                         }
                                     });
-                                } else {
+                                } else if !rv_url.is_empty() {
                                     let session_id = format!(
                                         "{}-{}", hex::encode(ember_hash),
                                         hex::encode(file_hash),
@@ -5747,6 +5752,15 @@ pub async fn start_network(
                                                 }).await;
                                             }
                                         }
+                                    });
+                                } else {
+                                    tracing::warn!("Broker: no peer relay candidate and no rendezvous URL for {attempt_key_owned}");
+                                    tokio::spawn(async move {
+                                        let Some(broker_tx) = broker_tx else { return; };
+                                        let _ = broker_tx.send(ember::broker::BrokerEvent::RelayFailed {
+                                            attempt_key: attempt_key_owned,
+                                            reason: "no relay candidate and no rendezvous URL".into(),
+                                        }).await;
                                     });
                                 }
                             }
@@ -8150,7 +8164,8 @@ pub async fn start_network(
                             let ext_ip = Ipv4Addr::from(ip_bytes);
                             info!("Server HighID reports our IP as {}", ext_ip);
                             if !ext_ip.is_unspecified() && !ext_ip.is_loopback() {
-                                if state.external_ip.is_none() {
+                                let was_none = state.external_ip.is_none();
+                                if was_none {
                                     state.external_ip = Some(ext_ip);
                                     state.stats.external_ip = ext_ip.to_string();
                                     info!("External IP set from server HighID: {}", ext_ip);
@@ -8161,6 +8176,10 @@ pub async fn start_network(
                                     info!("Server HighID IP {} differs from current external IP {:?} — not overwriting", ext_ip, state.external_ip);
                                 }
                                 state.firewall_checker.handle_firewalled_response(ext_ip);
+                                if was_none && state.nat_info.nat_type == ember::nat::NatType::Unknown {
+                                    info!("External IP discovered via server HighID — running initial NAT probe");
+                                    state.nat_info = ember::nat::probe_nat(&udp_socket).await;
+                                }
                             }
                         }
 
@@ -11309,6 +11328,11 @@ async fn handle_udp_packet(
                 state.external_ip = Some(external_ip);
                 state.stats.external_ip = external_ip.to_string();
                 info!("External IP set tentatively to {} (single KAD response, unconfirmed)", external_ip);
+            }
+
+            if prev_ip.is_none() && state.external_ip.is_some() && state.nat_info.nat_type == ember::nat::NatType::Unknown {
+                info!("External IP discovered via KAD — running initial NAT probe");
+                state.nat_info = ember::nat::probe_nat(socket).await;
             }
 
             if state.external_ip.is_some() {
