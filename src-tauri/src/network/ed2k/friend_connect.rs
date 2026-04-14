@@ -2,6 +2,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
+use ed25519_dalek::{Signer, Verifier, SigningKey, VerifyingKey};
+use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
@@ -9,6 +11,7 @@ use tracing::{debug, info};
 
 use super::messages::*;
 use super::upload::{EmberSessionMap, UploadEvent, UploadEventKind};
+use crate::network::ember::crypto;
 
 /// Lightweight TCP connection that performs Hello/EmuleInfo handshake and sends
 /// an OP_EMBER_FRIEND_REQ, then disconnects. Returns the remote peer's
@@ -22,6 +25,8 @@ pub async fn connect_and_send_friend_request(
     tcp_port: u16,
     udp_port: u16,
     obfuscate: bool,
+    ed25519_pubkey: Option<[u8; 32]>,
+    ed25519_secret_key: Option<[u8; 32]>,
 ) -> anyhow::Result<Option<[u8; 16]>> {
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -69,7 +74,8 @@ pub async fn connect_and_send_friend_request(
             e
         })?;
 
-    let emule_payload = build_emule_info(udp_port, false, Some(our_ember_hash));
+    let pk_ref = ed25519_pubkey.as_ref();
+    let emule_payload = build_emule_info(udp_port, false, Some(our_ember_hash), pk_ref);
     write_packet(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
 
     let (proto, opcode, payload) = read_packet_with_timeout(&mut reader, 15)
@@ -79,13 +85,18 @@ pub async fn connect_and_send_friend_request(
     if proto == OP_EMULEPROT && (opcode == OP_EMULEINFOANSWER || opcode == OP_EMULEINFO) {
         merge_caps(&mut hello_caps, parse_emule_info(&payload));
         if opcode == OP_EMULEINFO {
-            let answer = build_emule_info(udp_port, false, Some(our_ember_hash));
+            let answer = build_emule_info(udp_port, false, Some(our_ember_hash), pk_ref);
             write_packet(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &answer).await?;
         }
     }
 
     if !hello_caps.is_ember {
         anyhow::bail!("remote peer is not an Ember client");
+    }
+
+    // Ember auth challenge-response if both sides support it
+    if let (Some(peer_pk), Some(our_pk), Some(our_sk)) = (hello_caps.ember_pubkey, ed25519_pubkey, ed25519_secret_key) {
+        perform_ember_auth(&mut reader, &mut writer, &our_pk, &our_sk, &peer_pk, hello_caps.ember_hash.as_ref(), addr).await?;
     }
 
     info!("Friend-connect handshake with {} complete, sending friend request", addr);
@@ -154,6 +165,8 @@ pub async fn open_and_run_friend_session(
     ember_sessions: EmberSessionMap,
     ul_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
+    ed25519_pubkey: Option<[u8; 32]>,
+    ed25519_secret_key: Option<[u8; 32]>,
 ) -> anyhow::Result<FriendSessionHandle> {
     let stream = tokio::time::timeout(
         std::time::Duration::from_secs(15),
@@ -201,7 +214,8 @@ pub async fn open_and_run_friend_session(
             e
         })?;
 
-    let emule_payload = build_emule_info(udp_port, false, Some(&our_ember_hash));
+    let pk_ref = ed25519_pubkey.as_ref();
+    let emule_payload = build_emule_info(udp_port, false, Some(&our_ember_hash), pk_ref);
     write_packet(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
 
     let (proto, opcode, payload) = read_packet_with_timeout(&mut reader, 15)
@@ -210,7 +224,7 @@ pub async fn open_and_run_friend_session(
     if proto == OP_EMULEPROT && (opcode == OP_EMULEINFOANSWER || opcode == OP_EMULEINFO) {
         merge_caps(&mut hello_caps, parse_emule_info(&payload));
         if opcode == OP_EMULEINFO {
-            let answer = build_emule_info(udp_port, false, Some(&our_ember_hash));
+            let answer = build_emule_info(udp_port, false, Some(&our_ember_hash), pk_ref);
             write_packet(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &answer).await?;
         }
     }
@@ -220,6 +234,11 @@ pub async fn open_and_run_friend_session(
     }
     let peer_ember_hash = hello_caps.ember_hash
         .ok_or_else(|| anyhow::anyhow!("Ember peer has no ember_hash"))?;
+
+    // Ember auth challenge-response if both sides support it
+    if let (Some(peer_pk), Some(our_pk), Some(our_sk)) = (hello_caps.ember_pubkey, ed25519_pubkey, ed25519_secret_key) {
+        perform_ember_auth(&mut reader, &mut writer, &our_pk, &our_sk, &peer_pk, Some(&peer_ember_hash), addr).await?;
+    }
 
     let is_friend = friend_hashes.read().await.contains(&peer_ember_hash);
     if !is_friend {
@@ -399,4 +418,88 @@ async fn read_packet_with_timeout<R: AsyncReadExt + Unpin>(
     )
     .await
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
+}
+
+/// Perform the Ember Ed25519 challenge-response authentication exchange.
+///
+/// Both sides send a 32-byte random nonce as `OP_EMBER_AUTH_CHALLENGE`, then
+/// sign the received nonce with their Ed25519 key and send the signature as
+/// `OP_EMBER_AUTH_RESPONSE` (32-byte pubkey + 64-byte signature).
+///
+/// Verification checks:
+///   1. `BLAKE3(peer_pubkey)[0..16] == peer_ember_hash` (identity binding)
+///   2. The signature over our nonce is valid under the peer's public key
+async fn perform_ember_auth<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    our_pubkey: &[u8; 32],
+    our_secret_key: &[u8; 32],
+    peer_pubkey: &[u8; 32],
+    peer_ember_hash: Option<&[u8; 16]>,
+    addr: SocketAddr,
+) -> anyhow::Result<()>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    // Verify peer pubkey matches their advertised ember_hash
+    if let Some(expected_hash) = peer_ember_hash {
+        let peer_vk = VerifyingKey::from_bytes(peer_pubkey)
+            .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
+        let derived_hash = crypto::node_id_from_public_key(&peer_vk);
+        if derived_hash != *expected_hash {
+            anyhow::bail!(
+                "Ember auth: peer pubkey does not match ember_hash (derived={}, advertised={})",
+                hex::encode(derived_hash), hex::encode(expected_hash)
+            );
+        }
+    }
+
+    // Generate and send our challenge nonce
+    let mut our_nonce = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut our_nonce);
+    write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE, &our_nonce).await?;
+
+    // Read peer's challenge nonce
+    let (proto, opcode, peer_nonce_payload) = read_packet_with_timeout(reader, 10).await
+        .map_err(|e| anyhow::anyhow!("Ember auth: failed to read challenge from {addr}: {e}"))?;
+    if proto != OP_EMULEPROT || opcode != OP_EMBER_AUTH_CHALLENGE || peer_nonce_payload.len() != 32 {
+        anyhow::bail!(
+            "Ember auth: expected AUTH_CHALLENGE from {addr}, got proto=0x{proto:02X} op=0x{opcode:02X} len={}",
+            peer_nonce_payload.len()
+        );
+    }
+
+    // Sign the peer's nonce with our key and send response (pubkey + signature)
+    let signing_key = SigningKey::from_bytes(our_secret_key);
+    let signature = signing_key.sign(&peer_nonce_payload);
+    let mut response = Vec::with_capacity(96);
+    response.extend_from_slice(our_pubkey);
+    response.extend_from_slice(&signature.to_bytes());
+    write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE, &response).await?;
+
+    // Read peer's response (32-byte pubkey + 64-byte signature)
+    let (proto, opcode, peer_response) = read_packet_with_timeout(reader, 10).await
+        .map_err(|e| anyhow::anyhow!("Ember auth: failed to read response from {addr}: {e}"))?;
+    if proto != OP_EMULEPROT || opcode != OP_EMBER_AUTH_RESPONSE || peer_response.len() != 96 {
+        anyhow::bail!(
+            "Ember auth: expected AUTH_RESPONSE from {addr}, got proto=0x{proto:02X} op=0x{opcode:02X} len={}",
+            peer_response.len()
+        );
+    }
+
+    let resp_pubkey: [u8; 32] = peer_response[..32].try_into().unwrap();
+    if resp_pubkey != *peer_pubkey {
+        anyhow::bail!("Ember auth: response pubkey doesn't match EmuleInfo pubkey from {addr}");
+    }
+
+    let peer_vk = VerifyingKey::from_bytes(peer_pubkey)
+        .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
+    let sig_bytes: [u8; 64] = peer_response[32..96].try_into().unwrap();
+    let peer_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    peer_vk.verify(&our_nonce, &peer_sig)
+        .map_err(|e| anyhow::anyhow!("Ember auth: signature verification failed for {addr}: {e}"))?;
+
+    info!("Ember auth: verified peer {} at {}", hex::encode(&peer_pubkey[..8]), addr);
+    Ok(())
 }

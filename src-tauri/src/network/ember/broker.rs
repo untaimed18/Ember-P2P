@@ -21,6 +21,7 @@ pub struct BrokerConnection {
     pub source_ip: Ipv4Addr,
     pub source_port: u16,
     pub method: ConnectionMethod,
+    pub relay_addr: Option<(Ipv4Addr, u16)>,
     pub reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
     pub writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
 }
@@ -84,6 +85,23 @@ pub struct RelayCandidate {
     pub port: u16,
     pub last_seen: Instant,
     pub relay_sessions: u32,
+}
+
+/// Execute a QUIC hole-punch connect to the given remote address.
+/// Returns the opened bidirectional send/recv streams on success.
+pub async fn punch_quic(
+    endpoint: &quinn::Endpoint,
+    addr: SocketAddr,
+) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
+    let conn = endpoint.connect(addr, "ember-punch")
+        .map_err(|e| format!("quinn connect error: {e}"))?
+        .await
+        .map_err(|e| format!("QUIC handshake failed with {addr}: {e}"))?;
+
+    let (send, recv) = conn.open_bi().await
+        .map_err(|e| format!("QUIC open_bi failed: {e}"))?;
+
+    Ok((send, recv))
 }
 
 /// Orchestrates LowID-to-LowID connections: hole-punch first, relay fallback.
@@ -159,30 +177,6 @@ impl ConnectionBroker {
 
     pub fn quic_endpoint(&self) -> Option<&Arc<quinn::Endpoint>> {
         self.quic_endpoint.as_ref()
-    }
-
-    /// Execute hole-punch: connect via QUIC to the remote peer's external address.
-    /// Returns the opened send/recv streams on success.
-    pub async fn execute_punch(
-        &self,
-        remote_addr: SocketAddr,
-        attempt_key: &str,
-    ) -> Result<(quinn::SendStream, quinn::RecvStream), String> {
-        let endpoint = self.quic_endpoint.as_ref()
-            .ok_or_else(|| "no QUIC endpoint configured".to_string())?;
-
-        info!("Broker: attempting QUIC hole-punch to {remote_addr} for {attempt_key}");
-
-        let conn = endpoint.connect(remote_addr, "ember-punch")
-            .map_err(|e| format!("quinn connect error: {e}"))?
-            .await
-            .map_err(|e| format!("QUIC handshake failed with {remote_addr}: {e}"))?;
-
-        let (send, recv) = conn.open_bi().await
-            .map_err(|e| format!("QUIC open_bi failed: {e}"))?;
-
-        info!("Broker: QUIC hole-punch succeeded to {remote_addr} for {attempt_key}");
-        Ok((send, recv))
     }
 
     /// Called when a LowToLowIp situation is detected instead of giving up.
@@ -399,6 +393,14 @@ impl ConnectionBroker {
         self.attempts.get(attempt_key).map(|a| {
             (a.transfer_id.clone(), a.file_hash, a.source_ip, a.source_port)
         })
+    }
+
+    /// Increment the relay session count for a relay candidate after a successful relay.
+    pub fn increment_relay_sessions(&mut self, ip: Ipv4Addr, port: u16) {
+        if let Some(candidate) = self.relay_candidates.iter_mut().find(|c| c.ip == ip && c.port == port) {
+            candidate.relay_sessions += 1;
+            debug!("Broker: incremented relay_sessions for {}:{} to {}", ip, port, candidate.relay_sessions);
+        }
     }
 
     /// Transition an attempt to the RelayConnect phase.

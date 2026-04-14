@@ -110,6 +110,8 @@ pub const OP_EMBER_BROWSE_REQ: u8 = 0xF2;
 pub const OP_EMBER_BROWSE_RES: u8 = 0xF3;
 pub const OP_EMBER_FRIEND_REQ: u8 = 0xF4;
 pub const OP_EMBER_KEEPALIVE: u8 = 0xF5;
+pub const OP_EMBER_AUTH_CHALLENGE: u8 = 0xF6;
+pub const OP_EMBER_AUTH_RESPONSE: u8 = 0xF7;
 
 // Constants
 pub const EMBLOCKSIZE: u64 = 184_320;
@@ -296,6 +298,8 @@ pub struct PeerCapabilities {
     pub epx_version: u8,
     /// Ember-specific identity hash for the friend system (from EmuleInfo tag 0x56)
     pub ember_hash: Option<[u8; 16]>,
+    /// Ed25519 public key for Ember auth (from EmuleInfo tag 0x57)
+    pub ember_pubkey: Option<[u8; 32]>,
 }
 
 /// Build Hello with buddy info tags.
@@ -456,15 +460,15 @@ fn write_ed2k_tag(buf: &mut Vec<u8>, name_id: u8, value: &Ed2kTagValue) {
 
 /// Build an EmuleInfo packet payload matching eMule BaseClient.cpp SendMuleInfoPacket.
 /// Format: version(1) + EMULE_PROTOCOL(1) + tag_count(4) + 8 ET_ tags.
-pub fn build_emule_info(udp_port: u16, obfuscation_enabled: bool, ember_hash: Option<&[u8; 16]>) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(100);
+pub fn build_emule_info(udp_port: u16, obfuscation_enabled: bool, ember_hash: Option<&[u8; 16]>, ed25519_pubkey: Option<&[u8; 32]>) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(140);
 
-    // eMule: data.WriteUInt8((uint8)theApp.m_uCurVersionShort) -- 0x32 for 0.50
     buf.write_u8(0x32).unwrap();
-    // eMule: data.WriteUInt8(EMULE_PROTOCOL) -- 0x01, CRITICAL: peers discard without this
     buf.write_u8(0x01).unwrap();
 
-    let tag_count: u32 = if ember_hash.is_some() { 9 } else { 8 };
+    let tag_count: u32 = 8
+        + ember_hash.is_some() as u32
+        + ed25519_pubkey.is_some() as u32;
     buf.write_u32::<LittleEndian>(tag_count).unwrap();
 
     // ET_COMPRESSION (0x20) = 1
@@ -495,6 +499,14 @@ pub fn build_emule_info(udp_port: u16, obfuscation_enabled: bool, ember_hash: Op
         buf.write_u16::<LittleEndian>(1).unwrap(); // name length = 1
         buf.write_u8(0x56).unwrap(); // name_id
         buf.write_all(hash).unwrap();
+    }
+    // ET_EMBER_PUBKEY (0x57) — Ed25519 public key for Ember auth (BLOB: u32 len + 32 bytes)
+    if let Some(pk) = ed25519_pubkey {
+        buf.write_u8(0x07).unwrap(); // tag type BSob (blob with length prefix)
+        buf.write_u16::<LittleEndian>(1).unwrap(); // name length = 1
+        buf.write_u8(0x57).unwrap(); // name_id
+        buf.write_u32::<LittleEndian>(32).unwrap(); // data length
+        buf.write_all(pk).unwrap();
     }
 
     buf
@@ -575,10 +587,15 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
                 cursor.set_position((p + byte_count) as u64);
                 continue;
             }
-            0x07 => { // BLOB
+            0x07 => { // BLOB (BSob with u32 length prefix)
                 let blen = cursor.read_u32::<LittleEndian>().unwrap_or(0) as usize;
                 let p = cursor.position() as usize;
                 if blen > payload.len() || p > payload.len() - blen { break; }
+                if name_id == 0x57 && blen == 32 { // ET_EMBER_PUBKEY
+                    let mut pk = [0u8; 32];
+                    pk.copy_from_slice(&payload[p..p + 32]);
+                    caps.ember_pubkey = Some(pk);
+                }
                 cursor.set_position((p + blen) as u64);
                 continue;
             }
@@ -1680,7 +1697,7 @@ mod tests {
 
     #[test]
     fn parse_emule_info_roundtrip_preserves_flags() {
-        let caps = parse_emule_info(&build_emule_info(4672, true, None));
+        let caps = parse_emule_info(&build_emule_info(4672, true, None, None));
 
         assert_eq!(caps.udp_port, 4672);
         assert_eq!(caps.compression_ver, 1);

@@ -1586,7 +1586,7 @@ async fn download_parts_from_source(
     let mut peer_supports_aich = hello_caps.supports_aich;
     let mut peer_ember_hash: Option<[u8; 16]> = hello_caps.ember_hash;
 
-    let emule_payload = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash));
+    let emule_payload = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
     write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
 
     let mut deferred_packet: Option<(u8, u8, Vec<u8>)> = None;
@@ -1621,7 +1621,7 @@ async fn download_parts_from_source(
                     }
                 }
                 if opcode == OP_EMULEINFO {
-                    let emule_answer = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash));
+                    let emule_answer = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
                     let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_answer).await;
                     debug!("Received peer OP_EMULEINFO from source {}, replied", _src_idx);
                 } else {
@@ -1728,7 +1728,7 @@ async fn download_parts_from_source(
                     }
                 }
                 if opcode == OP_EMULEINFO {
-                    let emule_answer = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash));
+                    let emule_answer = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
                     let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_answer).await;
                     debug!("Received delayed peer OP_EMULEINFO from source {}, replied", _src_idx);
                 } else {
@@ -1943,7 +1943,7 @@ async fn download_parts_from_source(
                 }
             }
             if opcode == OP_EMULEINFO {
-                let emule_answer = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash));
+                let emule_answer = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
                 let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_answer).await;
                 debug!("Received peer OP_EMULEINFO from source {} during file-status wait, replied", _src_idx);
             } else {

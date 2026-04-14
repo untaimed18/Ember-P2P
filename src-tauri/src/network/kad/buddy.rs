@@ -567,7 +567,7 @@ async fn buddy_hello_handshake_outgoing(
         );
     }
 
-    let emule_info = crate::network::ed2k::messages::build_emule_info(udp_port, obfuscation_enabled, None);
+    let emule_info = crate::network::ed2k::messages::build_emule_info(udp_port, obfuscation_enabled, None, None);
     write_ed2k_packet(writer, OP_EMULEPROT, OP_EMULEINFO, &emule_info).await?;
 
     let (proto2, opcode2, _) =
