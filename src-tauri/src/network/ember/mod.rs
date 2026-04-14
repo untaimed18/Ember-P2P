@@ -1,5 +1,19 @@
 #[allow(dead_code)]
+pub mod crypto;
+#[allow(dead_code)]
+pub mod dht;
+#[allow(dead_code)]
+pub mod friends;
+#[allow(dead_code)]
 pub mod nat;
+#[allow(dead_code)]
+pub mod quic;
+#[allow(dead_code)]
+pub mod reputation;
+#[allow(dead_code)]
+pub mod transfer;
+#[allow(dead_code)]
+pub mod transport;
 #[allow(dead_code)]
 pub mod broker;
 #[allow(dead_code)]
