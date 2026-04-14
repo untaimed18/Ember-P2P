@@ -4939,10 +4939,12 @@ pub async fn start_network(
                             state.firewall_checker.record_udp_port_probe_sent();
                         }
                     }
-                    // Don't dispatch UDP firewall probes here — pongs haven't
-                    // arrived yet so external_udp_port may be stale.  The Pong
-                    // handler calls dispatch_udp_firewall_probe_requests() once
-                    // pong responses provide the correct external port.
+                    // Eagerly dispatch UDP firewall probes now. If a previous
+                    // cycle already learned the external UDP port it is still
+                    // available in firewall_checker; otherwise the function
+                    // falls back to settings.udp_port.  The Pong handler will
+                    // also call dispatch again once fresh pongs refine the port.
+                    dispatch_udp_firewall_probe_requests(&mut state, &settings);
                 }
 
                 if state.firewall_checker.evaluate() {
@@ -12350,8 +12352,9 @@ async fn handle_command(
                 }
             }
 
-            // UDP firewall probes will be dispatched by the Pong handler once
-            // pong replies provide the correct external UDP port.
+            // Eagerly dispatch UDP firewall probes (uses previous external port
+            // or falls back to settings.udp_port). Pong handler will also retry.
+            dispatch_udp_firewall_probe_requests(&mut state, &settings);
 
             info!("Sent {} firewall checks and {} ping probes", state.firewall_checks_sent, ping_contacts.len());
             let _ = tx.send(if state.firewall_checks_sent > 0 || !ping_contacts.is_empty() {
