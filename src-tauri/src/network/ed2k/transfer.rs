@@ -1747,8 +1747,18 @@ impl Ed2kDownload {
                 const MAX_CONSECUTIVE_BAD_BLOCKS: u32 = 5;
 
                 // Match eMule: only use I64 when offsets actually exceed 32-bit range
-                let needs_i64 = peer_supports_large_files
-                    && all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
+                let has_large_offsets = all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
+                let needs_i64 = peer_supports_large_files && has_large_offsets;
+
+                // If blocks exceed 4 GiB but the peer doesn't support large files,
+                // filter them out to avoid sending (0,0) clamped garbage requests.
+                if has_large_offsets && !peer_supports_large_files {
+                    warn!(
+                        "Skipping part {} — offsets exceed 4 GiB but peer lacks large-file support",
+                        part_idx
+                    );
+                    continue;
+                }
 
                 // Send initial batch of requests to fill the pipeline
                 while sent_idx < batches.len() && sent_idx < max_outstanding {

@@ -2989,12 +2989,8 @@ pub async fn start_network(
                                                     f.write_all(entry.as_bytes())
                                                 });
                                             tracing::info!("Computed AICH root for completed download: {aich_hex}");
-                                            match aich_tx.try_send(hs) {
-                                                Ok(()) => {}
-                                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                                    tracing::warn!("AICH channel full, hash set dropped — will recompute on next share scan");
-                                                }
-                                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                                            if let Err(e) = aich_tx.blocking_send(hs) {
+                                                tracing::warn!("AICH channel closed, hash set not stored: {e}");
                                             }
                                         }
                                         Err(e) => {
@@ -3800,7 +3796,9 @@ pub async fn start_network(
                         packet.extend_from_slice(&res_payload);
                         let sessions = state.ember_sessions.read().await;
                         if let Some(sender) = sessions.get(&browse_eh) {
-                            let _ = sender.try_send(packet);
+                            if let Err(e) = sender.try_send(packet) {
+                                tracing::warn!("Browse response to {} dropped: {e}", hex::encode(browse_eh));
+                            }
                         }
                         let _ = app_handle.emit("ember:browse-request", serde_json::json!({
                             "user_hash": hash_hex,
