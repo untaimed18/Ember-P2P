@@ -1161,7 +1161,7 @@ checksum = "4ef6b89e5b37196644d8796de5268852ff179b44e96276cf4290264843743bb7"
 
 [[package]]
 name = "ember"
-version = "0.7.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "blake3",
