@@ -29,7 +29,7 @@ export function formatEta(totalSize: number, transferred: number, speed: number)
   if (speed <= 0 || transferred >= totalSize) return '\u2014';
   const remaining = totalSize - transferred;
   const secs = Math.round(remaining / speed);
-  if (secs < 60) return '< 1m';
+  if (secs < 60) return `${secs}s`;
   const days = Math.floor(secs / 86400);
   const hrs = Math.floor((secs % 86400) / 3600);
   const mins = Math.floor((secs % 3600) / 60);
@@ -87,7 +87,7 @@ export function formatRemaining(totalSize: number, transferred: number, speed: n
   if (days > 0) timeStr = `${days}d ${hrs}h`;
   else if (hrs > 0) timeStr = `${hrs}h ${mins}m`;
   else if (mins > 0) timeStr = `${mins}m`;
-  else timeStr = '< 1m';
+  else timeStr = `${secs}s`;
   return `${timeStr} (${remainStr})`;
 }
 

@@ -317,9 +317,13 @@
     serverRetryPending = true;
     try {
       const retryRequestId = newSearchNonce();
+      patchSearchTabByRequestId(tabRequestId, (tab) => ({
+        ...tab,
+        requestId: retryRequestId,
+      }));
       const results = await searchFiles(tabQuery, 'server', retryRequestId, activeTab.fileType || undefined, activeTab.filters);
       if (results && results.length > 0) {
-        patchSearchTabByRequestId(tabRequestId, (tab) => ({
+        patchSearchTabByRequestId(retryRequestId, (tab) => ({
           ...tab,
           results: mergeSearchResults(tab.results, results),
         }));
