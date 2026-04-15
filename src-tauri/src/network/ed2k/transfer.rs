@@ -1081,7 +1081,11 @@ impl Ed2kDownload {
                         available_parts = vec![true; part_count.max(1)];
                     } else {
                         debug!("FileStatus: {} parts", parts.len());
-                        available_parts = parts;
+                        let mut padded = parts;
+                        if padded.len() < part_count {
+                            padded.resize(part_count, false);
+                        }
+                        available_parts = padded;
                     }
                     got_status = true;
                 }
@@ -1188,7 +1192,11 @@ impl Ed2kDownload {
                                 available_parts = vec![true; part_count.max(1)];
                             } else {
                                 debug!("FileStatus via MultiPacket: {} parts", parts.len());
-                                available_parts = parts;
+                                let mut padded = parts;
+                                if padded.len() < part_count {
+                                    padded.resize(part_count, false);
+                                }
+                                available_parts = padded;
                             }
                             got_status = true;
                         }
@@ -1279,61 +1287,73 @@ impl Ed2kDownload {
 
         let mut part_hashes: Vec<[u8; 16]> = Vec::new();
         let mut aich_master_hash: Option<[u8; 20]> = None;
-        // Try to read hashset answer (some peers may not support it)
-        match read_packet_with_timeout(&mut reader)
-            .await
-            .context("stage:hashset_wait")
-        {
-            Ok((proto, opcode, payload)) => {
-                if proto == OP_EDONKEYHEADER && opcode == OP_HASHSETANSWER {
-                    match parse_hashset_answer(&payload) {
-                        Ok((_hash, hashes)) => {
-                            if verify_hashset(&self.file_hash, &hashes, self.file_size) {
-                                debug!("Got verified hashset with {} part hashes", hashes.len());
-                                part_hashes = hashes;
-                            } else {
-                                warn!("Hashset verification failed - combined hash doesn't match file hash");
-                            }
-                        }
-                        Err(e) => debug!("Failed to parse hashset answer: {e}"),
-                    }
-                } else if proto == OP_EMULEPROT && opcode == OP_HASHSETANSWER2 {
-                    match parse_hashset_answer2(&payload) {
-                        Ok(resp) => {
-                            let local_ident = FileIdentifier {
-                                md4_hash: self.file_hash,
-                                file_size: Some(self.file_size),
-                                aich_hash: None,
-                            };
-                            if !local_ident.compare_relaxed(&resp.identifier) {
-                                anyhow::bail!("hashsetanswer2 file identifier mismatch");
-                            }
-                            if let (Some(root), Some(part_hashes)) =
-                                (resp.aich_master_hash, resp.aich_part_hashes.as_ref())
-                            {
-                                aich_master_hash = Some(root);
-                                debug!(
-                                    "Got HashSet2 AICH data: master={}, parts={}",
-                                    hex::encode(root),
-                                    part_hashes.len()
-                                );
-                            }
-                            if let Some(hashes) = resp.md4_hashes {
+        // Try to read hashset answer. The peer may send other packets
+        // (SecIdent, EmuleInfo) before the hashset, so read up to 5 packets.
+        for _hs_attempt in 0..5u32 {
+            match read_packet_with_timeout(&mut reader)
+                .await
+                .context("stage:hashset_wait")
+            {
+                Ok((proto, opcode, payload)) => {
+                    if proto == OP_EDONKEYHEADER && opcode == OP_HASHSETANSWER {
+                        match parse_hashset_answer(&payload) {
+                            Ok((_hash, hashes)) => {
                                 if verify_hashset(&self.file_hash, &hashes, self.file_size) {
-                                    debug!("Got verified hashset2 with {} part hashes", hashes.len());
+                                    debug!("Got verified hashset with {} part hashes", hashes.len());
                                     part_hashes = hashes;
                                 } else {
-                                    warn!("Hashset2 verification failed - combined hash doesn't match file hash");
+                                    warn!("Hashset verification failed - combined hash doesn't match file hash");
                                 }
                             }
+                            Err(e) => debug!("Failed to parse hashset answer: {e}"),
                         }
-                        Err(e) => debug!("Failed to parse hashset answer2: {e}"),
+                        break;
+                    } else if proto == OP_EMULEPROT && opcode == OP_HASHSETANSWER2 {
+                        match parse_hashset_answer2(&payload) {
+                            Ok(resp) => {
+                                let local_ident = FileIdentifier {
+                                    md4_hash: self.file_hash,
+                                    file_size: Some(self.file_size),
+                                    aich_hash: None,
+                                };
+                                if !local_ident.compare_relaxed(&resp.identifier) {
+                                    anyhow::bail!("hashsetanswer2 file identifier mismatch");
+                                }
+                                if let (Some(root), Some(part_hashes)) =
+                                    (resp.aich_master_hash, resp.aich_part_hashes.as_ref())
+                                {
+                                    aich_master_hash = Some(root);
+                                    debug!(
+                                        "Got HashSet2 AICH data: master={}, parts={}",
+                                        hex::encode(root),
+                                        part_hashes.len()
+                                    );
+                                }
+                                if let Some(hashes) = resp.md4_hashes {
+                                    if verify_hashset(&self.file_hash, &hashes, self.file_size) {
+                                        debug!("Got verified hashset2 with {} part hashes", hashes.len());
+                                        part_hashes = hashes;
+                                    } else {
+                                        warn!("Hashset2 verification failed - combined hash doesn't match file hash");
+                                    }
+                                }
+                            }
+                            Err(e) => debug!("Failed to parse hashset answer2: {e}"),
+                        }
+                        break;
+                    } else if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
+                        early_upload_accept = true;
+                        debug!("Received AcceptUploadReq while waiting for hashset — stopping hashset wait");
+                        break;
+                    } else {
+                        debug!("Waiting for hashset, got proto=0x{proto:02X} op=0x{opcode:02X} — skipping");
                     }
-                } else {
-                    debug!("Expected hashset answer, got proto=0x{proto:02X} op=0x{opcode:02X}");
+                }
+                Err(e) => {
+                    debug!("No hashset answer (peer may not support it): {e}");
+                    break;
                 }
             }
-            Err(e) => debug!("No hashset answer (peer may not support it): {e}"),
         }
 
         // Request source exchange only when not already sent in multipacket, and throttled
@@ -2204,6 +2224,21 @@ impl Ed2kDownload {
 
                 if peer_out_of_parts {
                     continue;
+                }
+
+                // Guard against duplicate/overlapping blocks that satisfied the
+                // byte budget without actually closing all gaps in this part.
+                {
+                    let (ps, pe) = tracker.part_range(part_idx);
+                    let part_has_gaps = tracker.gap_list().iter().any(|&(gs, ge)| gs < pe && ge > ps);
+                    if part_has_gaps {
+                        warn!(
+                            "Part {} byte budget met but gaps remain — peer likely sent duplicate blocks, marking for retry",
+                            part_idx
+                        );
+                        tracker.save();
+                        continue;
+                    }
                 }
 
                 // Verify part hash if we have the hashset

@@ -489,6 +489,15 @@ impl Database {
         Ok(transfers)
     }
 
+    pub fn transfer_exists(&self, transfer_id: &str) -> bool {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT 1 FROM transfers WHERE id = ?1",
+            params![transfer_id],
+            |_| Ok(()),
+        ).is_ok()
+    }
+
     pub fn remove_transfer(&self, transfer_id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM transfers WHERE id = ?1", params![transfer_id])?;

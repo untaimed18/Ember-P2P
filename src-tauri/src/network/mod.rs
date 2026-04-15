@@ -1482,6 +1482,20 @@ async fn try_start_pending_download_from_known_sources(
             return false;
         }
     }
+
+    // Only start transfers that are in the active set. Downloads still in
+    // the queue participate in source discovery (they live in
+    // pending_downloads) but must wait for promotion before connecting.
+    {
+        let mgr = transfer_manager.read().await;
+        let is_active = mgr.get_transfer(transfer_id)
+            .map(|t| !matches!(t.status, TransferStatus::Queued))
+            .unwrap_or(false);
+        if !is_active {
+            return false;
+        }
+    }
+
     let Some(pending) = state.pending_downloads.remove(transfer_id) else {
         return false;
     };
@@ -2557,7 +2571,11 @@ pub async fn start_network(
                     mgr.register_control(&transfer.id, control.clone());
                     active_now
                 };
-                if active_now {
+                // Register in pending_downloads regardless of whether active
+                // or queued. Queued downloads still need source discovery
+                // (KAD searches, server queries, retry timer) so they have
+                // sources ready when promoted.
+                if active_now || matches!(transfer.status, TransferStatus::Searching | TransferStatus::Queued) {
                     state.pending_downloads.insert(transfer.id.clone(), PendingDownload {
                         transfer_id: transfer.id.clone(),
                         file_hash: transfer.file_hash.clone(),
@@ -11605,49 +11623,59 @@ async fn handle_command(
 
                 let now = chrono::Utc::now().timestamp();
 
-                // Persist download to database for resume across restarts
-                let db_transfer = Transfer {
-                    id: transfer_id.clone(),
-                    file_name: file_name.clone(),
-                    file_hash: file_hash.clone(),
-                    peer_id: String::new(),
-                    peer_name: String::new(),
-                    direction: TransferDirection::Download,
-                    status: TransferStatus::Searching,
-                    progress: 0.0,
-                    speed: 0,
-                    total_size: file_size,
-                    transferred: 0,
-                    completed_size: 0,
-                    started_at: now,
-                    failure_reason: None,
-                    failure_kind: None,
-                    failure_stage: None,
-                    priority: "auto".to_string(),
-                    sources: 0,
-                    active_sources: 0,
-                    queued_sources: 0,
-                    queue_rank: None,
-                    last_seen_complete: None,
-                    last_received: None,
-                    health: TransferHealth::Healthy,
-                    health_reason: None,
-                    stalled_since: None,
-                    category: String::new(),
-                    wait_time: 0,
-                    upload_time: 0,
-                    a4af_sources: 0,
-                    max_sources: 0,
-                    preview_priority: false,
-                    ember_sources: 0,
-                    client_software: String::new(),
-                    country_code: None,
-                    user_hash: None,
-                };
+                // Persist download to database for resume across restarts.
+                // Check for an existing DB row first so we don't clobber
+                // progress/priority when a queued download is promoted.
                 {
                     let db_ref = db.clone();
-                    let t = db_transfer.clone();
-                    tokio::task::spawn_blocking(move || { let _ = db_ref.save_transfer(&t); });
+                    let tid = transfer_id.clone();
+                    let fname = file_name.clone();
+                    let fhash = file_hash.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if db_ref.transfer_exists(&tid) {
+                            let _ = db_ref.update_transfer_status(&tid, "searching");
+                        } else {
+                            let db_transfer = Transfer {
+                                id: tid,
+                                file_name: fname,
+                                file_hash: fhash,
+                                peer_id: String::new(),
+                                peer_name: String::new(),
+                                direction: TransferDirection::Download,
+                                status: TransferStatus::Searching,
+                                progress: 0.0,
+                                speed: 0,
+                                total_size: file_size,
+                                transferred: 0,
+                                completed_size: 0,
+                                started_at: now,
+                                failure_reason: None,
+                                failure_kind: None,
+                                failure_stage: None,
+                                priority: "auto".to_string(),
+                                sources: 0,
+                                active_sources: 0,
+                                queued_sources: 0,
+                                queue_rank: None,
+                                last_seen_complete: None,
+                                last_received: None,
+                                health: TransferHealth::Healthy,
+                                health_reason: None,
+                                stalled_since: None,
+                                category: String::new(),
+                                wait_time: 0,
+                                upload_time: 0,
+                                a4af_sources: 0,
+                                max_sources: 0,
+                                preview_priority: false,
+                                ember_sources: 0,
+                                client_software: String::new(),
+                                country_code: None,
+                                user_hash: None,
+                            };
+                            let _ = db_ref.save_transfer(&db_transfer);
+                        }
+                    });
                 }
 
                 let kad_search_started = if !closest.is_empty() {
@@ -11673,6 +11701,14 @@ async fn handle_command(
                     false
                 };
 
+                // Look up actual priority from the transfer manager if this
+                // is a promoted/re-started download, otherwise default to normal.
+                let pending_priority = {
+                    let mgr = transfer_manager.read().await;
+                    mgr.get_transfer(&transfer_id)
+                        .map(|t| priority_str_to_u32(&t.priority))
+                        .unwrap_or(1)
+                };
                 state.pending_downloads.insert(transfer_id.clone(), PendingDownload {
                     transfer_id: transfer_id.clone(),
                     file_hash: file_hash.clone(),
@@ -11681,7 +11717,7 @@ async fn handle_command(
                     control,
                     search_count: if kad_search_started { 1 } else { 0 },
                     last_search_at: if kad_search_started { now } else { 0 },
-                    priority: 1, // "auto" defaults to normal; auto-priority will adjust
+                    priority: pending_priority,
                 });
 
                 // Request sources from the connected ed2k server (non-blocking)
