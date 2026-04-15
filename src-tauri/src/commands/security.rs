@@ -374,6 +374,7 @@ pub async fn update_ipfilter_from_url(
 
 #[tauri::command]
 pub async fn import_ipfilter_file(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     file_path: String,
 ) -> Result<String, String> {
@@ -409,9 +410,46 @@ pub async fn import_ipfilter_file(
     .await
     .map_err(|e| format!("Task failed: {e}"))??;
 
+    let ext = path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+
+    let load_path = if ext == "gz" || ext == "zip" {
+        let data_dir = app.path()
+            .app_data_dir()
+            .map_err(|e| format!("Failed to get app data dir: {e}"))?;
+        tokio::fs::create_dir_all(&data_dir).await
+            .map_err(|e| format!("Failed to create data dir: {e}"))?;
+        let dest = data_dir.join("ipfilter.dat");
+
+        let src = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let raw = std::fs::read(&src)
+                .map_err(|e| format!("Failed to read file: {e}"))?;
+            let decompressed = if ext == "gz" {
+                use flate2::read::GzDecoder;
+                let mut decoder = GzDecoder::new(std::io::Cursor::new(&raw));
+                let mut out = Vec::new();
+                decoder.read_to_end(&mut out)
+                    .map_err(|e| format!("Failed to decompress .gz file: {e}"))?;
+                out
+            } else {
+                extract_ipfilter_from_zip(&raw)?
+            };
+            std::fs::write(&dest, &decompressed)
+                .map_err(|e| format!("Failed to write ipfilter.dat: {e}"))?;
+            Ok::<std::path::PathBuf, String>(dest)
+        })
+        .await
+        .map_err(|e| format!("Task failed: {e}"))??
+    } else {
+        path
+    };
+
     state
         .network_tx
-        .send(NetworkCommand::ReloadIpFilter { path })
+        .send(NetworkCommand::ReloadIpFilter { path: load_path })
         .await
         .map_err(|e| format!("Failed to reload filter: {e}"))?;
 

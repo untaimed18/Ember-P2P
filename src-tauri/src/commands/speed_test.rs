@@ -87,7 +87,7 @@ pub async fn run_speed_test() -> Result<SpeedTestResult, String> {
         download_speed,
         upload_speed,
         recommended_upload_limit: (upload_speed as f64 * 0.8) as u64,
-        recommended_download_limit: 0,
+        recommended_download_limit: (download_speed as f64 * 0.8) as u64,
     };
 
     info!(

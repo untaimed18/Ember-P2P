@@ -760,6 +760,11 @@ pub enum NetworkCommand {
     },
     CancelDownload {
         transfer_id: String,
+        /// When set, the handler will skip saving .part.met (files are about to
+        /// be deleted), await the task abort so file handles are released, remove
+        /// the tracker from the registry, and signal the sender so the caller
+        /// can safely delete the .part / .part.met files.
+        cleanup_ack: Option<oneshot::Sender<()>>,
     },
     PauseDownload {
         transfer_id: String,
@@ -11324,7 +11329,7 @@ async fn handle_command(
             info!("Cancelled search request {}", request_id);
         }
 
-        NetworkCommand::CancelDownload { transfer_id } => {
+        NetworkCommand::CancelDownload { transfer_id, cleanup_ack } => {
             // eMule: CPartFile::DeletePartFile -> StopFile -> PauseFile ->
             //   CSearchManager::StopSearch(GetKadFileSearchID(), true)
             // Remove from pending_downloads so no new searches are started
@@ -11347,12 +11352,21 @@ async fn handle_command(
             state.active_kad_search_state.remove(&transfer_id);
             state.per_file_sources.remove(&transfer_id);
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
-                if let Ok(reg) = state.tracker_registry.lock() {
-                    if let Some(tracker) = reg.get(&transfer_id) {
-                        if let Ok(t) = tracker.try_read() { t.save(); }
+                if cleanup_ack.is_none() {
+                    // Stop path: preserve .part.met for resume
+                    if let Ok(reg) = state.tracker_registry.lock() {
+                        if let Some(tracker) = reg.get(&transfer_id) {
+                            if let Ok(t) = tracker.try_read() { t.save(); }
+                        }
                     }
                 }
                 handle.abort();
+                let _ = handle.await;
+            }
+            if cleanup_ack.is_some() {
+                if let Ok(mut reg) = state.tracker_registry.lock() {
+                    reg.remove(&transfer_id);
+                }
             }
 
             // Remove partial download from KAD source publish
@@ -11382,6 +11396,10 @@ async fn handle_command(
                     "CancelDownload {}: removed pending_download={}, stopped {} KAD source search(es)",
                     transfer_id, removed_pending.is_some(), search_ids.len()
                 );
+            }
+
+            if let Some(tx) = cleanup_ack {
+                let _ = tx.send(());
             }
         }
 

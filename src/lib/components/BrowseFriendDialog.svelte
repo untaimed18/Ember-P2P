@@ -95,11 +95,12 @@
     if (downloadedHashes.has(file.hash)) return;
     downloadError = null;
     try {
-      await invoke('start_download_from_search', {
+      await invoke('start_download', {
         fileHash: file.hash,
         fileName: file.name,
         fileSize: file.size,
-        sources: [],
+        peerIp: '',
+        peerPort: 0,
       });
       downloadedHashes.add(file.hash);
       downloadedHashes = new Set(downloadedHashes);

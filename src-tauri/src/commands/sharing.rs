@@ -401,7 +401,9 @@ pub async fn remove_shared_folder(
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
     loop {
-        let still_active = state.hash_cancel_flags.read().await.contains_key(&path);
+        let still_active = state.hash_cancel_flags.read().await
+            .keys()
+            .any(|key| paths_equal_ignore_case(key, &path));
         if !still_active || std::time::Instant::now() >= deadline {
             break;
         }

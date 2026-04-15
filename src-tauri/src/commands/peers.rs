@@ -58,12 +58,12 @@ pub async fn add_friend(
         config.settings.max_friends
     };
 
-    let mut friends = state.friend_hashes.write().await;
-    if friends.len() as u32 >= max_friends {
-        return Err(format!("Friend limit reached ({max_friends}). Increase the limit in Settings > Friends."));
+    {
+        let friends = state.friend_hashes.read().await;
+        if friends.len() as u32 >= max_friends {
+            return Err(format!("Friend limit reached ({max_friends}). Increase the limit in Settings > Friends."));
+        }
     }
-    friends.insert(hash);
-    drop(friends);
 
     let db = state.db.clone();
     let db_hash = canonical.clone();
@@ -72,6 +72,8 @@ pub async fn add_friend(
         .await
         .map_err(|e| format!("Task error: {e}"))?
         .map_err(|e| format!("Failed to save friend: {e}"))?;
+
+    state.friend_hashes.write().await.insert(hash);
 
     if state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
         ember_hash: hash,
@@ -278,12 +280,12 @@ pub async fn accept_friend_request(
         config.settings.max_friends
     };
 
-    let mut friends = state.friend_hashes.write().await;
-    if friends.len() as u32 >= max_friends {
-        return Err(format!("Friend limit reached ({max_friends}). Increase the limit in Settings > Friends."));
+    {
+        let friends = state.friend_hashes.read().await;
+        if friends.len() as u32 >= max_friends {
+            return Err(format!("Friend limit reached ({max_friends}). Increase the limit in Settings > Friends."));
+        }
     }
-    friends.insert(hash);
-    drop(friends);
 
     let db = state.db.clone();
     let c2 = canonical.clone();
@@ -301,6 +303,8 @@ pub async fn accept_friend_request(
     .await
     .map_err(|e| format!("Task error: {e}"))?
     .map_err(|e| format!("Failed to accept friend request: {e}"))?;
+
+    state.friend_hashes.write().await.insert(hash);
 
     if state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
         ember_hash: hash,

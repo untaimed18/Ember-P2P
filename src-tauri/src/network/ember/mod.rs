@@ -157,11 +157,13 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
     }
 
     let mut entries = Vec::with_capacity(file_count);
+    let mut files_fully_parsed = true;
     for _ in 0..file_count {
         let remaining = data.len() - cursor.position() as usize;
         let min_header = if version >= 3 { V3_FILE_ENTRY_HEADER_SIZE } else { V2_FILE_ENTRY_HEADER_SIZE };
         if remaining < min_header {
             tracing::debug!("EPX payload truncated: declared {file_count} files but only parsed {}", entries.len());
+            files_fully_parsed = false;
             break;
         }
 
@@ -175,6 +177,7 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
                 let remaining = data.len() - cursor.position() as usize;
                 if remaining < 20 {
                     tracing::debug!("EPX payload truncated: missing AICH root for {}", hex::encode(file_hash));
+                    files_fully_parsed = false;
                     break;
                 }
                 let mut root = [0u8; 20];
@@ -197,6 +200,7 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
         let remaining = data.len() - cursor.position() as usize;
         if remaining < sources_bytes_needed {
             tracing::debug!("EPX payload truncated: not enough bytes for sources of file {}", hex::encode(file_hash));
+            files_fully_parsed = false;
             break;
         }
 
@@ -233,9 +237,10 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
         });
     }
 
-    // Parse peer discovery section (v3+)
+    // Only parse peer discovery if every declared file was fully read;
+    // otherwise the cursor is mid-record and remaining bytes are not the peer section.
     let mut peers = Vec::new();
-    if version >= 3 {
+    if version >= 3 && files_fully_parsed {
         let remaining = data.len() - cursor.position() as usize;
         if remaining >= 2 {
             let peer_count = cursor.read_u16::<LittleEndian>()? as usize;

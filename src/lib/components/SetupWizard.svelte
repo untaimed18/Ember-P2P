@@ -79,9 +79,9 @@
     speedTestRunning = true;
     speedTestResult = '';
     try {
-      const result: { recommended_upload: number; recommended_download: number } = await invoke('run_speed_test');
-      maxUploadSpeed = result.recommended_upload;
-      maxDownloadSpeed = result.recommended_download;
+      const result: { recommended_upload_limit: number; recommended_download_limit: number } = await invoke('run_speed_test');
+      maxUploadSpeed = result.recommended_upload_limit;
+      maxDownloadSpeed = result.recommended_download_limit;
       const fmtUp = maxUploadSpeed > 0 ? `${Math.round(maxUploadSpeed / 1024)} KB/s` : 'Unlimited';
       const fmtDl = maxDownloadSpeed > 0 ? `${Math.round(maxDownloadSpeed / 1024)} KB/s` : 'Unlimited';
       speedTestResult = `Recommended: ${fmtUp} up / ${fmtDl} down`;

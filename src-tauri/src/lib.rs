@@ -532,8 +532,10 @@ pub fn run() {
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     state.bw_shutdown.store(true, std::sync::atomic::Ordering::Release);
                     let tx = state.network_tx.clone();
-                    let _ = tx.try_send(network::NetworkCommand::Shutdown);
-                    info!("Sent shutdown command to network, waiting for save...");
+                    match tx.blocking_send(network::NetworkCommand::Shutdown) {
+                        Ok(()) => info!("Sent shutdown command to network, waiting for save..."),
+                        Err(e) => tracing::warn!("Failed to send shutdown command: {e}"),
+                    }
 
                     let flag = state.shutdown_complete.clone();
                     let start = std::time::Instant::now();
