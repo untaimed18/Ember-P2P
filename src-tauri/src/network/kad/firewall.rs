@@ -9,11 +9,15 @@ const MIN_IP_VOTES: usize = 3;
 /// Higher than eMule's default (4) because some contacts won't respond to
 /// FirewalledReq if their RequestTCP fails on their end.
 const FIREWALL_CHECK_COUNT: u32 = 8;
+/// Maximum UDP firewall probes to send across all batches in a single cycle.
+/// Each batch picks a few contacts; the Pong handler and periodic tick can
+/// dispatch additional batches until this cap is reached.  Set high because
+/// many KAD contacts have firewalled TCP and probes require TCP.
+const MAX_UDP_FIREWALL_PROBES: u32 = 12;
 /// Recheck interval (1 hour)
 pub const FIREWALL_RECHECK_SECS: i64 = 3600;
 /// How long to wait for firewall responses before concluding
 const RESPONSE_WINDOW_SECS: i64 = 30;
-const MIN_UDP_FAILURE_CHECKS: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirewallStatus {
@@ -185,7 +189,7 @@ impl FirewallChecker {
     }
 
     pub fn needs_udp_firewall_probes(&self) -> bool {
-        self.checking && self.udp_requests_sent == 0 && !self.udp_firewall_succeeded
+        self.checking && self.udp_requests_sent < MAX_UDP_FIREWALL_PROBES && !self.udp_firewall_succeeded
     }
 
     /// Called periodically to evaluate results if the response window has elapsed.
@@ -221,21 +225,18 @@ impl FirewallChecker {
 
         if self.udp_firewall_succeeded {
             self.udp_status = FirewallStatus::Open;
-        } else if self.udp_firewall_responses_received >= MIN_UDP_FAILURE_CHECKS
-            && self.udp_status != FirewallStatus::Open
-        {
+        } else if self.udp_status != FirewallStatus::Open && self.udp_requests_sent > 0 {
+            // We sent probes but never got a success response.
+            // If we were already confirmed Open, keep that (transient non-response
+            // shouldn't downgrade). Otherwise, conclude Firewalled — including
+            // transitioning out of Unknown, which is the initial state.
             self.udp_status = FirewallStatus::Firewalled;
-            info!("UDP firewall check complete: FIREWALLED");
-        } else if self.udp_requests_sent >= MIN_UDP_FAILURE_CHECKS
-            && self.udp_firewall_responses_received == 0
-        {
-            // No UDP firewall replies at all this cycle (common with transient routing/contact issues).
-            // Preserve current status instead of forcing a false firewalled conclusion.
             info!(
-                "UDP firewall check got no replies (sent {}, recv 0) - keeping previous status {:?}",
-                self.udp_requests_sent,
-                self.udp_status
+                "UDP firewall check complete: FIREWALLED (probes_sent={}, responses={}, success=0)",
+                self.udp_requests_sent, self.udp_firewall_responses_received
             );
+        } else if self.udp_requests_sent == 0 && self.udp_status == FirewallStatus::Unknown {
+            info!("UDP firewall check: no probes dispatched, status remains Unknown");
         }
 
         true

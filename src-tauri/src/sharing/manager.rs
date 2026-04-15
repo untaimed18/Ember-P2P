@@ -563,7 +563,10 @@ impl TransferManager {
             return Vec::new();
         }
         if let Some(idx) = self.queue.iter().position(|t| t.id == id) {
-            let mut transfer = self.queue.remove(idx).expect("queue index valid");
+            let Some(mut transfer) = self.queue.remove(idx) else {
+                tracing::error!("Queue index {idx} invalid after position() - skipping");
+                return Vec::new();
+            };
             transfer.status = Self::queued_wait_status(&transfer);
             Self::clear_runtime_health(&mut transfer);
             if let Some(control) = self.controls.get(id) {
@@ -809,7 +812,10 @@ impl TransferManager {
                 })
                 .map(|(i, _)| i);
             let Some(idx) = next_idx else { break };
-            let mut transfer = self.queue.remove(idx).expect("queue index valid");
+            let Some(mut transfer) = self.queue.remove(idx) else {
+                tracing::error!("Queue index {idx} invalid during promotion - skipping");
+                break;
+            };
             transfer.status = Self::queued_wait_status(&transfer);
             let t = transfer.clone();
             self.active.insert(transfer.id.clone(), transfer);

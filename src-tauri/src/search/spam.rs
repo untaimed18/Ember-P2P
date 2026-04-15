@@ -159,6 +159,22 @@ impl SpamFilter {
         }
     }
 
+    pub fn take_save_data(&mut self) -> Option<(String, std::path::PathBuf)> {
+        if !self.dirty {
+            return None;
+        }
+        match serde_json::to_string_pretty(&self.db) {
+            Ok(data) => {
+                self.dirty = false;
+                Some((data, self.data_path.clone()))
+            }
+            Err(e) => {
+                warn!("Failed to serialize spam filter: {e}");
+                None
+            }
+        }
+    }
+
     pub fn stats(&self) -> SpamStats {
         SpamStats {
             spam_hashes: self.db.spam_hashes.len(),
@@ -410,7 +426,6 @@ impl SpamFilter {
         }
 
         self.dirty = true;
-        self.save();
         info!("Marked as spam: {} ({})", name, result.file.hash);
     }
 
@@ -424,7 +439,6 @@ impl SpamFilter {
         self.db.not_spam_hashes.insert(file_hash.clone());
         self.db.spam_hashes.remove(&file_hash);
         self.dirty = true;
-        self.save();
         info!("Marked as not spam: {file_hash}");
     }
 

@@ -65,7 +65,7 @@
 
   // Sync global friend stores into local reactive state so the template
   // picks up events even if they arrived before this page mounted.
-  $effect(() => {
+  onMount(() => {
     const unsubs = [
       onlineFriendsStore.subscribe(v => { onlineFriends = v; }),
       unreadCountsStore.subscribe(v => { unreadCounts = v; }),

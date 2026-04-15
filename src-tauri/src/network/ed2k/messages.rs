@@ -811,13 +811,17 @@ pub fn build_file_request(file_hash: &[u8; 16]) -> Vec<u8> {
 
 /// Build a RequestParts payload with 32-bit offsets for legacy peers.
 /// Used when peer does not advertise SupportsLargeFiles.
-/// Offsets exceeding u32::MAX are clamped to (0, 0) to avoid silent truncation.
+///
+/// Callers MUST filter out any offsets exceeding `u32::MAX` before calling this.
+/// Any offset above `u32::MAX` is treated as a logic error (debug_assert) and
+/// clamped to 0 in release builds as a safety net.
 pub fn build_request_parts(file_hash: &[u8; 16], offsets: &[(u64, u64)]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(16 + 24);
     buf.write_all(file_hash).unwrap();
     for i in 0..3 {
         if i < offsets.len() {
-            let v = if offsets[i].0 > u32::MAX as u64 { 0u32 } else { offsets[i].0 as u32 };
+            debug_assert!(offsets[i].0 <= u32::MAX as u64, "caller must filter >4GiB offsets");
+            let v = offsets[i].0.min(u32::MAX as u64) as u32;
             buf.write_u32::<LittleEndian>(v).unwrap();
         } else {
             buf.write_u32::<LittleEndian>(0).unwrap();
@@ -825,7 +829,8 @@ pub fn build_request_parts(file_hash: &[u8; 16], offsets: &[(u64, u64)]) -> Vec<
     }
     for i in 0..3 {
         if i < offsets.len() {
-            let v = if offsets[i].1 > u32::MAX as u64 { 0u32 } else { offsets[i].1 as u32 };
+            debug_assert!(offsets[i].1 <= u32::MAX as u64, "caller must filter >4GiB offsets");
+            let v = offsets[i].1.min(u32::MAX as u64) as u32;
             buf.write_u32::<LittleEndian>(v).unwrap();
         } else {
             buf.write_u32::<LittleEndian>(0).unwrap();

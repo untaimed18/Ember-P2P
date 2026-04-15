@@ -81,6 +81,7 @@ pub async fn create_collection(
         "program files", "program files (x86)",
         "programdata", ".ssh", ".gnupg",
         "etc", "usr", "bin", "sbin", "var", "root",
+        "tmp", "temp", "proc", "sys", "dev",
     ];
     for component in canonical.components() {
         if let std::path::Component::Normal(seg) = component {
@@ -94,17 +95,18 @@ pub async fn create_collection(
     if !matches!(ext.as_deref(), Some("emulecollection") | Some("txt")) {
         return Err("Output file must have .emulecollection or .txt extension".into());
     }
+    let write_path = canonical.clone();
     tokio::task::spawn_blocking(move || {
         if binary {
-            collection.save_binary(&path).map_err(|e| format!("Failed to save: {e}"))?;
+            collection.save_binary(&write_path).map_err(|e| format!("Failed to save: {e}"))?;
         } else {
-            collection.save_text(&path).map_err(|e| format!("Failed to save: {e}"))?;
+            collection.save_text(&write_path).map_err(|e| format!("Failed to save: {e}"))?;
         }
         Ok::<_, String>(())
     })
     .await
     .map_err(|e| format!("Save task failed: {e}"))??;
-    Ok(format!("Created collection '{name}' at {output_path}"))
+    Ok(format!("Created collection '{name}' at {}", canonical.display()))
 }
 
 #[tauri::command]

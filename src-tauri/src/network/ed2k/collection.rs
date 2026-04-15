@@ -58,7 +58,8 @@ impl Collection {
         let mut name = String::new();
         let mut author = String::new();
 
-        for _ in 0..header_tag_count.min(20) {
+        let header_limit = header_tag_count.min(20);
+        for _ in 0..header_limit {
             let (tag_id, tag_value) = read_tag(cursor)?;
             match tag_id {
                 FT_FILENAME => {
@@ -79,6 +80,9 @@ impl Collection {
                 _ => {}
             }
         }
+        for _ in header_limit..header_tag_count {
+            let _ = read_tag(cursor)?;
+        }
 
         let file_count = cursor.read_u32::<LittleEndian>()? as usize;
         let mut files = Vec::with_capacity(file_count.min(10000));
@@ -90,7 +94,8 @@ impl Collection {
             let mut fhash = String::new();
             let mut faich = String::new();
 
-            for _ in 0..file_tag_count.min(20) {
+            let file_limit = file_tag_count.min(20);
+            for _ in 0..file_limit {
                 let (tag_id, tag_value) = read_tag(cursor)?;
                 match tag_id {
                     FT_FILENAME => {
@@ -117,6 +122,9 @@ impl Collection {
                     }
                     _ => {}
                 }
+            }
+            for _ in file_limit..file_tag_count {
+                let _ = read_tag(cursor)?;
             }
 
             files.push(CollectionFile {

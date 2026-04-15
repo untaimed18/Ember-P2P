@@ -387,6 +387,7 @@ pub async fn stop_transfers_batch(
             .network_tx
             .send(NetworkCommand::CancelDownload {
                 transfer_id: transfer_id.clone(),
+                cleanup_ack: None,
             })
             .await;
     }
@@ -420,12 +421,15 @@ pub async fn cancel_transfers_batch(
             promoted_by_id.entry(p.id.clone()).or_insert(p);
         }
 
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         let _ = state
             .network_tx
             .send(NetworkCommand::CancelDownload {
                 transfer_id: transfer_id.clone(),
+                cleanup_ack: Some(ack_tx),
             })
             .await;
+        let _ = ack_rx.await;
 
         let dl_folder = {
             let config = state.config.read().await;
@@ -489,6 +493,7 @@ pub async fn stop_transfer(
         .network_tx
         .send(NetworkCommand::CancelDownload {
             transfer_id: transfer_id.clone(),
+            cleanup_ack: None,
         })
         .await;
     start_promoted_downloads(&state, &promoted).await;
@@ -695,12 +700,14 @@ pub async fn cancel_transfer(
         db_blocking(move || { let _ = db.record_download_history(&file_hash, &file_name, file_size, "cancelled"); }).await;
     }
 
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let (_, dl_folder) = tokio::join!(
         async {
             let _ = state
                 .network_tx
                 .send(NetworkCommand::CancelDownload {
                     transfer_id: transfer_id.clone(),
+                    cleanup_ack: Some(ack_tx),
                 })
                 .await;
         },
@@ -709,6 +716,7 @@ pub async fn cancel_transfer(
             config.settings.download_folder.clone()
         },
     );
+    let _ = ack_rx.await;
     cleanup_partial_files(&dl_folder, &transfer_id).await;
 
     {
@@ -734,12 +742,14 @@ pub async fn remove_transfer(
         manager.remove(&transfer_id)
     };
 
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     let (_, dl_folder) = tokio::join!(
         async {
             let _ = state
                 .network_tx
                 .send(NetworkCommand::CancelDownload {
                     transfer_id: transfer_id.clone(),
+                    cleanup_ack: Some(ack_tx),
                 })
                 .await;
         },
@@ -748,6 +758,7 @@ pub async fn remove_transfer(
             config.settings.download_folder.clone()
         },
     );
+    let _ = ack_rx.await;
     let db = state.db.clone();
     let tid = transfer_id.clone();
     tokio::join!(
@@ -964,6 +975,7 @@ pub async fn clear_completed(
             .network_tx
             .send(NetworkCommand::CancelDownload {
                 transfer_id: id.clone(),
+                cleanup_ack: None,
             })
             .await;
     }

@@ -55,10 +55,15 @@ impl AppConfig {
         // Downloads dir.  It should be a Ember subfolder so we don't pollute it.
         if !settings.download_folder.is_empty() {
             let dl = std::path::Path::new(&settings.download_folder);
-            if dl.file_name().map(|n| !n.eq_ignore_ascii_case("Ember")).unwrap_or(false) {
+            let is_default = directories::UserDirs::new()
+                .and_then(|u| u.download_dir().map(|d| d.to_path_buf()))
+                .map(|d| dl == d.as_path())
+                .unwrap_or(false);
+            if is_default && dl.file_name().map(|n| !n.eq_ignore_ascii_case("Ember")).unwrap_or(false) {
                 let migrated = dl.join("Ember").to_string_lossy().to_string();
                 tracing::info!("Migrating download_folder: {} -> {}", settings.download_folder, migrated);
                 settings.download_folder = migrated;
+                let _ = std::fs::create_dir_all(&settings.download_folder);
                 config_changed = true;
             }
         }
@@ -82,6 +87,7 @@ impl AppConfig {
             let data = serde_json::to_string_pretty(&settings)?;
             let tmp = config_path.with_extension("json.tmp");
             std::fs::write(&tmp, &data)?;
+            crate::security::restrict_file_permissions(&tmp);
             std::fs::rename(&tmp, &config_path)?;
         }
 

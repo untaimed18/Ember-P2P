@@ -1553,7 +1553,7 @@ async fn read_server_packet<R: AsyncReadExt + Unpin>(
         ));
     }
     let length = reader.read_u32_le().await? as usize;
-    if length == 0 || length > 50 * 1024 * 1024 {
+    if length == 0 || length > 5 * 1024 * 1024 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid server packet length",

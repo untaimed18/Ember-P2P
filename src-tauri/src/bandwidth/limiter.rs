@@ -71,7 +71,13 @@ impl BandwidthLimiter {
     /// waiting on a `Notify` signal when the bucket is empty instead of
     /// busy-polling. The refill task notifies after adding tokens.
     async fn drain_tokens(&self, tokens: &AtomicU64, mut remaining: u64, _max: u64) {
+        let mut attempts = 0u32;
         while remaining > 0 {
+            attempts += 1;
+            if attempts > 6000 {
+                tracing::warn!("drain_tokens: exceeded max attempts, releasing");
+                return;
+            }
             let current = tokens.load(Ordering::Acquire);
             if current == 0 {
                 tokio::time::timeout(
@@ -176,11 +182,13 @@ impl BandwidthLimiter {
         self.download_speed.store(downloaded_delta, Ordering::Relaxed);
 
         let prev_up = self.smoothed_upload.load(Ordering::Relaxed);
-        let smoothed_up = (uploaded_delta * 30 + prev_up * 70) / 100;
+        let smoothed_up = uploaded_delta.saturating_mul(30)
+            .saturating_add(prev_up.saturating_mul(70)) / 100;
         self.smoothed_upload.store(smoothed_up, Ordering::Relaxed);
 
         let prev_down = self.smoothed_download.load(Ordering::Relaxed);
-        let smoothed_down = (downloaded_delta * 30 + prev_down * 70) / 100;
+        let smoothed_down = downloaded_delta.saturating_mul(30)
+            .saturating_add(prev_down.saturating_mul(70)) / 100;
         self.smoothed_download.store(smoothed_down, Ordering::Relaxed);
     }
 
