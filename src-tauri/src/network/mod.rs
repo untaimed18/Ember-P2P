@@ -7762,6 +7762,15 @@ pub async fn start_network(
                                     info!("Cancelled buddy search: HighID proves TCP is open");
                                 }
                             }
+                            state.stats.firewalled = state.firewalled;
+                            state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
+                            state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
+                            let _ = app_handle.emit("firewall-status", serde_json::json!({
+                                "firewalled": state.firewalled,
+                                "external_ip": state.stats.external_ip,
+                                "tcp_status": state.stats.tcp_status,
+                                "udp_status": state.stats.udp_status,
+                            }));
                             // HighID = our external IP (ed2k stores IPs as LE u32)
                             let ip_bytes = our_id.to_le_bytes();
                             let ext_ip = Ipv4Addr::from(ip_bytes);
@@ -11052,6 +11061,14 @@ async fn handle_udp_packet(
                 if udp_port > 0 {
                     state.external_udp_port = Some(udp_port);
                 }
+                state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
+                state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
+                let _ = app_handle.emit("firewall-status", serde_json::json!({
+                    "firewalled": state.firewalled,
+                    "external_ip": state.stats.external_ip,
+                    "tcp_status": state.stats.tcp_status,
+                    "udp_status": state.stats.udp_status,
+                }));
                 info!("UDP firewall test passed - UDP port {udp_port} is reachable, not UDP-firewalled");
             } else {
                 state.firewall_checker.handle_udp_firewall_result(false);
