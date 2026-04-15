@@ -11,8 +11,9 @@ const MIN_IP_VOTES: usize = 3;
 const FIREWALL_CHECK_COUNT: u32 = 8;
 /// Maximum UDP firewall probes to send across all batches in a single cycle.
 /// Each batch picks a few contacts; the Pong handler and periodic tick can
-/// dispatch additional batches until this cap is reached.
-const MAX_UDP_FIREWALL_PROBES: u32 = 6;
+/// dispatch additional batches until this cap is reached.  Set high because
+/// many KAD contacts have firewalled TCP and probes require TCP.
+const MAX_UDP_FIREWALL_PROBES: u32 = 12;
 /// Recheck interval (1 hour)
 pub const FIREWALL_RECHECK_SECS: i64 = 3600;
 /// How long to wait for firewall responses before concluding
@@ -231,8 +232,8 @@ impl FirewallChecker {
             // transitioning out of Unknown, which is the initial state.
             self.udp_status = FirewallStatus::Firewalled;
             info!(
-                "UDP firewall check complete: FIREWALLED (sent {}, success_replies 0)",
-                self.udp_requests_sent
+                "UDP firewall check complete: FIREWALLED (probes_sent={}, responses={}, success=0)",
+                self.udp_requests_sent, self.udp_firewall_responses_received
             );
         } else if self.udp_requests_sent == 0 && self.udp_status == FirewallStatus::Unknown {
             info!("UDP firewall check: no probes dispatched, status remains Unknown");

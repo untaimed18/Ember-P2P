@@ -9455,7 +9455,9 @@ fn dispatch_udp_firewall_probe_requests(state: &mut NetworkState, settings: &App
         .or(state.external_udp_port)
         .unwrap_or(settings.udp_port);
 
-    let contacts: Vec<KadContact> = state
+    // Prefer contacts that report open TCP (kad_options bit 1 clear).
+    // Contacts with kad_options == 0 haven't reported status; put them second.
+    let mut candidates: Vec<KadContact> = state
         .routing_table
         .all_contacts()
         .filter(|c| {
@@ -9463,12 +9465,19 @@ fn dispatch_udp_firewall_probe_requests(state: &mut NetworkState, settings: &App
                 && !c.is_dead()
                 && c.version > KADEMLIA_VERSION5_48A
                 && c.tcp_port > 0
+                && !c.is_tcp_firewalled()
                 && !state.firewall_checker.is_udp_firewall_check_ip(c.ip)
         })
-        .take(3)
         .cloned()
         .collect();
+    // Sort: contacts with known-open TCP first (kad_options reported & not firewalled),
+    // then contacts with unknown status (kad_options == 0).
+    candidates.sort_by_key(|c| if c.kad_options != 0 { 0u8 } else { 1u8 });
+    let contacts: Vec<KadContact> = candidates.into_iter().take(4).collect();
 
+    if !contacts.is_empty() {
+        info!("Dispatching {} UDP firewall probe(s) (ext_udp_port={})", contacts.len(), external_udp_port);
+    }
     let external_ip = state.external_ip;
     let obfuscation_enabled = settings.obfuscation_enabled;
     for contact in contacts {
@@ -9498,8 +9507,10 @@ fn spawn_udp_firewall_probe_request(
     external_ip: Option<Ipv4Addr>,
     obfuscation_enabled: bool,
 ) {
+    let contact_ip = contact.ip;
+    let contact_tcp = contact.tcp_port;
     tokio::spawn(async move {
-        if let Err(e) = send_udp_firewall_probe_request(
+        match send_udp_firewall_probe_request(
             contact,
             user_hash,
             nickname,
@@ -9512,7 +9523,9 @@ fn spawn_udp_firewall_probe_request(
         )
         .await
         {
-            debug!("UDP firewall probe request failed: {e}");
+            Ok(()) => info!("UDP firewall probe sent to {}:{} (asking for reply on ports {}/{})",
+                contact_ip, contact_tcp, udp_port, external_udp_port),
+            Err(e) => info!("UDP firewall probe to {}:{} failed: {e}", contact_ip, contact_tcp),
         }
     });
 }
@@ -9565,6 +9578,10 @@ async fn send_udp_firewall_probe_request(
     let receiver_key = KadUDPKey::generate(udp_key_seed, u32::from(contact.ip)).key;
     payload.extend_from_slice(&receiver_key.to_le_bytes());
     write_ed2k_packet_simple(&mut writer, OP_EMULEPROT, ed2k::messages::OP_FWCHECKUDPREQ, &payload).await?;
+    // Give the remote peer time to read and process the request before
+    // we drop the TCP connection.  Without this, some clients abort
+    // processing when they see the connection close immediately.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     Ok(())
 }
 
