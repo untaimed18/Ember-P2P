@@ -9465,7 +9465,7 @@ fn dispatch_udp_firewall_probe_requests(state: &mut NetworkState, settings: &App
                 && c.tcp_port > 0
                 && !state.firewall_checker.is_udp_firewall_check_ip(c.ip)
         })
-        .take(2)
+        .take(3)
         .cloned()
         .collect();
 

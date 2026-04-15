@@ -9,6 +9,10 @@ const MIN_IP_VOTES: usize = 3;
 /// Higher than eMule's default (4) because some contacts won't respond to
 /// FirewalledReq if their RequestTCP fails on their end.
 const FIREWALL_CHECK_COUNT: u32 = 8;
+/// Maximum UDP firewall probes to send across all batches in a single cycle.
+/// Each batch picks a few contacts; the Pong handler and periodic tick can
+/// dispatch additional batches until this cap is reached.
+const MAX_UDP_FIREWALL_PROBES: u32 = 6;
 /// Recheck interval (1 hour)
 pub const FIREWALL_RECHECK_SECS: i64 = 3600;
 /// How long to wait for firewall responses before concluding
@@ -184,7 +188,7 @@ impl FirewallChecker {
     }
 
     pub fn needs_udp_firewall_probes(&self) -> bool {
-        self.checking && self.udp_requests_sent == 0 && !self.udp_firewall_succeeded
+        self.checking && self.udp_requests_sent < MAX_UDP_FIREWALL_PROBES && !self.udp_firewall_succeeded
     }
 
     /// Called periodically to evaluate results if the response window has elapsed.
