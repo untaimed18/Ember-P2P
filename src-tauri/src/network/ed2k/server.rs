@@ -492,7 +492,11 @@ impl Ed2kServerConnection {
         payload.extend_from_slice(file_hash);
         let srv_flags = self.session.as_ref().map(|s| s.server_flags).unwrap_or(0);
         let supports_large = (srv_flags & SRV_TCPFLG_LARGEFILES) != 0;
-        if file_size > 0xFFFF_FFFF && supports_large {
+        if file_size > 0xFFFF_FFFF && !supports_large {
+            debug!("Skipping source query for >4 GiB file — server does not support LARGEFILES");
+            return Ok(());
+        }
+        if file_size > 0xFFFF_FFFF {
             payload.extend_from_slice(&0u32.to_le_bytes());
             payload.extend_from_slice(&file_size.to_le_bytes());
         } else {
