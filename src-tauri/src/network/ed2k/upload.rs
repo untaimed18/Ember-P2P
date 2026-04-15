@@ -3369,7 +3369,7 @@ async fn read_packet_async_inner<R: AsyncReadExt + Unpin>(
     const OP_PACKEDPROT: u8 = 0xD4;
     let protocol = reader.read_u8().await?;
     let length = reader.read_u32_le().await? as usize;
-    if length == 0 || length > 10 * 1024 * 1024 {
+    if length == 0 || length > 512 * 1024 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid packet length",
@@ -3390,7 +3390,7 @@ async fn read_packet_async_inner<R: AsyncReadExt + Unpin>(
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("packed decode failed: {e}")))?;
             if n == 0 { break; }
             unpacked.extend_from_slice(&buf[..n]);
-            if unpacked.len() > 10 * 1024 * 1024 {
+            if unpacked.len() > 1024 * 1024 {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "packed packet decompressed size exceeds limit"));
             }
         }
@@ -3419,7 +3419,7 @@ async fn read_packet_with_first_byte<R: AsyncReadExt + Unpin>(
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
     let protocol = first_byte;
     let length = reader.read_u32_le().await? as usize;
-    if length == 0 || length > 10 * 1024 * 1024 {
+    if length == 0 || length > 512 * 1024 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "invalid packet length",

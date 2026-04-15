@@ -19,6 +19,7 @@ const ENTRY_TTL: Duration = Duration::from_secs(300);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_REQUESTS_PER_MINUTE: u64 = 60;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
+const MAX_STORE_ENTRIES: usize = 100_000;
 
 #[derive(Clone)]
 struct PresenceEntry {
@@ -59,19 +60,26 @@ struct UnregisterRequest {
 }
 
 fn extract_client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
-    // Fly.io sets Fly-Client-IP; fall back to X-Forwarded-For, then peer addr
-    if let Some(val) = headers.get("fly-client-ip") {
-        if let Ok(s) = val.to_str() {
-            if let Ok(ip) = s.trim().parse::<IpAddr>() {
-                return ip;
+    // Only trust proxy headers when running behind a reverse proxy (e.g. Fly.io).
+    // Set TRUST_PROXY=false to disable when running without a proxy.
+    let trust_proxy = std::env::var("TRUST_PROXY")
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true);
+
+    if trust_proxy {
+        if let Some(val) = headers.get("fly-client-ip") {
+            if let Ok(s) = val.to_str() {
+                if let Ok(ip) = s.trim().parse::<IpAddr>() {
+                    return ip;
+                }
             }
         }
-    }
-    if let Some(val) = headers.get("x-forwarded-for") {
-        if let Ok(s) = val.to_str() {
-            if let Some(first) = s.split(',').next() {
-                if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                    return ip;
+        if let Some(val) = headers.get("x-forwarded-for") {
+            if let Ok(s) = val.to_str() {
+                if let Some(first) = s.split(',').next() {
+                    if let Ok(ip) = first.trim().parse::<IpAddr>() {
+                        return ip;
+                    }
                 }
             }
         }
@@ -135,7 +143,11 @@ async fn register(
         expires_at: Instant::now() + ENTRY_TTL,
     };
 
-    state.store.write().await.insert(body.id.to_lowercase(), entry);
+    let mut store = state.store.write().await;
+    if store.len() >= MAX_STORE_ENTRIES {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+    store.insert(body.id.to_lowercase(), entry);
     info!("registered {} ip={} (conn={})", &body.id[..8], presence_ip, client_ip);
     StatusCode::OK
 }

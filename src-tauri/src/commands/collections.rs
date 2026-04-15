@@ -81,6 +81,7 @@ pub async fn create_collection(
         "program files", "program files (x86)",
         "programdata", ".ssh", ".gnupg",
         "etc", "usr", "bin", "sbin", "var", "root",
+        "tmp", "temp", "proc", "sys", "dev",
     ];
     for component in canonical.components() {
         if let std::path::Component::Normal(seg) = component {

@@ -68,6 +68,7 @@ fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         "windows", "program files", "program files (x86)",
         "programdata", ".ssh", ".gnupg",
         "etc", "usr", "bin", "sbin", "var", "root",
+        "tmp", "temp", "proc", "sys", "dev",
     ];
     if !settings.download_folder.is_empty() {
         let path = std::path::Path::new(&settings.download_folder);
@@ -231,12 +232,22 @@ pub async fn download_nodes_dat(
         .map_err(|e| format!("Failed to create data dir: {e}"))?;
 
     let nodes_path = data_dir.join("nodes.dat");
-    tokio::fs::write(&nodes_path, &bytes)
+    let tmp_path = data_dir.join("nodes.dat.tmp");
+    tokio::fs::write(&tmp_path, &bytes)
         .await
         .map_err(|e| format!("Failed to write nodes.dat: {e}"))?;
 
-    let contacts = bootstrap::load_nodes_dat(&nodes_path)
-        .map_err(|e| format!("Failed to parse nodes.dat: {e}"))?;
+    let contacts = match bootstrap::load_nodes_dat(&tmp_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(format!("Downloaded file is corrupt: {e}"));
+        }
+    };
+
+    tokio::fs::rename(&tmp_path, &nodes_path)
+        .await
+        .map_err(|e| format!("Failed to finalize nodes.dat: {e}"))?;
 
     let contact_count = contacts.len();
     let byte_count = bytes.len();
@@ -298,9 +309,14 @@ pub async fn download_ipfilter(
         .map_err(|e| format!("Failed to create data dir: {e}"))?;
 
     let filter_path = data_dir.join("ipfilter.dat");
-    tokio::fs::write(&filter_path, &bytes)
+    let tmp_filter_path = data_dir.join("ipfilter.dat.tmp");
+    tokio::fs::write(&tmp_filter_path, &bytes)
         .await
         .map_err(|e| format!("Failed to write ipfilter.dat: {e}"))?;
+
+    tokio::fs::rename(&tmp_filter_path, &filter_path)
+        .await
+        .map_err(|e| format!("Failed to finalize ipfilter.dat: {e}"))?;
 
     let byte_count = bytes.len();
     let line_count = bytes.iter().filter(|&&b| b == b'\n').count();

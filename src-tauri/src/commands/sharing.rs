@@ -136,6 +136,7 @@ pub async fn add_shared_folder(
         "windows", "program files", "program files (x86)",
         "programdata", ".ssh", ".gnupg",
         "etc", "usr", "bin", "sbin", "var", "root",
+        "tmp", "temp", "proc", "sys", "dev",
     ];
     for component in canonical.components() {
         if let std::path::Component::Normal(seg) = component {
@@ -196,12 +197,12 @@ pub async fn add_shared_folder(
     let cancel_flags = state.hash_cancel_flags.clone();
     let config = state.config.clone();
 
-    scanning.fetch_add(1, Ordering::Relaxed);
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let cancel_key = canonical_str.clone();
     cancel_flags.write().await.insert(cancel_key.clone(), cancel_flag.clone());
 
     tokio::spawn(async move {
+        scanning.fetch_add(1, Ordering::Relaxed);
         let _scan_guard = ScanGuard(scanning.clone());
 
         let discover_path = canonical_str.clone();
@@ -495,12 +496,12 @@ pub async fn reload_shared_files(
     let config = state.config.clone();
     let discovery_folders = folders.clone();
 
-    scanning.fetch_add(1, Ordering::Relaxed);
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let reload_key = format!("__reload_{}__", RELOAD_COUNTER.fetch_add(1, Ordering::Relaxed));
     cancel_flags.write().await.insert(reload_key.clone(), cancel_flag.clone());
 
     tokio::spawn(async move {
+        scanning.fetch_add(1, Ordering::Relaxed);
         let _scan_guard = ScanGuard(scanning.clone());
 
         let mut discovered: Vec<FileInfo> = match tokio::task::spawn_blocking(move || {

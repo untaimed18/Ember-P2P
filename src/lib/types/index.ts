@@ -139,12 +139,12 @@ export interface SpamStats {
 export interface SpamExplanation {
   score: number;
   threshold: number;
-  profile: 'balanced' | 'aggressive';
+  profile: 'relaxed' | 'balanced' | 'aggressive';
   is_spam: boolean;
   reasons: string[];
 }
 
-export type SpamFilterProfile = 'balanced' | 'aggressive';
+export type SpamFilterProfile = 'relaxed' | 'balanced' | 'aggressive';
 
 export interface NetworkStats {
   connected_peers: number;
