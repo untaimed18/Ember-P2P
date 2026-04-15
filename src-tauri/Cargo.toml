@@ -59,6 +59,7 @@ strsim = "0.11"
 zip = "2"
 fs2 = "0.4"
 maxminddb = "0.24"
+parking_lot = "0.12"
 
 [profile.release]
 strip = true

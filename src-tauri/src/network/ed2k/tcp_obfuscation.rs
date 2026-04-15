@@ -264,11 +264,12 @@ pub struct Rc4Writer<W> {
     rc4: Rc4State,
     pending: Vec<u8>,
     pending_offset: usize,
+    pending_plaintext_len: usize,
 }
 
 impl<W> Rc4Writer<W> {
     pub fn new(inner: W, rc4: Rc4State) -> Self {
-        Self { inner, rc4, pending: Vec::new(), pending_offset: 0 }
+        Self { inner, rc4, pending: Vec::new(), pending_offset: 0, pending_plaintext_len: 0 }
     }
 }
 
@@ -290,6 +291,11 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Rc4Writer<W> {
                     if self.pending_offset >= self.pending.len() {
                         self.pending.clear();
                         self.pending_offset = 0;
+                        let consumed = self.pending_plaintext_len;
+                        self.pending_plaintext_len = 0;
+                        if consumed > 0 {
+                            return Poll::Ready(Ok(consumed));
+                        }
                     } else {
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
@@ -309,6 +315,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Rc4Writer<W> {
                 if n < encrypted.len() {
                     self.pending = encrypted;
                     self.pending_offset = n;
+                    self.pending_plaintext_len = 0;
                     cx.waker().wake_by_ref();
                 }
                 Poll::Ready(Ok(plaintext_len))
@@ -316,6 +323,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Rc4Writer<W> {
             Poll::Pending => {
                 self.pending = encrypted;
                 self.pending_offset = 0;
+                self.pending_plaintext_len = plaintext_len;
                 Poll::Pending
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),

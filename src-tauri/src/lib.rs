@@ -379,6 +379,7 @@ pub fn run() {
             let bw_rtt = uss_rtt_queue.clone();
             let bw_uss_flag = uss_enabled_flag.clone();
             let net_spam = spam_filter.clone();
+            let net_handle_err = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = network::start_network(
                     net_handle,
@@ -405,6 +406,7 @@ pub fn run() {
                 .await
                 {
                     tracing::error!("Network error: {e}");
+                    let _ = net_handle_err.emit("network-fatal-error", e.to_string());
                 }
                 shutdown_complete_net.store(true, std::sync::atomic::Ordering::Release);
             });
@@ -525,7 +527,10 @@ pub fn run() {
             commands::speed_test::run_speed_test,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building tauri application")
+        .unwrap_or_else(|e| {
+            tracing::error!("Fatal: failed to build Tauri application: {e}");
+            std::process::exit(1);
+        })
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
                 network::ed2k::preview::cleanup_previews();
@@ -547,6 +552,10 @@ pub fn run() {
                         std::thread::sleep(std::time::Duration::from_millis(200));
                     }
                     info!("Network shutdown complete");
+
+                    if let Ok(mut filter) = state.spam_filter.try_write() {
+                        filter.save();
+                    }
                 }
             }
         });

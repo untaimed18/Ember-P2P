@@ -1024,6 +1024,7 @@ dependencies = [
  "num-bigint-dig",
  "num-traits",
  "opener",
+ "parking_lot",
  "pkcs8",
  "rand 0.8.5",
  "reqwest 0.12.28",

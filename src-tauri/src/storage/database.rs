@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use rusqlite::{params, Connection};
 use tauri::Manager;
@@ -39,7 +39,7 @@ impl Database {
     }
 
     fn run_migrations(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
 
         conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL DEFAULT 0);")?;
         let version: i64 = conn.query_row(
@@ -281,7 +281,7 @@ impl Database {
     }
 
     pub fn save_peer(&self, peer: &PeerInfo) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let addresses = serde_json::to_string(&peer.addresses)?;
         conn.execute(
             "INSERT INTO peers (id, addresses, nickname, last_seen, files_shared, banned)
@@ -305,7 +305,7 @@ impl Database {
     }
 
     pub fn get_peers(&self) -> anyhow::Result<Vec<PeerInfo>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, addresses, nickname, last_seen, files_shared, banned FROM peers",
         )?;
@@ -334,7 +334,7 @@ impl Database {
     }
 
     pub fn ban_peer(&self, peer_id: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO peers (id, banned) VALUES (?1, 1)
              ON CONFLICT(id) DO UPDATE SET banned = 1",
@@ -344,7 +344,7 @@ impl Database {
     }
 
     pub fn unban_peer(&self, peer_id: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE peers SET banned = 0 WHERE id = ?1",
             params![peer_id],
@@ -353,7 +353,7 @@ impl Database {
     }
 
     pub fn save_transfer(&self, transfer: &Transfer) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let direction: &str = match transfer.direction {
             TransferDirection::Upload => "upload",
             TransferDirection::Download => "download",
@@ -410,7 +410,7 @@ impl Database {
     }
 
     pub fn get_incomplete_downloads(&self) -> anyhow::Result<Vec<Transfer>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category
              FROM transfers WHERE status NOT IN ('completed', 'failed', 'insufficient', 'noneneeded') AND direction = 'download'"
@@ -490,13 +490,13 @@ impl Database {
     }
 
     pub fn remove_transfer(&self, transfer_id: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM transfers WHERE id = ?1", params![transfer_id])?;
         Ok(())
     }
 
     pub fn update_transfer_status(&self, transfer_id: &str, status: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE transfers SET status = ?1 WHERE id = ?2",
             params![status, transfer_id],
@@ -511,7 +511,7 @@ impl Database {
         progress: f64,
         speed: u64,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE transfers
              SET transferred = ?1, progress = ?2, speed = ?3
@@ -522,7 +522,7 @@ impl Database {
     }
 
     pub fn update_transfer_priority(&self, transfer_id: &str, priority: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE transfers SET priority = ?1 WHERE id = ?2",
             params![priority, transfer_id],
@@ -531,7 +531,7 @@ impl Database {
     }
 
     pub fn update_transfer_category(&self, transfer_id: &str, category: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE transfers SET category = ?1 WHERE id = ?2",
             params![category, transfer_id],
@@ -540,7 +540,7 @@ impl Database {
     }
 
     pub fn load_credits(&self) -> anyhow::Result<Vec<([u8; 16], u64, u64, i64, Vec<u8>)>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT user_hash, uploaded, downloaded, last_seen, public_key FROM credits")?;
         let records = stmt
             .query_map([], |row| {
@@ -570,7 +570,7 @@ impl Database {
     }
 
     pub fn load_statistics(&self) -> anyhow::Result<Vec<(String, i64)>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT key, value FROM statistics")?;
         let rows = stmt
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?
@@ -586,7 +586,7 @@ impl Database {
     }
 
     pub fn save_statistics(&self, pairs: &[(&str, i64)]) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare("INSERT OR REPLACE INTO statistics (key, value) VALUES (?1, ?2)")?;
@@ -599,7 +599,7 @@ impl Database {
     }
 
     pub fn load_file_comments(&self) -> anyhow::Result<Vec<(String, u8, String)>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT file_hash, rating, comment FROM file_comments")?;
         let rows = stmt
             .query_map([], |row| {
@@ -621,7 +621,7 @@ impl Database {
     }
 
     pub fn save_file_comment(&self, file_hash: &str, rating: u8, comment: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT OR REPLACE INTO file_comments (file_hash, rating, comment) VALUES (?1, ?2, ?3)",
             params![file_hash, rating as i32, comment],
@@ -630,7 +630,7 @@ impl Database {
     }
 
     pub fn save_all_credits(&self, credits: &[(&[u8; 16], u64, u64, i64, &[u8])]) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
@@ -645,7 +645,7 @@ impl Database {
     }
 
     pub fn add_friend(&self, user_hash: &str, nickname: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             "INSERT INTO friends (user_hash, nickname, added_at) VALUES (?1, ?2, ?3)
@@ -656,7 +656,7 @@ impl Database {
     }
 
     pub fn remove_friend(&self, user_hash: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM chat_messages WHERE friend_hash = ?1", params![user_hash])?;
         tx.execute("DELETE FROM friends WHERE user_hash = ?1", params![user_hash])?;
@@ -666,7 +666,7 @@ impl Database {
     }
 
     pub fn get_friends(&self) -> anyhow::Result<Vec<(String, String, i64)>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT user_hash, nickname, added_at FROM friends ORDER BY added_at DESC")?;
         let rows = stmt
             .query_map([], |row| {
@@ -682,7 +682,7 @@ impl Database {
     }
 
     pub fn update_friend_nickname(&self, user_hash: &str, nickname: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE friends SET nickname = ?2 WHERE user_hash = ?1",
             params![user_hash, nickname],
@@ -691,7 +691,7 @@ impl Database {
     }
 
     pub fn update_friend_address(&self, user_hash: &str, ip: &str, port: u16) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             "UPDATE friends SET last_ip = ?2, last_port = ?3, last_seen = ?4 WHERE user_hash = ?1",
@@ -701,7 +701,7 @@ impl Database {
     }
 
     pub fn clear_friend_address(&self, user_hash: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE friends SET last_ip = '', last_port = 0 WHERE user_hash = ?1",
             params![user_hash],
@@ -710,7 +710,7 @@ impl Database {
     }
 
     pub fn get_friend_address(&self, user_hash: &str) -> anyhow::Result<Option<(String, u16)>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT COALESCE(last_ip, ''), COALESCE(last_port, 0) FROM friends WHERE user_hash = ?1"
         )?;
@@ -726,7 +726,7 @@ impl Database {
     }
 
     pub fn get_friends_full(&self) -> anyhow::Result<Vec<(String, String, i64, String, u16, i64, bool)>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT user_hash, nickname, added_at, COALESCE(last_ip, ''), COALESCE(last_port, 0), COALESCE(last_seen, 0), COALESCE(mutual, 0) FROM friends ORDER BY added_at DESC"
         )?;
@@ -748,7 +748,7 @@ impl Database {
     }
 
     pub fn set_friend_mutual(&self, user_hash: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE friends SET mutual = 1 WHERE user_hash = ?1",
             params![user_hash],
@@ -757,7 +757,7 @@ impl Database {
     }
 
     pub fn add_friend_request(&self, sender_hash: &str, nickname: &str, sender_ip: &str, sender_port: u16) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             "INSERT INTO friend_requests (sender_hash, sender_nickname, received_at, sender_ip, sender_port)
@@ -770,7 +770,7 @@ impl Database {
     }
 
     pub fn get_friend_requests(&self) -> anyhow::Result<Vec<(String, String, i64, String, u16)>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT sender_hash, sender_nickname, received_at, COALESCE(sender_ip, ''), COALESCE(sender_port, 0) FROM friend_requests ORDER BY received_at DESC"
         )?;
@@ -790,13 +790,13 @@ impl Database {
     }
 
     pub fn remove_friend_request(&self, sender_hash: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM friend_requests WHERE sender_hash = ?1", params![sender_hash])?;
         Ok(())
     }
 
     pub fn insert_chat_message(&self, friend_hash: &str, direction: &str, message: &str) -> anyhow::Result<i64> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             "INSERT INTO chat_messages (friend_hash, direction, message, timestamp, read) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -806,7 +806,7 @@ impl Database {
     }
 
     pub fn get_chat_messages(&self, friend_hash: &str, limit: i64, before_id: Option<i64>) -> anyhow::Result<Vec<(i64, String, String, i64, bool)>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         if let Some(bid) = before_id {
             let mut stmt = conn.prepare(
                 "SELECT id, direction, message, timestamp, read FROM chat_messages WHERE friend_hash = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3"
@@ -827,7 +827,7 @@ impl Database {
     }
 
     pub fn mark_messages_read(&self, friend_hash: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         conn.execute(
             "UPDATE chat_messages SET read = 1 WHERE friend_hash = ?1 AND read = 0",
             params![friend_hash],
@@ -836,7 +836,7 @@ impl Database {
     }
 
     pub fn unread_message_counts(&self) -> anyhow::Result<Vec<(String, i64)>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT friend_hash, COUNT(*) FROM chat_messages WHERE read = 0 GROUP BY friend_hash"
         )?;
@@ -850,7 +850,8 @@ impl Database {
     /// Reclaim unused pages freed by DELETE operations.
     /// Should be called periodically (e.g. alongside credit flush).
     pub fn incremental_vacuum(&self) {
-        if let Ok(conn) = self.conn.lock() {
+        {
+            let conn = self.conn.lock();
             if let Err(e) = conn.execute_batch("PRAGMA incremental_vacuum(64);") {
                 tracing::debug!("incremental_vacuum failed: {e}");
             }
@@ -865,7 +866,7 @@ impl Database {
         file_size: u64,
         status: &str,
     ) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             "INSERT INTO download_history (file_hash, file_name, file_size, status, timestamp)
@@ -889,7 +890,7 @@ impl Database {
         if hashes.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         let mut result = std::collections::HashMap::new();
         const CHUNK_SIZE: usize = 900;
         for chunk in hashes.chunks(CHUNK_SIZE) {
@@ -914,14 +915,14 @@ impl Database {
 
     /// Remove a specific file from download history (user override).
     pub fn remove_download_history(&self, file_hash: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM download_history WHERE file_hash = ?1", params![file_hash])?;
         Ok(())
     }
 
     /// Clear all download history entries of a given status.
     pub fn clear_download_history(&self, status: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock poisoned: {e}"))?;
+        let conn = self.conn.lock();
         conn.execute("DELETE FROM download_history WHERE status = ?1", params![status])?;
         Ok(())
     }
