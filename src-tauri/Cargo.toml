@@ -67,6 +67,7 @@ zip = "2"
 fs2 = "0.4"
 maxminddb = "0.24"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+parking_lot = "0.12"
 
 [profile.release]
 strip = true

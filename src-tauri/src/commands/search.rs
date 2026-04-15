@@ -248,11 +248,13 @@ pub async fn cancel_search(
 
 /// Compute the ed2k hash of raw bytes (for in-memory content)
 #[tauri::command]
-pub fn compute_ed2k_hash(data: Vec<u8>) -> Result<String, String> {
+pub async fn compute_ed2k_hash(data: Vec<u8>) -> Result<String, String> {
     if data.len() > 100 * 1024 * 1024 {
         return Err("Input too large (max 100MB)".into());
     }
-    Ok(hash::ed2k_hash_bytes(&data))
+    tokio::task::spawn_blocking(move || hash::ed2k_hash_bytes(&data))
+        .await
+        .map_err(|e| format!("Hash task failed: {e}"))
 }
 
 #[tauri::command]
@@ -328,8 +330,22 @@ pub async fn mark_spam(
         clean_name: String::new(),
         result_origin: String::new(),
     };
-    let mut spam = state.spam_filter.write().await;
-    spam.mark_spam(&result, &search_keywords, server_ip.as_deref());
+    let save_data = {
+        let mut spam = state.spam_filter.write().await;
+        spam.mark_spam(&result, &search_keywords, server_ip.as_deref());
+        spam.take_save_data()
+    };
+    if let Some((data, path)) = save_data {
+        let tmp = path.with_extension("json.tmp");
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = std::fs::write(&tmp, &data) {
+                tracing::warn!("Failed to write spam filter temp file: {e}");
+            } else if let Err(e) = std::fs::rename(&tmp, &path) {
+                let _ = std::fs::remove_file(&tmp);
+                tracing::warn!("Failed to save spam filter: {e}");
+            }
+        }).await.ok();
+    }
     Ok(())
 }
 
@@ -341,8 +357,22 @@ pub async fn mark_not_spam(
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err("Invalid file hash".into());
     }
-    let mut spam = state.spam_filter.write().await;
-    spam.mark_not_spam(&file_hash);
+    let save_data = {
+        let mut spam = state.spam_filter.write().await;
+        spam.mark_not_spam(&file_hash);
+        spam.take_save_data()
+    };
+    if let Some((data, path)) = save_data {
+        let tmp = path.with_extension("json.tmp");
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = std::fs::write(&tmp, &data) {
+                tracing::warn!("Failed to write spam filter temp file: {e}");
+            } else if let Err(e) = std::fs::rename(&tmp, &path) {
+                let _ = std::fs::remove_file(&tmp);
+                tracing::warn!("Failed to save spam filter: {e}");
+            }
+        }).await.ok();
+    }
     Ok(())
 }
 

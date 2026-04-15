@@ -133,7 +133,7 @@
     if (parts.length === 0) return r.peer_id === 'local';
     return parts.every((p) => p === 'Local');
   }
-  let spamProfile = $state<'balanced' | 'aggressive'>('balanced');
+  let spamProfile = $state<'relaxed' | 'balanced' | 'aggressive'>('balanced');
   let showSpamHelp = $state(false);
   let contextMenu: { x: number; y: number; result: SearchResult } | null = $state(null);
   let notesRequestId = $state(0);
@@ -277,7 +277,7 @@
       .catch(() => {});
   });
   let spamHiddenCount = $derived(searchResultsList.filter(r => r.is_spam).length);
-  let spamThreshold = $derived(spamProfile === 'aggressive' ? 45 : 60);
+  let spamThreshold = $derived(spamProfile === 'aggressive' ? 45 : spamProfile === 'relaxed' ? 80 : 60);
 
   let serverHintDismissedTabs = $state(new Set<string>());
   let serverRetryPending = $state(false);
@@ -1022,6 +1022,11 @@
     placeholder="Search files across the network..."
     onsubmit={handleSearch}
   />
+  <select class="type-select" bind:value={searchMethod} title="Search method">
+    <option value="global">Global</option>
+    <option value="kad">KAD Only</option>
+    <option value="server">Server Only</option>
+  </select>
   <select class="type-select" bind:value={searchFileType} title="Filter by file type">
     {#each FILE_TYPES as ft}
       <option value={ft.value}>{ft.label}</option>

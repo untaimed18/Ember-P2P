@@ -1184,6 +1184,7 @@ dependencies = [
  "num-bigint-dig",
  "num-traits",
  "opener",
+ "parking_lot",
  "pkcs8",
  "quinn",
  "rand 0.8.5",

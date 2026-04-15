@@ -766,7 +766,7 @@
       {#if logMessages.length === 0}
         <span class="log-placeholder">Server messages will appear here...</span>
       {:else}
-        {#each logMessages as msg, i (i)}
+        {#each logMessages as msg (msg)}
           <div class="log-line">{msg}</div>
         {/each}
       {/if}

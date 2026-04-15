@@ -783,6 +783,11 @@ pub enum NetworkCommand {
     },
     CancelDownload {
         transfer_id: String,
+        /// When set, the handler will skip saving .part.met (files are about to
+        /// be deleted), await the task abort so file handles are released, remove
+        /// the tracker from the registry, and signal the sender so the caller
+        /// can safely delete the .part / .part.met files.
+        cleanup_ack: Option<oneshot::Sender<()>>,
     },
     PauseDownload {
         transfer_id: String,
@@ -3030,12 +3035,8 @@ pub async fn start_network(
                                                     f.write_all(entry.as_bytes())
                                                 });
                                             tracing::info!("Computed AICH root for completed download: {aich_hex}");
-                                            match aich_tx.try_send(hs) {
-                                                Ok(()) => {}
-                                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                                    tracing::warn!("AICH channel full, hash set dropped — will recompute on next share scan");
-                                                }
-                                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                                            if let Err(e) = aich_tx.blocking_send(hs) {
+                                                tracing::warn!("AICH channel closed, hash set not stored: {e}");
                                             }
                                         }
                                         Err(e) => {
@@ -3860,7 +3861,9 @@ pub async fn start_network(
                         packet.extend_from_slice(&res_payload);
                         let sessions = state.ember_sessions.read().await;
                         if let Some(sender) = sessions.get(&browse_eh) {
-                            let _ = sender.try_send(packet);
+                            if let Err(e) = sender.try_send(packet) {
+                                tracing::warn!("Browse response to {} dropped: {e}", hex::encode(browse_eh));
+                            }
                         }
                         let _ = app_handle.emit("ember:browse-request", serde_json::json!({
                             "user_hash": hash_hex,
@@ -5018,10 +5021,12 @@ pub async fn start_network(
                             state.firewall_checker.record_udp_port_probe_sent();
                         }
                     }
-                    // Don't dispatch UDP firewall probes here — pongs haven't
-                    // arrived yet so external_udp_port may be stale.  The Pong
-                    // handler calls dispatch_udp_firewall_probe_requests() once
-                    // pong responses provide the correct external port.
+                    // Eagerly dispatch UDP firewall probes now. If a previous
+                    // cycle already learned the external UDP port it is still
+                    // available in firewall_checker; otherwise the function
+                    // falls back to settings.udp_port.  The Pong handler will
+                    // also call dispatch again once fresh pongs refine the port.
+                    dispatch_udp_firewall_probe_requests(&mut state, &settings);
                 }
 
                 if state.firewall_checker.evaluate() {
@@ -8159,6 +8164,15 @@ pub async fn start_network(
                                     info!("Cancelled buddy search: HighID proves TCP is open");
                                 }
                             }
+                            state.stats.firewalled = state.firewalled;
+                            state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
+                            state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
+                            let _ = app_handle.emit("firewall-status", serde_json::json!({
+                                "firewalled": state.firewalled,
+                                "external_ip": state.stats.external_ip,
+                                "tcp_status": state.stats.tcp_status,
+                                "udp_status": state.stats.udp_status,
+                            }));
                             // HighID = our external IP (ed2k stores IPs as LE u32)
                             let ip_bytes = our_id.to_le_bytes();
                             let ext_ip = Ipv4Addr::from(ip_bytes);
@@ -9868,7 +9882,9 @@ fn dispatch_udp_firewall_probe_requests(state: &mut NetworkState, settings: &App
         .or(state.external_udp_port)
         .unwrap_or(settings.udp_port);
 
-    let contacts: Vec<KadContact> = state
+    // Prefer contacts that report open TCP (kad_options bit 1 clear).
+    // Contacts with kad_options == 0 haven't reported status; put them second.
+    let mut candidates: Vec<KadContact> = state
         .routing_table
         .all_contacts()
         .filter(|c| {
@@ -9876,12 +9892,19 @@ fn dispatch_udp_firewall_probe_requests(state: &mut NetworkState, settings: &App
                 && !c.is_dead()
                 && c.version > KADEMLIA_VERSION5_48A
                 && c.tcp_port > 0
+                && !c.is_tcp_firewalled()
                 && !state.firewall_checker.is_udp_firewall_check_ip(c.ip)
         })
-        .take(2)
         .cloned()
         .collect();
+    // Sort: contacts with known-open TCP first (kad_options reported & not firewalled),
+    // then contacts with unknown status (kad_options == 0).
+    candidates.sort_by_key(|c| if c.kad_options != 0 { 0u8 } else { 1u8 });
+    let contacts: Vec<KadContact> = candidates.into_iter().take(4).collect();
 
+    if !contacts.is_empty() {
+        info!("Dispatching {} UDP firewall probe(s) (ext_udp_port={})", contacts.len(), external_udp_port);
+    }
     let external_ip = state.external_ip;
     let obfuscation_enabled = settings.obfuscation_enabled;
     for contact in contacts {
@@ -9911,8 +9934,10 @@ fn spawn_udp_firewall_probe_request(
     external_ip: Option<Ipv4Addr>,
     obfuscation_enabled: bool,
 ) {
+    let contact_ip = contact.ip;
+    let contact_tcp = contact.tcp_port;
     tokio::spawn(async move {
-        if let Err(e) = send_udp_firewall_probe_request(
+        match send_udp_firewall_probe_request(
             contact,
             user_hash,
             nickname,
@@ -9925,7 +9950,9 @@ fn spawn_udp_firewall_probe_request(
         )
         .await
         {
-            debug!("UDP firewall probe request failed: {e}");
+            Ok(()) => info!("UDP firewall probe sent to {}:{} (asking for reply on ports {}/{})",
+                contact_ip, contact_tcp, udp_port, external_udp_port),
+            Err(e) => info!("UDP firewall probe to {}:{} failed: {e}", contact_ip, contact_tcp),
         }
     });
 }
@@ -9978,6 +10005,10 @@ async fn send_udp_firewall_probe_request(
     let receiver_key = KadUDPKey::generate(udp_key_seed, u32::from(contact.ip)).key;
     payload.extend_from_slice(&receiver_key.to_le_bytes());
     write_ed2k_packet_simple(&mut writer, OP_EMULEPROT, ed2k::messages::OP_FWCHECKUDPREQ, &payload).await?;
+    // Give the remote peer time to read and process the request before
+    // we drop the TCP connection.  Without this, some clients abort
+    // processing when they see the connection close immediately.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     Ok(())
 }
 
@@ -11453,6 +11484,14 @@ async fn handle_udp_packet(
                 if udp_port > 0 {
                     state.external_udp_port = Some(udp_port);
                 }
+                state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
+                state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
+                let _ = app_handle.emit("firewall-status", serde_json::json!({
+                    "firewalled": state.firewalled,
+                    "external_ip": state.stats.external_ip,
+                    "tcp_status": state.stats.tcp_status,
+                    "udp_status": state.stats.udp_status,
+                }));
                 info!("UDP firewall test passed - UDP port {udp_port} is reachable, not UDP-firewalled");
             } else {
                 state.firewall_checker.handle_udp_firewall_result(false);
@@ -11749,7 +11788,7 @@ async fn handle_command(
             info!("Cancelled search request {}", request_id);
         }
 
-        NetworkCommand::CancelDownload { transfer_id } => {
+        NetworkCommand::CancelDownload { transfer_id, cleanup_ack } => {
             // eMule: CPartFile::DeletePartFile -> StopFile -> PauseFile ->
             //   CSearchManager::StopSearch(GetKadFileSearchID(), true)
             // Remove from pending_downloads so no new searches are started
@@ -11772,12 +11811,21 @@ async fn handle_command(
             state.active_kad_search_state.remove(&transfer_id);
             state.per_file_sources.remove(&transfer_id);
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
-                if let Ok(reg) = state.tracker_registry.lock() {
-                    if let Some(tracker) = reg.get(&transfer_id) {
-                        if let Ok(t) = tracker.try_read() { t.save(); }
+                if cleanup_ack.is_none() {
+                    // Stop path: preserve .part.met for resume
+                    if let Ok(reg) = state.tracker_registry.lock() {
+                        if let Some(tracker) = reg.get(&transfer_id) {
+                            if let Ok(t) = tracker.try_read() { t.save(); }
+                        }
                     }
                 }
                 handle.abort();
+                let _ = handle.await;
+            }
+            if cleanup_ack.is_some() {
+                if let Ok(mut reg) = state.tracker_registry.lock() {
+                    reg.remove(&transfer_id);
+                }
             }
 
             // Remove partial download from KAD source publish
@@ -11807,6 +11855,10 @@ async fn handle_command(
                     "CancelDownload {}: removed pending_download={}, stopped {} KAD source search(es)",
                     transfer_id, removed_pending.is_some(), search_ids.len()
                 );
+            }
+
+            if let Some(tx) = cleanup_ack {
+                let _ = tx.send(());
             }
         }
 
@@ -12777,8 +12829,9 @@ async fn handle_command(
                 }
             }
 
-            // UDP firewall probes will be dispatched by the Pong handler once
-            // pong replies provide the correct external UDP port.
+            // Eagerly dispatch UDP firewall probes (uses previous external port
+            // or falls back to settings.udp_port). Pong handler will also retry.
+            dispatch_udp_firewall_probe_requests(state, &settings);
 
             info!("Sent {} firewall checks and {} ping probes", state.firewall_checks_sent, ping_contacts.len());
             let _ = tx.send(if state.firewall_checks_sent > 0 || !ping_contacts.is_empty() {
@@ -14065,6 +14118,13 @@ async fn handle_upload_event(
                 "transfer-complete",
                 serde_json::json!({ "id": event.transfer_id, "direction": "upload" }),
             );
+            let tm = Arc::clone(transfer_manager);
+            let tid = event.transfer_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let mut mgr = tm.write().await;
+                mgr.completed.retain(|t| t.id != tid);
+            });
         }
         UploadEventKind::Failed { error } => {
             let promoted = match {
@@ -14082,6 +14142,13 @@ async fn handle_upload_event(
                 "transfer-failed",
                 serde_json::json!({ "id": event.transfer_id, "error": error, "direction": "upload" }),
             );
+            let tm = Arc::clone(transfer_manager);
+            let tid = event.transfer_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let mut mgr = tm.write().await;
+                mgr.completed.retain(|t| t.id != tid);
+            });
         }
         UploadEventKind::EmberSources { .. }
         | UploadEventKind::EmberPeerDiscovered { .. }
