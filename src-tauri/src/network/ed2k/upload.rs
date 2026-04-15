@@ -480,9 +480,21 @@ impl AbuseTracker {
         }
     }
 
+    /// Normalize IPv4-mapped IPv6 (::ffff:a.b.c.d) to plain V4 for consistent keying.
+    fn normalize_ip(ip: &std::net::IpAddr) -> std::net::IpAddr {
+        match ip {
+            std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => std::net::IpAddr::V4(v4),
+                None => *ip,
+            },
+            other => *other,
+        }
+    }
+
     /// Check if an IP is currently banned. Returns true if banned.
     fn is_banned(&self, ip: &std::net::IpAddr) -> bool {
-        if let Some(entry) = self.entries.get(ip) {
+        let key = Self::normalize_ip(ip);
+        if let Some(entry) = self.entries.get(&key) {
             if let Some(until) = entry.banned_until {
                 return std::time::Instant::now() < until;
             }
@@ -492,6 +504,7 @@ impl AbuseTracker {
 
     /// Record a request from this IP. Returns true if the IP should be banned.
     fn record_request(&mut self, ip: std::net::IpAddr) -> bool {
+        let ip = Self::normalize_ip(&ip);
         let now = std::time::Instant::now();
 
         // Periodic cleanup of expired entries
@@ -534,6 +547,7 @@ impl AbuseTracker {
 
     /// Record a "file not found" response to this IP. Returns true if should ban.
     fn record_file_not_found(&mut self, ip: std::net::IpAddr) -> bool {
+        let ip = Self::normalize_ip(&ip);
         let now = std::time::Instant::now();
         let entry = self.entries.entry(ip).or_insert_with(|| AbuseEntry {
             request_count: 0,
@@ -799,10 +813,10 @@ pub async fn start_upload_server(
 
                         // KAD firewall check: if this IP is one we probed, the TCP
                         // connect-back proves our port is reachable.
-                        if let std::net::IpAddr::V4(ipv4) = peer_addr.ip() {
+                        {
                             let is_probe = {
                                 match server.firewall_probe_ips.lock() {
-                                    Ok(mut probes) => probes.remove(&ipv4),
+                                    Ok(mut probes) => probes.remove(&peer_ipv4),
                                     Err(e) => {
                                         tracing::warn!("firewall_probe_ips mutex poisoned: {e}");
                                         false
@@ -1833,7 +1847,7 @@ impl UploadHandler {
                             let sig_bytes = &payload[1..1 + sig_len];
                             let peer_ip_u32 = match peer_addr.ip() {
                                 std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-                                _ => 0,
+                                std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| u32::from_be_bytes(v4.octets())).unwrap_or(0),
                             };
                             let mode = if payload.len() == 1 + sig_len {
                                 None

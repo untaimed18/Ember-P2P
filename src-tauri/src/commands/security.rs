@@ -190,12 +190,12 @@ pub async fn download_and_load_ipfilter(
 ) -> Result<String, String> {
     info!("Downloading ipfilter.zip from {DEFAULT_IPFILTER_ARCHIVE_URL}");
 
-    let (host, resolved_addrs) = crate::security::validate_fetch_url(DEFAULT_IPFILTER_ARCHIVE_URL).await
+    let (validated_url, host, resolved_addrs) = crate::security::validate_fetch_url(DEFAULT_IPFILTER_ARCHIVE_URL).await
         .map_err(|e| format!("URL validation failed: {e}"))?;
     let client = crate::security::build_pinned_client(&host, &resolved_addrs)
         .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
-    let response = client.get(DEFAULT_IPFILTER_ARCHIVE_URL).send()
+    let response = client.get(&validated_url).send()
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?
         .error_for_status()
@@ -278,16 +278,16 @@ pub async fn update_ipfilter_from_url(
     state: tauri::State<'_, AppState>,
     url: String,
 ) -> Result<String, String> {
-    let (host, resolved_addrs) = crate::security::validate_fetch_url(&url).await?;
+    let (validated_url, host, resolved_addrs) = crate::security::validate_fetch_url(&url).await?;
 
-    info!("Updating IP filter from URL: {url}");
+    info!("Updating IP filter from URL: {validated_url}");
 
     let client = crate::security::build_pinned_client(&host, &resolved_addrs)
         .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
     const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
     let response = client
-        .get(&url)
+        .get(&validated_url)
         .send()
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?

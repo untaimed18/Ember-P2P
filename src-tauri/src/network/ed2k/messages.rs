@@ -640,7 +640,11 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
 
     let mut caps = PeerCapabilities::default();
     caps.tcp_port = hello_tcp_port;
-    for _ in 0..tag_count.min(32) {
+    let safe_count = tag_count.min(256);
+    if tag_count > 256 {
+        tracing::warn!("Hello answer has excessive tags: {tag_count}, capping at 256");
+    }
+    for _ in 0..safe_count {
         let tag_type_raw = cursor.read_u8().unwrap_or(0);
         // Support new-format tags (0x80 bit = 1-byte name)
         let (tag_type, name_id) = if tag_type_raw & 0x80 != 0 {

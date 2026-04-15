@@ -321,7 +321,10 @@
         ...tab,
         requestId: retryRequestId,
       }));
-      const results = await searchFiles(tabQuery, 'server', retryRequestId, activeTab.fileType || undefined, activeTab.filters);
+      const results = await Promise.race([
+        searchFiles(tabQuery, 'server', retryRequestId, activeTab.fileType || undefined, activeTab.filters),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Server retry timed out after 60 seconds')), 60_000)),
+      ]);
       if (results && results.length > 0) {
         patchSearchTabByRequestId(retryRequestId, (tab) => ({
           ...tab,
@@ -790,6 +793,11 @@
       return;
     }
 
+    if (networkAddresses.length === 0 && !result.file.hash) {
+      addToast('error', 'No sources available for this file');
+      return;
+    }
+
     downloadPending[key] = true;
     try {
       const { ip: peerIp, port: peerPort } = parseAddress(networkAddresses[0] ?? '');
@@ -965,6 +973,10 @@
       );
       if (networkAddrs.length === 0 && result.result_origin?.includes('Local')) {
         skippedLocal++;
+        continue;
+      }
+      if (networkAddrs.length === 0 && !result.file.hash) {
+        failed++;
         continue;
       }
       try {

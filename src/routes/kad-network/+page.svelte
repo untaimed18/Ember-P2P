@@ -212,9 +212,15 @@
 
   let isConnected = $derived($networkStats.status === 'connected');
 
+  let lastNetworkError: string | null = null;
   $effect(() => {
-    if ($networkError) {
-      kadError = $networkError;
+    const ne = $networkError;
+    if (ne) {
+      kadError = ne;
+      lastNetworkError = ne;
+    } else if (lastNetworkError && kadError === lastNetworkError) {
+      kadError = null;
+      lastNetworkError = null;
     }
   });
 

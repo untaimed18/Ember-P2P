@@ -11331,8 +11331,12 @@ async fn handle_command(
                     search.search_terms_data = search_terms;
                 }
                 active_request.kad_pending = true;
+                let Some(search_tx) = tx.take() else {
+                    tracing::error!("KAD search: tx already consumed");
+                    break 'kad false;
+                };
                 state.pending_keyword_searches.insert(sid, PendingKeywordSearch {
-                    tx: tx.take().unwrap(),
+                    tx: search_tx,
                     local_results: local_results.take().unwrap_or_default(),
                     keywords,
                     request_id,

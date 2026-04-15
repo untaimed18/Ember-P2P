@@ -255,11 +255,17 @@
       [...servers].map(s => removeServer(s.ip, s.port))
     );
     const removed = results.filter((r) => r.status === 'fulfilled').length;
+    const failedCount = results.filter((r) => r.status === 'rejected').length;
     selectedServer = null;
     selectedServers = new Set();
     lastClickedKey = null;
-    log(`Removed ${removed} server${removed !== 1 ? 's' : ''}`);
-    flash(`Removed ${removed} server${removed !== 1 ? 's' : ''}`);
+    const msg = `Removed ${removed} server${removed !== 1 ? 's' : ''}`;
+    log(msg);
+    if (failedCount > 0) {
+      error = `${msg}, ${failedCount} failed to remove`;
+    } else {
+      flash(msg);
+    }
     await refresh();
   }
 
@@ -404,7 +410,13 @@
         case 'ip': {
           const pa = a.ip.split('.').map(Number);
           const pb = b.ip.split('.').map(Number);
-          for (let i = 0; i < 4 && cmp === 0; i++) cmp = (pa[i] || 0) - (pb[i] || 0);
+          const aIsIPv4 = pa.length === 4 && pa.every(n => !isNaN(n));
+          const bIsIPv4 = pb.length === 4 && pb.every(n => !isNaN(n));
+          if (aIsIPv4 && bIsIPv4) {
+            for (let i = 0; i < 4 && cmp === 0; i++) cmp = pa[i] - pb[i];
+          } else {
+            cmp = a.ip.localeCompare(b.ip);
+          }
           if (cmp === 0) cmp = a.port - b.port;
           break;
         }

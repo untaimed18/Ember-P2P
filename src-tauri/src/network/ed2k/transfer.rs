@@ -2810,7 +2810,7 @@ pub(crate) async fn maybe_send_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     };
     let peer_ip_u32 = match peer_addr.ip() {
         std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        _ => 0,
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| u32::from_be_bytes(v4.octets())).unwrap_or(0),
     };
     let cm = cm.read().await;
     let Some(state) = cm.secident_request_state(&peer_user_hash, peer_ip_u32, peer_secident_level) else {
@@ -2839,7 +2839,7 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     };
     let peer_ip_u32 = match peer_addr.ip() {
         std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        _ => 0,
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| u32::from_be_bytes(v4.octets())).unwrap_or(0),
     };
     let cm = cm.read().await;
     if state >= 2 {
@@ -2895,7 +2895,7 @@ pub(crate) async fn handle_secident_signature(
     };
     let peer_ip_u32 = match peer_addr.ip() {
         std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        _ => 0,
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| u32::from_be_bytes(v4.octets())).unwrap_or(0),
     };
     let sig_bytes = &payload[1..1 + sig_len];
     let challenge_kind = if payload.len() == 1 + sig_len {
