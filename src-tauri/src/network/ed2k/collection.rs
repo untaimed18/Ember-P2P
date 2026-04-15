@@ -85,9 +85,12 @@ impl Collection {
         }
 
         let file_count = cursor.read_u32::<LittleEndian>()? as usize;
-        let mut files = Vec::with_capacity(file_count.min(10000));
+        if file_count > 100_000 {
+            return Err(anyhow::anyhow!("Collection too large: {} files (max 100,000)", file_count));
+        }
+        let mut files = Vec::with_capacity(file_count);
 
-        for _ in 0..file_count.min(10000) {
+        for _ in 0..file_count {
             let file_tag_count = cursor.read_u32::<LittleEndian>()? as usize;
             let mut fname = String::new();
             let mut fsize: u64 = 0;

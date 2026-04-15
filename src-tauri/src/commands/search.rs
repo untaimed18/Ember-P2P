@@ -337,14 +337,21 @@ pub async fn mark_spam(
     };
     if let Some((data, path)) = save_data {
         let tmp = path.with_extension("json.tmp");
-        tokio::task::spawn_blocking(move || {
+        let ok = tokio::task::spawn_blocking(move || {
             if let Err(e) = std::fs::write(&tmp, &data) {
                 tracing::warn!("Failed to write spam filter temp file: {e}");
-            } else if let Err(e) = std::fs::rename(&tmp, &path) {
+                return false;
+            }
+            if let Err(e) = std::fs::rename(&tmp, &path) {
                 let _ = std::fs::remove_file(&tmp);
                 tracing::warn!("Failed to save spam filter: {e}");
+                return false;
             }
-        }).await.ok();
+            true
+        }).await.unwrap_or(false);
+        if ok {
+            state.spam_filter.write().await.clear_dirty();
+        }
     }
     Ok(())
 }
@@ -364,14 +371,21 @@ pub async fn mark_not_spam(
     };
     if let Some((data, path)) = save_data {
         let tmp = path.with_extension("json.tmp");
-        tokio::task::spawn_blocking(move || {
+        let ok = tokio::task::spawn_blocking(move || {
             if let Err(e) = std::fs::write(&tmp, &data) {
                 tracing::warn!("Failed to write spam filter temp file: {e}");
-            } else if let Err(e) = std::fs::rename(&tmp, &path) {
+                return false;
+            }
+            if let Err(e) = std::fs::rename(&tmp, &path) {
                 let _ = std::fs::remove_file(&tmp);
                 tracing::warn!("Failed to save spam filter: {e}");
+                return false;
             }
-        }).await.ok();
+            true
+        }).await.unwrap_or(false);
+        if ok {
+            state.spam_filter.write().await.clear_dirty();
+        }
     }
     Ok(())
 }

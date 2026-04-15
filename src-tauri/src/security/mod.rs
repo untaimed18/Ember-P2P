@@ -14,12 +14,21 @@ const DANGEROUS_EXTENSIONS: &[&str] = &[
 
 /// Returns true if the file extension is potentially dangerous (executable).
 pub fn is_dangerous_extension(filename: &str) -> bool {
-    let ext = Path::new(filename)
+    let path = Path::new(filename);
+    let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    DANGEROUS_EXTENSIONS.contains(&ext.as_str())
+    if DANGEROUS_EXTENSIONS.contains(&ext.as_str()) {
+        return true;
+    }
+    if let Some(inner_ext) = path.file_stem().and_then(|s| Path::new(s).extension()) {
+        if DANGEROUS_EXTENSIONS.contains(&inner_ext.to_string_lossy().to_lowercase().as_str()) {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn is_special_use_v4(v4: std::net::Ipv4Addr) -> bool {
@@ -82,7 +91,7 @@ pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {
 /// Also resolves hostnames and returns the validated (host, resolved_addrs) pair
 /// so callers can pin DNS with `reqwest::Client::builder().resolve()`,
 /// preventing TOCTOU DNS rebinding attacks.
-pub async fn validate_fetch_url(url: &str) -> Result<(String, Vec<std::net::SocketAddr>), String> {
+pub async fn validate_fetch_url(url: &str) -> Result<(String, String, Vec<std::net::SocketAddr>), String> {
     let url = url.trim();
     if url.is_empty() {
         return Err("URL is empty".into());
@@ -93,6 +102,7 @@ pub async fn validate_fetch_url(url: &str) -> Result<(String, Vec<std::net::Sock
     }
 
     let scheme_port: u16 = if url_lower.starts_with("https://") { 443 } else { 80 };
+    let scheme_str = if url_lower.starts_with("https://") { "https://" } else { "http://" };
 
     let host_part = url_lower
         .strip_prefix("https://")
@@ -130,24 +140,32 @@ pub async fn validate_fetch_url(url: &str) -> Result<(String, Vec<std::net::Sock
         }
     }
 
+    let original_after_scheme = &url[scheme_str.len()..];
+    let path_and_rest = original_after_scheme.find('/').map(|i| &original_after_scheme[i..]).unwrap_or("");
+    let normalized_url = format!("{}{}{}", scheme_str, authority, path_and_rest);
+
+    let url_port = if authority.starts_with('[') {
+        authority.rsplit(']').next()
+            .and_then(|rest| rest.strip_prefix(':'))
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(scheme_port)
+    } else if authority.matches(':').count() == 1 {
+        authority.split(':').nth(1)
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(scheme_port)
+    } else {
+        scheme_port
+    };
+
     let mut resolved_addrs = Vec::new();
 
-    if host.parse::<std::net::Ipv4Addr>().is_err() && host.parse::<std::net::Ipv6Addr>().is_err() {
-        let url_port = if authority.starts_with('[') {
-            authority.rsplit(']').next()
-                .and_then(|rest| rest.strip_prefix(':'))
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(scheme_port)
-        } else if authority.matches(':').count() == 1 {
-            authority.split(':').nth(1)
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(scheme_port)
-        } else {
-            scheme_port
-        };
-
+    if let Ok(ipv4) = host.parse::<std::net::Ipv4Addr>() {
+        resolved_addrs.push(std::net::SocketAddr::new(std::net::IpAddr::V4(ipv4), url_port));
+    } else if let Ok(ipv6) = host.parse::<std::net::Ipv6Addr>() {
+        resolved_addrs.push(std::net::SocketAddr::new(std::net::IpAddr::V6(ipv6), url_port));
+    } else {
         let lookup_host = host.clone();
-        let lookup_addr = format!("{lookup_host}:0");
+        let lookup_addr = format!("{lookup_host}:{scheme_port}");
         let resolved = tokio::task::spawn_blocking(move || {
             std::net::ToSocketAddrs::to_socket_addrs(&lookup_addr.as_str())
                 .map(|addrs| addrs.collect::<Vec<_>>())
@@ -155,22 +173,20 @@ pub async fn validate_fetch_url(url: &str) -> Result<(String, Vec<std::net::Sock
         .await
         .map_err(|e| format!("DNS lookup failed: {e}"))?;
         let addrs = resolved.map_err(|e| format!("DNS lookup failed: {e}"))?;
-        {
-            if addrs.is_empty() {
-                return Err("URL hostname could not be resolved".into());
-            }
-            for addr in &addrs {
-                if is_private_ip(addr.ip()) {
-                    return Err("URL hostname resolves to a private/loopback address".into());
-                }
-            }
-            resolved_addrs = addrs.iter()
-                .map(|a| std::net::SocketAddr::new(a.ip(), url_port))
-                .collect();
+        if addrs.is_empty() {
+            return Err("URL hostname could not be resolved".into());
         }
+        for addr in &addrs {
+            if is_private_ip(addr.ip()) {
+                return Err("URL hostname resolves to a private/loopback address".into());
+            }
+        }
+        resolved_addrs = addrs.iter()
+            .map(|a| std::net::SocketAddr::new(a.ip(), url_port))
+            .collect();
     }
 
-    Ok((host, resolved_addrs))
+    Ok((normalized_url, host, resolved_addrs))
 }
 
 /// Build a reqwest client that pins DNS to pre-validated addresses,
@@ -186,10 +202,12 @@ pub fn build_pinned_client(host: &str, addrs: &[std::net::SocketAddr]) -> Result
 /// Check whether a canonical path is within one of the allowed directories.
 pub fn is_path_within_dirs(canonical: &Path, allowed_dirs: &[String]) -> bool {
     allowed_dirs.iter().any(|dir| {
-        if let Ok(canon_dir) = std::fs::canonicalize(dir) {
-            canonical.starts_with(&canon_dir)
-        } else {
-            false
+        match std::fs::canonicalize(dir) {
+            Ok(canon_dir) => canonical.starts_with(&canon_dir),
+            Err(e) => {
+                tracing::debug!("Skipping non-canonicalizable allowed dir {dir:?}: {e}");
+                false
+            }
         }
     })
 }
@@ -272,13 +290,22 @@ pub fn write_file_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
         let tmp = dir.join(format!(".ember_tmp_{}", std::process::id()));
         std::fs::write(&tmp, data)?;
         restrict_file_permissions(&tmp);
-        std::fs::rename(&tmp, path).or_else(|_| -> std::io::Result<()> {
-            let _ = std::fs::remove_file(&tmp);
-            std::fs::write(path, data)?;
-            restrict_file_permissions(path);
-            Ok(())
-        })?;
-        Ok(())
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(_first_err) => {
+                let _ = std::fs::remove_file(path);
+                match std::fs::rename(&tmp, path) {
+                    Ok(()) => Ok(()),
+                    Err(_retry_err) => {
+                        tracing::warn!("Atomic rename failed, falling back to direct write for {}", path.display());
+                        let _ = std::fs::remove_file(&tmp);
+                        std::fs::write(path, data)?;
+                        restrict_file_permissions(path);
+                        Ok(())
+                    }
+                }
+            }
+        }
     }
 }
 

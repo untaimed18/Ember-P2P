@@ -341,11 +341,11 @@
     saveEditPending = true;
     const hash = editingHash;
     const nick = editNickname.trim();
-    editingHash = null;
     try {
       await updateFriendNickname(hash, nick);
       const idx = friends.findIndex((f) => f.user_hash === hash);
       if (idx !== -1) friends[idx] = { ...friends[idx], nickname: nick };
+      editingHash = null;
     } catch (e: unknown) {
       error = toErr(e);
     } finally {

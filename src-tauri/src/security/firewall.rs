@@ -50,7 +50,7 @@ fn delete_firewall_rule(rule_name: &str) {
 
 fn add_firewall_rule(rule_name: &str, protocol: &str, port: u16) -> bool {
     let exe_path = match std::env::current_exe() {
-        Ok(p) => p.to_string_lossy().to_string(),
+        Ok(p) => p.to_string_lossy().to_string().replace('"', ""),
         Err(e) => {
             warn!("Cannot determine exe path, skipping firewall rule to avoid overly permissive rule: {e}");
             return false;

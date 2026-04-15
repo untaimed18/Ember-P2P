@@ -130,11 +130,6 @@ pub async fn download_collection_files(
             tracing::debug!("Skipping collection entry: empty hash or name");
             continue;
         }
-        if file.size == 0 {
-            skipped_count += 1;
-            tracing::debug!("Skipping collection entry '{}': zero size", file.name);
-            continue;
-        }
         if file.hash.len() != 32 || hex::decode(&file.hash).is_err() {
             skipped_count += 1;
             tracing::debug!("Skipping collection entry '{}': invalid hash", file.name);
@@ -205,7 +200,7 @@ pub async fn download_collection_files(
         let _ = app.emit("transfer-started", &persisted_transfer);
 
         if active_now && !add_paused {
-            let _ = state
+            if let Err(e) = state
                 .network_tx
                 .send(crate::network::NetworkCommand::StartDownload {
                     file_hash: file.hash,
@@ -216,7 +211,10 @@ pub async fn download_collection_files(
                     transfer_id,
                     control,
                 })
-                .await;
+                .await
+            {
+                tracing::warn!("Failed to send StartDownload for collection entry '{}': {e}", file.name);
+            }
         }
     }
     if skipped_count > 0 {
