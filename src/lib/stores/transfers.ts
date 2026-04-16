@@ -14,6 +14,25 @@ interface ProgressPayload {
   upload_time?: number;
 }
 
+const STATUS_PRIORITY: Record<string, number> = {
+  searching: 0,
+  queued: 1,
+  active: 2,
+  paused: 3,
+  stopped: 3,
+  hashing: 4,
+  insufficient: 4,
+  noneneeded: 4,
+  failed: 5,
+  verifying: 6,
+  completing: 7,
+  completed: 8,
+};
+
+function isMoreAdvancedStatus(eventStatus: string, apiStatus: string): boolean {
+  return (STATUS_PRIORITY[eventStatus] ?? 0) > (STATUS_PRIORITY[apiStatus] ?? 0);
+}
+
 interface TransferEventPayload {
   id: string;
   error?: string;
@@ -24,6 +43,8 @@ interface TransferEventPayload {
   health_reason?: string;
   stalled_since?: number;
   sources?: number;
+  active_sources?: number;
+  queued_sources?: number;
   peer_id?: string;
 }
 
@@ -54,18 +75,20 @@ function flushProgress() {
   pendingProgress.clear();
   transfers.update((list) => {
     let changed = false;
-    const skipStatuses: Transfer['status'][] = ['paused', 'stopped', 'completed', 'failed', 'verifying', 'completing', 'hashing', 'insufficient'];
+    const skipStatuses: Transfer['status'][] = ['paused', 'stopped', 'completed', 'failed', 'verifying', 'completing', 'hashing', 'insufficient', 'noneneeded'];
     for (const [id, p] of batch) {
       const idx = list.findIndex((t) => t.id === id);
       if (idx < 0) continue;
       const existing = list[idx];
       if (skipStatuses.includes(existing.status)) continue;
-      const transferred = existing.direction === 'upload' ? (p.uploaded ?? p.downloaded ?? 0) : (p.downloaded ?? 0);
+      const rawTransferred = existing.direction === 'upload' ? (p.uploaded ?? p.downloaded ?? 0) : (p.downloaded ?? 0);
+      const transferred = Math.max(rawTransferred, existing.transferred || 0);
+      const completedSize = Math.max(transferred, existing.completed_size || 0);
       list[idx] = {
         ...existing,
         transferred,
-        completed_size: transferred,
-        progress: p.progress,
+        completed_size: completedSize,
+        progress: Math.max(p.progress, existing.progress || 0),
         speed: p.speed,
         status: existing.status === 'searching' || existing.status === 'queued' ? existing.status : 'active',
         health: existing.health === 'stalled' ? 'healthy' : existing.health,
@@ -136,6 +159,8 @@ export async function initTransferStore() {
           status,
           peer_id,
           sources,
+          active_sources,
+          queued_sources,
           error,
           failure_reason,
           failure_kind,
@@ -153,6 +178,8 @@ export async function initTransferStore() {
               updated.peer_id = peer_id;
             }
             if (sources !== undefined) updated.sources = sources;
+            if (active_sources !== undefined) updated.active_sources = active_sources;
+            if (queued_sources !== undefined) updated.queued_sources = queued_sources;
             if (failure_reason !== undefined) updated.failure_reason = failure_reason;
             else if (error !== undefined) updated.failure_reason = error;
             if (failure_kind !== undefined) updated.failure_kind = failure_kind;
@@ -229,8 +256,10 @@ export async function initTransferStore() {
       const merged = all.map((apiItem) => {
         const eventItem = currentById.get(apiItem.id);
         if (eventItem) {
+          const preferEvent = isMoreAdvancedStatus(eventItem.status, apiItem.status);
           return {
             ...apiItem,
+            status: preferEvent ? eventItem.status : apiItem.status,
             speed: eventItem.speed,
             progress: Math.max(apiItem.progress, eventItem.progress),
             transferred: Math.max(apiItem.transferred, eventItem.transferred),
@@ -305,22 +334,22 @@ export function startTransferPoll() {
         const apiIds = new Set(all.map((t) => t.id));
         const merged = all.map((apiItem) => {
           const eventItem = currentById.get(apiItem.id);
-          if (eventItem && eventItem.status === 'active' && apiItem.status === 'active') {
-            return {
-              ...apiItem,
-              progress: Math.max(apiItem.progress, eventItem.progress),
-              speed: eventItem.speed,
-              transferred: Math.max(apiItem.transferred, eventItem.transferred),
-              completed_size: Math.max(apiItem.completed_size || 0, eventItem.completed_size || 0),
-              health: eventItem.health ?? apiItem.health,
-              health_reason: eventItem.health_reason ?? apiItem.health_reason,
-              stalled_since: eventItem.stalled_since ?? apiItem.stalled_since,
-              failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
-              failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
-              failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
-            };
-          }
-          return apiItem;
+          if (!eventItem) return apiItem;
+          const preferEvent = isMoreAdvancedStatus(eventItem.status, apiItem.status);
+          return {
+            ...apiItem,
+            status: preferEvent ? eventItem.status : apiItem.status,
+            progress: Math.max(apiItem.progress, eventItem.progress),
+            speed: preferEvent ? eventItem.speed : apiItem.speed,
+            transferred: Math.max(apiItem.transferred, eventItem.transferred),
+            completed_size: Math.max(apiItem.completed_size || 0, eventItem.completed_size || 0),
+            health: eventItem.health ?? apiItem.health,
+            health_reason: eventItem.health_reason ?? apiItem.health_reason,
+            stalled_since: eventItem.stalled_since ?? apiItem.stalled_since,
+            failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
+            failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
+            failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
+          };
         });
         const terminalStatuses: Transfer['status'][] = ['completed', 'failed', 'stopped'];
         for (const t of current) {

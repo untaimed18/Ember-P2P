@@ -1536,6 +1536,8 @@ async fn try_start_pending_download_from_known_sources(
         "id": transfer_id,
         "status": "active",
         "sources": source_count,
+        "active_sources": 0,
+        "queued_sources": 0,
     }));
 
     {
@@ -4421,6 +4423,8 @@ pub async fn start_network(
                                     "id": &transfer_id,
                                     "status": "searching",
                                     "sources": indirect_count,
+                                    "active_sources": 0,
+                                    "queued_sources": 0,
                                 }));
                                 state.pending_downloads.insert(transfer_id, pending);
                             } else {
@@ -4477,6 +4481,8 @@ pub async fn start_network(
                                     "status": "active",
                                     "peer_id": peer_desc,
                                     "sources": source_count,
+                                    "active_sources": 0,
+                                    "queued_sources": 0,
                                 }));
 
                                 // Populate persistent per-file source list
@@ -6066,6 +6072,8 @@ pub async fn start_network(
                             "id": tid,
                             "status": "active",
                             "sources": source_count,
+                            "active_sources": 0,
+                            "queued_sources": 0,
                         }));
                         info!("Reasking {} persistent sources for download {}", source_count, tid);
                         let download_sources: Vec<DownloadSource> = {
@@ -6206,6 +6214,8 @@ pub async fn start_network(
                             "id": tid,
                             "status": "active",
                             "sources": source_count,
+                            "active_sources": 0,
+                            "queued_sources": 0,
                         }));
                         info!("Starting download {} from {} accumulated sources", tid, source_count);
                         {
@@ -8032,6 +8042,8 @@ pub async fn start_network(
                                     "id": tid,
                                     "status": "active",
                                     "sources": 1,
+                                    "active_sources": 0,
+                                    "queued_sources": 0,
                                 }));
 
                                 let uh = {
