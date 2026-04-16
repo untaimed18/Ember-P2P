@@ -11267,10 +11267,28 @@ async fn handle_command(
                 return;
             }
 
+            // Build the search expression once, reuse for TCP + UDP.
+            // For multiple keywords this produces an AND tree; for a single
+            // keyword with no file-type filter it returns empty (handled below).
+            let kad_file_type = search_filters.as_ref().and_then(|f| f.file_type.clone());
+            let search_terms = kad::messages::build_search_expression(&keywords, kad_file_type.as_deref());
+
+            let search_expr = if search_terms.is_empty() {
+                let kw = keywords.first().map(|s| s.as_str()).unwrap_or("");
+                let bytes = kw.as_bytes();
+                let mut buf = Vec::with_capacity(3 + bytes.len());
+                buf.push(0x01);
+                buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(bytes);
+                buf
+            } else {
+                search_terms.clone()
+            };
+
             // --- TCP server search ---
             if state.server_connected {
                 if let Some(mut conn) = state.server_connection.take() {
-                    match conn.send_search_async(&query).await {
+                    match conn.send_search_expr_bytes(&search_expr).await {
                         Ok(()) => {
                             active_request.server_pending = true;
                             state.pending_server_search = Some(PendingServerSearch {
@@ -11290,20 +11308,7 @@ async fn handle_command(
             }
 
             // --- UDP global search ---
-            let kad_file_type = search_filters.as_ref().and_then(|f| f.file_type.clone());
-            let search_terms = kad::messages::build_search_expression(&keywords, kad_file_type.as_deref());
-
-            let udp_expr = if search_terms.is_empty() {
-                let kw = keywords.first().map(|s| s.as_str()).unwrap_or("");
-                let bytes = kw.as_bytes();
-                let mut buf = Vec::with_capacity(3 + bytes.len());
-                buf.push(0x01);
-                buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
-                buf.extend_from_slice(bytes);
-                buf
-            } else {
-                search_terms.clone()
-            };
+            let udp_expr = search_expr;
 
             let servers = state.server_list.servers();
             for server in servers {

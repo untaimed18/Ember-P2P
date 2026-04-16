@@ -470,6 +470,18 @@ impl Ed2kServerConnection {
         Ok(())
     }
 
+    /// Send a pre-built search expression (AND tree or single keyword) as
+    /// `OP_SEARCHREQUEST`. Multi-word queries MUST use the AND-tree wire
+    /// format for reliable results across all eD2K servers.
+    pub async fn send_search_expr_bytes(&mut self, expr: &[u8]) -> anyhow::Result<()> {
+        info!(
+            "Sending OP_SEARCHREQUEST expression ({} bytes payload)",
+            expr.len(),
+        );
+        self.write_packet(OP_SEARCHREQUEST, expr).await?;
+        Ok(())
+    }
+
     /// Send a boolean search expression tree to the server.
     #[allow(dead_code)]
     pub async fn send_search_expression_async(
