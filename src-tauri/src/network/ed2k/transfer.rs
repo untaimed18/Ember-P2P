@@ -209,18 +209,22 @@ pub enum DownloadEvent {
         start: u64,
         end: u64,
         sender_ip: std::net::Ipv4Addr,
+        #[allow(dead_code)]
+        sender_user_hash: Option<[u8; 16]>,
     },
     /// A part passed its MD4 hash check.
     PartVerified {
         file_hash: [u8; 16],
         part_start: u64,
         part_end: u64,
+        sender_user_hash: Option<[u8; 16]>,
     },
     /// A part failed its MD4 hash check.
     PartCorrupted {
         file_hash: [u8; 16],
         part_start: u64,
         part_end: u64,
+        sender_user_hash: Option<[u8; 16]>,
     },
     /// AICH recovery was attempted for a corrupt part but failed (timeout, bad data, etc.).
     /// The network loop uses this to schedule a retry with a different source.
@@ -1909,6 +1913,7 @@ impl Ed2kDownload {
                                         start,
                                         end,
                                         sender_ip: v4,
+                                        sender_user_hash: Some(peer_user_hash),
                                     })
                                     .await;
                             }
@@ -1990,6 +1995,7 @@ impl Ed2kDownload {
                                         start,
                                         end: start + piece_len,
                                         sender_ip: v4,
+                                        sender_user_hash: Some(peer_user_hash),
                                     })
                                     .await;
                             }
@@ -2387,6 +2393,7 @@ impl Ed2kDownload {
                                 file_hash: self.file_hash,
                                 part_start: ps,
                                 part_end: pe,
+                                sender_user_hash: Some(peer_user_hash),
                             })
                             .await;
                         continue;
@@ -2397,6 +2404,7 @@ impl Ed2kDownload {
                             file_hash: self.file_hash,
                             part_start: ps,
                             part_end: pe,
+                            sender_user_hash: Some(peer_user_hash),
                         })
                         .await;
                 }

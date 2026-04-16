@@ -498,6 +498,8 @@ pub fn run() {
             commands::peers::kad_recheck_firewall,
             commands::peers::get_kad_contacts,
             commands::peers::get_kad_searches,
+            commands::peers::get_peer_reputation,
+            commands::peers::get_reputation_stats,
             commands::settings::get_settings,
             commands::settings::update_settings,
             commands::settings::download_nodes_dat,

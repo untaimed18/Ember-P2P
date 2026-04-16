@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 /// Maximum reputation score.
 const MAX_REPUTATION: i32 = 1000;
@@ -61,7 +64,7 @@ impl ReputationEvent {
 }
 
 /// Per-peer reputation record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerReputation {
     pub node_id: [u8; 16],
     pub score: i32,
@@ -132,21 +135,31 @@ impl ReputationManager {
     }
 
     /// Record an event for a peer, creating their entry if needed.
-    pub fn record_event(&mut self, node_id: &[u8; 16], event: ReputationEvent) {
+    /// Returns `true` if this event caused the peer to become banned.
+    pub fn record_event(&mut self, node_id: &[u8; 16], event: ReputationEvent) -> bool {
         let now = now_secs();
         let entry = self.peers.entry(*node_id).or_insert_with(|| {
             PeerReputation::new(*node_id, now)
         });
+        let was_banned = entry.is_banned(now);
         entry.apply_event(event, now);
+        let now_banned = entry.is_banned(now);
 
         if self.peers.len() > MAX_TRACKED_PEERS {
             self.evict_stale();
         }
+
+        !was_banned && now_banned
     }
 
     /// Get a peer's current score, applying decay first.
     pub fn get_score(&mut self, node_id: &[u8; 16]) -> i32 {
         self.maybe_decay();
+        self.peers.get(node_id).map_or(DEFAULT_REPUTATION, |p| p.score)
+    }
+
+    /// Get a peer's score without triggering decay (for use in immutable contexts).
+    pub fn score(&self, node_id: &[u8; 16]) -> i32 {
         self.peers.get(node_id).map_or(DEFAULT_REPUTATION, |p| p.score)
     }
 
@@ -198,6 +211,35 @@ impl ReputationManager {
         self.last_decay = now;
         for peer in self.peers.values_mut() {
             peer.apply_decay(intervals);
+        }
+    }
+
+    /// Save reputation data to disk as JSON.
+    pub fn save(&self, path: &Path) -> Result<(), String> {
+        let serializable: Vec<&PeerReputation> = self.peers.values().collect();
+        let json = serde_json::to_string(&serializable)
+            .map_err(|e| format!("reputation serialize: {e}"))?;
+        std::fs::write(path, json)
+            .map_err(|e| format!("reputation write: {e}"))
+    }
+
+    /// Load reputation data from disk. Returns a new manager on any error.
+    pub fn load(path: &Path) -> Self {
+        let data = match std::fs::read_to_string(path) {
+            Ok(d) => d,
+            Err(_) => return Self::new(),
+        };
+        let entries: Vec<PeerReputation> = match serde_json::from_str(&data) {
+            Ok(e) => e,
+            Err(_) => return Self::new(),
+        };
+        let mut peers = HashMap::with_capacity(entries.len());
+        for entry in entries {
+            peers.insert(entry.node_id, entry);
+        }
+        Self {
+            peers,
+            last_decay: now_secs(),
         }
     }
 

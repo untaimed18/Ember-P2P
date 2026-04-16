@@ -444,6 +444,15 @@ fn inject_source_into_active_transfers(
         ..Default::default()
     };
     let parsed_ip = source.peer_ip.parse::<Ipv4Addr>().ok();
+
+    // Skip reputation-banned sources
+    if let Some(ref uh) = source.peer_user_hash {
+        if state.reputation.is_banned(uh) {
+            stats.dropped_full += transfer_ids.len();
+            return stats;
+        }
+    }
+
     let mut stale_transfer_ids = Vec::new();
 
     for transfer_id in transfer_ids {
@@ -920,7 +929,30 @@ pub enum NetworkCommand {
     IsFriendDiscoverable {
         tx: oneshot::Sender<bool>,
     },
+    GetPeerReputation {
+        user_hash: [u8; 16],
+        tx: oneshot::Sender<Option<PeerReputationInfo>>,
+    },
+    GetReputationStats {
+        tx: oneshot::Sender<ReputationStatsInfo>,
+    },
     Shutdown,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerReputationInfo {
+    pub score: i32,
+    pub successful_transfers: u64,
+    pub failed_transfers: u64,
+    pub is_banned: bool,
+    pub first_seen: u64,
+    pub last_interaction: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReputationStatsInfo {
+    pub tracked_peers: usize,
+    pub banned_peers: usize,
 }
 
 struct PendingDownload {
@@ -1214,6 +1246,8 @@ struct NetworkState {
     broker_event_rx: Option<mpsc::Receiver<ember::broker::BrokerEvent>>,
     /// Manages relay sessions when this node acts as a relay for other peers
     relay_manager: Arc<tokio::sync::Mutex<ember::relay::RelayManager>>,
+    /// Peer reputation tracking (score, ban, decay)
+    reputation: ember::reputation::ReputationManager,
 }
 
 /// Filter search results by file type, matching eMule's AddToList behavior:
@@ -2186,6 +2220,7 @@ pub async fn start_network(
         connection_broker: None,
         broker_event_rx: None,
         relay_manager: Arc::new(tokio::sync::Mutex::new(ember::relay::RelayManager::new())),
+        reputation: ember::reputation::ReputationManager::load(&data_dir.join("reputation.json")),
     };
 
     // Load known files for hash cache
@@ -2466,6 +2501,10 @@ pub async fn start_network(
     upnp_renew_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut dead_source_timer = tokio::time::interval(std::time::Duration::from_secs(300));
     dead_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut reputation_timer = tokio::time::interval(std::time::Duration::from_secs(60));
+    reputation_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut reputation_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
+    reputation_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut watchdog_timer = tokio::time::interval(std::time::Duration::from_secs(30));
     watchdog_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // UDP source sweep for active downloads (eMule UDPSERVERREASKTIME = 30 min)
@@ -3512,14 +3551,41 @@ pub async fn start_network(
                             }
                         }
                     }
+                    // Reputation: record handshake success or failure
+                    if status == "transferring" || status == "failed" {
+                        if let Ok(v4) = ip.parse::<Ipv4Addr>() {
+                            let sm = source_manager.read().await;
+                            let maybe_uh = sm.find_user_hash_by_addr(v4, port);
+                            drop(sm);
+                            if let Some(uh) = maybe_uh {
+                                let rep_event = if status == "transferring" {
+                                    ember::reputation::ReputationEvent::SuccessfulHandshake
+                                } else {
+                                    ember::reputation::ReputationEvent::Timeout
+                                };
+                                let newly_banned = state.reputation.record_event(&uh, rep_event);
+                                if newly_banned {
+                                    if state.banned_ips.insert(v4) {
+                                        warn!("Reputation ban: banning IP {} (user_hash {})", v4, hex::encode(&uh));
+                                    }
+                                    if let Ok(mut shared) = shared_banned_ips.write() {
+                                        *shared = state.banned_ips.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 if let DownloadEvent::DataReceived { ref file_hash, start, end, sender_ip, .. } = event {
                     state.corruption_blackbox.record_data(*file_hash, start, end, sender_ip);
                 }
-                if let DownloadEvent::PartVerified { ref file_hash, part_start, part_end, .. } = event {
+                if let DownloadEvent::PartVerified { ref file_hash, part_start, part_end, ref sender_user_hash, .. } = event {
                     state.corruption_blackbox.verified_part(file_hash, part_start, part_end);
+                    if let Some(ref uh) = sender_user_hash {
+                        state.reputation.record_event(uh, ember::reputation::ReputationEvent::SuccessfulChunk);
+                    }
                 }
-                if let DownloadEvent::PartCorrupted { ref file_hash, part_start, part_end, .. } = event {
+                if let DownloadEvent::PartCorrupted { ref file_hash, part_start, part_end, ref sender_user_hash, .. } = event {
                     let ban_list = state.corruption_blackbox.corrupted_part(file_hash, part_start, part_end);
                     for ip in ban_list {
                         if state.banned_ips.insert(ip) {
@@ -3529,6 +3595,22 @@ pub async fn start_network(
                     if !state.banned_ips.is_empty() {
                         if let Ok(mut shared) = shared_banned_ips.write() {
                             *shared = state.banned_ips.clone();
+                        }
+                    }
+                    if let Some(ref uh) = sender_user_hash {
+                        let newly_banned = state.reputation.record_event(uh, ember::reputation::ReputationEvent::CorruptData);
+                        if newly_banned {
+                            let sm = source_manager.read().await;
+                            let ips = sm.find_ips_by_user_hash(uh);
+                            drop(sm);
+                            for ip in ips {
+                                if state.banned_ips.insert(ip) {
+                                    warn!("Reputation ban: banning IP {} (user_hash {})", ip, hex::encode(uh));
+                                }
+                            }
+                            if let Ok(mut shared) = shared_banned_ips.write() {
+                                *shared = state.banned_ips.clone();
+                            }
                         }
                     }
                 }
@@ -3939,6 +4021,60 @@ pub async fn start_network(
                             debug!("Friend {} reconnect skipped (backoff cooldown)", hash_hex);
                         }
                     }
+                }
+
+                // Reputation: record upload-side events
+                match &event.kind {
+                    UploadEventKind::Started { user_hash: Some(ref uh_hex), .. } => {
+                        if let Ok(bytes) = hex::decode(uh_hex) {
+                            if bytes.len() == 16 {
+                                let mut uh = [0u8; 16];
+                                uh.copy_from_slice(&bytes);
+                                state.reputation.record_event(&uh, ember::reputation::ReputationEvent::SuccessfulHandshake);
+                            }
+                        }
+                    }
+                    UploadEventKind::Completed => {
+                        let mgr = transfer_manager.read().await;
+                        if let Some(t) = mgr.get_transfer(&event.transfer_id) {
+                            if let Some(ref uh_hex) = t.user_hash {
+                                if let Ok(bytes) = hex::decode(uh_hex) {
+                                    if bytes.len() == 16 {
+                                        let mut uh = [0u8; 16];
+                                        uh.copy_from_slice(&bytes);
+                                        state.reputation.record_event(&uh, ember::reputation::ReputationEvent::SuccessfulChunk);
+                                    }
+                                }
+                            }
+                        }
+                        drop(mgr);
+                    }
+                    UploadEventKind::Failed { .. } => {
+                        let mgr = transfer_manager.read().await;
+                        if let Some(t) = mgr.get_transfer(&event.transfer_id) {
+                            if let Some(ref uh_hex) = t.user_hash {
+                                if let Ok(bytes) = hex::decode(uh_hex) {
+                                    if bytes.len() == 16 {
+                                        let mut uh = [0u8; 16];
+                                        uh.copy_from_slice(&bytes);
+                                        let newly_banned = state.reputation.record_event(&uh, ember::reputation::ReputationEvent::FailedChunk);
+                                        if newly_banned {
+                                            if let Ok(peer_ip) = t.peer_id.split(':').next().unwrap_or("").parse::<Ipv4Addr>() {
+                                                if state.banned_ips.insert(peer_ip) {
+                                                    warn!("Reputation ban: banning IP {} (user_hash {})", peer_ip, uh_hex);
+                                                }
+                                                if let Ok(mut shared) = shared_banned_ips.write() {
+                                                    *shared = state.banned_ips.clone();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        drop(mgr);
+                    }
+                    _ => {}
                 }
 
                 let mut promoted = Vec::new();
@@ -6420,7 +6556,18 @@ pub async fn start_network(
                 for (tid, _) in &to_retry {
                     if let Some(pfs) = state.per_file_sources.get_mut(tid) {
                         pfs.purge_dead_sources();
-                        let ready = pfs.sources_ready_for_reask();
+                        let sm_guard = source_manager.read().await;
+                        let ready = pfs.sources_ready_for_reask_with_reputation(
+                            |ip, port| {
+                                sm_guard.find_user_hash_by_addr(ip, port)
+                                    .map_or(false, |uh| state.reputation.is_banned(&uh))
+                            },
+                            |ip, port| {
+                                sm_guard.find_user_hash_by_addr(ip, port)
+                                    .map_or(0, |uh| state.reputation.score(&uh))
+                            },
+                        );
+                        drop(sm_guard);
                         if !ready.is_empty() {
                             let live: Vec<(String, u16)> = ready.into_iter()
                                 .filter(|(ip, port)| {
@@ -6484,13 +6631,24 @@ pub async fn start_network(
                                 continue;
                             }
                         };
+                        let sm_guard2 = source_manager.read().await;
                         let ready_sources: Vec<(String, u16)> = state.per_file_sources
                             .get(tid)
-                            .map(|pfs| pfs.sources_ready_for_reask().into_iter()
+                            .map(|pfs| pfs.sources_ready_for_reask_with_reputation(
+                                |ip, port| {
+                                    sm_guard2.find_user_hash_by_addr(ip, port)
+                                        .map_or(false, |uh| state.reputation.is_banned(&uh))
+                                },
+                                |ip, port| {
+                                    sm_guard2.find_user_hash_by_addr(ip, port)
+                                        .map_or(0, |uh| state.reputation.score(&uh))
+                                },
+                            ).into_iter()
                                 .filter(|(ip, port)| !state.dead_sources.is_dead_source_for_file(&hash_bytes, u32::from(*ip), *port))
                                 .map(|(ip, port)| (ip.to_string(), port))
                                 .collect())
                             .unwrap_or_default();
+                        drop(sm_guard2);
                         if ready_sources.is_empty() {
                             state.pending_downloads.insert(tid.clone(), pending);
                             continue;
@@ -8911,6 +9069,19 @@ pub async fn start_network(
                 stats_manager.save_cumulative(&db);
             }
 
+            // Periodic reputation maintenance (every 60s: lift bans)
+            _ = reputation_timer.tick() => {
+                state.reputation.lift_expired_bans();
+            }
+
+            // Periodic reputation save (every 5 minutes)
+            _ = reputation_save_timer.tick() => {
+                let rep_path = state.data_dir.join("reputation.json");
+                if let Err(e) = state.reputation.save(&rep_path) {
+                    error!("Failed to save reputation.json: {e}");
+                }
+            }
+
             // Periodic known.met save (every 11 minutes, matching eMule)
             _ = known_met_save_timer.tick() => {
                 if known_files.is_dirty() {
@@ -9771,6 +9942,13 @@ pub async fn start_network(
     }
     flush_credit_state(&credit_manager, &db, &state.data_dir, true).await;
     info!("Credit state saved on shutdown");
+
+    let rep_path = state.data_dir.join("reputation.json");
+    if let Err(e) = state.reputation.save(&rep_path) {
+        error!("Failed to save reputation.json on shutdown: {e}");
+    } else {
+        info!("Reputation data saved on shutdown ({} peers tracked)", state.reputation.tracked_count());
+    }
 
     let server_met_path = state.data_dir.join("server.met");
     let _ = state.server_list.save_server_met(&server_met_path);
@@ -13834,6 +14012,31 @@ async fn handle_command(
                 );
                 let _ = tx.send(Ok(()));
             }
+        }
+
+        NetworkCommand::GetPeerReputation { user_hash, tx } => {
+            let info = state.reputation.get_peer(&user_hash).map(|p| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                PeerReputationInfo {
+                    score: p.score,
+                    successful_transfers: p.successful_transfers,
+                    failed_transfers: p.failed_transfers,
+                    is_banned: p.is_banned(now),
+                    first_seen: p.first_seen,
+                    last_interaction: p.last_interaction,
+                }
+            });
+            let _ = tx.send(info);
+        }
+
+        NetworkCommand::GetReputationStats { tx } => {
+            let _ = tx.send(ReputationStatsInfo {
+                tracked_peers: state.reputation.tracked_count(),
+                banned_peers: state.reputation.banned_count(),
+            });
         }
 
         NetworkCommand::Shutdown => {}
