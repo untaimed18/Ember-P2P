@@ -251,6 +251,7 @@ impl PerFileSourceList {
     /// **Important:** This does not filter against `DeadSourceList`. Callers MUST
     /// filter the returned sources through `DeadSourceList::is_dead_source_for_file`
     /// before initiating connections.
+    #[cfg(test)]
     pub fn sources_ready_for_reask(&self) -> Vec<(Ipv4Addr, u16)> {
         let mut ready: Vec<&DownloadSourceEntry> = self.sources.iter()
             .filter(|s| {
@@ -269,6 +270,44 @@ impl PerFileSourceList {
                 _ => u32::MAX,
             };
             rank_a.cmp(&rank_b).then_with(|| a.fail_count.cmp(&b.fail_count))
+        });
+        ready.into_iter().map(|s| (s.ip, s.tcp_port)).collect()
+    }
+
+    /// Like `sources_ready_for_reask` but factors in reputation scores
+    /// and filters out reputation-banned peers.
+    pub fn sources_ready_for_reask_with_reputation<F>(
+        &self,
+        is_banned: F,
+        score_fn: impl Fn(Ipv4Addr, u16) -> i32,
+    ) -> Vec<(Ipv4Addr, u16)>
+    where
+        F: Fn(Ipv4Addr, u16) -> bool,
+    {
+        let mut ready: Vec<&DownloadSourceEntry> = self.sources.iter()
+            .filter(|s| {
+                s.time_until_reask() == 0
+                    && s.can_try_tcp()
+                    && !matches!(s.state, DownloadSourceState::Banned | DownloadSourceState::LowToLowIp | DownloadSourceState::EmberRelay)
+                    && !is_banned(s.ip, s.tcp_port)
+            })
+            .collect();
+        ready.sort_by(|a, b| {
+            let rank_a = match &a.state {
+                DownloadSourceState::OnQueue { rank } => rank.unwrap_or(u32::MAX),
+                _ => u32::MAX,
+            };
+            let rank_b = match &b.state {
+                DownloadSourceState::OnQueue { rank } => rank.unwrap_or(u32::MAX),
+                _ => u32::MAX,
+            };
+            rank_a.cmp(&rank_b)
+                .then_with(|| a.fail_count.cmp(&b.fail_count))
+                .then_with(|| {
+                    let rep_a = score_fn(a.ip, a.tcp_port);
+                    let rep_b = score_fn(b.ip, b.tcp_port);
+                    rep_b.cmp(&rep_a)
+                })
         });
         ready.into_iter().map(|s| (s.ip, s.tcp_port)).collect()
     }
@@ -436,6 +475,31 @@ impl SourceManager {
         if self.sources.len() > MAX_TRACKED_FILES {
             self.cleanup_expired();
         }
+    }
+
+    /// Look up the user_hash for a source by IP:port across all tracked files.
+    pub fn find_user_hash_by_addr(&self, ip: Ipv4Addr, port: u16) -> Option<[u8; 16]> {
+        for entries in self.sources.values() {
+            for e in entries {
+                if e.ip == ip && e.tcp_port == port && e.user_hash != [0u8; 16] {
+                    return Some(e.user_hash);
+                }
+            }
+        }
+        None
+    }
+
+    /// Look up all known IPs for a given user_hash across all tracked files.
+    pub fn find_ips_by_user_hash(&self, user_hash: &[u8; 16]) -> Vec<Ipv4Addr> {
+        let mut ips = Vec::new();
+        for entries in self.sources.values() {
+            for e in entries {
+                if &e.user_hash == user_hash && !ips.contains(&e.ip) {
+                    ips.push(e.ip);
+                }
+            }
+        }
+        ips
     }
 
     pub fn build_answer_sources2_versioned(

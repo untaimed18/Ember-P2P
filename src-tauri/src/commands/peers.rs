@@ -1,5 +1,5 @@
 use crate::app_state::AppState;
-use crate::network::NetworkCommand;
+use crate::network::{NetworkCommand, PeerReputationInfo, ReputationStatsInfo};
 use crate::storage::identity::NodeIdentity;
 use crate::types::*;
 
@@ -574,4 +574,26 @@ pub async fn get_kad_searches(
         .try_send(NetworkCommand::GetKadSearchesSnapshot { tx })
         .map_err(|e| format!("Network busy: {e}"))?;
     rx.await.map_err(|_| "Failed to get KAD searches".to_string())
+}
+
+#[tauri::command]
+pub async fn get_peer_reputation(
+    state: tauri::State<'_, AppState>,
+    user_hash_hex: String,
+) -> Result<Option<PeerReputationInfo>, String> {
+    let hash = parse_user_hash(&user_hash_hex.to_lowercase())?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.network_tx.try_send(NetworkCommand::GetPeerReputation { user_hash: hash, tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
+    rx.await.map_err(|_| "No response".to_string())
+}
+
+#[tauri::command]
+pub async fn get_reputation_stats(
+    state: tauri::State<'_, AppState>,
+) -> Result<ReputationStatsInfo, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.network_tx.try_send(NetworkCommand::GetReputationStats { tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
+    rx.await.map_err(|_| "No response".to_string())
 }
