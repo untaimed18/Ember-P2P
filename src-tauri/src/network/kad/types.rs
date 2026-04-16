@@ -451,6 +451,7 @@ pub const TAGTYPE_UINT8: u8 = 0x09;
 pub const TAGTYPE_BSOB: u8 = 0x0A;
 pub const TAGTYPE_UINT64: u8 = 0x0B;
 pub const TAGTYPE_STR1: u8 = 0x11;
+#[allow(dead_code)]
 pub const TAGTYPE_STR16: u8 = 0x20;
 pub const TAGTYPE_STR22: u8 = 0x26;
 
