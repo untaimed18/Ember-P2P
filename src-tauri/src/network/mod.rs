@@ -13749,13 +13749,6 @@ async fn handle_upload_event(
                 "transfer-complete",
                 serde_json::json!({ "id": event.transfer_id, "direction": "upload" }),
             );
-            let tm = Arc::clone(transfer_manager);
-            let tid = event.transfer_id.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let mut mgr = tm.write().await;
-                mgr.completed.retain(|t| t.id != tid);
-            });
         }
         UploadEventKind::Failed { error } => {
             let promoted = match {
