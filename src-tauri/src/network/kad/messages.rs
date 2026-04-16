@@ -869,16 +869,20 @@ pub fn build_hello_req(
     })
 }
 
-/// Build a binary KAD search expression for multiple keywords (eMule AND tree format).
+/// Build a binary search expression for >=1 keywords (eMule AND tree format).
 ///
 /// For N keywords, builds a left-leaning AND tree:
 ///   AND(AND(kw1, kw2), kw3) for 3 keywords, etc.
+/// A single keyword produces a plain string leaf.  When a file_type filter
+/// is present it is AND-combined with the keyword tree.
+///
+/// Returns empty only when there are zero keywords AND no file_type.
 ///
 /// Wire format:
 ///   0x00 0x00 = AND operator (followed by left child, right child)
 ///   0x01      = String leaf  (followed by UTF-8 length-prefixed string)
 pub fn build_search_expression(keywords: &[String], file_type: Option<&str>) -> Vec<u8> {
-    let has_keywords = keywords.len() > 1;
+    let has_keywords = !keywords.is_empty();
     let has_type = file_type.is_some_and(|t| !t.is_empty());
 
     if !has_keywords && !has_type {
@@ -903,7 +907,7 @@ pub fn build_search_expression(keywords: &[String], file_type: Option<&str>) -> 
         buf.push(tag_id);
     }
 
-    fn write_and_tree(buf: &mut Vec<u8>, keywords: &[String], end: usize) {
+    fn write_keyword_tree(buf: &mut Vec<u8>, keywords: &[String], end: usize) {
         if end == 1 {
             write_string_leaf(buf, &keywords[0]);
             return;
@@ -914,7 +918,7 @@ pub fn build_search_expression(keywords: &[String], file_type: Option<&str>) -> 
             write_string_leaf(buf, &keywords[0]);
             write_string_leaf(buf, &keywords[1]);
         } else {
-            write_and_tree(buf, keywords, end - 1);
+            write_keyword_tree(buf, keywords, end - 1);
             write_string_leaf(buf, &keywords[end - 1]);
         }
     }
@@ -924,10 +928,10 @@ pub fn build_search_expression(keywords: &[String], file_type: Option<&str>) -> 
     if has_keywords && has_type {
         buf.push(0x00); // operator
         buf.push(0x00); // AND
-        write_and_tree(&mut buf, keywords, keywords.len());
+        write_keyword_tree(&mut buf, keywords, keywords.len());
         write_meta_string(&mut buf, file_type.unwrap(), FT_FILETYPE_TAG);
     } else if has_keywords {
-        write_and_tree(&mut buf, keywords, keywords.len());
+        write_keyword_tree(&mut buf, keywords, keywords.len());
     } else {
         write_meta_string(&mut buf, file_type.unwrap(), FT_FILETYPE_TAG);
     }

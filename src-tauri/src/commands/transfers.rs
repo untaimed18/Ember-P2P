@@ -501,6 +501,8 @@ pub async fn stop_transfer(
 }
 
 /// Completed file in `Downloads/`, or in-progress `.part` in `Temp/`.
+/// Always prefers the final file in Downloads/ over the .part in Temp/ so
+/// that a stale in-memory status never misdirects the user.
 fn resolve_transfer_reveal_path(transfer: &Transfer, download_folder: &str) -> Result<PathBuf, String> {
     if transfer.direction != TransferDirection::Download {
         return Err("Not a download".into());
@@ -512,18 +514,10 @@ fn resolve_transfer_reveal_path(transfer: &Transfer, download_folder: &str) -> R
     let final_path = completed_dir.join(&safe_name);
     let part_path = temp_dir.join(format!("{}.part", transfer.id));
 
-    let (candidate, base_dir) = if matches!(transfer.status, TransferStatus::Completed) {
-        if final_path.is_file() {
-            (final_path, completed_dir)
-        } else if part_path.is_file() {
-            (part_path, temp_dir)
-        } else {
-            return Err("File not found on disk".into());
-        }
+    let (candidate, base_dir) = if final_path.is_file() {
+        (final_path, completed_dir)
     } else if part_path.is_file() {
         (part_path, temp_dir)
-    } else if final_path.is_file() {
-        (final_path, completed_dir)
     } else {
         return Err("File not found on disk".into());
     };
@@ -542,11 +536,10 @@ fn resolve_transfer_reveal_path(transfer: &Transfer, download_folder: &str) -> R
 
 #[cfg(windows)]
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
-    use std::ffi::OsString;
-    let mut arg = OsString::from("/select,");
-    arg.push(path.as_os_str());
+    use std::os::windows::process::CommandExt;
+    let raw = format!("/select,\"{}\"", path.display());
     std::process::Command::new("explorer")
-        .arg(arg)
+        .raw_arg(raw)
         .spawn()
         .map_err(|e| format!("Failed to open File Explorer: {e}"))?;
     Ok(())
@@ -616,9 +609,6 @@ pub async fn open_file(
         (mgr.get_transfer(&transfer_id).cloned(), cfg.settings.download_folder.clone())
     };
     let transfer = transfer.ok_or("Transfer not found")?;
-    if transfer.status != TransferStatus::Completed {
-        return Err("File is not completed".into());
-    }
     let safe_name = crate::security::sanitize_filename(&transfer.file_name);
     if crate::security::is_dangerous_extension(&safe_name) {
         return Err("Cannot open potentially dangerous file types. Please use a dedicated application.".into());
@@ -628,7 +618,7 @@ pub async fn open_file(
     let file_path = download_dir.join(&safe_name);
     tokio::task::spawn_blocking(move || {
         if !file_path.exists() {
-            return Err("File not found on disk".to_string());
+            return Err("Download has not finished yet".to_string());
         }
         let canonical = file_path.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
         let canonical_base = download_dir.canonicalize().map_err(|e| format!("Invalid base: {e}"))?;

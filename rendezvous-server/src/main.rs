@@ -98,7 +98,7 @@ fn extract_client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
     // Set TRUST_PROXY=false to disable when running without a proxy.
     let trust_proxy = std::env::var("TRUST_PROXY")
         .map(|v| v != "false" && v != "0")
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     if trust_proxy {
         if let Some(val) = headers.get("fly-client-ip") {
@@ -166,7 +166,7 @@ async fn register(
         .filter(|ip| match ip {
             IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified()
                 && !v4.is_private() && !v4.is_link_local(),
-            _ => false,
+            IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
         })
         .unwrap_or(client_ip);
 
@@ -181,7 +181,13 @@ async fn register(
     if store.len() >= MAX_STORE_ENTRIES {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
-    store.insert(body.id.to_lowercase(), entry);
+    let key = body.id.to_lowercase();
+    if let Some(existing) = store.get(&key) {
+        if existing.conn_ip != client_ip && existing.expires_at > Instant::now() {
+            return StatusCode::FORBIDDEN;
+        }
+    }
+    store.insert(key, entry);
     info!("registered {} ip={} (conn={})", &body.id[..8], presence_ip, client_ip);
     StatusCode::OK
 }
@@ -642,25 +648,42 @@ async fn main() {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("rendezvous server listening on {}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Failed to bind to {addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await
-    .unwrap();
+    {
+        eprintln!("Server error: {e}");
+        std::process::exit(1);
+    }
 }
 
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
-        let mut int = signal(SignalKind::interrupt()).expect("SIGINT handler");
-        tokio::select! {
-            _ = term.recv() => {},
-            _ = int.recv() => {},
+        let term = signal(SignalKind::terminate());
+        let int = signal(SignalKind::interrupt());
+        match (term, int) {
+            (Ok(mut term), Ok(mut int)) => {
+                tokio::select! {
+                    _ = term.recv() => {},
+                    _ = int.recv() => {},
+                }
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::warn!("Failed to register signal handler: {e}, falling back to ctrl_c");
+                tokio::signal::ctrl_c().await.ok();
+            }
         }
     }
     #[cfg(not(unix))]

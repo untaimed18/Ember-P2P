@@ -13,7 +13,7 @@ use crate::network::kad::types::KadId;
 /// Persistent node identity, equivalent to eMule's preferencesKad.dat + preferences.dat.
 /// The KAD ID and user hash are generated once and reused across sessions so other
 /// nodes recognize us in their routing tables and credit systems.
-#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct NodeIdentity {
     pub kad_id: [u8; 16],
     pub user_hash: [u8; 16],
@@ -36,6 +36,17 @@ pub struct NodeIdentity {
     /// X25519 static public key (32 bytes) for Noise protocol transport encryption.
     #[serde(default)]
     pub noise_public_key: [u8; 32],
+}
+
+impl std::fmt::Debug for NodeIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeIdentity")
+            .field("kad_id", &"[redacted]")
+            .field("user_hash", &"[redacted]")
+            .field("udp_key_seed", &"[redacted]")
+            .field("ember_hash", &"[redacted]")
+            .finish()
+    }
 }
 
 impl NodeIdentity {
@@ -142,13 +153,19 @@ impl NodeIdentity {
                         return Ok(id);
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to parse identity.json, regenerating: {e}");
+                        tracing::error!("Failed to parse identity.json, regenerating: {e}");
+                        let bak = path.with_extension("json.corrupt.bak");
+                        if let Err(bak_err) = std::fs::rename(&path, &bak) {
+                            tracing::warn!("Failed to backup corrupt identity.json: {bak_err}");
+                        } else {
+                            tracing::info!("Backed up corrupt identity to {}", bak.display());
+                        }
                     }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                tracing::warn!("Failed to read identity.json, regenerating: {e}");
+                tracing::error!("Failed to read identity.json, regenerating: {e}");
             }
         }
 

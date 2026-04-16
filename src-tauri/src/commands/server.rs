@@ -132,7 +132,7 @@ pub async fn download_server_met(
     state: tauri::State<'_, AppState>,
     url: String,
 ) -> Result<String, String> {
-    let (host, resolved_addrs) = crate::security::validate_fetch_url(&url).await?;
+    let (validated_url, host, resolved_addrs) = crate::security::validate_fetch_url(&url).await?;
 
     info!("Downloading server.met");
 
@@ -140,7 +140,7 @@ pub async fn download_server_met(
         .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
     const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-    let response = client.get(&url).send()
+    let response = client.get(&validated_url).send()
         .await
         .map_err(|e| format!("HTTP request failed: {e}"))?
         .error_for_status()

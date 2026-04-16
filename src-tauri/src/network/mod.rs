@@ -739,7 +739,6 @@ pub struct SearchFilters {
 pub enum NetworkCommand {
     SearchFiles {
         query: String,
-        #[allow(dead_code)]
         method: SearchMethod,
         request_id: u64,
         tx: oneshot::Sender<Vec<SearchResult>>,
@@ -1513,6 +1512,20 @@ async fn try_start_pending_download_from_known_sources(
             return false;
         }
     }
+
+    // Only start transfers that are in the active set. Downloads still in
+    // the queue participate in source discovery (they live in
+    // pending_downloads) but must wait for promotion before connecting.
+    {
+        let mgr = transfer_manager.read().await;
+        let is_active = mgr.get_transfer(transfer_id)
+            .map(|t| !matches!(t.status, TransferStatus::Queued))
+            .unwrap_or(false);
+        if !is_active {
+            return false;
+        }
+    }
+
     let Some(pending) = state.pending_downloads.remove(transfer_id) else {
         return false;
     };
@@ -1554,6 +1567,8 @@ async fn try_start_pending_download_from_known_sources(
         "id": transfer_id,
         "status": "active",
         "sources": source_count,
+        "active_sources": 0,
+        "queued_sources": 0,
     }));
 
     {
@@ -2594,7 +2609,11 @@ pub async fn start_network(
                     mgr.register_control(&transfer.id, control.clone());
                     active_now
                 };
-                if active_now {
+                // Register in pending_downloads regardless of whether active
+                // or queued. Queued downloads still need source discovery
+                // (KAD searches, server queries, retry timer) so they have
+                // sources ready when promoted.
+                if active_now || matches!(transfer.status, TransferStatus::Searching | TransferStatus::Queued) {
                     state.pending_downloads.insert(transfer.id.clone(), PendingDownload {
                         transfer_id: transfer.id.clone(),
                         file_hash: transfer.file_hash.clone(),
@@ -4481,6 +4500,8 @@ pub async fn start_network(
                                     "id": &transfer_id,
                                     "status": "searching",
                                     "sources": indirect_count,
+                                    "active_sources": 0,
+                                    "queued_sources": 0,
                                 }));
                                 state.pending_downloads.insert(transfer_id, pending);
                             } else {
@@ -4537,6 +4558,8 @@ pub async fn start_network(
                                     "status": "active",
                                     "peer_id": peer_desc,
                                     "sources": source_count,
+                                    "active_sources": 0,
+                                    "queued_sources": 0,
                                 }));
 
                                 // Populate persistent per-file source list
@@ -5188,27 +5211,27 @@ pub async fn start_network(
                                     Ok(b) if b.len() == 16 => b,
                                     _ => continue,
                                 };
-
-                                if kad_started < MAX_INITIAL_KAD {
-                                    let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
-                                    let closest = state.routing_table.find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
-                                    if !closest.is_empty() {
-                                        let sid = state.search_manager.start_search(
-                                            kad_hash,
-                                            SearchType::FindSource { file_size: pd.file_size },
-                                            closest,
-                                        );
-                                        if sid != SearchId(0) {
-                                            state.download_source_searches.insert(sid, tid.clone());
-                                            kad_started += 1;
-                                        }
-                                    }
-                                }
-
-                                pd.search_count += 1;
-                                pd.last_search_at = now;
                                 (hash_bytes, pd.file_size)
                             };
+
+                            let mut did_search = false;
+
+                            if kad_started < MAX_INITIAL_KAD {
+                                let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
+                                let closest = state.routing_table.find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
+                                if !closest.is_empty() {
+                                    let sid = state.search_manager.start_search(
+                                        kad_hash,
+                                        SearchType::FindSource { file_size },
+                                        closest,
+                                    );
+                                    if sid != SearchId(0) {
+                                        state.download_source_searches.insert(sid, tid.clone());
+                                        kad_started += 1;
+                                        did_search = true;
+                                    }
+                                }
+                            }
 
                             let mut fh = [0u8; 16];
                             fh.copy_from_slice(&hash_bytes);
@@ -5224,7 +5247,16 @@ pub async fn start_network(
                                 );
                                 if !packets.is_empty() {
                                     let room = MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
-                                    state.udp_source_queue.extend(packets.into_iter().take(room));
+                                    let to_queue: Vec<_> = packets.into_iter().take(room).collect();
+                                    if !to_queue.is_empty() { did_search = true; }
+                                    state.udp_source_queue.extend(to_queue);
+                                }
+                            }
+
+                            if did_search {
+                                if let Some(pd) = state.pending_downloads.get_mut(&tid) {
+                                    pd.search_count += 1;
+                                    pd.last_search_at = now;
                                 }
                             }
                         }
@@ -6451,6 +6483,8 @@ pub async fn start_network(
                             "id": tid,
                             "status": "active",
                             "sources": source_count,
+                            "active_sources": 0,
+                            "queued_sources": 0,
                         }));
                         info!("Reasking {} persistent sources for download {}", source_count, tid);
                         let download_sources: Vec<DownloadSource> = {
@@ -6591,6 +6625,8 @@ pub async fn start_network(
                             "id": tid,
                             "status": "active",
                             "sources": source_count,
+                            "active_sources": 0,
+                            "queued_sources": 0,
                         }));
                         info!("Starting download {} from {} accumulated sources", tid, source_count);
                         {
@@ -6701,7 +6737,7 @@ pub async fn start_network(
                 // (eMule udp_ver > 3 format). Sources whose SX is due are skipped
                 // so the normal TCP reask path can carry OP_REQUESTSOURCES.
                 {
-                    let reask_interval = ed2k::dead_sources::SOURCECLIENTREASKS_SECS;
+                    let reask_interval = ed2k::dead_sources::FILEREASKTIME_SECS;
                     let mut sm = source_manager.write().await;
                     for tid in &to_retry {
                         let (fh, file_size) = match state.pending_downloads.get(tid) {
@@ -6786,7 +6822,7 @@ pub async fn start_network(
                 }
                 let to_retry_len = to_retry.len();
                 for tid in to_retry {
-                    let (hash_bytes, file_size, search_count) = {
+                    let (hash_bytes, file_size) = {
                         let Some(pd) = state.pending_downloads.get_mut(&tid) else { continue; };
                         if pd.control.is_cancelled() || pd.control.is_paused() {
                             continue;
@@ -6795,15 +6831,10 @@ pub async fn start_network(
                             Ok(b) if b.len() == 16 => b,
                             _ => continue,
                         };
-                        pd.search_count += 1;
-                        pd.last_search_at = now;
-                        (hash_bytes, pd.file_size, pd.search_count)
+                        (hash_bytes, pd.file_size)
                     };
 
-                    info!(
-                        "Retrying source search for {} (attempt {})",
-                        tid, search_count
-                    );
+                    let mut did_search = false;
 
                     if kad_available && kad_searches_started < MAX_KAD_SEARCHES_PER_TICK {
                         let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
@@ -6817,6 +6848,7 @@ pub async fn start_network(
                             if sid != SearchId(0) {
                                 state.download_source_searches.insert(sid, tid.clone());
                                 kad_searches_started += 1;
+                                did_search = true;
                             }
                         } else {
                             debug!("Routing table empty for retry of {tid}, continuing with server-only source refresh");
@@ -6837,13 +6869,12 @@ pub async fn start_network(
                         );
                         if !packets.is_empty() {
                             let room = MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
-                            state.udp_source_queue.extend(packets.into_iter().take(room));
+                            let to_queue: Vec<_> = packets.into_iter().take(room).collect();
+                            if !to_queue.is_empty() { did_search = true; }
+                            state.udp_source_queue.extend(to_queue);
                         }
                     }
 
-                        // Request callbacks for LowID sources if we have HighID.
-                        // Uses dedup-aware selection to avoid re-requesting callbacks
-                        // that were sent within FILEREASKTIME.
                         if !state.low_id && state.server_connected {
                             if let Some(conn) = &mut state.server_connection {
                                 let current_server = state.server_addr.and_then(|addr| {
@@ -6873,11 +6904,25 @@ pub async fn start_network(
                                                 sm.mark_callback_sent(&fh, *cid);
                                             }
                                         }
+                                        did_search = true;
                                         debug!("Sent {} LowID callback requests for pending download", needing_callback.len());
                                     }
                                 }
                             }
                         }
+
+                    if did_search {
+                        if let Some(pd) = state.pending_downloads.get_mut(&tid) {
+                            pd.search_count += 1;
+                            pd.last_search_at = now;
+                        }
+                    }
+
+                    let search_count = state.pending_downloads.get(&tid).map(|pd| pd.search_count).unwrap_or(0);
+                    info!(
+                        "Retrying source search for {} (attempt {})",
+                        tid, search_count
+                    );
                 }
                 if to_retry_len > MAX_KAD_SEARCHES_PER_TICK {
                     state.kad_source_search_cursor = state.kad_source_search_cursor.wrapping_add(MAX_KAD_SEARCHES_PER_TICK);
@@ -8422,6 +8467,8 @@ pub async fn start_network(
                                     "id": tid,
                                     "status": "active",
                                     "sources": 1,
+                                    "active_sources": 0,
+                                    "queued_sources": 0,
                                 }));
 
                                 let uh = {
@@ -11428,9 +11475,23 @@ async fn handle_udp_packet(
                                         }
                                     }
                                     Err(e) if (connect_options & 0x04) != 0 => Err(e),
-                                    Err(_) => match writer.write_all(&ack_packet).await {
-                                        Ok(()) => writer.flush().await,
-                                        Err(e) => Err(e),
+                                    Err(_) => {
+                                        drop(writer);
+                                        drop(reader);
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_secs(5),
+                                            tokio::net::TcpStream::connect(tcp_addr),
+                                        ).await {
+                                            Ok(Ok(plain_stream)) => {
+                                                let mut pw = tokio::io::BufWriter::new(plain_stream);
+                                                match pw.write_all(&ack_packet).await {
+                                                    Ok(()) => pw.flush().await,
+                                                    Err(e) => Err(e),
+                                                }
+                                            }
+                                            Ok(Err(e)) => Err(e),
+                                            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "plain fallback connect timeout")),
+                                        }
                                     },
                                 }
                             } else {
@@ -11644,7 +11705,7 @@ async fn handle_command(
     ed25519_secret_key: [u8; 32],
 ) {
     match cmd {
-        NetworkCommand::SearchFiles { query, method: _, request_id, tx, search_filters } => {
+        NetworkCommand::SearchFiles { query, method, request_id, tx, search_filters } => {
             if let Some(active) = state.active_search_request.take() {
                 if active.request_id != request_id {
                     cancel_search_request(state, app_handle, active.request_id);
@@ -11674,10 +11735,20 @@ async fn handle_command(
                 return;
             }
 
+            // Build the search expression once, reuse for TCP + UDP.
+            // Single keyword → string leaf; multiple → AND tree; file-type
+            // filter is AND-combined when present.
+            let kad_file_type = search_filters.as_ref().and_then(|f| f.file_type.clone());
+            let search_expr = kad::messages::build_search_expression(&keywords, kad_file_type.as_deref());
+
             // --- TCP server search ---
-            if state.server_connected {
+            let run_server = matches!(method, SearchMethod::Global | SearchMethod::Server);
+            let run_udp    = matches!(method, SearchMethod::Global);
+            let run_kad    = matches!(method, SearchMethod::Global | SearchMethod::Kad);
+
+            if run_server && state.server_connected {
                 if let Some(mut conn) = state.server_connection.take() {
-                    match conn.send_search_async(&query).await {
+                    match conn.send_search_expr_bytes(&search_expr).await {
                         Ok(()) => {
                             active_request.server_pending = true;
                             state.pending_server_search = Some(PendingServerSearch {
@@ -11697,35 +11768,25 @@ async fn handle_command(
             }
 
             // --- UDP global search ---
-            let kad_file_type = search_filters.as_ref().and_then(|f| f.file_type.clone());
-            let search_terms = kad::messages::build_search_expression(&keywords, kad_file_type.as_deref());
-
-            let udp_expr = if search_terms.is_empty() {
-                let kw = keywords.first().map(|s| s.as_str()).unwrap_or("");
-                let bytes = kw.as_bytes();
-                let mut buf = Vec::with_capacity(3 + bytes.len());
-                buf.push(0x01);
-                buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
-                buf.extend_from_slice(bytes);
-                buf
-            } else {
-                search_terms.clone()
-            };
-
-            let servers = state.server_list.servers();
-            for server in servers {
-                if let Some(pkt) = ServerUdpSocket::build_global_search_packet(server, &udp_expr) {
-                    state.udp_search_queue.push_back(pkt);
+            if run_udp {
+                let servers = state.server_list.servers();
+                for server in servers {
+                    if let Some(pkt) = ServerUdpSocket::build_global_search_packet(server, &search_expr) {
+                        state.udp_search_queue.push_back(pkt);
+                    }
                 }
-            }
-            if !state.udp_search_queue.is_empty() {
-                active_request.udp_pending = true;
-                state.server_udp_search_age = 0;
-                info!("UDP global search queued for {} servers", state.udp_search_queue.len());
+                if !state.udp_search_queue.is_empty() {
+                    active_request.udp_pending = true;
+                    state.server_udp_search_age = 0;
+                    info!("UDP global search queued for {} servers", state.udp_search_queue.len());
+                }
             }
 
             // --- KAD search ---
             let kad_started = 'kad: {
+                if !run_kad {
+                    break 'kad false;
+                }
                 let Some(primary_keyword) = keywords.iter().max_by_key(|k| k.len()) else {
                     break 'kad false;
                 };
@@ -11753,11 +11814,15 @@ async fn handle_command(
                     break 'kad false;
                 }
                 if let Some(search) = state.search_manager.get_mut(&sid) {
-                    search.search_terms_data = search_terms;
+                    search.search_terms_data = search_expr;
                 }
                 active_request.kad_pending = true;
+                let Some(search_tx) = tx.take() else {
+                    tracing::error!("KAD search: tx already consumed");
+                    break 'kad false;
+                };
                 state.pending_keyword_searches.insert(sid, PendingKeywordSearch {
-                    tx: tx.take().unwrap(),
+                    tx: search_tx,
                     local_results: local_results.take().unwrap_or_default(),
                     keywords,
                     request_id,
@@ -12026,49 +12091,59 @@ async fn handle_command(
 
                 let now = chrono::Utc::now().timestamp();
 
-                // Persist download to database for resume across restarts
-                let db_transfer = Transfer {
-                    id: transfer_id.clone(),
-                    file_name: file_name.clone(),
-                    file_hash: file_hash.clone(),
-                    peer_id: String::new(),
-                    peer_name: String::new(),
-                    direction: TransferDirection::Download,
-                    status: TransferStatus::Searching,
-                    progress: 0.0,
-                    speed: 0,
-                    total_size: file_size,
-                    transferred: 0,
-                    completed_size: 0,
-                    started_at: now,
-                    failure_reason: None,
-                    failure_kind: None,
-                    failure_stage: None,
-                    priority: "auto".to_string(),
-                    sources: 0,
-                    active_sources: 0,
-                    queued_sources: 0,
-                    queue_rank: None,
-                    last_seen_complete: None,
-                    last_received: None,
-                    health: TransferHealth::Healthy,
-                    health_reason: None,
-                    stalled_since: None,
-                    category: String::new(),
-                    wait_time: 0,
-                    upload_time: 0,
-                    a4af_sources: 0,
-                    max_sources: 0,
-                    preview_priority: false,
-                    ember_sources: 0,
-                    client_software: String::new(),
-                    country_code: None,
-                    user_hash: None,
-                };
+                // Persist download to database for resume across restarts.
+                // Check for an existing DB row first so we don't clobber
+                // progress/priority when a queued download is promoted.
                 {
                     let db_ref = db.clone();
-                    let t = db_transfer.clone();
-                    tokio::task::spawn_blocking(move || { let _ = db_ref.save_transfer(&t); });
+                    let tid = transfer_id.clone();
+                    let fname = file_name.clone();
+                    let fhash = file_hash.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if db_ref.transfer_exists(&tid) {
+                            let _ = db_ref.update_transfer_status(&tid, "searching");
+                        } else {
+                            let db_transfer = Transfer {
+                                id: tid,
+                                file_name: fname,
+                                file_hash: fhash,
+                                peer_id: String::new(),
+                                peer_name: String::new(),
+                                direction: TransferDirection::Download,
+                                status: TransferStatus::Searching,
+                                progress: 0.0,
+                                speed: 0,
+                                total_size: file_size,
+                                transferred: 0,
+                                completed_size: 0,
+                                started_at: now,
+                                failure_reason: None,
+                                failure_kind: None,
+                                failure_stage: None,
+                                priority: "auto".to_string(),
+                                sources: 0,
+                                active_sources: 0,
+                                queued_sources: 0,
+                                queue_rank: None,
+                                last_seen_complete: None,
+                                last_received: None,
+                                health: TransferHealth::Healthy,
+                                health_reason: None,
+                                stalled_since: None,
+                                category: String::new(),
+                                wait_time: 0,
+                                upload_time: 0,
+                                a4af_sources: 0,
+                                max_sources: 0,
+                                preview_priority: false,
+                                ember_sources: 0,
+                                client_software: String::new(),
+                                country_code: None,
+                                user_hash: None,
+                            };
+                            let _ = db_ref.save_transfer(&db_transfer);
+                        }
+                    });
                 }
 
                 let kad_search_started = if !closest.is_empty() {
@@ -12094,6 +12169,14 @@ async fn handle_command(
                     false
                 };
 
+                // Look up actual priority from the transfer manager if this
+                // is a promoted/re-started download, otherwise default to normal.
+                let pending_priority = {
+                    let mgr = transfer_manager.read().await;
+                    mgr.get_transfer(&transfer_id)
+                        .map(|t| priority_str_to_u32(&t.priority))
+                        .unwrap_or(1)
+                };
                 state.pending_downloads.insert(transfer_id.clone(), PendingDownload {
                     transfer_id: transfer_id.clone(),
                     file_hash: file_hash.clone(),
@@ -12102,7 +12185,7 @@ async fn handle_command(
                     control,
                     search_count: if kad_search_started { 1 } else { 0 },
                     last_search_at: if kad_search_started { now } else { 0 },
-                    priority: 1, // "auto" defaults to normal; auto-priority will adjust
+                    priority: pending_priority,
                 });
 
                 // Request sources from the connected ed2k server (non-blocking)
@@ -12589,7 +12672,8 @@ async fn handle_command(
                     if let Some(t) = mgr.get_transfer(tid).cloned() {
                         let control = TransferControl::new();
                         mgr.register_control(tid, control.clone());
-                        mgr.update_status(tid, TransferStatus::Queued);
+                        mgr.update_sources(tid, t.sources, 0, 0);
+                        mgr.update_status(tid, TransferStatus::Searching);
                         state.pending_downloads.insert(tid.clone(), PendingDownload {
                             transfer_id: tid.clone(),
                             file_hash: t.file_hash.clone(),
@@ -12605,7 +12689,8 @@ async fn handle_command(
                         }
                         let _ = app_handle.emit("transfer-status", serde_json::json!({
                             "id": tid,
-                            "status": "queued",
+                            "status": "searching",
+                            "sources": t.sources,
                         }));
                     }
                 }
@@ -14118,13 +14203,6 @@ async fn handle_upload_event(
                 "transfer-complete",
                 serde_json::json!({ "id": event.transfer_id, "direction": "upload" }),
             );
-            let tm = Arc::clone(transfer_manager);
-            let tid = event.transfer_id.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let mut mgr = tm.write().await;
-                mgr.completed.retain(|t| t.id != tid);
-            });
         }
         UploadEventKind::Failed { error } => {
             let promoted = match {

@@ -224,7 +224,7 @@ pub async fn add_shared_folder(
 
         let still_shared = {
             let cfg = config.read().await;
-            file_in_shared_folders(&path, &cfg.settings.shared_folders)
+            file_in_shared_folders(&canonical_str, &cfg.settings.shared_folders)
         };
         if cancel_flag.load(Ordering::Relaxed) || !still_shared {
             info!("Hashing cancelled during discovery for {path}");
@@ -392,6 +392,10 @@ pub async fn remove_shared_folder(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
+    let canonical_path = std::path::Path::new(&path)
+        .canonicalize()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.clone());
     {
         let flags = state.hash_cancel_flags.read().await;
         for (key, flag) in flags.iter() {
@@ -429,7 +433,7 @@ pub async fn remove_shared_folder(
 
     {
         let mut index = state.local_index.write().await;
-        index.remove_files_by_path_prefix(&path);
+        index.remove_files_by_path_prefix(&canonical_path);
     }
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
 
@@ -529,7 +533,7 @@ pub async fn reload_shared_files(
         };
         let reloaded_folders = folders
             .iter()
-            .filter(|folder| current_folders.iter().any(|current| current == *folder))
+            .filter(|folder| current_folders.iter().any(|current| paths_equal_ignore_case(current, folder)))
             .cloned()
             .collect::<Vec<_>>();
         discovered.retain(|file| file_in_shared_folders(&file.path, &reloaded_folders));
