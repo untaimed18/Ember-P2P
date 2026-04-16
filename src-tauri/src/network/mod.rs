@@ -11268,22 +11268,10 @@ async fn handle_command(
             }
 
             // Build the search expression once, reuse for TCP + UDP.
-            // For multiple keywords this produces an AND tree; for a single
-            // keyword with no file-type filter it returns empty (handled below).
+            // Single keyword → string leaf; multiple → AND tree; file-type
+            // filter is AND-combined when present.
             let kad_file_type = search_filters.as_ref().and_then(|f| f.file_type.clone());
-            let search_terms = kad::messages::build_search_expression(&keywords, kad_file_type.as_deref());
-
-            let search_expr = if search_terms.is_empty() {
-                let kw = keywords.first().map(|s| s.as_str()).unwrap_or("");
-                let bytes = kw.as_bytes();
-                let mut buf = Vec::with_capacity(3 + bytes.len());
-                buf.push(0x01);
-                buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
-                buf.extend_from_slice(bytes);
-                buf
-            } else {
-                search_terms.clone()
-            };
+            let search_expr = kad::messages::build_search_expression(&keywords, kad_file_type.as_deref());
 
             // --- TCP server search ---
             if state.server_connected {
@@ -11308,11 +11296,9 @@ async fn handle_command(
             }
 
             // --- UDP global search ---
-            let udp_expr = search_expr;
-
             let servers = state.server_list.servers();
             for server in servers {
-                if let Some(pkt) = ServerUdpSocket::build_global_search_packet(server, &udp_expr) {
+                if let Some(pkt) = ServerUdpSocket::build_global_search_packet(server, &search_expr) {
                     state.udp_search_queue.push_back(pkt);
                 }
             }
@@ -11351,7 +11337,7 @@ async fn handle_command(
                     break 'kad false;
                 }
                 if let Some(search) = state.search_manager.get_mut(&sid) {
-                    search.search_terms_data = search_terms;
+                    search.search_terms_data = search_expr;
                 }
                 active_request.kad_pending = true;
                 let Some(search_tx) = tx.take() else {
