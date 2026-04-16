@@ -313,8 +313,11 @@
 
   // --- Uploads ---
   let allUploads = $derived($transfers.filter(t => t.direction === 'upload'));
-  let activeUploads = $derived(allUploads.filter(t => t.status !== 'completed' && t.status !== 'failed' && t.status !== 'queued'));
-  let completedUploads = $derived(allUploads.filter(t => t.status === 'completed' || t.status === 'failed'));
+  function isUploadFinished(t: Transfer): boolean {
+    return t.status === 'completed' || t.status === 'failed' || (t.status === 'active' && t.total_size > 0 && t.transferred >= t.total_size);
+  }
+  let activeUploads = $derived(allUploads.filter(t => !isUploadFinished(t) && t.status !== 'queued'));
+  let completedUploads = $derived(allUploads.filter(t => isUploadFinished(t)));
   let queuedUploads = $derived(allUploads.filter(t => t.status === 'queued'));
 
   // --- Bottom pane view tabs (eMule style) ---
@@ -639,7 +642,9 @@
 
   function ulStatusLabel(t: Transfer): string {
     switch (t.status) {
-      case 'active': return 'Transferring';
+      case 'active':
+        if (t.total_size > 0 && t.transferred >= t.total_size) return 'Complete';
+        return 'Transferring';
       case 'completed': return 'Complete';
       case 'failed': return 'Error';
       default: return t.status;
@@ -1311,7 +1316,9 @@
 
   function ulStatusTooltip(t: Transfer): string {
     switch (t.status) {
-      case 'active': return 'Actively uploading data to this client';
+      case 'active':
+        if (t.total_size > 0 && t.transferred >= t.total_size) return 'Upload to this client completed';
+        return 'Actively uploading data to this client';
       case 'completed': return 'Upload to this client completed';
       case 'failed': return 'Upload to this client failed';
       default: return t.status;
