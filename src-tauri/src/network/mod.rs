@@ -5317,15 +5317,14 @@ pub async fn start_network(
                                         broker.set_quic_endpoint(ep_arc.clone());
                                         tracing::info!("Broker: QUIC server+client endpoint ready on UDP port {}", state.tcp_port);
 
-                                        // Spawn the relay accept loop if we're HighID
-                                        if !state.firewalled && !state.low_id {
-                                            let relay_mgr = state.relay_manager.clone();
-                                            tokio::spawn(ember::relay::run_relay_accept_loop(
-                                                ep_arc,
-                                                relay_mgr,
-                                            ));
-                                            tracing::info!("Relay accept loop spawned");
-                                        }
+                                        let relay_mgr = state.relay_manager.clone();
+                                        let quic_cb_tx = kad_callback_tx.clone();
+                                        tokio::spawn(ember::relay::run_quic_accept_loop(
+                                            ep_arc,
+                                            relay_mgr,
+                                            quic_cb_tx,
+                                        ));
+                                        tracing::info!("QUIC accept loop spawned");
                                     }
                                     Err(e) => {
                                         tracing::warn!("Broker: failed to create QUIC endpoint: {e}");
@@ -5417,6 +5416,49 @@ pub async fn start_network(
                                 }
                                 Err(e) => {
                                     warn!("Rendezvous heartbeat failed: {e}");
+                                }
+                            }
+                        });
+                    }
+                }
+
+                // Poll for incoming server-relay invitations (if registered & have external IP)
+                if state.rendezvous_registered {
+                    if let Some(ext_ip) = state.external_ip {
+                        let our_relay_id = format!("{:0>64}", format!("{:08x}{:04x}", u32::from(ext_ip), state.tcp_port));
+                        let rv_url = settings.rendezvous_url.clone();
+                        let relay_cb_tx = kad_callback_tx.clone();
+                        tokio::spawn(async move {
+                            match ember::relay::poll_relay_invites(&rv_url, &our_relay_id).await {
+                                Ok(session_ids) => {
+                                    for sid in session_ids {
+                                        tracing::info!("Relay invite received, connecting to session {}", &sid[..16.min(sid.len())]);
+                                        let cb_tx = relay_cb_tx.clone();
+                                        let url = rv_url.clone();
+                                        tokio::spawn(async move {
+                                            match ember::relay::connect_server_relay(&url, &sid).await {
+                                                Ok(ws) => {
+                                                    let (reader, writer) = tokio::io::split(ws);
+                                                    let parts = crate::network::ed2k::upload::KadCallbackParts {
+                                                        peer_ip: std::net::Ipv4Addr::UNSPECIFIED,
+                                                        peer_port: 0,
+                                                        peer_user_hash: [0u8; 16],
+                                                        file_hash: [0u8; 16],
+                                                        reader: Box::new(reader),
+                                                        writer: Box::new(writer),
+                                                        emule_info_done: false,
+                                                    };
+                                                    let _ = cb_tx.send(parts).await;
+                                                }
+                                                Err(e) => {
+                                                    tracing::debug!("Relay invite connect failed for session: {e}");
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::trace!("Relay invite poll: {e}");
                                 }
                             }
                         });
@@ -5763,6 +5805,15 @@ pub async fn start_network(
                                         hex::encode(file_hash),
                                     );
                                     let transfer_id = attempt_transfer_id;
+
+                                    let target_id = format!("{:0>64}", format!("{:08x}{:04x}", u32::from(source_ip), source_port));
+                                    let invite_rv_url = rv_url.clone();
+                                    let invite_sid = session_id.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = ember::relay::post_relay_invite(&invite_rv_url, &target_id, &invite_sid).await {
+                                            tracing::debug!("Broker: relay invite post failed: {e}");
+                                        }
+                                    });
 
                                     tokio::spawn(async move {
                                         let Some(broker_tx) = broker_tx else { return; };

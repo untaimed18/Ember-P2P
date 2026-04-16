@@ -45,13 +45,10 @@ pub enum ConnectionMethod {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
 enum AttemptPhase {
     HolePunch,
     FindRelay,
     RelayConnect,
-    Failed,
-    Succeeded,
 }
 
 /// Tracks an in-progress LowID-to-LowID connection attempt.
@@ -74,7 +71,6 @@ impl ConnectionAttempt {
         let timeout = match self.phase {
             AttemptPhase::HolePunch => PUNCH_TIMEOUT,
             AttemptPhase::FindRelay | AttemptPhase::RelayConnect => RELAY_TIMEOUT,
-            AttemptPhase::Failed | AttemptPhase::Succeeded => Duration::ZERO,
         };
         self.phase_started.elapsed() > timeout
     }
@@ -112,8 +108,6 @@ pub struct ConnectionBroker {
     cooldowns: HashMap<(Ipv4Addr, u16), (Instant, u32)>,
     relay_candidates: Vec<RelayCandidate>,
     event_tx: mpsc::Sender<BrokerEvent>,
-    #[allow(dead_code)]
-    rendezvous_url: String,
     quic_endpoint: Option<Arc<quinn::Endpoint>>,
 }
 
@@ -158,13 +152,12 @@ pub enum BrokerEvent {
 }
 
 impl ConnectionBroker {
-    pub fn new(rendezvous_url: String, event_tx: mpsc::Sender<BrokerEvent>) -> Self {
+    pub fn new(_rendezvous_url: String, event_tx: mpsc::Sender<BrokerEvent>) -> Self {
         Self {
             attempts: HashMap::new(),
             cooldowns: HashMap::new(),
             relay_candidates: Vec::new(),
             event_tx,
-            rendezvous_url,
             quic_endpoint: None,
         }
     }
@@ -364,9 +357,6 @@ impl ConnectionBroker {
                         info!("Broker: relay timed out for {key}");
                         self.relay_failed(&key, "timeout").await;
                     }
-                    _ => {
-                        self.attempts.remove(&key);
-                    }
                 }
             }
         }
@@ -387,11 +377,6 @@ impl ConnectionBroker {
     #[allow(dead_code)]
     pub fn relay_candidate_count(&self) -> usize {
         self.relay_candidates.len()
-    }
-
-    #[allow(dead_code)]
-    pub fn rendezvous_url(&self) -> &str {
-        &self.rendezvous_url
     }
 
     /// Look up attempt metadata. Returns (transfer_id, file_hash, source_ip, source_port).

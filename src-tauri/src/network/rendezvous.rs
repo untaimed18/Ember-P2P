@@ -5,7 +5,7 @@ use tracing::{info, warn};
 
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-fn hashed_id(ember_hash: &[u8; 16]) -> String {
+pub fn hashed_id(ember_hash: &[u8; 16]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(ember_hash);
     hex::encode(hasher.finalize())
