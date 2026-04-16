@@ -355,33 +355,38 @@
   const priorityOrder: Record<string, number> = { release: 0, auto: 1, high: 2, normal: 3, low: 4, verylow: 5 };
   const statusOrder: Record<string, number> = { active: 0, verifying: 1, completing: 2, searching: 3, queued: 4, paused: 5, stopped: 6, hashing: 7, noneneeded: 8, insufficient: 9, failed: 10, completed: 11 };
 
-  // EWMA speed smoothing for stable ETA estimates (eMule "advanced remaining time")
+  // Client-side EWMA speed tracker: computes speed from transferred-byte
+  // deltas so the display works even when the backend reports speed=0.
   const speedHistory: Map<string, { ewma: number; lastTransferred: number; lastTime: number }> = new Map();
   const EWMA_ALPHA = 0.3;
+  const SPEED_STALE_MS = 12_000;
 
-  function smoothedSpeed(t: Transfer): number {
-    if (t.speed <= 0) return 0;
+  function liveSpeed(t: Transfer): number {
     const now = Date.now();
     let entry = speedHistory.get(t.id);
     if (!entry) {
-      entry = { ewma: t.speed, lastTransferred: t.transferred, lastTime: now };
+      entry = { ewma: 0, lastTransferred: t.transferred, lastTime: now };
       speedHistory.set(t.id, entry);
-      return t.speed;
+      return t.speed > 0 ? t.speed : 0;
     }
     const dt = (now - entry.lastTime) / 1000;
-    if (dt < 1) return entry.ewma > 0 ? entry.ewma : t.speed;
+    if (dt < 0.5) return entry.ewma > 0 ? entry.ewma : (t.speed > 0 ? t.speed : 0);
     const bytesThisPeriod = t.transferred - entry.lastTransferred;
-    const measuredSpeed = Math.max(0, bytesThisPeriod / dt);
-    entry.ewma = EWMA_ALPHA * measuredSpeed + (1 - EWMA_ALPHA) * entry.ewma;
-    entry.lastTransferred = t.transferred;
-    entry.lastTime = now;
+    if (bytesThisPeriod > 0) {
+      const measuredSpeed = bytesThisPeriod / dt;
+      entry.ewma = EWMA_ALPHA * measuredSpeed + (1 - EWMA_ALPHA) * entry.ewma;
+      entry.lastTransferred = t.transferred;
+      entry.lastTime = now;
+    } else if (now - entry.lastTime > SPEED_STALE_MS) {
+      entry.ewma = 0;
+    }
     return entry.ewma;
   }
 
   function etaSeconds(t: Transfer): number {
     const completed = t.completed_size ?? t.transferred;
-    if (t.speed <= 0 || completed >= t.total_size) return Infinity;
-    const speed = smoothedSpeed(t);
+    if (completed >= t.total_size) return Infinity;
+    const speed = liveSpeed(t);
     if (speed <= 0) return Infinity;
     return (t.total_size - completed) / speed;
   }
@@ -1503,7 +1508,8 @@
                 {:else if column.key === 'completed_size'}
                   <td class="num-cell">{formatSize(t.completed_size || t.transferred)}</td>
                 {:else if column.key === 'speed'}
-                  <td class="num-cell">{t.speed > 0 ? formatSpeed(t.speed) : '\u2014'}</td>
+                  {@const spd = liveSpeed(t)}
+                  <td class="num-cell">{spd > 0 ? formatSpeed(spd) : '\u2014'}</td>
                 {:else if column.key === 'progress'}
                   <td class="progress-cell">
                     {#if t.status === 'searching' && t.sources === 0 && t.progress === 0}
@@ -1531,7 +1537,8 @@
                     <span class="status-label st-{t.status}" title={dlStatusTooltip(t)}>{dlStatusLabel(t)}</span>
                   </td>
                 {:else if column.key === 'remaining'}
-                  <td class="num-cell">{formatRemaining(t.total_size, t.transferred, t.speed > 0 ? smoothedSpeed(t) : 0)}</td>
+                  {@const spd = liveSpeed(t)}
+                  <td class="num-cell">{formatRemaining(t.total_size, t.transferred, spd)}</td>
                 {:else if column.key === 'last_seen_complete'}
                   <td class="date-cell">{t.last_seen_complete ? formatDate(t.last_seen_complete) : '\u2014'}</td>
                 {:else if column.key === 'last_received'}
@@ -1817,7 +1824,8 @@
                   {:else if column.key === 'client_software'}
                     <td class="sw-cell" title={t.client_software || ''}>{t.client_software || '\u2014'}</td>
                   {:else if column.key === 'speed'}
-                    <td class="num-cell">{t.speed > 0 ? formatSpeed(t.speed) : '\u2014'}</td>
+                    {@const spd = liveSpeed(t)}
+                    <td class="num-cell">{spd > 0 ? formatSpeed(spd) : '\u2014'}</td>
                   {:else if column.key === 'transferred'}
                     <td class="num-cell">{formatSize(t.transferred)}</td>
                   {:else if column.key === 'total_size'}
