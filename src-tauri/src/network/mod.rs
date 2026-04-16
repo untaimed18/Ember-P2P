@@ -6316,7 +6316,7 @@ pub async fn start_network(
                 // (eMule udp_ver > 3 format). Sources whose SX is due are skipped
                 // so the normal TCP reask path can carry OP_REQUESTSOURCES.
                 {
-                    let reask_interval = ed2k::dead_sources::SOURCECLIENTREASKS_SECS;
+                    let reask_interval = ed2k::dead_sources::FILEREASKTIME_SECS;
                     let mut sm = source_manager.write().await;
                     for tid in &to_retry {
                         let (fh, file_size) = match state.pending_downloads.get(tid) {
@@ -11022,9 +11022,23 @@ async fn handle_udp_packet(
                                         }
                                     }
                                     Err(e) if (connect_options & 0x04) != 0 => Err(e),
-                                    Err(_) => match writer.write_all(&ack_packet).await {
-                                        Ok(()) => writer.flush().await,
-                                        Err(e) => Err(e),
+                                    Err(_) => {
+                                        drop(writer);
+                                        drop(reader);
+                                        match tokio::time::timeout(
+                                            std::time::Duration::from_secs(5),
+                                            tokio::net::TcpStream::connect(tcp_addr),
+                                        ).await {
+                                            Ok(Ok(plain_stream)) => {
+                                                let mut pw = tokio::io::BufWriter::new(plain_stream);
+                                                match pw.write_all(&ack_packet).await {
+                                                    Ok(()) => pw.flush().await,
+                                                    Err(e) => Err(e),
+                                                }
+                                            }
+                                            Ok(Err(e)) => Err(e),
+                                            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "plain fallback connect timeout")),
+                                        }
                                     },
                                 }
                             } else {

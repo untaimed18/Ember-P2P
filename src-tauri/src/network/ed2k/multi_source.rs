@@ -1669,7 +1669,7 @@ async fn download_parts_from_source(
                     addr,
                     peer_user_hash,
                     peer_secure_ident_level,
-                    0u32,
+                    our_client_id,
                 ).await?;
                 debug!("Responded to SecIdent challenge from source {}", _src_idx);
             }
@@ -1699,7 +1699,7 @@ async fn download_parts_from_source(
                     addr,
                     peer_secure_ident_level,
                     &payload,
-                    0u32,
+                    our_client_id,
                 ).await;
             }
             (OP_EMULEPROT, OP_EMULEINFOANSWER) | (OP_EMULEPROT, OP_EMULEINFO) => {
@@ -1855,6 +1855,13 @@ async fn download_parts_from_source(
             req_file_name_payload.extend_from_slice(&0u16.to_le_bytes());
         }
     }
+    let sx_allowed = if let Some(sm) = &source_mgr {
+        let sm = sm.read().await;
+        if let Ok(v4) = source.peer_ip.parse::<Ipv4Addr>() {
+            sm.can_request_sources_for(file_hash, v4, source.peer_port)
+        } else { true }
+    } else { true };
+
     if peer_supports_file_ident || peer_supports_ext_multipacket || peer_supports_multipacket {
         // eMule-style multipacket file request.
         let mut mp = Vec::with_capacity(64 + req_file_name_payload.len());
@@ -1882,6 +1889,15 @@ async fn download_parts_from_source(
         if !single_part {
             mp.push(OP_SETREQFILEID);
         }
+        if sx_allowed {
+            if peer_supports_source_ex2 {
+                mp.push(OP_REQUESTSOURCES2);
+                mp.push(SOURCEEXCHANGE2_VERSION);
+                mp.extend_from_slice(&0u16.to_le_bytes());
+            } else {
+                mp.push(OP_REQUESTSOURCES);
+            }
+        }
         if peer_supports_aich && !peer_supports_file_ident {
             mp.push(OP_AICHFILEHASHREQ);
         }
@@ -1893,6 +1909,14 @@ async fn download_parts_from_source(
             OP_MULTIPACKET
         };
         write_packet_async_ms(&mut *writer, OP_EMULEPROT, mp_opcode, &mp).await?;
+        if sx_allowed {
+            if let Some(sm) = &source_mgr {
+                let mut sm = sm.write().await;
+                if let Ok(v4) = source.peer_ip.parse::<Ipv4Addr>() {
+                    sm.mark_sx_sent(file_hash, v4, source.peer_port);
+                }
+            }
+        }
     } else {
         write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_REQUESTFILENAME, &req_file_name_payload).await?;
         if !single_part {
@@ -1981,7 +2005,7 @@ async fn download_parts_from_source(
                 addr,
                 peer_user_hash,
                 peer_secure_ident_level,
-                0u32,
+                our_client_id,
             ).await?;
             continue;
         }
@@ -1993,7 +2017,7 @@ async fn download_parts_from_source(
                 addr,
                 peer_secure_ident_level,
                 &_payload,
-                0u32,
+                our_client_id,
             ).await;
             continue;
         }
@@ -2049,7 +2073,11 @@ async fn download_parts_from_source(
             continue;
         }
         if proto == OP_EDONKEYHEADER && opcode == OP_FILESTATUS {
-            if let Ok((_hash, parts_vec)) = parse_file_status(&_payload) {
+            if let Ok((status_hash, parts_vec)) = parse_file_status(&_payload) {
+                if status_hash != *file_hash {
+                    debug!("Source {} OP_FILESTATUS hash mismatch, ignoring", _src_idx);
+                    continue;
+                }
                 let parts_vec = if parts_vec.is_empty() {
                     debug!("Source {} file status: part_count=0 → peer has complete file ({} parts)", _src_idx, part_count);
                     vec![true; part_count]
