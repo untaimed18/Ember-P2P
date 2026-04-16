@@ -589,7 +589,7 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
                 cursor.set_position((p + blen) as u64);
                 continue;
             }
-            t if (0x11..=0x20).contains(&t) => { // STR1..STR16
+            t if (0x11..=0x26).contains(&t) => { // STR1..STR22 (STR17-22 are legacy eMule 0.42f compat)
                 let slen = (t - 0x11 + 1) as usize;
                 let p = cursor.position() as usize;
                 if p + slen > payload.len() { break; }
@@ -688,7 +688,7 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
             0x06 => { let count = cursor.read_u16::<LittleEndian>().unwrap_or(0) as usize; let bc = (count + 7) / 8; let p = cursor.position() as usize; if p + bc > payload.len() { break; } cursor.set_position((p + bc) as u64); continue; }
             0x07 => { let blen = cursor.read_u32::<LittleEndian>().unwrap_or(0) as usize; let p = cursor.position() as usize; if blen > payload.len() || p > payload.len() - blen { break; } cursor.set_position((p + blen) as u64); continue; }
             0x0A => { let blen = cursor.read_u8().unwrap_or(0) as usize; let p = cursor.position() as usize; if p + blen > payload.len() { break; } cursor.set_position((p + blen) as u64); continue; }
-            t if (0x11..=0x20).contains(&t) => { let slen = (t - 0x11 + 1) as usize; let p = cursor.position() as usize; if p + slen > payload.len() { break; } cursor.set_position((p + slen) as u64); continue; }
+            t if (0x11..=0x26).contains(&t) => { let slen = (t - 0x11 + 1) as usize; let p = cursor.position() as usize; if p + slen > payload.len() { break; } cursor.set_position((p + slen) as u64); continue; }
             _ => { break; }
         };
 
