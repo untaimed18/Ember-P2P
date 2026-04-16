@@ -12217,7 +12217,8 @@ async fn handle_command(
                     if let Some(t) = mgr.get_transfer(tid).cloned() {
                         let control = TransferControl::new();
                         mgr.register_control(tid, control.clone());
-                        mgr.update_status(tid, TransferStatus::Queued);
+                        mgr.update_sources(tid, t.sources, 0, 0);
+                        mgr.update_status(tid, TransferStatus::Searching);
                         state.pending_downloads.insert(tid.clone(), PendingDownload {
                             transfer_id: tid.clone(),
                             file_hash: t.file_hash.clone(),
@@ -12233,7 +12234,8 @@ async fn handle_command(
                         }
                         let _ = app_handle.emit("transfer-status", serde_json::json!({
                             "id": tid,
-                            "status": "queued",
+                            "status": "searching",
+                            "sources": t.sources,
                         }));
                     }
                 }
