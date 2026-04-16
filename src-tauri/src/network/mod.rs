@@ -5129,27 +5129,27 @@ pub async fn start_network(
                                     Ok(b) if b.len() == 16 => b,
                                     _ => continue,
                                 };
-
-                                if kad_started < MAX_INITIAL_KAD {
-                                    let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
-                                    let closest = state.routing_table.find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
-                                    if !closest.is_empty() {
-                                        let sid = state.search_manager.start_search(
-                                            kad_hash,
-                                            SearchType::FindSource { file_size: pd.file_size },
-                                            closest,
-                                        );
-                                        if sid != SearchId(0) {
-                                            state.download_source_searches.insert(sid, tid.clone());
-                                            kad_started += 1;
-                                        }
-                                    }
-                                }
-
-                                pd.search_count += 1;
-                                pd.last_search_at = now;
                                 (hash_bytes, pd.file_size)
                             };
+
+                            let mut did_search = false;
+
+                            if kad_started < MAX_INITIAL_KAD {
+                                let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
+                                let closest = state.routing_table.find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
+                                if !closest.is_empty() {
+                                    let sid = state.search_manager.start_search(
+                                        kad_hash,
+                                        SearchType::FindSource { file_size },
+                                        closest,
+                                    );
+                                    if sid != SearchId(0) {
+                                        state.download_source_searches.insert(sid, tid.clone());
+                                        kad_started += 1;
+                                        did_search = true;
+                                    }
+                                }
+                            }
 
                             let mut fh = [0u8; 16];
                             fh.copy_from_slice(&hash_bytes);
@@ -5165,7 +5165,16 @@ pub async fn start_network(
                                 );
                                 if !packets.is_empty() {
                                     let room = MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
-                                    state.udp_source_queue.extend(packets.into_iter().take(room));
+                                    let to_queue: Vec<_> = packets.into_iter().take(room).collect();
+                                    if !to_queue.is_empty() { did_search = true; }
+                                    state.udp_source_queue.extend(to_queue);
+                                }
+                            }
+
+                            if did_search {
+                                if let Some(pd) = state.pending_downloads.get_mut(&tid) {
+                                    pd.search_count += 1;
+                                    pd.last_search_at = now;
                                 }
                             }
                         }
@@ -6411,7 +6420,7 @@ pub async fn start_network(
                 }
                 let to_retry_len = to_retry.len();
                 for tid in to_retry {
-                    let (hash_bytes, file_size, search_count) = {
+                    let (hash_bytes, file_size) = {
                         let Some(pd) = state.pending_downloads.get_mut(&tid) else { continue; };
                         if pd.control.is_cancelled() || pd.control.is_paused() {
                             continue;
@@ -6420,15 +6429,10 @@ pub async fn start_network(
                             Ok(b) if b.len() == 16 => b,
                             _ => continue,
                         };
-                        pd.search_count += 1;
-                        pd.last_search_at = now;
-                        (hash_bytes, pd.file_size, pd.search_count)
+                        (hash_bytes, pd.file_size)
                     };
 
-                    info!(
-                        "Retrying source search for {} (attempt {})",
-                        tid, search_count
-                    );
+                    let mut did_search = false;
 
                     if kad_available && kad_searches_started < MAX_KAD_SEARCHES_PER_TICK {
                         let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
@@ -6442,6 +6446,7 @@ pub async fn start_network(
                             if sid != SearchId(0) {
                                 state.download_source_searches.insert(sid, tid.clone());
                                 kad_searches_started += 1;
+                                did_search = true;
                             }
                         } else {
                             debug!("Routing table empty for retry of {tid}, continuing with server-only source refresh");
@@ -6462,13 +6467,12 @@ pub async fn start_network(
                         );
                         if !packets.is_empty() {
                             let room = MAX_UDP_SOURCE_QUEUE.saturating_sub(state.udp_source_queue.len());
-                            state.udp_source_queue.extend(packets.into_iter().take(room));
+                            let to_queue: Vec<_> = packets.into_iter().take(room).collect();
+                            if !to_queue.is_empty() { did_search = true; }
+                            state.udp_source_queue.extend(to_queue);
                         }
                     }
 
-                        // Request callbacks for LowID sources if we have HighID.
-                        // Uses dedup-aware selection to avoid re-requesting callbacks
-                        // that were sent within FILEREASKTIME.
                         if !state.low_id && state.server_connected {
                             if let Some(conn) = &mut state.server_connection {
                                 let current_server = state.server_addr.and_then(|addr| {
@@ -6498,11 +6502,25 @@ pub async fn start_network(
                                                 sm.mark_callback_sent(&fh, *cid);
                                             }
                                         }
+                                        did_search = true;
                                         debug!("Sent {} LowID callback requests for pending download", needing_callback.len());
                                     }
                                 }
                             }
                         }
+
+                    if did_search {
+                        if let Some(pd) = state.pending_downloads.get_mut(&tid) {
+                            pd.search_count += 1;
+                            pd.last_search_at = now;
+                        }
+                    }
+
+                    let search_count = state.pending_downloads.get(&tid).map(|pd| pd.search_count).unwrap_or(0);
+                    info!(
+                        "Retrying source search for {} (attempt {})",
+                        tid, search_count
+                    );
                 }
                 if to_retry_len > MAX_KAD_SEARCHES_PER_TICK {
                     state.kad_source_search_cursor = state.kad_source_search_cursor.wrapping_add(MAX_KAD_SEARCHES_PER_TICK);
