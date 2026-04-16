@@ -375,7 +375,13 @@ impl TransferManager {
     }
 
     pub fn complete(&mut self, id: &str) -> Option<Vec<Transfer>> {
-        if let Some(mut transfer) = self.active.remove(id) {
+        let mut transfer = self.active.remove(id);
+        if transfer.is_none() {
+            if let Some(idx) = self.queue.iter().position(|t| t.id == id) {
+                transfer = Some(self.queue.remove(idx).unwrap());
+            }
+        }
+        if let Some(mut transfer) = transfer {
             transfer.status = TransferStatus::Completed;
             transfer.progress = 100.0;
             transfer.speed = 0;
