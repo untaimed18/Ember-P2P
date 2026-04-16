@@ -309,9 +309,9 @@ impl MultiSourceDownload {
                 };
                 let resuming = completed_bytes > 0 || existing_len > 0;
                 if resuming {
-                    if completed_bytes == 0 && existing_len > 0 {
+                    if completed_bytes == 0 && existing_len > 0 && existing_len != fs {
                         warn!(
-                            "Preserving non-empty .part ({existing_len} bytes) for {tid} while resume metadata shows no completed bytes — \
+                            "Preserving non-empty .part ({existing_len} bytes, expected {fs}) for {tid} while resume metadata shows no completed bytes — \
                              .part.met may be missing or corrupt"
                         );
                     }
@@ -1669,7 +1669,7 @@ async fn download_parts_from_source(
                     addr,
                     peer_user_hash,
                     peer_secure_ident_level,
-                    0u32,
+                    our_client_id,
                 ).await?;
                 debug!("Responded to SecIdent challenge from source {}", _src_idx);
             }
@@ -1699,7 +1699,7 @@ async fn download_parts_from_source(
                     addr,
                     peer_secure_ident_level,
                     &payload,
-                    0u32,
+                    our_client_id,
                 ).await;
             }
             (OP_EMULEPROT, OP_EMULEINFOANSWER) | (OP_EMULEPROT, OP_EMULEINFO) => {
@@ -1855,6 +1855,13 @@ async fn download_parts_from_source(
             req_file_name_payload.extend_from_slice(&0u16.to_le_bytes());
         }
     }
+    let sx_allowed = if let Some(sm) = &source_mgr {
+        let sm = sm.read().await;
+        if let Ok(v4) = source.peer_ip.parse::<Ipv4Addr>() {
+            sm.can_request_sources_for(file_hash, v4, source.peer_port)
+        } else { true }
+    } else { true };
+
     if peer_supports_file_ident || peer_supports_ext_multipacket || peer_supports_multipacket {
         // eMule-style multipacket file request.
         let mut mp = Vec::with_capacity(64 + req_file_name_payload.len());
@@ -1882,6 +1889,15 @@ async fn download_parts_from_source(
         if !single_part {
             mp.push(OP_SETREQFILEID);
         }
+        if sx_allowed {
+            if peer_supports_source_ex2 {
+                mp.push(OP_REQUESTSOURCES2);
+                mp.push(SOURCEEXCHANGE2_VERSION);
+                mp.extend_from_slice(&0u16.to_le_bytes());
+            } else {
+                mp.push(OP_REQUESTSOURCES);
+            }
+        }
         if peer_supports_aich && !peer_supports_file_ident {
             mp.push(OP_AICHFILEHASHREQ);
         }
@@ -1893,6 +1909,14 @@ async fn download_parts_from_source(
             OP_MULTIPACKET
         };
         write_packet_async_ms(&mut *writer, OP_EMULEPROT, mp_opcode, &mp).await?;
+        if sx_allowed {
+            if let Some(sm) = &source_mgr {
+                let mut sm = sm.write().await;
+                if let Ok(v4) = source.peer_ip.parse::<Ipv4Addr>() {
+                    sm.mark_sx_sent(file_hash, v4, source.peer_port);
+                }
+            }
+        }
     } else {
         write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_REQUESTFILENAME, &req_file_name_payload).await?;
         if !single_part {
@@ -1981,7 +2005,7 @@ async fn download_parts_from_source(
                 addr,
                 peer_user_hash,
                 peer_secure_ident_level,
-                0u32,
+                our_client_id,
             ).await?;
             continue;
         }
@@ -1993,7 +2017,7 @@ async fn download_parts_from_source(
                 addr,
                 peer_secure_ident_level,
                 &_payload,
-                0u32,
+                our_client_id,
             ).await;
             continue;
         }
@@ -2049,13 +2073,21 @@ async fn download_parts_from_source(
             continue;
         }
         if proto == OP_EDONKEYHEADER && opcode == OP_FILESTATUS {
-            if let Ok((_hash, parts_vec)) = parse_file_status(&_payload) {
+            if let Ok((status_hash, parts_vec)) = parse_file_status(&_payload) {
+                if status_hash != *file_hash {
+                    debug!("Source {} OP_FILESTATUS hash mismatch, ignoring", _src_idx);
+                    continue;
+                }
                 let parts_vec = if parts_vec.is_empty() {
                     debug!("Source {} file status: part_count=0 → peer has complete file ({} parts)", _src_idx, part_count);
                     vec![true; part_count]
                 } else {
                     debug!("Source {} file status: {}/{} parts available", _src_idx, parts_vec.iter().filter(|&&p| p).count(), parts_vec.len());
-                    parts_vec
+                    let mut padded = parts_vec;
+                    if padded.len() < part_count {
+                        padded.resize(part_count, false);
+                    }
+                    padded
                 };
                 peer_file_status = Some(parts_vec);
             }
@@ -2088,7 +2120,11 @@ async fn download_parts_from_source(
                         vec![true; part_count]
                     } else {
                         debug!("Source {} multipacket file status: {}/{} parts available", _src_idx, parts_vec.iter().filter(|&&p| p).count(), parts_vec.len());
-                        parts_vec
+                        let mut padded = parts_vec;
+                        if padded.len() < part_count {
+                            padded.resize(part_count, false);
+                        }
+                        padded
                     };
                     peer_file_status = Some(parts_vec);
                     got_status = true;
@@ -2224,62 +2260,79 @@ async fn download_parts_from_source(
                 )
                 .await?;
             }
-            match read_packet_timeout_ms(&mut *reader)
-                .await
-                .context("stage:hashset_wait")
-            {
-                Ok((proto, opcode, payload))
-                    if proto == OP_EDONKEYHEADER && opcode == OP_HASHSETANSWER =>
+            // Read up to 5 packets waiting for the hashset answer.
+            // The peer may interleave SecIdent or other control packets.
+            for _hs_attempt in 0..5u32 {
+                match read_packet_timeout_ms(&mut *reader)
+                    .await
+                    .context("stage:hashset_wait")
                 {
-                    if let Ok((_h, hashes)) = parse_hashset_answer(&payload) {
-                        debug!("Got hashset with {} part hashes from source {}", hashes.len(), _src_idx);
-                        if super::transfer::verify_hashset(&file_hash, &hashes, file_size) {
-                            let mut ph = shared_part_hashes.write().await;
-                            if ph.is_empty() {
-                                *ph = hashes;
+                    Ok((proto, opcode, payload))
+                        if proto == OP_EDONKEYHEADER && opcode == OP_HASHSETANSWER =>
+                    {
+                        if let Ok((_h, hashes)) = parse_hashset_answer(&payload) {
+                            debug!("Got hashset with {} part hashes from source {}", hashes.len(), _src_idx);
+                            if super::transfer::verify_hashset(&file_hash, &hashes, file_size) {
+                                let mut ph = shared_part_hashes.write().await;
+                                if ph.is_empty() {
+                                    *ph = hashes;
+                                }
+                            } else {
+                                warn!("Hashset from source {} failed verification, discarding", _src_idx);
                             }
-                        } else {
-                            warn!("Hashset from source {} failed verification, discarding", _src_idx);
                         }
+                        break;
                     }
-                }
-                Ok((proto, opcode, payload))
-                    if proto == OP_EMULEPROT && opcode == OP_HASHSETANSWER2 =>
-                {
-                    if let Ok(resp) = parse_hashset_answer2(&payload) {
-                        let local_ident = FileIdentifier {
-                            md4_hash: *file_hash,
-                            file_size: Some(file_size),
-                            aich_hash: None,
-                        };
-                        if local_ident.compare_relaxed(&resp.identifier) {
-                            if let Some(root) = resp.aich_master_hash {
-                                let mut am = shared_aich_master.write().await;
-                                if am.is_none() {
-                                    *am = Some(root);
+                    Ok((proto, opcode, payload))
+                        if proto == OP_EMULEPROT && opcode == OP_HASHSETANSWER2 =>
+                    {
+                        if let Ok(resp) = parse_hashset_answer2(&payload) {
+                            let local_ident = FileIdentifier {
+                                md4_hash: *file_hash,
+                                file_size: Some(file_size),
+                                aich_hash: None,
+                            };
+                            if local_ident.compare_relaxed(&resp.identifier) {
+                                if let Some(root) = resp.aich_master_hash {
+                                    let mut am = shared_aich_master.write().await;
+                                    if am.is_none() {
+                                        *am = Some(root);
+                                    }
+                                    if let Some(part_hashes) = resp.aich_part_hashes.as_ref() {
+                                        debug!(
+                                            "Source {} provided HashSet2 AICH data: master={}, parts={}",
+                                            _src_idx,
+                                            hex::encode(root),
+                                            part_hashes.len()
+                                        );
+                                    }
                                 }
-                                if let Some(part_hashes) = resp.aich_part_hashes.as_ref() {
-                                    debug!(
-                                        "Source {} provided HashSet2 AICH data: master={}, parts={}",
-                                        _src_idx,
-                                        hex::encode(root),
-                                        part_hashes.len()
-                                    );
-                                }
-                            }
-                            if let Some(hashes) = resp.md4_hashes {
-                                if super::transfer::verify_hashset(&file_hash, &hashes, file_size) {
-                                    let mut ph = shared_part_hashes.write().await;
-                                    if ph.is_empty() {
-                                        *ph = hashes;
+                                if let Some(hashes) = resp.md4_hashes {
+                                    if super::transfer::verify_hashset(&file_hash, &hashes, file_size) {
+                                        let mut ph = shared_part_hashes.write().await;
+                                        if ph.is_empty() {
+                                            *ph = hashes;
+                                        }
                                     }
                                 }
                             }
                         }
+                        break;
                     }
-                }
-                _ => {
-                    debug!("No hashset answer from source {} (peer may not support it)", _src_idx);
+                    Ok((proto, opcode, _))
+                        if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ =>
+                    {
+                        early_upload_accept = true;
+                        debug!("Source {} received AcceptUploadReq while waiting for hashset — stopping hashset wait", _src_idx);
+                        break;
+                    }
+                    Ok((proto, opcode, _)) => {
+                        debug!("Source {} waiting for hashset, got proto=0x{proto:02X} op=0x{opcode:02X} — skipping", _src_idx);
+                    }
+                    Err(_) => {
+                        debug!("No hashset answer from source {} (peer may not support it)", _src_idx);
+                        break;
+                    }
                 }
             }
         }
@@ -3042,6 +3095,26 @@ async fn download_parts_from_source(
             t.save();
             ip_guard.unmark(part_idx);
             continue;
+        }
+
+        // Guard against duplicate/overlapping blocks that satisfied the
+        // byte budget without actually closing all gaps in this part.
+        {
+            let t = tracker.read().await;
+            let (ps, pe) = t.part_range(part_idx);
+            let part_has_gaps = t.gap_list().iter().any(|&(gs, ge)| gs < pe && ge > ps);
+            if part_has_gaps {
+                warn!(
+                    "Source {} part {} byte budget met but gaps remain — peer likely sent duplicate blocks, marking for retry",
+                    _src_idx, part_idx
+                );
+                drop(t);
+                let mut t = tracker.write().await;
+                t.set_in_progress(part_idx, false);
+                t.save();
+                ip_guard.unmark(part_idx);
+                continue;
+            }
         }
 
         // Verify part hash before marking complete

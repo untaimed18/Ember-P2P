@@ -649,6 +649,9 @@ impl Ed2kDownload {
         let mut deferred_packet: Option<(u8, u8, Vec<u8>)> = None;
         let mut client_software_label = client_software_from_caps(&initial_caps);
         let mut peer_name_label = initial_caps.peer_name.clone();
+        let our_client_id = self.external_ip
+            .map(|ip| u32::from_le_bytes(ip.octets()))
+            .unwrap_or(0);
 
         let peer_is_new_emule = initial_caps.emule_version_min > 0 || initial_caps.version_major > 0;
         if skip_emule_info || peer_is_new_emule {
@@ -795,7 +798,7 @@ impl Ed2kDownload {
                             self.source_addr,
                             peer_user_hash,
                             peer_secure_ident_level,
-                            0u32,
+                            our_client_id,
                         ).await?;
                     }
                     if pending_secident_challenge.is_none() {
@@ -833,7 +836,7 @@ impl Ed2kDownload {
                             self.source_addr,
                             peer_user_hash,
                             peer_secure_ident_level,
-                            0u32,
+                            our_client_id,
                         ).await?;
                     }
                     debug!("Responded to SecIdent challenge");
@@ -846,7 +849,7 @@ impl Ed2kDownload {
                         self.source_addr,
                         peer_secure_ident_level,
                         &pl,
-                        0u32,
+                        our_client_id,
                     ).await;
                 }
                 (OP_EMULEPROT, OP_EMULEINFOANSWER) | (OP_EMULEPROT, OP_EMULEINFO) => {
@@ -1081,7 +1084,11 @@ impl Ed2kDownload {
                         available_parts = vec![true; part_count.max(1)];
                     } else {
                         debug!("FileStatus: {} parts", parts.len());
-                        available_parts = parts;
+                        let mut padded = parts;
+                        if padded.len() < part_count {
+                            padded.resize(part_count, false);
+                        }
+                        available_parts = padded;
                     }
                     got_status = true;
                 }
@@ -1152,7 +1159,7 @@ impl Ed2kDownload {
                         self.source_addr,
                         peer_user_hash,
                         peer_secure_ident_level,
-                        0u32,
+                        our_client_id,
                     ).await?;
                 }
                 (OP_EMULEPROT, OP_SIGNATURE) if payload.len() >= 2 => {
@@ -1163,7 +1170,7 @@ impl Ed2kDownload {
                         self.source_addr,
                         peer_secure_ident_level,
                         &payload,
-                        0u32,
+                        our_client_id,
                     ).await;
                 }
                 (OP_EMULEPROT, OP_MULTIPACKETANSWER)
@@ -1188,7 +1195,11 @@ impl Ed2kDownload {
                                 available_parts = vec![true; part_count.max(1)];
                             } else {
                                 debug!("FileStatus via MultiPacket: {} parts", parts.len());
-                                available_parts = parts;
+                                let mut padded = parts;
+                                if padded.len() < part_count {
+                                    padded.resize(part_count, false);
+                                }
+                                available_parts = padded;
                             }
                             got_status = true;
                         }
@@ -1279,61 +1290,73 @@ impl Ed2kDownload {
 
         let mut part_hashes: Vec<[u8; 16]> = Vec::new();
         let mut aich_master_hash: Option<[u8; 20]> = None;
-        // Try to read hashset answer (some peers may not support it)
-        match read_packet_with_timeout(&mut reader)
-            .await
-            .context("stage:hashset_wait")
-        {
-            Ok((proto, opcode, payload)) => {
-                if proto == OP_EDONKEYHEADER && opcode == OP_HASHSETANSWER {
-                    match parse_hashset_answer(&payload) {
-                        Ok((_hash, hashes)) => {
-                            if verify_hashset(&self.file_hash, &hashes, self.file_size) {
-                                debug!("Got verified hashset with {} part hashes", hashes.len());
-                                part_hashes = hashes;
-                            } else {
-                                warn!("Hashset verification failed - combined hash doesn't match file hash");
-                            }
-                        }
-                        Err(e) => debug!("Failed to parse hashset answer: {e}"),
-                    }
-                } else if proto == OP_EMULEPROT && opcode == OP_HASHSETANSWER2 {
-                    match parse_hashset_answer2(&payload) {
-                        Ok(resp) => {
-                            let local_ident = FileIdentifier {
-                                md4_hash: self.file_hash,
-                                file_size: Some(self.file_size),
-                                aich_hash: None,
-                            };
-                            if !local_ident.compare_relaxed(&resp.identifier) {
-                                anyhow::bail!("hashsetanswer2 file identifier mismatch");
-                            }
-                            if let (Some(root), Some(part_hashes)) =
-                                (resp.aich_master_hash, resp.aich_part_hashes.as_ref())
-                            {
-                                aich_master_hash = Some(root);
-                                debug!(
-                                    "Got HashSet2 AICH data: master={}, parts={}",
-                                    hex::encode(root),
-                                    part_hashes.len()
-                                );
-                            }
-                            if let Some(hashes) = resp.md4_hashes {
+        // Try to read hashset answer. The peer may send other packets
+        // (SecIdent, EmuleInfo) before the hashset, so read up to 5 packets.
+        for _hs_attempt in 0..5u32 {
+            match read_packet_with_timeout(&mut reader)
+                .await
+                .context("stage:hashset_wait")
+            {
+                Ok((proto, opcode, payload)) => {
+                    if proto == OP_EDONKEYHEADER && opcode == OP_HASHSETANSWER {
+                        match parse_hashset_answer(&payload) {
+                            Ok((_hash, hashes)) => {
                                 if verify_hashset(&self.file_hash, &hashes, self.file_size) {
-                                    debug!("Got verified hashset2 with {} part hashes", hashes.len());
+                                    debug!("Got verified hashset with {} part hashes", hashes.len());
                                     part_hashes = hashes;
                                 } else {
-                                    warn!("Hashset2 verification failed - combined hash doesn't match file hash");
+                                    warn!("Hashset verification failed - combined hash doesn't match file hash");
                                 }
                             }
+                            Err(e) => debug!("Failed to parse hashset answer: {e}"),
                         }
-                        Err(e) => debug!("Failed to parse hashset answer2: {e}"),
+                        break;
+                    } else if proto == OP_EMULEPROT && opcode == OP_HASHSETANSWER2 {
+                        match parse_hashset_answer2(&payload) {
+                            Ok(resp) => {
+                                let local_ident = FileIdentifier {
+                                    md4_hash: self.file_hash,
+                                    file_size: Some(self.file_size),
+                                    aich_hash: None,
+                                };
+                                if !local_ident.compare_relaxed(&resp.identifier) {
+                                    anyhow::bail!("hashsetanswer2 file identifier mismatch");
+                                }
+                                if let (Some(root), Some(part_hashes)) =
+                                    (resp.aich_master_hash, resp.aich_part_hashes.as_ref())
+                                {
+                                    aich_master_hash = Some(root);
+                                    debug!(
+                                        "Got HashSet2 AICH data: master={}, parts={}",
+                                        hex::encode(root),
+                                        part_hashes.len()
+                                    );
+                                }
+                                if let Some(hashes) = resp.md4_hashes {
+                                    if verify_hashset(&self.file_hash, &hashes, self.file_size) {
+                                        debug!("Got verified hashset2 with {} part hashes", hashes.len());
+                                        part_hashes = hashes;
+                                    } else {
+                                        warn!("Hashset2 verification failed - combined hash doesn't match file hash");
+                                    }
+                                }
+                            }
+                            Err(e) => debug!("Failed to parse hashset answer2: {e}"),
+                        }
+                        break;
+                    } else if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
+                        early_upload_accept = true;
+                        debug!("Received AcceptUploadReq while waiting for hashset — stopping hashset wait");
+                        break;
+                    } else {
+                        debug!("Waiting for hashset, got proto=0x{proto:02X} op=0x{opcode:02X} — skipping");
                     }
-                } else {
-                    debug!("Expected hashset answer, got proto=0x{proto:02X} op=0x{opcode:02X}");
+                }
+                Err(e) => {
+                    debug!("No hashset answer (peer may not support it): {e}");
+                    break;
                 }
             }
-            Err(e) => debug!("No hashset answer (peer may not support it): {e}"),
         }
 
         // Request source exchange only when not already sent in multipacket, and throttled
@@ -2044,7 +2067,7 @@ impl Ed2kDownload {
                                 self.source_addr,
                                 peer_user_hash,
                                 peer_secure_ident_level,
-                                0u32,
+                                our_client_id,
                             ).await?;
                         }
                         (OP_EMULEPROT, OP_SIGNATURE) if payload.len() >= 2 => {
@@ -2055,7 +2078,7 @@ impl Ed2kDownload {
                                 self.source_addr,
                                 peer_secure_ident_level,
                                 &payload,
-                                0u32,
+                                our_client_id,
                             ).await;
                         }
                         // eMule OP_FILEDESC: peer sends comment/rating for the file
@@ -2204,6 +2227,21 @@ impl Ed2kDownload {
 
                 if peer_out_of_parts {
                     continue;
+                }
+
+                // Guard against duplicate/overlapping blocks that satisfied the
+                // byte budget without actually closing all gaps in this part.
+                {
+                    let (ps, pe) = tracker.part_range(part_idx);
+                    let part_has_gaps = tracker.gap_list().iter().any(|&(gs, ge)| gs < pe && ge > ps);
+                    if part_has_gaps {
+                        warn!(
+                            "Part {} byte budget met but gaps remain — peer likely sent duplicate blocks, marking for retry",
+                            part_idx
+                        );
+                        tracker.save();
+                        continue;
+                    }
                 }
 
                 // Verify part hash if we have the hashset
@@ -2810,7 +2848,7 @@ pub(crate) async fn maybe_send_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     };
     let peer_ip_u32 = match peer_addr.ip() {
         std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        _ => 0,
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| u32::from_be_bytes(v4.octets())).unwrap_or(0),
     };
     let cm = cm.read().await;
     let Some(state) = cm.secident_request_state(&peer_user_hash, peer_ip_u32, peer_secident_level) else {
@@ -2839,7 +2877,7 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     };
     let peer_ip_u32 = match peer_addr.ip() {
         std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        _ => 0,
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| u32::from_be_bytes(v4.octets())).unwrap_or(0),
     };
     let cm = cm.read().await;
     if state >= 2 {
@@ -2895,7 +2933,7 @@ pub(crate) async fn handle_secident_signature(
     };
     let peer_ip_u32 = match peer_addr.ip() {
         std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        _ => 0,
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| u32::from_be_bytes(v4.octets())).unwrap_or(0),
     };
     let sig_bytes = &payload[1..1 + sig_len];
     let challenge_kind = if payload.len() == 1 + sig_len {

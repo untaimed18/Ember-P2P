@@ -470,6 +470,18 @@ impl Ed2kServerConnection {
         Ok(())
     }
 
+    /// Send a pre-built search expression (AND tree or single keyword) as
+    /// `OP_SEARCHREQUEST`. Multi-word queries MUST use the AND-tree wire
+    /// format for reliable results across all eD2K servers.
+    pub async fn send_search_expr_bytes(&mut self, expr: &[u8]) -> anyhow::Result<()> {
+        info!(
+            "Sending OP_SEARCHREQUEST expression ({} bytes payload)",
+            expr.len(),
+        );
+        self.write_packet(OP_SEARCHREQUEST, expr).await?;
+        Ok(())
+    }
+
     /// Send a boolean search expression tree to the server.
     #[allow(dead_code)]
     pub async fn send_search_expression_async(
@@ -492,7 +504,11 @@ impl Ed2kServerConnection {
         payload.extend_from_slice(file_hash);
         let srv_flags = self.session.as_ref().map(|s| s.server_flags).unwrap_or(0);
         let supports_large = (srv_flags & SRV_TCPFLG_LARGEFILES) != 0;
-        if file_size > 0xFFFF_FFFF && supports_large {
+        if file_size > 0xFFFF_FFFF && !supports_large {
+            debug!("Skipping source query for >4 GiB file — server does not support LARGEFILES");
+            return Ok(());
+        }
+        if file_size > 0xFFFF_FFFF {
             payload.extend_from_slice(&0u32.to_le_bytes());
             payload.extend_from_slice(&file_size.to_le_bytes());
         } else {

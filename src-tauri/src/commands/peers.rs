@@ -59,21 +59,21 @@ pub async fn add_friend(
     };
 
     {
-        let friends = state.friend_hashes.read().await;
-        if friends.len() as u32 >= max_friends {
+        let mut friends = state.friend_hashes.write().await;
+        if friends.len() as u32 >= max_friends && !friends.contains(&hash) {
             return Err(format!("Friend limit reached ({max_friends}). Increase the limit in Settings > Friends."));
         }
+        friends.insert(hash);
     }
 
     let db = state.db.clone();
     let db_hash = canonical.clone();
     let db_nick = nick.clone();
-    tokio::task::spawn_blocking(move || db.add_friend(&db_hash, &db_nick))
-        .await
-        .map_err(|e| format!("Task error: {e}"))?
-        .map_err(|e| format!("Failed to save friend: {e}"))?;
-
-    state.friend_hashes.write().await.insert(hash);
+    let db_result = tokio::task::spawn_blocking(move || db.add_friend(&db_hash, &db_nick)).await;
+    if let Err(e) = db_result.as_ref().map_err(|e| e.to_string()).and_then(|r| r.as_ref().map_err(|e| e.to_string())) {
+        state.friend_hashes.write().await.remove(&hash);
+        return Err(format!("Failed to save friend: {e}"));
+    }
 
     state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
         ember_hash: hash,
@@ -278,15 +278,16 @@ pub async fn accept_friend_request(
     };
 
     {
-        let friends = state.friend_hashes.read().await;
-        if friends.len() as u32 >= max_friends {
+        let mut friends = state.friend_hashes.write().await;
+        if friends.len() as u32 >= max_friends && !friends.contains(&hash) {
             return Err(format!("Friend limit reached ({max_friends}). Increase the limit in Settings > Friends."));
         }
+        friends.insert(hash);
     }
 
     let db = state.db.clone();
     let c2 = canonical.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    let db_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let requests = db.get_friend_requests()?;
         let nick = requests.iter()
             .find(|(h, _, _, _, _)| h == &c2)
@@ -297,11 +298,11 @@ pub async fn accept_friend_request(
         db.remove_friend_request(&c2)?;
         Ok(())
     })
-    .await
-    .map_err(|e| format!("Task error: {e}"))?
-    .map_err(|e| format!("Failed to accept friend request: {e}"))?;
-
-    state.friend_hashes.write().await.insert(hash);
+    .await;
+    if let Err(e) = db_result.as_ref().map_err(|e| e.to_string()).and_then(|r| r.as_ref().map_err(|e| e.to_string())) {
+        state.friend_hashes.write().await.remove(&hash);
+        return Err(format!("Failed to accept friend request: {e}"));
+    }
 
     state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
         ember_hash: hash,
@@ -514,11 +515,11 @@ pub async fn kad_bootstrap_url(
     state: tauri::State<'_, AppState>,
     url: String,
 ) -> Result<(), String> {
-    let (host, resolved_addrs) = crate::security::validate_fetch_url(&url).await?;
+    let (validated_url, host, resolved_addrs) = crate::security::validate_fetch_url(&url).await?;
 
     state
         .network_tx
-        .try_send(NetworkCommand::KadBootstrapUrl { url, host, resolved_addrs })
+        .try_send(NetworkCommand::KadBootstrapUrl { url: validated_url, host, resolved_addrs })
         .map_err(|e| format!("Network busy: {e}"))?;
     Ok(())
 }

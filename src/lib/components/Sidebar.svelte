@@ -28,7 +28,10 @@
 
   function navigate(e: MouseEvent, href: string) {
     e.preventDefault();
-    if ($page.url.pathname === href) return;
+    const current = $page.url.pathname;
+    if (current === href) return;
+    const item = navItems.find(i => i.href === href);
+    if (item?.aliases?.some(a => current === a)) return;
     goto(href).catch(() => {
       window.location.href = href;
     });

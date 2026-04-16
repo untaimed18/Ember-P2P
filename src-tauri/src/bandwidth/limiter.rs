@@ -51,8 +51,8 @@ impl BandwidthLimiter {
             self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
             return;
         }
-        self.drain_tokens(&self.upload_tokens, bytes, max).await;
-        self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
+        let undrained = self.drain_tokens(&self.upload_tokens, bytes, max).await;
+        self.total_uploaded.fetch_add(bytes - undrained, Ordering::Relaxed);
     }
 
     /// Acquire download bandwidth. Drains tokens in chunks if the piece is larger
@@ -63,20 +63,21 @@ impl BandwidthLimiter {
             self.total_downloaded.fetch_add(bytes, Ordering::Relaxed);
             return;
         }
-        self.drain_tokens(&self.download_tokens, bytes, max).await;
-        self.total_downloaded.fetch_add(bytes, Ordering::Relaxed);
+        let undrained = self.drain_tokens(&self.download_tokens, bytes, max).await;
+        self.total_downloaded.fetch_add(bytes - undrained, Ordering::Relaxed);
     }
 
     /// Core token drain: takes as many tokens as available per iteration,
     /// waiting on a `Notify` signal when the bucket is empty instead of
     /// busy-polling. The refill task notifies after adding tokens.
-    async fn drain_tokens(&self, tokens: &AtomicU64, mut remaining: u64, _max: u64) {
+    /// Returns the number of bytes that could NOT be drained (0 on full success).
+    async fn drain_tokens(&self, tokens: &AtomicU64, mut remaining: u64, _max: u64) -> u64 {
         let mut attempts = 0u32;
         while remaining > 0 {
             attempts += 1;
             if attempts > 6000 {
                 tracing::warn!("drain_tokens: exceeded max attempts, releasing");
-                return;
+                return remaining;
             }
             let current = tokens.load(Ordering::Acquire);
             if current == 0 {
@@ -101,6 +102,7 @@ impl BandwidthLimiter {
                 }
             }
         }
+        0
     }
 
     /// Add a fraction of the rate limit worth of tokens (called at sub-second intervals).

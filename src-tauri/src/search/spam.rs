@@ -165,7 +165,6 @@ impl SpamFilter {
         }
         match serde_json::to_string_pretty(&self.db) {
             Ok(data) => {
-                self.dirty = false;
                 Some((data, self.data_path.clone()))
             }
             Err(e) => {
@@ -173,6 +172,10 @@ impl SpamFilter {
                 None
             }
         }
+    }
+
+    pub fn clear_dirty(&mut self) {
+        self.dirty = false;
     }
 
     pub fn stats(&self) -> SpamStats {

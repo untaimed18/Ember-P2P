@@ -452,6 +452,7 @@ pub const TAGTYPE_BSOB: u8 = 0x0A;
 pub const TAGTYPE_UINT64: u8 = 0x0B;
 pub const TAGTYPE_STR1: u8 = 0x11;
 pub const TAGTYPE_STR16: u8 = 0x20;
+pub const TAGTYPE_STR22: u8 = 0x26;
 
 // Well-known tag name IDs
 pub const TAG_FILENAME: u8 = 0x01;
@@ -583,7 +584,7 @@ impl KadTag {
                 reader.read_exact(&mut buf)?;
                 TagValue::Blob(buf)
             }
-            t if (TAGTYPE_STR1..=TAGTYPE_STR16).contains(&t) => {
+            t if (TAGTYPE_STR1..=TAGTYPE_STR22).contains(&t) => {
                 let len = (t - TAGTYPE_STR1 + 1) as usize;
                 let mut buf = vec![0u8; len];
                 reader.read_exact(&mut buf)?;

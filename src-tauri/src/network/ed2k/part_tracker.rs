@@ -500,6 +500,19 @@ impl PartTracker {
             return Ok(());
         }
 
+        // If all tags parsed but zero gap tags were found, the .part.met is
+        // either for a genuinely complete file or is missing gap data.  Since
+        // .part.met files only exist for incomplete downloads, treat this as
+        // fully incomplete to be safe — the final hash will verify completeness.
+        if gap_starts.is_empty() && self.file_size > 0 {
+            tracing::warn!(
+                "part.met has {} tags but no gap entries — assuming file is incomplete",
+                tag_count,
+            );
+            self.gaps = vec![(0, self.file_size)];
+            return Ok(());
+        }
+
         // Build byte-level gap list from paired start/end tags
         self.gaps = Vec::new();
         for (&idx, &start) in &gap_starts {
