@@ -40,7 +40,7 @@
   let unlistenError: UnlistenFn | null = null;
 
   async function setupListener() {
-    const gen = ++listenerGen;
+    const gen = listenerGen;
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenError) { unlistenError(); unlistenError = null; }
     const fn = await listen<{ user_hash: string; files: BrowseFileEntry[] }>('ember:browse-result', (event) => {

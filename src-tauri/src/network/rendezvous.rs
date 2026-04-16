@@ -72,7 +72,12 @@ pub async fn lookup(base_url: &str, friend_hash: &[u8; 16]) -> Result<Option<(Ip
         .await
         .map_err(|e| format!("rendezvous lookup bad body: {e}"))?;
     let ip_str = body["ip"].as_str().unwrap_or_default();
-    let port = body["port"].as_u64().unwrap_or_default() as u16;
+    let raw_port = body["port"].as_u64().unwrap_or_default();
+    if raw_port == 0 || raw_port > u16::MAX as u64 {
+        warn!("Rendezvous: lookup for {}… returned invalid port: {}", &id[..8], raw_port);
+        return Ok(None);
+    }
+    let port = raw_port as u16;
     if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
         if port > 0 {
             info!("Rendezvous: found {}… at {}:{}", &id[..8], ip, port);

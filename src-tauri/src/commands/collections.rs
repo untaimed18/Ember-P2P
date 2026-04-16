@@ -41,7 +41,7 @@ pub async fn load_collection(
     }
 
     tokio::task::spawn_blocking(move || {
-        Collection::load(&p).map_err(|e| format!("Failed to load collection: {e}"))
+        Collection::load(&canonical).map_err(|e| format!("Failed to load collection: {e}"))
     })
     .await
     .map_err(|e| format!("Load task failed: {e}"))?
@@ -49,6 +49,7 @@ pub async fn load_collection(
 
 #[tauri::command]
 pub async fn create_collection(
+    state: tauri::State<'_, AppState>,
     name: String,
     author: String,
     files: Vec<CollectionFile>,
@@ -62,9 +63,7 @@ pub async fn create_collection(
     };
     let path = std::path::PathBuf::from(&output_path);
 
-    // Canonicalize and validate the path to prevent traversal attacks
     let canonical = path.canonicalize().or_else(|_| {
-        // File doesn't exist yet; canonicalize the parent directory instead
         if let Some(parent) = path.parent() {
             parent.canonicalize().map(|p| p.join(path.file_name().unwrap_or_default()))
         } else {
@@ -76,21 +75,21 @@ pub async fn create_collection(
         return Err("Output path must not contain '..' components".into());
     }
 
-    let blocked_segments: &[&str] = &[
-        "windows", "system32", "syswow64",
-        "program files", "program files (x86)",
-        "programdata", ".ssh", ".gnupg",
-        "etc", "usr", "bin", "sbin", "var", "root",
-        "tmp", "temp", "proc", "sys", "dev",
-    ];
-    for component in canonical.components() {
-        if let std::path::Component::Normal(seg) = component {
-            let seg_lower = seg.to_string_lossy().to_lowercase();
-            if blocked_segments.contains(&seg_lower.as_str()) {
-                return Err(format!("Cannot write to system directory: {output_path}"));
-            }
-        }
+    let config = state.config.read().await;
+    let mut allowed_dirs: Vec<String> = config.settings.shared_folders.clone();
+    if !config.settings.download_folder.is_empty() {
+        allowed_dirs.push(std::path::PathBuf::from(&config.settings.download_folder)
+            .to_string_lossy().into_owned());
     }
+    drop(config);
+
+    if allowed_dirs.is_empty() {
+        return Err("No shared or download folders configured".into());
+    }
+    if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
+        return Err("Output path must be inside a shared or download folder".into());
+    }
+
     let ext = canonical.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase());
     if !matches!(ext.as_deref(), Some("emulecollection") | Some("txt")) {
         return Err("Output file must have .emulecollection or .txt extension".into());
@@ -184,6 +183,7 @@ pub async fn download_collection_files(
         let (active_now, persisted_transfer) = {
             let mut mgr = state.transfer_manager.write().await;
             if mgr.has_pending_for_hash(&file.hash) {
+                skipped_count += 1;
                 continue;
             }
             let active_now = mgr.enqueue(transfer.clone());

@@ -65,15 +65,6 @@
                 <line x1="10" y1="6.5" x2="14.5" y2="11.5"/>
                 <line x1="6.5" y1="14" x2="13.5" y2="14"/>
               </svg>
-            {:else if item.id === 'servers'}
-              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="3" y="2" width="14" height="5" rx="1"/>
-                <rect x="3" y="9" width="14" height="5" rx="1"/>
-                <circle cx="6" cy="4.5" r="0.75" fill="currentColor" stroke="none"/>
-                <circle cx="6" cy="11.5" r="0.75" fill="currentColor" stroke="none"/>
-                <line x1="10" y1="16" x2="10" y2="18"/>
-                <line x1="7" y1="18" x2="13" y2="18"/>
-              </svg>
             {:else if item.id === 'search'}
               <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                 <circle cx="8.5" cy="8.5" r="5.5"/>
