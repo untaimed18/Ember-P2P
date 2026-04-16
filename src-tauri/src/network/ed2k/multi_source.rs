@@ -309,9 +309,9 @@ impl MultiSourceDownload {
                 };
                 let resuming = completed_bytes > 0 || existing_len > 0;
                 if resuming {
-                    if completed_bytes == 0 && existing_len > 0 {
+                    if completed_bytes == 0 && existing_len > 0 && existing_len != fs {
                         warn!(
-                            "Preserving non-empty .part ({existing_len} bytes) for {tid} while resume metadata shows no completed bytes — \
+                            "Preserving non-empty .part ({existing_len} bytes, expected {fs}) for {tid} while resume metadata shows no completed bytes — \
                              .part.met may be missing or corrupt"
                         );
                     }
