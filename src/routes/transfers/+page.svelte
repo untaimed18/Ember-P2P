@@ -605,8 +605,9 @@
         return connected ? 'Searching' : 'Waiting';
       }
       case 'queued':
-        if (t.health === 'degraded') return t.queue_rank != null && t.queue_rank > 0 ? `Queued (QR: ${t.queue_rank})` : 'Queued';
-        return t.queue_rank != null && t.queue_rank > 0 ? `Queued (QR: ${t.queue_rank})` : 'Waiting';
+        if (t.sources === 0) return 'Searching';
+        if (t.queue_rank != null && t.queue_rank > 0) return `Queued (QR: ${t.queue_rank})`;
+        return 'Queued';
       case 'paused': return 'Paused';
       case 'stopped': return 'Stopped';
       case 'verifying': return 'Verifying';
@@ -1291,6 +1292,7 @@
         return t.health_reason ? `${base}. ${t.health_reason}` : base;
       }
       case 'queued':
+        if (t.sources === 0) return 'No sources found yet, searching the network';
         return t.health_reason
           ? `Waiting in a remote client's upload queue. ${t.health_reason}`
           : 'Waiting in a remote client\'s upload queue';

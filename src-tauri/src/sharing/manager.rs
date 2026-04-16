@@ -178,6 +178,12 @@ impl TransferManager {
                 }
             }
             TransferStatus::Queued => {
+                if transfer.sources == 0 {
+                    return (
+                        TransferHealth::Degraded,
+                        Some("No sources available".to_string()),
+                    );
+                }
                 let age_secs = now.saturating_sub(transfer.started_at);
                 if age_secs >= QUEUED_DEGRADED_SECS {
                     return (
@@ -235,7 +241,9 @@ impl TransferManager {
     fn queued_wait_status(transfer: &Transfer) -> TransferStatus {
         if transfer.direction == TransferDirection::Upload {
             TransferStatus::Active
-        } else if transfer.peer_id.is_empty() {
+        } else if transfer.sources == 0 && transfer.queued_sources == 0 {
+            TransferStatus::Searching
+        } else if transfer.peer_id.is_empty() && transfer.sources == 0 {
             TransferStatus::Searching
         } else {
             TransferStatus::Queued
@@ -263,10 +271,10 @@ impl TransferManager {
             return;
         }
         if transfer.status == TransferStatus::Active {
-            transfer.status = Self::queued_wait_status(transfer);
+            transfer.status = TransferStatus::Searching;
             return;
         }
-        if transfer.peer_id.is_empty() && transfer.status == TransferStatus::Queued {
+        if transfer.status == TransferStatus::Queued {
             transfer.status = TransferStatus::Searching;
         }
     }
