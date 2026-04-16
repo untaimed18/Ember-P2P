@@ -3323,7 +3323,8 @@ pub async fn start_network(
                 }
 
                 if let DownloadEvent::EmberPeerDiscovered { ip, tcp_port } = event {
-                    if !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() {
+                    if !ip.is_private() && !ip.is_loopback() && !ip.is_link_local()
+                        && !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast() {
                         if state.known_ember_peers.insert((ip, tcp_port)) {
                             state.stats.ember_peers = state.known_ember_peers.len() as u32;
                             state.ember_payload_dirty = true;
@@ -3841,7 +3842,8 @@ pub async fn start_network(
                 }
 
                 if let UploadEventKind::EmberPeerDiscovered { ip, tcp_port } = event.kind {
-                    if !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() {
+                    if !ip.is_private() && !ip.is_loopback() && !ip.is_link_local()
+                        && !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast() {
                         if state.known_ember_peers.insert((ip, tcp_port)) {
                             state.stats.ember_peers = state.known_ember_peers.len() as u32;
                             state.ember_payload_dirty = true;
@@ -9291,7 +9293,8 @@ pub async fn start_network(
                         if peers.len() >= ember::MAX_EPX_PEERS {
                             break;
                         }
-                        if !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() {
+                        if !ip.is_private() && !ip.is_loopback() && !ip.is_link_local()
+                            && !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast() {
                             peers.push(ember::EmberPeer { ip, tcp_port: port });
                         }
                     }
@@ -10417,7 +10420,7 @@ async fn handle_udp_packet(
                 debug!("Received UDP Port Test from {from}");
                 let maybe_tx = {
                     let waiters = active_port_tests.lock().await;
-                    waiters.get(&from.ip()).cloned()
+                    waiters.get(&std::net::IpAddr::V4(from_ipv4)).cloned()
                 };
                 if let Some(tx) = maybe_tx {
                     let _ = tx.send(()).await;
@@ -13545,7 +13548,8 @@ async fn handle_command(
                         }));
                         let _ = tx.send(Ok(()));
                     }
-                    Err(_) => { let _ = tx.send(Err("Connection channel full".into())); }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => { let _ = tx.send(Err("Connection channel full".into())); }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => { let _ = tx.send(Err("Connection to friend closed".into())); }
                 }
             } else {
                 drop(sessions);
@@ -13712,7 +13716,8 @@ async fn handle_command(
                     packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
                     match sender.try_send(packet) {
                         Ok(()) => { let _ = tx.send(Ok(())); }
-                        Err(_) => { let _ = tx.send(Err("Connection channel full".into())); }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => { let _ = tx.send(Err("Connection channel full".into())); }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => { let _ = tx.send(Err("Connection to friend closed".into())); }
                     }
                 } else {
                     drop(sessions);

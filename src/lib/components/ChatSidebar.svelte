@@ -44,7 +44,7 @@
   });
 
   async function setupListener() {
-    const gen = ++listenerGen;
+    const gen = listenerGen;
     if (unlisten) { unlisten(); unlisten = null; }
     const fn = await listen<{ user_hash: string; message: string; direction: string; timestamp: number }>('ember:chat-message', (event) => {
       if (event.payload.user_hash === friendHash) {

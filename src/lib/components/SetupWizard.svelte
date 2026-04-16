@@ -69,9 +69,13 @@
   }
 
   async function pickFolder() {
-    const selected = await open({ directory: true, multiple: false, title: 'Choose download folder' });
-    if (selected && typeof selected === 'string') {
-      downloadFolder = selected;
+    try {
+      const selected = await open({ directory: true, multiple: false, title: 'Choose download folder' });
+      if (selected && typeof selected === 'string') {
+        downloadFolder = selected;
+      }
+    } catch {
+      // User cancelled the dialog or plugin error — no action needed.
     }
   }
 

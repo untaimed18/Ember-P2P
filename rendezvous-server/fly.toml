@@ -10,6 +10,7 @@ primary_region = 'iad'
 
 [env]
   RUST_LOG = 'ember_rendezvous=info'
+  TRUST_PROXY = 'true'
 
 [http_service]
   internal_port = 8080

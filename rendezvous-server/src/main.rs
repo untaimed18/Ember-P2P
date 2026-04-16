@@ -24,6 +24,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_REQUESTS_PER_MINUTE: u64 = 60;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_STORE_ENTRIES: usize = 100_000;
+const MAX_RATE_ENTRIES: usize = 200_000;
 
 const PUNCH_TTL: Duration = Duration::from_secs(30);
 const MAX_PUNCH_PER_MINUTE: u64 = 10;
@@ -117,21 +118,15 @@ fn extract_client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
                 }
             }
         }
-        if let Some(val) = headers.get("x-forwarded-for") {
-            if let Ok(s) = val.to_str() {
-                if let Some(first) = s.split(',').next() {
-                    if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                        return ip;
-                    }
-                }
-            }
-        }
     }
     addr.ip()
 }
 
 async fn check_rate_limit(state: &AppState, ip: IpAddr) -> bool {
     let mut limits = state.rate_limits.write().await;
+    if limits.len() >= MAX_RATE_ENTRIES && !limits.contains_key(&ip) {
+        return false;
+    }
     let now = Instant::now();
     let entry = limits.entry(ip).or_insert(RateEntry {
         count: 0,
@@ -175,7 +170,8 @@ async fn register(
         .filter(|ip| match ip {
             IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_unspecified()
                 && !v4.is_private() && !v4.is_link_local(),
-            IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+            IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified()
+                && !v6.is_multicast(),
         })
         .unwrap_or(client_ip);
 
@@ -187,14 +183,13 @@ async fn register(
     };
 
     let mut store = state.store.write().await;
-    if store.len() >= MAX_STORE_ENTRIES {
-        return StatusCode::SERVICE_UNAVAILABLE;
-    }
     let key = body.id.to_lowercase();
     if let Some(existing) = store.get(&key) {
         if existing.conn_ip != client_ip && existing.expires_at > Instant::now() {
             return StatusCode::FORBIDDEN;
         }
+    } else if store.len() >= MAX_STORE_ENTRIES {
+        return StatusCode::SERVICE_UNAVAILABLE;
     }
     store.insert(key, entry);
     info!("registered {} ip={} (conn={})", &body.id[..8], presence_ip, client_ip);
@@ -673,12 +668,10 @@ async fn sweep_expired(state: AppState) {
     loop {
         tokio::time::sleep(SWEEP_INTERVAL).await;
         let now = Instant::now();
-        let mut store = state.store.write().await;
-        let before = store.len();
-        store.retain(|_, entry| entry.expires_at > now);
-        let removed = before - store.len();
-        if removed > 0 {
-            info!("swept {} expired entries, {} remain", removed, store.len());
+
+        {
+            let mut limits = state.rate_limits.write().await;
+            limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
         }
 
         let mut limits = state.rate_limits.write().await;

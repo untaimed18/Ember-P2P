@@ -21,21 +21,22 @@ export async function initFriendsStore() {
     registered.push(
       await listen<{ user_hash: string }>('ember:friend-online', (event) => {
         const hash = event.payload.user_hash;
-        onlineFriends.update((s) => { s.add(hash); return new Set(s); });
-        searchingFriends.update((s) => { s.delete(hash); return new Set(s); });
+        onlineFriends.update((s) => new Set([...s, hash]));
+        searchingFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
       }),
     );
     registered.push(
       await listen<{ user_hash: string }>('ember:friend-offline', (event) => {
-        onlineFriends.update((s) => { s.delete(event.payload.user_hash); return new Set(s); });
+        onlineFriends.update((s) => { const next = new Set(s); next.delete(event.payload.user_hash); return next; });
       }),
     );
     registered.push(
       await listen<{ user_hash: string; direction: string }>('ember:chat-message', (event) => {
         if (event.payload.direction === 'received') {
           unreadCounts.update((m) => {
-            m.set(event.payload.user_hash, (m.get(event.payload.user_hash) || 0) + 1);
-            return new Map(m);
+            const next = new Map(m);
+            next.set(event.payload.user_hash, (next.get(event.payload.user_hash) || 0) + 1);
+            return next;
           });
         }
       }),
@@ -49,7 +50,7 @@ export async function initFriendsStore() {
     );
     registered.push(
       await listen<{ user_hash: string }>('ember:friend-confirmed', (event) => {
-        searchingFriends.update((s) => { s.delete(event.payload.user_hash); return new Set(s); });
+        searchingFriends.update((s) => { const next = new Set(s); next.delete(event.payload.user_hash); return next; });
       }),
     );
     registered.push(
@@ -59,12 +60,12 @@ export async function initFriendsStore() {
     );
     registered.push(
       await listen<{ user_hash: string }>('ember:friend-searching', (event) => {
-        searchingFriends.update((s) => { s.add(event.payload.user_hash); return new Set(s); });
+        searchingFriends.update((s) => new Set([...s, event.payload.user_hash]));
       }),
     );
     registered.push(
       await listen<{ user_hash: string; reason?: string }>('ember:friend-search-failed', (event) => {
-        searchingFriends.update((s) => { s.delete(event.payload.user_hash); return new Set(s); });
+        searchingFriends.update((s) => { const next = new Set(s); next.delete(event.payload.user_hash); return next; });
       }),
     );
   } catch (e) {
@@ -87,7 +88,7 @@ export async function initFriendsStore() {
 }
 
 export function clearUnread(friendHash: string) {
-  unreadCounts.update((m) => { m.delete(friendHash); return new Map(m); });
+  unreadCounts.update((m) => { const next = new Map(m); next.delete(friendHash); return next; });
 }
 
 export function cleanupFriendsStore() {

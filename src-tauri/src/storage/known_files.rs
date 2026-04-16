@@ -82,6 +82,10 @@ impl KnownFileList {
         }
         let count = cursor.read_u32::<LittleEndian>()? as usize;
 
+        if count > 50_000 {
+            warn!("known.met declares {} records, capping parse at 50000", count);
+        }
+
         let mut consecutive_failures = 0u32;
         for _ in 0..count.min(50_000) {
             match Self::read_record(&mut cursor, version) {

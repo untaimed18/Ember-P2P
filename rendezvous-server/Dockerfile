@@ -5,8 +5,10 @@ COPY src ./src
 RUN cargo build --release
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r ember && useradd -r -g ember ember
 COPY --from=builder /app/target/release/ember-rendezvous /usr/local/bin/
 EXPOSE 8080
 ENV PORT=8080
+USER ember
 CMD ["ember-rendezvous"]

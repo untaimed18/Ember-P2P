@@ -94,10 +94,12 @@ pub async fn remove_server(
         return Err("Server IP is required".into());
     }
 
+    let resolved_ip = resolve_server_host(&ip, port).await?;
+
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
-        .try_send(NetworkCommand::RemoveServer { ip: ip.clone(), port, tx })
+        .try_send(NetworkCommand::RemoveServer { ip: resolved_ip, port, tx })
         .map_err(|e| format!("Network busy: {e}"))?;
 
     rx.await.map_err(|_| "Failed to remove server".to_string())?

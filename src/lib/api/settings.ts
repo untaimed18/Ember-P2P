@@ -14,5 +14,5 @@ export async function downloadNodesDat(): Promise<string> {
 }
 
 export async function downloadIpfilter(): Promise<string> {
-  return invoke('download_and_load_ipfilter');
+  return invoke('download_ipfilter');
 }
