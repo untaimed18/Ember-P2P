@@ -716,7 +716,6 @@ pub struct SearchFilters {
 pub enum NetworkCommand {
     SearchFiles {
         query: String,
-        #[allow(dead_code)]
         method: SearchMethod,
         request_id: u64,
         tx: oneshot::Sender<Vec<SearchResult>>,
@@ -11237,7 +11236,7 @@ async fn handle_command(
     ul_event_tx: &mpsc::Sender<upload_server::UploadEvent>,
 ) {
     match cmd {
-        NetworkCommand::SearchFiles { query, method: _, request_id, tx, search_filters } => {
+        NetworkCommand::SearchFiles { query, method, request_id, tx, search_filters } => {
             if let Some(active) = state.active_search_request.take() {
                 if active.request_id != request_id {
                     cancel_search_request(state, app_handle, active.request_id);
@@ -11274,7 +11273,11 @@ async fn handle_command(
             let search_expr = kad::messages::build_search_expression(&keywords, kad_file_type.as_deref());
 
             // --- TCP server search ---
-            if state.server_connected {
+            let run_server = matches!(method, SearchMethod::Global | SearchMethod::Server);
+            let run_udp    = matches!(method, SearchMethod::Global);
+            let run_kad    = matches!(method, SearchMethod::Global | SearchMethod::Kad);
+
+            if run_server && state.server_connected {
                 if let Some(mut conn) = state.server_connection.take() {
                     match conn.send_search_expr_bytes(&search_expr).await {
                         Ok(()) => {
@@ -11296,20 +11299,25 @@ async fn handle_command(
             }
 
             // --- UDP global search ---
-            let servers = state.server_list.servers();
-            for server in servers {
-                if let Some(pkt) = ServerUdpSocket::build_global_search_packet(server, &search_expr) {
-                    state.udp_search_queue.push_back(pkt);
+            if run_udp {
+                let servers = state.server_list.servers();
+                for server in servers {
+                    if let Some(pkt) = ServerUdpSocket::build_global_search_packet(server, &search_expr) {
+                        state.udp_search_queue.push_back(pkt);
+                    }
                 }
-            }
-            if !state.udp_search_queue.is_empty() {
-                active_request.udp_pending = true;
-                state.server_udp_search_age = 0;
-                info!("UDP global search queued for {} servers", state.udp_search_queue.len());
+                if !state.udp_search_queue.is_empty() {
+                    active_request.udp_pending = true;
+                    state.server_udp_search_age = 0;
+                    info!("UDP global search queued for {} servers", state.udp_search_queue.len());
+                }
             }
 
             // --- KAD search ---
             let kad_started = 'kad: {
+                if !run_kad {
+                    break 'kad false;
+                }
                 let Some(primary_keyword) = keywords.iter().max_by_key(|k| k.len()) else {
                     break 'kad false;
                 };
