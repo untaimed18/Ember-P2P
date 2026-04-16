@@ -649,6 +649,9 @@ impl Ed2kDownload {
         let mut deferred_packet: Option<(u8, u8, Vec<u8>)> = None;
         let mut client_software_label = client_software_from_caps(&initial_caps);
         let mut peer_name_label = initial_caps.peer_name.clone();
+        let our_client_id = self.external_ip
+            .map(|ip| u32::from_le_bytes(ip.octets()))
+            .unwrap_or(0);
 
         let peer_is_new_emule = initial_caps.emule_version_min > 0 || initial_caps.version_major > 0;
         if skip_emule_info || peer_is_new_emule {
@@ -795,7 +798,7 @@ impl Ed2kDownload {
                             self.source_addr,
                             peer_user_hash,
                             peer_secure_ident_level,
-                            0u32,
+                            our_client_id,
                         ).await?;
                     }
                     if pending_secident_challenge.is_none() {
@@ -833,7 +836,7 @@ impl Ed2kDownload {
                             self.source_addr,
                             peer_user_hash,
                             peer_secure_ident_level,
-                            0u32,
+                            our_client_id,
                         ).await?;
                     }
                     debug!("Responded to SecIdent challenge");
@@ -846,7 +849,7 @@ impl Ed2kDownload {
                         self.source_addr,
                         peer_secure_ident_level,
                         &pl,
-                        0u32,
+                        our_client_id,
                     ).await;
                 }
                 (OP_EMULEPROT, OP_EMULEINFOANSWER) | (OP_EMULEPROT, OP_EMULEINFO) => {
@@ -1156,7 +1159,7 @@ impl Ed2kDownload {
                         self.source_addr,
                         peer_user_hash,
                         peer_secure_ident_level,
-                        0u32,
+                        our_client_id,
                     ).await?;
                 }
                 (OP_EMULEPROT, OP_SIGNATURE) if payload.len() >= 2 => {
@@ -1167,7 +1170,7 @@ impl Ed2kDownload {
                         self.source_addr,
                         peer_secure_ident_level,
                         &payload,
-                        0u32,
+                        our_client_id,
                     ).await;
                 }
                 (OP_EMULEPROT, OP_MULTIPACKETANSWER)
@@ -2064,7 +2067,7 @@ impl Ed2kDownload {
                                 self.source_addr,
                                 peer_user_hash,
                                 peer_secure_ident_level,
-                                0u32,
+                                our_client_id,
                             ).await?;
                         }
                         (OP_EMULEPROT, OP_SIGNATURE) if payload.len() >= 2 => {
@@ -2075,7 +2078,7 @@ impl Ed2kDownload {
                                 self.source_addr,
                                 peer_secure_ident_level,
                                 &payload,
-                                0u32,
+                                our_client_id,
                             ).await;
                         }
                         // eMule OP_FILEDESC: peer sends comment/rating for the file
