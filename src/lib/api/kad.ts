@@ -1,9 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { NetworkStats, PeerInfo, KadContact, KadSearchEntry } from '$lib/types';
-
-export async function getPeers(): Promise<PeerInfo[]> {
-  return invoke('get_peers');
-}
+import type { NetworkStats, KadContact, KadSearchEntry } from '$lib/types';
 
 export async function getNetworkStats(): Promise<NetworkStats> {
   return invoke('get_network_stats');
@@ -13,28 +9,12 @@ export async function banPeer(peerId: string): Promise<void> {
   return invoke('ban_peer', { peerId });
 }
 
-export async function unbanPeer(peerId: string): Promise<void> {
-  return invoke('unban_peer', { peerId });
-}
-
 export async function kadConnect(): Promise<void> {
   return invoke('kad_connect');
 }
 
 export async function kadDisconnect(): Promise<void> {
   return invoke('kad_disconnect');
-}
-
-export async function kadBootstrapIp(ip: string, port: number): Promise<void> {
-  return invoke('kad_bootstrap_ip', { ip, port });
-}
-
-export async function kadBootstrapUrl(url: string): Promise<void> {
-  return invoke('kad_bootstrap_url', { url });
-}
-
-export async function kadBootstrapClients(): Promise<void> {
-  return invoke('kad_bootstrap_clients');
 }
 
 export async function kadRecheckFirewall(): Promise<void> {
