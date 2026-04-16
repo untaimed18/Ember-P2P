@@ -32,7 +32,7 @@
     const current = $page.url.pathname;
     if (current === href) return;
     const item = navItems.find(i => i.href === href);
-    if (item?.aliases?.some(a => current === a)) return;
+    if ((item as any)?.aliases?.some((a: string) => current === a)) return;
     goto(href).catch(() => {
       window.location.href = href;
     });

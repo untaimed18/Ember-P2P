@@ -32,6 +32,8 @@ const MAX_GLOBAL_RELAY_SESSIONS: usize = 200;
 const RELAY_BANDWIDTH_CAP_BYTES: usize = 256 * 1024;
 const RELAY_SESSION_TIMEOUT: Duration = Duration::from_secs(120);
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_RELAY_INVITES_PER_TARGET: usize = 8;
+const RELAY_INVITE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct PresenceEntry {
@@ -66,12 +68,19 @@ struct RelaySessionEntry {
 }
 
 #[derive(Clone)]
+struct RelayInvite {
+    session_id: String,
+    created_at: Instant,
+}
+
+#[derive(Clone)]
 struct AppState {
     store: Arc<RwLock<HashMap<String, PresenceEntry>>>,
     rate_limits: Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
     punch_requests: Arc<RwLock<HashMap<String, PunchEntry>>>,
     relay_sessions: Arc<RwLock<HashMap<String, RelaySessionEntry>>>,
     relay_ip_counts: Arc<RwLock<HashMap<IpAddr, usize>>>,
+    relay_invites: Arc<RwLock<HashMap<String, Vec<RelayInvite>>>>,
     started_at: Instant,
 }
 
@@ -358,6 +367,92 @@ async fn punch_poll(
 }
 
 // ---------------------------------------------------------------------------
+// Relay invitations (server-relay signaling)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct RelayInviteRequest {
+    target_id: String,
+    session_id: String,
+}
+
+#[derive(Serialize)]
+struct RelayInviteResponse {
+    session_id: String,
+}
+
+async fn relay_invite_post(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<RelayInviteRequest>,
+) -> StatusCode {
+    if !validate_hex_id(&body.target_id) || body.session_id.is_empty() || body.session_id.len() > 128 {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+
+    let target = body.target_id.to_lowercase();
+    let mut invites = state.relay_invites.write().await;
+    let list = invites.entry(target.clone()).or_default();
+
+    let now = Instant::now();
+    list.retain(|i| now.duration_since(i.created_at) < RELAY_INVITE_TTL);
+
+    if list.len() >= MAX_RELAY_INVITES_PER_TARGET {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+
+    list.push(RelayInvite {
+        session_id: body.session_id.clone(),
+        created_at: now,
+    });
+    info!("relay invite stored for {} session={} from {}", &target[..8], &body.session_id[..8.min(body.session_id.len())], client_ip);
+    StatusCode::OK
+}
+
+async fn relay_invite_poll(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<RelayInviteResponse>>, StatusCode> {
+    if !validate_hex_id(&id) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    let key = id.to_lowercase();
+    let mut invites = state.relay_invites.write().await;
+
+    match invites.remove(&key) {
+        Some(list) => {
+            let now = Instant::now();
+            let results: Vec<RelayInviteResponse> = list
+                .into_iter()
+                .filter(|i| now.duration_since(i.created_at) < RELAY_INVITE_TTL)
+                .map(|i| RelayInviteResponse { session_id: i.session_id })
+                .collect();
+            if results.is_empty() {
+                Err(StatusCode::NOT_FOUND)
+            } else {
+                info!("relay invite poll: {} invites for {} from {}", results.len(), &key[..8], client_ip);
+                Ok(Json(results))
+            }
+        }
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket relay
 // ---------------------------------------------------------------------------
 
@@ -598,6 +693,15 @@ async fn sweep_expired(state: AppState) {
             info!("swept {} expired punch requests", punch_removed);
         }
 
+        // Sweep expired relay invites
+        {
+            let mut invites = state.relay_invites.write().await;
+            invites.retain(|_, v| {
+                v.retain(|i| now.duration_since(i.created_at) < RELAY_INVITE_TTL);
+                !v.is_empty()
+            });
+        }
+
         // Sweep stale relay sessions (created but never bridged)
         let mut relays = state.relay_sessions.write().await;
         let relay_before = relays.len();
@@ -624,6 +728,7 @@ async fn main() {
         punch_requests: Arc::new(RwLock::new(HashMap::new())),
         relay_sessions: Arc::new(RwLock::new(HashMap::new())),
         relay_ip_counts: Arc::new(RwLock::new(HashMap::new())),
+        relay_invites: Arc::new(RwLock::new(HashMap::new())),
         started_at: Instant::now(),
     };
 
@@ -636,6 +741,8 @@ async fn main() {
         .route("/punch", post(punch_register))
         .route("/punch/{id}", get(punch_poll))
         .route("/relay/{session_id}", get(relay_ws))
+        .route("/relay-invite", post(relay_invite_post))
+        .route("/relay-invites/{id}", get(relay_invite_poll))
         .route("/health", get(health))
         .route("/stats", get(stats_handler))
         .with_state(state);
