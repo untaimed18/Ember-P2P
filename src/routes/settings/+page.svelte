@@ -393,6 +393,28 @@
             <ToggleSwitch bind:checked={settings.skip_compress_video} />
           </div>
 
+          <div class="divider"></div>
+
+          <div class="field">
+            <label for="queue-wait">Queue Wait Timeout (seconds)</label>
+            <input id="queue-wait" type="number" min="60" max="7200" bind:value={settings.download_queue_wait_secs} />
+            <span class="hint">How long to wait in a remote upload queue before giving up (default 1800).</span>
+          </div>
+          <div class="field-row">
+            <div class="field half">
+              <label for="ms-retry">Multi-Source Retries</label>
+              <input id="ms-retry" type="number" min="1" max="20" bind:value={settings.multisource_retry_rounds} />
+              <span class="hint">Extra retry rounds after initial source tasks.</span>
+            </div>
+            <div class="field half">
+              <label for="part-retry">Part Retry Rounds</label>
+              <input id="part-retry" type="number" min="1" max="20" bind:value={settings.download_part_retry_rounds} />
+              <span class="hint">Hash failure retries per part during transfer.</span>
+            </div>
+          </div>
+
+          <div class="divider"></div>
+
           <div class="field">
             <span class="toggle-title">Download History</span>
             <span class="field-hint">
@@ -583,6 +605,46 @@
             <ToggleSwitch bind:checked={settings.auto_connect_kad} />
           </div>
 
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Auto-Connect Server <span class="restart-badge">Restart</span></span>
+              <span class="hint">Automatically connect to an eD2K server on startup.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.auto_connect_server} />
+          </div>
+
+          <div class="field">
+            <label for="max-connections">Max TCP Connections</label>
+            <input id="max-connections" type="number" min="50" max="2000" bind:value={settings.max_connections} />
+            <span class="hint">Maximum simultaneous TCP connections (default 500).</span>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Filter Servers by IP</span>
+              <span class="hint">Apply IP filter to eD2K servers.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.filter_servers_by_ip} />
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Update Server List from Server</span>
+              <span class="hint">Accept new servers from a connected server's server list.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.add_servers_from_server} />
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Update Server List from Clients</span>
+              <span class="hint">Accept new servers discovered from eD2K clients.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.add_servers_from_clients} />
+          </div>
+
           <div class="divider"></div>
 
           <div class="field">
@@ -700,6 +762,30 @@
             <label for="max-friends">Maximum Friends</label>
             <input id="max-friends" type="number" min="1" max="500" bind:value={settings.max_friends} />
             <span class="hint">Limit the total number of friends you can add (1–500, default 200).</span>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Require Friend Approval</span>
+              <span class="hint">Require manual approval before granting friend-slot priority to new requests.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.friend_require_approval} />
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Friend Online Notifications</span>
+              <span class="hint">Show a notification when a friend comes online.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.friend_online_notifications} />
+          </div>
+
+          <div class="field">
+            <label for="rendezvous-url">Rendezvous Server URL</label>
+            <input id="rendezvous-url" bind:value={settings.rendezvous_url} placeholder="https://ember-rendezvous.fly.dev" />
+            <span class="hint">Ember rendezvous server for friend discovery and relay coordination.</span>
           </div>
         </div>
       </section>

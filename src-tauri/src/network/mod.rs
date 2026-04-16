@@ -881,7 +881,6 @@ pub enum NetworkCommand {
         tx: oneshot::Sender<Option<ed2k::comments::FileCommentInfo>>,
     },
     MergeServerMet {
-        #[allow(dead_code)]
         data: Vec<u8>,
         tx: oneshot::Sender<anyhow::Result<ed2k::server_list::ServerMergeStats>>,
     },
@@ -2128,7 +2127,10 @@ pub async fn start_network(
         first_publish_done: false,
         kad_initial_source_burst_done: false,
         friend_presence_initial_done: false,
-        server_list: ServerList::hardcoded(),
+        server_list: {
+            let met_path = data_dir.join("server.met");
+            ServerList::load_server_met(&met_path).unwrap_or_else(|_| ServerList::hardcoded())
+        },
         server_connected: false,
         server_connection: None,
         server_addr: None,
@@ -13225,8 +13227,17 @@ async fn handle_command(
             let _ = tx.send(info);
         }
 
-        NetworkCommand::MergeServerMet { data: _, tx } => {
-            let _ = tx.send(Ok(ed2k::server_list::ServerMergeStats::default()));
+        NetworkCommand::MergeServerMet { data, tx } => {
+            let result = state.server_list.merge_from_bytes_filtered(
+                &data,
+                settings.filter_servers_by_ip,
+                Some(&mut state.ip_filter),
+            );
+            if result.is_ok() {
+                let met_path = state.data_dir.join("server.met");
+                let _ = state.server_list.save_server_met(&met_path);
+            }
+            let _ = tx.send(result);
         }
 
         NetworkCommand::PreviewFile { transfer_id, tx } => {
