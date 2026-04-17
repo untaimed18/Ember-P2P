@@ -1017,6 +1017,12 @@
         if (typeof parsed.showDuplicatesOnly === 'boolean') {
           showDuplicatesOnly = parsed.showDuplicatesOnly;
         }
+        if (typeof parsed.topPanelOpen === 'boolean') {
+          topPanelOpen = parsed.topPanelOpen;
+        }
+        if (parsed.topPanelMetric === 'bytes' || parsed.topPanelMetric === 'requests') {
+          topPanelMetric = parsed.topPanelMetric;
+        }
       }
     } catch {
       try { localStorage.removeItem(FILTERS_KEY); } catch {}
@@ -1032,6 +1038,8 @@
         sortField,
         sortAsc,
         showDuplicatesOnly,
+        topPanelOpen,
+        topPanelMetric,
       }));
     } catch {}
   }
@@ -1040,6 +1048,7 @@
     if (!filtersRestored) return;
     // Track dependencies explicitly so this effect re-runs when any filter/sort changes.
     void typeFilter; void filterFolder; void searchQuery; void sortField; void sortAsc; void showDuplicatesOnly;
+    void topPanelOpen; void topPanelMetric;
     persistFilters();
   });
 
