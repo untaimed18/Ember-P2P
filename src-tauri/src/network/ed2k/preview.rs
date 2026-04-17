@@ -27,12 +27,25 @@ pub fn is_previewable_extension(ext: &str) -> bool {
 }
 
 /// Check if a partially downloaded file is ready for preview.
-/// Requires: first part downloaded, minimum size, previewable file type.
+///
+/// Requires:
+/// - Previewable file type (audio/video extension).
+/// - Minimum downloaded size.
+/// - All **parts** covering the preview window (the first ED2K part) have
+///   been MD4-verified against the known hashset. This prevents a malicious
+///   source from feeding arbitrary bytes to the user's media player: a part
+///   only reaches `verified_complete_parts[idx] == true` after its MD4 hash
+///   matched `part_hashes[idx]`.
+/// - `verified_complete_parts` must reflect tracker state AFTER any AICH
+///   recovery / `mark_incomplete` has been applied, and `part_hashes` must be
+///   the hashset bound to `file_hash`.
 pub fn can_preview(
     file_name: &str,
     file_size: u64,
-    filled_ranges: &[FilledRange],
     completed_bytes: u64,
+    has_part_hashes: bool,
+    verified_complete_parts: &[bool],
+    part_size: u64,
 ) -> bool {
     let ext = Path::new(file_name)
         .extension()
@@ -47,13 +60,20 @@ pub fn can_preview(
         return false;
     }
 
-    if filled_ranges.is_empty() {
+    // Without a verified hashset we cannot know whether the bytes on disk
+    // match what the publisher intended. Refuse to launch.
+    if !has_part_hashes || verified_complete_parts.is_empty() || part_size == 0 {
         return false;
     }
 
+    // Require every part covering [0, preview_end) to be verified.
     let first_256k = 256 * 1024u64;
-    let check_end = first_256k.min(file_size);
-    filled_ranges.iter().any(|r| r.start == 0 && r.end >= check_end)
+    let preview_end = first_256k.min(file_size);
+    let required_parts = preview_end.div_ceil(part_size) as usize;
+    if required_parts == 0 || required_parts > verified_complete_parts.len() {
+        return false;
+    }
+    verified_complete_parts[..required_parts].iter().all(|&ok| ok)
 }
 
 /// Create a temporary preview file by copying filled ranges.

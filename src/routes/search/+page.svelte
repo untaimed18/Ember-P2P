@@ -743,50 +743,47 @@
     closeContextMenu();
     let timeoutSec = searchTimeoutSecs;
     const searchPromise = searchFiles(q, method, requestId, searchFileType || undefined, searchFilterSnapshot);
-    clearSearchTimeoutForRequest(requestId);
-    searchTimeouts.set(
-      requestId,
-      setTimeout(async () => {
-        searchTimeouts.delete(requestId);
-        try { await cancelSearch(requestId); } catch { /* best effort */ }
-        patchSearchTabByRequestId(requestId, (tab) => {
-          if (!tab.isSearching) return tab;
-          return {
-            ...tab,
-            isSearching: false,
-            progress: null,
-            error: `Search timed out after ${timeoutSec} seconds. Try a more specific query or increase Search timeout in Settings.`,
-          };
-        });
-      }, timeoutSec * 1000),
-    );
-    try {
-      const s = await getSettings();
-      if (s.search_timeout_secs !== timeoutSec) {
-        timeoutSec = s.search_timeout_secs;
-        searchTimeoutSecs = timeoutSec;
-        clearSearchTimeoutForRequest(requestId);
-        searchTimeouts.set(
-          requestId,
-          setTimeout(async () => {
-            searchTimeouts.delete(requestId);
-            try { await cancelSearch(requestId); } catch { /* best effort */ }
-            patchSearchTabByRequestId(requestId, (tab) => {
-              if (!tab.isSearching) return tab;
-              return {
-                ...tab,
-                isSearching: false,
-                progress: null,
-                error: `Search timed out after ${timeoutSec} seconds. Try a more specific query or increase Search timeout in Settings.`,
-              };
-            });
-          }, timeoutSec * 1000),
-        );
-      }
-      spamProfile = s.spam_filter_profile ?? 'balanced';
-    } catch {
-      /* use cached timeout already set */
-    }
+
+    // Arm the watchdog once and expose a re-arm helper. getSettings() runs in
+    // parallel with the search so a slow settings fetch can never block (and
+    // therefore never race against) the search result path. If the search
+    // settles first the watchdog is cleared by the success/error branch below
+    // and the settings promise becomes a no-op.
+    const armTimeout = (secs: number) => {
+      clearSearchTimeoutForRequest(requestId);
+      searchTimeouts.set(
+        requestId,
+        setTimeout(async () => {
+          searchTimeouts.delete(requestId);
+          try { await cancelSearch(requestId); } catch { /* best effort */ }
+          patchSearchTabByRequestId(requestId, (tab) => {
+            if (!tab.isSearching) return tab;
+            return {
+              ...tab,
+              isSearching: false,
+              progress: null,
+              error: `Search timed out after ${secs} seconds. Try a more specific query or increase Search timeout in Settings.`,
+            };
+          });
+        }, secs * 1000),
+      );
+    };
+    armTimeout(timeoutSec);
+
+    getSettings()
+      .then((s) => {
+        if (!searchTimeouts.has(requestId)) return; // search already finished
+        if (s.search_timeout_secs !== timeoutSec) {
+          timeoutSec = s.search_timeout_secs;
+          searchTimeoutSecs = timeoutSec;
+          armTimeout(timeoutSec);
+        }
+        spamProfile = s.spam_filter_profile ?? 'balanced';
+      })
+      .catch(() => {
+        /* use cached timeout already set */
+      });
+
     try {
       const results = await searchPromise;
       // Search succeeded — cancel the watchdog so it doesn't fire later and

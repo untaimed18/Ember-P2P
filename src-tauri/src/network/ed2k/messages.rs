@@ -541,6 +541,10 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
             Err(_) => break,
         };
         if pos + 3 + name_len > payload.len() { break; }
+        // Tag names in eMule are single-byte identifiers; cap defensively
+        // to avoid amplifying a malicious payload into megabytes of allocations.
+        const MAX_TAG_NAME_LEN: usize = 256;
+        if name_len > MAX_TAG_NAME_LEN { break; }
         let mut name_buf = vec![0u8; name_len];
         if cursor.read_exact(&mut name_buf).is_err() { break; }
         let name_id = if name_len == 1 { name_buf[0] } else { 0 };
@@ -670,6 +674,19 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
             (real_type, nid)
         } else {
             let name_len = cursor.read_u16::<LittleEndian>().unwrap_or(0) as usize;
+            // Hard cap the tag-name length before allocating. A hostile peer
+            // can otherwise force ~64 KiB allocation per tag × up to 256 tags
+            // per hello (tens of MiB transient) just to amplify DoS.
+            const MAX_TAG_NAME_LEN: usize = 256;
+            if name_len > MAX_TAG_NAME_LEN {
+                break;
+            }
+            // Also verify the name bytes fit in the remaining payload; only
+            // allocate after both checks pass.
+            let pos = cursor.position() as usize;
+            if name_len > payload.len().saturating_sub(pos) {
+                break;
+            }
             let nid = if name_len == 1 {
                 cursor.read_u8().unwrap_or(0)
             } else {
@@ -1578,6 +1595,17 @@ pub fn parse_multipacket_answer(payload: &[u8], opcode: u8) -> io::Result<MultiP
                     break;
                 }
                 let part_count = cursor.read_u16::<LittleEndian>()? as usize;
+                // Same cap as the standalone parse_file_status path; a malicious
+                // peer can otherwise force a 65 535-entry Vec<bool> + O(n) inner
+                // loop per multipacket. 10 000 parts * PARTSIZE = ~95 GiB, which
+                // already exceeds realistic shared files.
+                const MAX_FILE_STATUS_PARTS: usize = 10_000;
+                if part_count > MAX_FILE_STATUS_PARTS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("multipacket file status claims {part_count} parts, exceeds maximum {MAX_FILE_STATUS_PARTS}"),
+                    ));
+                }
                 let bitmap_bytes = (part_count + 7) / 8;
                 if cursor.position() as usize + bitmap_bytes > payload.len() {
                     break;

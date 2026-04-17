@@ -2,7 +2,7 @@
   import type { FileInfo } from '$lib/types';
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { formatSize } from '$lib/utils';
-  import { onMount, untrack } from 'svelte';
+  import { onMount, onDestroy, untrack } from 'svelte';
 
   type SortField =
     | 'name'
@@ -410,10 +410,23 @@
   // --- Lifecycle ---
   onMount(() => {
     loadColumnState();
-    return () => {
-      if (scrollRaf) cancelAnimationFrame(scrollRaf);
-      resizeCleanup?.();
-    };
+  });
+
+  // Always run resize teardown on destroy, even if the user unmounts the
+  // component mid-drag. Restore document cursor / user-select so the rest of
+  // the app doesn't get stuck in col-resize mode after navigation.
+  onDestroy(() => {
+    if (scrollRaf) cancelAnimationFrame(scrollRaf);
+    if (resizeCleanup) {
+      try { resizeCleanup(); } catch { /* ignore */ }
+      resizeCleanup = null;
+      activeResize = null;
+    }
+    // Defensive: if cleanup missed (it shouldn't), explicitly reset body style.
+    if (typeof document !== 'undefined') {
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    }
   });
 </script>
 

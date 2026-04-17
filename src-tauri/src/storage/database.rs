@@ -26,7 +26,8 @@ impl Database {
             "PRAGMA journal_mode=WAL;\
              PRAGMA foreign_keys=ON;\
              PRAGMA secure_delete=ON;\
-             PRAGMA auto_vacuum=INCREMENTAL;",
+             PRAGMA auto_vacuum=INCREMENTAL;\
+             PRAGMA busy_timeout=5000;",
         )?;
 
         let db = Self {
@@ -103,7 +104,7 @@ impl Database {
                 CREATE INDEX IF NOT EXISTS idx_transfers_status ON transfers(status);
                 ",
             )?;
-            Self::add_column_if_missing(&tx, "shared_files", "aich_hash", "TEXT NOT NULL DEFAULT ''");
+            Self::add_column_if_missing(&tx, "shared_files", "aich_hash", "TEXT NOT NULL DEFAULT ''")?;
             set_version(&tx, 1)?;
             tx.commit()?;
         }
@@ -142,15 +143,15 @@ impl Database {
 
         if version < 4 {
             let tx = conn.unchecked_transaction()?;
-            Self::add_column_if_missing(&tx, "shared_files", "shared", "INTEGER NOT NULL DEFAULT 1");
+            Self::add_column_if_missing(&tx, "shared_files", "shared", "INTEGER NOT NULL DEFAULT 1")?;
             set_version(&tx, 4)?;
             tx.commit()?;
         }
 
         if version < 5 {
             let tx = conn.unchecked_transaction()?;
-            Self::add_column_if_missing(&tx, "transfers", "priority", "TEXT NOT NULL DEFAULT 'normal'");
-            Self::add_column_if_missing(&tx, "transfers", "category", "TEXT NOT NULL DEFAULT ''");
+            Self::add_column_if_missing(&tx, "transfers", "priority", "TEXT NOT NULL DEFAULT 'normal'")?;
+            Self::add_column_if_missing(&tx, "transfers", "category", "TEXT NOT NULL DEFAULT ''")?;
             set_version(&tx, 5)?;
             tx.commit()?;
         }
@@ -211,9 +212,9 @@ impl Database {
 
         if version < 9 {
             let tx = conn.unchecked_transaction()?;
-            Self::add_column_if_missing(&tx, "friends", "last_ip", "TEXT DEFAULT ''");
-            Self::add_column_if_missing(&tx, "friends", "last_port", "INTEGER DEFAULT 0");
-            Self::add_column_if_missing(&tx, "friends", "last_seen", "INTEGER DEFAULT 0");
+            Self::add_column_if_missing(&tx, "friends", "last_ip", "TEXT DEFAULT ''")?;
+            Self::add_column_if_missing(&tx, "friends", "last_port", "INTEGER DEFAULT 0")?;
+            Self::add_column_if_missing(&tx, "friends", "last_seen", "INTEGER DEFAULT 0")?;
             tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS chat_messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -231,7 +232,7 @@ impl Database {
 
         if version < 10 {
             let tx = conn.unchecked_transaction()?;
-            Self::add_column_if_missing(&tx, "friends", "mutual", "INTEGER NOT NULL DEFAULT 0");
+            Self::add_column_if_missing(&tx, "friends", "mutual", "INTEGER NOT NULL DEFAULT 0")?;
             tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS friend_requests (
                     sender_hash TEXT PRIMARY KEY,
@@ -245,8 +246,8 @@ impl Database {
 
         if version < 11 {
             let tx = conn.unchecked_transaction()?;
-            Self::add_column_if_missing(&tx, "friend_requests", "sender_ip", "TEXT DEFAULT ''");
-            Self::add_column_if_missing(&tx, "friend_requests", "sender_port", "INTEGER DEFAULT 0");
+            Self::add_column_if_missing(&tx, "friend_requests", "sender_ip", "TEXT DEFAULT ''")?;
+            Self::add_column_if_missing(&tx, "friend_requests", "sender_port", "INTEGER DEFAULT 0")?;
             set_version(&tx, 11)?;
             tx.commit()?;
         }
@@ -279,25 +280,30 @@ impl Database {
         Ok(())
     }
 
-    fn add_column_if_missing(conn: &Connection, table: &str, column: &str, col_type: &str) {
+    fn add_column_if_missing(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        col_type: &str,
+    ) -> anyhow::Result<()> {
         let valid_ident =
             |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
         let valid_col_type =
             |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '\'');
         if !valid_ident(table) || !valid_ident(column) || !valid_col_type(col_type) {
-            tracing::warn!("Rejecting invalid SQL identifier in migration: {table}.{column} {col_type}");
-            return;
+            anyhow::bail!("Invalid SQL identifier in migration: {table}.{column} {col_type}");
         }
         let has_column = conn
             .prepare(&format!("SELECT {column} FROM {table} LIMIT 0"))
             .is_ok();
         if !has_column {
             let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {col_type}");
-            match conn.execute(&sql, []) {
-                Ok(_) => info!("Added column {table}.{column}"),
-                Err(e) => tracing::warn!("Failed to add column {table}.{column}: {e}"),
-            }
+            conn.execute(&sql, []).map_err(|e| {
+                anyhow::anyhow!("Failed to add column {table}.{column}: {e}")
+            })?;
+            info!("Added column {table}.{column}");
         }
+        Ok(())
     }
 
     pub fn save_peer(&self, peer: &PeerInfo) -> anyhow::Result<()> {
