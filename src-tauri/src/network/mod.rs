@@ -1139,6 +1139,14 @@ struct NetworkState {
     /// source publish (vs keyword/notes).
     publish_pending: HashMap<(KadId, SocketAddr), (KadId, i64, bool)>,
     publish_confirmed: u32,
+    /// Diagnostic counters for `PublishRes` packet accounting. These let
+    /// the `Publish cycle:` log line surface exactly where packets are
+    /// being dropped. `wire` counts every inbound UDP packet whose raw
+    /// header byte + opcode byte look like PublishRes (0xE4 0x4B),
+    /// measured before rate-limit / validate_response / decode.
+    publish_res_wire: u64,
+    publish_res_received: u64,
+    publish_res_unmatched: u64,
     /// Per-file count of KAD peers that acknowledged the most recent source
     /// publish cycle with a `PublishRes`. Used as a crude "complete sources"
     /// estimate for files the user is purely sharing (where SourceManager
@@ -2255,6 +2263,9 @@ pub async fn start_network(
         peer_nicknames: HashMap::new(),
         publish_pending: HashMap::new(),
         publish_confirmed: 0,
+        publish_res_wire: 0,
+        publish_res_received: 0,
+        publish_res_unmatched: 0,
         source_publish_acks: HashMap::new(),
         store_keyword_searches: HashMap::new(),
         store_source_searches: HashMap::new(),
@@ -5740,9 +5751,13 @@ pub async fn start_network(
                 let needing_keyword = state.publish_manager.files_needing_keyword_publish().len();
                 info!(
                     "Publish cycle: {total_files} files registered, {needing_source} need source publish, \
-                     {needing_keyword} need keyword publish, {} confirmed, {} outstanding pending ack, firewalled={}, routing_table={}",
+                     {needing_keyword} need keyword publish, {} confirmed, {} outstanding pending ack, \
+                     PublishRes wire={} received={} unmatched={}, firewalled={}, routing_table={}",
                     state.publish_confirmed,
                     state.publish_pending.len(),
+                    state.publish_res_wire,
+                    state.publish_res_received,
+                    state.publish_res_unmatched,
                     state.publish_manager.firewalled,
                     state.routing_table.len(),
                 );
@@ -10857,6 +10872,13 @@ async fn handle_udp_packet(
         _ => from,
     };
 
+    // (PublishRes `wire` counter was moved below `decode_packet` so it
+    // catches obfuscated replies too. Raw-byte sniffing at data[0..2]
+    // is blind to obfuscated packets — the first byte is ciphertext,
+    // not 0xE4 — so we'd undercount every peer that responds
+    // obfuscated, giving the false impression "no PublishRes arrives"
+    // when in reality they arrive encrypted.)
+
     // Security: IP filter and ban check
     if let std::net::IpAddr::V4(ipv4) = from.ip() {
         if state.ip_filter.is_blocked_readonly(ipv4) {
@@ -10970,12 +10992,27 @@ async fn handle_udp_packet(
         KadMessage::FirewalledRes { .. } => Some(0x58),
         _ => None,
     };
+    // PublishRes `wire` counter, after successful decode (so it counts
+    // both plain and obfuscated replies). If this climbs while
+    // `received` stays at 0, the drop is in `validate_response` (see
+    // the `unmatched` counter below — which also tracks
+    // validate_response drops for 0x4B).
+    if matches!(&msg, KadMessage::PublishRes { .. }) {
+        state.publish_res_wire = state.publish_res_wire.saturating_add(1);
+    }
     if let Some(opcode) = response_opcode {
         if !state.flood_protection.validate_response(from, opcode) {
             if opcode == 0x3B {
                 warn!("Dropping unsolicited SearchRes from {from} (no matching outgoing SearchKeyReq)");
             } else if opcode == 0x5A {
                 warn!("Dropping unsolicited FindBuddyRes from {from} (no matching tracked FindBuddyReq)");
+            } else if opcode == 0x4B {
+                // Track PublishRes rejections separately so the Publish
+                // cycle log can tell us whether the ack counter is being
+                // starved by validate_response drops (upstream of the
+                // handler) vs. handler-level match misses.
+                state.publish_res_unmatched = state.publish_res_unmatched.saturating_add(1);
+                debug!("Dropping unsolicited PublishRes from {from} (no matching tracked publish request)");
             } else {
                 debug!("Dropping unsolicited response 0x{:02X} from {from}", opcode);
             }
@@ -11639,6 +11676,14 @@ async fn handle_udp_packet(
         }
 
         KadMessage::PublishRes { target, load } => {
+            // Diagnostic: count every PublishRes that reaches the
+            // handler. If this stays at 0 while Publish cycles show
+            // `N outstanding pending ack`, the packets are being
+            // dropped upstream (rate-limit / validate_response /
+            // obfuscation-decrypt). If this climbs but `matched`
+            // stays flat, the handler is running but the pending
+            // map's target key doesn't match the wire target.
+            state.publish_res_received = state.publish_res_received.saturating_add(1);
             // Match on `(target, peer_addr)` first (exact path). If that
             // misses, fall back to `(target, any-entry-with-same-IP)` —
             // peers behind carrier-grade NAT sometimes reply from a
@@ -11674,6 +11719,7 @@ async fn handle_udp_packet(
                     key, state.publish_confirmed
                 );
             } else {
+                state.publish_res_unmatched = state.publish_res_unmatched.saturating_add(1);
                 debug!(
                     "PublishRes from {from} for {target} matched no pending entry (load={load})"
                 );
