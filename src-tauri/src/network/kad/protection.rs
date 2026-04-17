@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
@@ -38,7 +38,15 @@ pub struct FloodProtection {
     ip_counters: HashMap<IpAddr, (u32, Instant)>,
     /// Per-(IP, opcode) tracking within OPCODE_WINDOW_SECS
     opcode_counters: HashMap<(IpAddr, u8), (u32, Instant)>,
-    outgoing_requests: HashSet<(SocketAddr, u8)>,
+    /// Count of *outstanding* outgoing requests per (peer_addr, opcode).
+    /// Previously a `HashSet`, which meant that if we sent e.g. five
+    /// PublishSourceReqs to the same peer in a burst (common during a
+    /// publish cycle that picks the same top-K closest peers for
+    /// multiple files), only the first ack validated — every
+    /// subsequent ack was rejected as "unsolicited" because the set
+    /// entry was already consumed. With a counter we decrement per ack,
+    /// so N requests can be matched by N acks in any order.
+    outgoing_requests: HashMap<(SocketAddr, u8), u32>,
     request_times: HashMap<(SocketAddr, u8), Instant>,
     outgoing_counters: HashMap<IpAddr, (u32, Instant)>,
     recent_ips: HashMap<IpAddr, Instant>,
@@ -54,7 +62,7 @@ impl FloodProtection {
         FloodProtection {
             ip_counters: HashMap::new(),
             opcode_counters: HashMap::new(),
-            outgoing_requests: HashSet::new(),
+            outgoing_requests: HashMap::new(),
             request_times: HashMap::new(),
             outgoing_counters: HashMap::new(),
             recent_ips: HashMap::new(),
@@ -191,12 +199,32 @@ impl FloodProtection {
     }
 
     /// Record an outgoing request so we can validate incoming responses.
+    /// Counter-based: sending N requests to the same (addr, opcode) leaves
+    /// N entries to be matched by N replies. Any ordering is acceptable.
     pub fn track_request(&mut self, addr: SocketAddr, opcode: u8) {
         let now = Instant::now();
         let key = (addr, opcode);
-        self.outgoing_requests.insert(key);
+        let count = self.outgoing_requests.entry(key).or_insert(0);
+        *count = count.saturating_add(1);
         self.request_times.insert(key, now);
         self.recent_ips.insert(addr.ip(), now);
+    }
+
+    /// Helper: decrement the counter for `key` and return whether an
+    /// entry was consumed. The entry is removed entirely (along with
+    /// `request_times`) when the count reaches zero.
+    fn consume_outgoing(&mut self, key: &(SocketAddr, u8)) -> bool {
+        if let Some(count) = self.outgoing_requests.get_mut(key) {
+            if *count > 0 {
+                *count -= 1;
+                if *count == 0 {
+                    self.outgoing_requests.remove(key);
+                    self.request_times.remove(key);
+                }
+                return true;
+            }
+        }
+        false
     }
 
     /// Check if we have a matching outgoing request for this response.
@@ -219,45 +247,32 @@ impl FloodProtection {
         if let Some(req_op) = request_opcode {
             if response_opcode == 0x3B {
                 // KAD peers send multiple SearchRes packets per SearchKeyReq
-                // (one per batch of results). Do NOT remove the tracking entry
-                // on first response; keep it alive for subsequent batches.
-                let key = (addr, req_op);
-                if self.outgoing_requests.contains(&key) {
-                    return true;
-                }
-                let key2 = (addr, 0x34);
-                if self.outgoing_requests.contains(&key2) {
-                    return true;
-                }
-                let key3 = (addr, 0x35);
-                if self.outgoing_requests.contains(&key3) {
+                // (one per batch of results). Do NOT decrement on any single
+                // response; just check presence so subsequent batches still
+                // validate. The entry will expire via the 30s cleanup.
+                if self.outgoing_requests.contains_key(&(addr, req_op))
+                    || self.outgoing_requests.contains_key(&(addr, 0x34))
+                    || self.outgoing_requests.contains_key(&(addr, 0x35))
+                {
                     return true;
                 }
                 return false;
             }
-            let key = (addr, req_op);
-            if self.outgoing_requests.remove(&key) {
-                self.request_times.remove(&key);
+            if self.consume_outgoing(&(addr, req_op)) {
                 return true;
             }
             // For PublishRes, also check PublishSourceReq and PublishNotesReq
             if response_opcode == 0x4B {
-                let key2 = (addr, 0x44);
-                if self.outgoing_requests.remove(&key2) {
-                    self.request_times.remove(&key2);
+                if self.consume_outgoing(&(addr, 0x44)) {
                     return true;
                 }
-                let key3 = (addr, 0x45);
-                if self.outgoing_requests.remove(&key3) {
-                    self.request_times.remove(&key3);
+                if self.consume_outgoing(&(addr, 0x45)) {
                     return true;
                 }
             }
             // For FirewalledRes, also check Firewalled2Req (0x53)
             if response_opcode == 0x58 {
-                let key2 = (addr, 0x53);
-                if self.outgoing_requests.remove(&key2) {
-                    self.request_times.remove(&key2);
+                if self.consume_outgoing(&(addr, 0x53)) {
                     return true;
                 }
             }
@@ -349,5 +364,35 @@ mod kad_protection_tests {
             assert!(!fp.over_compressed_budget(ip));
         }
         assert!(fp.over_compressed_budget(ip), "11th compressed packet must trip the budget");
+    }
+
+    /// outgoing_requests is multiset: sending N requests to the same
+    /// (addr, opcode) pair must validate N replies in any order, not
+    /// just the first. This was the root cause of `publish_confirmed`
+    /// being stuck at 0 — the old `HashSet` collapsed duplicates so only
+    /// the first ack per peer ever validated.
+    #[test]
+    fn outgoing_requests_multiset_counts_each_ack() {
+        let mut fp = FloodProtection::new();
+        let addr: SocketAddr = "203.0.113.9:4672".parse().unwrap();
+        // Track five PublishSourceReq sends to the same peer.
+        for _ in 0..5 {
+            fp.track_request(addr, 0x44);
+        }
+        // Each incoming PublishRes should validate against one of
+        // those entries until all are consumed.
+        for i in 0..5 {
+            assert!(
+                fp.validate_response(addr, 0x4B),
+                "PublishRes #{} must match a tracked request",
+                i + 1
+            );
+        }
+        // The sixth PublishRes has no backing request and must be
+        // rejected as unsolicited.
+        assert!(
+            !fp.validate_response(addr, 0x4B),
+            "6th PublishRes must be rejected once all 5 tracked requests are consumed"
+        );
     }
 }
