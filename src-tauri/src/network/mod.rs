@@ -1123,8 +1123,17 @@ struct NetworkState {
     firewalled: bool,
     firewall_checks_sent: u32,
     peer_nicknames: HashMap<KadId, String>,
-    /// target -> (file_hash, sent_at, is_source_publish)
-    publish_pending: HashMap<KadId, (KadId, i64, bool)>,
+    /// Outstanding publish requests awaiting `PublishRes` acks.
+    ///
+    /// Keyed by `(target_hash, peer_addr)` so each publish-to-peer
+    /// pair is tracked individually — this lets the ack counter count
+    /// *every* successful delivery instead of collapsing to one per
+    /// target (fixes the long-standing 0-confirmed publish cycle bug
+    /// where many peers acked but we silently dropped all but the first).
+    /// Value carries the original file hash (for retry book-keeping),
+    /// the send timestamp (for stale cleanup), and whether this is a
+    /// source publish (vs keyword/notes).
+    publish_pending: HashMap<(KadId, SocketAddr), (KadId, i64, bool)>,
     publish_confirmed: u32,
     /// Per-file count of KAD peers that acknowledged the most recent source
     /// publish cycle with a `PublishRes`. Used as a crude "complete sources"
@@ -4313,6 +4322,28 @@ pub async fn start_network(
                         let _ = send_kad_packet(
                             &udp_socket, &packet, *addr, &state, contact_id,
                         ).await;
+                        // Track publish requests for ack matching. poll_queries
+                        // can return KadReq (routing lookup) or Publish* (store
+                        // phase); only the latter expect a PublishRes so only
+                        // those need an entry. Insert at send-time (not at
+                        // search completion) — peers ack within milliseconds
+                        // and we used to miss every single lookup-phase ack.
+                        let (publish_target, is_source) = match msg {
+                            KadMessage::PublishSourceReq { target, .. } => (Some(*target), true),
+                            KadMessage::PublishKeyReq { target, .. } => (Some(*target), false),
+                            KadMessage::PublishNotesReq { target, .. } => (Some(*target), false),
+                            _ => (None, false),
+                        };
+                        if let Some(target) = publish_target {
+                            let file_hash = state
+                                .store_source_searches
+                                .get(sid)
+                                .map(|(fh, _)| *fh)
+                                .unwrap_or(target);
+                            state
+                                .publish_pending
+                                .insert((target, *addr), (file_hash, chrono::Utc::now().timestamp(), is_source));
+                        }
                     }
                 }
 
@@ -4325,14 +4356,28 @@ pub async fn start_network(
                         if let Some(search) = state.search_manager.get_mut(&sid) {
                             let candidates = search.next_publish_candidates();
                             if !candidates.is_empty() {
-                                if let Some((_, ref msg)) = state.store_source_searches.get(&sid) {
-                                    let msg = msg.clone();
+                                if let Some((file_hash, ref msg)) = state.store_source_searches.get(&sid).cloned() {
                                     let opcode = kad_request_opcode(&msg).unwrap_or(0);
+                                    // Snapshot publish target for ack tracking
+                                    // before the send loop (can't borrow msg
+                                    // across the loop otherwise).
+                                    let publish_target = match &msg {
+                                        KadMessage::PublishSourceReq { target, .. } => Some(*target),
+                                        KadMessage::PublishKeyReq { target, .. } => Some(*target),
+                                        KadMessage::PublishNotesReq { target, .. } => Some(*target),
+                                        _ => None,
+                                    };
                                     for contact in &candidates {
                                         let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                                         if let Ok(packet) = messages::encode_packet(&msg) {
                                             state.flood_protection.track_request(addr, opcode);
                                             let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
+                                            if let Some(target) = publish_target {
+                                                state.publish_pending.insert(
+                                                    (target, addr),
+                                                    (file_hash, chrono::Utc::now().timestamp(), true),
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -4515,11 +4560,36 @@ pub async fn start_network(
                             "count": total_kad_sources,
                         }));
 
-                        // Resolve file hash: prefer pending_downloads, fall back to KAD search target
-                        let resolved_file_hash: Option<[u8; 16]> = state.pending_downloads.get(&transfer_id)
+                        // Resolve file hash for downstream CallbackReq / source
+                        // injection use. Primary source is
+                        // `pending_downloads[transfer_id].file_hash` (raw md4
+                        // from the db). Fallback is the active KAD search's
+                        // target, but search.target is stored as a KadId
+                        // (the md4 with each 4-byte word byte-reversed, see
+                        // `md4_bytes_to_kad_id`) — we must reverse that back
+                        // to the wire md4 format before using it, or we send
+                        // a corrupted hash in CallbackReq that no peer
+                        // recognises. Previously this fallback handed the raw
+                        // KadId bytes out as if they were md4, which sent
+                        // byte-permuted hashes on the wire and made every
+                        // fallback-path callback silently fail.
+                        let resolved_file_hash: Option<[u8; 16]> = state
+                            .pending_downloads
+                            .get(&transfer_id)
                             .and_then(|pd| hex::decode(&pd.file_hash).ok())
                             .and_then(|b| if b.len() == 16 { let mut a = [0u8;16]; a.copy_from_slice(&b); Some(a) } else { None })
-                            .or_else(|| state.search_manager.get(&sid).map(|s| s.target.0));
+                            .or_else(|| {
+                                state
+                                    .search_manager
+                                    .get(&sid)
+                                    .map(|s| {
+                                        warn!(
+                                            "File hash fallback for transfer {}: using KAD search target (pending_downloads missed)",
+                                            transfer_id
+                                        );
+                                        kad_id_to_md4_bytes(&s.target)
+                                    })
+                            });
                         if resolved_file_hash.is_none() {
                             warn!("Could not resolve file hash for KAD source search {} (transfer {})", sid.0, transfer_id);
                         }
@@ -5027,7 +5097,6 @@ pub async fn start_network(
                             let now = chrono::Utc::now().timestamp();
                             let mut sent_any = false;
                             for (kw_hash, msg) in &kw_publishes {
-                                let mut sent_this_kw = false;
                                 for contact in search.closest.iter()
                                     .filter(|c| !state.overloaded_nodes.contains_key(&c.ip))
                                     .take(10)
@@ -5036,12 +5105,13 @@ pub async fn start_network(
                                     if let Ok(packet) = messages::encode_packet(msg) {
                                         state.flood_protection.track_request(addr, kad_request_opcode(msg).unwrap_or(0));
                                         let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
+                                        // Per-peer pending entry so every ack counts.
+                                        state.publish_pending.insert(
+                                            (*kw_hash, addr),
+                                            (file.file_hash, now, false),
+                                        );
                                         sent_any = true;
-                                        sent_this_kw = true;
                                     }
-                                }
-                                if sent_this_kw {
-                                    state.publish_pending.insert(*kw_hash, (file.file_hash, now, false));
                                 }
                             }
                             if sent_any {
@@ -5073,12 +5143,21 @@ pub async fn start_network(
                                 if let Ok(packet) = messages::encode_packet(&msg) {
                                     state.flood_protection.track_request(addr, kad_request_opcode(&msg).unwrap_or(0));
                                     let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
+                                    // Per-peer pending entry — we track the
+                                    // store's target rather than `file_hash` so
+                                    // remove-on-ack matches the target echoed
+                                    // in PublishRes (for source publishes these
+                                    // are the same value, but keyword/notes
+                                    // would differ).
+                                    state.publish_pending.insert(
+                                        (search.target, addr),
+                                        (file_hash, now, true),
+                                    );
                                     sent += 1;
                                 }
                             }
                             let total_published = already_published.len() + sent;
                             if total_published > 0 {
-                                state.publish_pending.insert(file_hash, (file_hash, now, true));
                                 state.publish_manager.mark_source_published(&file_hash);
                                 // Fresh publish cycle: reset ack counter so the
                                 // Sources column reflects acks from THIS cycle only.
@@ -6285,19 +6364,30 @@ pub async fn start_network(
                 }
 
                 let now = chrono::Utc::now().timestamp();
-                let stale_publishes: Vec<(KadId, KadId, bool)> = state.publish_pending
+                // Collect stale per-(target, peer) entries, then dedupe by
+                // file_hash so we reset publish_manager at most once per
+                // file regardless of how many peers we had outstanding.
+                let stale_keys: Vec<((KadId, SocketAddr), KadId, bool)> = state.publish_pending
                     .iter()
                     .filter(|(_, (_, sent_at, _))| now - sent_at > 120)
-                    .map(|(target, (file_hash, _, is_source))| (*target, *file_hash, *is_source))
+                    .map(|(k, (file_hash, _, is_source))| (*k, *file_hash, *is_source))
                     .collect();
-                for (target, file_hash, is_source) in &stale_publishes {
-                    state.publish_pending.remove(target);
-                    if *is_source {
-                        state.publish_manager.reset_source_publish(file_hash);
-                    } else {
-                        state.publish_manager.reset_keyword_publish(file_hash);
+                let mut retried_files: std::collections::HashSet<(KadId, bool)> = std::collections::HashSet::new();
+                for (key, file_hash, is_source) in &stale_keys {
+                    state.publish_pending.remove(key);
+                    // Skip stale-retry bookkeeping if any peer for this file
+                    // has already succeeded (file_hash still in
+                    // publish_pending under a different key → recently acked).
+                    // The dedupe set covers the common "all peers timed out"
+                    // path.
+                    if retried_files.insert((*file_hash, *is_source)) {
+                        if *is_source {
+                            state.publish_manager.reset_source_publish(file_hash);
+                        } else {
+                            state.publish_manager.reset_keyword_publish(file_hash);
+                        }
+                        debug!("Retrying unconfirmed publish for target {} (peer {})", key.0, key.1);
                     }
-                    debug!("Retrying unconfirmed publish for target {target}");
                 }
             }
 
@@ -11564,9 +11654,15 @@ async fn handle_udp_packet(
         }
 
         KadMessage::PublishRes { target, load } => {
-            if state.publish_pending.remove(&target).is_some() {
+            // Match on (target, peer) so every ack counts — prior behaviour
+            // matched on target only and dropped all but the first peer's
+            // ack per publish cycle.
+            if state.publish_pending.remove(&(target, from)).is_some() {
                 state.publish_confirmed += 1;
-                info!("Publish confirmed for {target} (load={load}, total_confirmed={})", state.publish_confirmed);
+                debug!(
+                    "Publish confirmed for {target} from {from} (load={load}, total_confirmed={})",
+                    state.publish_confirmed
+                );
             }
             // Count this ack toward the file's "complete sources" estimate.
             // `target` for a source publish equals the file hash, so presence
