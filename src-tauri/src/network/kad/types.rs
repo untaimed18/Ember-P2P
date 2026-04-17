@@ -133,16 +133,31 @@ impl KadId {
         KadId(result)
     }
 
+    /// Return the `i`-th 32-bit chunk treating the stored bytes as a
+    /// 128-bit unsigned integer in network byte order (big-endian).
+    ///
+    /// This matches eMule's `CUInt128::Get32BitChunk`, which reads wire
+    /// bytes via `SetValueBE` (`m_uData[i] = (b0<<24)|(b1<<16)|(b2<<8)|b3`)
+    /// so `Get32BitChunk(0)` is the **most significant** 32 bits of the
+    /// whole 128-bit value. The previous implementation used
+    /// `u32::from_le_bytes`, which silently flipped the byte order within
+    /// each chunk. The most visible symptom was `SEARCH_TOLERANCE` checks
+    /// inspecting the wrong 24 bits of the XOR distance — we'd pick
+    /// "within-tolerance" peers that eMule's
+    /// `Process_KADEMLIA2_PUBLISH_SOURCE_REQ` silently rejects (no
+    /// `PublishRes` ever sent), making `publish_confirmed` stuck at 0.
+    /// It also skewed every `get_bit_number` / `shift_left` / routing
+    /// bucket decision away from eMule's bit numbering.
     pub(crate) fn chunk(&self, i: usize) -> u32 {
         debug_assert!(i < KAD_ID_SIZE / 4, "KadId::chunk index out of bounds");
         let base = i * 4;
-        u32::from_le_bytes([self.0[base], self.0[base + 1], self.0[base + 2], self.0[base + 3]])
+        u32::from_be_bytes([self.0[base], self.0[base + 1], self.0[base + 2], self.0[base + 3]])
     }
 
     fn set_chunk(&mut self, i: usize, val: u32) {
         debug_assert!(i < KAD_ID_SIZE / 4, "KadId::set_chunk index out of bounds");
         let base = i * 4;
-        let bytes = val.to_le_bytes();
+        let bytes = val.to_be_bytes();
         self.0[base] = bytes[0];
         self.0[base + 1] = bytes[1];
         self.0[base + 2] = bytes[2];
@@ -269,24 +284,13 @@ impl PartialOrd for KadId {
 }
 
 impl Ord for KadId {
-    /// Match eMule's CUInt128 comparison: compare 4 little-endian u32 chunks
-    /// from most significant (chunk 0 = bytes 0..3) to least significant.
-    /// Each 4-byte group is interpreted as a LE u32 for the comparison.
+    /// Match eMule's `CUInt128::CompareTo`: treat the 16 bytes as a
+    /// 128-bit unsigned integer in network byte order. Byte-wise
+    /// lexicographic comparison of `[u8; 16]` is equivalent to comparing
+    /// four big-endian u32 chunks top-down, so we just defer to the
+    /// array's default `Ord`.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        for i in 0..4 {
-            let base = i * 4;
-            let a = u32::from_le_bytes([
-                self.0[base], self.0[base + 1], self.0[base + 2], self.0[base + 3],
-            ]);
-            let b = u32::from_le_bytes([
-                other.0[base], other.0[base + 1], other.0[base + 2], other.0[base + 3],
-            ]);
-            match a.cmp(&b) {
-                std::cmp::Ordering::Equal => continue,
-                ord => return ord,
-            }
-        }
-        std::cmp::Ordering::Equal
+        self.0.cmp(&other.0)
     }
 }
 
@@ -752,4 +756,100 @@ pub fn write_tag_list<W: Write>(writer: &mut W, tags: &[KadTag]) -> io::Result<(
         tag.write_to(writer)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod kad_id_endianness_tests {
+    use super::*;
+
+    /// Pins the most significant chunk semantics to eMule's
+    /// `CUInt128::Get32BitChunk(0)`. For wire bytes `01 02 03 04 …`,
+    /// eMule stores `m_uData[0] = (0x01<<24)|(0x02<<16)|(0x03<<8)|0x04
+    /// = 0x01020304`. Previously we used `from_le_bytes`, which yielded
+    /// `0x04030201` — causing `SEARCH_TOLERANCE` and every bit/shift
+    /// routing operation to inspect the wrong byte range.
+    #[test]
+    fn chunk_is_big_endian_like_emule() {
+        let mut bytes = [0u8; KAD_ID_SIZE];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i + 1) as u8;
+        }
+        let id = KadId(bytes);
+        assert_eq!(id.chunk(0), 0x01020304, "chunk(0) must be the top 32 bits");
+        assert_eq!(id.chunk(1), 0x05060708);
+        assert_eq!(id.chunk(2), 0x090A0B0C);
+        assert_eq!(id.chunk(3), 0x0D0E0F10);
+    }
+
+    /// eMule's search tolerance check is `(local XOR target).Get32BitChunk(0)
+    /// <= SEARCHTOLERANCE (0x01000000)`. The check operates on the MOST
+    /// significant 32 bits of the XOR distance. The previous LE
+    /// implementation mis-read this as the LSB range, so `publish_confirmed`
+    /// stuck at 0: we'd send PublishSourceReq to peers that eMule silently
+    /// rejects (no PublishRes response ever).
+    #[test]
+    fn search_tolerance_inspects_top_bits() {
+        let local = KadId([0u8; KAD_ID_SIZE]);
+
+        // Target differs only in the TOP byte → distance chunk(0) is huge,
+        // well beyond tolerance. Must be rejected.
+        let mut far_bytes = [0u8; KAD_ID_SIZE];
+        far_bytes[0] = 0xFF;
+        let far = KadId(far_bytes);
+        assert!(
+            local.xor_distance(&far).chunk(0) > SEARCH_TOLERANCE,
+            "top-byte mismatch must exceed tolerance"
+        );
+
+        // Target differs only in the LAST byte → distance chunk(0) is 0.
+        // Must accept.
+        let mut near_bytes = [0u8; KAD_ID_SIZE];
+        near_bytes[KAD_ID_SIZE - 1] = 0xFF;
+        let near = KadId(near_bytes);
+        assert_eq!(
+            local.xor_distance(&near).chunk(0),
+            0,
+            "last-byte differences live in chunk(3), not chunk(0)"
+        );
+        assert!(local.xor_distance(&near).chunk(0) <= SEARCH_TOLERANCE);
+    }
+
+    /// `get_bit_number(0)` must be the most significant bit of the
+    /// 128-bit value (`byte[0]`'s MSB), matching eMule.
+    #[test]
+    fn get_bit_number_zero_is_byte0_msb() {
+        let mut bytes = [0u8; KAD_ID_SIZE];
+        bytes[0] = 0x80;
+        let id = KadId(bytes);
+        assert_eq!(id.get_bit_number(0), 1, "bit 0 must be byte[0]'s MSB");
+        for bit in 1..128 {
+            assert_eq!(
+                id.get_bit_number(bit),
+                0,
+                "bit {bit} must be zero for this fixture",
+            );
+        }
+    }
+
+    /// KadId ordering must follow network-byte-order (lexicographic on
+    /// the raw bytes). This keeps our routing/sort agreement with eMule.
+    #[test]
+    fn ord_is_lexicographic_on_raw_bytes() {
+        let mut a = [0u8; KAD_ID_SIZE];
+        let mut b = [0u8; KAD_ID_SIZE];
+        a[0] = 0x01;
+        b[0] = 0x02;
+        assert!(KadId(a) < KadId(b));
+
+        let mut c = [0u8; KAD_ID_SIZE];
+        let mut d = [0u8; KAD_ID_SIZE];
+        c[0] = 0x10;
+        c[KAD_ID_SIZE - 1] = 0xFF;
+        d[0] = 0x11;
+        d[KAD_ID_SIZE - 1] = 0x00;
+        assert!(
+            KadId(c) < KadId(d),
+            "later-byte differences must not flip the ordering"
+        );
+    }
 }
