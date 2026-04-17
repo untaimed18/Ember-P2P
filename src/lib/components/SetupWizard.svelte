@@ -3,7 +3,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { relaunch } from '@tauri-apps/plugin-process';
   import { onDestroy, untrack } from 'svelte';
-  import { theme, applyTheme, type Theme } from '$lib/stores/theme';
+  import { theme, applyTheme, getInitialTheme, type Theme } from '$lib/stores/theme';
   import type { AppSettings } from '$lib/types';
   import ToggleSwitch from './ToggleSwitch.svelte';
   import SpeedInput from './SpeedInput.svelte';
@@ -30,9 +30,7 @@
   let maxUploadSpeed = $state(_init.max_upload_speed);
   let maxDownloadSpeed = $state(_init.max_download_speed);
   let autoConnectKad = $state(_init.auto_connect_kad);
-  let selectedTheme: Theme = $state(
-    (typeof localStorage !== 'undefined' && localStorage.getItem('ember-theme') as Theme) || 'dark'
-  );
+  let selectedTheme: Theme = $state(getInitialTheme());
 
   let speedTestRunning = $state(false);
   let speedTestResult = $state('');
@@ -48,8 +46,33 @@
   let stepTimer: ReturnType<typeof setTimeout> | undefined;
   onDestroy(() => clearTimeout(stepTimer));
 
+  function clampInt(v: unknown, min: number, max: number, fallback: number): number {
+    const n = typeof v === 'number' ? v : parseInt(String(v ?? ''), 10);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, Math.trunc(n)));
+  }
+
+  /** Whether the current step's required fields pass validation. */
+  let canAdvance = $derived.by(() => {
+    switch (step) {
+      case 2: // Identity
+        return nickname.trim().length > 0;
+      case 3: // Storage
+        return downloadFolder.trim().length > 0;
+      case 4: // Network
+        return (
+          tcpPort >= 1 && tcpPort <= 65535 &&
+          udpPort >= 1 && udpPort <= 65535 &&
+          tcpPort !== udpPort
+        );
+      default:
+        return true;
+    }
+  });
+
   function goNext() {
     if (step >= TOTAL_STEPS) return;
+    if (!canAdvance) return;
     transitioning = true;
     clearTimeout(stepTimer);
     stepTimer = setTimeout(() => {
@@ -104,11 +127,25 @@
 
   async function finish() {
     if (saving || downloading) return;
+    // Final validation before writing any settings to disk. Prevents an
+    // empty-nickname or port=0 config from sneaking past the per-step guard
+    // if the user somehow reaches the last step with invalid state.
+    if (!nickname.trim()) { saveError = 'Please enter a nickname.'; step = 2; return; }
+    if (!downloadFolder.trim()) { saveError = 'Please choose a download folder.'; step = 3; return; }
+    const tcp = clampInt(tcpPort, 1, 65535, 4662);
+    const udp = clampInt(udpPort, 1, 65535, 4672);
+    if (tcp === udp) { saveError = 'TCP and UDP ports must differ.'; step = 4; return; }
+    tcpPort = tcp;
+    udpPort = udp;
     saving = true;
     saveError = '';
-    const updated: AppSettings = {
+    // Keep setup_complete=false across the first save so that if the user
+    // kills the app mid-bootstrap (or it crashes during downloads) the wizard
+    // reappears on next launch and can retry. Only flip to true after the
+    // optional bootstrap downloads finish.
+    const partial: AppSettings = {
       ...settings,
-      nickname,
+      nickname: nickname.trim(),
       download_folder: downloadFolder,
       tcp_port: tcpPort,
       udp_port: udpPort,
@@ -117,12 +154,11 @@
       max_download_speed: maxDownloadSpeed,
       auto_connect_kad: autoConnectKad,
       auto_connect_server: false,
-      setup_complete: true,
+      setup_complete: false,
     };
 
-    // Save settings first
     try {
-      await saveSettings(updated);
+      await saveSettings(partial);
     } catch (e) {
       saveError = e instanceof Error ? e.message : String(e);
       saving = false;
@@ -130,7 +166,6 @@
     }
     saving = false;
 
-    // Download nodes.dat and IP filter in parallel
     downloading = true;
     dlNodesStatus = 'pending';
     dlIpStatus = 'pending';
@@ -147,15 +182,25 @@
     await new Promise(r => setTimeout(r, 900));
     downloading = false;
 
-    // Relaunch so the network starts with the user's chosen ports/settings.
-    // Settings are saved with setup_complete: true, so the wizard won't reappear.
+    // Bootstrap is complete (success or user-acknowledged failure). Persist
+    // setup_complete=true now so the wizard doesn't reappear next launch.
+    const final: AppSettings = { ...partial, setup_complete: true };
+    try {
+      await saveSettings(final);
+    } catch (e) {
+      // If this second save fails the wizard will show again — annoying but
+      // safe. Surface the error.
+      saveError = e instanceof Error ? e.message : String(e);
+      return;
+    }
+
     relaunching = true;
     try {
       await new Promise(r => setTimeout(r, 600));
       await relaunch();
     } catch {
       relaunching = false;
-      await oncomplete(updated);
+      await oncomplete(final);
     }
   }
 
@@ -451,7 +496,7 @@
 
       <div class="footer-right">
         {#if step < TOTAL_STEPS}
-          <button type="button" class="btn-next" onclick={goNext}>
+          <button type="button" class="btn-next" onclick={goNext} disabled={!canAdvance}>
             {step === 1 ? "Get Started" : "Next"}
           </button>
         {:else}

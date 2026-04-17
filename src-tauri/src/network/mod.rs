@@ -145,7 +145,7 @@ async fn handle_epx_sources(
             if state.dead_sources.is_dead_source_for_file(file_hash, u32::from(ip), port) {
                 continue;
             }
-            if ip.is_unspecified() || ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_broadcast() || ip.is_multicast() {
+            if crate::security::is_special_use_v4(ip) || ip.is_multicast() {
                 continue;
             }
             if state.banned_ips.contains(&ip) {
@@ -189,23 +189,48 @@ async fn handle_epx_sources(
         }
     }
 
-    // Pre-populate AICH root hashes received via EPX
+    // Pre-populate AICH root hashes received via EPX.
+    //
+    // EPX advertisements are unauthenticated, so a malicious peer could try
+    // to poison the map by being the first to announce a wrong root for a
+    // hash we haven't seen yet. To reduce the impact:
+    //   1. Only accept the EPX-supplied root when we have *no* local master
+    //      already (`aich_root_map` empty for this file).
+    //   2. Only trust the root if it matches an existing authoritative
+    //      source we already know (from a HashSet2 we retrieved ourselves
+    //      or from an in-progress transfer) — otherwise treat it as a
+    //      candidate and defer verification until recovery time
+    //      (`corrupt_blocks_from_aich_recovery` already rejects blocks that
+    //      don't reproduce the trusted master).
+    //
+    // The worst case is still that we try recovery against a bogus root and
+    // reject the recovery — no blocks are written to disk without matching
+    // the authoritative master.
     for (file_hash, aich_root) in aich_roots {
-        state.aich_root_map.entry(*file_hash).or_insert(*aich_root);
-        let already_known = state.aich_hash_sets.iter().any(|hs| hs.root_hash == *aich_root);
-        if !already_known {
-            tracing::debug!("EPX: pre-populated AICH root {} for file {}", hex::encode(aich_root), hex::encode(file_hash));
-            state.aich_hash_sets.push(ed2k::aich::AICHRecoveryHashSet {
-                root_hash: *aich_root,
-                leaf_hashes: Vec::new(),
-            });
+        if state.aich_root_map.contains_key(file_hash) {
+            continue;
+        }
+        let matches_trusted = state.aich_hash_sets.iter().any(|hs| hs.root_hash == *aich_root);
+        if matches_trusted {
+            state.aich_root_map.insert(*file_hash, *aich_root);
+            tracing::debug!(
+                "EPX: pinned AICH root {} for file {} (matches known hashset)",
+                hex::encode(aich_root),
+                hex::encode(file_hash)
+            );
+        } else {
+            tracing::debug!(
+                "EPX: deferring unverified AICH root {} for file {}",
+                hex::encode(aich_root),
+                hex::encode(file_hash)
+            );
         }
     }
 
     // Track discovered Ember peers for mesh building
     let mut new_peers = false;
     for &(ip, port) in ember_peers {
-        if ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() {
+        if crate::security::is_special_use_v4(ip) {
             continue;
         }
         if state.banned_ips.contains(&ip) {
@@ -1466,6 +1491,29 @@ async fn flush_credit_state(
             .collect();
         (bytes, records)
     };
+    // Ordering note: persist credits to the SQLite database *first* (the
+    // authoritative source on load — see `CreditManager` loader, which
+    // only falls back to `clients.met` when the DB has no rows) and only
+    // afterwards write the `clients.met` cache copy. If a crash happens
+    // between the two writes, the next launch still sees the latest credits
+    // via the DB; the on-disk cache may lag but does not clobber fresh data.
+    let db_ref = db.clone();
+    let db_save = tokio::task::spawn_blocking(move || {
+        let refs: Vec<(&[u8; 16], u64, u64, i64, &[u8])> = owned
+            .iter()
+            .map(|(h, u, d, l, p)| (h, *u, *d, *l, p.as_slice()))
+            .collect();
+        let result = db_ref.save_all_credits(&refs);
+        db_ref.incremental_vacuum();
+        result
+    })
+    .await;
+    match db_save {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => error!("Failed to save credits: {e}"),
+        Err(e) => error!("Credit save task failed: {e}"),
+    }
+
     let clients_met = data_dir.join("clients.met");
     let clients_bak = data_dir.join("clients.met.bak");
     if clients_met.exists() {
@@ -1475,23 +1523,6 @@ async fn flush_credit_state(
     }
     if let Err(e) = crate::security::atomic_write(&clients_met, &serialized_bytes, false) {
         debug!("Failed to finalize clients.met: {e}");
-    }
-
-    let db_ref = db.clone();
-    match tokio::task::spawn_blocking(move || {
-        let refs: Vec<(&[u8; 16], u64, u64, i64, &[u8])> = owned
-            .iter()
-            .map(|(h, u, d, l, p)| (h, *u, *d, *l, p.as_slice()))
-            .collect();
-        let result = db_ref.save_all_credits(&refs);
-        db_ref.incremental_vacuum();
-        result
-    })
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => error!("Failed to save credits: {e}"),
-        Err(e) => error!("Credit save task failed: {e}"),
     }
 }
 
@@ -2505,9 +2536,15 @@ pub async fn start_network(
     server_udp_ping_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut stats_timer = tokio::time::interval(std::time::Duration::from_secs(1));
     stats_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut stats_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
+    // Persist cumulative stats every minute so an OOM/crash only loses ~60s
+    // of transfer counters instead of ~5 min. Writes are a single
+    // transactional UPDATE — cheap to do more often.
+    let mut stats_save_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     stats_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut known_met_save_timer = tokio::time::interval(std::time::Duration::from_secs(660));
+    // Flush known.met every 2 min when dirty. Previous 11-minute interval
+    // left a long window where newly-indexed files / hash updates would be
+    // lost on hard-kill.
+    let mut known_met_save_timer = tokio::time::interval(std::time::Duration::from_secs(120));
     known_met_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut upnp_renew_timer = tokio::time::interval(std::time::Duration::from_secs(50 * 60));
     upnp_renew_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -3335,8 +3372,7 @@ pub async fn start_network(
                 }
 
                 if let DownloadEvent::EmberPeerDiscovered { ip, tcp_port } = event {
-                    if !ip.is_private() && !ip.is_loopback() && !ip.is_link_local()
-                        && !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast() {
+                    if !crate::security::is_special_use_v4(ip) && !ip.is_multicast() {
                         if state.known_ember_peers.insert((ip, tcp_port)) {
                             state.stats.ember_peers = state.known_ember_peers.len() as u32;
                             state.ember_payload_dirty = true;
@@ -3864,8 +3900,7 @@ pub async fn start_network(
                 }
 
                 if let UploadEventKind::EmberPeerDiscovered { ip, tcp_port } = event.kind {
-                    if !ip.is_private() && !ip.is_loopback() && !ip.is_link_local()
-                        && !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast() {
+                    if !crate::security::is_special_use_v4(ip) && !ip.is_multicast() {
                         if state.known_ember_peers.insert((ip, tcp_port)) {
                             state.stats.ember_peers = state.known_ember_peers.len() as u32;
                             state.ember_payload_dirty = true;
@@ -9324,8 +9359,7 @@ pub async fn start_network(
                         if peers.len() >= ember::MAX_EPX_PEERS {
                             break;
                         }
-                        if !ip.is_private() && !ip.is_loopback() && !ip.is_link_local()
-                            && !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast() {
+                        if !crate::security::is_special_use_v4(ip) && !ip.is_multicast() {
                             peers.push(ember::EmberPeer { ip, tcp_port: port });
                         }
                     }
@@ -10526,7 +10560,14 @@ async fn handle_udp_packet(
                 } else {
                     None
                 };
-                if let IpAddr::V4(v4) = from.ip() {
+                // Accept both native IPv4 and IPv4-mapped IPv6 (::ffff:x.x.x.x)
+                // so hosts that open IPv6 UDP sockets still get their queue
+                // rank updated correctly.
+                let v4_opt = match from.ip() {
+                    IpAddr::V4(v4) => Some(v4),
+                    IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+                };
+                if let Some(v4) = v4_opt {
                     for pfs in state.per_file_sources.values_mut() {
                         for src in &mut pfs.sources {
                             if src.ip == v4 && src.udp_port == from.port() {
@@ -10542,7 +10583,11 @@ async fn handle_udp_packet(
 
             // eMule UDP: queue full or file not found responses
             if header == OP_EMULEPROT && (opcode == ed2k::messages::OP_QUEUEFULL_UDP || opcode == ed2k::messages::OP_FILEREQANSNOFIL || opcode == ed2k::messages::OP_FILENOTFOUND_UDP) {
-                if let IpAddr::V4(v4) = from.ip() {
+                let v4_opt = match from.ip() {
+                    IpAddr::V4(v4) => Some(v4),
+                    IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+                };
+                if let Some(v4) = v4_opt {
                     let is_banned = state.banned_ips.contains(&v4);
                     for pfs in state.per_file_sources.values_mut() {
                         for src in &mut pfs.sources {

@@ -50,6 +50,20 @@ impl Database {
         )
         .unwrap_or(0);
 
+        // Refuse to run against a database that was last opened by a newer
+        // Ember build. Silently running would invite subtle data corruption
+        // (missing columns, renamed tables, semantic changes). Bump this
+        // when introducing a new migration.
+        const MAX_SUPPORTED_VERSION: i64 = 13;
+        if version > MAX_SUPPORTED_VERSION {
+            anyhow::bail!(
+                "Database schema version {version} is newer than this Ember build supports \
+                 (max {MAX_SUPPORTED_VERSION}). The database was likely written by a more \
+                 recent version of Ember. Install that version to access this data; refusing \
+                 to start to avoid corruption."
+            );
+        }
+
         let set_version = |tx: &Connection, v: i64| -> anyhow::Result<()> {
             tx.execute("DELETE FROM schema_version", [])?;
             tx.execute("INSERT INTO schema_version (version) VALUES (?1)", params![v])?;
@@ -157,9 +171,16 @@ impl Database {
         }
 
         if version < 6 {
+            // Back up the rows we're about to mass-UPDATE. If the TRIM
+            // accidentally matches an unusual-but-valid value the original
+            // rows can be recovered from `transfers_v5_backup`.
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(
-                "UPDATE transfers SET status = TRIM(status, '\"') WHERE status LIKE '\"%\"';
+                "DROP TABLE IF EXISTS transfers_v5_backup;
+                 CREATE TABLE transfers_v5_backup AS
+                     SELECT id, status, direction FROM transfers
+                     WHERE status LIKE '\"%\"' OR direction LIKE '\"%\"';
+                 UPDATE transfers SET status = TRIM(status, '\"') WHERE status LIKE '\"%\"';
                  UPDATE transfers SET direction = TRIM(direction, '\"') WHERE direction LIKE '\"%\"';",
             )?;
             set_version(&tx, 6)?;

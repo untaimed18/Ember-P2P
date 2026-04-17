@@ -1070,7 +1070,8 @@ fn build_login_request(user_hash: &[u8; 16], tcp_port: u16, nickname: &str, flag
 
     // Tag 4: CT_EMULE_VERSION (0xFB) - (compat << 24) | (major << 17) | (minor << 10) | (update << 7)
     // Claim 0.50a (last official eMule release) — must match build_hello_inner.
-    let emule_version: u32 = (0u32 << 24) | (0u32 << 17) | (50u32 << 10) | (0u32 << 7);
+    // update=1 encodes the 'a' suffix.
+    let emule_version: u32 = (50u32 << 10) | (1u32 << 7);
     write_uint32_tag(&mut buf, CT_EMULE_VERSION, emule_version);
 
     buf

@@ -117,8 +117,54 @@
     activeTimers.add(saveTimer);
   }
 
+  function clampInt(v: unknown, min: number, max: number, fallback: number): number {
+    const n = typeof v === 'number' ? v : parseInt(String(v ?? ''), 10);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, Math.trunc(n)));
+  }
+
+  function clampNonNegInt(v: unknown, max: number, fallback: number): number {
+    const n = typeof v === 'number' ? v : parseInt(String(v ?? ''), 10);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(0, Math.trunc(n)));
+  }
+
+  /** Validate and clamp numeric fields to the ranges documented in AppSettings.
+   *  Returns null on success or an error message. Mutates `s` in place. */
+  function validateSettings(s: AppSettings): string | null {
+    if (!s.nickname.trim()) {
+      return 'Nickname cannot be empty.';
+    }
+    if (!s.download_folder.trim()) {
+      return 'Download folder cannot be empty.';
+    }
+    s.tcp_port = clampInt(s.tcp_port, 1, 65535, 4662);
+    s.udp_port = clampInt(s.udp_port, 1, 65535, 4672);
+    if (s.tcp_port === s.udp_port) {
+      return 'TCP and UDP ports must differ.';
+    }
+    s.max_upload_speed = clampNonNegInt(s.max_upload_speed, 2_147_483_647, 0);
+    s.max_download_speed = clampNonNegInt(s.max_download_speed, 2_147_483_647, 0);
+    s.max_concurrent_downloads = clampInt(s.max_concurrent_downloads, 1, 100, 3);
+    s.max_concurrent_uploads = clampInt(s.max_concurrent_uploads, 1, 100, 4);
+    s.max_sources_per_file = clampInt(s.max_sources_per_file, 1, 10_000, 1000);
+    s.max_connections = clampInt(s.max_connections, 10, 5000, 500);
+    s.download_queue_wait_secs = clampInt(s.download_queue_wait_secs, 60, 7200, 600);
+    s.multisource_retry_rounds = clampInt(s.multisource_retry_rounds, 1, 20, 3);
+    s.download_part_retry_rounds = clampInt(s.download_part_retry_rounds, 1, 20, 3);
+    s.max_download_file_size_gib = clampInt(s.max_download_file_size_gib, 1, 16384, 4096);
+    s.search_timeout_secs = clampInt(s.search_timeout_secs, 30, 600, 120);
+    s.max_friends = clampInt(s.max_friends, 1, 500, 100);
+    return null;
+  }
+
   async function handleSave() {
     if (!settings || saving) return;
+    const validationError = validateSettings(settings);
+    if (validationError) {
+      showSaveMsg(validationError, true, 5000);
+      return;
+    }
     saving = true;
     saveMessage = null;
     const snapshot = JSON.stringify(settings);

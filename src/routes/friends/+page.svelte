@@ -45,6 +45,13 @@
 
   let friendRequests: FriendRequestInfo[] = $state([]);
   let failedSearchToastsShown = new Set<string>();
+
+  // Whenever a friend comes online, reset our "we already toasted for this
+  // hash" memo so the next offline search failure can re-toast. Reactively
+  // driven from the onlineFriends store (no separate Tauri listener needed).
+  $effect(() => {
+    for (const hash of onlineFriends) failedSearchToastsShown.delete(hash);
+  });
   let searchingFriends: Set<string> = $state(new Set());
   let isFirewalled = $state(false);
   let recheckingFirewall = $state(false);
@@ -62,6 +69,10 @@
   let isDiscoverable = $state(false);
   let processingRequests: Set<string> = $state(new Set());
   let adding = $state(false);
+
+  // Module-scoped lifecycle flag used by async loaders below so they don't
+  // patch state after navigation.
+  let destroyed = false;
 
   // Sync global friend stores into local reactive state so the template
   // picks up events even if they arrived before this page mounted.
@@ -192,18 +203,21 @@
   }
 
   onMount(() => {
+    destroyed = false;
     loadFriends();
     loadMyHash();
-    getNetworkStats().then(s => { isFirewalled = s.firewalled; }).catch(() => {});
+    getNetworkStats()
+      .then(s => { if (!destroyed) isFirewalled = s.firewalled; })
+      .catch(() => {});
 
-    let destroyed = false;
     const unlistenFns: (() => void)[] = [];
 
-    // Page-local listeners for side effects that need the local friends list
-    listen<{ user_hash: string }>('ember:friend-online', (event) => {
-      failedSearchToastsShown.delete(event.payload.user_hash);
-    }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
-
+    // Page-local listeners for side effects not already covered by the shared
+    // friends store (which already handles online/offline state updates).
+    // We intentionally do NOT register another listener for 'ember:friend-online'
+    // — we rely on the `onlineFriendsStore` subscription above to drive
+    // `onlineFriends`, and the effect below takes care of the toast-clear
+    // side effect. This avoids double event handling when the page is open.
     listen<{ user_hash: string }>('ember:friend-confirmed', () => {
       loadFriends();
     }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
@@ -252,8 +266,11 @@
 
   async function loadMyHash() {
     try {
-      myHash = await getMyEmberHash();
+      const h = await getMyEmberHash();
+      if (destroyed) return;
+      myHash = h;
     } catch {
+      if (destroyed) return;
       myHash = '';
     }
   }
@@ -269,14 +286,18 @@
   }
 
   async function loadFriends() {
+    if (destroyed) return;
     loading = true;
     error = null;
     try {
-      friends = await getFriends();
+      const list = await getFriends();
+      if (destroyed) return;
+      friends = list;
     } catch (e: unknown) {
+      if (destroyed) return;
       error = toErr(e);
     } finally {
-      loading = false;
+      if (!destroyed) loading = false;
     }
   }
 

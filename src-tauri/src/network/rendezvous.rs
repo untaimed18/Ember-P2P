@@ -25,6 +25,30 @@ fn client() -> reqwest::Client {
     }
 }
 
+/// Read the response body with a hard byte cap. Protects against a hostile
+/// or misbehaving rendezvous server that might otherwise stream megabytes of
+/// JSON at us.
+async fn read_bounded_bytes(resp: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
+    if let Some(len) = resp.content_length() {
+        if len as usize > limit {
+            return Err(format!(
+                "rendezvous response too large: {len} bytes (max {limit})"
+            ));
+        }
+    }
+    let mut stream = resp.bytes_stream();
+    use futures::StreamExt;
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("rendezvous read failed: {e}"))?;
+        if buf.len().saturating_add(chunk.len()) > limit {
+            return Err(format!("rendezvous response exceeded {limit}-byte cap"));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// Register our presence with the rendezvous server.
 /// If `external_ip` is provided, it is sent so the server stores our true
 /// IPv4 address instead of the (possibly IPv6) connection address.
@@ -67,9 +91,8 @@ pub async fn lookup(base_url: &str, friend_hash: &[u8; 16]) -> Result<Option<(Ip
         let status = resp.status();
         return Err(format!("rendezvous lookup returned {status}"));
     }
-    let body: serde_json::Value = resp
-        .json()
-        .await
+    let bytes = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|e| format!("rendezvous lookup bad body: {e}"))?;
     let ip_str = body["ip"].as_str().unwrap_or_default();
     let raw_port = body["port"].as_u64().unwrap_or_default();

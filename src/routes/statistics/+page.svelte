@@ -9,21 +9,24 @@
   let refreshInterval: ReturnType<typeof setInterval> | null = null;
   let refreshBusy = false;
   let tickCounter = $state(0);
+  let unmounted = false;
 
   async function loadStats() {
-    if (refreshBusy) return;
+    if (refreshBusy || unmounted) return;
     refreshBusy = true;
     try {
       const result: TransferStats = await Promise.race([
         getStatistics(),
         new Promise<TransferStats>((_, reject) => setTimeout(() => reject(new Error('timeout')), 4000)),
       ]);
+      if (unmounted) return;
       stats = result;
       error = null;
     } catch (e) {
+      if (unmounted) return;
       error = e instanceof Error ? e.message : String(e);
     } finally {
-      loading = false;
+      if (!unmounted) loading = false;
       refreshBusy = false;
     }
   }
@@ -35,6 +38,7 @@
     refreshInterval = setInterval(loadStats, 2000);
     tickInterval = setInterval(() => tickCounter++, 1000);
     return () => {
+      unmounted = true;
       if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
       if (tickInterval) { clearInterval(tickInterval); tickInterval = null; }
     };

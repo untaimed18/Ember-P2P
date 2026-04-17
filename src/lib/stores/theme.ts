@@ -5,7 +5,7 @@ export type Theme = 'light' | 'dark';
 
 const STORAGE_KEY = 'ember-theme';
 
-function getInitialTheme(): Theme {
+export function getInitialTheme(): Theme {
   if (browser) {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored === 'light' || stored === 'dark') return stored;
@@ -37,10 +37,11 @@ export function toggleTheme() {
 let themeCleanup: (() => void) | null = null;
 
 export function initTheme() {
-  const stored = browser ? localStorage.getItem(STORAGE_KEY) : null;
   const t = getInitialTheme();
   applyThemeToDOM(t);
-  if (stored) localStorage.setItem(STORAGE_KEY, stored);
+  // Persist the validated theme so a garbage localStorage value self-heals
+  // on next launch instead of sticking around forever.
+  if (browser) localStorage.setItem(STORAGE_KEY, t);
   theme.set(t);
 
   if (browser) {

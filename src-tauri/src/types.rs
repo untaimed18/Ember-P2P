@@ -622,7 +622,7 @@ impl Default for AppSettings {
             max_download_file_size_gib: default_max_download_file_size_gib(),
             search_timeout_secs: default_search_timeout_secs(),
             setup_complete: false,
-            friend_require_approval: false,
+            friend_require_approval: true,
             friend_chat_disabled: false,
             friend_browse_disabled: false,
             friend_online_notifications: true,

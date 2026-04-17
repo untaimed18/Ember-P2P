@@ -408,9 +408,11 @@ fn build_hello_inner(
     write_ed2k_tag(&mut buf, 0xFA, &Ed2kTagValue::Uint32(build_misc_options1()));
     // Tag 5: CT_EMULE_MISCOPTIONS2 (0xFE)
     write_ed2k_tag(&mut buf, 0xFE, &Ed2kTagValue::Uint32(build_misc_options2(options)));
-    // Tag 6: CT_EMULE_VERSION (0xFB) - claim 0.50a (last official eMule release)
+    // Tag 6: CT_EMULE_VERSION (0xFB) - claim 0.50a (last official eMule release).
+    // Layout from BaseClient.cpp: (compat << 24) | (major << 17) | (minor << 10) | (update << 7).
+    // For 0.50a: major=0, minor=50, update=1 (the 'a' suffix); compat=0 (standard eMule).
     // Using a real version avoids anti-leecher detection for impossible version numbers.
-    let emule_version: u32 = (0u32 << 24) | (0u32 << 17) | (50u32 << 10) | (0u32 << 7);
+    let emule_version: u32 = (50u32 << 10) | (1u32 << 7);
     write_ed2k_tag(&mut buf, 0xFB, &Ed2kTagValue::Uint32(emule_version));
 
     // Optional buddy tags

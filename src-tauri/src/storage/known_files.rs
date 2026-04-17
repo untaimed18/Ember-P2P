@@ -435,7 +435,16 @@ impl KnownFileList {
 
         crate::security::atomic_write(path, &buf, false)?;
         self.dirty = false;
-        if let Err(e) = self.save_path_index(&path.with_file_name("known_paths.dat")) {
+        // Pair the companion path index to this specific known.met revision
+        // by embedding known.met's current mtime. On load we only use the
+        // cached path index when the mtime still matches — otherwise the
+        // two files got out of sync (partial write, crash between writes)
+        // and the stale index is silently discarded instead of producing
+        // confusing name+size+mtime mismatches.
+        let known_mtime_ns = mtime_ns(path).unwrap_or(0);
+        if let Err(e) =
+            self.save_path_index(&path.with_file_name("known_paths.dat"), known_mtime_ns)
+        {
             warn!("Failed to save known_paths.dat: {e}");
         }
         info!("Saved {} known files to known.met", self.files.len());
@@ -469,7 +478,22 @@ impl KnownFileList {
             Ok(v) => v,
             Err(_) => return,
         };
-        if version != 1 {
+        // Version 2 adds a known.met mtime tag so we can detect pairs that
+        // drifted apart (partial write / crash). Version 1 (no mtime) is
+        // still accepted for backward compatibility with older installs.
+        if version == 2 {
+            let expected_mtime = match cur.read_u64::<LittleEndian>() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let actual_mtime = mtime_ns(&path.with_file_name("known.met")).unwrap_or(0);
+            if expected_mtime != actual_mtime {
+                warn!(
+                    "known_paths.dat mtime tag does not match known.met (expected {expected_mtime}, got {actual_mtime}); discarding stale path index"
+                );
+                return;
+            }
+        } else if version != 1 {
             return;
         }
         let count = match cur.read_u32::<LittleEndian>() {
@@ -507,13 +531,14 @@ impl KnownFileList {
         }
     }
 
-    fn save_path_index(&self, path: &Path) -> anyhow::Result<()> {
+    fn save_path_index(&self, path: &Path, known_mtime_ns: u64) -> anyhow::Result<()> {
         if self.path_index.is_empty() {
             return Ok(());
         }
-        let mut buf = Vec::with_capacity(9 + self.path_index.len() * 40);
+        let mut buf = Vec::with_capacity(17 + self.path_index.len() * 40);
         buf.write_all(b"NXPI")?;
-        buf.write_u8(1)?;
+        buf.write_u8(2)?;
+        buf.write_u64::<LittleEndian>(known_mtime_ns)?;
         buf.write_u32::<LittleEndian>(self.path_index.len() as u32)?;
         for (file_path, hash) in &self.path_index {
             let pb = file_path.as_bytes();
@@ -525,6 +550,18 @@ impl KnownFileList {
         crate::security::atomic_write(path, &buf, false)?;
         Ok(())
     }
+}
+
+/// Return the file's last-modification time in nanoseconds since the Unix
+/// epoch, or None if the file doesn't exist or the filesystem doesn't
+/// expose a modified timestamp.
+fn mtime_ns(path: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?;
+    mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_nanos() as u64)
 }
 
 fn write_string_tag(buf: &mut Vec<u8>, name_id: u8, value: &str) -> anyhow::Result<()> {

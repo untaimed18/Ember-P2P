@@ -40,7 +40,11 @@ impl SharedFoldersWatcher {
     /// disabled — the app still functions, the user just needs to reload
     /// manually).
     pub fn start(app: AppHandle, initial_paths: Vec<String>) -> Option<Arc<Self>> {
-        let (reload_tx, mut reload_rx) = mpsc::unbounded_channel::<()>();
+        // Bounded ping channel — the coalescing loop only needs to know that
+        // *some* event arrived, so a small capacity plus `try_send` drops
+        // extras. This caps memory under a bulk copy that fires thousands of
+        // notifications before the reload driver catches up.
+        let (reload_tx, mut reload_rx) = mpsc::channel::<()>(8);
 
         // Reload driver task: coalesces pings, emits the UI event, and
         // reuses reload_shared_files so the heavy lifting (discover, hash,
@@ -106,7 +110,18 @@ impl SharedFoldersWatcher {
                         return;
                     }
                     debug!("FS watcher: {} debounced event(s)", events.len());
-                    let _ = tx_for_debouncer.send(());
+                    // try_send + discard on full: a pending ping already means
+                    // a reload is queued; no information is lost by dropping
+                    // the redundant notification.
+                    match tx_for_debouncer.try_send(()) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            debug!("FS watcher: reload queue full, ping coalesced");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            warn!("FS watcher: reload driver task has exited");
+                        }
+                    }
                 }
                 Err(e) => warn!("FS watcher error: {e:?}"),
             },
