@@ -1089,6 +1089,12 @@ struct NetworkState {
     /// target -> (file_hash, sent_at, is_source_publish)
     publish_pending: HashMap<KadId, (KadId, i64, bool)>,
     publish_confirmed: u32,
+    /// Per-file count of KAD peers that acknowledged the most recent source
+    /// publish cycle with a `PublishRes`. Used as a crude "complete sources"
+    /// estimate for files the user is purely sharing (where SourceManager
+    /// has no entries because we never searched/downloaded them).
+    /// Reset to 0 at the start of each source-publish cycle.
+    source_publish_acks: HashMap<KadId, u32>,
     /// Store-keyword searches: search_id -> (file PublishableFile, keyword publish messages)
     store_keyword_searches: HashMap<SearchId, (PublishableFile, Vec<(KadId, KadMessage)>)>,
     /// Store-source searches: search_id -> (file_hash, publish message)
@@ -2144,6 +2150,7 @@ pub async fn start_network(
         peer_nicknames: HashMap::new(),
         publish_pending: HashMap::new(),
         publish_confirmed: 0,
+        source_publish_acks: HashMap::new(),
         store_keyword_searches: HashMap::new(),
         store_source_searches: HashMap::new(),
         pending_notes_searches: HashMap::new(),
@@ -4938,6 +4945,9 @@ pub async fn start_network(
                             if total_published > 0 {
                                 state.publish_pending.insert(file_hash, (file_hash, now, true));
                                 state.publish_manager.mark_source_published(&file_hash);
+                                // Fresh publish cycle: reset ack counter so the
+                                // Sources column reflects acks from THIS cycle only.
+                                state.source_publish_acks.insert(file_hash, 0);
                                 info!("StoreSource search {} completed: published to {} nodes ({} during lookup, {} at completion)",
                                     sid.0, total_published, already_published.len(), sent);
                             }
@@ -9344,6 +9354,17 @@ pub async fn start_network(
                             break;
                         }
                     }
+                    // Fallback for purely-shared files (never searched/downloaded):
+                    // use the number of KAD peers that accepted our most recent
+                    // source publish. +1 includes ourselves so the value reads
+                    // as "total peers holding a reference" rather than "other".
+                    let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
+                    if let Some(&ack_count) = state.source_publish_acks.get(&kad_hash) {
+                        let publish_count = ack_count.saturating_add(1);
+                        if publish_count > count {
+                            count = publish_count;
+                        }
+                    }
                     if count > 0 {
                         updates.push((hash_hex.clone(), count));
                     }
@@ -11300,6 +11321,13 @@ async fn handle_udp_packet(
                 state.publish_confirmed += 1;
                 info!("Publish confirmed for {target} (load={load}, total_confirmed={})", state.publish_confirmed);
             }
+            // Count this ack toward the file's "complete sources" estimate.
+            // `target` for a source publish equals the file hash, so presence
+            // in `source_publish_acks` both identifies source-publish acks and
+            // filters out keyword-publish acks (whose target is a keyword hash).
+            if let Some(count) = state.source_publish_acks.get_mut(&target) {
+                *count = count.saturating_add(1);
+            }
             // KAD v9+: acknowledge the PublishRes
             let ack = KadMessage::PublishResAck;
             if let Ok(packet) = messages::encode_packet(&ack) {
@@ -12145,7 +12173,9 @@ async fn handle_command(
             if let Some(fh) = cancel_hash {
                 if let Ok(hb) = hex::decode(&fh) {
                     if hb.len() >= 16 {
-                        state.publish_manager.remove_file(&md4_bytes_to_kad_id(&hb[..16]));
+                        let kad_hash = md4_bytes_to_kad_id(&hb[..16]);
+                        state.publish_manager.remove_file(&kad_hash);
+                        state.source_publish_acks.remove(&kad_hash);
                         let mut fh_arr = [0u8; 16];
                         fh_arr.copy_from_slice(&hb[..16]);
                         state.corruption_blackbox.remove_file(&fh_arr);
@@ -12851,6 +12881,7 @@ async fn handle_command(
             state.store_source_searches.clear();
             state.pending_note_publishes.clear();
             state.publish_pending.clear();
+            state.source_publish_acks.clear();
 
             // Reset network state (eMule resets firewall, deletes routing zone)
             state.routing_table.clear();
@@ -13367,6 +13398,9 @@ async fn handle_command(
             let shared_count = files.len();
             state.publish_manager.clear_all();
             state.publish_manager.add_files_batch(files);
+            // Reset the ack map alongside publish state -- the counters
+            // correspond to the previous set of published hashes.
+            state.source_publish_acks.clear();
 
             // Re-add active partial downloads to KAD publish after clear
             let mut partial_count = 0u32;
