@@ -42,6 +42,11 @@ pub struct FloodProtection {
     request_times: HashMap<(SocketAddr, u8), Instant>,
     outgoing_counters: HashMap<IpAddr, (u32, Instant)>,
     recent_ips: HashMap<IpAddr, Instant>,
+    /// K21: per-IP compressed-packet counter within a 1-second window so
+    /// we can decline to decompress over-quota traffic. Tracks (count,
+    /// window_start). 10 compressed packets/sec is far more than any
+    /// legit eMule client ever sends us but cheap to enforce.
+    compressed_counters: HashMap<IpAddr, (u32, Instant)>,
 }
 
 impl FloodProtection {
@@ -53,6 +58,39 @@ impl FloodProtection {
             request_times: HashMap::new(),
             outgoing_counters: HashMap::new(),
             recent_ips: HashMap::new(),
+            compressed_counters: HashMap::new(),
+        }
+    }
+
+    /// K21: returns true when `ip` has exceeded its compressed-packet
+    /// decompression budget for the current 1-second window. Callers
+    /// should drop the packet (skip decompression) when this is true.
+    pub fn over_compressed_budget(&mut self, ip: IpAddr) -> bool {
+        const MAX_COMPRESSED_PER_SEC: u32 = 10;
+        const MAX_COMPRESSED_ENTRIES: usize = 10_000;
+        let now = Instant::now();
+        if self.compressed_counters.len() >= MAX_COMPRESSED_ENTRIES
+            && !self.compressed_counters.contains_key(&ip)
+        {
+            if let Some(oldest) = self
+                .compressed_counters
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| *k)
+            {
+                self.compressed_counters.remove(&oldest);
+            } else {
+                return true;
+            }
+        }
+        let entry = self.compressed_counters.entry(ip).or_insert((0, now));
+        if now.saturating_duration_since(entry.1).as_secs() >= 1 {
+            entry.0 = 1;
+            entry.1 = now;
+            false
+        } else {
+            entry.0 += 1;
+            entry.0 > MAX_COMPRESSED_PER_SEC
         }
     }
 
@@ -63,7 +101,21 @@ impl FloodProtection {
         // Layer 1: per-(IP, opcode) within OPCODE_WINDOW_SECS
         let op_key = (ip, opcode);
         if self.opcode_counters.len() >= MAX_OPCODE_ENTRIES && !self.opcode_counters.contains_key(&op_key) {
-            return true;
+            // K19: previous behaviour rejected the new peer outright as
+            // soon as the per-opcode table filled — an attacker that fills
+            // the table with one-shot spam permanently locks out legit
+            // peers. We now LRU-evict: drop the entry whose window-start
+            // timestamp is oldest, freeing a slot for the new peer.
+            if let Some(oldest_key) = self
+                .opcode_counters
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| *k)
+            {
+                self.opcode_counters.remove(&oldest_key);
+            } else {
+                return true;
+            }
         }
         let op_entry = self.opcode_counters.entry(op_key).or_insert((0, now));
         if now.saturating_duration_since(op_entry.1).as_secs() >= OPCODE_WINDOW_SECS {
@@ -80,7 +132,17 @@ impl FloodProtection {
 
         // Layer 2: global per-IP per-second cap
         if self.ip_counters.len() >= MAX_IP_ENTRIES && !self.ip_counters.contains_key(&ip) {
-            return true;
+            // K19: same LRU eviction rationale as above.
+            if let Some(oldest_ip) = self
+                .ip_counters
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| *k)
+            {
+                self.ip_counters.remove(&oldest_ip);
+            } else {
+                return true;
+            }
         }
         let entry = self.ip_counters.entry(ip).or_insert((0, now));
         let max_packets = if known_peer { MAX_PACKETS_PER_SEC_KNOWN } else { MAX_PACKETS_PER_SEC_UNKNOWN };
@@ -104,7 +166,17 @@ impl FloodProtection {
     pub fn check_outgoing_rate(&mut self, ip: IpAddr) -> bool {
         let now = Instant::now();
         if self.outgoing_counters.len() >= MAX_IP_ENTRIES && !self.outgoing_counters.contains_key(&ip) {
-            return true;
+            // K19: LRU-evict instead of hard-failing.
+            if let Some(oldest_ip) = self
+                .outgoing_counters
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| *k)
+            {
+                self.outgoing_counters.remove(&oldest_ip);
+            } else {
+                return true;
+            }
         }
         let entry = self.outgoing_counters.entry(ip).or_insert((0, now));
 
@@ -231,5 +303,51 @@ impl FloodProtection {
         self.recent_ips.retain(|_, last| {
             now.saturating_duration_since(*last).as_secs() < TRACKER_EXPIRY_SECS
         });
+        // K21: compressed-packet budget table follows the same 60s cleanup.
+        self.compressed_counters.retain(|_, (_, last)| {
+            now.saturating_duration_since(*last).as_secs() < 60
+        });
+    }
+}
+
+#[cfg(test)]
+mod kad_protection_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// K19: when the opcode-tracker table is full, a new IP should still
+    /// be accepted by LRU-evicting the oldest entry.
+    #[test]
+    fn lru_evicts_when_opcode_table_full() {
+        let mut fp = FloodProtection::new();
+        // Fill the table with distinct (IP, opcode) pairs up to the cap.
+        for i in 0..MAX_OPCODE_ENTRIES {
+            let ip = IpAddr::V4(Ipv4Addr::new(
+                ((i >> 24) & 0xFF) as u8,
+                ((i >> 16) & 0xFF) as u8,
+                ((i >> 8) & 0xFF) as u8,
+                (i & 0xFF) as u8,
+            ));
+            let _ = fp.check_rate_limit_with_opcode(ip, false, 0x21);
+        }
+        assert_eq!(fp.opcode_counters.len(), MAX_OPCODE_ENTRIES);
+        // Introduce a brand new IP. With the LRU fix this must succeed
+        // (return false meaning "not rate-limited").
+        let new_ip = IpAddr::V4(Ipv4Addr::new(255, 255, 255, 254));
+        assert!(
+            !fp.check_rate_limit_with_opcode(new_ip, false, 0x21),
+            "LRU eviction must admit a fresh peer even when the table is full"
+        );
+    }
+
+    /// K21: 11th compressed packet from same IP in 1s should be declined.
+    #[test]
+    fn compressed_budget_enforced() {
+        let mut fp = FloodProtection::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        for _ in 0..10 {
+            assert!(!fp.over_compressed_budget(ip));
+        }
+        assert!(fp.over_compressed_budget(ip), "11th compressed packet must trip the budget");
     }
 }

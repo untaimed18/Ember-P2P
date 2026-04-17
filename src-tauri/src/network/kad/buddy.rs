@@ -600,6 +600,10 @@ async fn run_buddy_reader(
     expected_callback_check: Option<KadId>,
 ) {
     let mut reader = reader;
+    // K9: per-session OP_REASKCALLBACKTCP budget. A legit buddy using
+    // queue reasks for our downloads will need a handful of these; a
+    // malicious buddy trying to reflect UDP traffic runs out quickly.
+    let mut reask_callback_budget: u32 = 64;
     loop {
         match read_ed2k_packet(&mut reader).await {
             Ok((proto, opcode, payload)) => {
@@ -647,22 +651,52 @@ async fn run_buddy_reader(
                         }
                     }
                     (OP_EMULEPROT, OP_REASKCALLBACKTCP) => {
-                        // OP_REASKCALLBACKTCP: [ip:4][port:2][file_hash:16] = 22 bytes
+                        // OP_REASKCALLBACKTCP: [ip:4][port:2][file_hash:16] = 22 bytes.
+                        //
+                        // K9: this opcode tells us to direct a UDP reask at
+                        // `dest_ip:dest_port` on our buddy's behalf. Unlike
+                        // OP_CALLBACK it has no cryptographic check token
+                        // in the wire format. A malicious buddy could use it
+                        // to reflect UDP traffic at arbitrary hosts. Three
+                        // layered mitigations here:
+                        //   1. Require `dest_port != 0`.
+                        //   2. Refuse special-use / loopback / private IPs
+                        //      as destination (matches the rest of the
+                        //      codebase's `is_special_use_v4` policy).
+                        //   3. Rate-limit per buddy session via
+                        //      `reask_callback_budget` so a flood of these
+                        //      can't amplify our egress.
                         if payload.len() >= 22 {
                             let ip_bytes = [payload[0], payload[1], payload[2], payload[3]];
                             let dest_ip = Ipv4Addr::from(u32::from_le_bytes(ip_bytes));
                             let dest_port = u16::from_le_bytes([payload[4], payload[5]]);
                             let mut file_hash = [0u8; 16];
                             file_hash.copy_from_slice(&payload[6..22]);
-                            debug!(
-                                "Received OP_REASKCALLBACKTCP: {}:{} hash={}",
-                                dest_ip, dest_port, hex::encode(file_hash)
-                            );
-                            Some(BuddyEvent::ReaskCallback {
-                                dest_ip,
-                                dest_port,
-                                file_hash,
-                            })
+                            if dest_port == 0
+                                || crate::security::is_special_use_v4(dest_ip)
+                            {
+                                debug!(
+                                    "Rejecting OP_REASKCALLBACKTCP: bad dest {}:{}",
+                                    dest_ip, dest_port
+                                );
+                                None
+                            } else if reask_callback_budget == 0 {
+                                debug!(
+                                    "Rejecting OP_REASKCALLBACKTCP: per-session budget exhausted"
+                                );
+                                None
+                            } else {
+                                reask_callback_budget -= 1;
+                                debug!(
+                                    "Received OP_REASKCALLBACKTCP: {}:{} hash={} (budget remaining {})",
+                                    dest_ip, dest_port, hex::encode(file_hash), reask_callback_budget
+                                );
+                                Some(BuddyEvent::ReaskCallback {
+                                    dest_ip,
+                                    dest_port,
+                                    file_hash,
+                                })
+                            }
                         } else {
                             debug!("OP_REASKCALLBACKTCP too short ({} bytes)", payload.len());
                             None

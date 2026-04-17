@@ -140,16 +140,38 @@ impl IpFilter {
             "p2b" => self.load_p2b_file(path),
             "p2p" => self.load_p2p_file(path),
             _ => {
-                let content = match std::fs::read_to_string(path) {
-                    Ok(c) => c,
+                // K20: ipfilter.dat can legitimately be tens of MB and
+                // pathologically-large files (from buggy crawlers or
+                // malicious downloads) can be gigabytes. Read the file
+                // line-by-line with a hard per-line cap instead of
+                // slurping the whole thing into memory as a UTF-8
+                // String. A single oversized line gets dropped, not the
+                // entire file.
+                use std::io::BufRead;
+                let file = match std::fs::File::open(path) {
+                    Ok(f) => f,
                     Err(e) => {
-                        warn!("Failed to read ipfilter.dat: {e}");
+                        warn!("Failed to open ipfilter.dat: {e}");
                         return 0;
                     }
                 };
-
-                let mut count = 0;
-                for line in content.lines() {
+                const MAX_LINE_BYTES: usize = 8 * 1024; // 8 KiB per line.
+                const MAX_LINES: usize = 5_000_000;     // hard cap on parsed entries.
+                let reader = std::io::BufReader::new(file);
+                let mut count = 0usize;
+                let mut overlong_drops = 0usize;
+                for (lineno, line_res) in reader.lines().enumerate().take(MAX_LINES) {
+                    let line = match line_res {
+                        Ok(l) => l,
+                        Err(e) => {
+                            warn!("Stopping ipfilter.dat parse after I/O error at line {}: {e}", lineno + 1);
+                            break;
+                        }
+                    };
+                    if line.len() > MAX_LINE_BYTES {
+                        overlong_drops += 1;
+                        continue;
+                    }
                     let line = line.trim();
                     if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
                         continue;
@@ -161,6 +183,11 @@ impl IpFilter {
                         self.blocked_ranges.push(range);
                         count += 1;
                     }
+                }
+                if overlong_drops > 0 {
+                    warn!(
+                        "ipfilter.dat: dropped {overlong_drops} lines longer than {MAX_LINE_BYTES} bytes"
+                    );
                 }
 
                 self.blocked_ranges.sort_by_key(|r| r.start);

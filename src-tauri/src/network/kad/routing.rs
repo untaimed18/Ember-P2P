@@ -655,6 +655,9 @@ impl RoutingZone {
         }
     }
 
+    // K3: retained for future explicit-trust callers (tests, migration
+    // tools) now that the ambient load paths no longer mass-verify.
+    #[allow(dead_code)]
     fn set_all_contacts_verified(&mut self) {
         if let Some(bin) = &mut self.bin {
             for c in &mut bin.contacts {
@@ -876,6 +879,17 @@ impl RoutingTable {
             return false;
         }
 
+        // K1: keep the verified flag and contact_type consistent. A contact
+        // flagged `verified=true` must not also be `CONTACT_TYPE_NEW`,
+        // otherwise `get_closest_to` (max_type=2) would silently skip it
+        // when answering KadReq and starve peers of fresh bootstrap data.
+        // We promote to OPEN (type 2) — the weakest of the non-NEW types —
+        // which is what eMule assumes for a contact that's been verified
+        // at least once via bootstrap handshake.
+        if contact.verified && contact.contact_type == CONTACT_TYPE_NEW {
+            contact.contact_type = CONTACT_TYPE_OPEN;
+        }
+
         let distance = self.local_id.xor_distance(&contact.id);
 
         // Check if contact already exists -- handle update path
@@ -993,11 +1007,30 @@ impl RoutingTable {
     }
 
     pub fn remove(&mut self, id: &KadId) -> bool {
+        // K12: the XOR-distance fast path only works when the contact
+        // lives in the zone that matches its current XOR distance from
+        // `local_id`. After a RoutingZone split, an older contact can be
+        // referenced by stale lookups whose computed distance no longer
+        // matches the leaf bin where the contact was re-homed. We first
+        // try the fast path, then fall back to scanning every leaf so
+        // ghost contacts (e.g. from in-flight cleanup after a split) can
+        // always be removed.
         let distance = self.local_id.xor_distance(id);
-        let Some(bin) = self.root.find_bin_mut(&distance) else { return false; };
-        if let Some(removed) = bin.remove_contact(id) {
-            self.track_ip_remove(removed.ip);
-            return true;
+        if let Some(bin) = self.root.find_bin_mut(&distance) {
+            if let Some(removed) = bin.remove_contact(id) {
+                self.track_ip_remove(removed.ip);
+                return true;
+            }
+        }
+        let mut leaves: Vec<&mut RoutingZone> = Vec::new();
+        collect_leaves_mut(&mut self.root, &mut leaves);
+        for zone in leaves {
+            if let Some(bin) = zone.bin.as_mut() {
+                if let Some(removed) = bin.remove_contact(id) {
+                    self.track_ip_remove(removed.ip);
+                    return true;
+                }
+            }
         }
         false
     }
@@ -1115,6 +1148,8 @@ impl RoutingTable {
         self.root.find_bin_mut(&distance)?.get_contact_mut(id)
     }
 
+    // K3: kept for future explicit-trust callers; see RoutingZone counterpart.
+    #[allow(dead_code)]
     pub fn set_all_contacts_verified(&mut self) {
         self.root.set_all_contacts_verified();
     }

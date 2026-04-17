@@ -273,6 +273,14 @@ impl DhtStore {
         }
     }
 
+    /// Returns a 0-100 load percentage suitable for the KADEMLIA2_PUBLISH_RES
+    /// `byLoad` field. K16: eMule 0.50a's `CIndexed::SendPublishResponse`
+    /// computes this as `(m_uTotalIndexLoad * 100) / m_uMaxIndexLoad`,
+    /// i.e. a straight percentage capped at 100 — which is what this does.
+    /// Peers that treat load ≥ 100 as "skip this node for now" work
+    /// correctly against us because we never emit values above 100 here;
+    /// our receive-side handlers also treat `load >= 100` as an
+    /// informational bucket-full signal (see PublishRes handling).
     fn compute_load(&self) -> u8 {
         let ratio = self.total_count as f64 / MAX_TOTAL_ENTRIES as f64;
         (ratio * 100.0).min(100.0) as u8

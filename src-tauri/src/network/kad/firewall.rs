@@ -27,7 +27,12 @@ pub enum FirewallStatus {
 }
 
 pub struct FirewallChecker {
-    external_ip_votes: HashMap<Ipv4Addr, u32>,
+    /// Per-reported-IP: set of /24 networks of the voters who reported it.
+    /// K7: counting raw votes lets a Sybil cluster (or one attacker with
+    /// many spoofed source IPs) dominate external-IP confirmation.
+    /// Counting distinct /24s raises the bar — at least 3 different
+    /// networks must agree before we trust the reported IP.
+    external_ip_votes: HashMap<Ipv4Addr, HashSet<[u8; 3]>>,
     confirmed_external_ip: Option<Ipv4Addr>,
     tcp_status: FirewallStatus,
     udp_status: FirewallStatus,
@@ -120,8 +125,10 @@ impl FirewallChecker {
     /// Handle KADEMLIA_FIREWALLED_RES: a peer reports our external IP.
     /// This message arrives via UDP, so it only proves UDP connectivity --
     /// it does NOT indicate TCP is open (the separate TCP connect-back does).
-    /// The caller must validate the sender via is_firewall_check_ip() first.
-    pub fn handle_firewalled_response(&mut self, reported_ip: Ipv4Addr) {
+    /// The caller must validate the sender via is_firewall_check_ip() first
+    /// and pass the reporter's source IP so we can enforce distinct-voter
+    /// (distinct-/24) confirmation.
+    pub fn handle_firewalled_response(&mut self, reported_ip: Ipv4Addr, reporter: Ipv4Addr) {
         if reported_ip.is_private()
             || reported_ip.is_loopback()
             || reported_ip.is_unspecified()
@@ -131,27 +138,76 @@ impl FirewallChecker {
             debug!("Ignoring private/reserved external IP vote: {reported_ip}");
             return;
         }
-        *self.external_ip_votes.entry(reported_ip).or_insert(0) += 1;
+        // K7: require votes from distinct /24 networks. Sybil clusters
+        // (one attacker holding many IPs in the same /24, spoofed source
+        // IPs in a single subnet) can no longer set our external IP.
+        let reporter_octets = reporter.octets();
+        let reporter_net: [u8; 3] = [reporter_octets[0], reporter_octets[1], reporter_octets[2]];
+        self.external_ip_votes
+            .entry(reported_ip)
+            .or_insert_with(HashSet::new)
+            .insert(reporter_net);
 
-        let best_ip = self.external_ip_votes.iter()
-            .max_by_key(|(_, &count)| count)
+        let best_ip = self
+            .external_ip_votes
+            .iter()
+            .max_by_key(|(_, nets)| nets.len())
             .map(|(&ip, _)| ip);
 
         if let Some(ip) = best_ip {
-            let count = self.external_ip_votes[&ip];
-            if count >= MIN_IP_VOTES as u32 {
+            let distinct_nets = self.external_ip_votes[&ip].len();
+            if distinct_nets >= MIN_IP_VOTES {
                 if self.confirmed_external_ip != Some(ip) {
-                    info!("External IP confirmed: {ip} ({count} votes)");
+                    info!("External IP confirmed: {ip} ({distinct_nets} distinct-/24 votes)");
                 }
                 self.confirmed_external_ip = Some(ip);
             }
         }
 
         if self.external_ip_votes.len() > 1 {
-            let tally: Vec<String> = self.external_ip_votes.iter().map(|(ip, c)| format!("{}={}", ip, c)).collect();
-            info!("External IP votes disagree: [{}]", tally.join(", "));
+            let tally: Vec<String> = self
+                .external_ip_votes
+                .iter()
+                .map(|(ip, nets)| format!("{}={}", ip, nets.len()))
+                .collect();
+            info!("External IP votes disagree (distinct /24s): [{}]", tally.join(", "));
         } else {
-            debug!("External IP vote for {reported_ip} ({} total votes)", self.external_ip_votes.values().sum::<u32>());
+            debug!(
+                "External IP vote for {reported_ip} (distinct /24 voters: {})",
+                self.external_ip_votes
+                    .get(&reported_ip)
+                    .map(|s| s.len())
+                    .unwrap_or(0)
+            );
+        }
+    }
+
+    /// Trusted-source path: the ed2k server we're connected to told us our
+    /// HighID. The server is one reporter so distinct-/24 voting can't
+    /// apply, but we still treat it as confirmatory evidence alongside
+    /// any KAD-side `handle_firewalled_response` votes. If we already have
+    /// a conflicting KAD-confirmed IP we keep ours (the log message
+    /// records the disagreement).
+    pub fn handle_server_highid_response(&mut self, reported_ip: Ipv4Addr) {
+        if reported_ip.is_private()
+            || reported_ip.is_loopback()
+            || reported_ip.is_unspecified()
+            || reported_ip.is_broadcast()
+            || reported_ip.is_link_local()
+        {
+            return;
+        }
+        match self.confirmed_external_ip {
+            None => {
+                self.confirmed_external_ip = Some(reported_ip);
+                info!("External IP confirmed by ed2k server: {reported_ip}");
+            }
+            Some(existing) if existing == reported_ip => {}
+            Some(existing) => {
+                info!(
+                    "Ed2k server reports external IP {reported_ip} but KAD confirmed {existing}; keeping KAD-confirmed value"
+                );
+            }
         }
     }
 
@@ -268,7 +324,13 @@ impl FirewallChecker {
     }
 
     pub fn ip_vote_count(&self) -> u32 {
-        self.external_ip_votes.values().copied().max().unwrap_or(0)
+        // K7: votes are now keyed by distinct-/24 sets; return the max
+        // distinct-voter count across all reported IPs for diagnostics.
+        self.external_ip_votes
+            .values()
+            .map(|nets| nets.len() as u32)
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn external_udp_port(&self) -> Option<u16> {

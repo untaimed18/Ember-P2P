@@ -40,6 +40,12 @@ export interface KadContact {
 }
 
 export interface KadSearchEntry {
+  /** K33: the backend id is a Rust u64. In theory it could exceed JS
+   *  `Number.MAX_SAFE_INTEGER` (2^53 - 1), but the counter starts at 1 and
+   *  increments by 1 per search, so we'd need billions of searches/sec for
+   *  ~285 years to hit that. We keep the JSON-native `number` type here but
+   *  the cancel command takes a string so there's always a safe escape hatch.
+   */
   id: number;
   target: string;
   type: string;
@@ -51,6 +57,8 @@ export interface KadSearchEntry {
   packets_sent: number;
   request_answer: number;
   responses: number;
+  /** K30: unix seconds; UI derives "age" column from this. */
+  started_at: number;
 }
 
 export interface Transfer {

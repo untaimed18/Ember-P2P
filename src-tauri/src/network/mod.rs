@@ -862,14 +862,25 @@ pub enum NetworkCommand {
     KadBootstrapIp {
         ip: String,
         port: u16,
+        /// Result channel — `Ok(message)` with a human-readable success
+        /// string on completion, or `Err(message)` describing the failure.
+        /// Wire K0: the command must not return success until this
+        /// resolves, otherwise the UI shows "Bootstrapping…" for a
+        /// connection that never happened.
+        tx: oneshot::Sender<Result<String, String>>,
     },
     KadBootstrapUrl {
         url: String,
         host: String,
         resolved_addrs: Vec<std::net::SocketAddr>,
+        tx: oneshot::Sender<Result<String, String>>,
     },
     KadBootstrapClients {
         tx: oneshot::Sender<Result<usize, String>>,
+    },
+    /// K30: fire-and-forget cancellation of an active search by id.
+    CancelKadSearch {
+        id: u64,
     },
     RecheckFirewall {
         tx: oneshot::Sender<Result<usize, String>>,
@@ -1253,6 +1264,14 @@ struct NetworkState {
     callback_buddy_attempts: HashMap<([u8; 16], [u8; 16]), (u32, i64)>,
     /// Semaphore limiting concurrent outgoing TCP connections for firewall checks
     firewall_connect_semaphore: Arc<tokio::sync::Semaphore>,
+    /// K18: per-IP cooldown timestamps for incoming FirewalledReq. An
+    /// attacker with UDP spoof capability can send many FirewalledReq
+    /// packets that each trigger an outgoing TCP connect-back attempt
+    /// on our end (default 5s timeout, ~16 in flight). A simple 60s
+    /// per-IP cooldown + compact size cap blocks that amplification
+    /// without hurting legit peers (eMule only rechecks its firewall
+    /// status once an hour).
+    firewall_req_cooldown: HashMap<Ipv4Addr, i64>,
     /// Ember friends currently connected (ember_hash -> last_seen_timestamp)
     online_friends: HashMap<[u8; 16], i64>,
     /// Shared Ember session map for sending outbound packets to friend connections
@@ -1814,18 +1833,33 @@ fn kad_searches_snapshot(state: &NetworkState) -> Vec<KadSearchInfo> {
             } else {
                 search.results.len() as u32
             };
+            // K11: populate load_* from real search state so the UI can
+            // actually render a progress meter. Semantics match eMule's
+            // search-debugging columns as closely as the data permits:
+            //   load_total:    contacts that have been queried at all
+            //                  (i.e. whose outcome is known or pending).
+            //   load_response: contacts that actually responded during
+            //                  the lookup phase (verified alive).
+            //   load:          percentage of queried contacts that have
+            //                  answered — 0-100.
+            let queried = search.queried.len() as u32;
+            let responded = search.responded_during_lookup.len() as u32;
+            let pending = search.pending.len() as u32;
+            let load_total = queried.saturating_add(pending);
+            let load_pct = if queried == 0 { 0 } else { (responded * 100) / queried };
             KadSearchInfo {
                 id: sid.0,
                 target: search.target.to_hex(),
                 search_type: type_name.to_string(),
                 name,
                 status: if search.completed { "stopping".to_string() } else { "active".to_string() },
-                load: 0,
-                load_response: 0,
-                load_total: 0,
-                packets_sent: search.queried.len() as u32,
-                request_answer: search.pending.len() as u32,
+                load: load_pct,
+                load_response: responded,
+                load_total,
+                packets_sent: queried,
+                request_answer: pending,
                 responses,
+                started_at: search.started_at,
             }
         })
         .collect()
@@ -1987,10 +2021,32 @@ pub async fn start_network(
     let search_manager = SearchManager::new();
     let publish_manager = PublishManager::new(local_id, user_hash, tcp_port, udp_port);
 
-    // Load bootstrap contacts
+    // Load bootstrap contacts from the app's own nodes.dat.
+    // K3: if the file format is the older "no verified bit" variant we
+    // can safely trust its contents (the user saved it from a previous
+    // live session — not an attacker-supplied URL). For the modern
+    // format, respect the per-contact verified byte on the wire.
     let nodes_dat_path = data_dir.join("nodes.dat");
     let mut boot_contacts = if nodes_dat_path.exists() {
-        bootstrap::load_nodes_dat(&nodes_dat_path).unwrap_or_default()
+        match bootstrap::load_nodes_dat_with_format(&nodes_dat_path) {
+            Ok((mut cs, bootstrap::NodesDatFormat::LegacyNoVerified)) => {
+                for c in &mut cs {
+                    c.verified = true;
+                }
+                if !cs.is_empty() {
+                    info!(
+                        "Trusting {} contacts from legacy (no-verified-bit) on-disk nodes.dat",
+                        cs.len()
+                    );
+                }
+                cs
+            }
+            Ok((cs, bootstrap::NodesDatFormat::WithVerifiedBit)) => cs,
+            Err(e) => {
+                warn!("Failed to load nodes.dat: {e}");
+                Vec::new()
+            }
+        }
     } else {
         Vec::new()
     };
@@ -2049,12 +2105,14 @@ pub async fn start_network(
         routing_table.insert(contact);
     }
 
-    // eMule: if no contacts are verified (v0/v1 nodes.dat), mark all verified
-    // to speed up KAD bootstrapping.
-    if !boot_contacts.is_empty() && !boot_contacts.iter().any(|c| c.verified) {
-        routing_table.set_all_contacts_verified();
-        info!("Marked all loaded contacts as verified (old nodes.dat format)");
-    }
+    // K3: the earlier heuristic — "if no contact in the loaded file is
+    // verified, mass-promote them all" — runs per-file without the caller
+    // knowing whether the file format was capable of carrying verified
+    // bits. That meant a handcrafted file (including one fetched via URL
+    // bootstrap) could bypass verification entirely. We now gate this
+    // promotion on the real format version; see `load_local_nodes_dat`
+    // which does the load + format-aware promotion in one place for the
+    // on-disk file, and URL-bootstrap paths never take this shortcut.
 
     info!(
         "Routing table initialized with {} contacts",
@@ -2255,6 +2313,7 @@ pub async fn start_network(
         aich_root_map: HashMap::new(),
         callback_buddy_attempts: HashMap::new(),
         firewall_connect_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
+        firewall_req_cooldown: HashMap::new(),
         online_friends: HashMap::new(),
         ember_sessions: Arc::new(RwLock::new(HashMap::new())),
         upload_disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -5726,13 +5785,30 @@ pub async fn start_network(
                     }
                 }
 
+                // K4: files is capped by `max_keyword_per_cycle`, but each
+                // file can contain many keywords and each keyword starts a
+                // fresh DHT walk. A single pathological filename with
+                // dozens of tokens would fire dozens of parallel
+                // `StoreKeyword` searches per cycle — a self-DoS. Cap the
+                // *total* searches launched this cycle too so egress stays
+                // predictable regardless of tokenization.
+                let max_keyword_searches_per_cycle: usize =
+                    if !state.first_publish_done || state.publish_confirmed == 0 { 20 } else { 8 };
+                let mut keyword_searches_started: usize = 0;
                 let keyword_files = state.publish_manager.files_needing_keyword_publish()
                     .into_iter().take(max_keyword_per_cycle).cloned().collect::<Vec<_>>();
-                for file in &keyword_files {
+                'kwfiles: for file in &keyword_files {
                     let publishes = state.publish_manager.build_keyword_publishes(&file);
                     if publishes.is_empty() { continue; }
                     let mut any_started = false;
                     for (kw_hash, msg) in publishes {
+                        if keyword_searches_started >= max_keyword_searches_per_cycle {
+                            debug!(
+                                "Keyword publish cycle hit cap ({}); deferring remaining keywords",
+                                max_keyword_searches_per_cycle
+                            );
+                            break 'kwfiles;
+                        }
                         let closest = state.routing_table.find_closest_prefer_verified(&kw_hash, SEARCH_INITIAL_CONTACTS);
                         if closest.is_empty() { continue; }
                         let sid = state.search_manager.start_search(
@@ -5743,6 +5819,7 @@ pub async fn start_network(
                         if sid == SearchId(0) { continue; }
                         state.store_keyword_searches.insert(sid, (file.clone(), vec![(kw_hash, msg)]));
                         any_started = true;
+                        keyword_searches_started += 1;
                     }
                     if !any_started {
                         // No search started for any keyword — don't mark as published
@@ -9782,18 +9859,26 @@ pub async fn start_network(
                         } else {
                             search.results.len() as u32
                         };
+                        // K11: see `kad_searches_snapshot` for the same
+                        // computation — keep them in sync.
+                        let queried = search.queried.len() as u32;
+                        let responded = search.responded_during_lookup.len() as u32;
+                        let pending = search.pending.len() as u32;
+                        let load_total = queried.saturating_add(pending);
+                        let load_pct = if queried == 0 { 0 } else { (responded * 100) / queried };
                         KadSearchInfo {
                             id: sid.0,
                             target: search.target.to_hex(),
                             search_type: type_name.to_string(),
                             name,
                             status: if search.completed { "stopping".to_string() } else { "active".to_string() },
-                            load: 0,
-                            load_response: 0,
-                            load_total: 0,
-                            packets_sent: search.queried.len() as u32,
-                            request_answer: search.pending.len() as u32,
+                            load: load_pct,
+                            load_response: responded,
+                            load_total,
+                            packets_sent: queried,
+                            request_answer: pending,
                             responses,
+                            started_at: search.started_at,
                         }
                     })
                     .collect();
@@ -10113,6 +10198,14 @@ async fn send_kad_packet(
 /// value when we have no contact at that address, which is the common case
 /// for unsolicited publish requests. This stops a single IP from writing
 /// per-sender entries under arbitrary KAD IDs to poison the store.
+/// Identity we use for DHT store accounting when a publish arrives from a
+/// peer whose `claimed` `KadId` we can't cross-check against the routing
+/// table. K6: the previous behaviour was to trust the wire value, which
+/// let one IP rotate claimed IDs on every publish to occupy many logical
+/// publisher slots. We now derive a deterministic-but-unspoofable ID by
+/// hashing `(ip, port)` into the 128-bit KadId space so the same peer
+/// always resolves to the same synthetic identity regardless of what
+/// they claim on the wire.
 fn resolve_verified_sender_id(
     state: &NetworkState,
     from: SocketAddr,
@@ -10127,7 +10220,19 @@ fn resolve_verified_sender_id(
     {
         return c.id;
     }
-    *claimed
+    // Unknown sender — synthesize a stable ID from the socket pair.
+    // MD5 is enough here: we're hashing into an opaque 16-byte identity
+    // namespace, not making a cryptographic claim. Prefix distinguishes
+    // these synthetic IDs in logs / debug tools.
+    use digest::Digest;
+    let mut h = md5::Md5::new();
+    h.update(b"ember-kad-unknown-sender-v1");
+    h.update(v4.octets());
+    h.update(from.port().to_le_bytes());
+    let digest = h.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest);
+    KadId(bytes)
 }
 
 async fn send_kad_response(
@@ -10716,6 +10821,20 @@ async fn handle_udp_packet(
         return;
     }
 
+    // K21: per-IP zlib-decompression budget. A malicious peer can send
+    // compressed KAD packets all day and burn CPU on every one; the
+    // per-packet MAX_DECOMPRESSED_SIZE caps one shot but nothing caps
+    // aggregate throughput. Reject decompression when the IP is over its
+    // 10-packets/sec budget for compressed traffic specifically.
+    if data.first() == Some(&kad::messages::OP_KADEMLIAPACKEDPROT)
+        && state.flood_protection.over_compressed_budget(from.ip())
+    {
+        debug!(
+            "Dropping compressed KAD packet from {from}: per-IP decompression budget exhausted"
+        );
+        return;
+    }
+
     let mut packet_sender_udp_key: Option<KadUDPKey> = None;
     let mut packet_valid_receiver_key = false;
     let msg = match messages::decode_packet(data) {
@@ -10842,17 +10961,19 @@ async fn handle_udp_packet(
                 received_hello: false,
             });
 
-            // eMule: if routing table was empty before bootstrap, assume all contacts
-            // are verified to speed up the connecting process.
-            let assume_verified = state.routing_table.len() <= 1;
-
+            // K2: previously we blanket-marked every bootstrap-response
+            // contact as `verified` when the local routing table was
+            // empty. That let a single malicious bootstrap peer poison
+            // the routing table end-to-end at first launch. Now we insert
+            // them unverified and let the normal handshake / UDP-key
+            // exchange flow promote them. Up to the first 8 contacts get
+            // an immediate Hello via `contact_addrs` below to bootstrap
+            // liveness; the rest wait to be verified lazily as they're
+            // touched.
             let mut contact_addrs = Vec::new();
-            for mut c in contacts {
+            for c in contacts {
                 let addr = SocketAddr::new(c.ip.into(), c.udp_port);
                 contact_addrs.push(addr);
-                if assume_verified {
-                    c.verified = true;
-                }
                 state.routing_table.insert(c);
             }
 
@@ -11453,6 +11574,22 @@ async fn handle_udp_packet(
             // filters out keyword-publish acks (whose target is a keyword hash).
             if let Some(count) = state.source_publish_acks.get_mut(&target) {
                 *count = count.saturating_add(1);
+                // K15: use the reported load to adapt source republish
+                // frequency for this file hash. High load = back off.
+                state.publish_manager.record_source_publish_load(&target, load);
+            } else {
+                // K15: keyword publish path. The target is a keyword hash,
+                // not a file hash, so we route the feedback through the
+                // keyword-search → file mapping we keep in
+                // store_keyword_searches.
+                if let Some((file, _)) = state.store_keyword_searches
+                    .values()
+                    .find(|(_, entries)| entries.iter().any(|(kw, _)| *kw == target))
+                {
+                    state
+                        .publish_manager
+                        .record_keyword_publish_load(&file.file_hash, load);
+                }
             }
             // KAD v9+: acknowledge the PublishRes
             let ack = KadMessage::PublishResAck;
@@ -11486,12 +11623,19 @@ async fn handle_udp_packet(
                 }
                 dispatch_udp_firewall_probe_requests(state, settings);
             }
-            if let std::net::IpAddr::V4(v4) = from.ip() {
-                let contact_id = state.routing_table.all_contacts()
-                    .find(|c| c.ip == v4 && c.udp_port == from.port())
-                    .map(|c| c.id);
-                if let Some(contact) = contact_id {
-                    state.routing_table.mark_verified(&contact);
+            // K22: only promote a contact to verified when the Pong
+            // carried our correct per-receiver UDP key (proves the sender
+            // could decrypt/compose against our current key seed, not
+            // just that their source address is reachable). This matches
+            // eMule's own check before accepting an identity claim.
+            if packet_valid_receiver_key {
+                if let std::net::IpAddr::V4(v4) = from.ip() {
+                    let contact_id = state.routing_table.all_contacts()
+                        .find(|c| c.ip == v4 && c.udp_port == from.port())
+                        .map(|c| c.id);
+                    if let Some(contact) = contact_id {
+                        state.routing_table.mark_verified(&contact);
+                    }
                 }
             }
             // USS RTT measurement: if this Pong is from our USS ping target, compute RTT
@@ -11598,6 +11742,14 @@ async fn handle_udp_packet(
 
         KadMessage::PublishKeyReq { target, entries } => {
             if state.udp_firewalled {
+                // K14: we can't be a reliable DHT storage node while
+                // firewalled, but silently dropping publishes makes the
+                // publisher retry us forever. Send an explicit reject
+                // with load=100 so they mark us "done" and move on.
+                let res = KadMessage::PublishRes { target, load: 100 };
+                if let Ok(packet) = messages::encode_packet(&res) {
+                    let _ = send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key).await;
+                }
                 return;
             }
             if !state.dht_store.is_within_tolerance(&target) {
@@ -11634,6 +11786,12 @@ async fn handle_udp_packet(
 
         KadMessage::PublishSourceReq { target, sender_id, tags } => {
             if state.udp_firewalled {
+                // K14: see PublishKeyReq for the rationale; also emit a
+                // reject PublishRes so the publisher stops retrying us.
+                let res = KadMessage::PublishRes { target, load: 100 };
+                if let Ok(packet) = messages::encode_packet(&res) {
+                    let _ = send_kad_response(socket, &packet, from, state, Some(&sender_id), packet_sender_udp_key).await;
+                }
                 return;
             }
             // Bind the publishing identity to the UDP-authenticated contact
@@ -11665,6 +11823,11 @@ async fn handle_udp_packet(
 
         KadMessage::PublishNotesReq { target, sender_id, ref tags } => {
             if state.udp_firewalled {
+                // K14: emit a reject PublishRes so the publisher stops.
+                let res = KadMessage::PublishRes { target, load: 100 };
+                if let Ok(packet) = messages::encode_packet(&res) {
+                    let _ = send_kad_response(socket, &packet, from, state, Some(&sender_id), packet_sender_udp_key).await;
+                }
                 return;
             }
             let verified_sender_id = resolve_verified_sender_id(state, from, &sender_id);
@@ -11740,20 +11903,46 @@ async fn handle_udp_packet(
 
         KadMessage::FirewalledReq { tcp_port: peer_tcp_port } => {
             // Return the requester's external IP as we see it
-            let ip_raw = match from.ip() {
-                std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
+            let peer_ip = match from.ip() {
+                std::net::IpAddr::V4(v4) => v4,
                 _ => return,
             };
+            let ip_raw = u32::from_be_bytes(peer_ip.octets());
             let res = KadMessage::FirewalledRes { ip: ip_raw };
             if let Ok(packet) = messages::encode_packet(&res) {
                 let _ = send_kad_response(socket, &packet, from, state, None, packet_sender_udp_key).await;
             }
 
-            // Optionally try to connect back to their TCP port to verify they're reachable
-            let peer_ip = match from.ip() {
-                std::net::IpAddr::V4(v4) => v4,
-                _ => return,
-            };
+            // K18: per-IP cooldown for the (expensive) TCP connect-back.
+            // 60s is generous vs. eMule's 1-hour self-recheck cadence.
+            // Also reject special-use / port-0 / port-53 destinations
+            // so the connect-back path can't be abused as a reflective
+            // TCP probe at arbitrary private hosts or DNS resolvers.
+            const FIREWALL_REQ_COOLDOWN_SECS: i64 = 60;
+            const MAX_FIREWALL_REQ_COOLDOWN_ENTRIES: usize = 4096;
+            if peer_tcp_port == 0
+                || peer_tcp_port == 53
+                || crate::security::is_special_use_v4(peer_ip)
+            {
+                return;
+            }
+            let now = chrono::Utc::now().timestamp();
+            // Prune stale entries lazily to keep the map bounded.
+            if state.firewall_req_cooldown.len() >= MAX_FIREWALL_REQ_COOLDOWN_ENTRIES {
+                state
+                    .firewall_req_cooldown
+                    .retain(|_, ts| now - *ts < FIREWALL_REQ_COOLDOWN_SECS);
+            }
+            if let Some(prev) = state.firewall_req_cooldown.get(&peer_ip) {
+                if now - *prev < FIREWALL_REQ_COOLDOWN_SECS {
+                    debug!(
+                        "Skipping FirewalledReq connect-back to {peer_ip}: within {FIREWALL_REQ_COOLDOWN_SECS}s cooldown"
+                    );
+                    return;
+                }
+            }
+            state.firewall_req_cooldown.insert(peer_ip, now);
+
             if peer_tcp_port > 0 {
                 let tcp_addr = SocketAddr::new(peer_ip.into(), peer_tcp_port);
                 let fw_sem = state.firewall_connect_semaphore.clone();
@@ -11799,19 +11988,30 @@ async fn handle_udp_packet(
             }
             let external_ip = Ipv4Addr::from(ip.to_be_bytes());
             info!("FirewalledRes from {}: reports our IP as {}", sender_ip, external_ip);
-            state.firewall_checker.handle_firewalled_response(external_ip);
+            // K7: pass the reporter IP so the firewall checker can count
+            // distinct /24 networks instead of raw vote counts.
+            state.firewall_checker.handle_firewalled_response(external_ip, sender_ip);
 
+            // K8: only write state.external_ip once the firewall checker
+            // has confirmed it (≥3 distinct /24 voters). The prior
+            // "tentative" path let a single report write the global
+            // external_ip, which propagates through credits, friend
+            // payloads, logs — a Sybil-trivial vector. Downstream code
+            // that needs a best-effort IP can still read
+            // `firewall_checker.tentative_ip()` (see below) without
+            // mutating shared state.
             let prev_ip = state.external_ip;
             if let Some(confirmed) = state.firewall_checker.external_ip() {
                 state.external_ip = Some(confirmed);
                 state.stats.external_ip = confirmed.to_string();
                 if prev_ip != Some(confirmed) {
-                    info!("External IP changed: {:?} -> {} (KAD confirmed, {} votes)", prev_ip, confirmed, state.firewall_checker.ip_vote_count());
+                    info!(
+                        "External IP changed: {:?} -> {} (KAD confirmed, {} votes)",
+                        prev_ip,
+                        confirmed,
+                        state.firewall_checker.ip_vote_count()
+                    );
                 }
-            } else if state.external_ip.is_none() && !external_ip.is_unspecified() {
-                state.external_ip = Some(external_ip);
-                state.stats.external_ip = external_ip.to_string();
-                info!("External IP set tentatively to {} (single KAD response, unconfirmed)", external_ip);
             }
 
             if prev_ip.is_none() && state.external_ip.is_some() && state.nat_info.nat_type == ember::nat::NatType::Unknown {
@@ -12793,6 +12993,20 @@ async fn handle_command(
             let _ = tx.send(kad_searches_snapshot(state));
         }
 
+        NetworkCommand::CancelKadSearch { id } => {
+            // K30: release routing-table in-use refs first (so the
+            // contacts can be cleaned up normally) then drop the search.
+            let sid = crate::network::kad::search::SearchId(id);
+            if let Some(removed) = state.search_manager.remove(&sid) {
+                if !removed.in_use_ids.is_empty() {
+                    state.routing_table.release_contacts_in_use(&removed.in_use_ids);
+                }
+                info!("KAD search {id} cancelled by user");
+            } else {
+                debug!("KAD search {id} not found (already completed?) — ignoring cancel");
+            }
+        }
+
         NetworkCommand::IsFriendDiscoverable { tx } => {
             let _ = tx.send(state.rendezvous_registered);
         }
@@ -12939,18 +13153,22 @@ async fn handle_command(
                 .reset_big_timer_global(chrono::Utc::now().timestamp());
             let _ = app_handle.emit("network-status", NetworkStatus::Connecting);
 
-            // Reload routing table from saved nodes.dat (eMule recreates RoutingZone on Start)
+            // Reload routing table from saved nodes.dat (eMule recreates RoutingZone on Start).
+            // K3: trust the legacy on-disk format for convenience; the
+            // modern format carries per-contact verified bits which we
+            // respect as-is.
             let nodes_path = state.data_dir.join("nodes.dat");
             if state.routing_table.is_empty() {
                 if nodes_path.exists() {
-                    match bootstrap::load_nodes_dat(&nodes_path) {
-                        Ok(saved) => {
-                            let any_verified = saved.iter().any(|c| c.verified);
+                    match bootstrap::load_nodes_dat_with_format(&nodes_path) {
+                        Ok((mut saved, fmt)) => {
+                            if fmt == bootstrap::NodesDatFormat::LegacyNoVerified {
+                                for c in &mut saved {
+                                    c.verified = true;
+                                }
+                            }
                             for c in &saved {
                                 state.routing_table.insert(c.clone());
-                            }
-                            if !saved.is_empty() && !any_verified {
-                                state.routing_table.set_all_contacts_verified();
                             }
                             info!("Loaded {} contacts from nodes.dat on connect", saved.len());
                         }
@@ -13157,9 +13375,9 @@ async fn handle_command(
             info!("KAD fully disconnected — all activity stopped");
         }
 
-        NetworkCommand::KadBootstrapIp { ip, port } => {
+        NetworkCommand::KadBootstrapIp { ip, port, tx } => {
             info!("KAD bootstrap from IP {ip}:{port}");
-            if let Ok(addr_ip) = ip.parse::<Ipv4Addr>() {
+            let outcome: Result<String, String> = if let Ok(addr_ip) = ip.parse::<Ipv4Addr>() {
                 let contact = KadContact {
                     id: KadId::zero(),
                     ip: addr_ip,
@@ -13180,87 +13398,145 @@ async fn handle_command(
 
                 let addr = SocketAddr::new(addr_ip.into(), port);
                 let msg = KadMessage::BootstrapReq;
-                if let Ok(packet) = messages::encode_packet(&msg) {
-                    state.flood_protection.track_request(addr, 0x01);
-                    let _ = socket.send_to(&packet, addr).await;
-                    info!("Sent bootstrap request to {addr}");
-                }
-
-                if state.stats.status == NetworkStatus::Disconnected {
-                    state.stats.status = NetworkStatus::Connecting;
+                match messages::encode_packet(&msg) {
+                    Ok(packet) => {
+                        state.flood_protection.track_request(addr, 0x01);
+                        match socket.send_to(&packet, addr).await {
+                            Ok(_) => {
+                                info!("Sent bootstrap request to {addr}");
+                                if state.stats.status == NetworkStatus::Disconnected {
+                                    state.stats.status = NetworkStatus::Connecting;
+                                }
+                                Ok(format!(
+                                    "Bootstrap request sent to {addr} — contacts will appear as they respond"
+                                ))
+                            }
+                            Err(e) => Err(format!("Failed to send bootstrap packet: {e}")),
+                        }
+                    }
+                    Err(e) => Err(format!("Failed to encode bootstrap packet: {e}")),
                 }
             } else {
                 warn!("Invalid bootstrap IP: {ip}");
-            }
+                Err(format!("Invalid bootstrap IP: {ip}"))
+            };
+            let _ = tx.send(outcome);
         }
 
-        NetworkCommand::KadBootstrapUrl { url, host, resolved_addrs } => {
+        NetworkCommand::KadBootstrapUrl { url, host, resolved_addrs, tx } => {
             info!("KAD bootstrap from URL: {url}");
             const MAX_NODES_BYTES: usize = 10 * 1024 * 1024;
-            let client = match crate::security::build_pinned_client(&host, &resolved_addrs) {
-                Ok(c) => c,
-                Err(e) => { warn!("Failed to build HTTP client for {url}: {e}"); return; }
-            };
-            match client.get(&url).send().await {
-                Ok(resp) => {
-                    let download_result: Result<Vec<u8>, String> = {
-                        use futures::StreamExt;
-                        let mut body = Vec::new();
-                        let mut stream = resp.bytes_stream();
-                        let mut err: Option<String> = None;
-                        while let Some(chunk) = stream.next().await {
-                            match chunk {
-                                Ok(data) => {
-                                    body.extend_from_slice(&data);
-                                    if body.len() > MAX_NODES_BYTES {
-                                        err = Some("Response too large".into());
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    err = Some(format!("{e}"));
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(e) = err { Err(e) } else { Ok(body) }
-                    };
-                    match download_result {
-                        Ok(bytes) => {
-                            let tmp_dir = std::env::temp_dir();
-                            let tmp_path = tmp_dir.join(format!("ember-nodes-{}.dat", chrono::Utc::now().timestamp()));
-                            if let Err(e) = tokio::fs::write(&tmp_path, &bytes).await {
-                                warn!("Failed to write temp nodes.dat: {e}");
+            let outcome: Result<String, String> =
+                match crate::security::build_pinned_client(&host, &resolved_addrs) {
+                    Ok(client) => match client.get(&url).send().await {
+                        Ok(resp) => {
+                            if !resp.status().is_success() {
+                                Err(format!(
+                                    "HTTP {} from {}",
+                                    resp.status().as_u16(),
+                                    host
+                                ))
                             } else {
-                                match bootstrap::load_nodes_dat(&tmp_path) {
-                                    Ok(contacts) => {
-                                        let count = contacts.len();
-                                        for c in &contacts {
-                                            state.routing_table.insert(c.clone());
-                                        }
-                                        for contact in contacts.iter().take(20) {
-                                            let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
-                                            let msg = KadMessage::BootstrapReq;
-                                            if let Ok(packet) = messages::encode_packet(&msg) {
-                                                state.flood_protection.track_request(addr, 0x01);
-                                                let _ = socket.send_to(&packet, addr).await;
+                                let download_result: Result<Vec<u8>, String> = {
+                                    use futures::StreamExt;
+                                    let mut body = Vec::new();
+                                    let mut stream = resp.bytes_stream();
+                                    let mut err: Option<String> = None;
+                                    while let Some(chunk) = stream.next().await {
+                                        match chunk {
+                                            Ok(data) => {
+                                                body.extend_from_slice(&data);
+                                                if body.len() > MAX_NODES_BYTES {
+                                                    err = Some(format!(
+                                                        "Response exceeded {} byte cap",
+                                                        MAX_NODES_BYTES
+                                                    ));
+                                                    break;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                err = Some(format!("Download failed: {e}"));
+                                                break;
                                             }
                                         }
-                                        info!("Loaded {count} contacts from URL, bootstrapping");
-                                        if state.stats.status == NetworkStatus::Disconnected {
-                                            state.stats.status = NetworkStatus::Connecting;
+                                    }
+                                    if let Some(e) = err { Err(e) } else { Ok(body) }
+                                };
+                                match download_result {
+                                    Ok(bytes) => {
+                                        let tmp_dir = std::env::temp_dir();
+                                        let tmp_path = tmp_dir.join(format!(
+                                            "ember-nodes-{}.dat",
+                                            chrono::Utc::now().timestamp()
+                                        ));
+                                        match tokio::fs::write(&tmp_path, &bytes).await {
+                                            Err(e) => Err(format!(
+                                                "Failed to write temp nodes.dat: {e}"
+                                            )),
+                                            Ok(_) => {
+                                                let parse_res =
+                                                    bootstrap::load_nodes_dat(&tmp_path);
+                                                let _ = tokio::fs::remove_file(&tmp_path).await;
+                                                match parse_res {
+                                                    Err(e) => Err(format!(
+                                                        "Parsed {} bytes but file is not a valid nodes.dat: {e}",
+                                                        bytes.len()
+                                                    )),
+                                                    Ok(contacts) => {
+                                                        let count = contacts.len();
+                                                        if count == 0 {
+                                                            Err("Downloaded nodes.dat contained no contacts".into())
+                                                        } else {
+                                                            for c in &contacts {
+                                                                state.routing_table.insert(c.clone());
+                                                            }
+                                                            for contact in contacts.iter().take(20) {
+                                                                let addr = SocketAddr::new(
+                                                                    contact.ip.into(),
+                                                                    contact.udp_port,
+                                                                );
+                                                                let msg = KadMessage::BootstrapReq;
+                                                                if let Ok(packet) =
+                                                                    messages::encode_packet(&msg)
+                                                                {
+                                                                    state
+                                                                        .flood_protection
+                                                                        .track_request(addr, 0x01);
+                                                                    let _ = socket
+                                                                        .send_to(&packet, addr)
+                                                                        .await;
+                                                                }
+                                                            }
+                                                            info!(
+                                                                "Loaded {count} contacts from URL, bootstrapping"
+                                                            );
+                                                            if state.stats.status
+                                                                == NetworkStatus::Disconnected
+                                                            {
+                                                                state.stats.status =
+                                                                    NetworkStatus::Connecting;
+                                                            }
+                                                            Ok(format!(
+                                                                "Loaded {count} contacts from nodes.dat"
+                                                            ))
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
-                                    Err(e) => warn!("Failed to parse nodes.dat from URL: {e}"),
+                                    Err(e) => Err(e),
                                 }
-                                let _ = tokio::fs::remove_file(&tmp_path).await;
                             }
                         }
-                        Err(e) => warn!("Failed to read response from {url}: {e}"),
-                    }
-                }
-                Err(e) => warn!("Failed to download from {url}: {e}"),
+                        Err(e) => Err(format!("Failed to reach {host}: {e}")),
+                    },
+                    Err(e) => Err(format!("Failed to build HTTP client for {url}: {e}")),
+                };
+            if let Err(ref e) = outcome {
+                warn!("KAD bootstrap from {url} failed: {e}");
             }
+            let _ = tx.send(outcome);
         }
 
         NetworkCommand::KadBootstrapClients { tx } => {
@@ -13272,19 +13548,29 @@ async fn handle_command(
                 .cloned()
                 .collect();
             let send_count = contacts.len().min(20);
+            let mut actually_sent = 0usize;
             for contact in contacts.iter().take(send_count) {
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
+                // K17: the KadBootstrapIp path tracks outgoing bootstrap
+                // requests in flood_protection so we don't double-send.
+                // This bulk path didn't, meaning a rapid user-triggered
+                // rebootstrap could send duplicate BootstrapReqs to the
+                // same contact within the flood window — we'd then reject
+                // our own replies. Track every send here too.
+                state.flood_protection.track_request(addr, 0x01);
                 let msg = KadMessage::BootstrapReq;
                 if let Ok(packet) = messages::encode_packet(&msg) {
-                    let _ = socket.send_to(&packet, addr).await;
+                    if socket.send_to(&packet, addr).await.is_ok() {
+                        actually_sent += 1;
+                    }
                 }
             }
-            info!("Sent bootstrap requests to {send_count} connected contacts");
-            if state.stats.status == NetworkStatus::Disconnected && !contacts.is_empty() {
+            info!("Sent bootstrap requests to {actually_sent}/{send_count} connected contacts");
+            if state.stats.status == NetworkStatus::Disconnected && actually_sent > 0 {
                 state.stats.status = NetworkStatus::Connecting;
             }
-            let _ = tx.send(if send_count > 0 {
-                Ok(send_count)
+            let _ = tx.send(if actually_sent > 0 {
+                Ok(actually_sent)
             } else {
                 Err("No known contacts are available for bootstrap".to_string())
             });
@@ -15362,19 +15648,46 @@ fn parse_kad_search_expression(data: &[u8]) -> Option<KadSearchExpr> {
         return None;
     }
     let mut cursor = Cursor::new(data);
-    let expr = parse_kad_search_expression_node(&mut cursor).ok()?;
+    // K5: hostile peers can craft a deep left-leaning boolean expression
+    // in a ~64 KiB UDP packet; recursive descent would blow the stack.
+    // Cap both depth and total node count. eMule's own SearchKeyReq
+    // expressions are trivially small in practice (a few leaves).
+    let mut node_budget: u32 = 256;
+    let expr = parse_kad_search_expression_node(&mut cursor, 0, &mut node_budget).ok()?;
     if cursor.position() as usize != data.len() {
         return None;
     }
     Some(expr)
 }
 
-fn parse_kad_search_expression_node(cursor: &mut Cursor<&[u8]>) -> std::io::Result<KadSearchExpr> {
+/// Maximum nesting depth for a KAD search expression. Chosen so a legit
+/// `(a AND b AND c AND d AND ...)` of 32 conjuncts still parses but
+/// nothing remotely close to stack exhaustion is possible.
+const MAX_KAD_SEARCH_EXPR_DEPTH: u32 = 32;
+
+fn parse_kad_search_expression_node(
+    cursor: &mut Cursor<&[u8]>,
+    depth: u32,
+    node_budget: &mut u32,
+) -> std::io::Result<KadSearchExpr> {
+    if depth >= MAX_KAD_SEARCH_EXPR_DEPTH {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "search expression nested too deeply",
+        ));
+    }
+    if *node_budget == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "search expression exceeded node-count budget",
+        ));
+    }
+    *node_budget -= 1;
     match ReadBytesExt::read_u8(cursor)? {
         0x00 => {
             let op = ReadBytesExt::read_u8(cursor)?;
-            let left = Box::new(parse_kad_search_expression_node(cursor)?);
-            let right = Box::new(parse_kad_search_expression_node(cursor)?);
+            let left = Box::new(parse_kad_search_expression_node(cursor, depth + 1, node_budget)?);
+            let right = Box::new(parse_kad_search_expression_node(cursor, depth + 1, node_budget)?);
             match op {
                 0x00 => Ok(KadSearchExpr::And(left, right)),
                 0x01 => Ok(KadSearchExpr::Or(left, right)),
