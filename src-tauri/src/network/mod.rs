@@ -1141,9 +1141,29 @@ struct NetworkState {
     publish_confirmed: u32,
     /// Diagnostic counters for `PublishRes` packet accounting. These let
     /// the `Publish cycle:` log line surface exactly where packets are
-    /// being dropped. `wire` counts every inbound UDP packet whose raw
-    /// header byte + opcode byte look like PublishRes (0xE4 0x4B),
-    /// measured before rate-limit / validate_response / decode.
+    /// being dropped. Seen from newest (closest to the "packet leaves the
+    /// wire") to oldest (closest to the handler):
+    ///
+    /// - `publish_res_plain_seen`: raw inbound with `data[0]==0xE4 &&
+    ///   data[1]==0x4B`, counted **before** IP filter / rate limit /
+    ///   decompress / decrypt. Obfuscated responses look like ciphertext
+    ///   at byte 0 and are *not* counted here (they can't be — byte 1 is
+    ///   random). Use this to tell whether plain PublishRes even reach
+    ///   our socket.
+    /// - `publish_res_obf_decoded`: obfuscated UDP packets that
+    ///   successfully decrypt **and** decode as a `PublishRes`. Pairs
+    ///   with `obf_decoded_total` so you can see whether the drop is
+    ///   specific to PublishRes or general to our decrypt path.
+    /// - `obf_decoded_total`: any obfuscated UDP packet that decrypted
+    ///   and decoded. Baseline for the previous counter.
+    /// - `publish_res_wire`: `PublishRes` reached the decoded-message
+    ///   stage (plain or obfuscated), before `validate_response`.
+    /// - `publish_res_received`: handler entered, any load value.
+    /// - `publish_res_unmatched`: decoded but `validate_response` said
+    ///   unsolicited, OR handler couldn't match `publish_pending`.
+    publish_res_plain_seen: u64,
+    publish_res_obf_decoded: u64,
+    obf_decoded_total: u64,
     publish_res_wire: u64,
     publish_res_received: u64,
     publish_res_unmatched: u64,
@@ -2263,6 +2283,9 @@ pub async fn start_network(
         peer_nicknames: HashMap::new(),
         publish_pending: HashMap::new(),
         publish_confirmed: 0,
+        publish_res_plain_seen: 0,
+        publish_res_obf_decoded: 0,
+        obf_decoded_total: 0,
         publish_res_wire: 0,
         publish_res_received: 0,
         publish_res_unmatched: 0,
@@ -5752,9 +5775,13 @@ pub async fn start_network(
                 info!(
                     "Publish cycle: {total_files} files registered, {needing_source} need source publish, \
                      {needing_keyword} need keyword publish, {} confirmed, {} outstanding pending ack, \
-                     PublishRes wire={} received={} unmatched={}, firewalled={}, routing_table={}",
+                     PublishRes plain_seen={} obf_decoded={}/{} wire={} received={} unmatched={}, \
+                     firewalled={}, routing_table={}",
                     state.publish_confirmed,
                     state.publish_pending.len(),
+                    state.publish_res_plain_seen,
+                    state.publish_res_obf_decoded,
+                    state.obf_decoded_total,
                     state.publish_res_wire,
                     state.publish_res_received,
                     state.publish_res_unmatched,
@@ -10872,12 +10899,17 @@ async fn handle_udp_packet(
         _ => from,
     };
 
-    // (PublishRes `wire` counter was moved below `decode_packet` so it
-    // catches obfuscated replies too. Raw-byte sniffing at data[0..2]
-    // is blind to obfuscated packets — the first byte is ciphertext,
-    // not 0xE4 — so we'd undercount every peer that responds
-    // obfuscated, giving the false impression "no PublishRes arrives"
-    // when in reality they arrive encrypted.)
+    // PublishRes `plain_seen`: counted BEFORE any filtering (IP filter,
+    // ban list, rate limit, decrypt). Only matches the plain-text wire
+    // shape `[0xE4, 0x4B, ...]`. Obfuscated PublishRes cannot be
+    // recognised here (byte 1 is ciphertext) and is counted later via
+    // `publish_res_obf_decoded`. The point of this counter is to answer
+    // one question unambiguously: "did any plain PublishRes reach our
+    // socket at all?" If this stays at 0 while other plain traffic is
+    // flowing, the remote simply isn't sending them.
+    if data.len() >= 2 && data[0] == 0xE4 && data[1] == 0x4B {
+        state.publish_res_plain_seen = state.publish_res_plain_seen.saturating_add(1);
+    }
 
     // Security: IP filter and ban check
     if let std::net::IpAddr::V4(ipv4) = from.ip() {
@@ -10956,6 +10988,16 @@ async fn handle_udp_packet(
                 packet_valid_receiver_key = decrypted.valid_receiver_key;
                 match messages::decode_packet(&decrypted.payload) {
                     Ok(m) => {
+                        // Diagnostic: classify every successful decrypt+decode
+                        // so the `Publish cycle:` log can distinguish
+                        // "obfuscated path is broken" from "PublishRes
+                        // specifically is missing" from "remote never sent".
+                        state.obf_decoded_total =
+                            state.obf_decoded_total.saturating_add(1);
+                        if matches!(&m, KadMessage::PublishRes { .. }) {
+                            state.publish_res_obf_decoded =
+                                state.publish_res_obf_decoded.saturating_add(1);
+                        }
                         debug!("Decrypted obfuscated KAD packet from {from} ({} bytes)", data.len());
                         m
                     }
