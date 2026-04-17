@@ -119,10 +119,31 @@ impl LocalIndex {
     }
 
     pub fn get_by_hash(&self, hash: &str) -> Option<&FileInfo> {
-        self.hash_map
-            .get(hash)
-            .and_then(|indices| indices.first())
-            .and_then(|&idx| self.files.get(idx))
+        // When multiple shares have the same MD4 (e.g. the user re-added
+        // the same file from two folders), pick a deterministic winner
+        // rather than `indices.first()` (which depends on insertion order).
+        // Preference order: highest upload priority first, then shortest
+        // path so results don't flip between runs as folders rescan.
+        let indices = self.hash_map.get(hash)?;
+        let mut best: Option<&FileInfo> = None;
+        for &idx in indices {
+            let Some(candidate) = self.files.get(idx) else { continue };
+            best = Some(match best {
+                None => candidate,
+                Some(prev) => {
+                    let p_prev = crate::network::ed2k::upload::priority_weight(&prev.priority);
+                    let p_cand = crate::network::ed2k::upload::priority_weight(&candidate.priority);
+                    if p_cand > p_prev
+                        || (p_cand == p_prev && candidate.path.len() < prev.path.len())
+                    {
+                        candidate
+                    } else {
+                        prev
+                    }
+                }
+            });
+        }
+        best
     }
 
     pub fn get_by_path(&self, path: &str) -> Option<&FileInfo> {

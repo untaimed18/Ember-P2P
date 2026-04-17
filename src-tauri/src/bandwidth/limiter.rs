@@ -51,8 +51,8 @@ impl BandwidthLimiter {
             self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
             return;
         }
-        let undrained = self.drain_tokens(&self.upload_tokens, bytes, max).await;
-        self.total_uploaded.fetch_add(bytes - undrained, Ordering::Relaxed);
+        self.drain_tokens(&self.upload_tokens, bytes, max).await;
+        self.total_uploaded.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Acquire download bandwidth. Drains tokens in chunks if the piece is larger
@@ -63,28 +63,39 @@ impl BandwidthLimiter {
             self.total_downloaded.fetch_add(bytes, Ordering::Relaxed);
             return;
         }
-        let undrained = self.drain_tokens(&self.download_tokens, bytes, max).await;
-        self.total_downloaded.fetch_add(bytes - undrained, Ordering::Relaxed);
+        self.drain_tokens(&self.download_tokens, bytes, max).await;
+        self.total_downloaded.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Core token drain: takes as many tokens as available per iteration,
     /// waiting on a `Notify` signal when the bucket is empty instead of
     /// busy-polling. The refill task notifies after adding tokens.
-    /// Returns the number of bytes that could NOT be drained (0 on full success).
-    async fn drain_tokens(&self, tokens: &AtomicU64, mut remaining: u64, _max: u64) -> u64 {
-        let mut attempts = 0u32;
+    ///
+    /// Blocks until all `remaining` bytes are acquired. Removing the old
+    /// 6000-attempt give-up loop (which returned `remaining > 0` and let the
+    /// caller then send the bytes anyway, silently bypassing the rate cap
+    /// after ~10 minutes of sustained pressure).
+    ///
+    /// To avoid a runaway loop if the refill task dies or the limit is set
+    /// impossibly low, we log a single warning once the wait exceeds 60s
+    /// but keep waiting — shutdown is the caller's responsibility (upload
+    /// sessions already poll `network_disconnected`).
+    async fn drain_tokens(&self, tokens: &AtomicU64, mut remaining: u64, _max: u64) {
+        let start = std::time::Instant::now();
+        let mut warned_slow = false;
         while remaining > 0 {
-            attempts += 1;
-            if attempts > 6000 {
-                tracing::warn!("drain_tokens: exceeded max attempts, releasing");
-                return remaining;
-            }
             let current = tokens.load(Ordering::Acquire);
             if current == 0 {
                 tokio::time::timeout(
                     Duration::from_millis(100),
                     self.refill_notify.notified(),
                 ).await.ok();
+                if !warned_slow && start.elapsed() > Duration::from_secs(60) {
+                    warned_slow = true;
+                    tracing::warn!(
+                        "drain_tokens: waited >60s for bandwidth tokens (remaining={remaining}); check rate limit / refill task"
+                    );
+                }
                 continue;
             }
             let take = remaining.min(current);
@@ -102,7 +113,6 @@ impl BandwidthLimiter {
                 }
             }
         }
-        0
     }
 
     /// Add a fraction of the rate limit worth of tokens (called at sub-second intervals).

@@ -201,7 +201,7 @@
       } else {
         expandedSources = [...expandedSources, { ip: d.ip, port: d.port, status: d.status as SourceInfo['status'], queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software, peer_name: d.peer_name || '', available_parts: d.available_parts, total_parts: d.total_parts, country_code: d.country_code } as SourceInfo];
       }
-    }).then((u) => { if (mounted) sourceUnlisten = u; else u(); }).catch((e) => { console.error('Failed to subscribe to transfer-source-detail:', e); });
+    }).then((u) => { if (mounted) sourceUnlisten = u; else u(); }).catch(() => { /* backend may not be up yet; the store also listens for the same event */ });
 
     const searchUnsubs: (() => void)[] = [];
     listen<{ transfer_id: string; kind: string; count?: number }>('transfer:source-search', (event) => {
@@ -317,12 +317,33 @@
     return t.status === 'completed' || t.status === 'failed' || (t.status === 'active' && t.total_size > 0 && t.transferred >= t.total_size);
   }
   let activeUploads = $derived(allUploads.filter(t => !isUploadFinished(t) && t.status !== 'queued'));
-  let completedUploads = $derived(allUploads.filter(t => isUploadFinished(t)));
+  let completedUploads = $derived(allUploads.filter(t => isUploadFinished(t) && t.status !== 'failed'));
+  let failedUploads = $derived(allUploads.filter(t => t.status === 'failed'));
   let queuedUploads = $derived(allUploads.filter(t => t.status === 'queued'));
 
   // --- Bottom pane view tabs (eMule style) ---
   type BottomView = 'uploading' | 'on_queue' | 'download_clients';
-  let bottomView: BottomView = $state('uploading');
+  const BOTTOM_VIEW_KEY = 'transfers-bottom-view';
+  function loadBottomView(): BottomView {
+    try {
+      const v = localStorage.getItem(BOTTOM_VIEW_KEY);
+      if (v === 'uploading' || v === 'on_queue' || v === 'download_clients') return v;
+    } catch { /* ignore */ }
+    return 'uploading';
+  }
+  let bottomView: BottomView = $state(loadBottomView());
+  $effect(() => {
+    try { localStorage.setItem(BOTTOM_VIEW_KEY, bottomView); } catch { /* ignore */ }
+  });
+
+  // If "On Queue" is currently hidden (no queued rows — see below) but
+  // was the last active tab, snap to "Uploading" so the user doesn't see
+  // an empty pane with no highlighted tab button.
+  $effect(() => {
+    if (bottomView === 'on_queue' && queuedUploads.length === 0) {
+      bottomView = 'uploading';
+    }
+  });
 
   // --- Sorting ---
   type DlSortField = 'file_name' | 'total_size' | 'transferred' | 'completed_size' | 'speed' | 'progress' | 'sources' | 'priority' | 'status' | 'remaining' | 'last_seen_complete' | 'last_received' | 'category' | 'started_at';
@@ -358,6 +379,20 @@
   // Client-side EWMA speed tracker: computes speed from transferred-byte
   // deltas so the display works even when the backend reports speed=0.
   const speedHistory: Map<string, { ewma: number; lastTransferred: number; lastTime: number }> = new Map();
+
+  // Prune `speedHistory` entries for transfers that no longer exist in the
+  // store. Without this the map grows unbounded for the life of the page
+  // whenever the backend removes a transfer via an event path the UI's
+  // local `speedHistory.delete(...)` callers don't cover (e.g. backend
+  // finalise / retention policies, or peers dropping).
+  $effect(() => {
+    const liveIds = new Set($transfers.map((t) => t.id));
+    if (speedHistory.size > liveIds.size) {
+      for (const id of Array.from(speedHistory.keys())) {
+        if (!liveIds.has(id)) speedHistory.delete(id);
+      }
+    }
+  });
   const EWMA_ALPHA = 0.3;
   const SPEED_STALE_MS = 12_000;
 
@@ -400,7 +435,13 @@
         case 'total_size': cmp = a.total_size - b.total_size; break;
         case 'transferred': cmp = a.transferred - b.transferred; break;
         case 'completed_size': cmp = (a.completed_size || 0) - (b.completed_size || 0); break;
-        case 'speed': cmp = a.speed - b.speed; break;
+        case 'speed': {
+          // Match the row display: prefer EWMA `liveSpeed`, fall back to raw
+          // backend `t.speed` so sort order agrees with what's visible.
+          const la = liveSpeed(a), lb = liveSpeed(b);
+          cmp = (la > 0 ? la : a.speed) - (lb > 0 ? lb : b.speed);
+          break;
+        }
         case 'progress': cmp = a.progress - b.progress; break;
         case 'sources': cmp = a.sources - b.sources; break;
         case 'priority': cmp = (priorityOrder[a.priority] ?? 2) - (priorityOrder[b.priority] ?? 2); break;
@@ -449,6 +490,16 @@
       || (t.peer_id || '').toLowerCase().includes(query)
       || (t.client_software || '').toLowerCase().includes(query)
       || ulStatusLabel(t).toLowerCase().includes(query)
+    );
+  });
+  let filteredFailedUploads = $derived.by(() => {
+    const query = transferFilter.trim().toLowerCase();
+    if (!query) return failedUploads;
+    return failedUploads.filter((t) =>
+      t.file_name.toLowerCase().includes(query)
+      || (t.peer_name || '').toLowerCase().includes(query)
+      || (t.peer_id || '').toLowerCase().includes(query)
+      || (t.failure_reason || '').toLowerCase().includes(query)
     );
   });
   let filteredCompletedUploads = $derived.by(() => {
@@ -564,10 +615,19 @@
       .map((id) => allDownloads.find((x) => x.id === id))
       .filter((x): x is Transfer => x !== undefined);
   }
+  // Helper that prefers the EWMA-smoothed `liveSpeed` rate used for row
+  // cells, falling back to the raw `t.speed` value from the backend. Sort
+  // and totals need to agree with what the user sees in each row; using
+  // `t.speed` alone diverges when the backend reports 0 but bytes are
+  // still flowing (very common during brief scheduling gaps).
+  function displaySpeed(t: Transfer): number {
+    const live = liveSpeed(t);
+    return live > 0 ? live : (t.speed > 0 ? t.speed : 0);
+  }
   // Match eMule-style behavior: show rate when transfer data is actually flowing.
-  let totalDownloadRate = $derived(activeDownloads.reduce((sum, t) => sum + (t.speed > 0 ? t.speed : 0), 0));
-  let totalUploadRate = $derived(activeUploads.reduce((sum, t) => sum + (t.speed > 0 ? t.speed : 0), 0));
-  let transferringDownloads = $derived(activeDownloads.filter((t) => t.speed > 0).length);
+  let totalDownloadRate = $derived(activeDownloads.reduce((sum, t) => sum + displaySpeed(t), 0));
+  let totalUploadRate = $derived(activeUploads.reduce((sum, t) => sum + displaySpeed(t), 0));
+  let transferringDownloads = $derived(activeDownloads.filter((t) => displaySpeed(t) > 0).length);
   let totalKnownSources = $derived(activeDownloads.reduce((sum, t) => sum + (t.sources || 0), 0));
   let activeConnectedSources = $derived(activeDownloads.reduce((sum, t) => sum + (t.active_sources || 0) + (t.queued_sources || 0), 0));
 
@@ -578,7 +638,7 @@
       switch (ulSortField) {
         case 'peer_name': cmp = (a.peer_name || a.peer_id).localeCompare(b.peer_name || b.peer_id); break;
         case 'file_name': cmp = a.file_name.localeCompare(b.file_name); break;
-        case 'speed': cmp = a.speed - b.speed; break;
+        case 'speed': cmp = displaySpeed(a) - displaySpeed(b); break;
         case 'transferred': cmp = a.transferred - b.transferred; break;
         case 'waited': cmp = (a.wait_time || 0) - (b.wait_time || 0); break;
         case 'upload_time': cmp = (a.upload_time || 0) - (b.upload_time || 0); break;
@@ -651,7 +711,17 @@
         if (t.total_size > 0 && t.transferred >= t.total_size) return 'Complete';
         return 'Transferring';
       case 'completed': return 'Complete';
-      case 'failed': return 'Error';
+      case 'failed': {
+        const reason = (t.failure_reason || '').toLowerCase();
+        // Map common failure messages to short, human labels so the
+        // Completed / Failed section doesn't just say "Error" for every row.
+        if (reason.includes('timeout') || reason.includes('timed out')) return 'Timeout';
+        if (reason.includes('refused')) return 'Refused';
+        if (reason.includes('reset') || reason.includes('eof')) return 'Disconnected';
+        if (reason.includes('cancel')) return 'Cancelled';
+        if (reason.includes('hash') && reason.includes('mismatch')) return 'Bad data';
+        return 'Error';
+      }
       default: return t.status;
     }
   }
@@ -1325,7 +1395,13 @@
         if (t.total_size > 0 && t.transferred >= t.total_size) return 'Upload to this client completed';
         return 'Actively uploading data to this client';
       case 'completed': return 'Upload to this client completed';
-      case 'failed': return 'Upload to this client failed';
+      case 'failed': {
+        // Prefer the backend-supplied reason over a generic "failed" so the
+        // user can understand why an upload dropped out (timeout, refused,
+        // peer reset, hash mismatch, etc.).
+        const reason = t.failure_reason?.trim();
+        return reason ? `Upload failed: ${reason}` : 'Upload to this client failed';
+      }
       default: return t.status;
     }
   }
@@ -1749,11 +1825,21 @@
           class:active={bottomView === 'uploading'}
           onclick={() => bottomView = 'uploading'}
         >Uploading ({filteredActiveUploads.length})</button>
-        <button
-          class="tab-btn"
-          class:active={bottomView === 'on_queue'}
-          onclick={() => bottomView = 'on_queue'}
-        >On Queue ({filteredQueuedUploads.length})</button>
+        <!--
+          "On Queue" is hidden until the backend emits upload-queue events
+          (`UploadEventKind::Queued` / rank updates). Until then the table
+          would always be empty and misleading — the queued peer list lives
+          only inside the upload server task. Tracked as a follow-up. The
+          tab is still rendered when any queued upload rows do exist so a
+          future backend change light up the UI without a frontend edit.
+        -->
+        {#if filteredQueuedUploads.length > 0}
+          <button
+            class="tab-btn"
+            class:active={bottomView === 'on_queue'}
+            onclick={() => bottomView = 'on_queue'}
+          >On Queue ({filteredQueuedUploads.length})</button>
+        {/if}
         <button
           class="tab-btn"
           class:active={bottomView === 'download_clients'}
@@ -1876,9 +1962,39 @@
                 </tr>
               {/each}
             {/if}
+            {#if filteredFailedUploads.length > 0}
+              <tr class="section-divider-row failed-divider"><td colspan={ulColCount}>Failed ({filteredFailedUploads.length})</td></tr>
+              {#each filteredFailedUploads as t (t.id)}
+                <tr class="ul-row failed-row">
+                  {#each visibleUploadColumns as column (column.key)}
+                    {#if column.key === 'country'}
+                      <td class="flag-cell" title={t.country_code ?? ''}>{#if countryFlagSrc(t.country_code)}<img src={countryFlagSrc(t.country_code)} alt={t.country_code ?? ''} class="flag-img" />{/if}</td>
+                    {:else if column.key === 'peer_name'}
+                      <td class="client-cell" title={t.peer_name || t.peer_id}>{t.peer_name || t.peer_id || '\u2014'}</td>
+                    {:else if column.key === 'file_name'}
+                      <td class="name-cell" title={t.file_name}>{t.file_name}</td>
+                    {:else if column.key === 'client_software'}
+                      <td class="sw-cell" title={t.client_software || ''}>{t.client_software || '\u2014'}</td>
+                    {:else if column.key === 'speed'}
+                      <td class="num-cell">{'\u2014'}</td>
+                    {:else if column.key === 'transferred'}
+                      <td class="num-cell">{formatSize(t.transferred)}</td>
+                    {:else if column.key === 'total_size'}
+                      <td class="num-cell">{formatSize(t.total_size)}</td>
+                    {:else if column.key === 'upload_time'}
+                      <td class="num-cell">{formatDuration(t.upload_time)}</td>
+                    {:else if column.key === 'status'}
+                      <td class="status-cell"><span class="status-label st-failed" title={ulStatusTooltip(t)}>{ulStatusLabel(t)}</span></td>
+                    {:else if column.key === 'up_status'}
+                      <td class="bar-cell"><span class="no-bar">—</span></td>
+                    {/if}
+                  {/each}
+                </tr>
+              {/each}
+            {/if}
             {#if allUploads.length === 0}
               <tr><td colspan={ulColCount} class="empty-cell">No uploads</td></tr>
-            {:else if filteredActiveUploads.length === 0 && filteredCompletedUploads.length === 0}
+            {:else if filteredActiveUploads.length === 0 && filteredCompletedUploads.length === 0 && filteredFailedUploads.length === 0}
               <tr><td colspan={ulColCount} class="empty-cell">No uploads match this filter</td></tr>
             {/if}
           </tbody>

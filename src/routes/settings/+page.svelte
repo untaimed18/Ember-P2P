@@ -443,11 +443,11 @@
           <div class="field-row">
             <div class="field half">
               <label for="max-concurrent">Max Downloads</label>
-              <input id="max-concurrent" type="number" min="1" max="50" bind:value={settings.max_concurrent_downloads} />
+              <input id="max-concurrent" type="number" min="1" max="100" bind:value={settings.max_concurrent_downloads} />
             </div>
             <div class="field half">
               <label for="max-uploads">Max Uploads</label>
-              <input id="max-uploads" type="number" min="1" max="50" bind:value={settings.max_concurrent_uploads} />
+              <input id="max-uploads" type="number" min="1" max="100" bind:value={settings.max_concurrent_uploads} />
             </div>
           </div>
 
@@ -827,6 +827,22 @@
           </div>
         </div>
         <div class="card-body">
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Require Approval for Friend Requests</span>
+              <span class="hint">Always show incoming friend requests on the Friends page for explicit accept. When off, requests from peers you already added as a friend auto-confirm. Recommended on because the peer-supplied Ember Hash cannot yet be cryptographically verified.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.friend_require_approval} />
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Online Notifications</span>
+              <span class="hint">Show a toast when a friend comes online.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.friend_online_notifications} />
+          </div>
+
           <div class="field toggle-row">
             <div class="toggle-info">
               <span class="toggle-title">Disable Friend Chat</span>

@@ -2392,6 +2392,13 @@ pub async fn start_network(
     let shared_ember_payload: ember::SharedEmberPayload = Arc::new(RwLock::new(Arc::new(Vec::new())));
     let ember_payload_generation: ember::EmberPayloadGeneration = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+    // Upload queue shared between the upload listener (owner/writer) and
+    // the UDP reask-ack handler (reader that needs to answer the real queue
+    // rank for a peer pinging us over UDP). Holding the shared handle here
+    // avoids a placeholder 0 rank reply.
+    let upload_queue_handle: ed2k::upload::UploadQueueRef =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
     // Start the peer-to-peer upload listener (accepts incoming file requests from other KAD peers)
     {
         let ul_tx = ul_event_tx.clone();
@@ -2427,6 +2434,7 @@ pub async fn start_network(
         let ul_geoip = geoip.clone();
         let ul_ember_sessions = state.ember_sessions.clone();
         let ul_disconnected = state.upload_disconnected.clone();
+        let ul_queue = upload_queue_handle.clone();
         tokio::spawn(async move {
             if let Err(e) = upload_server::start_upload_server(
                 tcp_port,
@@ -2467,6 +2475,7 @@ pub async fn start_network(
                 ul_ember_sessions,
                 ember_hash,
                 ul_disconnected,
+                ul_queue,
             )
             .await
             {
@@ -2525,7 +2534,11 @@ pub async fn start_network(
     nodes_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut cache_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(5));
     cache_refresh_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut credit_save_timer = tokio::time::interval(std::time::Duration::from_secs(300));
+    // Persist credits every 60 s so a crash/OOM only loses the last minute
+    // of upload credit accumulation instead of the previous 5 minutes. Each
+    // save is a single DB transaction plus one atomic clients.met write,
+    // which is cheap enough to run at this cadence.
+    let mut credit_save_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     credit_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut a4af_timer = tokio::time::interval(std::time::Duration::from_secs(480));
     a4af_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -2851,6 +2864,8 @@ pub async fn start_network(
                             &settings,
                             &db,
                             &active_port_tests,
+                            &upload_queue_handle,
+                            &credit_manager,
                         ).await;
                     }
                     Err(e) => {
@@ -2878,6 +2893,8 @@ pub async fn start_network(
                             &settings,
                             &db,
                             &active_port_tests,
+                            &upload_queue_handle,
+                            &credit_manager,
                         ).await;
                             }
                         }
@@ -10481,6 +10498,8 @@ async fn handle_udp_packet(
     settings: &AppSettings,
     db: &Arc<Database>,
     active_port_tests: &Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, mpsc::Sender<()>>>>,
+    upload_queue: &ed2k::upload::UploadQueueRef,
+    credit_manager: &Arc<RwLock<CreditManager>>,
 ) {
     // Reject oversized packets (max 64 KiB for UDP)
     if data.len() > 65535 {
@@ -10540,11 +10559,25 @@ async fn handle_udp_packet(
                 };
 
                 if has_file {
-                    // Respond with OP_REASKACK and queue rank (0 = no queue, just alive)
+                    // Compute the peer's real queue rank from the shared
+                    // upload queue. If they're not currently queued (e.g.,
+                    // just granted a slot or dropped), fall back to 0 which
+                    // eMule-family clients interpret as "alive, not queued".
+                    let rank = ed2k::upload::udp_queue_rank_for_peer(
+                        upload_queue,
+                        credit_manager,
+                        local_index,
+                        from.ip(),
+                        &file_hash,
+                    )
+                    .await
+                    .unwrap_or(0);
                     let mut resp = vec![OP_EMULEPROT, ed2k::messages::OP_REASKACK];
-                    resp.extend_from_slice(&0u16.to_le_bytes());
+                    resp.extend_from_slice(&rank.to_le_bytes());
                     let _ = socket.send_to(&resp, from).await;
-                    debug!("Answered UDP reask from {from} for {hash_hex}: file available");
+                    debug!(
+                        "Answered UDP reask from {from} for {hash_hex}: file available, rank={rank}"
+                    );
                 } else {
                     let resp = vec![OP_EMULEPROT, ed2k::messages::OP_FILEREQANSNOFIL];
                     let _ = socket.send_to(&resp, from).await;
