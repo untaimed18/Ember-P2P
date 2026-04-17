@@ -70,14 +70,14 @@
   type SettingsSection = 'general' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'search';
   let activeSection: SettingsSection = $state('general');
 
-  const sections: Array<{ id: SettingsSection; label: string; icon: string }> = [
-    { id: 'general', label: 'General', icon: '\u2630' },
-    { id: 'downloads', label: 'Downloads', icon: '\u2193' },
-    { id: 'bandwidth', label: 'Bandwidth', icon: '\u2195' },
-    { id: 'network', label: 'Network', icon: '\u22EE' },
-    { id: 'security', label: 'Security', icon: '\uD83D\uDEE1' },
-    { id: 'friends', label: 'Friends', icon: '\uD83D\uDC65' },
-    { id: 'search', label: 'Search', icon: '\uD83D\uDD0D' },
+  const sections: Array<{ id: SettingsSection; label: string }> = [
+    { id: 'general', label: 'General' },
+    { id: 'downloads', label: 'Downloads' },
+    { id: 'bandwidth', label: 'Bandwidth' },
+    { id: 'network', label: 'Network' },
+    { id: 'security', label: 'Security' },
+    { id: 'friends', label: 'Friends' },
+    { id: 'search', label: 'Search' },
   ];
 
   let hasUnsavedChanges = $derived(settings ? JSON.stringify(settings) !== originalSettings : false);
@@ -267,7 +267,54 @@
             class:active={activeSection === section.id}
             onclick={() => activeSection = section.id}
           >
-            <span class="settings-nav-icon">{section.icon}</span>
+            <span class="settings-nav-icon" aria-hidden="true">
+              {#if section.id === 'general'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="3" y1="5.5" x2="17" y2="5.5"/>
+                  <line x1="3" y1="10" x2="17" y2="10"/>
+                  <line x1="3" y1="14.5" x2="17" y2="14.5"/>
+                </svg>
+              {:else if section.id === 'downloads'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="10" y1="3" x2="10" y2="13"/>
+                  <polyline points="6,9.5 10,13.5 14,9.5"/>
+                  <line x1="4" y1="17" x2="16" y2="17"/>
+                </svg>
+              {:else if section.id === 'bandwidth'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="7" y1="3" x2="7" y2="17"/>
+                  <polyline points="3.5,6.5 7,3 10.5,6.5"/>
+                  <line x1="13" y1="3" x2="13" y2="17"/>
+                  <polyline points="9.5,13.5 13,17 16.5,13.5"/>
+                </svg>
+              {:else if section.id === 'network'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="10" cy="4" r="2"/>
+                  <circle cx="4" cy="15" r="2"/>
+                  <circle cx="16" cy="15" r="2"/>
+                  <line x1="10" y1="6" x2="5" y2="13"/>
+                  <line x1="10" y1="6" x2="15" y2="13"/>
+                  <line x1="6" y1="15" x2="14" y2="15"/>
+                </svg>
+              {:else if section.id === 'security'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M10 2L3 6v4c0 4.4 3 8.5 7 10 4-1.5 7-5.6 7-10V6l-7-4z"/>
+                  <polyline points="7,10 9.5,12.5 13.5,7.5"/>
+                </svg>
+              {:else if section.id === 'friends'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="7" cy="6" r="3"/>
+                  <circle cx="14" cy="7" r="2.5"/>
+                  <path d="M1 17c0-3.3 2.7-6 6-6s6 2.7 6 6"/>
+                  <path d="M13 11.5c2.5 0 4.5 2 4.5 4.5"/>
+                </svg>
+              {:else if section.id === 'search'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="8.5" cy="8.5" r="5.5"/>
+                  <line x1="12.5" y1="12.5" x2="17" y2="17"/>
+                </svg>
+              {/if}
+            </span>
             <span>{section.label}</span>
           </button>
         {/each}
@@ -921,9 +968,25 @@
   }
 
   .settings-nav-icon {
-    width: 14px;
-    text-align: center;
-    opacity: 0.9;
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.85;
+    transition: opacity var(--transition-normal) ease, color var(--transition-normal) ease;
+  }
+
+  .settings-nav-icon :global(svg) {
+    width: 18px;
+    height: 18px;
+    display: block;
+  }
+
+  .settings-nav-item:hover .settings-nav-icon,
+  .settings-nav-item.active .settings-nav-icon {
+    opacity: 1;
   }
 
   .cards-grid {
