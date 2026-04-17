@@ -733,7 +733,17 @@ fn write_gap_tag(
     if use_large {
         w.write_u64::<LittleEndian>(value)?;
     } else {
-        w.write_u32::<LittleEndian>(value as u32)?;
+        // Don't silently truncate the gap offset. If the caller asked for the
+        // 32-bit format but the value doesn't fit, that indicates a caller
+        // bug (the file-size threshold for `use_large` was wrong) and
+        // writing a truncated value would corrupt the resume metadata.
+        let narrow = u32::try_from(value).map_err(|_| {
+            anyhow::anyhow!(
+                "gap offset {value} exceeds u32 range but use_large=false \
+                 — refusing to truncate resume data (gap_type={gap_type}, index={index})"
+            )
+        })?;
+        w.write_u32::<LittleEndian>(narrow)?;
     }
     Ok(())
 }

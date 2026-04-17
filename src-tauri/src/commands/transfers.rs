@@ -537,7 +537,19 @@ fn resolve_transfer_reveal_path(transfer: &Transfer, download_folder: &str) -> R
 #[cfg(windows)]
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
-    let raw = format!("/select,\"{}\"", path.display());
+    // NTFS paths cannot contain `"` but a crafted / non-NTFS path could.
+    // Reject it outright so we never interpolate user-controlled quote
+    // characters into the raw command line below.
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| "Path contains non-UTF8 characters".to_string())?;
+    if path_str.contains('"') || path_str.contains('\0') {
+        return Err("Path contains unsupported characters".to_string());
+    }
+    // explorer.exe doesn't understand \\?\-prefixed long paths — strip it so
+    // the /select, argument resolves against the user-visible namespace.
+    let clean = path_str.strip_prefix(r"\\?\").unwrap_or(path_str);
+    let raw = format!(r#"/select,"{clean}""#);
     std::process::Command::new("explorer")
         .raw_arg(raw)
         .spawn()

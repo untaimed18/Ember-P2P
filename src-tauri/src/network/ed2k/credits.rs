@@ -42,6 +42,41 @@ impl CreditRecord {
     }
 }
 
+/// SecIdent credit tracker.
+///
+/// ## Cryptographic threat model
+///
+/// SecIdent is **wire-compatible with eMule 0.50a**, and therefore uses the
+/// same parameters as the rest of the ecosystem:
+///
+/// - **RSA keys are 384 bits.** By modern standards this is well below the
+///   2048-bit minimum for strong signing keys. A motivated attacker with
+///   significant compute could potentially factor a captured public key and
+///   forge signatures, spoofing another peer's credit identity.
+/// - **Signatures use SHA-1** over the challenge material. SHA-1 is broken
+///   for collision resistance but only second-preimage attacks would matter
+///   here (signing a specific challenge); those are still infeasible.
+/// - **Keys are reused across sessions** (persisted in `cryptkey.dat`). Loss
+///   of the key file silently forfeits accumulated credits; access to the
+///   file lets anyone impersonate this node.
+///
+/// The practical impact is limited by what credits actually buy: upload
+/// queue priority in eMule-family clients. Forged SecIdent cannot read
+/// another peer's shared files, downgrade our own transfers, or intercept
+/// content — it can only let an attacker reap the slot advantage the
+/// legitimate peer built up.
+///
+/// We accept these parameters because:
+/// 1. Raising the key size or hash would break interop with every eMule
+///    peer we participate with — the whole point of this feature is the
+///    shared network-wide credit ledger.
+/// 2. The stronger security property ("no one downloads our files without
+///    paying") is provided by the upload slot / queue rules, not by
+///    SecIdent itself.
+///
+/// Do **not** rely on SecIdent for any property stronger than "this peer
+/// has the same cryptkey file it had last time". Everything that actually
+/// matters for file integrity is covered by MD4 part hashes and AICH.
 #[derive(ZeroizeOnDrop)]
 pub struct CreditManager {
     #[zeroize(skip)]
@@ -318,9 +353,12 @@ impl CreditManager {
             && record.ident_state == IdentState::Unknown
             && (record.uploaded > 0 || record.downloaded > 0)
         {
+            // Log only the user-hash prefix — the full 16-byte value is PII
+            // that can be correlated across sessions. 4 bytes is enough for a
+            // developer to correlate with a peer log entry.
             tracing::info!(
-                "Resetting credits for {} on first SecureIdent verification (was up={} down={})",
-                hex::encode(user_hash), record.uploaded, record.downloaded
+                "Resetting credits for peer {}\u{2026} on first SecureIdent verification (was up={} down={})",
+                &hex::encode(user_hash)[..8], record.uploaded, record.downloaded
             );
             record.uploaded = 1;
             record.downloaded = 1;

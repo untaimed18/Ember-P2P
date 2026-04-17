@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 
 use sha2::{Digest, Sha256};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -66,7 +66,15 @@ pub async fn register(base_url: &str, ember_hash: &[u8; 16], port: u16, external
         .await
         .map_err(|e| format!("rendezvous register failed: {e}"))?;
     if resp.status().is_success() {
-        info!("Rendezvous: registered {}… on port {} (ip={:?})", &id[..8], port, external_ip);
+        // Don't leak the hashed friend ID or our public IP at `info!` level:
+        // user-facing logs should not deanonymize the identity. Keep a terse
+        // success message at info and the identifying bits at debug.
+        info!("Rendezvous: registration succeeded on port {port}");
+        debug!(
+            "Rendezvous: registered {}… (ip={:?})",
+            &id[..8],
+            external_ip
+        );
         Ok(())
     } else {
         let status = resp.status();
@@ -97,17 +105,26 @@ pub async fn lookup(base_url: &str, friend_hash: &[u8; 16]) -> Result<Option<(Ip
     let ip_str = body["ip"].as_str().unwrap_or_default();
     let raw_port = body["port"].as_u64().unwrap_or_default();
     if raw_port == 0 || raw_port > u16::MAX as u64 {
-        warn!("Rendezvous: lookup for {}… returned invalid port: {}", &id[..8], raw_port);
+        debug!(
+            "Rendezvous: lookup for {}… returned invalid port: {}",
+            &id[..8],
+            raw_port
+        );
         return Ok(None);
     }
     let port = raw_port as u16;
     if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
         if port > 0 {
-            info!("Rendezvous: found {}… at {}:{}", &id[..8], ip, port);
+            // Friend IP/port is effectively PII — keep it at debug rather than
+            // info so it doesn't land in user-shared log bundles by default.
+            debug!("Rendezvous: found {}… at {}:{}", &id[..8], ip, port);
             return Ok(Some((ip, port)));
         }
     }
-    warn!("Rendezvous: lookup for {}… returned unparseable data: {}", &id[..8], body);
+    debug!(
+        "Rendezvous: lookup for {}… returned unparseable data",
+        &id[..8]
+    );
     Ok(None)
 }
 
@@ -122,7 +139,7 @@ pub async fn unregister(base_url: &str, ember_hash: &[u8; 16]) -> Result<(), Str
         .await
         .map_err(|e| format!("rendezvous unregister failed: {e}"))?;
     if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
-        info!("Rendezvous: unregistered {}…", &id[..8]);
+        debug!("Rendezvous: unregistered {}…", &id[..8]);
         Ok(())
     } else {
         let status = resp.status();

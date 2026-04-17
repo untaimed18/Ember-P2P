@@ -720,7 +720,19 @@ async fn write_ed2k_packet(
     opcode: u8,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    let length = (1 + payload.len()) as u32;
+    // The ed2k header length field is u32. In practice every packet we
+    // emit is well under that, but a `len as u32` silent truncation would
+    // produce a malformed packet that's ambiguous to the peer, so be explicit.
+    let length = u32::try_from(1usize.saturating_add(payload.len())).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "ed2k packet payload too large: {} bytes (max {})",
+                payload.len(),
+                u32::MAX - 1
+            ),
+        )
+    })?;
     writer.write_u8(protocol).await?;
     writer.write_u32_le(length).await?;
     writer.write_u8(opcode).await?;
@@ -730,7 +742,10 @@ async fn write_ed2k_packet(
 }
 
 fn build_emule_packet(opcode: u8, payload: &[u8]) -> Vec<u8> {
-    let len = (1 + payload.len()) as u32;
+    // u32::try_from only fails on 64-bit platforms if payload.len() > 4 GiB,
+    // which the rest of the stack never builds. saturate to u32::MAX on the
+    // off chance to avoid a hidden truncation bug.
+    let len = u32::try_from(1usize.saturating_add(payload.len())).unwrap_or(u32::MAX);
     let mut pkt = Vec::with_capacity(6 + payload.len());
     pkt.push(OP_EMULEPROT);
     pkt.extend_from_slice(&len.to_le_bytes());
