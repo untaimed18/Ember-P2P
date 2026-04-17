@@ -8759,7 +8759,11 @@ pub async fn start_network(
                                 } else {
                                     info!("Server HighID IP {} differs from current external IP {:?} — not overwriting", ext_ip, state.external_ip);
                                 }
-                                state.firewall_checker.handle_firewalled_response(ext_ip);
+                                // Server HighID is a single trusted report; route it
+                                // through the dedicated 1-arg path rather than the
+                                // KAD-peer-vote path (which requires a reporter IP
+                                // for distinct-/24 sybil protection).
+                                state.firewall_checker.handle_server_highid_response(ext_ip);
                                 if was_none && state.nat_info.nat_type == ember::nat::NatType::Unknown {
                                     info!("External IP discovered via server HighID — running initial NAT probe");
                                     state.nat_info = ember::nat::probe_nat(&udp_socket).await;

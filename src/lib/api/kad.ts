@@ -1,6 +1,28 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { NetworkStats, KadContact, KadSearchEntry } from '$lib/types';
 
+/**
+ * K24: wrap a Tauri invoke in a race against a deadline so the KAD UI
+ * doesn't hang indefinitely when the backend is wedged (e.g. blocked on
+ * a slow DNS resolution or a stuck oneshot receiver). Throws a normal
+ * `Error` with a recognisable message so the caller can show the user a
+ * "timed out, please try again" toast instead of a spinner that never
+ * resolves. 20 seconds is enough for legitimate slow ops (pinned HTTP
+ * download of a fresh nodes.dat, firewall recheck) but short enough
+ * that a hung IPC doesn't feel permanent.
+ */
+function withTimeout<T>(promise: Promise<T>, label: string, ms = 20_000): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`));
+    }, ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
 export async function getNetworkStats(): Promise<NetworkStats> {
   return invoke('get_network_stats');
 }

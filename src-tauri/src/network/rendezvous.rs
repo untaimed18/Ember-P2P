@@ -5,6 +5,12 @@ use tracing::{debug, info, warn};
 
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Hard byte cap on rendezvous responses. Payloads are always small JSON
+/// blobs (at most a few dozen bytes today); 64 KiB leaves orders of
+/// magnitude of headroom for future fields while still making us
+/// resistant to a hostile server that streams megabytes at us.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
 pub fn hashed_id(ember_hash: &[u8; 16]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(ember_hash);
