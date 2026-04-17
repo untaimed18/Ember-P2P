@@ -60,10 +60,12 @@
       case 3: // Storage
         return downloadFolder.trim().length > 0;
       case 4: // Network
+        // TCP and UDP are independent protocols and the OS keeps two
+        // separate port tables, so reusing the same number on both is
+        // fine — useful when a VPN only forwards a single port.
         return (
           tcpPort >= 1 && tcpPort <= 65535 &&
-          udpPort >= 1 && udpPort <= 65535 &&
-          tcpPort !== udpPort
+          udpPort >= 1 && udpPort <= 65535
         );
       default:
         return true;
