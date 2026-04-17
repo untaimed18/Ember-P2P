@@ -256,21 +256,7 @@ pub fn save_nodes_dat(path: &Path, contacts: &[KadContact]) -> anyhow::Result<()
         std::fs::create_dir_all(parent)?;
     }
 
-    let tmp_path = path.with_extension("dat.tmp");
-    {
-        let mut f = std::fs::File::create(&tmp_path)?;
-        std::io::Write::write_all(&mut f, &buf)?;
-        f.sync_all()?;
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        if cfg!(windows) {
-            std::fs::copy(&tmp_path, path)
-                .map_err(|e2| anyhow::anyhow!("copy fallback failed: {e2} (original rename: {e})"))?;
-            let _ = std::fs::remove_file(&tmp_path);
-        } else {
-            return Err(e.into());
-        }
-    }
+    crate::security::atomic_write(path, &buf, false)?;
     info!("Saved {} contacts to nodes.dat", contacts.len());
     Ok(())
 }

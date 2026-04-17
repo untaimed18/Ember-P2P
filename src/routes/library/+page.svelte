@@ -1310,10 +1310,14 @@
       mounted = false;
       destroyed = true;
       clearInterval(scanPoll);
-      if (refreshTimer) clearTimeout(refreshTimer);
+      if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
       if (commentSaveTimer) {
         clearTimeout(commentSaveTimer);
         commentSaveTimer = null;
+      }
+      if (commentFetchTimer) {
+        clearTimeout(commentFetchTimer);
+        commentFetchTimer = null;
       }
       dragCleanup?.();
       for (const u of unlisteners) u();

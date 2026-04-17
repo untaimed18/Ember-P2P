@@ -1472,10 +1472,7 @@ async fn flush_credit_state(
             debug!("Failed to create clients.met backup: {e}");
         }
     }
-    let tmp_path = data_dir.join("clients.met.tmp");
-    if let Err(e) = std::fs::write(&tmp_path, &serialized_bytes) {
-        debug!("Failed to write clients.met.tmp: {e}");
-    } else if let Err(e) = std::fs::rename(&tmp_path, &clients_met) {
+    if let Err(e) = crate::security::atomic_write(&clients_met, &serialized_bytes, false) {
         debug!("Failed to finalize clients.met: {e}");
     }
 
@@ -10031,6 +10028,30 @@ async fn send_kad_packet(
     result
 }
 
+/// Resolve the KAD id to trust for a store-side operation. We prefer the
+/// KAD id already in our routing table for the source IP:port, because that
+/// entry was either added after a successful Hello (verified path) or from
+/// nodes.dat (booted from disk). We only fall back to the wire `claimed`
+/// value when we have no contact at that address, which is the common case
+/// for unsolicited publish requests. This stops a single IP from writing
+/// per-sender entries under arbitrary KAD IDs to poison the store.
+fn resolve_verified_sender_id(
+    state: &NetworkState,
+    from: SocketAddr,
+    claimed: &KadId,
+) -> KadId {
+    let v4 = match from.ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        _ => return *claimed,
+    };
+    if let Some(c) = state.routing_table.all_contacts()
+        .find(|c| c.ip == v4 && c.udp_port == from.port())
+    {
+        return c.id;
+    }
+    *claimed
+}
+
 async fn send_kad_response(
     socket: &UdpSocket,
     packet: &[u8],
@@ -11510,11 +11531,17 @@ async fn handle_udp_packet(
             if state.udp_firewalled {
                 return;
             }
+            // Bind the publishing identity to the UDP-authenticated contact
+            // (IP:port). Trusting the wire sender_id lets an attacker poison
+            // the storage index with arbitrary per-publisher keys; the routing
+            // table match is only honoured when sender_id also matches the
+            // entry we have for that address.
+            let verified_sender_id = resolve_verified_sender_id(state, from, &sender_id);
             if !state.dht_store.is_within_tolerance(&target) {
                 debug!("PublishSourceReq for {target} rejected - outside tolerance zone");
                 let res = KadMessage::PublishRes { target, load: 100 };
                 if let Ok(packet) = messages::encode_packet(&res) {
-                    let _ = send_kad_response(socket, &packet, from, state, Some(&sender_id), packet_sender_udp_key).await;
+                    let _ = send_kad_response(socket, &packet, from, state, Some(&verified_sender_id), packet_sender_udp_key).await;
                 }
             } else {
                 let sender_ip = match from.ip() {
@@ -11522,17 +11549,29 @@ async fn handle_udp_packet(
                     _ => return,
                 };
                 let load = state.dht_store.store_source_entry(
-                    &target, sender_id, tags, sender_ip, from.port(),
+                    &target, verified_sender_id, tags, sender_ip, from.port(),
                 );
                 let res = KadMessage::PublishRes { target, load };
                 if let Ok(packet) = messages::encode_packet(&res) {
-                    let _ = send_kad_response(socket, &packet, from, state, Some(&sender_id), packet_sender_udp_key).await;
+                    let _ = send_kad_response(socket, &packet, from, state, Some(&verified_sender_id), packet_sender_udp_key).await;
                 }
             }
         }
 
         KadMessage::PublishNotesReq { target, sender_id, ref tags } => {
             if state.udp_firewalled {
+                return;
+            }
+            let verified_sender_id = resolve_verified_sender_id(state, from, &sender_id);
+            // Tolerance check FIRST: if we're not responsible for this hash we
+            // must not absorb the comment into our local view either. Letting
+            // peers dump arbitrary per-hash comments into our UI without the
+            // tolerance gate makes us a spam/comment-poisoning amplifier.
+            if !state.dht_store.is_within_tolerance(&target) {
+                let res = KadMessage::PublishRes { target, load: 100 };
+                if let Ok(packet) = messages::encode_packet(&res) {
+                    let _ = send_kad_response(socket, &packet, from, state, Some(&verified_sender_id), packet_sender_udp_key).await;
+                }
                 return;
             }
             let mut note_rating = 0u8;
@@ -11554,23 +11593,16 @@ async fn handle_udp_packet(
             }
             if note_rating > 0 || !note_comment.is_empty() {
                 let hash_hex = target.to_hex();
-                let peer_name = sender_id.to_hex()[..8].to_string();
+                let peer_name = verified_sender_id.to_hex()[..8].to_string();
                 use ed2k::comments::rating_name;
                 debug!("Received peer note for {}: rating={} ({})", hash_hex, note_rating, rating_name(note_rating));
                 state.comment_manager.write().await.add_peer_comment(&hash_hex, peer_name, note_rating, note_comment, 1);
             }
             let tags_owned = tags.clone();
-            if !state.dht_store.is_within_tolerance(&target) {
-                let res = KadMessage::PublishRes { target, load: 100 };
-                if let Ok(packet) = messages::encode_packet(&res) {
-                    let _ = send_kad_response(socket, &packet, from, state, Some(&sender_id), packet_sender_udp_key).await;
-                }
-            } else {
-                let load = state.dht_store.store_notes_entry(&target, sender_id, tags_owned);
-                let res = KadMessage::PublishRes { target, load };
-                if let Ok(packet) = messages::encode_packet(&res) {
-                    let _ = send_kad_response(socket, &packet, from, state, Some(&sender_id), packet_sender_udp_key).await;
-                }
+            let load = state.dht_store.store_notes_entry(&target, verified_sender_id, tags_owned);
+            let res = KadMessage::PublishRes { target, load };
+            if let Ok(packet) = messages::encode_packet(&res) {
+                let _ = send_kad_response(socket, &packet, from, state, Some(&verified_sender_id), packet_sender_udp_key).await;
             }
         }
 

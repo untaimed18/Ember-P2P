@@ -281,10 +281,29 @@ impl KnownFileList {
 
     /// eMule-compatible lookup: match by filename, size, and modified time.
     /// Used when file paths aren't available (e.g. after loading from known.met).
+    ///
+    /// Safety: when multiple stored records share the same (name, size, mtime)
+    /// tuple we intentionally return `None` rather than pick an arbitrary one.
+    /// Returning the wrong record here would attribute a file's hash/AICH to
+    /// the wrong path on disk, causing uploads/downloads to serve corrupted
+    /// data. The next indexer pass will rehash the file and re-establish a
+    /// unique association via `path_index`.
+    ///
+    /// TODO: persist an inode/NtfsFileID discriminator alongside the record
+    /// so ambiguous matches can be resolved without a rehash. Requires a
+    /// known.met format-version bump (add a new tag).
     pub fn find_by_name_and_meta(&self, name: &str, size: u64, mtime: i64) -> Option<&KnownFileRecord> {
-        self.files.values().find(|r| {
+        let mut matches = self.files.values().filter(|r| {
             r.file_name == name && r.file_size == size && r.modified_at == mtime
-        })
+        });
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            warn!(
+                "known.met: ambiguous match for {name} ({size} bytes, mtime {mtime}); rehashing"
+            );
+            return None;
+        }
+        Some(first)
     }
 
     pub fn find_by_hash(&self, hash: &[u8; 16]) -> Option<&KnownFileRecord> {
@@ -414,9 +433,7 @@ impl KnownFileList {
             buf.write_all(&tags)?;
         }
 
-        let tmp_path = path.with_extension("met.tmp");
-        std::fs::write(&tmp_path, &buf)?;
-        std::fs::rename(&tmp_path, path)?;
+        crate::security::atomic_write(path, &buf, false)?;
         self.dirty = false;
         if let Err(e) = self.save_path_index(&path.with_file_name("known_paths.dat")) {
             warn!("Failed to save known_paths.dat: {e}");
@@ -505,9 +522,7 @@ impl KnownFileList {
             buf.write_all(&pb[..len])?;
             buf.write_all(hash)?;
         }
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &buf)?;
-        std::fs::rename(&tmp, path)?;
+        crate::security::atomic_write(path, &buf, false)?;
         Ok(())
     }
 }

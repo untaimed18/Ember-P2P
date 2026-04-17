@@ -13,6 +13,16 @@ use crate::network::kad::types::KadId;
 /// Persistent node identity, equivalent to eMule's preferencesKad.dat + preferences.dat.
 /// The KAD ID and user hash are generated once and reused across sessions so other
 /// nodes recognize us in their routing tables and credit systems.
+///
+/// Security notes:
+/// - On-disk layout is plaintext JSON but written via `security::atomic_write`
+///   with `restrict=true`, which applies mode 0o600 on Unix and a Windows ACL
+///   limiting access to the current user (see `restrict_file_permissions`).
+/// - TODO (release hardening): encrypt at rest using a per-user OS keyring.
+///   On Windows: DPAPI (`CryptProtectData` / `CryptUnprotectData`) scoped to the
+///   current user. On macOS: Keychain. On Linux: Secret Service / libsecret.
+///   The identity is not a cryptographic secret that rotates, but leaking
+///   `user_hash` / `ember_hash` deanonymizes the node across sessions.
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct NodeIdentity {
     pub kad_id: [u8; 16],
@@ -158,6 +168,10 @@ impl NodeIdentity {
                         if let Err(bak_err) = std::fs::rename(&path, &bak) {
                             tracing::warn!("Failed to backup corrupt identity.json: {bak_err}");
                         } else {
+                            // The moved-aside file retains its original 0o600/ACL
+                            // on Unix/Windows, but re-apply defensively in case
+                            // filesystem semantics differ on the destination.
+                            crate::security::restrict_file_permissions(&bak);
                             tracing::info!("Backed up corrupt identity to {}", bak.display());
                         }
                     }
@@ -172,9 +186,7 @@ impl NodeIdentity {
         let id = Self::generate();
         let data = serde_json::to_string_pretty(&id)?;
         std::fs::create_dir_all(data_dir)?;
-        let tmp_path = path.with_extension("json.tmp");
-        crate::security::write_file_restricted(&tmp_path, data.as_bytes())?;
-        std::fs::rename(&tmp_path, &path)?;
+        crate::security::atomic_write(&path, data.as_bytes(), true)?;
         info!("Generated new identity (KAD ID={}…)", &hex::encode(id.kad_id)[..4]);
         Ok(id)
     }

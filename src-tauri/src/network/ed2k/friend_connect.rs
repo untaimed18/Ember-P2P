@@ -268,10 +268,37 @@ pub async fn open_and_run_friend_session(
         const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(90);
         let mut last_activity = tokio::time::Instant::now();
 
+        // Dedicated reader task: reading an ed2k packet requires multiple
+        // sequential awaits (protocol byte, length, opcode, payload). If the
+        // outer tokio::select! cancelled the read mid-packet, we'd desync the
+        // stream. Spawning a reader task keeps the framing state private and
+        // only surfaces whole packets (or errors) through a channel, which is
+        // cancel-safe at the select! site.
+        let (pkt_tx, mut pkt_rx) = tokio::sync::mpsc::channel::<std::io::Result<(u8, u8, Vec<u8>)>>(8);
+        let reader_task = tokio::spawn(async move {
+            loop {
+                let res = read_packet_inner(&mut reader).await;
+                let is_err = res.is_err();
+                if pkt_tx.send(res).await.is_err() {
+                    break;
+                }
+                if is_err {
+                    break;
+                }
+            }
+        });
+
         loop {
             let keepalive = tokio::time::sleep_until(last_activity + KEEPALIVE_INTERVAL);
             tokio::select! {
-                result = read_packet_inner(&mut reader) => {
+                result = pkt_rx.recv() => {
+                    let result = match result {
+                        Some(r) => r,
+                        None => {
+                            debug!("Friend session reader task from {addr} ended");
+                            break;
+                        }
+                    };
                     match result {
                         Ok((proto, opcode, payload)) => {
                             last_activity = tokio::time::Instant::now();
@@ -356,6 +383,9 @@ pub async fn open_and_run_friend_session(
                 }
             }
         }
+
+        reader_task.abort();
+        let _ = reader_task.await;
 
         {
             let mut sessions = session_ember_sessions.write().await;

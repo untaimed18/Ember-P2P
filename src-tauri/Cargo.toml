@@ -74,4 +74,7 @@ notify-debouncer-mini = { version = "0.7", default-features = false }
 strip = true
 lto = true
 codegen-units = 1
-panic = "abort"
+# Unwind on panic so tokio task panics surface via JoinHandle instead of
+# killing the whole process. A single malformed network packet or corrupt
+# file should never take down a long-running P2P client.
+panic = "unwind"

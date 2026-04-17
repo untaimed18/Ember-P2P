@@ -51,12 +51,33 @@ impl SharedFoldersWatcher {
         // synchronous `setup` hook, which is not itself running inside a
         // Tokio reactor context.
         tauri::async_runtime::spawn(async move {
+            // Upper bound on total time we'll defer a rescan while new events
+            // keep arriving. Without this, a long-running bulk copy that emits
+            // a steady trickle of events could starve the reload indefinitely.
+            const MAX_COALESCE_WINDOW: Duration = Duration::from_secs(15);
+            const COALESCE_COOLDOWN: Duration = Duration::from_millis(400);
+
             while reload_rx.recv().await.is_some() {
+                let first_event = std::time::Instant::now();
                 while reload_rx.try_recv().is_ok() {}
-                // Small cooldown on top of notify's debounce to let a burst
-                // of related file operations (e.g. a drag-copy) settle.
-                tokio::time::sleep(Duration::from_millis(400)).await;
+                tokio::time::sleep(COALESCE_COOLDOWN).await;
                 while reload_rx.try_recv().is_ok() {}
+
+                // If more events arrived during the cooldown, coalesce them
+                // but stop deferring once we've been holding the rescan for
+                // longer than MAX_COALESCE_WINDOW.
+                loop {
+                    let elapsed = first_event.elapsed();
+                    if elapsed >= MAX_COALESCE_WINDOW {
+                        break;
+                    }
+                    match tokio::time::timeout(COALESCE_COOLDOWN, reload_rx.recv()).await {
+                        Ok(Some(_)) => {
+                            while reload_rx.try_recv().is_ok() {}
+                        }
+                        _ => break,
+                    }
+                }
 
                 info!("FS watcher: triggering shared-folder rescan");
                 let _ = app_for_handler.emit(

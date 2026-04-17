@@ -516,21 +516,17 @@ const KNOWN2_MET_VERSION: u8 = 0x02;
 /// Format: version(u8) + repeated [master_hash(20) + hash_count(u32) + hashes(20*count)]
 pub fn save_known2_met(path: &std::path::Path, hash_sets: &[AICHRecoveryHashSet]) -> std::io::Result<()> {
     use std::io::Write;
-    let tmp_path = path.with_extension("met.tmp");
-    let mut file = std::fs::File::create(&tmp_path)?;
-    file.write_all(&[KNOWN2_MET_VERSION])?;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.write_all(&[KNOWN2_MET_VERSION])?;
     for hs in hash_sets {
-        file.write_all(&hs.root_hash)?;
+        buf.write_all(&hs.root_hash)?;
         let count = hs.leaf_hashes.len() as u32;
-        file.write_all(&count.to_le_bytes())?;
+        buf.write_all(&count.to_le_bytes())?;
         for leaf in &hs.leaf_hashes {
-            file.write_all(leaf)?;
+            buf.write_all(leaf)?;
         }
     }
-    file.flush()?;
-    drop(file);
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+    crate::security::atomic_write(path, &buf, false)
 }
 
 /// Load AICH hash sets from known2_64.met.

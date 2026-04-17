@@ -2,6 +2,23 @@
 pub mod firewall;
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic counter used to generate unique temp paths within this process,
+/// so concurrent atomic writes to different finals never collide on the same
+/// temp file (even when two callers target the same parent directory).
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn unique_tmp_path(final_path: &Path) -> PathBuf {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = final_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    parent.join(format!(".{stem}.{pid}.{seq}.tmp"))
+}
 
 const DANGEROUS_EXTENSIONS: &[&str] = &[
     "exe", "bat", "cmd", "com", "scr", "pif", "msi", "msp", "mst",
@@ -11,6 +28,36 @@ const DANGEROUS_EXTENSIONS: &[&str] = &[
     "application", "gadget", "msh", "msh1", "msh2", "mshxml",
     "msh1xml", "msh2xml", "dll", "sys", "drv",
 ];
+
+/// Render a fatal network error for display in the UI without leaking IP
+/// addresses, file paths, or deep error-chain diagnostics. The full error is
+/// still written to the tracing log for operators.
+///
+/// Kept conservative: a single short phrase plus the root-cause kind.
+pub fn redact_fatal_error(err: &anyhow::Error) -> String {
+    // Walk the chain to find a recognisable category; fall back to a generic
+    // message if nothing matches.
+    let mut category: Option<&'static str> = None;
+    for cause in err.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind::*;
+            category = Some(match io.kind() {
+                PermissionDenied => "permission denied",
+                AddrInUse => "port already in use",
+                AddrNotAvailable => "address not available",
+                ConnectionRefused | ConnectionReset | ConnectionAborted => {
+                    "network connection lost"
+                }
+                NotFound => "required file missing",
+                TimedOut => "network timeout",
+                _ => "I/O error",
+            });
+            break;
+        }
+    }
+    let tag = category.unwrap_or("unexpected error");
+    format!("The network service stopped ({tag}). See logs for details.")
+}
 
 /// Returns true if the file extension is potentially dangerous (executable).
 pub fn is_dangerous_extension(filename: &str) -> bool {
@@ -269,44 +316,78 @@ pub fn restrict_file_permissions(path: &Path) {
     }
 }
 
-/// Write data to a file that is created with restricted permissions from
-/// the start, avoiding the TOCTOU window of write-then-chmod.
-pub fn write_file_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
+/// Write data to `final_path` atomically: a unique temp file in the same
+/// directory is created, fsynced, then renamed to the destination. On Unix
+/// the parent directory is also fsynced so the rename survives crashes.
+/// When `restrict` is true the temp file is created with 0600 on Unix or
+/// has `restrict_file_permissions` applied on Windows before the rename,
+/// so the final file is never world-readable between creation and chmod.
+pub fn atomic_write(final_path: &Path, data: &[u8], restrict: bool) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let tmp = unique_tmp_path(final_path);
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        let mode = if restrict { 0o600 } else { 0o644 };
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        std::io::Write::write_all(&mut f, data)?;
-        return Ok(());
+            .mode(mode)
+            .open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
     }
     #[cfg(not(unix))]
     {
-        let dir = path.parent().unwrap_or(path);
-        let tmp = dir.join(format!(".ember_tmp_{}", std::process::id()));
-        std::fs::write(&tmp, data)?;
-        restrict_file_permissions(&tmp);
-        match std::fs::rename(&tmp, path) {
-            Ok(()) => Ok(()),
-            Err(_first_err) => {
-                let _ = std::fs::remove_file(path);
-                match std::fs::rename(&tmp, path) {
-                    Ok(()) => Ok(()),
-                    Err(_retry_err) => {
-                        tracing::warn!("Atomic rename failed, falling back to direct write for {}", path.display());
-                        let _ = std::fs::remove_file(&tmp);
-                        std::fs::write(path, data)?;
-                        restrict_file_permissions(path);
-                        Ok(())
-                    }
-                }
-            }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(data)?;
+        let _ = f.sync_all();
+        drop(f);
+        if restrict {
+            restrict_file_permissions(&tmp);
         }
     }
+
+    if let Err(e) = std::fs::rename(&tmp, final_path) {
+        #[cfg(target_os = "windows")]
+        {
+            // Windows rejects rename-over-existing in some cases; fall back
+            // to remove+rename while still preserving atomicity intent.
+            let _ = e;
+            let _ = std::fs::remove_file(final_path);
+            if let Err(retry_err) = std::fs::rename(&tmp, final_path) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(retry_err);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
+
+    #[cfg(unix)]
+    if let Some(parent) = final_path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
+    Ok(())
+}
+
+/// Back-compat: write a file with restricted perms atomically.
+pub fn write_file_restricted(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    atomic_write(path, data, true)
 }
 
 #[cfg(target_os = "windows")]

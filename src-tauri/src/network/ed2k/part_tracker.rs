@@ -255,75 +255,68 @@ impl PartTracker {
 
     /// Save in eMule-compatible .part.met format.
     fn save_emule_format(&self) -> anyhow::Result<()> {
-        let tmp_path = self.met_path.with_extension("met.tmp");
-        let mut file = std::fs::File::create(&tmp_path)?;
+        let mut buf: Vec<u8> = Vec::with_capacity(512);
+        {
+            let mut cur = std::io::Cursor::new(&mut buf);
 
-        let use_large = self.file_size > 0xFFFF_FFFF;
-        let version = if use_large { PARTFILE_VERSION_LARGEFILE } else { PARTFILE_VERSION };
-        file.write_u8(version)?;
+            let use_large = self.file_size > 0xFFFF_FFFF;
+            let version = if use_large { PARTFILE_VERSION_LARGEFILE } else { PARTFILE_VERSION };
+            cur.write_u8(version)?;
 
-        let date = chrono::Utc::now().timestamp().min(u32::MAX as i64) as u32;
-        file.write_u32::<LittleEndian>(date)?;
+            let date = chrono::Utc::now().timestamp().min(u32::MAX as i64) as u32;
+            cur.write_u32::<LittleEndian>(date)?;
 
-        file.write_all(&self.file_hash)?;
-        let part_hash_count = self.part_hashes.len();
-        if part_hash_count > u16::MAX as usize {
-            tracing::warn!(
-                "part.met: {} part hashes exceeds u16 limit, clamping to {}",
-                part_hash_count, u16::MAX
-            );
-        }
-        file.write_u16::<LittleEndian>(part_hash_count.min(u16::MAX as usize) as u16)?;
-        for ph in &self.part_hashes {
-            file.write_all(ph)?;
-        }
+            cur.write_all(&self.file_hash)?;
+            let part_hash_count = self.part_hashes.len();
+            if part_hash_count > u16::MAX as usize {
+                tracing::warn!(
+                    "part.met: {} part hashes exceeds u16 limit, clamping to {}",
+                    part_hash_count, u16::MAX
+                );
+            }
+            cur.write_u16::<LittleEndian>(part_hash_count.min(u16::MAX as usize) as u16)?;
+            for ph in &self.part_hashes {
+                cur.write_all(ph)?;
+            }
 
-        // Tag count placeholder (will seek back to fill)
-        // version(1) + date(4) + hash(16) + part_hash_count(2) + part_hashes(N*16)
-        let tag_count_pos = 5 + 16 + 2 + self.part_hashes.len() * 16;
-        file.write_u32::<LittleEndian>(0)?;
+            let tag_count_pos = 5 + 16 + 2 + self.part_hashes.len() * 16;
+            cur.write_u32::<LittleEndian>(0)?;
 
-        let mut tag_count: u32 = 0;
+            let mut tag_count: u32 = 0;
 
-        // FT_FILENAME
-        if !self.file_name.is_empty() {
-            write_string_tag(&mut file, FT_FILENAME, &self.file_name)?;
+            if !self.file_name.is_empty() {
+                write_string_tag(&mut cur, FT_FILENAME, &self.file_name)?;
+                tag_count += 1;
+            }
+
+            if use_large {
+                write_uint64_tag(&mut cur, FT_FILESIZE, self.file_size)?;
+            } else {
+                write_uint32_tag(&mut cur, FT_FILESIZE, self.file_size as u32)?;
+            }
             tag_count += 1;
+
+            let transferred = self.completed_bytes();
+            if use_large {
+                write_uint64_tag(&mut cur, FT_TRANSFERRED, transferred)?;
+            } else {
+                write_uint32_tag(&mut cur, FT_TRANSFERRED, transferred as u32)?;
+            }
+            tag_count += 1;
+
+            // Gap list: eMule uses inclusive end (last missing byte), our gaps
+            // use exclusive end (byte past last missing), so subtract 1 for wire format.
+            for (i, &(gap_start, gap_end)) in self.gaps.iter().enumerate() {
+                write_gap_tag(&mut cur, FT_GAPSTART, i, gap_start, use_large)?;
+                write_gap_tag(&mut cur, FT_GAPEND, i, gap_end.saturating_sub(1), use_large)?;
+                tag_count += 2;
+            }
+
+            cur.seek(SeekFrom::Start(tag_count_pos as u64))?;
+            cur.write_u32::<LittleEndian>(tag_count)?;
         }
 
-        // FT_FILESIZE
-        if use_large {
-            write_uint64_tag(&mut file, FT_FILESIZE, self.file_size)?;
-        } else {
-            write_uint32_tag(&mut file, FT_FILESIZE, self.file_size as u32)?;
-        }
-        tag_count += 1;
-
-        // FT_TRANSFERRED
-        let transferred = self.completed_bytes();
-        if use_large {
-            write_uint64_tag(&mut file, FT_TRANSFERRED, transferred)?;
-        } else {
-            write_uint32_tag(&mut file, FT_TRANSFERRED, transferred as u32)?;
-        }
-        tag_count += 1;
-
-        // Gap list: eMule uses inclusive end (last missing byte), our gaps
-        // use exclusive end (byte past last missing), so subtract 1 for wire format.
-        for (i, &(gap_start, gap_end)) in self.gaps.iter().enumerate() {
-            write_gap_tag(&mut file, FT_GAPSTART, i, gap_start, use_large)?;
-            write_gap_tag(&mut file, FT_GAPEND, i, gap_end.saturating_sub(1), use_large)?;
-            tag_count += 2;
-        }
-
-        // Seek back and write the actual tag count
-        file.seek(SeekFrom::Start(tag_count_pos as u64))?;
-        file.write_u32::<LittleEndian>(tag_count)?;
-
-        file.seek(SeekFrom::End(0))?;
-        file.sync_data()?;
-        drop(file);
-        std::fs::rename(&tmp_path, &self.met_path)?;
+        crate::security::atomic_write(&self.met_path, &buf, false)?;
         Ok(())
     }
 

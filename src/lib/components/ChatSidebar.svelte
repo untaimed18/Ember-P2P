@@ -20,7 +20,6 @@
   let messagesEnd: HTMLDivElement | undefined = $state();
   let chatInputEl: HTMLInputElement | undefined = $state();
   let unlisten: UnlistenFn | null = null;
-  let listenerGen = 0;
   let loadGen = 0;
   let msgIdCounter = 0;
 
@@ -34,39 +33,58 @@
     if (open && friendHash) {
       sendError = null;
       inputText = '';
-      loadMessages().then(() => setupListener());
+      // Bump both generations at the start so any in-flight loadMessages or
+      // setupListener from a previous conversation abandon their work before
+      // touching the UI. We pass the captured generation into setupListener
+      // so a slow getChatMessages() doesn't re-attach a listener after the
+      // user switched friends or closed the sidebar.
+      const gen = ++loadGen;
+      if (unlisten) { unlisten(); unlisten = null; }
+      loadMessages(gen).then(() => {
+        if (gen !== loadGen) return;
+        setupListener(gen);
+      });
       markAsRead();
     }
     return () => {
-      listenerGen++;
+      loadGen++;
       if (unlisten) { unlisten(); unlisten = null; }
     };
   });
 
-  async function setupListener() {
-    const gen = listenerGen;
+  async function setupListener(gen: number) {
+    if (gen !== loadGen) return;
     if (unlisten) { unlisten(); unlisten = null; }
-    const fn = await listen<{ user_hash: string; message: string; direction: string; timestamp: number }>('ember:chat-message', (event) => {
-      if (event.payload.user_hash === friendHash) {
-        messages = [...messages, {
-          id: --msgIdCounter,
-          direction: event.payload.direction as 'sent' | 'received',
-          message: event.payload.message,
-          timestamp: event.payload.timestamp,
-          read: true,
-        }];
-        scrollToBottom();
-        if (event.payload.direction === 'received') {
-          markAsRead();
+    let fn: UnlistenFn;
+    try {
+      fn = await listen<{ user_hash: string; message: string; direction: string; timestamp: number }>('ember:chat-message', (event) => {
+        if (gen !== loadGen) return;
+        if (event.payload.user_hash === friendHash) {
+          messages = [...messages, {
+            id: --msgIdCounter,
+            direction: event.payload.direction as 'sent' | 'received',
+            message: event.payload.message,
+            timestamp: event.payload.timestamp,
+            read: true,
+          }];
+          scrollToBottom();
+          if (event.payload.direction === 'received') {
+            markAsRead();
+          }
         }
-      }
-    });
-    if (gen !== listenerGen) { fn(); return; }
+      });
+    } catch (e) {
+      // Tauri's IPC bridge can reject `listen()` during teardown or if the
+      // backend hasn't finished initialising. Log and fall back to a
+      // load-only view; the UI still functions, just without live updates.
+      console.warn('ChatSidebar: failed to register chat listener', e);
+      return;
+    }
+    if (gen !== loadGen) { fn(); return; }
     unlisten = fn;
   }
 
-  async function loadMessages() {
-    const gen = ++loadGen;
+  async function loadMessages(gen: number) {
     loading = true;
     try {
       const rows = await getChatMessages(friendHash, 100);

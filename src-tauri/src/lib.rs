@@ -411,7 +411,12 @@ pub fn run() {
                 .await
                 {
                     tracing::error!("Network error: {e}");
-                    let _ = net_handle_err.emit("network-fatal-error", e.to_string());
+                    // The full error chain can contain IPs, peer IDs, paths,
+                    // and low-level socket diagnostics we don't want to leak
+                    // to the UI (it's shown verbatim). Log the rich version
+                    // for diagnostics and send a redacted, user-facing summary.
+                    let redacted = crate::security::redact_fatal_error(&e);
+                    let _ = net_handle_err.emit("network-fatal-error", redacted);
                 }
                 shutdown_complete_net.store(true, std::sync::atomic::Ordering::Release);
             });
@@ -562,6 +567,32 @@ pub fn run() {
                         std::thread::sleep(std::time::Duration::from_millis(200));
                     }
                     info!("Network shutdown complete");
+
+                    // Wait for in-flight discovery/hash workers to finish or
+                    // abort after a short grace window. Prevents scans from
+                    // mutating state (known.met, local_index) while we're
+                    // flushing it to disk below.
+                    {
+                        let scanning = state.scanning_count.clone();
+                        let bg = state.background_scans.clone();
+                        let rt = tauri::async_runtime::handle();
+                        rt.block_on(async move {
+                            let deadline = std::time::Instant::now()
+                                + std::time::Duration::from_secs(5);
+                            while scanning.load(std::sync::atomic::Ordering::Relaxed) > 0
+                                && std::time::Instant::now() < deadline
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            }
+                            let handles: Vec<_> = {
+                                let mut map = bg.write().await;
+                                map.drain().map(|(_, h)| h).collect()
+                            };
+                            for h in handles {
+                                h.abort();
+                            }
+                        });
+                    }
 
                     if let Ok(mut filter) = state.spam_filter.try_write() {
                         filter.save();

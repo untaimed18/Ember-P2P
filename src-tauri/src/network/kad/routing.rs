@@ -158,18 +158,20 @@ impl RoutingBin {
     }
 
     /// eMule RoutingBin::GetClosestTo -- collect contacts filtered by type+verified,
-    /// keyed by XOR distance to target, keeping at most max_required.
+    /// keyed by (XOR distance, ip, udp_port) so two distinct contacts that
+    /// happen to share the same KadId (stale duplicates across zones, or a
+    /// contact we are migrating by IP) never silently overwrite each other.
     fn get_closest_to(
         &self,
         max_type: u8,
         target: &KadId,
         max_required: usize,
-        result: &mut BTreeMap<KadId, KadContact>,
+        result: &mut BTreeMap<(KadId, Ipv4Addr, u16), KadContact>,
     ) {
         for c in &self.contacts {
             if c.contact_type <= max_type && c.verified {
                 let dist = target.xor_distance(&c.id);
-                result.insert(dist, c.clone());
+                result.insert((dist, c.ip, c.udp_port), c.clone());
             }
         }
         while result.len() > max_required {
@@ -438,7 +440,7 @@ impl RoutingZone {
         target: &KadId,
         distance: &KadId,
         max_required: usize,
-        result: &mut BTreeMap<KadId, KadContact>,
+        result: &mut BTreeMap<(KadId, Ipv4Addr, u16), KadContact>,
     ) {
         if let Some(bin) = &self.bin {
             bin.get_closest_to(max_type, target, max_required, result);
