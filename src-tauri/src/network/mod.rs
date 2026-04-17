@@ -5740,8 +5740,11 @@ pub async fn start_network(
                 let needing_keyword = state.publish_manager.files_needing_keyword_publish().len();
                 info!(
                     "Publish cycle: {total_files} files registered, {needing_source} need source publish, \
-                     {needing_keyword} need keyword publish, {} confirmed, firewalled={}, routing_table={}",
-                    state.publish_confirmed, state.publish_manager.firewalled, state.routing_table.len(),
+                     {needing_keyword} need keyword publish, {} confirmed, {} outstanding pending ack, firewalled={}, routing_table={}",
+                    state.publish_confirmed,
+                    state.publish_pending.len(),
+                    state.publish_manager.firewalled,
+                    state.routing_table.len(),
                 );
                 // Rendezvous heartbeat: re-register every 2 minutes to keep
                 // our presence alive on the rendezvous server.
@@ -11636,14 +11639,43 @@ async fn handle_udp_packet(
         }
 
         KadMessage::PublishRes { target, load } => {
-            // Match on (target, peer) so every ack counts — prior behaviour
-            // matched on target only and dropped all but the first peer's
-            // ack per publish cycle.
-            if state.publish_pending.remove(&(target, from)).is_some() {
+            // Match on `(target, peer_addr)` first (exact path). If that
+            // misses, fall back to `(target, any-entry-with-same-IP)` —
+            // peers behind carrier-grade NAT sometimes reply from a
+            // different source *port* than the one we sent to because
+            // the router rewrites the mapping; the IP stays stable. As a
+            // last resort, match on target alone (consume any pending
+            // entry for this target) — this accepts that the publish
+            // was acknowledged even if we can't identify the exact peer,
+            // which is what the counter is really measuring. Without
+            // this, many networks silently show `0 confirmed` forever.
+            let matched_key: Option<(KadId, SocketAddr)> = if state.publish_pending.contains_key(&(target, from)) {
+                Some((target, from))
+            } else {
+                let from_ip = from.ip();
+                state
+                    .publish_pending
+                    .keys()
+                    .find(|(t, a)| *t == target && a.ip() == from_ip)
+                    .copied()
+                    .or_else(|| {
+                        state
+                            .publish_pending
+                            .keys()
+                            .find(|(t, _)| *t == target)
+                            .copied()
+                    })
+            };
+            if let Some(key) = matched_key {
+                state.publish_pending.remove(&key);
                 state.publish_confirmed += 1;
                 debug!(
-                    "Publish confirmed for {target} from {from} (load={load}, total_confirmed={})",
-                    state.publish_confirmed
+                    "Publish confirmed for {target} from {from} (orig_key={:?}, load={load}, total_confirmed={})",
+                    key, state.publish_confirmed
+                );
+            } else {
+                debug!(
+                    "PublishRes from {from} for {target} matched no pending entry (load={load})"
                 );
             }
             // Count this ack toward the file's "complete sources" estimate.
