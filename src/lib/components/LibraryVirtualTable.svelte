@@ -31,7 +31,7 @@
     { key: 'type',        label: 'Type',        width: 70,  minWidth: 56,  sortField: 'extension' },
     { key: 'priority',    label: 'Priority',    width: 72,  minWidth: 60,  sortField: 'priority' },
     { key: 'transferred', label: 'Transferred', width: 90,  minWidth: 60,  sortField: 'bytes_transferred' },
-    { key: 'sources',     label: 'Sources',     width: 60,  minWidth: 50,  sortField: 'complete_sources' },
+    { key: 'sources',     label: 'Peers',       width: 60,  minWidth: 50,  sortField: 'complete_sources' },
     { key: 'shared',      label: 'Shared',      width: 80,  minWidth: 60 },
     { key: 'hash',        label: 'File ID',     width: 120, minWidth: 80,  sortField: 'hash' },
     { key: 'requests',    label: 'Requests',    width: 70,  minWidth: 50,  sortField: 'requests' },
@@ -40,7 +40,7 @@
     { key: 'modified',    label: 'Modified',    width: 100, minWidth: 80,  sortField: 'modified_at' },
   ];
 
-  const DEFAULT_HIDDEN = new Set(['hash', 'requests', 'accepted', 'folder', 'modified']);
+  const DEFAULT_HIDDEN = new Set(['hash', 'requests', 'accepted', 'folder']);
   const FIXED_KEY = 'name';
   const STORAGE_WIDTHS = 'library-col-widths';
   const STORAGE_HIDDEN = 'library-col-hidden';
@@ -541,14 +541,14 @@
                       <span class="shared-badges">
                         {#if file.shared_kad}<span class="shared-badge kad" title="Published to KAD network">KAD</span>{/if}
                         {#if file.shared_ed2k}<span class="shared-badge ed2k" title="Published to eD2K servers">eD2K</span>{/if}
-                        {#if file.aich_hash}<span class="shared-badge aich" title="AICH hash available — corruption can be detected and recovered mid-download">AICH</span>{/if}
+                        {#if file.aich_hash}<span class="shared-badge aich" title="AICH hash available — bad chunks can be identified without re-downloading the whole file">AICH</span>{/if}
                       </span>
                     {/if}
                   {:else}
                     <span class="shared-icon shared-no" title="Not shared">&#x2715;</span>
                     {#if file.aich_hash}
                       <span class="shared-badges">
-                        <span class="shared-badge aich" title="AICH hash available — corruption can be detected and recovered mid-download">AICH</span>
+                        <span class="shared-badge aich" title="AICH hash available — bad chunks can be identified without re-downloading the whole file">AICH</span>
                       </span>
                     {/if}
                   {/if}

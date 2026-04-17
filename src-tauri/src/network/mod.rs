@@ -9356,13 +9356,13 @@ pub async fn start_network(
                     }
                     // Fallback for purely-shared files (never searched/downloaded):
                     // use the number of KAD peers that accepted our most recent
-                    // source publish. +1 includes ourselves so the value reads
-                    // as "total peers holding a reference" rather than "other".
+                    // source publish. This represents *other* peers who know
+                    // about us as a source; the local copy is not counted so
+                    // the UI label ("Peers") stays honest.
                     let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
                     if let Some(&ack_count) = state.source_publish_acks.get(&kad_hash) {
-                        let publish_count = ack_count.saturating_add(1);
-                        if publish_count > count {
-                            count = publish_count;
+                        if ack_count > count {
+                            count = ack_count;
                         }
                     }
                     if count > 0 {
