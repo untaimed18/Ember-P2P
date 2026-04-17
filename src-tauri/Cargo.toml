@@ -22,7 +22,6 @@ serde_json = "1"
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-blake3 = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "5"
@@ -48,10 +47,8 @@ tauri-plugin-single-instance = "2.4.0"
 
 tauri-plugin-process = "2"
 rsa = "0.9"
-pkcs8 = { version = "0.10", features = ["std"] }
 signature = "2"
 num-bigint-dig = "0.8"
-num-traits = "0.2"
 opener = "0.8.4"
 crc32fast = "1.5.0"
 zeroize = { version = "1", features = ["derive"] }
