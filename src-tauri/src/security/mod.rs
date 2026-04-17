@@ -239,7 +239,18 @@ pub async fn validate_fetch_url(url: &str) -> Result<(String, String, Vec<std::n
 /// Build a reqwest client that pins DNS to pre-validated addresses,
 /// preventing TOCTOU DNS rebinding attacks.
 pub fn build_pinned_client(host: &str, addrs: &[std::net::SocketAddr]) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder()
+        // K35: restrict redirects so a malicious bootstrap URL can't
+        // re-point to an internal host we never resolved (the
+        // `resolve`-map above only pins the *original* host). 3 hops is
+        // enough for legit hosting platforms (GitLab Pages, Cloudflare,
+        // etc.) while making a redirect-to-localhost or
+        // redirect-to-metadata-service attack impossible.
+        .redirect(reqwest::redirect::Policy::limited(3))
+        // Hard per-request ceiling. Bootstrap downloads should be small
+        // and fast; anything over a minute is already failing.
+        .timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(std::time::Duration::from_secs(15));
     for addr in addrs {
         builder = builder.resolve(host, *addr);
     }

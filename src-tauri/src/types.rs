@@ -332,6 +332,10 @@ pub struct KadSearchInfo {
     pub packets_sent: u32,
     pub request_answer: u32,
     pub responses: u32,
+    /// K30: unix timestamp (seconds) when the search was created. The
+    /// UI derives an "age" column from this so users can see if a
+    /// search is fresh or stuck.
+    pub started_at: i64,
 }
 
 impl Default for NetworkStats {

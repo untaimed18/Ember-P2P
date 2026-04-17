@@ -31,7 +31,7 @@ const TIMEOUT_FIND_BUDDY: i64 = 100;  // SEARCHFINDBUDDY_LIFETIME
 /// Grace period after entering fetch phase for late results (eMule PrepareToStop gives 15s)
 const FETCH_TIMEOUT_SECS: i64 = 15;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SearchType {
     FindNode,
     FindKeyword,
@@ -41,6 +41,37 @@ pub enum SearchType {
     StoreFile,
     StoreKeyword,
     StoreNotes,
+}
+
+/// K13: discriminator used as part of the `target_map` key so two
+/// searches that share a KadId (e.g. `FindSource` + `StoreFile` on the
+/// same file-hash target) do not collide and starve each other of
+/// dispatches. Mirrors `SearchType` discriminants without payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SearchKind {
+    FindNode,
+    FindKeyword,
+    FindSource,
+    FindNotes,
+    FindBuddy,
+    StoreFile,
+    StoreKeyword,
+    StoreNotes,
+}
+
+impl SearchType {
+    pub fn kind(&self) -> SearchKind {
+        match self {
+            SearchType::FindNode => SearchKind::FindNode,
+            SearchType::FindKeyword => SearchKind::FindKeyword,
+            SearchType::FindSource { .. } => SearchKind::FindSource,
+            SearchType::FindNotes { .. } => SearchKind::FindNotes,
+            SearchType::FindBuddy => SearchKind::FindBuddy,
+            SearchType::StoreFile => SearchKind::StoreFile,
+            SearchType::StoreKeyword => SearchKind::StoreKeyword,
+            SearchType::StoreNotes => SearchKind::StoreNotes,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -748,7 +779,9 @@ fn is_lan_ip(ip: std::net::Ipv4Addr) -> bool {
 pub struct SearchManager {
     next_id: u64,
     pub active: HashMap<SearchId, SearchState>,
-    target_map: HashMap<KadId, SearchId>,
+    /// K13: keyed by (target, kind) so concurrent `FindSource` +
+    /// `StoreFile` on the same file-hash target don't collide.
+    target_map: HashMap<(KadId, SearchKind), SearchId>,
     /// Contact IDs that need to be marked in-use on the routing table.
     /// Accumulated by start_search, drained by the caller via `drain_in_use_ids`.
     pending_in_use: Vec<KadId>,
@@ -777,8 +810,9 @@ impl SearchManager {
         search_type: SearchType,
         initial_contacts: Vec<KadContact>,
     ) -> SearchId {
+        let key = (target, search_type.kind());
         if Self::reuses_existing_search(search_type) {
-            if let Some(existing_id) = self.target_map.get(&target) {
+            if let Some(existing_id) = self.target_map.get(&key) {
                 if let Some(state) = self.active.get(existing_id) {
                     if !state.completed && state.search_type == search_type {
                         return *existing_id;
@@ -798,8 +832,9 @@ impl SearchManager {
                 .collect();
             for id in completed {
                 if let Some(s) = self.active.remove(&id) {
-                    if self.target_map.get(&s.target) == Some(&id) {
-                        self.target_map.remove(&s.target);
+                    let k = (s.target, s.search_type.kind());
+                    if self.target_map.get(&k) == Some(&id) {
+                        self.target_map.remove(&k);
                     }
                 }
             }
@@ -815,7 +850,7 @@ impl SearchManager {
         let mut state = SearchState::new(id, target, search_type);
         state.seed(initial_contacts);
         let in_use = state.in_use_ids.clone();
-        self.target_map.insert(target, id);
+        self.target_map.insert(key, id);
         self.active.insert(id, state);
         self.pending_in_use.extend(in_use);
         debug!("Started search {}: target={}", id.0, target);
@@ -833,22 +868,18 @@ impl SearchManager {
     /// Get the expected response contact count for a target (eMule GetExpectedResponseContactCount).
     /// Returns 0 if no active search for this target (meaning the response should be rejected).
     pub fn get_expected_response_count(&self, target: &KadId) -> u8 {
-        // First check the target_map entry (fast path for the common single-search case)
-        if let Some(search_id) = self.target_map.get(target) {
-            if let Some(search) = self.active.get(search_id) {
-                if !search.completed {
-                    return search.get_expected_response_count();
-                }
-            }
-        }
-        // Fallback: scan all active searches for this target in case
-        // target_map points to a completed search while another is still active.
-        for search in self.active.values() {
-            if search.target == *target && !search.completed {
-                return search.get_expected_response_count();
-            }
-        }
-        0
+        // K13: target_map is keyed by (target, kind) so we can't look up
+        // by target alone. Scan active searches instead — this is the
+        // response-routing hot path and ties are rare (typically a single
+        // FindNode/FindSource search per target at any time). Preferring
+        // the search with the highest expected count matches the earlier
+        // behaviour of returning whichever search was registered last.
+        self.active
+            .values()
+            .filter(|s| s.target == *target && !s.completed)
+            .map(|s| s.get_expected_response_count())
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn active_count(&self) -> usize {
@@ -955,8 +986,9 @@ impl SearchManager {
         let mut released_ids = Vec::new();
         for &id in &to_remove {
             if let Some(state) = self.active.remove(&id) {
-                if self.target_map.get(&state.target) == Some(&id) {
-                    self.target_map.remove(&state.target);
+                let k = (state.target, state.search_type.kind());
+                if self.target_map.get(&k) == Some(&id) {
+                    self.target_map.remove(&k);
                 }
                 released_ids.extend(state.in_use_ids);
             }
@@ -980,8 +1012,9 @@ impl SearchManager {
 
     pub fn remove(&mut self, id: &SearchId) -> Option<SearchState> {
         if let Some(state) = self.active.remove(id) {
-            if self.target_map.get(&state.target) == Some(id) {
-                self.target_map.remove(&state.target);
+            let k = (state.target, state.search_type.kind());
+            if self.target_map.get(&k) == Some(id) {
+                self.target_map.remove(&k);
             }
             Some(state)
         } else {
@@ -1062,7 +1095,7 @@ mod tests {
 
         assert_ne!(first, second);
         assert_eq!(
-            manager.target_map.get(&target),
+            manager.target_map.get(&(target, SearchKind::FindKeyword)),
             Some(&second),
             "target_map should point to newest search for response routing"
         );

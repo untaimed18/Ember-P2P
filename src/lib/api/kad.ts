@@ -10,21 +10,31 @@ export async function banPeer(peerId: string): Promise<void> {
 }
 
 export async function kadConnect(): Promise<void> {
-  return invoke('kad_connect');
+  return withTimeout(invoke('kad_connect'), 'KAD connect');
 }
 
 export async function kadDisconnect(): Promise<void> {
-  return invoke('kad_disconnect');
+  return withTimeout(invoke('kad_disconnect'), 'KAD disconnect');
 }
 
 export async function kadRecheckFirewall(): Promise<void> {
-  return invoke('kad_recheck_firewall');
+  return withTimeout(invoke('kad_recheck_firewall'), 'KAD firewall recheck');
 }
 
 export async function getKadContacts(): Promise<KadContact[]> {
-  return invoke('get_kad_contacts');
+  return withTimeout(invoke<KadContact[]>('get_kad_contacts'), 'get_kad_contacts', 10_000);
 }
 
 export async function getKadSearches(): Promise<KadSearchEntry[]> {
-  return invoke('get_kad_searches');
+  return withTimeout(invoke<KadSearchEntry[]>('get_kad_searches'), 'get_kad_searches', 10_000);
+}
+
+/** K30: cancel an active KAD search. The backend accepts the id as a
+ *  string to dodge the JS BigInt/Number precision boundary for u64. */
+export async function kadCancelSearch(id: number | string): Promise<void> {
+  return withTimeout(
+    invoke('kad_cancel_search', { id: String(id) }),
+    'KAD cancel search',
+    5_000,
+  );
 }

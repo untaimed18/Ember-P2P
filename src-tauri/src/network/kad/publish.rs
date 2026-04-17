@@ -23,6 +23,12 @@ struct PublishRecord {
     pub file: PublishableFile,
     pub last_keyword_publish: i64,
     pub last_source_publish: i64,
+    /// K15: exponential backoff shift for keyword republishing. The
+    /// effective republish interval is `REPUBLISH_KEYWORD_SECS <<
+    /// keyword_backoff_shift`. Grows when peers return load=100 (hot
+    /// file / full bucket) and resets on a successful publish.
+    pub keyword_backoff_shift: u32,
+    pub source_backoff_shift: u32,
 }
 
 /// Manages publishing files to the KAD network.
@@ -74,6 +80,8 @@ impl PublishManager {
                 file,
                 last_keyword_publish: 0,
                 last_source_publish: 0,
+                keyword_backoff_shift: 0,
+                source_backoff_shift: 0,
             });
     }
 
@@ -99,7 +107,15 @@ impl PublishManager {
         let now = chrono::Utc::now().timestamp();
         self.records
             .values()
-            .filter(|r| now - r.last_keyword_publish > REPUBLISH_KEYWORD_SECS)
+            .filter(|r| {
+                // K15: honour per-file exponential backoff. Cap the shift
+                // at 4 so the interval never exceeds 16x the base — that
+                // gives us a ceiling around 4 hours for a keyword that's
+                // saturated on every receiver.
+                let shift = r.keyword_backoff_shift.min(4);
+                let interval = REPUBLISH_KEYWORD_SECS.saturating_mul(1_i64 << shift);
+                now - r.last_keyword_publish > interval
+            })
             .map(|r| &r.file)
             .collect()
     }
@@ -109,7 +125,11 @@ impl PublishManager {
         let now = chrono::Utc::now().timestamp();
         self.records
             .values()
-            .filter(|r| now - r.last_source_publish > REPUBLISH_SOURCE_SECS)
+            .filter(|r| {
+                let shift = r.source_backoff_shift.min(4);
+                let interval = REPUBLISH_SOURCE_SECS.saturating_mul(1_i64 << shift);
+                now - r.last_source_publish > interval
+            })
             .map(|r| &r.file)
             .collect()
     }
@@ -125,6 +145,31 @@ impl PublishManager {
     pub fn mark_source_published(&mut self, file_hash: &KadId) {
         if let Some(record) = self.records.get_mut(file_hash) {
             record.last_source_publish = chrono::Utc::now().timestamp();
+        }
+    }
+
+    /// K15: record the load value returned by the peer that accepted
+    /// our keyword publish. Load >= 90 means the peer's keyword bucket
+    /// is effectively full — don't hammer it. Load < 50 means we have
+    /// headroom and we can reset backoff.
+    pub fn record_keyword_publish_load(&mut self, file_hash: &KadId, load: u8) {
+        if let Some(record) = self.records.get_mut(file_hash) {
+            if load >= 90 {
+                record.keyword_backoff_shift = (record.keyword_backoff_shift + 1).min(4);
+            } else if load < 50 {
+                record.keyword_backoff_shift = 0;
+            }
+        }
+    }
+
+    /// Counterpart to `record_keyword_publish_load` for source publishes.
+    pub fn record_source_publish_load(&mut self, file_hash: &KadId, load: u8) {
+        if let Some(record) = self.records.get_mut(file_hash) {
+            if load >= 90 {
+                record.source_backoff_shift = (record.source_backoff_shift + 1).min(4);
+            } else if load < 50 {
+                record.source_backoff_shift = 0;
+            }
         }
     }
 

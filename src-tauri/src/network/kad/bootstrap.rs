@@ -49,9 +49,26 @@ pub fn default_bootstrap_contacts() -> Vec<KadContact> {
         .collect()
 }
 
-/// Read contacts from a nodes.dat file.
-/// Supports format version 0, 1, and 2.
-pub fn load_nodes_dat(path: &Path) -> anyhow::Result<Vec<KadContact>> {
+/// Which wire format was parsed from a `nodes.dat`. Carries security-relevant
+/// detail the caller needs for K3: legacy formats (v0, v1, v3-bootstrap)
+/// don't encode a per-contact `verified` bit and were previously
+/// blanket-verified on load, which an attacker-supplied file (URL
+/// bootstrap) could abuse. Callers should only mass-verify legacy-format
+/// contacts when they come from the app's own on-disk `nodes.dat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodesDatFormat {
+    /// Pre-verified-bit format: v0 contacts, v1 whole file, or
+    /// v3-bootstrap_edition — no `verified` field on the wire.
+    LegacyNoVerified,
+    /// Modern format where each contact carries its own `verified` byte.
+    WithVerifiedBit,
+}
+
+/// Read contacts from a nodes.dat file, returning the format variant so
+/// callers can decide whether to trust a "no verified bits present" file.
+pub fn load_nodes_dat_with_format(
+    path: &Path,
+) -> anyhow::Result<(Vec<KadContact>, NodesDatFormat)> {
     let data = std::fs::read(path)?;
     if data.len() < 6 {
         anyhow::bail!("nodes.dat too small");
@@ -60,6 +77,7 @@ pub fn load_nodes_dat(path: &Path) -> anyhow::Result<Vec<KadContact>> {
     let data_slice: &[u8] = &data;
     let mut cursor = Cursor::new(data_slice);
     let mut contacts = Vec::new();
+    let mut format = NodesDatFormat::LegacyNoVerified;
 
     // Check for v2/v3 header: first 4 bytes == 0
     let first_u32 = cursor.read_u32::<LittleEndian>()?;
@@ -86,9 +104,10 @@ pub fn load_nodes_dat(path: &Path) -> anyhow::Result<Vec<KadContact>> {
                     }
                 }
                 info!("Loaded {} valid contacts from bootstrap nodes.dat", contacts.len());
-                return Ok(contacts);
+                return Ok((contacts, NodesDatFormat::LegacyNoVerified));
             }
             // v3 with bootstrap_edition != 1: separate count follows (eMule RoutingZone format)
+            format = NodesDatFormat::WithVerifiedBit;
             let count = (cursor.read_u32::<LittleEndian>()? as usize).min(50_000);
             info!("Loading {count} contacts from nodes.dat v3");
             for _ in 0..count {
@@ -101,6 +120,7 @@ pub fn load_nodes_dat(path: &Path) -> anyhow::Result<Vec<KadContact>> {
                 }
             }
         } else if version == 2 || version == 1 {
+            if version == 2 { format = NodesDatFormat::WithVerifiedBit; }
             let count = (cursor.read_u32::<LittleEndian>()? as usize).min(50_000);
             info!("Loading {count} contacts from nodes.dat v{version}");
             for _ in 0..count {
@@ -124,6 +144,7 @@ pub fn load_nodes_dat(path: &Path) -> anyhow::Result<Vec<KadContact>> {
             }
         } else {
             warn!("Unknown nodes.dat version: {version}, trying as v2");
+            format = NodesDatFormat::WithVerifiedBit;
             let count = (cursor.read_u32::<LittleEndian>()? as usize).min(50_000);
             info!("Loading {count} contacts from nodes.dat v{version}");
             for _ in 0..count {
@@ -153,7 +174,14 @@ pub fn load_nodes_dat(path: &Path) -> anyhow::Result<Vec<KadContact>> {
     }
 
     info!("Loaded {} valid contacts from nodes.dat", contacts.len());
-    Ok(contacts)
+    Ok((contacts, format))
+}
+
+/// Backward-compatible thin wrapper that drops the format tag. Prefer
+/// `load_nodes_dat_with_format` for new call sites that care about the
+/// "file has no verified bits" discriminator (K3).
+pub fn load_nodes_dat(path: &Path) -> anyhow::Result<Vec<KadContact>> {
+    load_nodes_dat_with_format(path).map(|(c, _)| c)
 }
 
 fn read_contact_v0(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<KadContact> {
@@ -254,6 +282,19 @@ pub fn save_nodes_dat(path: &Path, contacts: &[KadContact]) -> anyhow::Result<()
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+
+    // LOW-backend: before overwriting the existing nodes.dat, keep a
+    // `.bak` copy so an unclean shutdown during the atomic write (or a
+    // corrupted buffer that still parses enough to pass header checks)
+    // doesn't wipe out our only working contact list. The `.bak` is
+    // intentionally silent on failure — we'd rather save the new file
+    // than refuse because a backup couldn't be made.
+    if path.exists() {
+        let bak = path.with_extension("dat.bak");
+        if let Err(e) = std::fs::copy(path, &bak) {
+            tracing::debug!("Could not create nodes.dat.bak: {e}");
+        }
     }
 
     crate::security::atomic_write(path, &buf, false)?;

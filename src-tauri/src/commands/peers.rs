@@ -494,7 +494,7 @@ pub async fn kad_bootstrap_ip(
     state: tauri::State<'_, AppState>,
     ip: String,
     port: u16,
-) -> Result<(), String> {
+) -> Result<String, String> {
     if ip.is_empty() {
         return Err("IP address is required".into());
     }
@@ -503,25 +503,44 @@ pub async fn kad_bootstrap_ip(
     }
     let resolved_ip = resolve_kad_host(&ip, port).await?;
 
+    // K0: await the real outcome from the network task via oneshot so the UI
+    // reports "sent"/"failed" based on what actually happened, not merely
+    // that the command was enqueued.
+    let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
-        .try_send(NetworkCommand::KadBootstrapIp { ip: resolved_ip, port })
+        .try_send(NetworkCommand::KadBootstrapIp {
+            ip: resolved_ip,
+            port,
+            tx,
+        })
         .map_err(|e| format!("Network busy: {e}"))?;
-    Ok(())
+    rx.await
+        .map_err(|_| "Bootstrap worker dropped the request".to_string())?
 }
 
 #[tauri::command]
 pub async fn kad_bootstrap_url(
     state: tauri::State<'_, AppState>,
     url: String,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let (validated_url, host, resolved_addrs) = crate::security::validate_fetch_url(&url).await?;
 
+    // K0: same oneshot pattern as kad_bootstrap_ip — this is what lets the
+    // UI show "Loaded N contacts" on success and a useful error on failure
+    // instead of always toasting "Fetching…" on enqueue.
+    let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
-        .try_send(NetworkCommand::KadBootstrapUrl { url: validated_url, host, resolved_addrs })
+        .try_send(NetworkCommand::KadBootstrapUrl {
+            url: validated_url,
+            host,
+            resolved_addrs,
+            tx,
+        })
         .map_err(|e| format!("Network busy: {e}"))?;
-    Ok(())
+    rx.await
+        .map_err(|_| "Bootstrap worker dropped the request".to_string())?
 }
 
 #[tauri::command]

@@ -628,10 +628,20 @@ impl KadTag {
                 writer.write_u8(*id)?;
             }
             TagName::Str(s) => {
+                // K23: the previous behaviour silently truncated tag
+                // names longer than 65535 bytes. That produces a packet
+                // that the peer will parse as a different tag (or throw
+                // an InvalidData error) — a subtle interop / integrity
+                // bug that's better surfaced as an error at the source.
                 writer.write_u8(type_byte)?;
-                let name_len = u16::try_from(s.len()).unwrap_or(u16::MAX);
+                let name_len = u16::try_from(s.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("tag name exceeds u16::MAX bytes ({})", s.len()),
+                    )
+                })?;
                 writer.write_u16::<LittleEndian>(name_len)?;
-                writer.write_all(&s.as_bytes()[..name_len as usize])?;
+                writer.write_all(s.as_bytes())?;
             }
         }
 
@@ -640,9 +650,16 @@ impl KadTag {
             TagValue::String(s) => {
                 let len = s.len();
                 if !(1..=16).contains(&len) {
-                    let wire_len = u16::try_from(len).unwrap_or(u16::MAX);
+                    // K23: same reasoning as above for string value
+                    // payloads — never silently truncate.
+                    let wire_len = u16::try_from(len).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("tag string value exceeds u16::MAX bytes ({len})"),
+                        )
+                    })?;
                     writer.write_u16::<LittleEndian>(wire_len)?;
-                    writer.write_all(&s.as_bytes()[..wire_len as usize])?;
+                    writer.write_all(s.as_bytes())?;
                 } else {
                     writer.write_all(s.as_bytes())?;
                 }
