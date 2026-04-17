@@ -4510,7 +4510,21 @@ pub async fn start_network(
                         maybe_finish_active_search(&mut state, &app_handle, request_id);
                     } else if let Some(tx) = state.pending_source_searches.remove(&sid) {
                         let sources = if let Some(search) = state.search_manager.get(&sid) {
-                            extract_sources_from_results(&search.results)
+                            let all = extract_kad_sources(&search.results);
+                            let before = all.len();
+                            let filtered: Vec<(String, u16)> = all
+                                .into_iter()
+                                .filter(|s| !is_self_source(s, &state))
+                                .map(|s| (s.ip.to_string(), s.tcp_port))
+                                .collect();
+                            if filtered.len() != before {
+                                debug!(
+                                    "Source search {}: dropped {} self-sources",
+                                    sid.0,
+                                    before - filtered.len()
+                                );
+                            }
+                            filtered
                         } else {
                             Vec::new()
                         };
@@ -4552,7 +4566,21 @@ pub async fn start_network(
                         }
                     } else if let Some((transfer_id, search_file_hash)) = state.download_source_searches.remove(&sid) {
                         let kad_sources = if let Some(search) = state.search_manager.get(&sid) {
-                            extract_kad_sources(&search.results)
+                            let all = extract_kad_sources(&search.results);
+                            let before = all.len();
+                            let filtered: Vec<KadSource> = all
+                                .into_iter()
+                                .filter(|s| !is_self_source(s, &state))
+                                .collect();
+                            if filtered.len() != before {
+                                debug!(
+                                    "Download source search {} for {}: dropped {} self-sources",
+                                    sid.0,
+                                    transfer_id,
+                                    before - filtered.len()
+                                );
+                            }
+                            filtered
                         } else {
                             Vec::new()
                         };
@@ -15597,13 +15625,32 @@ struct KadSource {
     ed2k_server_port: u16,
 }
 
-fn extract_sources_from_results(
-    entries: &[kad::messages::SearchResultEntry],
-) -> Vec<(String, u16)> {
-    extract_kad_sources(entries)
-        .into_iter()
-        .map(|s| (s.ip.to_string(), s.tcp_port))
-        .collect()
+/// Returns true if this `KadSource` actually describes us — either by
+/// matching our externally-visible `(IP, TCP port)` pair or by carrying
+/// our ed2k `user_hash`.
+///
+/// Self-sources arise naturally after a publish cycle: we publish
+/// `(SourceIP=our_ext_ip, SourcePort=our_tcp_port, SourceUID=our_user_hash)`
+/// to the DHT nodes closest to each file hash, and a subsequent source
+/// search for the same hash converges on those same nodes, which
+/// dutifully hand our own entry back to us. Injecting it as a download
+/// source wastes an idx slot and produces a noisy
+/// "Injected source N failed: stage:hello_wait" line when we attempt to
+/// connect to ourselves. The user-hash check also catches the dynamic
+/// IP case where our publishes were made under a different IP than the
+/// one we report now.
+fn is_self_source(src: &KadSource, state: &NetworkState) -> bool {
+    if let Some(ext) = state.external_ip {
+        if src.ip == ext && src.tcp_port == state.tcp_port {
+            return true;
+        }
+    }
+    if let Some(uh) = src.source_user_hash {
+        if uh == state.user_hash {
+            return true;
+        }
+    }
+    false
 }
 
 fn extract_kad_sources(
