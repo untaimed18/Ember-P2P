@@ -1,6 +1,7 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles, cancelSearch, parseEd2kLink, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, clearDownloadHistory, type SearchMethod } from '$lib/api/search';
+  import { searchFiles, cancelSearch, parseEd2kLink, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, type SearchMethod } from '$lib/api/search';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { getSettings } from '$lib/api/settings';
   import { startDownload } from '$lib/api/transfers';
   import { transfers } from '$lib/stores/transfers';
@@ -43,25 +44,58 @@
 
   let downloadHistoryMap = $state<Record<string, string>>({});
   let historyFetchedHashes = new Set<string>();
+  let historyPendingHashes = new Set<string>();
+  let historyFetchTimer: ReturnType<typeof setTimeout> | null = null;
 
-  async function fetchDownloadHistory(hashes: string[]) {
-    const newHashes = hashes.filter(h => h && !historyFetchedHashes.has(h));
-    if (newHashes.length === 0) return;
-    for (const h of newHashes) historyFetchedHashes.add(h);
+  async function flushHistoryFetch() {
+    historyFetchTimer = null;
+    if (historyPendingHashes.size === 0) return;
+    const batch = [...historyPendingHashes];
+    historyPendingHashes.clear();
     try {
-      const result = await getDownloadHistory(newHashes);
+      const result = await getDownloadHistory(batch);
+      if (destroyed) return;
       if (Object.keys(result).length > 0) {
         downloadHistoryMap = { ...downloadHistoryMap, ...result };
       }
     } catch (e) {
       console.error('Failed to fetch download history:', e);
+      // Failed batch — forget the "already fetched" mark so they retry next cycle.
+      for (const h of batch) historyFetchedHashes.delete(h);
     }
   }
 
+  function queueHistoryFetch(hashes: string[]) {
+    let added = false;
+    for (const h of hashes) {
+      if (!h || historyFetchedHashes.has(h)) continue;
+      historyFetchedHashes.add(h);
+      historyPendingHashes.add(h);
+      added = true;
+    }
+    if (!added) return;
+    // Coalesce high-frequency streaming updates into a single batched fetch.
+    if (historyFetchTimer) return;
+    historyFetchTimer = setTimeout(flushHistoryFetch, 250);
+  }
+
   $effect(() => {
-    const hashes = searchResultsList.map(r => r.file.hash).filter(Boolean);
-    if (hashes.length > 0) fetchDownloadHistory(hashes);
+    // Touch the list length so the effect re-runs as streaming batches arrive,
+    // but do the diffing inside queueHistoryFetch to avoid re-sending known
+    // hashes. The actual invoke is debounced.
+    const hashes = searchResultsList.map(r => r.file.hash);
+    if (hashes.length > 0) queueHistoryFetch(hashes);
   });
+
+  // Destructive-action confirmation state. Shared by "Clear Results" and
+  // "Close Tab". Skip confirmation for empty / non-destructive cases.
+  type ConfirmAction =
+    | { kind: 'clear-results' }
+    | { kind: 'close-tab'; tab: SearchTab };
+  let pendingConfirm: ConfirmAction | null = $state(null);
+  let confirmOpen = $state(false);
+  let confirmTitle = $state('');
+  let confirmMessage = $state('');
 
   let selectedResultKey = $state<string | null>(null);
   let checkedKeys = $state(new Set<string>());
@@ -166,6 +200,7 @@
   onDestroy(() => {
     destroyed = true;
     if (filterDebounceTimer) { clearTimeout(filterDebounceTimer); filterDebounceTimer = null; }
+    if (historyFetchTimer) { clearTimeout(historyFetchTimer); historyFetchTimer = null; }
     for (const t of searchTimeouts.values()) clearTimeout(t);
     searchTimeouts.clear();
     for (const id of miscTimers) clearTimeout(id);
@@ -231,6 +266,101 @@
   let sortField: SortField = $state('sources');
   let sortDir: SortDir = $state('desc');
 
+  // ---- Persistence: filters, sort, advanced open state, search method/type ----
+  // Stored under a versioned key so a future shape change can be migrated or
+  // discarded safely by bumping the suffix.
+  const PREFS_KEY = 'search-prefs-v1';
+  const VALID_SEARCH_METHODS = new Set<SearchMethod>(['global', 'kad', 'server']);
+  const VALID_FILTER_COLUMNS = new Set<FilterColumn>([
+    'name', 'size', 'type', 'sources', 'origin', 'hash', 'all',
+  ]);
+  const VALID_SORT_FIELDS = new Set<SortField>(['name', 'size', 'type', 'sources', 'origin']);
+  const VALID_SIZE_UNITS = new Set<number>(SIZE_UNITS.map((u) => u.value));
+  const VALID_FILE_TYPES = new Set<string>(FILE_TYPES.map((t) => t.value));
+  let prefsRestored = false;
+
+  function loadPersistedPrefs() {
+    try {
+      const raw = localStorage.getItem(PREFS_KEY);
+      if (!raw) return;
+      const p = JSON.parse(raw);
+      if (!p || typeof p !== 'object') return;
+      if (typeof p.searchMethod === 'string' && VALID_SEARCH_METHODS.has(p.searchMethod as SearchMethod)) {
+        searchMethod = p.searchMethod as SearchMethod;
+      }
+      if (typeof p.searchFileType === 'string' && VALID_FILE_TYPES.has(p.searchFileType)) {
+        searchFileType = p.searchFileType;
+      }
+      if (typeof p.filterType === 'string' && VALID_FILE_TYPES.has(p.filterType)) {
+        filterType = p.filterType;
+      }
+      if (typeof p.filterColumn === 'string' && VALID_FILTER_COLUMNS.has(p.filterColumn as FilterColumn)) {
+        filterColumn = p.filterColumn as FilterColumn;
+      }
+      if (typeof p.filterExtension === 'string' && p.filterExtension.length <= 16) {
+        filterExtension = p.filterExtension;
+      }
+      if (typeof p.filterMinSize === 'string' && p.filterMinSize.length <= 24) {
+        filterMinSize = p.filterMinSize;
+      }
+      if (typeof p.filterMaxSize === 'string' && p.filterMaxSize.length <= 24) {
+        filterMaxSize = p.filterMaxSize;
+      }
+      if (typeof p.filterMinUnit === 'number' && VALID_SIZE_UNITS.has(p.filterMinUnit)) {
+        filterMinUnit = p.filterMinUnit;
+      }
+      if (typeof p.filterMaxUnit === 'number' && VALID_SIZE_UNITS.has(p.filterMaxUnit)) {
+        filterMaxUnit = p.filterMaxUnit;
+      }
+      if (typeof p.filterMinSources === 'string' && p.filterMinSources.length <= 8) {
+        filterMinSources = p.filterMinSources;
+      }
+      if (typeof p.hideSpam === 'boolean') hideSpam = p.hideSpam;
+      if (typeof p.showAdvancedFilters === 'boolean') showAdvancedFilters = p.showAdvancedFilters;
+      if (typeof p.sortField === 'string' && VALID_SORT_FIELDS.has(p.sortField as SortField)) {
+        sortField = p.sortField as SortField;
+      }
+      if (p.sortDir === 'asc' || p.sortDir === 'desc') {
+        sortDir = p.sortDir;
+      }
+    } catch {
+      try { localStorage.removeItem(PREFS_KEY); } catch { /* ignore */ }
+    }
+  }
+
+  function persistPrefs() {
+    try {
+      localStorage.setItem(PREFS_KEY, JSON.stringify({
+        searchMethod,
+        searchFileType,
+        filterType,
+        filterColumn,
+        filterExtension,
+        filterMinSize,
+        filterMaxSize,
+        filterMinUnit,
+        filterMaxUnit,
+        filterMinSources,
+        hideSpam,
+        showAdvancedFilters,
+        sortField,
+        sortDir,
+      }));
+    } catch { /* quota/serialization — not fatal */ }
+  }
+
+  $effect(() => {
+    if (!prefsRestored) return;
+    // Reactivity markers: touch every persisted field so the effect runs
+    // whenever any of them changes.
+    void searchMethod; void searchFileType;
+    void filterType; void filterColumn; void filterExtension;
+    void filterMinSize; void filterMaxSize; void filterMinUnit; void filterMaxUnit;
+    void filterMinSources; void hideSpam; void showAdvancedFilters;
+    void sortField; void sortDir;
+    persistPrefs();
+  });
+
   function toggleSort(field: SortField) {
     if (sortField === field) {
       sortDir = sortDir === 'asc' ? 'desc' : 'asc';
@@ -269,6 +399,8 @@
   let searchTimeoutSecs = $state(120);
 
   onMount(() => {
+    loadPersistedPrefs();
+    prefsRestored = true;
     getSettings()
       .then((s) => {
         searchTimeoutSecs = s.search_timeout_secs;
@@ -312,24 +444,25 @@
   async function retryServerSearch() {
     if (!activeTab || serverRetryPending || $serverStatus !== 'connected') return;
     const tabQuery = activeTab.query;
-    const tabRequestId = activeTab.requestId;
+    const tabId = activeTab.id;
     if (!tabQuery.trim()) return;
     serverRetryPending = true;
+    // Keep the tab's canonical requestId unchanged so late streaming events
+    // for the original search still land in the correct tab. The retry
+    // request runs under its own nonce and we merge its final payload by
+    // looking up the tab by id rather than by request id.
     try {
       const retryRequestId = newSearchNonce();
-      patchSearchTabByRequestId(tabRequestId, (tab) => ({
-        ...tab,
-        requestId: retryRequestId,
-      }));
       const results = await Promise.race([
         searchFiles(tabQuery, 'server', retryRequestId, activeTab.fileType || undefined, activeTab.filters),
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Server retry timed out after 60 seconds')), 60_000)),
       ]);
       if (results && results.length > 0) {
-        patchSearchTabByRequestId(retryRequestId, (tab) => ({
-          ...tab,
-          results: mergeSearchResults(tab.results, results),
-        }));
+        searchTabs.update((tabs) => tabs.map((t) => (
+          t.id === tabId
+            ? { ...t, results: mergeSearchResults(t.results, results) }
+            : t
+        )));
         addToast('success', `Server returned ${results.length} result${results.length !== 1 ? 's' : ''}`);
       } else {
         addToast('info', 'Server returned no results on retry');
@@ -514,7 +647,58 @@
     closeContextMenu();
   }
 
-  async function onCloseSearchTab(tab: SearchTab) {
+  /**
+   * Arrow-key navigation across search tabs, matching WAI-ARIA tablist
+   * guidance: Left/Right move, Home/End jump to ends, and focus follows
+   * selection so the selected tab is always the one activated.
+   */
+  function onTabKeydown(e: KeyboardEvent, tabId: string) {
+    const tabs = get(searchTabs);
+    if (tabs.length === 0) return;
+    const idx = tabs.findIndex((t) => t.id === tabId);
+    if (idx === -1) return;
+    let target = -1;
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+      target = (idx + 1) % tabs.length;
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+      target = (idx - 1 + tabs.length) % tabs.length;
+    } else if (e.key === 'Home') {
+      target = 0;
+    } else if (e.key === 'End') {
+      target = tabs.length - 1;
+    } else {
+      return;
+    }
+    e.preventDefault();
+    const nextTab = tabs[target];
+    if (!nextTab) return;
+    selectSearchTab(nextTab.id);
+    requestAnimationFrame(() => {
+      const el = document.querySelector<HTMLButtonElement>(
+        `[data-search-tab-id="${nextTab.id}"]`,
+      );
+      el?.focus();
+    });
+  }
+
+  function requestCloseSearchTab(tab: SearchTab) {
+    // Only confirm when closing would lose work: an in-flight search or
+    // accumulated results. A closed, empty tab is always one click to drop.
+    const hasResults = tab.results.length > 0;
+    if (!tab.isSearching && !hasResults) {
+      void performCloseSearchTab(tab);
+      return;
+    }
+    pendingConfirm = { kind: 'close-tab', tab };
+    confirmTitle = tab.isSearching ? 'Stop and close tab?' : 'Close tab?';
+    const preview = tab.query.length > 60 ? `${tab.query.slice(0, 59)}…` : tab.query;
+    confirmMessage = tab.isSearching
+      ? `"${preview}" is still searching. Stop it and close the tab?`
+      : `Close "${preview}" and discard ${tab.results.length} result${tab.results.length !== 1 ? 's' : ''}?`;
+    confirmOpen = true;
+  }
+
+  async function performCloseSearchTab(tab: SearchTab) {
     clearSearchTimeoutForRequest(tab.requestId);
     await closeSearchTab(tab.id);
     selectedResultKey = null;
@@ -599,8 +783,10 @@
     }
     try {
       const results = await searchPromise;
+      // Search succeeded — cancel the watchdog so it doesn't fire later and
+      // call cancelSearch() against a request the backend has already closed.
+      clearSearchTimeoutForRequest(requestId);
       if (!get(searchTabs).some((t) => t.requestId === requestId)) {
-        clearSearchTimeoutForRequest(requestId);
         return;
       }
       if (results && results.length > 0) {
@@ -758,6 +944,24 @@
 
   let downloadPending: Record<string, boolean> = $state({});
 
+  /**
+   * Pick the first syntactically valid address from the candidate list.
+   * Returns `{ ip: '', port: 0 }` when nothing parses — the backend then
+   * performs full KAD/server source discovery on its own. Previously we
+   * passed `addresses[0]` blindly, which could pin the transfer's first
+   * source to a bad peer when the list was unordered.
+   */
+  function pickInitialSource(addresses: string[]): { ip: string; port: number } {
+    for (const addr of addresses) {
+      if (!addr) continue;
+      const { ip, port } = parseAddress(addr);
+      if (ip && port > 0 && ip !== '0.0.0.0') {
+        return { ip, port };
+      }
+    }
+    return { ip: '', port: 0 };
+  }
+
   function parseAddress(addr: string): { ip: string; port: number } {
     if (!addr) return { ip: '', port: 0 };
     const bracketEnd = addr.lastIndexOf(']');
@@ -800,7 +1004,7 @@
 
     downloadPending[key] = true;
     try {
-      const { ip: peerIp, port: peerPort } = parseAddress(networkAddresses[0] ?? '');
+      const { ip: peerIp, port: peerPort } = pickInitialSource(networkAddresses);
       const res = await startDownload(
         result.file.hash,
         result.file.name,
@@ -902,7 +1106,16 @@
     contextMenu = null;
   }
 
-  function clearResults() {
+  function requestClearResults() {
+    const tab = activeTab;
+    if (!tab || tab.results.length === 0) return;
+    pendingConfirm = { kind: 'clear-results' };
+    confirmTitle = 'Clear all results?';
+    confirmMessage = `Discard ${tab.results.length} result${tab.results.length !== 1 ? 's' : ''} in this tab? The search itself stays open so you can run it again.`;
+    confirmOpen = true;
+  }
+
+  function performClearResults() {
     const tabId = get(activeSearchTabId);
     if (!tabId) return;
     searchTabs.update((tabs) => tabs.map((t) => (t.id === tabId ? { ...t, results: [], error: null } : t)));
@@ -916,6 +1129,21 @@
     spamExplainCache = {};
     spamTooltipKey = null;
     clearChecked();
+  }
+
+  function handleConfirm() {
+    const action = pendingConfirm;
+    pendingConfirm = null;
+    if (!action) return;
+    if (action.kind === 'clear-results') {
+      performClearResults();
+    } else if (action.kind === 'close-tab') {
+      void performCloseSearchTab(action.tab);
+    }
+  }
+
+  function handleConfirmCancel() {
+    pendingConfirm = null;
   }
 
   function toggleCheck(key: string, index: number, shiftKey: boolean) {
@@ -964,38 +1192,73 @@
     bulkDownloadPending = true;
     bulkDownloadMessage = '';
     const toDownload = filteredResults.filter((r) => checkedKeys.has(resultKey(r)));
+
     let queued = 0;
     let failed = 0;
     let skippedLocal = 0;
-    for (const result of toDownload) {
-      const networkAddrs = (result.source_addresses ?? []).filter(
-        (a) => a && a !== 'local'
-      );
-      if (networkAddrs.length === 0 && result.result_origin?.includes('Local')) {
-        skippedLocal++;
-        continue;
-      }
-      if (networkAddrs.length === 0 && !result.file.hash) {
-        failed++;
-        continue;
-      }
-      try {
-        const { ip: peerIp, port: peerPort } = parseAddress(networkAddrs[0] ?? '');
-        await startDownload(result.file.hash, result.file.name, result.file.size, peerIp, peerPort);
-        queued++;
-      } catch {
-        failed++;
+    const failures: string[] = [];
+
+    // Fan out with bounded concurrency so the backend doesn't get hammered
+    // with hundreds of simultaneous start_download calls on a big selection.
+    const CONCURRENCY = 6;
+    let cursor = 0;
+    async function worker() {
+      while (true) {
+        const idx = cursor++;
+        if (idx >= toDownload.length) return;
+        const result = toDownload[idx];
+        const networkAddrs = (result.source_addresses ?? []).filter((a) => a && a !== 'local');
+        if (networkAddrs.length === 0 && result.result_origin?.includes('Local')) {
+          skippedLocal++;
+          continue;
+        }
+        if (networkAddrs.length === 0 && !result.file.hash) {
+          failed++;
+          failures.push(`${result.file.name}: no sources`);
+          continue;
+        }
+        try {
+          const { ip: peerIp, port: peerPort } = pickInitialSource(networkAddrs);
+          await startDownload(result.file.hash, result.file.name, result.file.size, peerIp, peerPort);
+          queued++;
+        } catch (e) {
+          failed++;
+          const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'download failed';
+          failures.push(`${result.file.name}: ${msg}`);
+        }
       }
     }
+
+    try {
+      const workers: Promise<void>[] = [];
+      for (let i = 0; i < Math.min(CONCURRENCY, toDownload.length); i++) {
+        workers.push(worker());
+      }
+      await Promise.all(workers);
+    } finally {
+      bulkDownloadPending = false;
+    }
+
     const parts: string[] = [];
     if (queued > 0) parts.push(`Queued ${queued}`);
     if (skippedLocal > 0) parts.push(`${skippedLocal} already in library`);
     if (failed > 0) parts.push(`${failed} failed`);
     bulkDownloadMessage = parts.join(', ');
-    bulkDownloadPending = false;
     safeTimeout(() => {
       bulkDownloadMessage = '';
     }, 3000);
+
+    // Surface a single summary toast plus the first few failure reasons so
+    // large-batch failures don't silently disappear into an inline string.
+    if (queued > 0 && failed === 0) {
+      addToast('success', `Queued ${queued} file${queued !== 1 ? 's' : ''}${skippedLocal > 0 ? ` (${skippedLocal} already in library)` : ''}`);
+    } else if (failed > 0) {
+      const head = failures.slice(0, 3).join(' · ');
+      const more = failures.length > 3 ? ` (+${failures.length - 3} more)` : '';
+      addToast('error', `${failed} failed${queued > 0 ? `, ${queued} queued` : ''}${head ? `: ${head}${more}` : ''}`);
+    } else if (skippedLocal > 0) {
+      addToast('info', `${skippedLocal} already in library`);
+    }
   }
 
   let hasActiveFilters = $derived(
@@ -1033,6 +1296,7 @@
     bind:value={barQuery}
     placeholder="Search files across the network..."
     onsubmit={handleSearch}
+    recentKey="search-recent-queries-v1"
   />
   <select class="type-select" bind:value={searchMethod} title="Search method">
     <option value="global">Global</option>
@@ -1058,9 +1322,12 @@
         <button
           type="button"
           class="search-tab-select"
+          data-search-tab-id={tab.id}
           onclick={() => selectSearchTab(tab.id)}
+          onkeydown={(e) => onTabKeydown(e, tab.id)}
           role="tab"
           aria-selected={tab.id === $activeSearchTabId}
+          tabindex={tab.id === $activeSearchTabId ? 0 : -1}
         >
           <span class="search-tab-label">{shortenTabLabel(tab.query)}</span>
           <span class="search-tab-meta" aria-label={tab.isSearching ? 'Search in progress' : `${tab.results.length} results`}>
@@ -1077,10 +1344,15 @@
         <button
           type="button"
           class="search-tab-close"
-          onclick={() => onCloseSearchTab(tab)}
+          onclick={() => requestCloseSearchTab(tab)}
           title="Close tab"
           aria-label="Close search tab"
-        >×</button>
+        >
+          <svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+            <line x1="3.5" y1="3.5" x2="10.5" y2="10.5"/>
+            <line x1="10.5" y1="3.5" x2="3.5" y2="10.5"/>
+          </svg>
+        </button>
       </div>
     {/each}
   </div>
@@ -1117,7 +1389,12 @@
           class="filter-text-input"
         />
         {#if filterTextInput}
-          <button class="filter-text-clear" onclick={clearFilterText} title="Clear filter text">✕</button>
+          <button class="filter-text-clear" onclick={clearFilterText} title="Clear filter text" aria-label="Clear filter text">
+            <svg viewBox="0 0 14 14" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <line x1="3.5" y1="3.5" x2="10.5" y2="10.5"/>
+              <line x1="10.5" y1="3.5" x2="3.5" y2="10.5"/>
+            </svg>
+          </button>
         {/if}
       </div>
     </div>
@@ -1148,7 +1425,13 @@
             onfocus={() => (showSpamHelp = true)}
             onblur={() => (showSpamHelp = false)}
             onclick={() => (showSpamHelp = !showSpamHelp)}
-          >?</button>
+          >
+            <svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="8" cy="8" r="6.25"/>
+              <path d="M6.25 6.25c0-1 .75-1.75 1.75-1.75s1.75.75 1.75 1.75c0 1-1.75 1.25-1.75 2.75"/>
+              <circle cx="8" cy="11.5" r="0.55" fill="currentColor" stroke="none"/>
+            </svg>
+          </button>
           {#if showSpamHelp}
             <div class="filter-help-popover" role="tooltip">
               {#if spamHiddenCount > 0}
@@ -1283,7 +1566,12 @@
   {/if}
   {#if $searchTabs.length === 0}
     <div class="empty-state">
-      <div class="icon">&#x2315;</div>
+      <div class="icon" aria-hidden="true">
+        <svg viewBox="0 0 48 48" width="48" height="48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="20" cy="20" r="13"/>
+          <line x1="30" y1="30" x2="41" y2="41"/>
+        </svg>
+      </div>
       <p>Search for files across the P2P network</p>
       <p class="hint">Enter a query and press Enter or click Search — each search opens in its own tab</p>
     </div>
@@ -1302,7 +1590,12 @@
     </div>
   {:else if searchResultsList.length === 0 && !activeTab?.isSearching}
     <div class="empty-state">
-      <div class="icon">&#x2315;</div>
+      <div class="icon" aria-hidden="true">
+        <svg viewBox="0 0 48 48" width="48" height="48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="20" cy="20" r="13"/>
+          <line x1="30" y1="30" x2="41" y2="41"/>
+        </svg>
+      </div>
       <p>No results for this search</p>
       <p class="hint">Try another query or different keywords</p>
     </div>
@@ -1320,7 +1613,7 @@
           {searchResultsList.length} results
         {/if}
       </span>
-      <button class="ghost clear-results-btn" onclick={clearResults}>Clear Results</button>
+      <button class="ghost clear-results-btn" onclick={requestClearResults}>Clear Results</button>
     </div>
     {#if checkedCount > 0}
       <div class="bulk-actions" role="toolbar" aria-label="Bulk actions">
@@ -1461,26 +1754,36 @@
     {/if}
 
     {#if contextMenu}
-      <!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
-      <div class="context-menu-backdrop" onclick={closeContextMenu} oncontextmenu={(e) => { e.preventDefault(); closeContextMenu(); }}></div>
-      <div class="context-menu" style="left: {contextMenu.x}px; top: {contextMenu.y}px;">
+      <button
+        type="button"
+        class="context-menu-backdrop"
+        aria-label="Close context menu"
+        onclick={closeContextMenu}
+        oncontextmenu={(e) => { e.preventDefault(); closeContextMenu(); }}
+      ></button>
+      <div class="context-menu" role="menu" style="left: {contextMenu.x}px; top: {contextMenu.y}px;">
         {#if contextMenu.result.is_spam}
-          <button onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}>Mark as Not Spam</button>
+          <button role="menuitem" onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}>Mark as Not Spam</button>
         {:else}
-          <button onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}>Mark as Spam</button>
+          <button role="menuitem" onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}>Mark as Spam</button>
         {/if}
-        <button onclick={() => { if (contextMenu) download(contextMenu.result); closeContextMenu(); }}>Download</button>
+        <button role="menuitem" onclick={() => { if (contextMenu) download(contextMenu.result); closeContextMenu(); }}>Download</button>
         {#if checkedCount > 1}
-          <button onclick={() => { downloadChecked(); closeContextMenu(); }}>Download {checkedCount} Selected</button>
+          <button role="menuitem" onclick={() => { downloadChecked(); closeContextMenu(); }}>Download {checkedCount} Selected</button>
         {/if}
-        <button onclick={() => { if (contextMenu) showFileDetails(contextMenu.result); closeContextMenu(); }}>Details</button>
+        <button role="menuitem" onclick={() => { if (contextMenu) showFileDetails(contextMenu.result); closeContextMenu(); }}>Details</button>
       </div>
     {/if}
     {#if selectedResult}
-      <div class="file-details-panel">
+      <div class="file-details-panel scroll-shadows">
         <div class="panel-header">
           <h3>File Details</h3>
-          <button class="ghost" onclick={() => { selectedResultKey = null; notesRequestId += 1; loadingNotes = false; spamExplainLoading = false; spamExplainError = null; }}>✕</button>
+          <button class="ghost panel-close" aria-label="Close file details" onclick={() => { selectedResultKey = null; notesRequestId += 1; loadingNotes = false; spamExplainLoading = false; spamExplainError = null; }}>
+            <svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <line x1="3.5" y1="3.5" x2="10.5" y2="10.5"/>
+              <line x1="10.5" y1="3.5" x2="3.5" y2="10.5"/>
+            </svg>
+          </button>
         </div>
         <div class="panel-body">
           <div class="detail-row"><strong>Name:</strong> {selectedResult.file.name}</div>
@@ -1580,6 +1883,17 @@
   {/if}
 </div>
 
+<ConfirmDialog
+  bind:open={confirmOpen}
+  title={confirmTitle}
+  message={confirmMessage}
+  confirmLabel={pendingConfirm?.kind === 'close-tab' ? 'Close Tab' : 'Clear'}
+  cancelLabel="Keep"
+  danger={true}
+  onconfirm={handleConfirm}
+  oncancel={handleConfirmCancel}
+/>
+
 <style>
   .search-area {
     display: flex;
@@ -1591,7 +1905,7 @@
     flex-wrap: wrap;
   }
 
-  .search-area :global(.search-bar) {
+  .search-area :global(.search-bar-wrap) {
     flex: 1 1 420px;
     min-width: 260px;
   }
@@ -2032,6 +2346,7 @@
   .col-size {
     width: 10%;
     text-align: right;
+    font-variant-numeric: tabular-nums;
   }
 
   .col-type {
@@ -2050,6 +2365,7 @@
   .col-sources {
     width: 7%;
     text-align: center;
+    font-variant-numeric: tabular-nums;
   }
 
   .col-history {
@@ -2102,6 +2418,16 @@
 
   .search-results-table tbody tr {
     height: 30px;
+    /*
+     * Chromium-native virtualization: skips layout/paint for rows that are
+     * offscreen, using the intrinsic-size hint to reserve scroll space.
+     * Tauri ships with WebView2 (Chromium) on Windows, so this is always
+     * available in the app; other engines gracefully fall back to normal
+     * rendering. This gives large result sets (thousands of rows) a huge
+     * scroll-perf win without fragile manual row windowing.
+     */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 30px;
   }
 
   th.sortable {
@@ -2601,16 +2927,21 @@
     position: fixed;
     inset: 0;
     z-index: 999;
+    padding: 0;
+    margin: 0;
+    border: none;
+    background: transparent;
+    cursor: default;
   }
   .context-menu {
     position: fixed;
     z-index: 1000;
-    background: var(--bg-secondary, #2a2a2a);
-    border: 1px solid var(--border, #444);
-    border-radius: 6px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
     padding: 4px 0;
     min-width: 160px;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    box-shadow: var(--shadow-md);
   }
   .context-menu button {
     display: block;
