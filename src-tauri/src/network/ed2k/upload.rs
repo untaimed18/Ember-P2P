@@ -122,6 +122,19 @@ pub struct UdpFirewallCheckRequest {
 }
 
 const CLIENT_TIMEOUT_SECS: u64 = 120;
+/// How long we'll hold a granted upload slot for a peer that has gone
+/// silent (no `OP_REQUESTPARTS` and no other activity) before closing
+/// the session and rotating the slot to the next queued peer.
+///
+/// Tighter than `CLIENT_TIMEOUT_SECS` because an actively downloading
+/// eMule client sends `OP_REQUESTPARTS` back-to-back — typically one
+/// per completed ~540 KB batch, so at any sane rate there's something
+/// on the wire every second or two. 60 s of total silence means the
+/// peer has paused, crashed, or walked away; sitting on their slot
+/// starves our queue. The full 120 s timeout is kept for pre-grant
+/// (discovery / secident / handshake) states where long silences are
+/// normal.
+const SLOT_IDLE_TIMEOUT_SECS: u64 = 60;
 /// Maximum concurrent TCP connections from a single IP address
 const MAX_CONNECTIONS_PER_IP: usize = 3;
 /// Maximum total concurrent TCP connections to the upload server
@@ -1778,7 +1791,23 @@ impl UploadHandler {
             let (proto, opcode, payload) = if let Some(pkt) = deferred_packet.take() {
                 pkt
             } else {
-                let wait_secs = if queued_identity.is_some() { 1 } else if owns_ember_slot { 90 } else { CLIENT_TIMEOUT_SECS };
+                // Shorter timeout once a slot is actively granted — a
+                // peer that stops requesting parts is almost certainly
+                // gone, and holding their slot blocks the queue. See
+                // `SLOT_IDLE_TIMEOUT_SECS` for the rationale; the full
+                // `CLIENT_TIMEOUT_SECS` is still used during the
+                // discovery / secident / hello phase where long silences
+                // are normal, and for plain queued peers we poll every
+                // 1s to re-evaluate promotion / rank updates.
+                let wait_secs = if queued_identity.is_some() {
+                    1
+                } else if owns_ember_slot {
+                    90
+                } else if slot_guard.is_active() {
+                    SLOT_IDLE_TIMEOUT_SECS
+                } else {
+                    CLIENT_TIMEOUT_SECS
+                };
                 let timeout_dur = std::time::Duration::from_secs(wait_secs);
                 let read_result = tokio::select! {
                     r = tokio::time::timeout(timeout_dur, pkt_rx.recv()) => r,
@@ -1943,7 +1972,22 @@ impl UploadHandler {
                             }
                             continue;
                         }
-                        debug!("Client timed out");
+                        // Distinguish the two cases for operators: an
+                        // active-slot idle timeout means the peer stopped
+                        // requesting blocks while holding a slot (we'll
+                        // rotate to the next queued peer), while a
+                        // pre-grant timeout means the peer never
+                        // progressed through the handshake. Either way,
+                        // the function-exit cleanup at the end of
+                        // `handle_connection` emits the appropriate
+                        // `Completed` / `Failed` UploadEvent.
+                        if slot_guard.is_active() {
+                            debug!(
+                                "Upload slot idle >{SLOT_IDLE_TIMEOUT_SECS}s for {peer_addr} — closing to rotate slot"
+                            );
+                        } else {
+                            debug!("Client {peer_addr} timed out before slot grant");
+                        }
                         break;
                     }
                 }
