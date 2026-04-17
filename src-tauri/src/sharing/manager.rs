@@ -717,7 +717,15 @@ impl TransferManager {
         let stale_threshold = (SPEED_WINDOW_MS / 1000) as i64;
 
         for transfer in self.active.values_mut() {
-            if transfer.speed > 0 && transfer.direction == TransferDirection::Download {
+            // Decay `speed` to 0 on both directions once no progress event
+            // has landed within the speed-averaging window. Without this,
+            // upload rows froze their displayed speed forever after a peer
+            // stopped requesting blocks: `update_progress` is only called
+            // when bytes actually move, so the row retained its last-known
+            // rate with no natural path back to 0. Previously this branch
+            // was gated on `direction == Download`, which silently skipped
+            // uploads — a contributor to the "uploads appear frozen" UX.
+            if transfer.speed > 0 {
                 let last_activity = transfer.last_received.unwrap_or(transfer.started_at);
                 if now.saturating_sub(last_activity) > stale_threshold {
                     speed_resets.push(SpeedReset {

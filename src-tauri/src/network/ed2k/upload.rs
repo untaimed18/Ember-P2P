@@ -2040,14 +2040,34 @@ impl UploadHandler {
                             );
 
                             // Check if this is a partial download (.part file)
-                            // and build an accurate bitmap from PartTracker
+                            // and build an accurate bitmap from PartTracker.
+                            //
+                            // IMPORTANT: the bitmap must match our serving policy,
+                            // not our download progress. We only serve bytes
+                            // that pass `is_range_safe_to_serve`, which requires
+                            // each part to be BOTH complete AND MD4-verified
+                            // (see `part_tracker.rs:181`). Advertising a part
+                            // that's complete-but-unverified creates a "dead
+                            // upload" condition: the peer sees the bit set,
+                            // requests blocks from that part, and every
+                            // OP_REQUESTPARTS gets silently rejected at the
+                            // serve gate. The UI row shows "Started" with no
+                            // progress and the session sits open until the
+                            // peer eventually disconnects — exactly the
+                            // "uploads freeze in the UI" symptom. Gate the
+                            // advertised bitmap on the same condition the
+                            // serve path uses so the peer only ever asks for
+                            // ranges we're willing to send.
                             if file.is_partial && file.size > 0 {
                                 let tracker = super::part_tracker::PartTracker::new(file.size, &file.path);
                                 for byte_idx in 0..bitmap_bytes {
                                     let mut byte = 0u8;
                                     for bit in 0..8 {
                                         let part_idx = byte_idx * 8 + bit;
-                                        if part_idx < ed2k_part_count as usize && tracker.is_part_complete(part_idx) {
+                                        if part_idx < ed2k_part_count as usize
+                                            && tracker.is_part_complete(part_idx)
+                                            && tracker.is_part_verified(part_idx)
+                                        {
                                             byte |= 1 << bit;
                                         }
                                     }
