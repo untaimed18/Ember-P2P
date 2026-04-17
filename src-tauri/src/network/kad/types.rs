@@ -133,31 +133,38 @@ impl KadId {
         KadId(result)
     }
 
-    /// Return the `i`-th 32-bit chunk treating the stored bytes as a
-    /// 128-bit unsigned integer in network byte order (big-endian).
+    /// Return the `i`-th 32-bit chunk of the 128-bit ID, matching eMule's
+    /// `CUInt128::Get32BitChunk(i)` — which returns `m_uData[i]` as a
+    /// native `ULONG`.
     ///
-    /// This matches eMule's `CUInt128::Get32BitChunk`, which reads wire
-    /// bytes via `SetValueBE` (`m_uData[i] = (b0<<24)|(b1<<16)|(b2<<8)|b3`)
-    /// so `Get32BitChunk(0)` is the **most significant** 32 bits of the
-    /// whole 128-bit value. The previous implementation used
-    /// `u32::from_le_bytes`, which silently flipped the byte order within
-    /// each chunk. The most visible symptom was `SEARCH_TOLERANCE` checks
-    /// inspecting the wrong 24 bits of the XOR distance — we'd pick
-    /// "within-tolerance" peers that eMule's
-    /// `Process_KADEMLIA2_PUBLISH_SOURCE_REQ` silently rejects (no
-    /// `PublishRes` ever sent), making `publish_confirmed` stuck at 0.
-    /// It also skewed every `get_bit_number` / `shift_left` / routing
-    /// bucket decision away from eMule's bit numbering.
+    /// Why `from_le_bytes` and not `from_be_bytes`: eMule's wire format
+    /// for a `CUInt128` is produced by `WriteUInt128` (see
+    /// `kademlia/io/DataIO.cpp:263`), which hands the raw address of
+    /// `m_uData[4]` to `WriteArray`. On x86/x64 (every LE host eMule
+    /// runs on) each `ULONG` lands on the wire LSB-first, so the first
+    /// four wire bytes are the **little-endian** encoding of
+    /// `m_uData[0]`. `KadId::from_bytes` copies wire bytes verbatim into
+    /// `self.0`, so `u32::from_le_bytes(self.0[0..4])` reconstructs
+    /// `m_uData[0]` exactly.
+    ///
+    /// Using `from_be_bytes` here instead silently byte-swaps every
+    /// chunk, which had looked plausible because eMule's `SetValueBE`
+    /// *also* exists — but that path is only used for **externally**
+    /// BE-formatted byte arrays (e.g. MD4 file hashes read from
+    /// `.part.met` files), not for wire decoding. Our `publish.rs`
+    /// already runs that same 4-byte swap when turning an MD4 digest
+    /// into a `KadId`, so by the time bytes hit `self.0` they're
+    /// already in wire order and `from_le_bytes` is what we want.
     pub(crate) fn chunk(&self, i: usize) -> u32 {
         debug_assert!(i < KAD_ID_SIZE / 4, "KadId::chunk index out of bounds");
         let base = i * 4;
-        u32::from_be_bytes([self.0[base], self.0[base + 1], self.0[base + 2], self.0[base + 3]])
+        u32::from_le_bytes([self.0[base], self.0[base + 1], self.0[base + 2], self.0[base + 3]])
     }
 
     fn set_chunk(&mut self, i: usize, val: u32) {
         debug_assert!(i < KAD_ID_SIZE / 4, "KadId::set_chunk index out of bounds");
         let base = i * 4;
-        let bytes = val.to_be_bytes();
+        let bytes = val.to_le_bytes();
         self.0[base] = bytes[0];
         self.0[base + 1] = bytes[1];
         self.0[base + 2] = bytes[2];
@@ -284,13 +291,27 @@ impl PartialOrd for KadId {
 }
 
 impl Ord for KadId {
-    /// Match eMule's `CUInt128::CompareTo`: treat the 16 bytes as a
-    /// 128-bit unsigned integer in network byte order. Byte-wise
-    /// lexicographic comparison of `[u8; 16]` is equivalent to comparing
-    /// four big-endian u32 chunks top-down, so we just defer to the
-    /// array's default `Ord`.
+    /// Match eMule's `CUInt128::CompareTo`: compare `m_uData[0..4]`
+    /// top-down as `ULONG` values. Given our wire-order storage (see
+    /// `KadId::chunk`), each chunk is the `u32::from_le_bytes` of its
+    /// 4-byte window. Byte-wise lexicographic comparison on `self.0`
+    /// would be **wrong** here — it orders by `self.0[0]` (the LSB of
+    /// `m_uData[0]`) first, producing a different ordering than eMule.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
+        for i in 0..4 {
+            let base = i * 4;
+            let a = u32::from_le_bytes([
+                self.0[base], self.0[base + 1], self.0[base + 2], self.0[base + 3],
+            ]);
+            let b = u32::from_le_bytes([
+                other.0[base], other.0[base + 1], other.0[base + 2], other.0[base + 3],
+            ]);
+            match a.cmp(&b) {
+                std::cmp::Ordering::Equal => continue,
+                ord => return ord,
+            }
+        }
+        std::cmp::Ordering::Equal
     }
 }
 
@@ -759,97 +780,91 @@ pub fn write_tag_list<W: Write>(writer: &mut W, tags: &[KadTag]) -> io::Result<(
 }
 
 #[cfg(test)]
-mod kad_id_endianness_tests {
+mod kad_id_wire_layout_tests {
     use super::*;
 
-    /// Pins the most significant chunk semantics to eMule's
-    /// `CUInt128::Get32BitChunk(0)`. For wire bytes `01 02 03 04 …`,
-    /// eMule stores `m_uData[0] = (0x01<<24)|(0x02<<16)|(0x03<<8)|0x04
-    /// = 0x01020304`. Previously we used `from_le_bytes`, which yielded
-    /// `0x04030201` — causing `SEARCH_TOLERANCE` and every bit/shift
-    /// routing operation to inspect the wrong byte range.
+    /// Pin `chunk()` to eMule's `CUInt128::Get32BitChunk(0)` on LE hosts.
+    ///
+    /// `WriteUInt128` writes the raw bytes of `m_uData[4]` — four
+    /// `ULONG`s — to the wire. On every eMule host (x86/x64 LE), each
+    /// `ULONG` lands on the wire LSB-first. So for wire bytes
+    /// `67 45 23 01 …` the peer's `m_uData[0] = 0x01234567`. Our stored
+    /// `self.0` copies wire bytes verbatim, hence
+    /// `u32::from_le_bytes(self.0[0..4]) == m_uData[0]`.
     #[test]
-    fn chunk_is_big_endian_like_emule() {
-        let mut bytes = [0u8; KAD_ID_SIZE];
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = (i + 1) as u8;
-        }
-        let id = KadId(bytes);
-        assert_eq!(id.chunk(0), 0x01020304, "chunk(0) must be the top 32 bits");
-        assert_eq!(id.chunk(1), 0x05060708);
-        assert_eq!(id.chunk(2), 0x090A0B0C);
-        assert_eq!(id.chunk(3), 0x0D0E0F10);
+    fn chunk_matches_emule_uint128_get32bitchunk() {
+        let wire_bytes = [
+            0x67, 0x45, 0x23, 0x01, 0xEF, 0xCD, 0xAB, 0x89,
+            0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+        ];
+        let id = KadId(wire_bytes);
+        assert_eq!(id.chunk(0), 0x0123_4567, "chunk(0) = m_uData[0]");
+        assert_eq!(id.chunk(1), 0x89AB_CDEF);
+        assert_eq!(id.chunk(2), 0x0506_0708);
+        assert_eq!(id.chunk(3), 0x0102_0304);
     }
 
-    /// eMule's search tolerance check is `(local XOR target).Get32BitChunk(0)
-    /// <= SEARCHTOLERANCE (0x01000000)`. The check operates on the MOST
-    /// significant 32 bits of the XOR distance. The previous LE
-    /// implementation mis-read this as the LSB range, so `publish_confirmed`
-    /// stuck at 0: we'd send PublishSourceReq to peers that eMule silently
-    /// rejects (no PublishRes response ever).
+    /// `SEARCH_TOLERANCE` gate must match eMule's
+    /// `Process_KADEMLIA2_PUBLISH_SOURCE_REQ` distance check, which
+    /// operates on `Get32BitChunk(0)` of the XOR distance — i.e. the top
+    /// 32 bits conceptually. With LE-per-chunk storage those top bits
+    /// live in `self.0[3]` (the MSB of `m_uData[0]` is the *last* of the
+    /// first four wire bytes).
     #[test]
-    fn search_tolerance_inspects_top_bits() {
+    fn search_tolerance_uses_msb_of_chunk0() {
         let local = KadId([0u8; KAD_ID_SIZE]);
 
-        // Target differs only in the TOP byte → distance chunk(0) is huge,
-        // well beyond tolerance. Must be rejected.
+        // Flip the MSB of m_uData[0] → byte index 3. Distance is huge.
         let mut far_bytes = [0u8; KAD_ID_SIZE];
-        far_bytes[0] = 0xFF;
-        let far = KadId(far_bytes);
-        assert!(
-            local.xor_distance(&far).chunk(0) > SEARCH_TOLERANCE,
-            "top-byte mismatch must exceed tolerance"
-        );
+        far_bytes[3] = 0xFF;
+        assert!(local.xor_distance(&KadId(far_bytes)).chunk(0) > SEARCH_TOLERANCE);
 
-        // Target differs only in the LAST byte → distance chunk(0) is 0.
-        // Must accept.
+        // Flip any byte inside m_uData[1..4] → chunk(0) stays 0.
         let mut near_bytes = [0u8; KAD_ID_SIZE];
+        near_bytes[4] = 0xFF;
         near_bytes[KAD_ID_SIZE - 1] = 0xFF;
-        let near = KadId(near_bytes);
-        assert_eq!(
-            local.xor_distance(&near).chunk(0),
-            0,
-            "last-byte differences live in chunk(3), not chunk(0)"
-        );
-        assert!(local.xor_distance(&near).chunk(0) <= SEARCH_TOLERANCE);
+        assert_eq!(local.xor_distance(&KadId(near_bytes)).chunk(0), 0);
     }
 
-    /// `get_bit_number(0)` must be the most significant bit of the
-    /// 128-bit value (`byte[0]`'s MSB), matching eMule.
+    /// `get_bit_number(0)` is the MSB of `m_uData[0]`, which in our
+    /// LE-per-chunk storage sits at byte index 3 (not 0).
     #[test]
-    fn get_bit_number_zero_is_byte0_msb() {
+    fn get_bit_number_zero_is_msb_of_m_udata0() {
         let mut bytes = [0u8; KAD_ID_SIZE];
-        bytes[0] = 0x80;
+        bytes[3] = 0x80;
         let id = KadId(bytes);
-        assert_eq!(id.get_bit_number(0), 1, "bit 0 must be byte[0]'s MSB");
+        assert_eq!(
+            id.get_bit_number(0),
+            1,
+            "bit 0 must be the MSB of m_uData[0], stored at byte[3] on LE"
+        );
         for bit in 1..128 {
-            assert_eq!(
-                id.get_bit_number(bit),
-                0,
-                "bit {bit} must be zero for this fixture",
-            );
+            assert_eq!(id.get_bit_number(bit), 0, "bit {bit} must be zero");
         }
     }
 
-    /// KadId ordering must follow network-byte-order (lexicographic on
-    /// the raw bytes). This keeps our routing/sort agreement with eMule.
+    /// Ordering mirrors `CUInt128::CompareTo`: compare `m_uData[0]`
+    /// first as a `ULONG`, then `[1]`, etc. This is *not* the same as
+    /// byte-wise lex on `self.0` because each chunk is LE within.
     #[test]
-    fn ord_is_lexicographic_on_raw_bytes() {
+    fn ord_follows_emule_compareto_not_raw_byte_lex() {
+        // Two IDs differing only in the MSB of m_uData[0] (byte 3).
+        let mut lo_bytes = [0u8; KAD_ID_SIZE];
+        let mut hi_bytes = [0u8; KAD_ID_SIZE];
+        lo_bytes[3] = 0x01;
+        hi_bytes[3] = 0x02;
+        assert!(KadId(lo_bytes) < KadId(hi_bytes));
+
+        // Flip a low-order byte of m_uData[0] vs a high-order byte.
+        // eMule's CompareTo treats m_uData[0] as one u32, so byte[3]
+        // dominates byte[0]. Raw byte-lex would disagree.
         let mut a = [0u8; KAD_ID_SIZE];
         let mut b = [0u8; KAD_ID_SIZE];
-        a[0] = 0x01;
-        b[0] = 0x02;
-        assert!(KadId(a) < KadId(b));
-
-        let mut c = [0u8; KAD_ID_SIZE];
-        let mut d = [0u8; KAD_ID_SIZE];
-        c[0] = 0x10;
-        c[KAD_ID_SIZE - 1] = 0xFF;
-        d[0] = 0x11;
-        d[KAD_ID_SIZE - 1] = 0x00;
+        a[0] = 0xFF; // low byte of chunk 0 on LE
+        b[3] = 0x01; // high byte of chunk 0 on LE
         assert!(
-            KadId(c) < KadId(d),
-            "later-byte differences must not flip the ordering"
+            KadId(a) < KadId(b),
+            "chunk-0 comparison must dominate raw byte-lex on self.0"
         );
     }
 }
