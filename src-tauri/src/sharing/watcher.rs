@@ -46,7 +46,11 @@ impl SharedFoldersWatcher {
         // reuses reload_shared_files so the heavy lifting (discover, hash,
         // publish) is shared with the manual-reload path.
         let app_for_handler = app.clone();
-        tokio::spawn(async move {
+        // NOTE: must use `tauri::async_runtime::spawn` (not `tokio::spawn`)
+        // because `SharedFoldersWatcher::start` is called from Tauri's
+        // synchronous `setup` hook, which is not itself running inside a
+        // Tokio reactor context.
+        tauri::async_runtime::spawn(async move {
             while reload_rx.recv().await.is_some() {
                 while reload_rx.try_recv().is_ok() {}
                 // Small cooldown on top of notify's debounce to let a burst
