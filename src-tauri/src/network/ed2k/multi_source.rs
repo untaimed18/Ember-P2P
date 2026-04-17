@@ -1214,7 +1214,14 @@ impl MultiSourceDownload {
             };
 
             if verified_ok {
-                // Verification passed — safe to move file and clean up resume state
+                // Verification passed — safe to move file and clean up resume state.
+                // Mark every part verified (covers < PARTSIZE single-part
+                // files that never set per-part flags, and acts as a
+                // belt-and-braces reset for multi-part files).
+                {
+                    let mut t = tracker.write().await;
+                    t.mark_file_hash_verified();
+                }
                 let safe_name = crate::security::sanitize_filename(&self.file_name);
                 let final_path = self.download_dir.join("Downloads").join(&safe_name);
                 let pp = part_path.clone();
@@ -1290,6 +1297,14 @@ impl MultiSourceDownload {
     }
 }
 
+/// Maximum distinct in-flight compressed blocks per download session.
+/// A hostile peer could otherwise stream many `OP_COMPRESSEDPART*` packets
+/// with different `start` keys, each buffering up to
+/// `MAX_DECOMPRESSED_PART` bytes, and multiply our memory footprint. eMule
+/// negotiates at most a few outstanding requested blocks per session; 16
+/// is comfortably above any legitimate pipelining depth.
+const MAX_PENDING_COMPRESSED_BLOCKS: usize = 16;
+
 fn append_compressed_chunk_ms(
     pending: &mut HashMap<u64, PendingCompressedBlock>,
     start: u64,
@@ -1302,6 +1317,17 @@ fn append_compressed_chunk_ms(
     }
     if total_packed > MAX_DECOMPRESSED_PART {
         anyhow::bail!("packed size {total_packed} exceeds limit");
+    }
+    // Memory DoS guard: refuse to track more than N concurrent compressed
+    // blocks per connection. Allow existing `start` keys to keep growing
+    // (legitimate continuation); only reject genuinely new entries once the
+    // map is full.
+    if !pending.contains_key(&start) && pending.len() >= MAX_PENDING_COMPRESSED_BLOCKS {
+        anyhow::bail!(
+            "too many concurrent compressed blocks from peer ({} open, max {})",
+            pending.len(),
+            MAX_PENDING_COMPRESSED_BLOCKS
+        );
     }
     let entry = pending.entry(start).or_insert_with(|| PendingCompressedBlock {
         compressed_total_size: total_packed_size,
@@ -1384,6 +1410,14 @@ async fn download_parts_from_source(
     let src_ip = addr.ip().to_string();
     let src_port = addr.port();
     let mut src_transferred: u64 = 0;
+    // D12: bytes received from this peer since the last successful MD4
+    // verification, grouped by (pending). We defer calling
+    // `cm.add_downloaded(...)` until the part these bytes contributed to
+    // actually verifies; on a Mismatch the bytes are dropped so the peer
+    // gets no credit for corrupt data. Legit bytes contributed to a
+    // multi-source part completion will be counted when any one peer's
+    // task observes the Verified outcome.
+    let mut pending_credit_bytes: u64 = 0;
     let mut early_upload_accept = false;
     let mut pending_secident_challenge: Option<u32> = None;
     let mut epx_packets_received: u8 = 0;
@@ -2293,27 +2327,48 @@ async fn download_parts_from_source(
                                 aich_hash: None,
                             };
                             if local_ident.compare_relaxed(&resp.identifier) {
-                                if let Some(root) = resp.aich_master_hash {
-                                    let mut am = shared_aich_master.write().await;
-                                    if am.is_none() {
-                                        *am = Some(root);
-                                    }
-                                    if let Some(part_hashes) = resp.aich_part_hashes.as_ref() {
-                                        debug!(
-                                            "Source {} provided HashSet2 AICH data: master={}, parts={}",
-                                            _src_idx,
-                                            hex::encode(root),
-                                            part_hashes.len()
-                                        );
-                                    }
-                                }
-                                if let Some(hashes) = resp.md4_hashes {
-                                    if super::transfer::verify_hashset(&file_hash, &hashes, file_size) {
+                                // Pin the AICH master hash ONLY after the
+                                // accompanying MD4 hashset verifies against
+                                // the file's ed2k hash. This prevents a
+                                // first-wins peer from pinning a bogus
+                                // master that is never tied to a verified
+                                // file identity (see audit D2). If MD4
+                                // hashes are missing or bad, we defer AICH
+                                // pinning until a trustworthy source
+                                // arrives or the EPX-time check accepts it.
+                                let md4_ok = resp
+                                    .md4_hashes
+                                    .as_ref()
+                                    .map(|h| {
+                                        super::transfer::verify_hashset(&file_hash, h, file_size)
+                                    })
+                                    .unwrap_or(false);
+                                if md4_ok {
+                                    if let Some(hashes) = resp.md4_hashes {
                                         let mut ph = shared_part_hashes.write().await;
                                         if ph.is_empty() {
                                             *ph = hashes;
                                         }
                                     }
+                                    if let Some(root) = resp.aich_master_hash {
+                                        let mut am = shared_aich_master.write().await;
+                                        if am.is_none() {
+                                            *am = Some(root);
+                                        }
+                                        if let Some(part_hashes) = resp.aich_part_hashes.as_ref() {
+                                            debug!(
+                                                "Source {} provided HashSet2 AICH data: master={}, parts={}",
+                                                _src_idx,
+                                                hex::encode(root),
+                                                part_hashes.len()
+                                            );
+                                        }
+                                    }
+                                } else if resp.aich_master_hash.is_some() {
+                                    warn!(
+                                        "HashSet2 from source {} had an AICH master but the MD4 hashset failed or was absent — deferring AICH pin",
+                                        _src_idx
+                                    );
                                 }
                             }
                         }
@@ -2664,6 +2719,16 @@ async fn download_parts_from_source(
                     let (hash, start, end, data) = if opcode == OP_SENDINGPART_I64 {
                         parse_sending_part_i64(&payload)?
                     } else {
+                        // D19: a 32-bit OP_SENDINGPART cannot address past
+                        // 4 GiB. If our file is larger the peer must use
+                        // OP_SENDINGPART_I64; reject 32-bit frames rather
+                        // than silently wrap / mis-write.
+                        if file_size > u32::MAX as u64 {
+                            anyhow::bail!(
+                                "source {_src_idx} sent 32-bit OP_SENDINGPART for a {}-byte file (requires I64)",
+                                file_size
+                            );
+                        }
                         parse_sending_part_32(&payload)?
                     };
                     if hash != *file_hash {
@@ -2683,11 +2748,32 @@ async fn download_parts_from_source(
                         }
                         continue;
                     }
-                    consecutive_bad_blocks = 0;
+                    // D18: refuse absurdly small chunks. eMule-family peers
+                    // never ship OP_SENDINGPART below a few KiB; a peer
+                    // sending 1-byte chunks is either broken or abusive
+                    // (work amplification vs our syscall/allocator path).
+                    // 16 bytes keeps the floor trivially low for any legit
+                    // truncated-tail block.
+                    const MIN_BLOCK_BYTES: u64 = 16;
                     let piece_len = end - start;
+                    if piece_len < MIN_BLOCK_BYTES && end != file_size {
+                        consecutive_bad_blocks += 1;
+                        tracing::warn!(
+                            "source {_src_idx} sent undersized block ({piece_len} bytes); treating as abusive"
+                        );
+                        if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                            anyhow::bail!("source {_src_idx} sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
+                        }
+                        continue;
+                    }
+                    consecutive_bad_blocks = 0;
                     bw.acquire_download(piece_len).await;
 
-                    {
+                    // D20: only commit the fill_range to the tracker if the
+                    // disk write actually succeeded. Previously fill_range
+                    // could run before the write and a spawn_blocking error
+                    // would leave the tracker thinking bytes were on disk.
+                    let write_result = {
                         let out = output.clone();
                         let buf = data.to_vec();
                         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
@@ -2695,10 +2781,26 @@ async fn download_parts_from_source(
                             f.seek(std::io::SeekFrom::Start(start))?;
                             f.write_all(&buf)?;
                             Ok(())
-                        }).await.map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+                        }).await
+                    };
+                    match write_result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                "source {_src_idx}: disk write failed at start={start} ({piece_len} bytes): {e}"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "source {_src_idx}: blocking-write task failed: {e}"
+                            );
+                            continue;
+                        }
                     }
 
-                    // Update byte-level gap tracker for mid-part resume
+                    // Update byte-level gap tracker for mid-part resume.
+                    // Only reached when the disk write succeeded.
                     {
                         let mut t = tracker.write().await;
                         t.fill_range(start, end);
@@ -2724,10 +2826,9 @@ async fn download_parts_from_source(
                     src_transferred += piece_len;
                     blocks_received_in_current_req += 1;
                     speed_bytes += piece_len;
-                    if let Some(cm) = &credit_mgr {
-                        let mut cm = cm.write().await;
-                        cm.add_downloaded(peer_user_hash, piece_len);
-                    }
+                    // D12: defer credit accrual until the covered part
+                    // verifies; see `pending_credit_bytes` declaration.
+                    pending_credit_bytes = pending_credit_bytes.saturating_add(piece_len);
                     let _ = progress_tx.send((_src_idx, piece_len as i64)).await;
                 }
                 (OP_EMULEPROT, OP_COMPRESSEDPART_I64) | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
@@ -2802,10 +2903,9 @@ async fn download_parts_from_source(
                     src_transferred += piece_len;
                     blocks_received_in_current_req += 1;
                     speed_bytes += piece_len;
-                    if let Some(cm) = &credit_mgr {
-                        let mut cm = cm.write().await;
-                        cm.add_downloaded(peer_user_hash, piece_len);
-                    }
+                    // D12: accrue credit only after the covered part
+                    // verifies.
+                    pending_credit_bytes = pending_credit_bytes.saturating_add(piece_len);
                     let _ = progress_tx.send((_src_idx, piece_len as i64)).await;
                 }
                 (OP_EMULEPROT, OP_AICHANSWER) if payload.len() >= 38 => {
@@ -3256,14 +3356,18 @@ async fn download_parts_from_source(
                                         .await;
                                 }
                             }
+                            // D15: subtract only the bytes for THIS part,
+                            // not the whole session total. Subtracting
+                            // total_received over-rewinds progress and
+                            // breaks stall detection.
                             let _ = progress_tx
-                                .send((_src_idx, -(total_received as i64)))
+                                .send((_src_idx, -(part_len as i64)))
                                 .await;
                             PartHashOutcome::Mismatch
                         }
                     } else {
                         let _ = progress_tx
-                            .send((_src_idx, -(total_received as i64)))
+                            .send((_src_idx, -(part_len as i64)))
                             .await;
                         PartHashOutcome::Mismatch
                     }
@@ -3288,9 +3392,21 @@ async fn download_parts_from_source(
                 let mut t = tracker.write().await;
                 let (ps, pe) = t.part_range(part_idx);
                 t.mark_complete(part_idx);
+                // Flip the persistent verified flag so the upload path can
+                // serve this range (see PartTracker::is_range_safe_to_serve).
+                t.set_part_verified(part_idx);
                 t.set_in_progress(part_idx, false);
                 t.save();
                 ip_guard.unmark(part_idx);
+                // D12: flush accumulated bytes to the credit ledger now
+                // that this peer's contribution went into a verified part.
+                if pending_credit_bytes > 0 {
+                    if let Some(cm) = &credit_mgr {
+                        let mut cm = cm.write().await;
+                        cm.add_downloaded(peer_user_hash, pending_credit_bytes);
+                    }
+                    pending_credit_bytes = 0;
+                }
                 if let Some(ref etx) = event_tx {
                     let _ = etx
                         .send(DownloadEvent::PartVerified {
@@ -3305,11 +3421,18 @@ async fn download_parts_from_source(
             PartHashOutcome::Mismatch => {
                 let mut t = tracker.write().await;
                 let (ps, pe) = t.part_range(part_idx);
+                // D15: the inner verification block has already sent a
+                // progress correction for this part (using part_len);
+                // don't double-subtract here.
+                let _ = (ps, pe);
                 t.mark_incomplete(part_idx);
                 t.set_in_progress(part_idx, false);
                 t.save();
                 drop(t);
                 ip_guard.unmark(part_idx);
+                // D12: drop the pending credit bytes — the peer sent data
+                // that didn't verify, so no credit accrues.
+                pending_credit_bytes = 0;
                 let _ = progress_tx.send((_src_idx, 0i64)).await;
                 if let Some(ref etx) = event_tx {
                     let _ = etx

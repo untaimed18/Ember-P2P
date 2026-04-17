@@ -1677,24 +1677,30 @@ async fn try_start_pending_download_from_known_sources(
             }
         }
     }
+    // D9: dedup by (ip, port) before handing sources to the downloader so
+    // we don't spawn two concurrent handshakes to the same peer (common
+    // when a source is discovered via both the server list and SX/KAD).
     let download_sources: Vec<DownloadSource> = {
         let sm = source_manager.read().await;
-        live_sources
-            .iter()
-            .map(|(ip, port)| {
-                let uh = ip.parse::<Ipv4Addr>().ok()
-                    .and_then(|v4| sm.get_user_hash(&hash_bytes, v4, *port));
-                let co = ip.parse::<Ipv4Addr>().ok()
-                    .and_then(|v4| sm.get_connect_options(&hash_bytes, v4, *port));
-                DownloadSource {
-                    peer_ip: ip.clone(),
-                    peer_port: *port,
-                    available_parts: Vec::new(),
-                    peer_user_hash: uh,
-                    peer_connect_options: co,
-                }
-            })
-            .collect()
+        let mut seen: HashSet<(String, u16)> = HashSet::new();
+        let mut out: Vec<DownloadSource> = Vec::with_capacity(live_sources.len());
+        for (ip, port) in &live_sources {
+            if !seen.insert((ip.clone(), *port)) {
+                continue;
+            }
+            let uh = ip.parse::<Ipv4Addr>().ok()
+                .and_then(|v4| sm.get_user_hash(&hash_bytes, v4, *port));
+            let co = ip.parse::<Ipv4Addr>().ok()
+                .and_then(|v4| sm.get_connect_options(&hash_bytes, v4, *port));
+            out.push(DownloadSource {
+                peer_ip: ip.clone(),
+                peer_port: *port,
+                available_parts: Vec::new(),
+                peer_user_hash: uh,
+                peer_connect_options: co,
+            });
+        }
+        out
     };
     let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
     let ms_download = MultiSourceDownload {
@@ -4832,24 +4838,28 @@ pub async fn start_network(
                                             }
                                         }
                                     }
+                                    // D9: dedup (ip, port) — see the
+                                    // equivalent block in the initial-start
+                                    // path for rationale.
                                     let download_sources: Vec<DownloadSource> = {
                                         let sm = source_manager.read().await;
-                                        live_sources
-                                            .iter()
-                                            .map(|(ip, port)| {
-                                                let uh = ip.parse::<Ipv4Addr>().ok()
-                                                    .and_then(|v4| sm.get_user_hash(&hash_bytes, v4, *port));
-                                                let co = ip.parse::<Ipv4Addr>().ok()
-                                                    .and_then(|v4| sm.get_connect_options(&hash_bytes, v4, *port));
-                                                DownloadSource {
-                                                    peer_ip: ip.clone(),
-                                                    peer_port: *port,
-                                                    available_parts: Vec::new(),
-                                                    peer_user_hash: uh,
-                                                    peer_connect_options: co,
-                                                }
-                                            })
-                                            .collect()
+                                        let mut seen: HashSet<(String, u16)> = HashSet::new();
+                                        let mut out: Vec<DownloadSource> = Vec::with_capacity(live_sources.len());
+                                        for (ip, port) in live_sources {
+                                            if !seen.insert((ip.clone(), *port)) { continue; }
+                                            let uh = ip.parse::<Ipv4Addr>().ok()
+                                                .and_then(|v4| sm.get_user_hash(&hash_bytes, v4, *port));
+                                            let co = ip.parse::<Ipv4Addr>().ok()
+                                                .and_then(|v4| sm.get_connect_options(&hash_bytes, v4, *port));
+                                            out.push(DownloadSource {
+                                                peer_ip: ip.clone(),
+                                                peer_port: *port,
+                                                available_parts: Vec::new(),
+                                                peer_user_hash: uh,
+                                                peer_connect_options: co,
+                                            });
+                                        }
+                                        out
                                     };
                                     let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
                                     let ms_download = MultiSourceDownload {
@@ -12344,11 +12354,14 @@ async fn handle_command(
             }
 
             // Keep download_source_searches mappings alive so in-flight KAD
-            // searches can still register discovered sources into SourceManager
-            // when they complete. The search completion handler checks
-            // pending_downloads to decide whether to start the transfer;
-            // since paused downloads are removed from pending_downloads, the
-            // sources will be saved but the download won't be started.
+            // searches can still register discovered sources into
+            // SourceManager when they complete. The search completion
+            // handler checks `pending_downloads` to decide whether to start
+            // the transfer; paused downloads STAY in `pending_downloads`
+            // but have their `PendingDownload::control` marked paused, so
+            // `try_start_pending_download_from_known_sources` guards against
+            // starting them until resumed. (L4: earlier comment wrongly
+            // said paused downloads are "removed from pending_downloads".)
             let in_flight = state.download_source_searches.values()
                 .filter(|tid| *tid == &transfer_id)
                 .count();

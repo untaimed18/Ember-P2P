@@ -32,12 +32,19 @@
   </div>
 
   <div class="status-right" aria-label="Transfer speeds">
-    <span class="status-item upload">
+    <!--
+      D7: status bar rate is the total network rate (file payload + protocol
+      overhead: server, KAD, source exchange, reasks). The Transfers page
+      "DL" / "UL" chips show only the active transfer-payload rate. The
+      numbers legitimately differ, so label the status bar "Network" in the
+      tooltip to flag the distinction.
+    -->
+    <span class="status-item upload" title="Total network upload (includes protocol overhead)">
       <span aria-hidden="true">↑</span>
       <span class="sr-only">Upload speed:</span>
       {formatSpeed($networkStats.upload_speed)}
     </span>
-    <span class="status-item download">
+    <span class="status-item download" title="Total network download (includes protocol overhead)">
       <span aria-hidden="true">↓</span>
       <span class="sr-only">Download speed:</span>
       {formatSpeed($networkStats.download_speed)}

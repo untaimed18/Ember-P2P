@@ -168,6 +168,25 @@ pub async fn start_download(
 
     // Zero-byte ed2k files are valid (hash must be empty-file MD4 on the network stack).
 
+    // D16: reject oversized files up front instead of enqueueing them and
+    // failing later at network-start with a confusing "exceeds maximum"
+    // error. `max_download_file_size_gib` is user-configurable; a size of
+    // 0 disables the cap.
+    {
+        let config = state.config.read().await;
+        let cap_gib = config.settings.max_download_file_size_gib;
+        if cap_gib > 0 {
+            let cap_bytes = (cap_gib as u64).saturating_mul(1024 * 1024 * 1024);
+            if file_size > cap_bytes {
+                let gib = (file_size as f64) / (1024.0 * 1024.0 * 1024.0);
+                return Err(format!(
+                    "File size {:.2} GiB exceeds your configured maximum of {} GiB — raise Max Download Size in Settings > Downloads to enqueue this file.",
+                    gib, cap_gib
+                ));
+            }
+        }
+    }
+
     let transfer_id = uuid::Uuid::new_v4().to_string();
 
     let has_source = !peer_ip.is_empty() && peer_ip != "0.0.0.0" && peer_port > 0;
@@ -837,6 +856,14 @@ pub async fn set_preview_priority(
     Ok(())
 }
 
+/// Pause every active download.
+///
+/// L7 note: this operation is eventually-consistent, not atomic. It takes
+/// a write lock on the transfer manager to capture the set of active IDs,
+/// then fans out individual `NetworkCommand::PauseDownload` messages. If
+/// the user resumes a transfer concurrently, the resume and the broadcast
+/// pause may interleave; last command wins per transfer. Callers should
+/// debounce in the UI rather than expect a transactional guarantee.
 #[tauri::command]
 pub async fn pause_all_transfers(
     state: tauri::State<'_, AppState>,
@@ -887,6 +914,8 @@ pub async fn pause_all_transfers(
 }
 
 #[tauri::command]
+/// Resume every paused / stopped download. See pause_all_transfers for the
+/// same eventual-consistency caveat.
 pub async fn resume_all_transfers(
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
@@ -959,6 +988,11 @@ pub async fn get_transfer_sources(
 pub async fn clear_completed(
     state: tauri::State<'_, AppState>,
 ) -> Result<u32, String> {
+    // L1: completed rows have no live network state (their upload/download
+    // tasks already returned), so there's nothing for CancelDownload to
+    // clean up. Just drop from the manager's completed bucket and delete
+    // the on-disk .part file below. This avoids a pointless round-trip
+    // through the network command channel for every completed row.
     let mut manager = state.transfer_manager.write().await;
     let mut ids: Vec<String> = Vec::new();
     manager.completed.retain(|t| {
@@ -971,16 +1005,6 @@ pub async fn clear_completed(
     });
     let count = u32::try_from(ids.len()).unwrap_or(u32::MAX);
     drop(manager);
-
-    for id in &ids {
-        let _ = state
-            .network_tx
-            .send(NetworkCommand::CancelDownload {
-                transfer_id: id.clone(),
-                cleanup_ack: None,
-            })
-            .await;
-    }
 
     let dl_folder = {
         let config = state.config.read().await;
