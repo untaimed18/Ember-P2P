@@ -68,6 +68,7 @@ fs2 = "0.4"
 maxminddb = "0.24"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 parking_lot = "0.12"
+notify-debouncer-mini = { version = "0.7", default-features = false }
 
 [profile.release]
 strip = true

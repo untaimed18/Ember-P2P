@@ -138,6 +138,11 @@ pub fn run() {
                 Arc::new(RwLock::new(set))
             };
 
+            let shared_folder_watcher = sharing::watcher::SharedFoldersWatcher::start(
+                app_handle.clone(),
+                settings.shared_folders.clone(),
+            );
+
             app.manage(AppState {
                 network_tx,
                 db: db.clone(),
@@ -470,6 +475,9 @@ pub fn run() {
             commands::sharing::open_shared_file,
             commands::sharing::open_shared_folder,
             commands::sharing::delete_shared_file,
+            commands::sharing::republish_file,
+            commands::sharing::scan_missing_files,
+            commands::sharing::remove_missing_files,
             commands::peers::get_peers,
             commands::peers::get_network_stats,
             commands::peers::ban_peer,

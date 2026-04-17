@@ -190,6 +190,12 @@ pub async fn add_shared_folder(
         }).await.map_err(|e| format!("Config save error: {e}"))?.map_err(|e| format!("Config save error: {e}"))?;
     }
 
+    // Start watching the new folder (and anything else currently shared).
+    if let Some(watcher) = state.shared_folder_watcher.as_ref() {
+        let folders = state.config.read().await.settings.shared_folders.clone();
+        watcher.sync_paths(&folders);
+    }
+
     let local_index = state.local_index.clone();
     let file_cache = state.cached_shared_files.clone();
     let network_tx = state.network_tx.clone();
@@ -436,6 +442,12 @@ pub async fn remove_shared_folder(
         index.remove_files_by_path_prefix(&canonical_path);
     }
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+
+    // Stop watching the removed folder.
+    if let Some(watcher) = state.shared_folder_watcher.as_ref() {
+        let folders = state.config.read().await.settings.shared_folders.clone();
+        watcher.sync_paths(&folders);
+    }
 
     if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
         warn!("Failed to queue SharedFilesChanged after folder removal: {e}");
@@ -878,6 +890,105 @@ pub async fn delete_shared_file(
             .map(|hash| format!(" ({hash})"))
             .unwrap_or_default()
     );
+    Ok(())
+}
+
+/// Check the filesystem for every indexed shared file and return the list of
+/// paths that no longer exist. This is cheap (a single metadata lookup per
+/// file); typical libraries finish in well under a second even with tens of
+/// thousands of files. Callers can then display the count and offer a bulk
+/// "remove missing" action via `remove_missing_files`.
+#[tauri::command]
+pub async fn scan_missing_files(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let paths: Vec<String> = {
+        let index = state.local_index.read().await;
+        index.all_files().iter().map(|f| f.path.clone()).collect()
+    };
+    let missing = tokio::task::spawn_blocking(move || {
+        let mut missing = Vec::new();
+        for p in paths {
+            if !std::path::Path::new(&p).exists() {
+                missing.push(p);
+            }
+        }
+        missing
+    })
+    .await
+    .map_err(|e| format!("Scan task failed: {e}"))?;
+    Ok(missing)
+}
+
+/// Remove the given paths from the shared-file index if — and only if —
+/// they no longer exist on disk. This double-check protects against races
+/// where a file reappears (e.g. an external drive mounts back) between the
+/// missing-scan and the user's confirmation click.
+#[tauri::command]
+pub async fn remove_missing_files(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<u32, String> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    let to_check = paths.clone();
+    let really_missing = tokio::task::spawn_blocking(move || {
+        to_check
+            .into_iter()
+            .filter(|p| !std::path::Path::new(p).exists())
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| format!("Scan task failed: {e}"))?;
+
+    let mut removed = 0u32;
+    {
+        let mut index = state.local_index.write().await;
+        for path in &really_missing {
+            if index.remove_file_by_path(path).is_some() {
+                removed += 1;
+            }
+        }
+    }
+    if removed > 0 {
+        refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+        if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+            warn!("Failed to queue SharedFilesChanged after remove_missing_files: {e}");
+        }
+        let _ = app.emit(
+            "shared-files-changed",
+            serde_json::json!({ "missing_removed": removed }),
+        );
+        info!("Removed {} missing files from shared index", removed);
+    }
+    Ok(removed)
+}
+
+#[tauri::command]
+pub async fn republish_file(
+    state: tauri::State<'_, AppState>,
+    file_hash: String,
+) -> Result<(), String> {
+    let cleaned = file_hash.trim().to_lowercase();
+    if cleaned.len() != 32 || hex::decode(&cleaned).is_err() {
+        return Err("Invalid file hash (expected 32-char hex MD4)".into());
+    }
+    let file_exists = {
+        let index = state.local_index.read().await;
+        index
+            .all_files()
+            .iter()
+            .any(|f| !f.hash.is_empty() && f.hash.eq_ignore_ascii_case(&cleaned))
+    };
+    if !file_exists {
+        return Err("File not found in shared index".into());
+    }
+    state
+        .network_tx
+        .try_send(NetworkCommand::RepublishFile { file_hash_hex: cleaned })
+        .map_err(|e| format!("Network busy: {e}"))?;
     Ok(())
 }
 

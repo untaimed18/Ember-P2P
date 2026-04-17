@@ -55,13 +55,15 @@
   let newCollAuthor = $state('');
   let selectedFileHashes: Set<string> = $state(new Set());
   let creatingCollection = $state(false);
+  let newCollFormat: 'binary' | 'text' = $state('binary');
+  let copyingCollectionLinks = $state(false);
 
   async function handleOpenCollection() {
     try {
       const { open: openDialog } = await import('@tauri-apps/plugin-dialog');
       const selected = await openDialog({
         multiple: false,
-        filters: [{ name: 'eMule Collection', extensions: ['emulecollection'] }],
+        filters: [{ name: 'eMule Collection', extensions: ['emulecollection', 'txt'] }],
       });
       if (!selected) return;
       collectionLoading = true;
@@ -90,6 +92,22 @@
     }
   }
 
+  async function handleCopyCollectionLinks() {
+    if (!loadedCollection || copyingCollectionLinks) return;
+    copyingCollectionLinks = true;
+    try {
+      const links = await Promise.all(
+        loadedCollection.files.map((f) => formatEd2kLink(f.name, f.size, f.hash))
+      );
+      await navigator.clipboard.writeText(links.join('\n'));
+      toastSuccess(`Copied ${links.length} eD2K link${links.length !== 1 ? 's' : ''}`);
+    } catch (e: unknown) {
+      toastError(toErr(e));
+    } finally {
+      copyingCollectionLinks = false;
+    }
+  }
+
   let collectionSearch = $state('');
   let collectionFilteredFiles = $derived.by(() => {
     const q = collectionSearch.trim().toLowerCase();
@@ -97,12 +115,24 @@
     return hashedLibraryFiles.filter(f => f.name.toLowerCase().includes(q));
   });
 
-  function openCreateDialog() {
+  function openCreateDialog(preselectHashes?: Iterable<string>) {
     newCollName = '';
     newCollAuthor = '';
-    selectedFileHashes = new Set();
+    selectedFileHashes = new Set(preselectHashes ?? []);
     collectionSearch = '';
+    newCollFormat = 'binary';
     createCollectionOpen = true;
+  }
+
+  function openCreateDialogFromSelection() {
+    const hashes = getCheckedFiles()
+      .map((f) => f.hash)
+      .filter((h): h is string => !!h);
+    if (hashes.length === 0) {
+      toastWarning('Select at least one hashed file to build a collection.');
+      return;
+    }
+    openCreateDialog(hashes);
   }
 
   function toggleFileSelection(hash: string) {
@@ -128,16 +158,19 @@
     if (!newCollName.trim() || selectedFileHashes.size === 0) return;
     try {
       const { save: saveDialog } = await import('@tauri-apps/plugin-dialog');
+      const isBinary = newCollFormat === 'binary';
+      const ext = isBinary ? 'emulecollection' : 'txt';
+      const filterName = isBinary ? 'eMule Collection' : 'eD2K Links (Text)';
       const outputPath = await saveDialog({
-        defaultPath: `${newCollName.trim()}.emulecollection`,
-        filters: [{ name: 'eMule Collection', extensions: ['emulecollection'] }],
+        defaultPath: `${newCollName.trim()}.${ext}`,
+        filters: [{ name: filterName, extensions: [ext] }],
       });
       if (!outputPath) return;
       creatingCollection = true;
       const collFiles: CollectionFile[] = hashedLibraryFiles
         .filter((f) => selectedFileHashes.has(f.hash))
         .map((f) => ({ name: f.name, size: f.size, hash: f.hash, aich_hash: f.aich_hash }));
-      const msg = await createCollection(newCollName.trim(), newCollAuthor.trim(), collFiles, outputPath, false);
+      const msg = await createCollection(newCollName.trim(), newCollAuthor.trim(), collFiles, outputPath, isBinary);
       toastSuccess(msg || `Created collection "${newCollName.trim()}" with ${collFiles.length} files`);
       createCollectionOpen = false;
     } catch (e: unknown) {
@@ -149,9 +182,69 @@
 
   // --- Search / Type filter ---
   let searchQuery = $state('');
+  let searchInputEl: HTMLInputElement | undefined = $state(undefined);
   const typeFilterOptions = ['All', 'Audio', 'Video', 'Image', 'Archive', 'Document', 'CD/DVD'] as const;
   type TypeFilter = (typeof typeFilterOptions)[number];
   let typeFilter: TypeFilter = $state('All');
+  let showDuplicatesOnly = $state(false);
+  let showMissingOnly = $state(false);
+  let missingPathSet: Set<string> = $state(new Set());
+  let missingScanInFlight = false;
+
+  async function refreshMissingSet() {
+    if (missingScanInFlight) return;
+    missingScanInFlight = true;
+    try {
+      const list = await scanMissingFiles();
+      if (!mounted) return;
+      missingPathSet = new Set(list);
+      if (showMissingOnly && missingPathSet.size === 0) {
+        showMissingOnly = false;
+      }
+    } catch {
+      // Non-fatal: leave previous set in place.
+    } finally {
+      missingScanInFlight = false;
+    }
+  }
+
+  async function handleRemoveMissing() {
+    if (missingPathSet.size === 0) return;
+    try {
+      const { confirm } = await import('@tauri-apps/plugin-dialog');
+      const confirmed = await confirm(
+        `Remove ${missingPathSet.size} missing file${missingPathSet.size !== 1 ? 's' : ''} from your library?\n\nThis only affects Ember's index — no files on disk are touched.`,
+        { title: 'Remove Missing Files', kind: 'warning' }
+      );
+      if (!confirmed) return;
+      const removed = await removeMissingFiles([...missingPathSet]);
+      toastSuccess(`Removed ${removed} missing file${removed !== 1 ? 's' : ''}`);
+      missingPathSet = new Set();
+      showMissingOnly = false;
+      await refresh();
+    } catch (e: unknown) {
+      toastError(toErr(e));
+    }
+  }
+
+  let duplicateHashes = $derived.by(() => {
+    const counts = new Map<string, number>();
+    for (const f of files) {
+      if (!f.hash) continue;
+      counts.set(f.hash, (counts.get(f.hash) ?? 0) + 1);
+    }
+    const dupes = new Set<string>();
+    for (const [h, n] of counts) {
+      if (n > 1) dupes.add(h);
+    }
+    return dupes;
+  });
+  let duplicateFileCount = $derived.by(() => {
+    if (duplicateHashes.size === 0) return 0;
+    let n = 0;
+    for (const f of files) if (f.hash && duplicateHashes.has(f.hash)) n++;
+    return n;
+  });
 
   function normalizePathForMatch(path: string): string {
     return path.replace(/\\/g, '/').replace(/\/+$/, '');
@@ -227,6 +320,7 @@
         debouncedRefresh();
       }
     }
+    if (mounted) void refreshMissingSet();
   }
 
   function toErr(e: unknown): string {
@@ -323,10 +417,16 @@
     if (typeFilter !== 'All') {
       result = result.filter(f => fileType(f.extension) === typeFilter);
     }
+    if (showDuplicatesOnly) {
+      result = result.filter(f => !!f.hash && duplicateHashes.has(f.hash));
+    }
+    if (showMissingOnly) {
+      result = result.filter(f => missingPathSet.has(f.path));
+    }
     return result;
   });
 
-  let hasActiveLibraryFilters = $derived(!!filterFolder || !!searchQuery.trim() || typeFilter !== 'All');
+  let hasActiveLibraryFilters = $derived(!!filterFolder || !!searchQuery.trim() || typeFilter !== 'All' || showDuplicatesOnly || showMissingOnly);
   let libraryFileStats = $derived.by(() => {
     let shared = 0;
     let hashed = 0;
@@ -351,6 +451,8 @@
     filterFolder = null;
     searchQuery = '';
     typeFilter = 'All';
+    showDuplicatesOnly = false;
+    showMissingOnly = false;
   }
 
   // --- Multi-select ---
@@ -519,6 +621,34 @@
   });
   let activeFolderLabel = $derived(folderDisplayName(filterFolder));
 
+  // --- Top Uploads (popularity panel) ---
+  let topPanelOpen = $state(true);
+  let topPanelMetric: 'bytes' | 'requests' = $state('bytes');
+  const TOP_PANEL_SIZE = 10;
+
+  let topFiles = $derived.by(() => {
+    if (topPanelMetric === 'bytes') {
+      return [...files]
+        .filter((f) => f.hash && f.alltime_transferred > 0)
+        .sort((a, b) => b.alltime_transferred - a.alltime_transferred)
+        .slice(0, TOP_PANEL_SIZE);
+    }
+    return [...files]
+      .filter((f) => f.hash && f.alltime_accepted > 0)
+      .sort((a, b) => b.alltime_accepted - a.alltime_accepted)
+      .slice(0, TOP_PANEL_SIZE);
+  });
+  let topMaxValue = $derived.by(() => {
+    if (topFiles.length === 0) return 0;
+    return topPanelMetric === 'bytes'
+      ? topFiles[0].alltime_transferred
+      : topFiles[0].alltime_accepted;
+  });
+  function selectAndRevealFile(path: string) {
+    selectedPath = path;
+    clearLibraryFilters();
+  }
+
   // --- File type display ---
   const audioExts = new Set([
     'aac','ac3','aif','aifc','aiff','amr','ape','au','aud','audio','cda',
@@ -674,6 +804,128 @@
   }
   function onDocClick() { if (mounted) closeCtx(); }
 
+  function isTypingTarget(el: EventTarget | null): boolean {
+    if (!(el instanceof HTMLElement)) return false;
+    if (el.isContentEditable) return true;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+  }
+
+  async function deleteSelectedFile() {
+    const f = selectedFile;
+    if (!f) return;
+    try {
+      const { confirm } = await import('@tauri-apps/plugin-dialog');
+      const confirmed = await confirm(
+        `Delete "${f.name}" from disk?\n\nThis cannot be undone.`,
+        { title: 'Delete File', kind: 'warning' }
+      );
+      if (!confirmed) return;
+      await deleteSharedFile(f.path, f.hash || undefined);
+      if (selectedPath === f.path) selectedPath = null;
+      toastSuccess(`Deleted "${f.name}"`);
+      await refresh();
+    } catch (e: unknown) { error = toErr(e); }
+  }
+
+  async function copyLinkForSelection() {
+    const targets = checkedCount > 0
+      ? getCheckedFiles().filter(f => !!f.hash)
+      : (selectedFile && selectedFile.hash ? [selectedFile] : []);
+    if (targets.length === 0) return;
+    try {
+      const links = await Promise.all(targets.map(f => formatEd2kLink(f.name, f.size, f.hash)));
+      await navigator.clipboard.writeText(links.join('\n'));
+      const unsharedCount = targets.filter(f => !f.shared).length;
+      if (unsharedCount > 0) {
+        toastWarning(`Copied ${links.length} link${links.length !== 1 ? 's' : ''}, but ${unsharedCount} file${unsharedCount !== 1 ? 's are' : ' is'} not shared.`);
+      } else {
+        toastSuccess(`Copied ${links.length} eD2K link${links.length !== 1 ? 's' : ''}`);
+      }
+    } catch (e: unknown) { error = toErr(e); }
+  }
+
+  function onPageKeyDown(e: KeyboardEvent) {
+    if (!mounted) return;
+    if (ctxMenu && e.key === 'Escape') { closeCtx(); e.preventDefault(); return; }
+
+    const typing = isTypingTarget(e.target);
+
+    // "/" focuses the search input when not already typing.
+    if (!typing && e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      searchInputEl?.focus();
+      searchInputEl?.select();
+      return;
+    }
+
+    // Escape clears the search if it's focused and has content; otherwise clears selection.
+    if (e.key === 'Escape') {
+      if (typing && e.target === searchInputEl && searchQuery) {
+        searchQuery = '';
+        e.preventDefault();
+        return;
+      }
+      if (!typing && selectedPath) {
+        selectedPath = null;
+        e.preventDefault();
+        return;
+      }
+    }
+
+    if (typing) return;
+
+    // Ignore shortcuts while a modal is open.
+    if (createCollectionOpen) return;
+
+    // Ctrl/Cmd+A selects all visible.
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'a' || e.key === 'A')) {
+      if (sortedFiles.length === 0) return;
+      e.preventDefault();
+      checkedPaths = new Set(sortedFiles.map(f => f.path));
+      lastClickedPath = null;
+      return;
+    }
+
+    // Ctrl/Cmd+D clears the check selection.
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'd' || e.key === 'D')) {
+      if (checkedPaths.size === 0) return;
+      e.preventDefault();
+      clearChecked();
+      return;
+    }
+
+    // Ctrl/Cmd+C copies links for the current check selection or selected row.
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (e.key === 'c' || e.key === 'C')) {
+      const hasTargets = checkedCount > 0 || (selectedFile && !!selectedFile.hash);
+      if (!hasTargets) return;
+      e.preventDefault();
+      void copyLinkForSelection();
+      return;
+    }
+
+    // Enter on the selected row opens the file.
+    if (e.key === 'Enter' && selectedFile) {
+      e.preventDefault();
+      void openSharedFile(selectedFile.path);
+      return;
+    }
+
+    // Delete on the selected row triggers delete flow.
+    if (e.key === 'Delete' && selectedFile) {
+      e.preventDefault();
+      void deleteSelectedFile();
+      return;
+    }
+
+    // Space toggles the check on the selected row.
+    if (e.key === ' ' && selectedFile) {
+      e.preventDefault();
+      toggleCheck(selectedFile.path, false);
+      return;
+    }
+  }
+
   async function ctxAction(action: string, extra?: string) {
     if (!ctxMenu) return;
     const f = ctxMenu.file;
@@ -708,6 +960,12 @@
         }
         case 'unshare': await unshareFile(f.path, f.hash || undefined); await refresh(); break;
         case 'share': await shareFile(f.path); await refresh(); break;
+        case 'republish': {
+          if (!f.hash || !f.shared) break;
+          await republishFile(f.hash);
+          toastSuccess('Queued republish to KAD');
+          break;
+        }
       }
     } catch (e: unknown) { error = toErr(e); }
   }
@@ -723,6 +981,75 @@
     if (!ts) return '';
     return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
+
+  // --- Persisted filters / sort ---
+  const FILTERS_KEY = 'library-filters-v1';
+  const VALID_TYPE_FILTERS = new Set(typeFilterOptions);
+  const VALID_SORT_FIELDS: Set<SortField> = new Set([
+    'name', 'size', 'extension', 'priority', 'hash', 'requests', 'accepted',
+    'bytes_transferred', 'folder', 'complete_sources', 'modified_at',
+  ]);
+  let filtersRestored = $state(false);
+
+  function loadPersistedFilters() {
+    try {
+      const raw = localStorage.getItem(FILTERS_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        if (typeof parsed.typeFilter === 'string' && VALID_TYPE_FILTERS.has(parsed.typeFilter as TypeFilter)) {
+          typeFilter = parsed.typeFilter as TypeFilter;
+        }
+        if (typeof parsed.filterFolder === 'string' && parsed.filterFolder.length > 0) {
+          filterFolder = parsed.filterFolder;
+        } else if (parsed.filterFolder === null) {
+          filterFolder = null;
+        }
+        if (typeof parsed.searchQuery === 'string' && parsed.searchQuery.length <= 500) {
+          searchQuery = parsed.searchQuery;
+        }
+        if (typeof parsed.sortField === 'string' && VALID_SORT_FIELDS.has(parsed.sortField as SortField)) {
+          sortField = parsed.sortField as SortField;
+        }
+        if (typeof parsed.sortAsc === 'boolean') {
+          sortAsc = parsed.sortAsc;
+        }
+        if (typeof parsed.showDuplicatesOnly === 'boolean') {
+          showDuplicatesOnly = parsed.showDuplicatesOnly;
+        }
+      }
+    } catch {
+      try { localStorage.removeItem(FILTERS_KEY); } catch {}
+    }
+  }
+
+  function persistFilters() {
+    try {
+      localStorage.setItem(FILTERS_KEY, JSON.stringify({
+        typeFilter,
+        filterFolder,
+        searchQuery,
+        sortField,
+        sortAsc,
+        showDuplicatesOnly,
+      }));
+    } catch {}
+  }
+
+  $effect(() => {
+    if (!filtersRestored) return;
+    // Track dependencies explicitly so this effect re-runs when any filter/sort changes.
+    void typeFilter; void filterFolder; void searchQuery; void sortField; void sortAsc; void showDuplicatesOnly;
+    persistFilters();
+  });
+
+  // If the persisted folder no longer exists after folders load, clear it silently.
+  $effect(() => {
+    if (!filtersRestored) return;
+    if (filterFolder && folders.length > 0 && !folders.includes(filterFolder)) {
+      filterFolder = null;
+    }
+  });
 
   // --- Sidebar resize ---
   let sidebarWidth = $state(200);
@@ -753,6 +1080,37 @@
     };
   }
 
+  let dndActive = $state(false);
+  let dndHover = $state(false);
+
+  async function handleOsFolderDrop(paths: string[]) {
+    const uniquePaths = [...new Set(paths.filter((p) => typeof p === 'string' && p.length > 0))];
+    if (uniquePaths.length === 0) return;
+
+    // Backend `add_shared_folder` will reject non-directories and already-shared paths.
+    // We let it arbitrate and surface per-path errors here.
+    let added = 0;
+    const failures: string[] = [];
+    for (const path of uniquePaths) {
+      try {
+        await addSharedFolder(path);
+        added++;
+      } catch (e: unknown) {
+        failures.push(`${path}: ${toErr(e)}`);
+      }
+    }
+    if (added > 0) {
+      stoppedByUser = false;
+      scanning = true;
+      toastSuccess(
+        `Added ${added} folder${added !== 1 ? 's' : ''}${failures.length ? ` (${failures.length} skipped)` : ''}`
+      );
+      if (mounted) await refresh();
+    } else if (failures.length > 0) {
+      toastWarning(failures[0]);
+    }
+  }
+
   onMount(() => {
     mounted = true;
     const saved = localStorage.getItem('library-sidebar-w');
@@ -760,6 +1118,9 @@
       const val = parseInt(saved);
       if (!isNaN(val)) sidebarWidth = Math.max(120, Math.min(400, val));
     }
+
+    loadPersistedFilters();
+    filtersRestored = true;
 
     refresh();
 
@@ -810,6 +1171,31 @@
       if (destroyed) { u1(); u2(); } else { unlisteners.push(u1, u2); }
     })();
 
+    (async () => {
+      try {
+        const { getCurrentWebview } = await import('@tauri-apps/api/webview');
+        const u = await getCurrentWebview().onDragDropEvent((event) => {
+          if (!mounted) return;
+          const t = event.payload.type;
+          if (t === 'enter' || t === 'over') {
+            dndActive = true;
+            dndHover = t === 'over';
+          } else if (t === 'leave') {
+            dndActive = false;
+            dndHover = false;
+          } else if (t === 'drop') {
+            dndActive = false;
+            dndHover = false;
+            const paths = (event.payload as { paths?: string[] }).paths ?? [];
+            if (paths.length > 0) void handleOsFolderDrop(paths);
+          }
+        });
+        if (destroyed) u(); else unlisteners.push(u);
+      } catch (e) {
+        console.warn('Drag-drop listener unavailable:', e);
+      }
+    })();
+
     return () => {
       mounted = false;
       destroyed = true;
@@ -825,15 +1211,13 @@
   });
 </script>
 
-<svelte:document onclick={onDocClick} onkeydown={(e) => {
-  if (e.key === 'Escape' && ctxMenu) { closeCtx(); e.preventDefault(); }
-}} />
+<svelte:document onclick={onDocClick} onkeydown={onPageKeyDown} />
 
 <div class="page-header">
   <h2>Library</h2>
   <div class="header-actions">
     <button class="ghost" onclick={handleOpenCollection}>Open Collection</button>
-    <button class="ghost" onclick={openCreateDialog}>Create Collection</button>
+    <button class="ghost" onclick={() => openCreateDialog()}>Create Collection</button>
     <button onclick={handleReload}>Reload</button>
     <button onclick={handleAddFolder}>+ Add Folder</button>
   </div>
@@ -850,8 +1234,9 @@
       <input
         type="text"
         class="filter-search"
-        placeholder="Search files by name…"
+        placeholder="Search files by name…  (press / to focus)"
         bind:value={searchQuery}
+        bind:this={searchInputEl}
       />
       {#if searchQuery}
         <button class="filter-clear-btn" onclick={() => (searchQuery = '')} title="Clear search">✕</button>
@@ -862,6 +1247,31 @@
         <option value={opt}>{opt === 'All' ? 'All Types' : opt}</option>
       {/each}
     </select>
+    <button
+      class="dupes-toggle"
+      class:active={showDuplicatesOnly}
+      disabled={duplicateHashes.size === 0}
+      onclick={() => (showDuplicatesOnly = !showDuplicatesOnly)}
+      title={duplicateHashes.size === 0 ? 'No duplicates detected' : `Show only files whose hash matches another file (${duplicateFileCount} file${duplicateFileCount !== 1 ? 's' : ''} across ${duplicateHashes.size} hash${duplicateHashes.size !== 1 ? 'es' : ''})`}
+    >
+      {showDuplicatesOnly ? '\u2714' : ' '} Duplicates{duplicateHashes.size > 0 ? ` (${duplicateFileCount})` : ''}
+    </button>
+    <button
+      class="dupes-toggle missing-toggle"
+      class:active={showMissingOnly}
+      disabled={missingPathSet.size === 0}
+      onclick={() => (showMissingOnly = !showMissingOnly)}
+      title={missingPathSet.size === 0 ? 'No indexed files are missing from disk' : `Show only files whose path no longer exists on disk (${missingPathSet.size})`}
+    >
+      {showMissingOnly ? '\u2714' : ' '} Missing{missingPathSet.size > 0 ? ` (${missingPathSet.size})` : ''}
+    </button>
+    {#if showMissingOnly && missingPathSet.size > 0}
+      <button
+        class="dupes-toggle missing-remove-btn"
+        onclick={handleRemoveMissing}
+        title="Remove all missing files from the shared index (does not touch disk)"
+      >Remove Missing</button>
+    {/if}
     {#if hasActiveLibraryFilters}
       <button class="ghost clear-library-filters" onclick={clearLibraryFilters}>Clear Filters</button>
     {/if}
@@ -894,6 +1304,9 @@
       {#if loadedCollection}
         <button class="coll-action-btn download-all-btn" onclick={handleDownloadAll} disabled={downloadingCollection}>
           {downloadingCollection ? 'Queueing…' : 'Download All'}
+        </button>
+        <button class="coll-action-btn ghost" onclick={handleCopyCollectionLinks} disabled={copyingCollectionLinks || loadedCollection.files.length === 0} title="Copy all eD2K links to clipboard">
+          {copyingCollectionLinks ? 'Copying…' : 'Copy Links'}
         </button>
         <button class="coll-action-btn ghost" onclick={() => { loadedCollection = null; collectionsOpen = false; }}>Close</button>
       {/if}
@@ -945,6 +1358,25 @@
           <input id="coll-author" type="text" class="form-input" bind:value={newCollAuthor} placeholder="Optional" />
         </div>
         <div class="form-row">
+          <span class="form-label">Format</span>
+          <div class="format-toggle">
+            <label class="format-option">
+              <input type="radio" name="coll-format" value="binary" bind:group={newCollFormat} />
+              <span class="format-label">
+                <span class="format-name">Binary (.emulecollection)</span>
+                <span class="format-desc">Standard eMule collection — preserves author and name</span>
+              </span>
+            </label>
+            <label class="format-option">
+              <input type="radio" name="coll-format" value="text" bind:group={newCollFormat} />
+              <span class="format-label">
+                <span class="format-name">Text (.txt)</span>
+                <span class="format-desc">Plain list of eD2K links — works with any client or paste target</span>
+              </span>
+            </label>
+          </div>
+        </div>
+        <div class="form-row">
           <span class="form-label">Select Files ({selectedFileHashes.size} of {hashedLibraryFiles.length} selected)</span>
           <button class="ghost select-all-btn" onclick={toggleAllFileSelection}>
             {allHashedFilesSelected ? 'Deselect All' : 'Select All'}
@@ -990,6 +1422,22 @@
   <div class="error-banner">
     <span>{error}</span>
     <button class="ghost" onclick={() => error = null}>Dismiss</button>
+  </div>
+{/if}
+
+{#if dndActive}
+  <div class="dnd-overlay" class:hover={dndHover} role="presentation">
+    <div class="dnd-hint">
+      <div class="dnd-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" width="42" height="42">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+          <line x1="12" y1="11" x2="12" y2="17"/>
+          <polyline points="9 14 12 11 15 14"/>
+        </svg>
+      </div>
+      <div class="dnd-title">Drop folder to share</div>
+      <div class="dnd-sub">Folders will be scanned and added to your library</div>
+    </div>
   </div>
 {/if}
 
@@ -1042,6 +1490,68 @@
           </span>
         </div>
       {/each}
+    </div>
+
+    <div class="sidebar-section top-section">
+      <button
+        type="button"
+        class="sidebar-section-header"
+        aria-expanded={topPanelOpen}
+        onclick={() => (topPanelOpen = !topPanelOpen)}
+      >
+        <span class="section-arrow">{topPanelOpen ? '\u25BE' : '\u25B8'}</span>
+        <span class="section-title">Top Uploads</span>
+      </button>
+      {#if topPanelOpen}
+        <div class="top-metric-switch" role="tablist" aria-label="Top upload metric">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={topPanelMetric === 'bytes'}
+            class:active={topPanelMetric === 'bytes'}
+            onclick={() => (topPanelMetric = 'bytes')}
+          >By Bytes</button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={topPanelMetric === 'requests'}
+            class:active={topPanelMetric === 'requests'}
+            onclick={() => (topPanelMetric = 'requests')}
+          >By Uploads</button>
+        </div>
+        <div class="top-list">
+          {#if topFiles.length === 0}
+            <div class="top-empty">
+              No upload activity yet. Files you've shared will appear here once peers start downloading.
+            </div>
+          {:else}
+            {#each topFiles as tf, i (tf.path)}
+              {@const val = topPanelMetric === 'bytes' ? tf.alltime_transferred : tf.alltime_accepted}
+              {@const pct = topMaxValue > 0 ? Math.max(4, Math.round((val / topMaxValue) * 100)) : 0}
+              <button
+                type="button"
+                class="top-row"
+                class:selected={selectedPath === tf.path}
+                onclick={() => selectAndRevealFile(tf.path)}
+                title={tf.name}
+              >
+                <span class="top-rank">{i + 1}</span>
+                <span class="top-body">
+                  <span class="top-name">{tf.name}</span>
+                  <span class="top-bar-wrap">
+                    <span class="top-bar" style="width:{pct}%"></span>
+                  </span>
+                  <span class="top-value">
+                    {topPanelMetric === 'bytes'
+                      ? formatSize(val)
+                      : `${val.toLocaleString()} upload${val !== 1 ? 's' : ''}`}
+                  </span>
+                </span>
+              </button>
+            {/each}
+          {/if}
+        </div>
+      {/if}
     </div>
   </div>
 
@@ -1138,6 +1648,7 @@
         <button class="tb-btn" onclick={bulkShare} title="Share all selected files">Share</button>
         <button class="tb-btn" onclick={bulkUnshare} title="Unshare all selected files">Unshare</button>
         <button class="tb-btn" onclick={bulkCopyLinks} title="Copy eD2K links for selected files">Copy Links</button>
+        <button class="tb-btn" onclick={openCreateDialogFromSelection} title="Create a collection from selected files">New Collection</button>
         <button class="tb-btn" onclick={clearChecked} title="Clear selection">Clear</button>
       </div>
     {/if}
@@ -1189,10 +1700,11 @@
           <span class="meta-label">Shared</span>
           <span class="meta-value">
             {selectedFile.shared ? 'Yes' : 'No'}
-            {#if selectedFile.shared && selectedFile.hash}
+            {#if selectedFile.hash}
               <span class="meta-badges">
-                {#if selectedFile.shared_kad}<span class="meta-badge">KAD</span>{/if}
-                {#if selectedFile.shared_ed2k}<span class="meta-badge">eD2K</span>{/if}
+                {#if selectedFile.shared && selectedFile.shared_kad}<span class="meta-badge" title="Published to KAD network">KAD</span>{/if}
+                {#if selectedFile.shared && selectedFile.shared_ed2k}<span class="meta-badge" title="Published to eD2K servers">eD2K</span>{/if}
+                {#if selectedFile.aich_hash}<span class="meta-badge meta-badge-aich" title="AICH hash available — corruption can be detected and recovered mid-download">AICH</span>{/if}
               </span>
             {/if}
           </span>
@@ -1311,6 +1823,7 @@
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>Copy eD2K Link</button>
       <div class="ctx-sep"></div>
       {#if ctxMenu.file.shared}
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('republish')} title="Reset publish timers so this file is re-published to the KAD network on the next cycle">Republish to KAD</button>
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>Unshare File</button>
       {:else}
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('share')}>Share File</button>
@@ -1322,6 +1835,35 @@
 {/if}
 
 <style>
+  /* --- Drag & drop overlay --- */
+  .dnd-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    pointer-events: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(10, 15, 25, 0.55);
+    backdrop-filter: blur(2px);
+    border: 3px dashed var(--accent, #4a90e2);
+    transition: background 0.12s ease;
+  }
+  .dnd-overlay.hover { background: rgba(74, 144, 226, 0.22); }
+  .dnd-hint {
+    background: var(--bg-secondary, #1e2433);
+    border: 1px solid var(--border, #333);
+    border-radius: 10px;
+    padding: 22px 28px;
+    text-align: center;
+    color: var(--text, #e0e0e0);
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+    max-width: 360px;
+  }
+  .dnd-icon { color: var(--accent, #4a90e2); margin-bottom: 6px; }
+  .dnd-title { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+  .dnd-sub { font-size: 12px; color: var(--text-muted, #999); }
+
   /* --- Layout --- */
   .page-header {
     display: flex;
@@ -1424,7 +1966,138 @@
     border-bottom: 1px solid var(--border);
     background: var(--bg-surface);
   }
-  .folder-tree { flex: 1; overflow-y: auto; padding: 6px; }
+  .folder-tree { flex: 1 1 auto; overflow-y: auto; padding: 6px; min-height: 80px; }
+
+  /* --- Top Uploads (popularity) panel --- */
+  .sidebar-section {
+    display: flex;
+    flex-direction: column;
+    border-top: 1px solid var(--border);
+    background: var(--bg-secondary);
+    flex-shrink: 0;
+    max-height: 45%;
+  }
+  .sidebar-section-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--bg-surface);
+    border: none;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    text-align: left;
+  }
+  .sidebar-section-header:hover { color: var(--text-primary); }
+  .section-arrow { width: 10px; color: var(--text-muted); font-size: 10px; }
+  .section-title { flex: 1; }
+  .top-metric-switch {
+    display: flex;
+    gap: 4px;
+    padding: 6px 6px 4px;
+  }
+  .top-metric-switch button {
+    flex: 1;
+    padding: 3px 6px;
+    font-size: 11px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+  }
+  .top-metric-switch button:hover { color: var(--text-primary); }
+  .top-metric-switch button.active {
+    background: color-mix(in srgb, var(--accent-dim) 55%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+  .top-list {
+    overflow-y: auto;
+    padding: 4px 6px 8px;
+    flex: 1;
+    min-height: 0;
+  }
+  .top-empty {
+    padding: 10px 8px;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-style: italic;
+    line-height: 1.4;
+  }
+  .top-row {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 6px;
+    margin-bottom: 2px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font: inherit;
+    text-align: left;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .top-row:hover {
+    background: var(--bg-hover);
+    border-color: var(--border);
+  }
+  .top-row.selected {
+    background: color-mix(in srgb, var(--accent-dim) 55%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    color: var(--text-primary);
+  }
+  .top-rank {
+    flex-shrink: 0;
+    width: 16px;
+    text-align: right;
+    font-size: 10px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .top-body {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+  }
+  .top-name {
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .top-bar-wrap {
+    display: block;
+    height: 3px;
+    background: var(--bg-primary);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .top-bar {
+    display: block;
+    height: 100%;
+    background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 70%, transparent), var(--accent));
+    border-radius: 2px;
+    transition: width 0.25s ease;
+  }
+  .top-value {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
   .tree-item {
     display: flex;
     align-items: center;
@@ -1799,6 +2472,41 @@
     font-size: 12px;
     padding: 7px 12px;
   }
+  .dupes-toggle {
+    padding: 7px 10px;
+    font-size: 12px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-primary, #1e1e1e);
+    color: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
+  }
+  .dupes-toggle:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
+  .dupes-toggle.active {
+    background: color-mix(in srgb, var(--accent-dim) 55%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+  .dupes-toggle:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .missing-toggle.active {
+    background: color-mix(in srgb, var(--danger, #e74c3c) 20%, transparent);
+    border-color: color-mix(in srgb, var(--danger, #e74c3c) 55%, var(--border));
+    color: var(--danger, #e74c3c);
+  }
+  .missing-remove-btn {
+    background: var(--danger, #e74c3c);
+    color: #fff;
+    border-color: var(--danger, #e74c3c);
+  }
+  .missing-remove-btn:hover:not(:disabled) { opacity: 0.85; background: var(--danger, #e74c3c); }
 
   /* --- Bulk action bar --- */
   .bulk-action-bar {
@@ -1879,6 +2587,9 @@
     color: #fff;
     font-weight: 600;
     letter-spacing: 0.3px;
+  }
+  .meta-badge.meta-badge-aich {
+    background: #27ae60;
   }
 
   /* --- Comment panel --- */
@@ -2154,6 +2865,38 @@
     outline: none;
   }
   .form-input:focus { border-color: var(--accent, #3498db); }
+
+  .format-toggle {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    flex: 1;
+  }
+  .format-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .format-option:hover { background: var(--bg-hover); }
+  .format-option input[type="radio"] { margin-top: 2px; flex-shrink: 0; cursor: pointer; }
+  .format-option:has(input[type="radio"]:checked) {
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+    background: color-mix(in srgb, var(--accent-dim) 30%, transparent);
+  }
+  .format-label {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    line-height: 1.3;
+  }
+  .format-name { font-size: 12px; font-weight: 600; color: var(--text-primary); }
+  .format-desc { font-size: 11px; color: var(--text-muted); }
+
   .select-all-btn { font-size: 11px; margin-left: auto; padding: 2px 8px; }
   .coll-search-row {
     margin-bottom: 6px;
