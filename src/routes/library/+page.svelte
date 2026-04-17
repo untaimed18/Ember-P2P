@@ -20,6 +20,7 @@
   import { formatEd2kLink } from '$lib/api/search';
   import { loadCollection, createCollection, downloadCollectionFiles, type Collection, type CollectionFile } from '$lib/api/collections';
   import { toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
+  import { networkStats } from '$lib/stores/network';
   import { formatSize } from '$lib/utils';
   import type { FileInfo } from '$lib/types';
   import { onMount, tick } from 'svelte';
@@ -154,6 +155,19 @@
     }
   }
 
+  function sanitizeFilename(raw: string): string {
+    // Strip characters forbidden by Windows/macOS/Linux plus path separators
+    // and control chars. Collapse runs of whitespace and trim dots/spaces
+    // from the ends so that e.g. "My:Mix/2025." -> "My_Mix_2025".
+    const cleaned = raw
+      // eslint-disable-next-line no-control-regex
+      .replace(/[\\/:*?"<>|\x00-\x1f]/g, '_')
+      .replace(/\s+/g, ' ')
+      .replace(/^[.\s]+|[.\s]+$/g, '')
+      .slice(0, 120);
+    return cleaned.length > 0 ? cleaned : 'Collection';
+  }
+
   async function handleCreateCollection() {
     if (!newCollName.trim() || selectedFileHashes.size === 0) return;
     try {
@@ -161,8 +175,9 @@
       const isBinary = newCollFormat === 'binary';
       const ext = isBinary ? 'emulecollection' : 'txt';
       const filterName = isBinary ? 'eMule Collection' : 'eD2K Links (Text)';
+      const safeName = sanitizeFilename(newCollName.trim());
       const outputPath = await saveDialog({
-        defaultPath: `${newCollName.trim()}.${ext}`,
+        defaultPath: `${safeName}.${ext}`,
         filters: [{ name: filterName, extensions: [ext] }],
       });
       if (!outputPath) return;
@@ -343,8 +358,16 @@
   }
 
   async function handleRemoveFolder(path: string) {
-    error = null;
+    const stats = folderStats.counts.get(path) ?? 0;
     try {
+      const { confirm } = await import('@tauri-apps/plugin-dialog');
+      const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
+      const body = stats > 0
+        ? `Remove "${displayName}" from your shared folders?\n\n${stats.toLocaleString()} file${stats !== 1 ? 's' : ''} will be removed from the index. No files on disk are touched.`
+        : `Remove "${displayName}" from your shared folders?\n\nNo files on disk are touched.`;
+      const confirmed = await confirm(body, { title: 'Remove Folder', kind: 'warning' });
+      if (!confirmed || !mounted) return;
+      error = null;
       await removeSharedFolder(path);
       if (!mounted) return;
       if (filterFolder === path) filterFolder = null;
@@ -539,6 +562,41 @@
     } catch (e: unknown) { error = toErr(e); }
   }
 
+  async function bulkDelete() {
+    const targets = getCheckedFiles();
+    if (targets.length === 0) return;
+    const totalBytes = targets.reduce((sum, f) => sum + f.size, 0);
+    try {
+      const { confirm } = await import('@tauri-apps/plugin-dialog');
+      const confirmed = await confirm(
+        `Delete ${targets.length.toLocaleString()} file${targets.length !== 1 ? 's' : ''} (${formatSize(totalBytes)}) from disk?\n\nThis cannot be undone.`,
+        { title: 'Delete Files', kind: 'warning' }
+      );
+      if (!confirmed) return;
+      let deleted = 0;
+      const failures: string[] = [];
+      for (const f of targets) {
+        try {
+          await deleteSharedFile(f.path, f.hash || undefined);
+          deleted++;
+        } catch (e: unknown) {
+          failures.push(`${f.name}: ${toErr(e)}`);
+        }
+      }
+      if (selectedPath && targets.some((f) => f.path === selectedPath)) {
+        selectedPath = null;
+      }
+      clearChecked();
+      await refresh();
+      if (deleted > 0) {
+        toastSuccess(`Deleted ${deleted} file${deleted !== 1 ? 's' : ''}${failures.length ? ` (${failures.length} failed)` : ''}`);
+      }
+      if (failures.length > 0) {
+        toastError(failures[0]);
+      }
+    } catch (e: unknown) { error = toErr(e); }
+  }
+
   async function bulkCopyLinks() {
     const targets = getCheckedFiles().filter(f => !!f.hash);
     if (targets.length === 0) return;
@@ -624,26 +682,23 @@
   // --- Top Uploads (popularity panel) ---
   let topPanelOpen = $state(true);
   let topPanelMetric: 'bytes' | 'requests' = $state('bytes');
+  let topPanelScope: 'session' | 'alltime' = $state('alltime');
   const TOP_PANEL_SIZE = 10;
 
-  let topFiles = $derived.by(() => {
-    if (topPanelMetric === 'bytes') {
-      return [...files]
-        .filter((f) => f.hash && f.alltime_transferred > 0)
-        .sort((a, b) => b.alltime_transferred - a.alltime_transferred)
-        .slice(0, TOP_PANEL_SIZE);
+  function topValueFor(f: FileInfo): number {
+    if (topPanelScope === 'session') {
+      return topPanelMetric === 'bytes' ? f.bytes_transferred : f.accepted;
     }
+    return topPanelMetric === 'bytes' ? f.alltime_transferred : f.alltime_accepted;
+  }
+
+  let topFiles = $derived.by(() => {
     return [...files]
-      .filter((f) => f.hash && f.alltime_accepted > 0)
-      .sort((a, b) => b.alltime_accepted - a.alltime_accepted)
+      .filter((f) => f.hash && topValueFor(f) > 0)
+      .sort((a, b) => topValueFor(b) - topValueFor(a))
       .slice(0, TOP_PANEL_SIZE);
   });
-  let topMaxValue = $derived.by(() => {
-    if (topFiles.length === 0) return 0;
-    return topPanelMetric === 'bytes'
-      ? topFiles[0].alltime_transferred
-      : topFiles[0].alltime_accepted;
-  });
+  let topMaxValue = $derived(topFiles.length === 0 ? 0 : topValueFor(topFiles[0]));
   function selectAndRevealFile(path: string) {
     selectedPath = path;
     clearLibraryFilters();
@@ -713,6 +768,10 @@
   }
 
   // --- Comments ---
+  // Selecting rows rapidly (e.g. arrow-keying through 50 files) would otherwise
+  // fire a getFileComments RPC per row. Debounce so we only hit the backend
+  // once the selection has settled for ~200ms.
+  let commentFetchTimer: ReturnType<typeof setTimeout> | null = null;
   $effect(() => {
     const hash = selectedHash;
     commentSaveState = 'idle';
@@ -721,6 +780,10 @@
       clearTimeout(commentSaveTimer);
       commentSaveTimer = null;
     }
+    if (commentFetchTimer) {
+      clearTimeout(commentFetchTimer);
+      commentFetchTimer = null;
+    }
     if (!hash) {
       commentInfo = null;
       commentLoading = false;
@@ -728,17 +791,21 @@
       return;
     }
     commentLoading = true;
-    getFileComments(hash).then((info) => {
+    commentFetchTimer = setTimeout(() => {
+      commentFetchTimer = null;
       if (selectedHash !== hash) return;
-      commentInfo = info;
-      ourRating = info?.our_rating ?? 0;
-      ourComment = info?.our_comment ?? '';
-      commentLoading = false;
-    }).catch(() => {
-      if (selectedHash !== hash) return;
-      commentInfo = null;
-      commentLoading = false;
-    });
+      getFileComments(hash).then((info) => {
+        if (selectedHash !== hash) return;
+        commentInfo = info;
+        ourRating = info?.our_rating ?? 0;
+        ourComment = info?.our_comment ?? '';
+        commentLoading = false;
+      }).catch(() => {
+        if (selectedHash !== hash) return;
+        commentInfo = null;
+        commentLoading = false;
+      });
+    }, 200);
   });
 
   async function handleSaveComment() {
@@ -911,11 +978,20 @@
       return;
     }
 
-    // Delete on the selected row triggers delete flow.
-    if (e.key === 'Delete' && selectedFile) {
-      e.preventDefault();
-      void deleteSelectedFile();
-      return;
+    // Delete prefers the checkbox selection when one exists; otherwise it
+    // falls back to the single row that was last clicked. This prevents a
+    // surprising "deleted only one of my 200 selected files" scenario.
+    if (e.key === 'Delete') {
+      if (checkedCount > 0) {
+        e.preventDefault();
+        void bulkDelete();
+        return;
+      }
+      if (selectedFile) {
+        e.preventDefault();
+        void deleteSelectedFile();
+        return;
+      }
     }
 
     // Space toggles the check on the selected row.
@@ -963,7 +1039,11 @@
         case 'republish': {
           if (!f.hash || !f.shared) break;
           await republishFile(f.hash);
-          toastSuccess('Queued republish to KAD');
+          if ($networkStats.status === 'connected') {
+            toastSuccess('Queued republish to KAD');
+          } else {
+            toastWarning('KAD is not connected — file will be republished once the network comes online.');
+          }
           break;
         }
       }
@@ -972,6 +1052,18 @@
 
   async function handleUnshareFolder(path: string) {
     try {
+      const { confirm } = await import('@tauri-apps/plugin-dialog');
+      const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
+      const sharedCount = files.filter((f) => f.shared && isPathInFolder(f.path, path)).length;
+      if (sharedCount === 0) {
+        toastWarning(`No shared files in "${displayName}"`);
+        return;
+      }
+      const confirmed = await confirm(
+        `Unshare ${sharedCount.toLocaleString()} file${sharedCount !== 1 ? 's' : ''} in "${displayName}"?\n\nOther peers will no longer be able to download these files from you. The folder itself stays in your library.`,
+        { title: 'Unshare Folder', kind: 'warning' }
+      );
+      if (!confirmed) return;
       await unshareFolder(path);
       await refresh();
     } catch (e: unknown) { error = toErr(e); }
@@ -1023,6 +1115,9 @@
         if (parsed.topPanelMetric === 'bytes' || parsed.topPanelMetric === 'requests') {
           topPanelMetric = parsed.topPanelMetric;
         }
+        if (parsed.topPanelScope === 'session' || parsed.topPanelScope === 'alltime') {
+          topPanelScope = parsed.topPanelScope;
+        }
       }
     } catch {
       try { localStorage.removeItem(FILTERS_KEY); } catch {}
@@ -1040,6 +1135,7 @@
         showDuplicatesOnly,
         topPanelOpen,
         topPanelMetric,
+        topPanelScope,
       }));
     } catch {}
   }
@@ -1048,7 +1144,7 @@
     if (!filtersRestored) return;
     // Track dependencies explicitly so this effect re-runs when any filter/sort changes.
     void typeFilter; void filterFolder; void searchQuery; void sortField; void sortAsc; void showDuplicatesOnly;
-    void topPanelOpen; void topPanelMetric;
+    void topPanelOpen; void topPanelMetric; void topPanelScope;
     persistFilters();
   });
 
@@ -1186,7 +1282,13 @@
         const u = await getCurrentWebview().onDragDropEvent((event) => {
           if (!mounted) return;
           const t = event.payload.type;
+          // Only surface the overlay when the drag actually carries OS paths.
+          // Tauri fires enter/over for in-app drags (e.g. column reorders, text
+          // selections) too, which would otherwise flash the overlay.
+          const paths = (event.payload as { paths?: string[] }).paths ?? [];
+          const hasPaths = paths.length > 0;
           if (t === 'enter' || t === 'over') {
+            if (!hasPaths) return;
             dndActive = true;
             dndHover = t === 'over';
           } else if (t === 'leave') {
@@ -1195,8 +1297,7 @@
           } else if (t === 'drop') {
             dndActive = false;
             dndHover = false;
-            const paths = (event.payload as { paths?: string[] }).paths ?? [];
-            if (paths.length > 0) void handleOsFolderDrop(paths);
+            if (hasPaths) void handleOsFolderDrop(paths);
           }
         });
         if (destroyed) u(); else unlisteners.push(u);
@@ -1225,7 +1326,13 @@
 <div class="page-header">
   <h2>Library</h2>
   <div class="header-actions">
-    <button class="ghost" onclick={handleOpenCollection}>Open Collection</button>
+    <button class="ghost" onclick={handleOpenCollection} disabled={collectionLoading}>
+      {#if collectionLoading}
+        <span class="spinner-inline" aria-hidden="true"></span> Opening&hellip;
+      {:else}
+        Open Collection
+      {/if}
+    </button>
     <button class="ghost" onclick={() => openCreateDialog()}>Create Collection</button>
     <button onclick={handleReload}>Reload</button>
     <button onclick={handleAddFolder}>+ Add Folder</button>
@@ -1351,7 +1458,15 @@
 
 {#if createCollectionOpen}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-  <div class="modal-overlay" role="dialog" aria-modal="true" tabindex="-1" onkeydown={(e) => { if (e.key === 'Escape') createCollectionOpen = false; }}>
+  <div class="modal-overlay" role="dialog" aria-modal="true" tabindex="-1" onkeydown={(e) => {
+    if (e.key === 'Escape') { createCollectionOpen = false; return; }
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      if (!!newCollName.trim() && selectedFileHashes.size > 0 && !creatingCollection) {
+        e.preventDefault();
+        void handleCreateCollection();
+      }
+    }
+  }}>
     <div class="modal-content create-coll-modal">
       <div class="modal-header">
         <span class="modal-title">Create Collection</span>
@@ -1360,7 +1475,19 @@
       <div class="modal-body">
         <div class="form-row">
           <label class="form-label" for="coll-name">Name</label>
-          <input id="coll-name" type="text" class="form-input" bind:value={newCollName} placeholder="My Collection" />
+          <input
+            id="coll-name"
+            type="text"
+            class="form-input"
+            bind:value={newCollName}
+            placeholder="My Collection"
+            onkeydown={(e) => {
+              if (e.key === 'Enter' && !!newCollName.trim() && selectedFileHashes.size > 0 && !creatingCollection) {
+                e.preventDefault();
+                void handleCreateCollection();
+              }
+            }}
+          />
         </div>
         <div class="form-row">
           <label class="form-label" for="coll-author">Author</label>
@@ -1512,6 +1639,24 @@
         <span class="section-title">Top Uploads</span>
       </button>
       {#if topPanelOpen}
+        <div class="top-metric-switch" role="tablist" aria-label="Top upload scope">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={topPanelScope === 'alltime'}
+            class:active={topPanelScope === 'alltime'}
+            onclick={() => (topPanelScope = 'alltime')}
+            title="Cumulative uploads across all sessions"
+          >All time</button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={topPanelScope === 'session'}
+            class:active={topPanelScope === 'session'}
+            onclick={() => (topPanelScope = 'session')}
+            title="Uploads since the app was last started"
+          >Session</button>
+        </div>
         <div class="top-metric-switch" role="tablist" aria-label="Top upload metric">
           <button
             type="button"
@@ -1531,11 +1676,13 @@
         <div class="top-list">
           {#if topFiles.length === 0}
             <div class="top-empty">
-              No upload activity yet. Files you've shared will appear here once peers start downloading.
+              {topPanelScope === 'session'
+                ? 'No uploads yet this session. Activity resets each time Ember starts.'
+                : "No upload activity yet. Files you've shared will appear here once peers start downloading."}
             </div>
           {:else}
             {#each topFiles as tf, i (tf.path)}
-              {@const val = topPanelMetric === 'bytes' ? tf.alltime_transferred : tf.alltime_accepted}
+              {@const val = topValueFor(tf)}
               {@const pct = topMaxValue > 0 ? Math.max(4, Math.round((val / topMaxValue) * 100)) : 0}
               <button
                 type="button"
@@ -1658,15 +1805,18 @@
         <button class="tb-btn" onclick={bulkUnshare} title="Unshare all selected files">Unshare</button>
         <button class="tb-btn" onclick={bulkCopyLinks} title="Copy eD2K links for selected files">Copy Links</button>
         <button class="tb-btn" onclick={openCreateDialogFromSelection} title="Create a collection from selected files">New Collection</button>
+        <button class="tb-btn tb-danger" onclick={bulkDelete} title="Delete selected files from disk">Delete</button>
         <button class="tb-btn" onclick={clearChecked} title="Clear selection">Clear</button>
       </div>
     {/if}
 
     <div class="status-bar">
-      <span>{filteredFiles.length} file{filteredFiles.length !== 1 ? 's' : ''} shown</span>
-      <span class="status-sep">&middot;</span>
-      <span>{filteredSharedCount} shared</span>
-      <span class="status-sep">&middot;</span>
+      {#if hasActiveLibraryFilters && filteredFiles.length !== files.length}
+        <span>Showing {filteredFiles.length.toLocaleString()} of {files.length.toLocaleString()} files</span>
+        <span class="status-sep">&middot;</span>
+        <span>{filteredSharedCount.toLocaleString()} shared in view</span>
+        <span class="status-sep">&middot;</span>
+      {/if}
       <span>{activeFolderLabel}</span>
       {#if selectedFile}
         <span class="status-sep">&middot;</span>
@@ -1713,7 +1863,7 @@
               <span class="meta-badges">
                 {#if selectedFile.shared && selectedFile.shared_kad}<span class="meta-badge" title="Published to KAD network">KAD</span>{/if}
                 {#if selectedFile.shared && selectedFile.shared_ed2k}<span class="meta-badge" title="Published to eD2K servers">eD2K</span>{/if}
-                {#if selectedFile.aich_hash}<span class="meta-badge meta-badge-aich" title="AICH hash available — corruption can be detected and recovered mid-download">AICH</span>{/if}
+                {#if selectedFile.aich_hash}<span class="meta-badge meta-badge-aich" title="AICH hash available — bad chunks can be identified without re-downloading the whole file">AICH</span>{/if}
               </span>
             {/if}
           </span>
@@ -1724,8 +1874,10 @@
           <span class="meta-label">Transferred</span>
           <span class="meta-value">{formatSize(selectedFile.bytes_transferred)}{selectedFile.alltime_transferred ? ` (${formatSize(selectedFile.alltime_transferred)} all-time)` : ''}</span>
           {#if selectedFile.complete_sources > 0}
-            <span class="meta-label">Sources</span>
-            <span class="meta-value">{selectedFile.complete_sources} complete</span>
+            <span class="meta-label">Peers</span>
+            <span class="meta-value" title="KAD peers that have acknowledged a source record or known complete copies">
+              {selectedFile.complete_sources.toLocaleString()} with a copy
+            </span>
           {/if}
         </div>
 
@@ -1832,7 +1984,14 @@
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>Copy eD2K Link</button>
       <div class="ctx-sep"></div>
       {#if ctxMenu.file.shared}
-        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('republish')} title="Reset publish timers so this file is re-published to the KAD network on the next cycle">Republish to KAD</button>
+        <button
+          class="ctx-item"
+          role="menuitem"
+          onclick={() => ctxAction('republish')}
+          title={$networkStats.status === 'connected'
+            ? 'Reset publish timers so this file is re-published to the KAD network on the next cycle'
+            : 'KAD is not connected — republish will be deferred until the network comes online'}
+        >Republish to KAD{$networkStats.status !== 'connected' ? ' (offline)' : ''}</button>
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>Unshare File</button>
       {:else}
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('share')}>Share File</button>
@@ -2544,6 +2703,29 @@
     gap: 4px;
   }
   .bulk-prio-btn { font-size: 11px; padding: 2px 6px; }
+  .spinner-inline {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border: 2px solid var(--text-muted);
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spinner-rotate 0.9s linear infinite;
+    vertical-align: -1px;
+    margin-right: 4px;
+  }
+  @keyframes spinner-rotate {
+    to { transform: rotate(360deg); }
+  }
+
+  .tb-btn.tb-danger {
+    border-color: rgba(231, 76, 60, 0.4);
+    color: #e74c3c;
+  }
+  .tb-btn.tb-danger:hover:not(:disabled) {
+    background: rgba(231, 76, 60, 0.12);
+    border-color: #e74c3c;
+  }
 
   /* --- Details meta grid --- */
   .details-meta-grid {
