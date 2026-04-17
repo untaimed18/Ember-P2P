@@ -2572,19 +2572,31 @@ impl UploadHandler {
                         })
                         .collect();
 
-                    // Merge overlapping / duplicate ranges before sending.
-                    // eMule-family peers normally send 3 disjoint block
-                    // requests, but a buggy or malicious peer can re-request
-                    // the same offset multiple times; without this merge
-                    // we would double-count bytes in both the upload
-                    // progress counter and the credit ledger, inflating
-                    // the peer's credit ratio and the UI "transferred" stat.
+                    // Merge *overlapping* ranges before sending (not merely
+                    // adjacent ones). eMule-family peers normally send 3
+                    // disjoint EMBLOCKSIZE-sized block requests per
+                    // OP_REQUESTPARTS, and those blocks are contiguous —
+                    // e.g. (0, 180K) (180K, 360K) (360K, 540K). A buggy or
+                    // malicious peer can re-request the same offset twice;
+                    // without deduping we'd double-count bytes in the
+                    // upload progress counter and the credit ledger,
+                    // inflating the peer's credit ratio and the UI
+                    // "transferred" stat. Use strict `<` so contiguous
+                    // ranges stay as separate entries: fusing them lets a
+                    // single OP_SENDINGPART cover all three blocks, and
+                    // the downloader counts block responses per packet
+                    // (see `multi_source.rs` `blocks_received_in_current_req`).
+                    // With the old `<=` the downloader's refill logic
+                    // stalled after the first 540 KB and the outer
+                    // per-part loop ran out of work, so the peer sent
+                    // OP_END_OF_DOWNLOAD after ~one batch and the session
+                    // ended far short of the file.
                     if offsets.len() > 1 {
                         offsets.sort_by_key(|&(s, _)| s);
                         let mut merged: Vec<(u64, u64)> = Vec::with_capacity(offsets.len());
                         for (s, e) in offsets {
                             if let Some(last) = merged.last_mut() {
-                                if s <= last.1 {
+                                if s < last.1 {
                                     if e > last.1 { last.1 = e; }
                                     continue;
                                 }
@@ -2592,6 +2604,32 @@ impl UploadHandler {
                             merged.push((s, e));
                         }
                         offsets = merged;
+                    }
+
+                    // Belt-and-suspenders: split any range larger than
+                    // EMBLOCKSIZE back into per-block pieces before we
+                    // serve it. Under normal peer behaviour the merge
+                    // above is a no-op on a sorted list of EMBLOCKSIZE
+                    // requests, but a peer that *does* legitimately ask
+                    // for more than one block in a single range entry
+                    // (or an attacker that sends overlapping ranges we
+                    // had to collapse into one big range) would still
+                    // go out as a single OP_SENDINGPART — and the
+                    // downloader's block counter is per-packet, not
+                    // per-byte. Emitting one packet per EMBLOCKSIZE
+                    // keeps the downloader's pipeline-refill logic
+                    // happy no matter what shape the request came in.
+                    if offsets.iter().any(|&(s, e)| e - s > EMBLOCKSIZE) {
+                        let mut split: Vec<(u64, u64)> = Vec::with_capacity(offsets.len() * 3);
+                        for (s, e) in offsets {
+                            let mut cur = s;
+                            while cur < e {
+                                let next = (cur + EMBLOCKSIZE).min(e);
+                                split.push((cur, next));
+                                cur = next;
+                            }
+                        }
+                        offsets = split;
                     }
 
                     let resolved = match self.resolve_upload_file(&hash).await {
