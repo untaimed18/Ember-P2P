@@ -140,9 +140,11 @@
     }
     s.tcp_port = clampInt(s.tcp_port, 1, 65535, 4662);
     s.udp_port = clampInt(s.udp_port, 1, 65535, 4672);
-    if (s.tcp_port === s.udp_port) {
-      return 'TCP and UDP ports must differ.';
-    }
+    // TCP and UDP are separate protocols on the OS and on the IGD/UPnP
+    // side, so reusing the same port number for both is fully supported
+    // (eMule has always allowed this too). This matters for users on a
+    // VPN that only forwards a single port for both protocols. The only
+    // thing we still require is that the port is in the 1-65535 range.
     s.max_upload_speed = clampNonNegInt(s.max_upload_speed, 2_147_483_647, 0);
     s.max_download_speed = clampNonNegInt(s.max_download_speed, 2_147_483_647, 0);
     s.max_concurrent_downloads = clampInt(s.max_concurrent_downloads, 1, 100, 3);
@@ -678,7 +680,7 @@
                 <span class="restart-badge">Restart</span>
               </label>
               <input id="udp-port" type="number" min="1" max="65535" bind:value={settings.udp_port} />
-              <span class="hint">KAD DHT (default 4672)</span>
+              <span class="hint">KAD DHT (default 4672). May match the TCP port if your VPN only forwards a single port.</span>
             </div>
           </div>
 

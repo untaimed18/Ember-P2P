@@ -134,7 +134,10 @@
     if (!downloadFolder.trim()) { saveError = 'Please choose a download folder.'; step = 3; return; }
     const tcp = clampInt(tcpPort, 1, 65535, 4662);
     const udp = clampInt(udpPort, 1, 65535, 4672);
-    if (tcp === udp) { saveError = 'TCP and UDP ports must differ.'; step = 4; return; }
+    // TCP and UDP on the same port number is allowed: they're different
+    // transport protocols so there's no socket collision, and UPnP maps
+    // them as separate entries. This matters for users on VPNs that
+    // forward one port number for both protocols.
     tcpPort = tcp;
     udpPort = udp;
     saving = true;
@@ -320,7 +323,7 @@
       {:else if step === 4}
         <div class="step-content">
           <h2 class="step-title">Network Ports</h2>
-          <p class="step-desc">Ember needs two ports for peer communication. The defaults work for most users. Enable UPnP to automatically forward ports on your router.</p>
+          <p class="step-desc">Ember needs a TCP port (file transfers) and a UDP port (KAD DHT). The defaults work for most users. If your VPN only forwards a single port number, you can set both fields to the same value — TCP and UDP are independent protocols. Enable UPnP to automatically forward ports on your router.</p>
           <div class="fields-row">
             <div class="field">
               <label for="tcp-port">TCP Port</label>
