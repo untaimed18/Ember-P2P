@@ -133,9 +133,12 @@ impl FileIndexer {
     #[allow(dead_code)]
     pub fn hash_file(path: &Path) -> anyhow::Result<(String, String)> {
         let ed2k = ed2k_hash_file(path)?;
+        // AICH failures must propagate: an empty AICH hex would look like a
+        // legitimate (empty-file) hash to callers and be served to peers as
+        // authoritative recovery data, which is dangerous.
         let aich = compute_aich_root(path)
-            .map(|h| hex::encode(h))
-            .unwrap_or_default();
+            .map(hex::encode)
+            .map_err(|e| anyhow::anyhow!("AICH hash failed for {}: {e}", path.display()))?;
         Ok((ed2k, aich))
     }
 

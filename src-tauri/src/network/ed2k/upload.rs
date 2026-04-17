@@ -1382,26 +1382,31 @@ impl UploadHandler {
             }
         }
 
-        // Check if this is an incoming buddy connection
-        {
+        // Check if this is an incoming buddy connection.
+        // Release the pending-buddy mutex before awaiting on the bounded
+        // `buddy_conn_tx` channel: if the channel is at capacity, `.send().await`
+        // parks until a receiver drains it, and anything in the network loop
+        // that wanted to `lock().await` this mutex would deadlock.
+        let buddy_callback = {
             let mut pending = self.pending_buddy_hashes.lock().await;
-            if let Some((callback_check, _)) = pending.remove(&peer_user_hash) {
-                info!("Recognized incoming buddy connection from {peer_addr}");
-                let (tcp_reader, tcp_writer): (
-                    Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-                    Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>,
-                ) = match (reader, writer) {
-                    (StreamReader::Plain(r), StreamWriter::Plain(w)) => (Box::new(r), Box::new(w)),
-                    (StreamReader::Obfuscated(r), StreamWriter::Obfuscated(w)) => {
-                        (Box::new(r), Box::new(w))
-                    }
-                    _ => {
-                        return Ok(());
-                    }
-                };
-                let _ = self.buddy_conn_tx.send((peer_user_hash, callback_check, tcp_reader, tcp_writer)).await;
-                return Ok(());
-            }
+            pending.remove(&peer_user_hash)
+        };
+        if let Some((callback_check, _)) = buddy_callback {
+            info!("Recognized incoming buddy connection from {peer_addr}");
+            let (tcp_reader, tcp_writer): (
+                Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                Box<dyn tokio::io::AsyncWrite + Unpin + Send + Sync>,
+            ) = match (reader, writer) {
+                (StreamReader::Plain(r), StreamWriter::Plain(w)) => (Box::new(r), Box::new(w)),
+                (StreamReader::Obfuscated(r), StreamWriter::Obfuscated(w)) => {
+                    (Box::new(r), Box::new(w))
+                }
+                _ => {
+                    return Ok(());
+                }
+            };
+            let _ = self.buddy_conn_tx.send((peer_user_hash, callback_check, tcp_reader, tcp_writer)).await;
+            return Ok(());
         }
 
         // Check if this is a KAD callback connection (firewalled source connecting back)
@@ -1636,6 +1641,28 @@ impl UploadHandler {
         let mut last_preempt_check: std::time::Instant = std::time::Instant::now();
         let mut epx_packets_received: u8 = 0;
 
+        // Dedicated reader task: ed2k framing requires four sequential awaits
+        // (proto, length, opcode, payload). The main loop uses tokio::select!
+        // to race the next packet against outbound writes, and select! cancels
+        // the losing future. If it cancelled read_packet_async_inner mid-packet
+        // we'd resume on the next iteration with the stream positioned in the
+        // middle of a frame, causing desync and connection loss. Moving the
+        // read into its own task keeps frame state private; the select! site
+        // consumes whole packets from a channel and is trivially cancel-safe.
+        let (pkt_tx, mut pkt_rx) = tokio::sync::mpsc::channel::<std::io::Result<(u8, u8, Vec<u8>)>>(4);
+        let reader_task = tokio::spawn(async move {
+            loop {
+                let res = read_packet_async_inner(&mut reader).await;
+                let was_err = res.is_err();
+                if pkt_tx.send(res).await.is_err() {
+                    break;
+                }
+                if was_err {
+                    break;
+                }
+            }
+        });
+
         loop {
             // eMule: terminate upload sessions when the network is disconnected.
             if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1649,7 +1676,7 @@ impl UploadHandler {
                 let wait_secs = if queued_identity.is_some() { 1 } else if owns_ember_slot { 90 } else { CLIENT_TIMEOUT_SECS };
                 let timeout_dur = std::time::Duration::from_secs(wait_secs);
                 let read_result = tokio::select! {
-                    r = tokio::time::timeout(timeout_dur, read_packet_async_inner(&mut reader)) => r,
+                    r = tokio::time::timeout(timeout_dur, pkt_rx.recv()) => r,
                     Some(outbound_data) = outbound_rx.recv() => {
                         if writer.write_all(&outbound_data).await.is_ok() {
                             let _ = writer.flush().await;
@@ -1659,9 +1686,13 @@ impl UploadHandler {
                 };
 
                 match read_result {
-                    Ok(Ok(p)) => p,
-                    Ok(Err(e)) => {
+                    Ok(Some(Ok(p))) => p,
+                    Ok(Some(Err(e))) => {
                         debug!("Client disconnected: {e}");
+                        break;
+                    }
+                    Ok(None) => {
+                        debug!("Reader task ended unexpectedly");
                         break;
                     }
                     Err(_) => {
@@ -3200,6 +3231,9 @@ impl UploadHandler {
                 }
             }
         }
+
+        reader_task.abort();
+        let _ = reader_task.await;
 
         if let (true, Some(eh)) = (owns_ember_slot, peer_ember_hash) {
             self.ember_sessions.write().await.remove(&eh);

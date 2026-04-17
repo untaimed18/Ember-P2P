@@ -97,6 +97,19 @@ pub struct Transfer {
     pub failure_kind: Option<String>,
     #[serde(default)]
     pub failure_stage: Option<String>,
+    /// Priority for this transfer, using eMule's full ladder:
+    /// "verylow" | "low" | "normal" | "high" | "release" | "auto".
+    ///
+    /// Interpreted differently depending on [`direction`](TransferDirection):
+    /// - For downloads: relative source-slot allocation across our own
+    ///   transfers (higher = more in-flight source requests).
+    /// - For uploads: remote slot ranking when a peer is in our upload queue
+    ///   (higher = earlier slot grant).
+    ///
+    /// The shared upload-priority stored on a [`FileInfo`] is copied into the
+    /// upload-direction [`Transfer::priority`] when a peer connects, so both
+    /// fields share a single domain to simplify IPC and keep eMule
+    /// compatibility.
     #[serde(default = "default_priority")]
     pub priority: String,
     #[serde(default)]
@@ -354,6 +367,7 @@ pub enum NetworkStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppSettings {
     pub nickname: String,
     pub shared_folders: Vec<String>,

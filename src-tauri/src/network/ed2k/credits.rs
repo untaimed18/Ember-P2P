@@ -102,15 +102,9 @@ impl CreditManager {
             out.extend_from_slice(&self.our_public_key);
             out.extend_from_slice(&(self.our_private_key.len() as u32).to_le_bytes());
             out.extend_from_slice(&self.our_private_key);
-            let tmp_path = key_path.with_extension("dat.tmp");
-            if let Err(e) = crate::security::write_file_restricted(&tmp_path, &out) {
-                tracing::warn!("Failed to save RSA keypair: {e}");
-            } else {
-                if let Err(e) = std::fs::rename(&tmp_path, &key_path) {
-                    tracing::warn!("Failed to finalize RSA keypair save: {e}");
-                } else {
-                    tracing::info!("Generated and saved new RSA keypair to {}", key_path.display());
-                }
+            match crate::security::atomic_write(&key_path, &out, true) {
+                Ok(()) => tracing::info!("Generated and saved new RSA keypair to {}", key_path.display()),
+                Err(e) => tracing::warn!("Failed to save RSA keypair: {e}"),
             }
         }
     }

@@ -8,6 +8,14 @@ import { cancelSearch } from '$lib/api/search';
 export type SearchTab = {
   id: string;
   requestId: number;
+  /**
+   * When a retry is in flight (e.g. retryServerSearch), this is the
+   * secondary request id used by the backend for the retry. Events
+   * with either `requestId` OR `retryRequestId` are routed into this
+   * tab, so live progress/results during a retry are not dropped.
+   * Cleared when the retry completes.
+   */
+  retryRequestId: number | null;
   query: string;
   method: SearchMethod;
   fileType?: string;
@@ -103,7 +111,7 @@ function updateTabByRequestId(
   requestId: number,
   fn: (tab: SearchTab) => SearchTab,
 ): SearchTab[] {
-  const i = tabs.findIndex((t) => t.requestId === requestId);
+  const i = tabs.findIndex((t) => t.requestId === requestId || t.retryRequestId === requestId);
   if (i === -1) return tabs;
   const next = [...tabs];
   next[i] = fn(next[i]);
@@ -115,6 +123,31 @@ export function patchSearchTabByRequestId(requestId: number, fn: (tab: SearchTab
   searchTabs.update((tabs) => updateTabByRequestId(tabs, requestId, fn));
 }
 
+/**
+ * Attach a secondary request id (e.g. from a retry) to an existing tab so
+ * incoming search-result/progress/complete events for that id merge into it.
+ */
+export function attachRetryRequestId(tabId: string, retryRequestId: number) {
+  searchTabs.update((tabs) => {
+    const i = tabs.findIndex((t) => t.id === tabId);
+    if (i === -1) return tabs;
+    const next = [...tabs];
+    next[i] = { ...next[i], retryRequestId };
+    return next;
+  });
+}
+
+/** Clear retry routing when the retry completes or is cancelled. */
+export function clearRetryRequestId(tabId: string) {
+  searchTabs.update((tabs) => {
+    const i = tabs.findIndex((t) => t.id === tabId);
+    if (i === -1 || tabs[i].retryRequestId == null) return tabs;
+    const next = [...tabs];
+    next[i] = { ...next[i], retryRequestId: null };
+    return next;
+  });
+}
+
 /** Start a new search tab and select it. Returns tab id and request id for invoke/searchFiles. */
 export function openSearchTab(query: string, method: SearchMethod, fileType?: string, filters?: SearchFilters): { tabId: string; requestId: number } {
   const requestId = newSearchNonce();
@@ -122,6 +155,7 @@ export function openSearchTab(query: string, method: SearchMethod, fileType?: st
   const tab: SearchTab = {
     id,
     requestId,
+    retryRequestId: null,
     query,
     method,
     fileType,
@@ -150,6 +184,13 @@ export async function closeSearchTab(tabId: string): Promise<void> {
       await cancelSearch(tab.requestId);
     } catch {
       /* best effort */
+    }
+    if (tab.retryRequestId != null) {
+      try {
+        await cancelSearch(tab.retryRequestId);
+      } catch {
+        /* best effort */
+      }
     }
   }
   searchTabs.update((currentTabs) => currentTabs.filter((t) => t.id !== tabId));
@@ -184,11 +225,22 @@ export async function initSearchStore() {
     registered.push(await listen<{ request_id: number }>('search-complete', (event) => {
       const requestId = event.payload.request_id;
       searchTabs.update((tabs) =>
-        updateTabByRequestId(tabs, requestId, (t) => ({
-          ...t,
-          isSearching: false,
-          progress: null,
-        })),
+        updateTabByRequestId(tabs, requestId, (t) => {
+          const isRetry = t.retryRequestId === requestId;
+          const isPrimary = t.requestId === requestId;
+          // Only flip isSearching off once both primary and any in-flight
+          // retry have finished, so the spinner doesn't disappear between
+          // the two phases of a retry-server search.
+          const stillRetrying = t.retryRequestId != null && !isRetry;
+          const stillPrimary = !isPrimary && t.isSearching;
+          const done = !(stillRetrying || stillPrimary);
+          return {
+            ...t,
+            retryRequestId: isRetry ? null : t.retryRequestId,
+            isSearching: done ? false : t.isSearching,
+            progress: done ? null : t.progress,
+          };
+        }),
       );
     }));
     registered.push(await listen<{ request_id: number; nodes_contacted: number; results_so_far: number; phase: string }>(

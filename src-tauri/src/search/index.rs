@@ -5,9 +5,24 @@ use crate::types::{FileInfo, SearchResult};
 
 pub struct LocalIndex {
     files: Vec<FileInfo>,
+    /// Keyed by `normalize_path_key(file.path)` so Windows paths that differ
+    /// only in case resolve to the same index entry.
     path_map: HashMap<String, usize>,
     hash_map: HashMap<String, Vec<usize>>,
     name_tokens: HashMap<String, Vec<usize>>,
+}
+
+/// Windows filesystems are (by default) case-insensitive; indexing a path that
+/// arrived from the watcher in one casing and lookups that arrive from the UI
+/// in another would spuriously miss. Lowercase the path on Windows; preserve
+/// it exactly on other platforms where case matters.
+#[inline]
+fn normalize_path_key(path: &str) -> String {
+    if cfg!(windows) {
+        path.to_lowercase()
+    } else {
+        path.to_string()
+    }
 }
 
 impl LocalIndex {
@@ -112,7 +127,7 @@ impl LocalIndex {
 
     pub fn get_by_path(&self, path: &str) -> Option<&FileInfo> {
         self.path_map
-            .get(path)
+            .get(&normalize_path_key(path))
             .and_then(|&idx| self.files.get(idx))
     }
 
@@ -146,24 +161,62 @@ impl LocalIndex {
 
     /// Remove a file by its `id` field (handles temporary "pending:..." ids
     /// assigned during the discovery phase before hashing completes).
+    /// Uses swap_remove + targeted index patching so cost is O(k) in the
+    /// removed file's token count, not O(n) per call.
     pub fn remove_file_by_id(&mut self, id: &str) -> Option<FileInfo> {
-        if let Some(pos) = self.files.iter().position(|f| f.id == id) {
-            let removed = self.files.remove(pos);
-            self.rebuild_indices();
-            Some(removed)
-        } else {
-            None
-        }
+        let pos = self.files.iter().position(|f| f.id == id)?;
+        Some(self.swap_remove_indexed(pos))
     }
 
     pub fn remove_file_by_path(&mut self, path: &str) -> Option<FileInfo> {
-        if let Some(pos) = self.files.iter().position(|f| f.path == path) {
-            let removed = self.files.remove(pos);
-            self.rebuild_indices();
-            Some(removed)
+        let pos = *self.path_map.get(&normalize_path_key(path))?;
+        Some(self.swap_remove_indexed(pos))
+    }
+
+    /// swap_remove the file at `pos` and incrementally patch path_map,
+    /// hash_map, and name_tokens so callers don't need a full rebuild.
+    fn swap_remove_indexed(&mut self, pos: usize) -> FileInfo {
+        let last_idx = self.files.len() - 1;
+        let moved = pos != last_idx;
+        let moved_key = if moved {
+            Some((self.files[last_idx].path.clone(),
+                  self.files[last_idx].hash.clone(),
+                  tokenize(&self.files[last_idx].name.to_lowercase())))
         } else {
             None
+        };
+
+        let removed = self.files.swap_remove(pos);
+
+        self.path_map.remove(&normalize_path_key(&removed.path));
+        if !removed.hash.is_empty() {
+            if let Some(v) = self.hash_map.get_mut(&removed.hash) {
+                v.retain(|&i| i != pos && i != last_idx);
+                if v.is_empty() {
+                    self.hash_map.remove(&removed.hash);
+                }
+            }
         }
+        for token in tokenize(&removed.name.to_lowercase()) {
+            if let Some(v) = self.name_tokens.get_mut(&token) {
+                v.retain(|&i| i != pos && i != last_idx);
+                if v.is_empty() {
+                    self.name_tokens.remove(&token);
+                }
+            }
+        }
+
+        if let Some((moved_path, moved_hash, moved_tokens)) = moved_key {
+            self.path_map.insert(normalize_path_key(&moved_path), pos);
+            if !moved_hash.is_empty() {
+                self.hash_map.entry(moved_hash).or_default().push(pos);
+            }
+            for token in moved_tokens {
+                self.name_tokens.entry(token).or_default().push(pos);
+            }
+        }
+
+        removed
     }
 
     pub fn update_alltime_stats(&mut self, hash: &str, alltime_requests: u32, alltime_accepted: u32, alltime_transferred: u64) {
@@ -222,7 +275,7 @@ impl LocalIndex {
     }
 
     pub fn set_file_priority_by_path(&mut self, path: &str, priority: &str) -> bool {
-        if let Some(&idx) = self.path_map.get(path) {
+        if let Some(&idx) = self.path_map.get(&normalize_path_key(path)) {
             if let Some(file) = self.files.get_mut(idx) {
                 file.priority = priority.to_string();
                 return true;
@@ -232,7 +285,7 @@ impl LocalIndex {
     }
 
     pub fn set_file_shared_by_path(&mut self, path: &str, shared: bool) -> bool {
-        if let Some(&idx) = self.path_map.get(path) {
+        if let Some(&idx) = self.path_map.get(&normalize_path_key(path)) {
             if let Some(file) = self.files.get_mut(idx) {
                 file.shared = shared;
                 return true;
@@ -269,7 +322,7 @@ impl LocalIndex {
         self.hash_map.clear();
         self.name_tokens.clear();
         for (idx, file) in self.files.iter().enumerate() {
-            self.path_map.insert(file.path.clone(), idx);
+            self.path_map.insert(normalize_path_key(&file.path), idx);
             if !file.hash.is_empty() {
                 self.hash_map
                     .entry(file.hash.clone())

@@ -43,23 +43,39 @@
     const gen = listenerGen;
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenError) { unlistenError(); unlistenError = null; }
-    const fn = await listen<{ user_hash: string; files: BrowseFileEntry[] }>('ember:browse-result', (event) => {
-      if (event.payload.user_hash === friendHash) {
-        clearTimeout(browseTimeout);
-        files = event.payload.files;
-        loading = false;
-      }
-    });
+    let fn: UnlistenFn;
+    try {
+      fn = await listen<{ user_hash: string; files: BrowseFileEntry[] }>('ember:browse-result', (event) => {
+        if (event.payload.user_hash === friendHash) {
+          clearTimeout(browseTimeout);
+          // Defensive: treat missing/invalid `files` as empty rather than
+          // crashing the dialog if the backend ever emits a malformed payload.
+          files = Array.isArray(event.payload.files) ? event.payload.files : [];
+          loading = false;
+        }
+      });
+    } catch (e) {
+      console.warn('BrowseFriendDialog: failed to register browse-result listener', e);
+      error = 'Could not listen for browse results. Try re-opening the dialog.';
+      loading = false;
+      return;
+    }
     if (gen !== listenerGen) { fn(); return; }
     unlisten = fn;
 
-    const errFn = await listen<{ user_hash: string; reason: string }>('ember:browse-error', (event) => {
-      if (event.payload.user_hash === friendHash && loading) {
-        clearTimeout(browseTimeout);
-        error = event.payload.reason || 'Browse failed — friend went offline.';
-        loading = false;
-      }
-    });
+    let errFn: UnlistenFn;
+    try {
+      errFn = await listen<{ user_hash: string; reason: string }>('ember:browse-error', (event) => {
+        if (event.payload.user_hash === friendHash && loading) {
+          clearTimeout(browseTimeout);
+          error = event.payload.reason || 'Browse failed — friend went offline.';
+          loading = false;
+        }
+      });
+    } catch (e) {
+      console.warn('BrowseFriendDialog: failed to register browse-error listener', e);
+      return;
+    }
     if (gen !== listenerGen) { errFn(); return; }
     unlistenError = errFn;
   }

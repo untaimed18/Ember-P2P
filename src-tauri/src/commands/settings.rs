@@ -18,9 +18,43 @@ pub async fn get_settings(
     Ok(config.settings.clone())
 }
 
+/// Upper bounds for IPC inputs. These exist to prevent a malicious/buggy
+/// frontend from pushing multi-megabyte blobs through the Tauri bridge, which
+/// would bloat `config.json`, block the async runtime on serialize, and
+/// potentially exhaust memory. Values are deliberately generous vs. normal use.
+const MAX_PATH_LEN: usize = 4 * 1024;
+const MAX_SHARED_FOLDERS: usize = 512;
+const MAX_URL_LEN: usize = 2 * 1024;
+const MAX_FILENAME_CLEANUPS_LEN: usize = 16 * 1024;
+
 fn validate_settings(settings: &AppSettings) -> Result<(), String> {
     if settings.spam_filter_profile != "relaxed" && settings.spam_filter_profile != "balanced" && settings.spam_filter_profile != "aggressive" {
         return Err("Spam filter profile must be 'relaxed', 'balanced', or 'aggressive'".into());
+    }
+    if settings.download_folder.len() > MAX_PATH_LEN {
+        return Err(format!("Download folder path exceeds {MAX_PATH_LEN} bytes"));
+    }
+    if settings.shared_folders.len() > MAX_SHARED_FOLDERS {
+        return Err(format!("Too many shared folders (max {MAX_SHARED_FOLDERS})"));
+    }
+    for folder in &settings.shared_folders {
+        if folder.len() > MAX_PATH_LEN {
+            return Err(format!("Shared folder path exceeds {MAX_PATH_LEN} bytes"));
+        }
+    }
+    if settings.rendezvous_url.len() > MAX_URL_LEN {
+        return Err(format!("Rendezvous URL exceeds {MAX_URL_LEN} bytes"));
+    }
+    if settings.nodes_dat_path.len() > MAX_PATH_LEN {
+        return Err(format!("nodes.dat path exceeds {MAX_PATH_LEN} bytes"));
+    }
+    if settings.server_list_path.len() > MAX_PATH_LEN {
+        return Err(format!("server.met path exceeds {MAX_PATH_LEN} bytes"));
+    }
+    if settings.filename_cleanups.len() > MAX_FILENAME_CLEANUPS_LEN {
+        return Err(format!(
+            "filename_cleanups exceeds {MAX_FILENAME_CLEANUPS_LEN} bytes"
+        ));
     }
     if settings.tcp_port == 0 {
         return Err("TCP port must be between 1 and 65535".into());
@@ -230,22 +264,41 @@ pub async fn download_nodes_dat(
         .map_err(|e| format!("Failed to create data dir: {e}"))?;
 
     let nodes_path = data_dir.join("nodes.dat");
-    let tmp_path = data_dir.join("nodes.dat.tmp");
-    tokio::fs::write(&tmp_path, &bytes)
-        .await
-        .map_err(|e| format!("Failed to write nodes.dat: {e}"))?;
-
-    let contacts = match bootstrap::load_nodes_dat(&tmp_path) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(format!("Downloaded file is corrupt: {e}"));
+    // Parse-validate the buffer in-memory first so we never leave a half-written
+    // temp file on disk and so the atomic_write path is also the last write.
+    let validation_bytes = bytes.clone();
+    let contacts = {
+        let scratch = data_dir.join(format!(".nodes.dat.validate.{}.{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)));
+        let scratch_w = scratch.clone();
+        tokio::fs::write(&scratch_w, &validation_bytes)
+            .await
+            .map_err(|e| format!("Failed to write nodes.dat scratch: {e}"))?;
+        let scratch_r = scratch.clone();
+        let parsed = tokio::task::spawn_blocking(move || bootstrap::load_nodes_dat(&scratch_r))
+            .await
+            .map_err(|e| format!("Validation task failed: {e}"))?;
+        let _ = tokio::fs::remove_file(&scratch).await;
+        match parsed {
+            Ok(c) => c,
+            Err(e) => return Err(format!("Downloaded file is corrupt: {e}")),
         }
     };
 
-    tokio::fs::rename(&tmp_path, &nodes_path)
+    {
+        let nodes_path_w = nodes_path.clone();
+        let write_bytes = bytes.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::security::atomic_write(&nodes_path_w, &write_bytes, false)
+        })
         .await
+        .map_err(|e| format!("Save task failed: {e}"))?
         .map_err(|e| format!("Failed to finalize nodes.dat: {e}"))?;
+    }
 
     let contact_count = contacts.len();
     let byte_count = bytes.len();
@@ -307,14 +360,16 @@ pub async fn download_ipfilter(
         .map_err(|e| format!("Failed to create data dir: {e}"))?;
 
     let filter_path = data_dir.join("ipfilter.dat");
-    let tmp_filter_path = data_dir.join("ipfilter.dat.tmp");
-    tokio::fs::write(&tmp_filter_path, &bytes)
+    {
+        let filter_path_w = filter_path.clone();
+        let write_bytes = bytes.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::security::atomic_write(&filter_path_w, &write_bytes, false)
+        })
         .await
-        .map_err(|e| format!("Failed to write ipfilter.dat: {e}"))?;
-
-    tokio::fs::rename(&tmp_filter_path, &filter_path)
-        .await
+        .map_err(|e| format!("Save task failed: {e}"))?
         .map_err(|e| format!("Failed to finalize ipfilter.dat: {e}"))?;
+    }
 
     let byte_count = bytes.len();
     let line_count = bytes.iter().filter(|&&b| b == b'\n').count();

@@ -85,10 +85,7 @@ impl AppConfig {
 
         if config_changed {
             let data = serde_json::to_string_pretty(&settings)?;
-            let tmp = config_path.with_extension("json.tmp");
-            std::fs::write(&tmp, &data)?;
-            crate::security::restrict_file_permissions(&tmp);
-            std::fs::rename(&tmp, &config_path)?;
+            crate::security::atomic_write(&config_path, data.as_bytes(), true)?;
         }
 
         info!("Config loaded from {}", config_path.display());
@@ -100,17 +97,18 @@ impl AppConfig {
 
     /// Serialize settings to JSON and return the data + path for async writing.
     /// This lets the caller drop the RwLock before doing file I/O.
+    /// The tmp path is a placeholder for back-compat; the actual temp path is
+    /// generated uniquely per write inside `write_to_disk`.
     pub fn prepare_save(&self) -> anyhow::Result<(String, std::path::PathBuf, std::path::PathBuf)> {
         let data = serde_json::to_string_pretty(&self.settings)?;
-        let tmp_path = self.config_path.with_extension(format!("json.{}.tmp", std::process::id()));
-        Ok((data, tmp_path, self.config_path.clone()))
+        Ok((data, self.config_path.clone(), self.config_path.clone()))
     }
 
     /// Blocking file write -- call this OUTSIDE of the RwLock.
-    pub fn write_to_disk(data: &str, tmp_path: &std::path::Path, final_path: &std::path::Path) -> anyhow::Result<()> {
-        std::fs::write(tmp_path, data)?;
-        crate::security::restrict_file_permissions(tmp_path);
-        std::fs::rename(tmp_path, final_path)?;
+    /// `_tmp_path` is retained for back-compat but ignored; `atomic_write`
+    /// generates a unique temp path internally.
+    pub fn write_to_disk(data: &str, _tmp_path: &std::path::Path, final_path: &std::path::Path) -> anyhow::Result<()> {
+        crate::security::atomic_write(final_path, data.as_bytes(), true)?;
         info!("Config saved");
         Ok(())
     }

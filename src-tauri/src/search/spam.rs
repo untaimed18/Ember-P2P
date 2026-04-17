@@ -142,20 +142,12 @@ impl SpamFilter {
             Ok(d) => d,
             Err(e) => { warn!("Failed to serialize spam filter: {e}"); return; }
         };
-        let tmp = self.data_path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, &data) {
-            warn!("Failed to write spam filter temp file: {e}");
-            return;
-        }
-        match std::fs::rename(&tmp, &self.data_path) {
+        match crate::security::atomic_write(&self.data_path, data.as_bytes(), false) {
             Ok(()) => {
                 self.dirty = false;
                 debug!("Spam filter saved");
             }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                warn!("Failed to save spam filter: {e}");
-            }
+            Err(e) => warn!("Failed to save spam filter: {e}"),
         }
     }
 

@@ -179,12 +179,32 @@ impl Database {
         }
 
         if version < 8 {
+            // v8 replaces shared_files/settings with file-based storage
+            // (known.met + config.json). Preserve the legacy rows in
+            // _backup tables instead of dropping outright so users upgrading
+            // from v<8 aren't silently wiped — a subsequent admin/dev can
+            // recover or export them if needed. These back-up tables are
+            // never queried by the live app.
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(
-                "DROP TABLE IF EXISTS shared_files;
-                 DROP TABLE IF EXISTS settings;
+                "DROP TABLE IF EXISTS shared_files_v7_backup;
+                 DROP TABLE IF EXISTS settings_v7_backup;
                  DROP INDEX IF EXISTS idx_shared_files_hash;",
             )?;
+            let has_shared: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='shared_files'",
+                [], |r| r.get(0),
+            ).unwrap_or(0);
+            if has_shared > 0 {
+                tx.execute_batch("ALTER TABLE shared_files RENAME TO shared_files_v7_backup;")?;
+            }
+            let has_settings: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='settings'",
+                [], |r| r.get(0),
+            ).unwrap_or(0);
+            if has_settings > 0 {
+                tx.execute_batch("ALTER TABLE settings RENAME TO settings_v7_backup;")?;
+            }
             set_version(&tx, 8)?;
             tx.commit()?;
         }

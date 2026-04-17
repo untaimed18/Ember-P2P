@@ -336,18 +336,14 @@ pub async fn mark_spam(
         spam.take_save_data()
     };
     if let Some((data, path)) = save_data {
-        let tmp = path.with_extension("json.tmp");
         let ok = tokio::task::spawn_blocking(move || {
-            if let Err(e) = std::fs::write(&tmp, &data) {
-                tracing::warn!("Failed to write spam filter temp file: {e}");
-                return false;
+            match crate::security::atomic_write(&path, data.as_bytes(), false) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("Failed to save spam filter: {e}");
+                    false
+                }
             }
-            if let Err(e) = std::fs::rename(&tmp, &path) {
-                let _ = std::fs::remove_file(&tmp);
-                tracing::warn!("Failed to save spam filter: {e}");
-                return false;
-            }
-            true
         }).await.unwrap_or(false);
         if ok {
             state.spam_filter.write().await.clear_dirty();
@@ -370,18 +366,14 @@ pub async fn mark_not_spam(
         spam.take_save_data()
     };
     if let Some((data, path)) = save_data {
-        let tmp = path.with_extension("json.tmp");
         let ok = tokio::task::spawn_blocking(move || {
-            if let Err(e) = std::fs::write(&tmp, &data) {
-                tracing::warn!("Failed to write spam filter temp file: {e}");
-                return false;
+            match crate::security::atomic_write(&path, data.as_bytes(), false) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("Failed to save spam filter: {e}");
+                    false
+                }
             }
-            if let Err(e) = std::fs::rename(&tmp, &path) {
-                let _ = std::fs::remove_file(&tmp);
-                tracing::warn!("Failed to save spam filter: {e}");
-                return false;
-            }
-            true
         }).await.unwrap_or(false);
         if ok {
             state.spam_filter.write().await.clear_dirty();

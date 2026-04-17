@@ -13,6 +13,8 @@
     newSearchNonce,
     openSearchTab,
     patchSearchTabByRequestId,
+    attachRetryRequestId,
+    clearRetryRequestId,
     searchTabs,
     setActiveSearchTab,
     type SearchTab,
@@ -448,11 +450,14 @@
     if (!tabQuery.trim()) return;
     serverRetryPending = true;
     // Keep the tab's canonical requestId unchanged so late streaming events
-    // for the original search still land in the correct tab. The retry
-    // request runs under its own nonce and we merge its final payload by
-    // looking up the tab by id rather than by request id.
+    // for the original search still land in the correct tab. The retry runs
+    // under its own nonce; we attach it as the tab's secondary request id so
+    // search-results / search-progress / search-complete events for the retry
+    // merge into this tab live, and the backend's cancel path still works if
+    // the user closes the tab mid-retry.
+    const retryRequestId = newSearchNonce();
+    attachRetryRequestId(tabId, retryRequestId);
     try {
-      const retryRequestId = newSearchNonce();
       const results = await Promise.race([
         searchFiles(tabQuery, 'server', retryRequestId, activeTab.fileType || undefined, activeTab.filters),
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Server retry timed out after 60 seconds')), 60_000)),
@@ -471,6 +476,7 @@
       const msg = e instanceof Error ? e.message : 'Retry failed';
       addToast('error', msg);
     } finally {
+      clearRetryRequestId(tabId);
       serverRetryPending = false;
     }
   }
