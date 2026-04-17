@@ -1792,7 +1792,7 @@ async fn download_parts_from_source(
         }
         if let std::net::IpAddr::V4(v4) = addr.ip() {
             let peer_tcp = addr.port();
-            if peer_tcp > 0 && !v4.is_private() && !v4.is_loopback() && !v4.is_link_local() {
+            if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
                 if let Some(ref etx) = event_tx {
                     let _ = etx.send(DownloadEvent::EmberPeerDiscovered {
                         ip: v4,

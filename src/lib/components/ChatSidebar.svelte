@@ -12,6 +12,15 @@
 
   let { open = $bindable(), friendHash, friendName, onclose }: Props = $props();
 
+  /**
+   * Hard cap on in-memory chat messages per conversation. Old messages beyond
+   * this are trimmed from the front of the array; they remain in the database
+   * and can be re-fetched by reopening the conversation. Without the cap a
+   * long-running session (or a friend spamming the channel) causes unbounded
+   * memory growth.
+   */
+  const MAX_LIVE_MESSAGES = 500;
+
   let messages: ChatMessage[] = $state([]);
   let inputText = $state('');
   let loading = $state(false);
@@ -60,13 +69,16 @@
       fn = await listen<{ user_hash: string; message: string; direction: string; timestamp: number }>('ember:chat-message', (event) => {
         if (gen !== loadGen) return;
         if (event.payload.user_hash === friendHash) {
-          messages = [...messages, {
+          const next = [...messages, {
             id: --msgIdCounter,
             direction: event.payload.direction as 'sent' | 'received',
             message: event.payload.message,
             timestamp: event.payload.timestamp,
             read: true,
           }];
+          messages = next.length > MAX_LIVE_MESSAGES
+            ? next.slice(next.length - MAX_LIVE_MESSAGES)
+            : next;
           scrollToBottom();
           if (event.payload.direction === 'received') {
             markAsRead();

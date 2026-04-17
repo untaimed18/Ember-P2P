@@ -785,22 +785,41 @@ pub async fn start_upload_server(
                         };
 
                         if server.filter_incoming_connections {
-                            if let Ok(snap) = server.shared_ip_filter.read() {
-                                if snap.is_blocked(peer_ipv4) {
-                                    info!("IP filter blocked incoming TCP from {peer_addr}");
-                                    drop(stream);
-                                    continue;
+                            // Fail closed on poisoned lock: if we can't read
+                            // the filter snapshot we refuse the connection
+                            // rather than silently letting potentially-blocked
+                            // peers through.
+                            let blocked = match server.shared_ip_filter.read() {
+                                Ok(snap) => snap.is_blocked(peer_ipv4),
+                                Err(_poisoned) => {
+                                    tracing::warn!(
+                                        "IP filter lock poisoned while checking {peer_addr}; rejecting connection"
+                                    );
+                                    true
                                 }
-                            }
-                        }
-
-                        // Ban check: reject connections from banned IPs or auto-banned abusers
-                        if let Ok(banned) = server.banned_ips.read() {
-                            if banned.contains(&peer_ipv4) {
-                                debug!("Rejecting TCP connection from banned IP {peer_addr}");
+                            };
+                            if blocked {
+                                info!("IP filter blocked incoming TCP from {peer_addr}");
                                 drop(stream);
                                 continue;
                             }
+                        }
+
+                        // Ban check: reject connections from banned IPs or auto-banned abusers.
+                        // Same fail-closed policy: a poisoned lock rejects.
+                        let banned_check = match server.banned_ips.read() {
+                            Ok(banned) => banned.contains(&peer_ipv4),
+                            Err(_poisoned) => {
+                                tracing::warn!(
+                                    "Banned-IP lock poisoned while checking {peer_addr}; rejecting connection"
+                                );
+                                true
+                            }
+                        };
+                        if banned_check {
+                            debug!("Rejecting TCP connection from banned IP {peer_addr}");
+                            drop(stream);
+                            continue;
                         }
                         {
                             let tracker = server.abuse_tracker.lock().await;
@@ -1570,7 +1589,7 @@ impl UploadHandler {
                 info!("EPX payload empty, skipping EPX send to {peer_addr}");
             }
             if let std::net::IpAddr::V4(v4) = peer_addr.ip() {
-                if hello_caps.tcp_port > 0 && !v4.is_private() && !v4.is_loopback() && !v4.is_link_local() {
+                if hello_caps.tcp_port > 0 && !crate::security::is_special_use_v4(v4) {
                     let _ = self.upload_event_tx.send(UploadEvent {
                         transfer_id: String::new(),
                         kind: UploadEventKind::EmberPeerDiscovered {

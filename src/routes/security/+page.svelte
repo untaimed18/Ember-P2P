@@ -78,20 +78,26 @@
     });
   });
 
+  let unmounted = false;
+
   onMount(() => {
     loadStats();
-    return () => { clearTimeout(flashTimer); };
+    return () => { unmounted = true; clearTimeout(flashTimer); };
   });
 
   async function loadStats() {
+    if (unmounted) return;
     loading = true;
     error = null;
     try {
-      stats = await getIpFilterStats();
+      const result = await getIpFilterStats();
+      if (unmounted) return;
+      stats = result;
     } catch (e: unknown) {
+      if (unmounted) return;
       error = toErrorMsg(e);
     } finally {
-      loading = false;
+      if (!unmounted) loading = false;
     }
   }
 

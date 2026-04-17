@@ -26,10 +26,15 @@ const READ_TIMEOUT_SECS: u64 = super::dead_sources::DOWNLOADTIMEOUT_SECS as u64;
 /// Maximum decompressed part size (PARTSIZE + margin = 10 MiB)
 const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
 
-/// Returns `true` if the IP should be rejected as a source exchange result
-/// (unspecified, loopback, RFC-1918 private, or link-local).
+/// Returns `true` if the IP should be rejected as a source exchange result.
+///
+/// Delegates to `security::is_special_use_v4` so every parser path that
+/// accepts IPs from the wire (OP_ANSWERSOURCES, SX, EPX injection) uses the
+/// same predicate — RFC-1918, loopback, link-local, broadcast, CGNAT (RFC
+/// 6598 100.64/10), documentation (TEST-NET-1/2/3), and benchmarking
+/// (198.18/15) ranges.
 pub(super) fn is_filtered_source_ip(ip: &std::net::Ipv4Addr) -> bool {
-    ip.is_unspecified() || ip.is_loopback() || ip.is_private() || ip.is_link_local()
+    crate::security::is_special_use_v4(*ip)
 }
 
 /// Convert parsed EPX result into the flattened vectors used by DownloadEvent.
@@ -941,7 +946,7 @@ impl Ed2kDownload {
             }
             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                 let peer_tcp = self.source_addr.port();
-                if peer_tcp > 0 && !v4.is_private() && !v4.is_loopback() && !v4.is_link_local() {
+                if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
                     let _ = event_tx.send(DownloadEvent::EmberPeerDiscovered {
                         ip: v4,
                         tcp_port: peer_tcp,
