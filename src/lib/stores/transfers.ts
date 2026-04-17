@@ -205,7 +205,20 @@ export async function initTransferStore() {
           // D30: never flip a row already in a terminal state (e.g. late
           // `transfer-complete` after a `transfer-failed`).
           if (isTerminal(t.status) && t.status !== 'completed') return t;
-          return { ...t, status: 'completed' as const, progress: 100, speed: 0, transferred: t.total_size, completed_size: t.total_size };
+          // Preserve the actual byte counters. A `transfer-complete` from
+          // the uploader side means "this upload *session* ended
+          // successfully from our POV" (peer said OP_END_OF_DOWNLOAD, or
+          // the session rotated out at SESSIONMAXTRANS, or we hit the
+          // queue-preempt path) — it does NOT mean we pushed the entire
+          // file. eMule sessions routinely top out well short of
+          // `total_size`. The old snap to `transferred: t.total_size,
+          // completed_size: t.total_size, progress: 100` produced
+          // "586 MB / 586 MB Complete" rows for sessions that only
+          // served a couple hundred megabytes before the peer
+          // disconnected, hiding real transfer problems behind a
+          // misleading success line. Trust whatever `transferred` the
+          // backend last reported via `transfer-progress`.
+          return { ...t, status: 'completed' as const, speed: 0 };
         })
       );
     }),

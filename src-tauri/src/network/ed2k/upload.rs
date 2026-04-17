@@ -2241,6 +2241,32 @@ impl UploadHandler {
                         current_file_hash = Some(hash);
                     }
 
+                    // Duplicate OP_STARTUPLOADREQ on an already-granted session.
+                    // eMule/Ember peers occasionally re-send STARTUPLOADREQ after
+                    // they've already received OP_ACCEPTUPLOADREQ — e.g. in
+                    // response to an unexpected QUEUERANKING, or as a soft
+                    // retry during an early handshake race. The handler below
+                    // unconditionally runs `slot_guard.activate()`, resets
+                    // `uploaded = 0`, mints a fresh `transfer_id`, and fires a
+                    // new `Started` event. That orphans the original
+                    // transfer_id (the UI row never receives a terminal
+                    // event), doubles up the row in the transfers window,
+                    // and — combined with the OP_CANCELTRANSFER /
+                    // OP_END_OF_DOWNLOAD path below — makes the stranded
+                    // first row snap to "Complete" with the full file size
+                    // even though zero bytes went out on it. Re-ack and keep
+                    // the existing session intact instead.
+                    if slot_guard.is_active() && transfer_id.is_some() {
+                        write_packet_async(
+                            &mut writer,
+                            OP_EDONKEYHEADER,
+                            OP_ACCEPTUPLOADREQ,
+                            &[],
+                        )
+                        .await?;
+                        continue;
+                    }
+
                     if let Some(h) = current_file_hash {
                         if self.resolve_upload_file(&h).await.is_some() {
                             self.record_share_request_once(&h, &mut recorded_share_request)
@@ -2945,9 +2971,30 @@ impl UploadHandler {
                 (OP_EDONKEYHEADER, OP_CANCELTRANSFER) | (OP_EDONKEYHEADER, OP_END_OF_DOWNLOAD) => {
                     debug!("Peer {peer_addr} cancelled/ended transfer");
                     if let Some(tid) = &transfer_id {
+                        // Mirror the connection-exit cleanup at the bottom of
+                        // this function: only report a session as Completed
+                        // when at least one byte actually went out. A peer
+                        // that tears down a freshly-granted slot before we
+                        // got a chance to serve anything (e.g. they saw an
+                        // unexpected OP_QUEUERANKING echo and decided to
+                        // bail, or their downloader's initial part_queue
+                        // was empty so it went straight to
+                        // OP_END_OF_DOWNLOAD) previously surfaced in the
+                        // UI as "Complete, 586 MB transferred" because the
+                        // front-end snaps `transferred` to `total_size` on
+                        // every `transfer-complete`. Emit Failed instead so
+                        // the zero-byte row is visibly distinguishable from
+                        // a real upload.
+                        let kind = if uploaded > 0 {
+                            UploadEventKind::Completed
+                        } else {
+                            UploadEventKind::Failed {
+                                error: "Peer ended transfer before any data was sent".to_string(),
+                            }
+                        };
                         let _ = self.upload_event_tx.send(UploadEvent {
                             transfer_id: tid.clone(),
-                            kind: UploadEventKind::Completed,
+                            kind,
                         }).await;
                     }
                     slot_guard.deactivate();
