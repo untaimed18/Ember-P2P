@@ -982,4 +982,50 @@ mod tests {
 
         let _ = std::fs::remove_file(part_path.with_extension("part.met"));
     }
+
+    /// `OP_FILESTATUS` advertising must match the serve gate: every
+    /// advertised part must pass `is_range_safe_to_serve` for the whole
+    /// part. Previously the bitmap used `is_part_complete` alone, so a
+    /// part that was fully received but not yet MD4-verified would be
+    /// advertised as available, then every peer block request for it
+    /// was silently rejected at the serve gate — producing the "upload
+    /// appears frozen" UX. This test pins the invariant
+    ///   advertise = (is_part_complete && is_part_verified)  => safe to serve
+    /// for all the states a part tracker can be in mid-download.
+    #[test]
+    fn advertised_parts_are_always_safe_to_serve() {
+        let part_path = temp_part_path("advertise-gate");
+        // Three parts: part 0 = complete+verified, part 1 =
+        // complete-but-unverified, part 2 = still has a gap.
+        let file_size = PARTSIZE * 3;
+        let mut tracker = PartTracker::new(file_size, &part_path);
+
+        // Part 0: fill + mark verified.
+        tracker.fill_range(0, PARTSIZE);
+        tracker.set_part_verified(0);
+        // Part 1: fill but do NOT verify.
+        tracker.fill_range(PARTSIZE, 2 * PARTSIZE);
+        // Part 2: only partially fill.
+        tracker.fill_range(2 * PARTSIZE, 2 * PARTSIZE + 100);
+
+        // Advertise predicate (what OP_FILESTATUS uses post-fix).
+        let advertised = |p: usize| tracker.is_part_complete(p) && tracker.is_part_verified(p);
+        assert!(advertised(0), "verified+complete part must advertise");
+        assert!(!advertised(1), "complete-but-unverified part must NOT advertise");
+        assert!(!advertised(2), "incomplete part must NOT advertise");
+
+        // Serve gate: every advertised part must be safe for its
+        // entire byte range. This is what the invariant hinges on.
+        for p in 0..3 {
+            let (start, end) = tracker.part_range(p);
+            if advertised(p) {
+                assert!(
+                    tracker.is_range_safe_to_serve(start, end),
+                    "advertised part {p} must be safe to serve [{start}, {end})"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
 }
