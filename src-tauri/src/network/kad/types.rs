@@ -647,28 +647,43 @@ impl KadTag {
             TagValue::Blob(_) => TAGTYPE_BLOB,
         };
 
-        match &self.name {
-            TagName::Id(id) => {
-                writer.write_u8(type_byte | 0x80)?;
-                writer.write_u8(*id)?;
-            }
-            TagName::Str(s) => {
-                // K23: the previous behaviour silently truncated tag
-                // names longer than 65535 bytes. That produces a packet
-                // that the peer will parse as a different tag (or throw
-                // an InvalidData error) — a subtle interop / integrity
-                // bug that's better surfaced as an error at the source.
-                writer.write_u8(type_byte)?;
-                let name_len = u16::try_from(s.len()).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("tag name exceeds u16::MAX bytes ({})", s.len()),
-                    )
-                })?;
-                writer.write_u16::<LittleEndian>(name_len)?;
-                writer.write_all(s.as_bytes())?;
-            }
-        }
+        // eMule `CDataIO::WriteTag` (kademlia/io/DataIO.cpp:300-304):
+        //   WriteByte(uType);              // 1-byte type, no bit-7 flag
+        //   WriteUInt16(name.length);      // always a u16 length prefix
+        //   WriteArray(name, length);      // name bytes (1 byte for IDs)
+        //
+        // There is NO short-form in the KAD tag format — that
+        // `type | 0x80` optimisation only exists in the ed2k client-
+        // tag serialiser (see `CTag::WriteTagToFile`). The previous
+        // write path emitted `[type|0x80, id]` for every `TagName::Id`
+        // in a `PublishSourceReq`/`PublishKeyReq`/etc. eMule's
+        // `ReadTag` reads that first byte as an unknown type, then
+        // consumes *two more bytes* trying to read `uLenName`, which
+        // desyncs the reader. The result is a thrown IOException that
+        // eMule silently swallows at the packet level, so our publish
+        // request is dropped and no `PublishRes` is ever sent back —
+        // exactly the `plain_seen=0, obf_decoded=0/421, wire=0` pattern
+        // observed in the diagnostics. Source searches weren't
+        // affected because `SearchSourceReq` carries no tags.
+        //
+        // K23: the previous behaviour also silently truncated tag
+        // names longer than 65535 bytes. That produces a packet the
+        // peer parses as a different tag (or an InvalidData error) —
+        // a subtle interop / integrity bug that's better surfaced as
+        // an error at the source.
+        writer.write_u8(type_byte)?;
+        let name_bytes: &[u8] = match &self.name {
+            TagName::Id(id) => std::slice::from_ref(id),
+            TagName::Str(s) => s.as_bytes(),
+        };
+        let name_len = u16::try_from(name_bytes.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("tag name exceeds u16::MAX bytes ({})", name_bytes.len()),
+            )
+        })?;
+        writer.write_u16::<LittleEndian>(name_len)?;
+        writer.write_all(name_bytes)?;
 
         match &self.value {
             TagValue::Hash(h) => writer.write_all(h)?,
@@ -777,6 +792,72 @@ pub fn write_tag_list<W: Write>(writer: &mut W, tags: &[KadTag]) -> io::Result<(
         tag.write_to(writer)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod kad_tag_wire_layout_tests {
+    use super::*;
+
+    /// Pins the exact bytes we emit for a `TagName::Id` KAD tag.
+    /// eMule `CDataIO::WriteTag` (kademlia/io/DataIO.cpp:300-304) writes
+    ///   [type, uint16_le(name_len), name_bytes..., value...]
+    /// with *no* bit-7 short form. The earlier `type | 0x80` encoding
+    /// caused every PublishSourceReq/PublishKeyReq to be dropped by
+    /// peers — this test fails loudly if anyone reintroduces it.
+    #[test]
+    fn write_id_tag_uses_emule_long_form_not_short_form() {
+        // TAG_SOURCEPORT (0xFD) as a u16 value 40615 (= 0x9EA7).
+        let tag = KadTag {
+            name: TagName::Id(TAG_SOURCEPORT),
+            value: TagValue::Uint16(40615),
+        };
+        let mut buf = Vec::new();
+        tag.write_to(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            vec![
+                TAGTYPE_UINT16, // 0x03 — no 0x80 bit
+                0x01, 0x00,     // u16 LE name length = 1
+                TAG_SOURCEPORT, // 0xFD
+                0xA7, 0x9E,     // 40615 LE
+            ],
+            "KAD tag wire format must match eMule's CDataIO::WriteTag exactly"
+        );
+    }
+
+    /// Round-trip a realistic PublishSourceReq tag bundle and verify
+    /// that what we write is parseable byte-for-byte using our own
+    /// reader (which defensively accepts both formats). The point is
+    /// to make sure the fix doesn't accidentally regress the reader.
+    #[test]
+    fn publish_source_tag_bundle_roundtrips() {
+        let tags = vec![
+            KadTag { name: TagName::Id(TAG_SOURCEPORT), value: TagValue::Uint16(4662) },
+            KadTag { name: TagName::Id(TAG_SOURCEUPORT), value: TagValue::Uint16(4672) },
+            KadTag { name: TagName::Id(TAG_SOURCETYPE), value: TagValue::Uint8(1) },
+            KadTag { name: TagName::Id(TAG_FILESIZE), value: TagValue::Uint64(1_234_567_890) },
+            KadTag { name: TagName::Id(TAG_ENCRYPTION), value: TagValue::Uint8(0x0C) },
+        ];
+        let mut buf = Vec::new();
+        write_tag_list(&mut buf, &tags).unwrap();
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let parsed = read_tag_list(&mut cursor).unwrap();
+        assert_eq!(parsed.len(), tags.len());
+
+        // Pin each (name, value) pair rather than relying on
+        // derive(PartialEq) we don't have.
+        for (a, b) in parsed.iter().zip(tags.iter()) {
+            let a_id = match &a.name { TagName::Id(x) => *x, _ => panic!("not an Id name") };
+            let b_id = match &b.name { TagName::Id(x) => *x, _ => panic!("not an Id name") };
+            assert_eq!(a_id, b_id, "tag name id mismatch");
+        }
+        assert_eq!(parsed[0].uint16_value(), Some(4662));
+        assert_eq!(parsed[1].uint16_value(), Some(4672));
+        assert_eq!(parsed[2].uint8_value(), Some(1));
+        assert_eq!(parsed[3].uint64_value(), Some(1_234_567_890));
+        assert_eq!(parsed[4].uint8_value(), Some(0x0C));
+    }
 }
 
 #[cfg(test)]
