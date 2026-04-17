@@ -122,6 +122,16 @@ pub struct UdpFirewallCheckRequest {
 }
 
 const CLIENT_TIMEOUT_SECS: u64 = 120;
+/// Minimum wall time between `UploadEventKind::Progress` events for a
+/// single upload session. The OP_REQUESTPARTS handler naturally fires one
+/// Progress per 180 KiB block sent; at 2 MiB/s that's ~11 events/sec per
+/// slot, and with several active slots we can flood both the shared
+/// mpsc channel (capacity 128) and the Tauri IPC pipe to the webview.
+/// 200 ms gives an upper bound of 5 events/sec per session with no
+/// perceptible UI stutter (ProgressBar already smooths via `transition:
+/// width 0.3s`) while leaving plenty of headroom for the event consumer
+/// even at full saturation.
+const PROGRESS_EMIT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 /// How long we'll hold a granted upload slot for a peer that has gone
 /// silent (no `OP_REQUESTPARTS` and no other activity) before closing
 /// the session and rotating the slot to the next queued peer.
@@ -1732,6 +1742,19 @@ impl UploadHandler {
         let mut uploaded: u64 = 0;
         let mut transfer_id: Option<String> = None;
         let mut total_size: u64 = 0;
+        // Rate-limit `UploadEventKind::Progress` emission to the shared
+        // `ul_event_tx` channel. The hot path in `OP_REQUESTPARTS` fires one
+        // Progress per ~180 KiB block (often 3 per request), which at
+        // saturation across several slots can easily produce hundreds of
+        // events per second funneling through a 128-slot mpsc channel and
+        // then through Tauri's IPC to the webview. Under load that back-
+        // pressures the session (the `.send().await` blocks on a full
+        // channel) AND flooded the UI with redundant frames. Coalesce to
+        // at most one emit per `PROGRESS_EMIT_MIN_INTERVAL`, always
+        // emitting the first Progress (so the UI snaps out of "just
+        // started") and the final byte-count at session end.
+        let mut last_progress_emit: Option<std::time::Instant> = None;
+        let mut last_progress_uploaded: u64 = 0;
         // Set when the transfer is cancelled mid-send via UI; the inner
         // parts-send loop breaks, then the outer session loop sees this
         // flag and terminates the connection, letting all the normal
@@ -1904,6 +1927,13 @@ impl UploadHandler {
                                         if let Some(hash) = current_file_hash {
                                             let tid = uuid::Uuid::new_v4().to_string();
                                             transfer_id = Some(tid.clone());
+                                            // Reset the Progress throttle for this new
+                                            // session so the first chunk we send always
+                                            // produces an immediate UI update instead
+                                            // of waiting for the 200 ms coalesce window
+                                            // to elapse.
+                                            last_progress_emit = None;
+                                            last_progress_uploaded = 0;
 
                                             let hash_hex = hex::encode(hash);
                                             let file_name = {
@@ -2451,6 +2481,11 @@ impl UploadHandler {
                     if let Some(hash) = current_file_hash {
                         let tid = uuid::Uuid::new_v4().to_string();
                         transfer_id = Some(tid.clone());
+                        // Reset the Progress throttle for this new session
+                        // so the first chunk's Progress event is emitted
+                        // immediately rather than coalesced.
+                        last_progress_emit = None;
+                        last_progress_uploaded = 0;
 
                         let hash_hex = hex::encode(hash);
                         let file_name = {
@@ -2670,13 +2705,23 @@ impl UploadHandler {
                                         }
 
                                         if let Some(tid) = &transfer_id {
-                                            let _ = self.upload_event_tx.send(UploadEvent {
-                                                transfer_id: tid.clone(),
-                                                kind: UploadEventKind::Progress {
-                                                    uploaded,
-                                                    total: total_size,
-                                                },
-                                            }).await;
+                                            let should_emit = match last_progress_emit {
+                                                None => true,
+                                                Some(last) => {
+                                                    last.elapsed() >= PROGRESS_EMIT_MIN_INTERVAL
+                                                }
+                                            };
+                                            if should_emit {
+                                                last_progress_emit = Some(std::time::Instant::now());
+                                                last_progress_uploaded = uploaded;
+                                                let _ = self.upload_event_tx.send(UploadEvent {
+                                                    transfer_id: tid.clone(),
+                                                    kind: UploadEventKind::Progress {
+                                                        uploaded,
+                                                        total: total_size,
+                                                    },
+                                                }).await;
+                                            }
                                         }
                                         continue;
                                     }
@@ -2715,6 +2760,36 @@ impl UploadHandler {
                         }
 
                         if let Some(tid) = &transfer_id {
+                            let should_emit = match last_progress_emit {
+                                None => true,
+                                Some(last) => last.elapsed() >= PROGRESS_EMIT_MIN_INTERVAL,
+                            };
+                            if should_emit {
+                                last_progress_emit = Some(std::time::Instant::now());
+                                last_progress_uploaded = uploaded;
+                                let _ = self.upload_event_tx.send(UploadEvent {
+                                    transfer_id: tid.clone(),
+                                    kind: UploadEventKind::Progress {
+                                        uploaded,
+                                        total: total_size,
+                                    },
+                                }).await;
+                            }
+                        }
+                    }
+
+                    // OP_REQUESTPARTS is the hot path. After the inner
+                    // offset loop, flush a final Progress event if the
+                    // throttle coalesced away the last update for this
+                    // batch — otherwise the UI can sit on a stale
+                    // `uploaded` value for up to `PROGRESS_EMIT_MIN_INTERVAL`
+                    // after a burst of blocks, which is exactly the
+                    // "row frozen while data is clearly moving" symptom
+                    // for short bursty sessions.
+                    if let Some(tid) = &transfer_id {
+                        if uploaded != last_progress_uploaded {
+                            last_progress_emit = Some(std::time::Instant::now());
+                            last_progress_uploaded = uploaded;
                             let _ = self.upload_event_tx.send(UploadEvent {
                                 transfer_id: tid.clone(),
                                 kind: UploadEventKind::Progress {

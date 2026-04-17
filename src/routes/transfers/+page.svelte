@@ -2095,8 +2095,27 @@
                     <td class="status-cell"><span class="status-label st-{t.status}" title={ulStatusTooltip(t)}>{ulStatusLabel(t)}</span></td>
                   {:else if column.key === 'up_status'}
                     <td class="bar-cell">
-                      {#if t.progress > 0}
-                        <ProgressBar value={t.progress} color="var(--accent)" />
+                      {#if t.total_size > 0}
+                        <!--
+                          Feed the ProgressBar raw bytes rather than
+                          `t.progress`. `t.progress` is recomputed from
+                          `transferred / total_size` on every backend
+                          `update_progress`, but in practice the
+                          `transfer-progress` events for uploads arrive
+                          much more often than any downstream effect
+                          that re-derives progress, and we'd rather the
+                          bar animate continuously as bytes flow than
+                          freeze at 0% waiting for a progress sample
+                          with a non-zero value. The old
+                          `t.progress > 0` gate left the upload row
+                          showing only a dash for the entire session
+                          whenever the first few progress payloads
+                          rounded to 0.0% (tiny `uploaded / total_size`
+                          for the first block of a large file) — the
+                          "uploads appear and freeze until they
+                          complete" UX.
+                        -->
+                        <ProgressBar value={t.transferred} max={t.total_size} color="var(--accent)" />
                       {:else}
                         <span class="no-bar">—</span>
                       {/if}
