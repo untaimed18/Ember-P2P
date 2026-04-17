@@ -452,6 +452,48 @@ tr:hover td {
   padding: 0;
 }
 
+/*
+ * Scroll-shadow indicators — classic Lea Verou technique.
+ *
+ * Four layered backgrounds on the scroll container:
+ *   1. Top cover    (local) — opaque fade that sits on top of the content
+ *   2. Bottom cover (local) — same, at the bottom
+ *   3. Top shadow    (scroll) — radial shadow fixed to the viewport's top edge
+ *   4. Bottom shadow (scroll) — radial shadow fixed to the viewport's bottom edge
+ *
+ * Because the covers scroll with the content (attachment: local) but the
+ * shadows don't (attachment: scroll), the cover hides the shadow only at
+ * the actual edges of the content. In the middle of the list both shadows
+ * show. Overflows that fit on one screen show no shadows at all.
+ *
+ * Consumers can tune two custom properties:
+ *   --scroll-cover  — the surface color to match behind the scroller
+ *   --scroll-shadow — the shadow strength
+ *
+ * `.page-content` opts in automatically; any other scroll container can
+ * opt in by adding the `.scroll-shadows` class. Both share the same rule.
+ */
+.scroll-shadows,
+.page-content {
+  --scroll-cover: var(--bg-primary);
+  --scroll-shadow: rgba(0, 0, 0, 0.16);
+  background:
+    linear-gradient(var(--scroll-cover) 30%, transparent),
+    linear-gradient(transparent, var(--scroll-cover) 70%) 0 100%,
+    radial-gradient(farthest-side at 50% 0, var(--scroll-shadow), transparent),
+    radial-gradient(farthest-side at 50% 100%, var(--scroll-shadow), transparent) 0 100%;
+  background-repeat: no-repeat;
+  background-color: var(--scroll-cover);
+  background-size: 100% 32px, 100% 32px, 100% 10px, 100% 10px;
+  background-attachment: local, local, scroll, scroll;
+}
+
+/* Dark mode: shadow needs to be darker than the dark canvas to register. */
+[data-theme="dark"] .scroll-shadows,
+[data-theme="dark"] .page-content {
+  --scroll-shadow: rgba(0, 0, 0, 0.5);
+}
+
 .stat-card {
   background: var(--bg-surface);
   border: 1px solid var(--border);
