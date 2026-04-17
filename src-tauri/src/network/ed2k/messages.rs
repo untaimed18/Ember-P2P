@@ -1188,7 +1188,19 @@ pub fn parse_answer_sources2(payload: &[u8]) -> io::Result<(u8, [u8; 16], Vec<So
     let mut file_hash = [0u8; 16];
     file_hash.copy_from_slice(&payload[1..17]);
     let count = u16::from_le_bytes([payload[17], payload[18]]) as usize;
-    let expected_len = 19 + count * entry_size;
+    // Use checked arithmetic so a hostile count value cannot wrap usize on
+    // unusual targets; `count` is bounded by u16::MAX and `entry_size` by
+    // 29, so the real product always fits in usize on 32/64-bit platforms,
+    // but defensively saturate to usize::MAX on overflow to fail-closed.
+    let expected_len = count
+        .checked_mul(entry_size)
+        .and_then(|n| n.checked_add(19))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("SX2 length overflow: count={count} entry_size={entry_size}"),
+            )
+        })?;
     if payload.len() < expected_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

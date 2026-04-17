@@ -4,6 +4,7 @@ import type { SearchResult } from '$lib/types';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { SearchMethod, SearchFilters } from '$lib/api/search';
 import { cancelSearch } from '$lib/api/search';
+import { dev } from '$app/environment';
 
 export type SearchTab = {
   id: string;
@@ -212,7 +213,7 @@ export async function initSearchStore() {
       const requestId = event.payload.request_id;
       const incoming = event.payload.results;
       const origins = new Set(incoming.map((r) => r.result_origin).filter(Boolean));
-      if (origins.size > 0) {
+      if (dev && origins.size > 0) {
         console.debug(`[search-results] req=${requestId} count=${incoming.length} origins=${[...origins].join(', ')}`);
       }
       searchTabs.update((tabs) =>

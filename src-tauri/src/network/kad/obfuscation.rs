@@ -4,7 +4,6 @@
 // (preventing casual deep-packet inspection), NOT meaningful confidentiality.
 // It is retained solely for interoperability with the existing eMule/KAD network.
 
-use rand::Rng;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use super::types::{KadId, KadUDPKey};
@@ -156,10 +155,15 @@ pub fn encrypt_kad_packet(
     sender_key: u32,
     receiver_key: u32,
 ) -> Vec<u8> {
-    let mut rng = rand::thread_rng();
+    // OsRng: key material for UDP obfuscation must remain unpredictable
+    // from the network; using the OS entropy source keeps the security
+    // property reviewable independent of the thread-RNG seeding story.
+    use rand::rngs::OsRng;
+    use rand::RngCore;
+    let mut rng = OsRng;
 
-    let random_key_part: u16 = rng.gen();
-    let pad_len = (rng.gen::<u8>() & 0x0F) as usize;
+    let random_key_part: u16 = (rng.next_u32() & 0xFFFF) as u16;
+    let pad_len = ((rng.next_u32() & 0x0F) as u8) as usize;
 
     let use_verify_key = *target_kad_id == KadId::zero() && receiver_key != 0;
 
@@ -184,8 +188,10 @@ pub fn encrypt_kad_packet(
 
     plaintext.extend_from_slice(&MAGICVALUE_UDP_SYNC_CLIENT.to_le_bytes());
     plaintext.push(pad_len as u8);
-    for _ in 0..pad_len {
-        plaintext.push(rng.gen());
+    if pad_len > 0 {
+        let pad_start = plaintext.len();
+        plaintext.resize(pad_start + pad_len, 0);
+        rng.fill_bytes(&mut plaintext[pad_start..]);
     }
     plaintext.extend_from_slice(&receiver_key.to_le_bytes());
     plaintext.extend_from_slice(&sender_key.to_le_bytes());
@@ -197,7 +203,7 @@ pub fn encrypt_kad_packet(
     let semi_random = {
         let mut result = None;
         for _ in 0..256 {
-            let mut b: u8 = rng.gen();
+            let mut b: u8 = (rng.next_u32() & 0xFF) as u8;
             b = (b & 0xFC) | marker_bits;
             if !VALID_INNER_HEADERS.contains(&b) && b != 0x00 {
                 result = Some(b);

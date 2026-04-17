@@ -3,6 +3,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use digest::Digest;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tracing::{debug, info};
 
@@ -22,9 +24,26 @@ const PLAIN_PROTOCOL_MARKERS: [u8; 5] = [
     0xF5, // OP_ED2KV2PACKEDPROT
 ];
 
+/// RC4 obfuscation key material needs to be unpredictable to peers observing
+/// the handshake. `rand::random` delegates to a thread-local PRNG that *is*
+/// seeded from the OS, but being explicit about using `OsRng` makes the
+/// security property locally reviewable and avoids a future reseed-from-time
+/// regression.
+fn rand_u32_os() -> u32 {
+    OsRng.next_u32()
+}
+
+fn rand_u8_os() -> u8 {
+    (OsRng.next_u32() & 0xFF) as u8
+}
+
+fn fill_random_os(buf: &mut [u8]) {
+    OsRng.fill_bytes(buf);
+}
+
 fn semi_random_not_protocol_marker() -> u8 {
     for _ in 0..256 {
-        let b = rand::random::<u8>();
+        let b = rand_u8_os();
         if !PLAIN_PROTOCOL_MARKERS.contains(&b) && b != 0 {
             return b;
         }
@@ -126,15 +145,15 @@ where
     // Step 6: Send our response (encrypted with send_key)
     if send_response {
         // eMule default: CryptTCPPaddingLength=128, so % (128+1) = 0..128
-        let response_pad_len = (rand::random::<u8>() % 129) as usize;
+        let response_pad_len = (rand_u8_os() % 129) as usize;
         let resp_len = 4 + 1 + 1 + response_pad_len;
         let mut resp_plain = Vec::with_capacity(resp_len);
         resp_plain.extend_from_slice(&MAGICVALUE_SYNC.to_le_bytes());
         resp_plain.push(ENM_OBFUSCATION);
         resp_plain.push(response_pad_len as u8);
-        for _ in 0..response_pad_len {
-            resp_plain.push(rand::random::<u8>());
-        }
+        let pad_start = resp_plain.len();
+        resp_plain.resize(pad_start + response_pad_len, 0);
+        fill_random_os(&mut resp_plain[pad_start..]);
 
         let mut resp_encrypted = vec![0u8; resp_plain.len()];
         send_key.process(&resp_plain, &mut resp_encrypted);
@@ -158,7 +177,7 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let random_key_part = rand::random::<u32>();
+    let random_key_part = rand_u32_os();
     let rkp = random_key_part.to_le_bytes();
 
     let mut key_buf = [0u8; 21];
@@ -174,15 +193,15 @@ where
     let mut recv_key = Rc4State::new(&recv_md5);
     recv_key.skip(RC4_DROP_BYTES);
 
-    let pad_len = (rand::random::<u8>() % 129) as usize;
+    let pad_len = (rand_u8_os() % 129) as usize;
     let mut plain = Vec::with_capacity(7 + pad_len);
     plain.extend_from_slice(&MAGICVALUE_SYNC.to_le_bytes());
     plain.push(ENM_OBFUSCATION);
     plain.push(ENM_OBFUSCATION);
     plain.push(pad_len as u8);
-    for _ in 0..pad_len {
-        plain.push(rand::random::<u8>());
-    }
+    let pad_start = plain.len();
+    plain.resize(pad_start + pad_len, 0);
+    fill_random_os(&mut plain[pad_start..]);
     let mut encrypted = vec![0u8; plain.len()];
     send_key.process(&plain, &mut encrypted);
 

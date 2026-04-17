@@ -24,13 +24,17 @@
   const instanceId = Math.random().toString(36).slice(2, 10);
 
   function handleConfirm() {
-    open = false;
+    // Run the callback first so it sees the dialog still mounted and any
+    // parent-owned state remains valid. Flipping `open` before the callback
+    // can let the parent teardown (remove bindings, unmount the dialog)
+    // race against the callback's state reads.
     onconfirm?.();
+    open = false;
   }
 
   function handleCancel() {
-    open = false;
     oncancel?.();
+    open = false;
   }
 
   function handleKeydown(e: KeyboardEvent) {
