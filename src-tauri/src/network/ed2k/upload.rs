@@ -182,7 +182,7 @@ impl FileRequestTracker {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum QueueIdentity {
+pub(crate) enum QueueIdentity {
     UserHash([u8; 16]),
     Ip(IpAddr),
 }
@@ -197,8 +197,13 @@ impl QueueIdentity {
     }
 }
 
+/// Shared handle to the upload queue so non-upload subsystems (e.g. the UDP
+/// OP_REASKFILEPING handler in `network/mod.rs`) can report an accurate
+/// queue rank for their peers instead of a placeholder 0.
+pub(crate) type UploadQueueRef = Arc<tokio::sync::Mutex<Vec<QueueEntry>>>;
+
 #[derive(Debug, Clone)]
-struct QueueEntry {
+pub(crate) struct QueueEntry {
     identity: QueueIdentity,
     current_addr: Option<SocketAddr>,
     user_hash: [u8; 16],
@@ -569,7 +574,7 @@ impl AbuseTracker {
 }
 
 /// eMule file priority to score multiplier, matching GetFilePrioAsNumber()/10.
-fn priority_weight(priority: &str) -> f64 {
+pub(crate) fn priority_weight(priority: &str) -> f64 {
     match priority {
         "release" => 1.8,   // maps to eMule VeryHigh (18/10)
         "high" => 0.9,      // maps to eMule High (9/10)
@@ -598,10 +603,18 @@ fn score_queue_entry(
         .get_by_hash(&hex::encode(file_hash))
         .map(|f| priority_weight(&f.priority))
         .unwrap_or(0.7);
+    // Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) so queue scoring and
+    // BadGuy IP checks work for peers connecting over dual-stack sockets.
+    // Previously these peers got peer_ip=0, which defeated the credit
+    // IP-pinning used by `get_current_ident_state` to detect identity
+    // spoofing via IP switches.
     let peer_ip = current_addr
         .map(|a| match a.ip() {
             IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-            _ => 0,
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(|v4| u32::from_be_bytes(v4.octets()))
+                .unwrap_or(0),
         })
         .unwrap_or(0);
     let mut score = cm.get_queue_score(user_hash, wait_secs, file_prio, peer_ip);
@@ -652,6 +665,65 @@ fn compute_queue_rank(
 /// eMule MAX_PURGEQUEUETIME: 1 hour in seconds
 const MAX_PURGEQUEUETIME_SECS: u64 = 3600;
 
+/// Compute the rank of a queued peer reached over UDP (OP_REASKFILEPING).
+///
+/// Matches on either a known `user_hash` or the UDP source IP — we don't
+/// have the user hash from UDP alone, so IP+file is the normal fallback.
+/// If multiple candidate entries match (e.g., two peers NATted behind the
+/// same address) we pick the earliest join time so the rank we report is
+/// stable and non-inflationary.
+///
+/// Returns `Some(rank)` where rank is 1-based (matching TCP `OP_QUEUERANKING`
+/// semantics) or `None` if no matching entry exists (caller should treat as
+/// "not queued — freshly granted or dropped").
+pub(crate) async fn udp_queue_rank_for_peer(
+    upload_queue: &UploadQueueRef,
+    credit_manager: &Arc<tokio::sync::RwLock<CreditManager>>,
+    local_index: &Arc<tokio::sync::RwLock<LocalIndex>>,
+    from_ip: IpAddr,
+    file_hash: &[u8; 16],
+) -> Option<u16> {
+    let queue = upload_queue.lock().await;
+    let cm = credit_manager.read().await;
+    let idx = local_index.read().await;
+    let mut best: Option<&QueueEntry> = None;
+    for entry in queue.iter() {
+        if entry.file_hash != *file_hash {
+            continue;
+        }
+        let matches = matches!(&entry.identity, QueueIdentity::Ip(ip) if *ip == from_ip)
+            || entry
+                .current_addr
+                .map(|a| a.ip() == from_ip)
+                .unwrap_or(false);
+        if matches {
+            match best {
+                Some(prev) if prev.join_time <= entry.join_time => {}
+                _ => best = Some(entry),
+            }
+        }
+    }
+    let target = best?;
+    let my_score = score_queue_entry(
+        &cm,
+        &idx,
+        &target.user_hash,
+        target.file_hash,
+        target.join_time.elapsed().as_secs(),
+        target.current_addr,
+        target.emule_version,
+        target.is_friend_slot,
+    );
+    Some(compute_queue_rank(
+        &cm,
+        &idx,
+        &queue,
+        &target.identity,
+        my_score,
+        target.join_time,
+    ))
+}
+
 pub async fn start_upload_server(
     tcp_port: u16,
     user_hash: [u8; 16],
@@ -691,6 +763,9 @@ pub async fn start_upload_server(
     ember_sessions: EmberSessionMap,
     ember_hash: [u8; 16],
     network_disconnected: Arc<std::sync::atomic::AtomicBool>,
+    // Queue handle created by the caller so other subsystems (UDP REASKACK
+    // rank, diagnostics) can read the same shared queue state.
+    upload_queue: UploadQueueRef,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     let listener = match TcpListener::bind(addr).await {
@@ -704,7 +779,6 @@ pub async fn start_upload_server(
     info!("Peer-to-peer upload listener started on TCP port {tcp_port} (max {current_max} uploads)");
 
     let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let upload_queue = Arc::new(tokio::sync::Mutex::new(Vec::<QueueEntry>::new()));
     let slot_notify = Arc::new(tokio::sync::Notify::new());
     let slot_rates: SlotRateRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
@@ -1645,6 +1719,11 @@ impl UploadHandler {
         let mut uploaded: u64 = 0;
         let mut transfer_id: Option<String> = None;
         let mut total_size: u64 = 0;
+        // Set when the transfer is cancelled mid-send via UI; the inner
+        // parts-send loop breaks, then the outer session loop sees this
+        // flag and terminates the connection, letting all the normal
+        // cleanup (slot guard drop, queue retain, completion event) run.
+        let mut user_cancelled = false;
         let mut slot_guard = UploadSlotGuard::new(self.active_count.clone(), self.slot_notify.clone());
         let mut session_start: Option<std::time::Instant> = None;
         let mut rate_tracker = SessionRateTracker::new();
@@ -1688,6 +1767,13 @@ impl UploadHandler {
                 debug!("Terminating upload session with {peer_addr}: network disconnected");
                 break;
             }
+            // User cancelled this transfer via the UI. The inner parts-send
+            // loop flips `user_cancelled` and breaks; this check makes sure
+            // we also leave the outer packet loop so the connection closes
+            // and all shared cleanup at function exit runs.
+            if user_cancelled {
+                break;
+            }
 
             let (proto, opcode, payload) = if let Some(pkt) = deferred_packet.take() {
                 pkt
@@ -1722,9 +1808,16 @@ impl UploadHandler {
                             let dynamic_slots = self.compute_dynamic_slot_count();
 
                             if current_active < dynamic_slots {
-                                // Snapshot queue entries and release lock before acquiring RwLocks
+                                // Snapshot queue entries and release lock before acquiring RwLocks.
+                                // Purge stale entries (eMule MAX_PURGEQUEUETIME) first so
+                                // this periodic rank/grant path respects the same TTL as
+                                // STARTUPLOADREQ; otherwise a peer that only holds the TCP
+                                // session open can live in the queue past the 1-hour cap.
                                 let queue_snapshot: Vec<_> = {
-                                    let queue = self.upload_queue.lock().await;
+                                    let mut queue = self.upload_queue.lock().await;
+                                    queue.retain(|e| {
+                                        e.join_time.elapsed().as_secs() < MAX_PURGEQUEUETIME_SECS
+                                    });
                                     queue.iter().enumerate().map(|(i, e)| {
                                         (i, e.identity.clone(), e.current_addr, e.join_time, e.file_hash, e.user_hash, e.emule_version, e.is_friend_slot)
                                     }).collect()
@@ -2340,7 +2433,7 @@ impl UploadHandler {
                         parse_request_parts_32(&payload)?
                     };
 
-                    let offsets: Vec<(u64, u64)> = offsets
+                    let mut offsets: Vec<(u64, u64)> = offsets
                         .into_iter()
                         .filter(|&(start, end)| {
                             if end > total_size {
@@ -2353,6 +2446,28 @@ impl UploadHandler {
                             }
                         })
                         .collect();
+
+                    // Merge overlapping / duplicate ranges before sending.
+                    // eMule-family peers normally send 3 disjoint block
+                    // requests, but a buggy or malicious peer can re-request
+                    // the same offset multiple times; without this merge
+                    // we would double-count bytes in both the upload
+                    // progress counter and the credit ledger, inflating
+                    // the peer's credit ratio and the UI "transferred" stat.
+                    if offsets.len() > 1 {
+                        offsets.sort_by_key(|&(s, _)| s);
+                        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(offsets.len());
+                        for (s, e) in offsets {
+                            if let Some(last) = merged.last_mut() {
+                                if s <= last.1 {
+                                    if e > last.1 { last.1 = e; }
+                                    continue;
+                                }
+                            }
+                            merged.push((s, e));
+                        }
+                        offsets = merged;
+                    }
 
                     let resolved = match self.resolve_upload_file(&hash).await {
                         Some(file) => file,
@@ -2398,14 +2513,22 @@ impl UploadHandler {
                             }
                         }
 
-                        // Check if the upload was cancelled by the user
+                        // Check if the upload was cancelled by the user.
+                        // Fall out of the entire session loop so the normal
+                        // cleanup at function exit still runs: UploadSlotGuard
+                        // drop decrements active_count, the queue entry is
+                        // removed, Ember session state is cleaned up, and a
+                        // final transfer-complete event fires. The prior
+                        // `return Ok(())` leaked all of that and left zombie
+                        // rows in the UI queue.
                         if let Some(tid) = &transfer_id {
                             let mgr = self.transfer_manager.read().await;
                             let cancelled = !mgr.active.contains_key(tid);
                             drop(mgr);
                             if cancelled {
-                                info!("Upload {tid} cancelled by user, aborting");
-                                return Ok(());
+                                info!("Upload {tid} cancelled by user, ending session");
+                                user_cancelled = true;
+                                break;
                             }
                         }
 
@@ -3466,18 +3589,34 @@ async fn read_packet_async_inner<R: AsyncReadExt + Unpin>(
     Ok((protocol, opcode, payload))
 }
 
+/// Maximum wall time we allow a single packet write (including flush) to
+/// take before giving up. A slow-reading peer can otherwise wedge the
+/// writer side on a TCP send buffer that never drains and permanently
+/// occupy an upload slot. 60s is generous even on a saturated uplink
+/// for our largest single-chunk packet (~180 KiB).
+const WRITE_PACKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 async fn write_packet_async<W: AsyncWriteExt + Unpin + ?Sized>(
     writer: &mut W,
     protocol: u8,
     opcode: u8,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    writer.write_u8(protocol).await?;
-    writer.write_u32_le((1 + payload.len()) as u32).await?;
-    writer.write_u8(opcode).await?;
-    writer.write_all(payload).await?;
-    writer.flush().await?;
-    Ok(())
+    let fut = async {
+        writer.write_u8(protocol).await?;
+        writer.write_u32_le((1 + payload.len()) as u32).await?;
+        writer.write_u8(opcode).await?;
+        writer.write_all(payload).await?;
+        writer.flush().await?;
+        Ok::<_, std::io::Error>(())
+    };
+    match tokio::time::timeout(WRITE_PACKET_TIMEOUT, fut).await {
+        Ok(res) => res,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "peer is not reading — write stalled > 60s (slow-loris protection)",
+        )),
+    }
 }
 
 async fn read_packet_with_first_byte<R: AsyncReadExt + Unpin>(

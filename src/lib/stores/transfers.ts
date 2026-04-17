@@ -55,7 +55,17 @@ let unlisteners: UnlistenFn[] = [];
 let pollInterval: ReturnType<typeof setInterval> | null = null;
 let pollConsumers = 0;
 
-const pendingProgress = new Map<string, ProgressPayload>();
+// Pending progress payloads per transfer id. We keep the newest payload
+// and the first-seen timestamp so that a `transfer-progress` that arrives
+// ahead of its `transfer-started` (or for a row the API poll hasn't
+// caught up on yet) is not silently dropped — it's retried on the next
+// flush up to ORPHAN_PROGRESS_TTL_MS, then discarded.
+interface PendingProgress {
+  payload: ProgressPayload;
+  firstSeen: number;
+}
+const pendingProgress = new Map<string, PendingProgress>();
+const ORPHAN_PROGRESS_TTL_MS = 5000;
 let progressFlushScheduled = false;
 
 function scheduleProgressFlush() {
@@ -71,14 +81,23 @@ function scheduleProgressFlush() {
 function flushProgress() {
   progressFlushScheduled = false;
   if (pendingProgress.size === 0) return;
-  const batch = new Map(pendingProgress);
-  pendingProgress.clear();
+  const now = Date.now();
+  const batch = Array.from(pendingProgress.entries());
+  const retained = new Map<string, PendingProgress>();
   transfers.update((list) => {
     let changed = false;
     const skipStatuses: Transfer['status'][] = ['paused', 'stopped', 'completed', 'failed', 'verifying', 'completing', 'hashing', 'insufficient', 'noneneeded'];
-    for (const [id, p] of batch) {
+    for (const [id, entry] of batch) {
+      const p = entry.payload;
       const idx = list.findIndex((t) => t.id === id);
-      if (idx < 0) continue;
+      if (idx < 0) {
+        // No matching row yet. Keep the latest payload and re-try on the
+        // next frame unless the race window has clearly expired.
+        if (now - entry.firstSeen < ORPHAN_PROGRESS_TTL_MS) {
+          retained.set(id, entry);
+        }
+        continue;
+      }
       const existing = list[idx];
       if (skipStatuses.includes(existing.status)) continue;
       const rawTransferred = existing.direction === 'upload' ? (p.uploaded ?? p.downloaded ?? 0) : (p.downloaded ?? 0);
@@ -100,6 +119,11 @@ function flushProgress() {
     }
     return changed ? [...list] : list;
   });
+  pendingProgress.clear();
+  if (retained.size > 0) {
+    for (const [id, entry] of retained) pendingProgress.set(id, entry);
+    scheduleProgressFlush();
+  }
 }
 
 export async function initTransferStore() {
@@ -120,7 +144,11 @@ export async function initTransferStore() {
     listen<ProgressPayload>('transfer-progress', (event) => {
       markEventUpdate();
       const p = event.payload;
-      pendingProgress.set(p.id, p);
+      const existing = pendingProgress.get(p.id);
+      pendingProgress.set(p.id, {
+        payload: p,
+        firstSeen: existing?.firstSeen ?? Date.now(),
+      });
       scheduleProgressFlush();
     }),
     listen<TransferEventPayload>('transfer-complete', (event) => {
