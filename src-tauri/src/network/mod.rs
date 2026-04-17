@@ -565,13 +565,14 @@ fn spawn_rendezvous_friend_lookup(
     state: &NetworkState,
     ember_hash: [u8; 16],
     target_hash: [u8; 16],
-    db: &Arc<crate::storage::database::Database>,
+    _db: &Arc<crate::storage::database::Database>,
     app_handle: &tauri::AppHandle,
     friend_hashes: &crate::app_state::SharedFriendHashes,
     ul_event_tx: &mpsc::Sender<upload_server::UploadEvent>,
     ed25519_pubkey: [u8; 32],
     ed25519_secret_key: [u8; 32],
 ) {
+    // _db is kept in the signature for future authenticated-mutual promotion.
     let rv_url = settings.rendezvous_url.clone();
     let our_uh = state.user_hash;
     let our_eh = ember_hash;
@@ -580,7 +581,6 @@ fn spawn_rendezvous_friend_lookup(
     let tcp = settings.tcp_port;
     let udp = settings.udp_port;
     let obfuscate = settings.friend_session_encryption;
-    let db_fc = db.clone();
     let app_fc = app_handle.clone();
     let fh_fc = friend_hashes.clone();
     let sess_fc = state.ember_sessions.clone();
@@ -598,8 +598,9 @@ fn spawn_rendezvous_friend_lookup(
                     Ok(Some(remote_eh)) => {
                         info!("Rendezvous friend connect to {} succeeded, remote={}", addr, hex::encode(remote_eh));
                         if fh_fc.read().await.contains(&remote_eh) {
-                            let h = hex::encode(remote_eh);
-                            let _ = tokio::task::spawn_blocking(move || db_fc.set_friend_mutual(&h));
+                            // Do NOT auto-flip mutual: ember_hash in the remote handshake is
+                            // self-reported and unverified (FUTURE_WORK.md F2). User must
+                            // accept an inbound friend request before features unlock.
                             let _ = app_fc.emit("ember:friend-confirmed", serde_json::json!({
                                 "user_hash": hex::encode(remote_eh),
                             }));
@@ -3397,16 +3398,26 @@ pub async fn start_network(
                 if let DownloadEvent::EmberFriendRequest { ember_hash: req_hash, ref nickname, ref peer_ip, peer_port } = event {
                     let hash_hex = hex::encode(req_hash);
                     info!("Processing download-side friend request from {} (nick='{}', ip={}:{})", hash_hex, nickname, peer_ip, peer_port);
-                    if friend_hashes.read().await.contains(&req_hash) {
-                        info!("Friend {} is already in our list → setting mutual", hash_hex);
-                        let db2 = db.clone();
-                        let h2 = hash_hex.clone();
-                        let _ = tokio::task::spawn_blocking(move || db2.set_friend_mutual(&h2));
-                        let _ = app_handle.emit("ember:friend-confirmed", serde_json::json!({
-                            "user_hash": hash_hex,
-                        }));
+                    // Ember hash is self-reported in the EmuleInfo handshake and cannot be
+                    // cryptographically verified (see FUTURE_WORK.md F2). Never auto-promote
+                    // a peer to "mutual" based on that tag — require explicit user approval
+                    // through the Friends UI. If the sender is already mutual, ignore; if
+                    // they are in our list but not mutual, route through the request queue
+                    // so the user sees "<nick> wants to confirm friendship" and must accept.
+                    let db_q = db.clone();
+                    let h_q = hash_hex.clone();
+                    let already_mutual = tokio::task::spawn_blocking(move || {
+                        db_q.get_friends_full()
+                            .ok()
+                            .and_then(|rows| rows.into_iter().find(|(h, ..)| h == &h_q).map(|(_, _, _, _, _, _, mutual)| mutual))
+                            .unwrap_or(false)
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if already_mutual {
+                        info!("Friend {} already mutual — ignoring redundant EmberFriendRequest", hash_hex);
                     } else {
-                        info!("New friend request from {} → adding to requests", hash_hex);
+                        info!("Queuing friend request from {} for user approval", hash_hex);
                         let db2 = db.clone();
                         let h2 = hash_hex.clone();
                         let n2 = nickname.clone();
@@ -3901,16 +3912,22 @@ pub async fn start_network(
                 if let UploadEventKind::EmberFriendRequest { ember_hash: req_hash, ref nickname, ref peer_ip, peer_port } = event.kind {
                     let hash_hex = hex::encode(req_hash);
                     info!("Processing upload-side friend request from {} (nick='{}', ip={}:{})", hash_hex, nickname, peer_ip, peer_port);
-                    if friend_hashes.read().await.contains(&req_hash) {
-                        info!("Friend {} is already in our list → setting mutual", hash_hex);
-                        let db2 = db.clone();
-                        let h2 = hash_hex.clone();
-                        let _ = tokio::task::spawn_blocking(move || db2.set_friend_mutual(&h2));
-                        let _ = app_handle.emit("ember:friend-confirmed", serde_json::json!({
-                            "user_hash": hash_hex,
-                        }));
+                    // See the download-side handler above: never auto-mutual based on an
+                    // unauthenticated ember_hash tag. Always require explicit user approval.
+                    let db_q = db.clone();
+                    let h_q = hash_hex.clone();
+                    let already_mutual = tokio::task::spawn_blocking(move || {
+                        db_q.get_friends_full()
+                            .ok()
+                            .and_then(|rows| rows.into_iter().find(|(h, ..)| h == &h_q).map(|(_, _, _, _, _, _, mutual)| mutual))
+                            .unwrap_or(false)
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if already_mutual {
+                        info!("Friend {} already mutual — ignoring redundant EmberFriendRequest", hash_hex);
                     } else {
-                        info!("New friend request from {} → adding to requests", hash_hex);
+                        info!("Queuing friend request from {} for user approval", hash_hex);
                         let db2 = db.clone();
                         let h2 = hash_hex.clone();
                         let n2 = nickname.clone();
@@ -13591,8 +13608,22 @@ async fn handle_command(
 
                 let completed_bytes = tracker.completed_bytes();
 
-                if !ed2k::preview::can_preview(&file_name, file_size, &filled_ranges, completed_bytes) {
-                    return Err("File is not ready for preview (need at least the first 256KB downloaded and a previewable file type)".to_string());
+                // Preview must be gated on MD4 verification of the covered
+                // parts — without this a malicious peer could feed arbitrary
+                // bytes that we then hand to the OS default media handler.
+                let has_part_hashes = !tracker.part_hashes().is_empty();
+                let verified_complete_parts = tracker.completed_parts();
+                let part_size = ed2k::hash::PARTSIZE;
+
+                if !ed2k::preview::can_preview(
+                    &file_name,
+                    file_size,
+                    completed_bytes,
+                    has_part_hashes,
+                    &verified_complete_parts,
+                    part_size,
+                ) {
+                    return Err("File is not ready for preview (need the first 256KB downloaded and MD4-verified, and a previewable file type)".to_string());
                 }
 
                 let preview_path = ed2k::preview::create_preview_file(&part_path, &filled_ranges, &file_name)
@@ -13937,7 +13968,6 @@ async fn handle_command(
             let tcp = settings.tcp_port;
             let udp = settings.udp_port;
             let obfs = settings.friend_session_encryption;
-            let db2 = db.clone();
             let db3 = db.clone();
             let app2 = app_handle.clone();
             let fh = friend_hashes.clone();
@@ -13961,8 +13991,11 @@ async fn handle_command(
                     Ok(Some(remote_eh)) => {
                         info!("Friend connect to {} succeeded, remote ember_hash={}", addr, hex::encode(remote_eh));
                         if fh.read().await.contains(&remote_eh) {
-                            let h = hex::encode(remote_eh);
-                            let _ = tokio::task::spawn_blocking(move || db2.set_friend_mutual(&h));
+                            // Do NOT auto-flip mutual: ember_hash in the remote handshake is
+                            // self-reported and unverified (FUTURE_WORK.md F2). We still emit
+                            // "confirmed" to clear the searching spinner and mark online, but
+                            // mutual promotion must come from an explicit user accept on an
+                            // inbound friend request.
                             let _ = app2.emit("ember:friend-confirmed", serde_json::json!({
                                 "user_hash": hex::encode(remote_eh),
                             }));

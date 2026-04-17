@@ -113,16 +113,21 @@ impl CreditManager {
         self.credits.entry(user_hash).or_insert_with(|| CreditRecord::new(user_hash))
     }
 
-    /// eMule: only accumulate credits when identity is verified.
-    /// Rejects credits for Failed/BadGuy peers regardless of crypto availability.
+    /// eMule: only accumulate credits when identity is verified via SecIdent.
+    /// When crypto is available we require `IdentState::Verified` — Unknown,
+    /// Needed, Failed, and BadGuy all reject. A peer that never completes the
+    /// public-key + challenge/response exchange cannot farm credits.
+    /// When crypto is unavailable (no local RSA key) we fall back to the
+    /// permissive behavior but still reject Failed/BadGuy.
     /// Returns false if credits were rejected due to identity state.
     pub fn add_uploaded(&mut self, user_hash: [u8; 16], bytes: u64) -> bool {
         let crypto = self.crypto_available;
         let record = self.get_or_create(user_hash);
-        if matches!(record.ident_state, IdentState::Failed | IdentState::BadGuy) {
-            return false;
-        }
-        if crypto && matches!(record.ident_state, IdentState::Needed) {
+        if crypto {
+            if !matches!(record.ident_state, IdentState::Verified) {
+                return false;
+            }
+        } else if matches!(record.ident_state, IdentState::Failed | IdentState::BadGuy) {
             return false;
         }
         record.uploaded = record.uploaded.saturating_add(bytes);
@@ -133,10 +138,11 @@ impl CreditManager {
     pub fn add_downloaded(&mut self, user_hash: [u8; 16], bytes: u64) -> bool {
         let crypto = self.crypto_available;
         let record = self.get_or_create(user_hash);
-        if matches!(record.ident_state, IdentState::Failed | IdentState::BadGuy) {
-            return false;
-        }
-        if crypto && matches!(record.ident_state, IdentState::Needed) {
+        if crypto {
+            if !matches!(record.ident_state, IdentState::Verified) {
+                return false;
+            }
+        } else if matches!(record.ident_state, IdentState::Failed | IdentState::BadGuy) {
             return false;
         }
         record.downloaded = record.downloaded.saturating_add(bytes);

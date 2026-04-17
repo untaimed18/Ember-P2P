@@ -114,6 +114,16 @@ impl NodeIdentity {
     }
 
     /// Load identity from disk, or generate and save a new one.
+    ///
+    /// Identity loss silently rotates `user_hash` / `ember_hash`, which breaks
+    /// the user's KAD reputation, credits, and friend relationships. So on a
+    /// *parse failure* (malformed JSON) we **refuse to start** rather than
+    /// generate a new identity: the raw file is moved aside with a `.corrupt`
+    /// suffix and the user is expected to either restore from a backup or
+    /// explicitly delete both files to consent to a reset.
+    ///
+    /// Only the `NotFound` case (genuinely no identity yet) triggers automatic
+    /// generation.
     pub fn load_or_create(data_dir: &Path) -> anyhow::Result<Self> {
         let path = data_dir.join("identity.json");
         match std::fs::read_to_string(&path) {
@@ -160,34 +170,50 @@ impl NodeIdentity {
                             std::fs::rename(&tmp_path, &path)?;
                         }
                         info!("Loaded persistent identity (KAD ID={}…)", &hex::encode(id.kad_id)[..4]);
-                        return Ok(id);
+                        Ok(id)
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to parse identity.json, regenerating: {e}");
-                        let bak = path.with_extension("json.corrupt.bak");
-                        if let Err(bak_err) = std::fs::rename(&path, &bak) {
-                            tracing::warn!("Failed to backup corrupt identity.json: {bak_err}");
-                        } else {
-                            // The moved-aside file retains its original 0o600/ACL
-                            // on Unix/Windows, but re-apply defensively in case
-                            // filesystem semantics differ on the destination.
-                            crate::security::restrict_file_permissions(&bak);
-                            tracing::info!("Backed up corrupt identity to {}", bak.display());
-                        }
+                    Err(parse_err) => {
+                        tracing::error!("identity.json is corrupt: {parse_err}");
+                        let bak = path.with_extension("json.corrupt");
+                        let backup_note = match std::fs::copy(&path, &bak) {
+                            Ok(_) => {
+                                crate::security::restrict_file_permissions(&bak);
+                                format!("A copy has been saved to {}. ", bak.display())
+                            }
+                            Err(bak_err) => {
+                                tracing::warn!("Failed to back up corrupt identity.json: {bak_err}");
+                                String::new()
+                            }
+                        };
+                        Err(anyhow::anyhow!(
+                            "Identity file at {} is corrupt ({}). {}\
+                             Refusing to generate a new identity automatically because this would \
+                             permanently reset your KAD ID, user hash, friend relationships, and \
+                             upload credits. To reset, delete the identity.json file and restart; \
+                             to recover, restore a backup copy of identity.json.",
+                            path.display(), parse_err, backup_note
+                        ))
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let id = Self::generate();
+                let data = serde_json::to_string_pretty(&id)?;
+                std::fs::create_dir_all(data_dir)?;
+                crate::security::atomic_write(&path, data.as_bytes(), true)?;
+                info!("Generated new identity (KAD ID={}…)", &hex::encode(id.kad_id)[..4]);
+                Ok(id)
+            }
             Err(e) => {
-                tracing::error!("Failed to read identity.json, regenerating: {e}");
+                // For permission-denied / transient I/O errors, do NOT generate a
+                // new identity — the real file may still be on disk and readable
+                // next launch. Surface the error instead of masking it.
+                Err(anyhow::anyhow!(
+                    "Failed to read identity file at {}: {}. Fix the underlying I/O error \
+                     (permissions, disk, antivirus) and restart.",
+                    path.display(), e
+                ))
             }
         }
-
-        let id = Self::generate();
-        let data = serde_json::to_string_pretty(&id)?;
-        std::fs::create_dir_all(data_dir)?;
-        crate::security::atomic_write(&path, data.as_bytes(), true)?;
-        info!("Generated new identity (KAD ID={}…)", &hex::encode(id.kad_id)[..4]);
-        Ok(id)
     }
 }
