@@ -8,6 +8,7 @@ use crate::network::NetworkCommand;
 use crate::search::index::LocalIndex;
 use crate::search::spam::SpamFilter;
 use crate::sharing::manager::TransferManager;
+use crate::sharing::watcher::SharedFoldersWatcher;
 use crate::storage::config::AppConfig;
 use crate::storage::database::Database;
 use crate::storage::statistics::TransferStats;

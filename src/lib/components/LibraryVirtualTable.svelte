@@ -537,14 +537,20 @@
                     <span class="hashing-label">Pending</span>
                   {:else if file.shared}
                     <span class="shared-icon shared-yes" title="Shared">&#x2713;</span>
-                    {#if file.shared_kad || file.shared_ed2k}
+                    {#if file.shared_kad || file.shared_ed2k || file.aich_hash}
                       <span class="shared-badges">
-                        {#if file.shared_kad}<span class="shared-badge kad">KAD</span>{/if}
-                        {#if file.shared_ed2k}<span class="shared-badge ed2k">eD2K</span>{/if}
+                        {#if file.shared_kad}<span class="shared-badge kad" title="Published to KAD network">KAD</span>{/if}
+                        {#if file.shared_ed2k}<span class="shared-badge ed2k" title="Published to eD2K servers">eD2K</span>{/if}
+                        {#if file.aich_hash}<span class="shared-badge aich" title="AICH hash available — corruption can be detected and recovered mid-download">AICH</span>{/if}
                       </span>
                     {/if}
                   {:else}
                     <span class="shared-icon shared-no" title="Not shared">&#x2715;</span>
+                    {#if file.aich_hash}
+                      <span class="shared-badges">
+                        <span class="shared-badge aich" title="AICH hash available — corruption can be detected and recovered mid-download">AICH</span>
+                      </span>
+                    {/if}
                   {/if}
                 </td>
               {/if}
@@ -796,6 +802,10 @@
   .shared-badge.ed2k {
     background: rgba(155, 89, 182, 0.15);
     color: #9b59b6;
+  }
+  .shared-badge.aich {
+    background: rgba(39, 174, 96, 0.15);
+    color: #27ae60;
   }
 
   .prio-verylow { color: #888; }

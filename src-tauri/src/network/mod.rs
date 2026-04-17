@@ -765,6 +765,13 @@ pub enum NetworkCommand {
     AnnounceFiles {
         files: Vec<FileInfo>,
     },
+    /// Force an immediate re-publish of a single already-known file to KAD.
+    /// The file must already be registered with the publish manager (e.g. via
+    /// `AnnounceFiles`); this command just resets its source/keyword publish
+    /// timestamps so the next publish cycle picks it up.
+    RepublishFile {
+        file_hash_hex: String,
+    },
     FindSources {
         file_hash: KadId,
         file_size: u64,
@@ -12486,6 +12493,24 @@ async fn handle_command(
             info!(
                 "Registered {} files for KAD publishing",
                 state.publish_manager.file_count()
+            );
+        }
+
+        NetworkCommand::RepublishFile { file_hash_hex } => {
+            let Ok(raw_bytes) = hex::decode(&file_hash_hex) else {
+                warn!("RepublishFile: invalid hex in file hash");
+                return;
+            };
+            if raw_bytes.len() != 16 {
+                warn!("RepublishFile: expected 16-byte MD4 hash, got {}", raw_bytes.len());
+                return;
+            }
+            let kad_hash = md4_bytes_to_kad_id(&raw_bytes);
+            state.publish_manager.reset_source_publish(&kad_hash);
+            state.publish_manager.reset_keyword_publish(&kad_hash);
+            info!(
+                "Scheduled immediate KAD republish for file hash {}",
+                &file_hash_hex[..file_hash_hex.len().min(16)]
             );
         }
 

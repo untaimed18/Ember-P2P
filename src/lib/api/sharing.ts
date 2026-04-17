@@ -60,3 +60,15 @@ export async function openSharedFolder(filePath: string): Promise<void> {
 export async function deleteSharedFile(filePath: string, fileHash?: string): Promise<void> {
   return invoke('delete_shared_file', { filePath, fileHash });
 }
+
+export async function republishFile(fileHash: string): Promise<void> {
+  return invoke('republish_file', { fileHash });
+}
+
+export async function scanMissingFiles(): Promise<string[]> {
+  return invoke('scan_missing_files');
+}
+
+export async function removeMissingFiles(paths: string[]): Promise<number> {
+  return invoke('remove_missing_files', { paths });
+}
