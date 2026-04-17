@@ -1421,7 +1421,7 @@
         {/if}
       </div>
     </div>
-    <div class="pane-content">
+    <div class="pane-content scroll-shadows">
       <table
         class="transfer-table dl-table"
         bind:this={downloadTableEl}
@@ -1761,7 +1761,7 @@
         >Download Clients</button>
       </div>
     </div>
-    <div class="pane-content">
+    <div class="pane-content scroll-shadows">
       {#if bottomView === 'uploading'}
         <!-- UPLOADING VIEW -->
         <table

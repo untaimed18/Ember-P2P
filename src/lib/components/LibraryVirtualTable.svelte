@@ -473,7 +473,7 @@
     </thead>
   </table>
 </div>
-<div class="vtable-scroll" bind:this={scrollContainer} use:passiveScroll={onTableScroll}>
+<div class="vtable-scroll scroll-shadows" bind:this={scrollContainer} use:passiveScroll={onTableScroll}>
   <div class="vtable-spacer" style="height:{sortedFiles.length * ROW_HEIGHT}px;">
     <table class="lib-table vtable-body" style="transform:translateY({virtualSlice.topPad}px);min-width:{tableMinWidth}px;">
       <colgroup>
