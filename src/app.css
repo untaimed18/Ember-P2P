@@ -14,6 +14,7 @@
   --accent: #1a73e8;
   --accent-hover: #1565d8;
   --accent-dim: #d2e3fc;
+  --accent-halo: #d2e3fc;
   --success: #34a853;
   --warning: #ea8600;
   --danger: #d93025;
@@ -24,11 +25,12 @@
   --sidebar-width: 220px;
   --statusbar-height: 32px;
 
-  --radius-sm: 4px;
-  --radius-md: 6px;
-  --radius-lg: 8px;
+  --radius-sm: 5px;
+  --radius-md: 7px;
+  --radius-lg: 10px;
 
   --font-mono: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable', 'Segoe UI', Roboto, sans-serif;
 
   --shadow-sm: 0 1px 2px rgba(0,0,0,0.06);
   --shadow-md: 0 2px 6px rgba(0,0,0,0.08);
@@ -40,7 +42,7 @@
   --bg-disabled: #e8ecf4;
   --text-disabled: #8890a8;
 
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-family: var(--font-sans);
   font-size: 14px;
   line-height: 1.5;
   color: var(--text-primary);
@@ -48,36 +50,109 @@
 
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
+/*
+ * ——— Ember dark theme ———
+ * Neutral charcoal base (warm-neutral, not blue-purple) with carefully
+ * layered depth. Each bg step is roughly 4–6% lighter than the one beneath
+ * so panels separate without hard borders. Borders and dividers are
+ * *very* quiet; depth is carried by the bg layering and subtle shadows.
+ */
 [data-theme="dark"] {
-  --bg-primary: #1a1a2e;
-  --bg-secondary: #16213e;
-  --bg-tertiary: #0f3460;
-  --bg-surface: #1e2746;
-  --bg-hover: #253255;
-  --bg-input: #121a30;
+  --bg-primary: #0d0f12;    /* app canvas (deepest) */
+  --bg-secondary: #15181d;  /* panels, cards, sidebars */
+  --bg-surface: #1a1e24;    /* elevated cards, stat boxes */
+  --bg-tertiary: #1f242b;   /* nested surfaces, alt inputs */
+  --bg-hover: #252a33;      /* hover / selected rows */
+  --bg-input: #101317;      /* inputs — slightly inset below panels */
 
-  --text-primary: #e0e0e0;
-  --text-secondary: #a0a8c0;
-  --text-muted: #6b7394;
-  --text-accent: #4fc3f7;
+  --text-primary: #e7e9ec;
+  --text-secondary: #a3a8b2;
+  --text-muted: #6c7079;
+  --text-accent: #8fb8eb;
 
-  --accent: #4fc3f7;
-  --accent-hover: #29b6f6;
-  --accent-dim: #1a7baa;
-  --success: #66bb6a;
-  --warning: #ffa726;
-  --danger: #ef5350;
+  /* Accent: desaturated sky-blue — legible, pro, not electric. */
+  --accent: #6ea3dc;
+  --accent-hover: #88b8ea;
+  --accent-dim: #1e3a5c;            /* muted navy for alt buttons / selection */
+  --accent-halo: rgba(110, 163, 220, 0.26); /* translucent glow for focus rings */
 
-  --border: #2a3456;
-  --border-light: #3a4576;
+  --success: #5fc27b;
+  --warning: #e0a84d;
+  --danger: #dc6e62;
 
-  --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
-  --shadow-md: 0 2px 6px rgba(0,0,0,0.4);
+  /* Borders are barely there — 4–5% lighter than the bg they sit against. */
+  --border: #232830;
+  --border-light: #2e343e;
 
-  --bg-disabled: #1e2746;
-  --text-disabled: #4a5270;
+  /* Deeper, more diffuse shadows so elevated surfaces visibly lift. */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
+  --shadow-md: 0 6px 18px rgba(0, 0, 0, 0.55);
+
+  --bg-disabled: #171a1f;
+  --text-disabled: #4a4f58;
+}
+
+/* Focus halo uses a translucent accent on dark so it reads as a glow
+   rather than a solid band. The token abstracts the per-theme value. */
+[data-theme="dark"] input:focus,
+[data-theme="dark"] select:focus,
+[data-theme="dark"] textarea:focus {
+  box-shadow: 0 0 0 3px var(--accent-halo);
+}
+
+/* Primary buttons use the full accent in dark mode (the old theme
+   compromised here because the accent was too electric). */
+[data-theme="dark"] button {
+  background: var(--accent);
+  color: #0d0f12;
+  font-weight: 600;
+}
+[data-theme="dark"] button:hover:not(:disabled) {
+  background: var(--accent-hover);
+  color: #0d0f12;
+}
+[data-theme="dark"] button.ghost {
+  background: transparent;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+[data-theme="dark"] button.ghost:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+[data-theme="dark"] button.danger {
+  background: var(--danger);
+  color: #0d0f12;
+}
+[data-theme="dark"] button.danger:hover:not(:disabled) {
+  background: #e28a80;
+}
+
+/* Softer, more controlled scrollbars for dark. */
+[data-theme="dark"] * {
+  scrollbar-color: #2e343e #0d0f12;
+}
+[data-theme="dark"] ::-webkit-scrollbar-track {
+  background: transparent;
+}
+[data-theme="dark"] ::-webkit-scrollbar-thumb {
+  background: #2a2f38;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 6px;
+}
+[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+  background: #3a404a;
+  background-clip: padding-box;
+}
+
+/* Selection: subtle accent-tinted fill, readable text. */
+[data-theme="dark"] ::selection {
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+  color: var(--text-primary);
 }
 
 *, *::before, *::after {
@@ -139,18 +214,19 @@ a:focus-visible {
 button {
   font-family: inherit;
   font-size: inherit;
+  font-weight: 500;
   cursor: pointer;
   border: none;
   border-radius: var(--radius-sm);
   padding: 6px 14px;
   background: var(--accent);
   color: #fff;
-  transition: background-color 0.15s;
-}
-
-[data-theme="dark"] button {
-  background: var(--accent-dim);
-  color: var(--text-primary);
+  transition:
+    background-color var(--transition-normal) ease,
+    color var(--transition-normal) ease,
+    transform 0.08s ease,
+    box-shadow var(--transition-normal) ease;
+  will-change: transform;
 }
 
 button:hover {
@@ -158,8 +234,8 @@ button:hover {
   color: #fff;
 }
 
-button:active {
-  opacity: 0.85;
+button:active:not(:disabled) {
+  transform: translateY(0.5px) scale(0.997);
 }
 
 button:focus-visible {
@@ -207,7 +283,7 @@ input, select, textarea {
 
 input:focus, select:focus, textarea:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-dim);
+  box-shadow: 0 0 0 2px var(--accent-halo);
 }
 
 input:disabled, select:disabled, textarea:disabled {
@@ -224,6 +300,7 @@ table {
   width: 100%;
   border-collapse: collapse;
   font-size: 13px;
+  font-variant-numeric: tabular-nums;
 }
 
 th {
@@ -286,6 +363,50 @@ tr:hover td {
 .badge.highid { background: var(--success); color: #fff; }
 .badge.lowid { background: var(--danger); color: #fff; }
 
+/*
+ * Dark-mode badges: tinted-accent backgrounds with semantic-colored text.
+ * Reads as refined "status chip" rather than loud paint chip. Each state
+ * shares the same 18% tint / 1px border recipe.
+ */
+[data-theme="dark"] .badge {
+  letter-spacing: 0.3px;
+  border: 1px solid transparent;
+  padding: 2px 9px;
+}
+[data-theme="dark"] .badge.connected,
+[data-theme="dark"] .badge.completed,
+[data-theme="dark"] .badge.highid {
+  background: color-mix(in srgb, var(--success) 18%, transparent);
+  border-color: color-mix(in srgb, var(--success) 32%, transparent);
+  color: #8fd9a3;
+}
+[data-theme="dark"] .badge.connecting,
+[data-theme="dark"] .badge.paused,
+[data-theme="dark"] .badge.upload {
+  background: color-mix(in srgb, var(--warning) 18%, transparent);
+  border-color: color-mix(in srgb, var(--warning) 32%, transparent);
+  color: #f0c37a;
+}
+[data-theme="dark"] .badge.disconnected,
+[data-theme="dark"] .badge.failed,
+[data-theme="dark"] .badge.lowid {
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 32%, transparent);
+  color: #ea9388;
+}
+[data-theme="dark"] .badge.active,
+[data-theme="dark"] .badge.download {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 32%, transparent);
+  color: #a6c7ea;
+}
+[data-theme="dark"] .badge.queued,
+[data-theme="dark"] .badge.searching {
+  background: color-mix(in srgb, var(--text-muted) 22%, transparent);
+  border-color: color-mix(in srgb, var(--text-muted) 38%, transparent);
+  color: var(--text-secondary);
+}
+
 .empty-state {
   display: flex;
   flex-direction: column;
@@ -307,7 +428,16 @@ tr:hover td {
   align-items: center;
   justify-content: space-between;
   padding: 16px 20px;
-  border-bottom: 1px solid var(--border);
+  /* Gradient divider — fades to transparent at both edges so the line
+     reads as a soft horizon rather than a hard rule. */
+  border-bottom: 1px solid transparent;
+  border-image: linear-gradient(
+    to right,
+    transparent 0%,
+    var(--border) 12%,
+    var(--border) 88%,
+    transparent 100%
+  ) 1;
 }
 
 .page-header h2 {
@@ -342,6 +472,7 @@ tr:hover td {
   font-weight: 700;
   color: var(--text-primary);
   margin-top: 4px;
+  font-variant-numeric: tabular-nums;
 }
 
 .stat-card .sub {
@@ -415,6 +546,32 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
   overflow: hidden;
   box-shadow: 0 8px 32px rgba(0,0,0,0.24);
   animation: dialog-in 0.2s ease;
+}
+
+/*
+ * Dark-mode elevation polish: frosted overlays, soft inner top-edge
+ * highlight on cards and dialogs. The 1px inset highlight at 4% white
+ * reads as light-from-above and is what separates a flat dark UI from a
+ * three-dimensional one.
+ */
+[data-theme="dark"] .confirm-overlay {
+  background: rgba(8, 10, 13, 0.45);
+  backdrop-filter: blur(6px) saturate(1.15);
+  -webkit-backdrop-filter: blur(6px) saturate(1.15);
+}
+[data-theme="dark"] :is(.modal-overlay) {
+  backdrop-filter: blur(6px) saturate(1.15);
+  -webkit-backdrop-filter: blur(6px) saturate(1.15);
+}
+[data-theme="dark"] .confirm-dialog {
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.05),
+    0 16px 48px rgba(0, 0, 0, 0.55);
+}
+[data-theme="dark"] .stat-card {
+  box-shadow:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.04),
+    var(--shadow-sm);
 }
 .confirm-dialog h3 {
   margin-bottom: 10px;

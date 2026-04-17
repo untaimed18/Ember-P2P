@@ -309,14 +309,11 @@
     font-size: 22px;
     flex-shrink: 0;
   }
-  .down-icon { background: rgba(26,115,232,0.12); color: var(--accent); }
-  .up-icon   { background: rgba(52,168,83,0.12);  color: var(--success); }
-  .time-icon { background: rgba(234,134,0,0.12);  color: var(--warning); }
-  .ratio-icon{ background: rgba(156,39,176,0.12);  color: #9c27b0; }
-  :global([data-theme="dark"]) .down-icon { background: rgba(79,195,247,0.15); color: var(--accent); }
-  :global([data-theme="dark"]) .up-icon   { background: rgba(102,187,106,0.15); color: var(--success); }
-  :global([data-theme="dark"]) .time-icon { background: rgba(255,167,38,0.15); color: var(--warning); }
-  :global([data-theme="dark"]) .ratio-icon{ background: rgba(186,104,200,0.15); color: #ba68c8; }
+  .down-icon  { background: color-mix(in srgb, var(--accent)  14%, transparent); color: var(--accent); }
+  .up-icon    { background: color-mix(in srgb, var(--success) 14%, transparent); color: var(--success); }
+  .time-icon  { background: color-mix(in srgb, var(--warning) 14%, transparent); color: var(--warning); }
+  .ratio-icon { background: rgba(156, 39, 176, 0.12); color: #9c27b0; }
+  :global([data-theme="dark"]) .ratio-icon { background: rgba(186, 104, 200, 0.18); color: #c792d9; }
   .hero-body { display: flex; flex-direction: column; min-width: 0; }
   .hero-value {
     font-size: 1.25rem;

@@ -2997,10 +2997,12 @@
     justify-content: center;
   }
   .modal-content {
-    background: var(--bg-primary, #1e1e1e);
+    background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: 8px;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    border-radius: var(--radius-lg);
+    box-shadow:
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.05),
+      0 16px 48px rgba(0, 0, 0, 0.45);
     display: flex;
     flex-direction: column;
     max-height: 80vh;

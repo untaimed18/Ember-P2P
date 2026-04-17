@@ -226,15 +226,35 @@
   }
 
   .nav-list li a {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 12px;
     padding: 10px 16px;
     color: var(--text-secondary);
     text-decoration: none;
-    transition: background-color var(--transition-normal), color var(--transition-normal), border-color var(--transition-normal);
+    transition: background-color var(--transition-normal), color var(--transition-normal);
     font-size: 14px;
-    border-left: 3px solid transparent;
+  }
+
+  /*
+   * Active indicator rendered as a dedicated pseudo-element so it can have
+   * rounded ends, slight vertical inset, and fade in/out independently of
+   * the row's background. Reserves 3px on the left via a transparent
+   * border so hover/active rows don't shift horizontally.
+   */
+  .nav-list li a::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 6px;
+    bottom: 6px;
+    width: 3px;
+    border-radius: 0 3px 3px 0;
+    background: var(--accent);
+    opacity: 0;
+    transform: scaleY(0.5);
+    transition: opacity var(--transition-normal) ease, transform var(--transition-normal) ease;
   }
 
   .nav-list li a:hover {
@@ -251,7 +271,12 @@
   .nav-list li a.active {
     background: var(--bg-tertiary);
     color: var(--accent);
-    border-left-color: var(--accent);
+  }
+
+  .nav-list li a.active::before {
+    opacity: 1;
+    transform: scaleY(1);
+    box-shadow: 0 0 10px 0 var(--accent-halo);
   }
 
   .nav-icon {
@@ -292,20 +317,42 @@
     border-radius: 50%;
     flex-shrink: 0;
     background: var(--text-muted);
+    position: relative;
+    transition: background-color var(--transition-normal) ease, box-shadow var(--transition-normal) ease;
   }
 
   .nav-dot.connected {
-    background: #22c55e;
-    box-shadow: 0 0 4px #22c55e80;
+    background: #3ccf6d;
+    box-shadow:
+      0 0 0 2px color-mix(in srgb, #3ccf6d 22%, transparent),
+      0 0 8px color-mix(in srgb, #3ccf6d 55%, transparent);
   }
 
   .nav-dot.connecting {
-    background: #eab308;
-    box-shadow: 0 0 4px #eab30880;
+    background: #f0b93f;
+    box-shadow:
+      0 0 0 2px color-mix(in srgb, #f0b93f 22%, transparent),
+      0 0 8px color-mix(in srgb, #f0b93f 55%, transparent);
+    animation: nav-dot-pulse 1.5s ease-in-out infinite;
   }
 
   .nav-dot.disconnected {
-    background: #ef4444;
-    box-shadow: 0 0 3px #ef444460;
+    background: #e06a5f;
+    box-shadow:
+      0 0 0 2px color-mix(in srgb, #e06a5f 18%, transparent),
+      0 0 6px color-mix(in srgb, #e06a5f 40%, transparent);
+  }
+
+  @keyframes nav-dot-pulse {
+    0%, 100% {
+      box-shadow:
+        0 0 0 2px color-mix(in srgb, #f0b93f 22%, transparent),
+        0 0 8px color-mix(in srgb, #f0b93f 55%, transparent);
+    }
+    50% {
+      box-shadow:
+        0 0 0 4px color-mix(in srgb, #f0b93f 10%, transparent),
+        0 0 14px color-mix(in srgb, #f0b93f 40%, transparent);
+    }
   }
 </style>
