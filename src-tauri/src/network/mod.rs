@@ -346,7 +346,7 @@ fn drain_active_source_overflow(
             state.active_source_senders.remove(&transfer_id);
             state.active_source_overflow.remove(&transfer_id);
             state.active_kad_search_state.remove(&transfer_id);
-            state.download_source_searches.retain(|_, tid| tid != &transfer_id);
+            state.download_source_searches.retain(|_, (tid, _)| tid != &transfer_id);
             continue;
         }
 
@@ -529,7 +529,7 @@ fn inject_source_into_active_transfers(
         state.active_source_senders.remove(transfer_id);
         state.active_source_overflow.remove(transfer_id);
         state.active_kad_search_state.remove(transfer_id);
-        state.download_source_searches.retain(|_, tid| tid != transfer_id);
+        state.download_source_searches.retain(|_, (tid, _)| tid != transfer_id);
     }
 
     let hash_hex = hex::encode(file_hash);
@@ -1113,8 +1113,12 @@ struct NetworkState {
     /// 750ms intervals (eMule UDPSEARCHSPEED = SEC2MS(3)/4).
     udp_search_queue: VecDeque<(Vec<u8>, std::net::SocketAddr)>,
     pending_source_searches: HashMap<SearchId, oneshot::Sender<Vec<(String, u16)>>>,
-    /// Source searches tied to pending downloads (search_id -> transfer_id)
-    download_source_searches: HashMap<SearchId, String>,
+    /// Source searches tied to pending downloads (search_id -> (transfer_id, file_hash_md4)).
+    /// File hash is carried alongside so the search-completion handler can build
+    /// CallbackReqs / inject sources without re-reading `pending_downloads`, which
+    /// gets consumed the moment `try_start_from_known` promotes a transfer to
+    /// active (server returned sources first).
+    download_source_searches: HashMap<SearchId, (String, [u8; 16])>,
     /// Downloads waiting for sources (transfer_id -> PendingDownload)
     pending_downloads: HashMap<String, PendingDownload>,
     data_dir: PathBuf,
@@ -1827,8 +1831,7 @@ fn kad_searches_snapshot(state: &NetworkState) -> Vec<KadSearchInfo> {
                 SearchType::FindSource { .. } => state
                     .download_source_searches
                     .get(sid)
-                    .and_then(|tid| state.pending_downloads.get(tid))
-                    .map(|pd| pd.file_name.clone())
+                    .and_then(|(tid, _)| state.pending_downloads.get(tid).map(|pd| pd.file_name.clone()))
                     .unwrap_or_else(|| "Source Search".to_string()),
                 SearchType::FindBuddy => "Find Buddy".to_string(),
                 _ => String::new(),
@@ -3083,7 +3086,7 @@ pub async fn start_network(
                         }
                     }
                     let stale_sids: Vec<SearchId> = state.download_source_searches.iter()
-                        .filter(|(_, tid)| *tid == transfer_id)
+                        .filter(|(_, (tid, _))| tid == transfer_id)
                         .map(|(sid, _)| *sid)
                         .collect();
                     for sid in &stale_sids {
@@ -3261,7 +3264,7 @@ pub async fn start_network(
                     // Cancel stale KAD source searches so they don't waste
                     // bandwidth while the download is re-queued.
                     let stale_sids: Vec<SearchId> = state.download_source_searches.iter()
-                        .filter(|(_, tid)| *tid == transfer_id)
+                        .filter(|(_, (tid, _))| tid == transfer_id)
                         .map(|(sid, _)| *sid)
                         .collect();
                     for sid in &stale_sids {
@@ -4513,7 +4516,7 @@ pub async fn start_network(
                                 }
                             }
                         }
-                    } else if let Some(transfer_id) = state.download_source_searches.remove(&sid) {
+                    } else if let Some((transfer_id, search_file_hash)) = state.download_source_searches.remove(&sid) {
                         let kad_sources = if let Some(search) = state.search_manager.get(&sid) {
                             extract_kad_sources(&search.results)
                         } else {
@@ -4560,39 +4563,14 @@ pub async fn start_network(
                             "count": total_kad_sources,
                         }));
 
-                        // Resolve file hash for downstream CallbackReq / source
-                        // injection use. Primary source is
-                        // `pending_downloads[transfer_id].file_hash` (raw md4
-                        // from the db). Fallback is the active KAD search's
-                        // target, but search.target is stored as a KadId
-                        // (the md4 with each 4-byte word byte-reversed, see
-                        // `md4_bytes_to_kad_id`) — we must reverse that back
-                        // to the wire md4 format before using it, or we send
-                        // a corrupted hash in CallbackReq that no peer
-                        // recognises. Previously this fallback handed the raw
-                        // KadId bytes out as if they were md4, which sent
-                        // byte-permuted hashes on the wire and made every
-                        // fallback-path callback silently fail.
-                        let resolved_file_hash: Option<[u8; 16]> = state
-                            .pending_downloads
-                            .get(&transfer_id)
-                            .and_then(|pd| hex::decode(&pd.file_hash).ok())
-                            .and_then(|b| if b.len() == 16 { let mut a = [0u8;16]; a.copy_from_slice(&b); Some(a) } else { None })
-                            .or_else(|| {
-                                state
-                                    .search_manager
-                                    .get(&sid)
-                                    .map(|s| {
-                                        warn!(
-                                            "File hash fallback for transfer {}: using KAD search target (pending_downloads missed)",
-                                            transfer_id
-                                        );
-                                        kad_id_to_md4_bytes(&s.target)
-                                    })
-                            });
-                        if resolved_file_hash.is_none() {
-                            warn!("Could not resolve file hash for KAD source search {} (transfer {})", sid.0, transfer_id);
-                        }
+                        // File hash is carried in `download_source_searches`
+                        // alongside the transfer_id — it was captured when
+                        // the search was started and no longer depends on
+                        // `pending_downloads` (which is consumed by
+                        // `try_start_from_known` the moment server-side
+                        // sources arrive, leaving in-flight KAD searches
+                        // orphaned under the old design).
+                        let resolved_file_hash: Option<[u8; 16]> = Some(search_file_hash);
 
                         // Send KADEMLIA_CALLBACK_REQ for buddy-backed callback sources.
                         if !callback_sources.is_empty() {
@@ -5586,6 +5564,8 @@ pub async fn start_network(
                             };
 
                             let mut did_search = false;
+                            let mut file_hash_arr = [0u8; 16];
+                            file_hash_arr.copy_from_slice(&hash_bytes[..16]);
 
                             if kad_started < MAX_INITIAL_KAD {
                                 let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
@@ -5597,7 +5577,7 @@ pub async fn start_network(
                                         closest,
                                     );
                                     if sid != SearchId(0) {
-                                        state.download_source_searches.insert(sid, tid.clone());
+                                        state.download_source_searches.insert(sid, (tid.clone(), file_hash_arr));
                                         kad_started += 1;
                                         did_search = true;
                                     }
@@ -6754,7 +6734,7 @@ pub async fn start_network(
                     for tid in &to_cancel {
                         if let Some(_pending) = state.pending_downloads.remove(tid) {
                             let stale_sids: Vec<SearchId> = state.download_source_searches.iter()
-                                .filter(|(_, t)| *t == tid)
+                                .filter(|(_, (t, _))| t == tid)
                                 .map(|(sid, _)| *sid)
                                 .collect();
                             for sid in &stale_sids {
@@ -7308,6 +7288,8 @@ pub async fn start_network(
                     };
 
                     let mut did_search = false;
+                    let mut fh = [0u8; 16];
+                    fh.copy_from_slice(&hash_bytes);
 
                     if kad_available && kad_searches_started < MAX_KAD_SEARCHES_PER_TICK {
                         let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
@@ -7319,7 +7301,7 @@ pub async fn start_network(
                                 closest,
                             );
                             if sid != SearchId(0) {
-                                state.download_source_searches.insert(sid, tid.clone());
+                                state.download_source_searches.insert(sid, (tid.clone(), fh));
                                 kad_searches_started += 1;
                                 did_search = true;
                             }
@@ -7327,9 +7309,6 @@ pub async fn start_network(
                             debug!("Routing table empty for retry of {tid}, continuing with server-only source refresh");
                         }
                     }
-
-                    let mut fh = [0u8; 16];
-                    fh.copy_from_slice(&hash_bytes);
                     let src_count = {
                         let sm = source_manager.read().await;
                         sm.source_count(&fh)
@@ -7441,7 +7420,7 @@ pub async fn start_network(
                                 closest,
                             );
                             if sid != SearchId(0) {
-                                state.download_source_searches.insert(sid, tid.clone());
+                                state.download_source_searches.insert(sid, (tid.clone(), fh));
                                 kad_searches_started += 1;
                                 active_kad_started += 1;
                                 let entry = state.active_kad_search_state.entry(tid.clone()).or_insert((0, 0));
@@ -9934,9 +9913,12 @@ pub async fn start_network(
                         let name = match search.search_type {
                             SearchType::FindKeyword => "Keyword Search".to_string(),
                             SearchType::FindSource { .. } => {
+                                // pending_downloads may have been consumed
+                                // already by `try_start_from_known`; fall
+                                // back to whatever the transfer manager
+                                // knows for a display-name.
                                 state.download_source_searches.get(sid)
-                                    .and_then(|tid| state.pending_downloads.get(tid))
-                                    .map(|pd| pd.file_name.clone())
+                                    .and_then(|(tid, _)| state.pending_downloads.get(tid).map(|pd| pd.file_name.clone()))
                                     .unwrap_or_else(|| "Source Search".to_string())
                             }
                             SearchType::FindBuddy => "Find Buddy".to_string(),
@@ -12563,7 +12545,7 @@ async fn handle_command(
 
             // Find and stop all active KAD source searches for this transfer
             let search_ids: Vec<SearchId> = state.download_source_searches.iter()
-                .filter(|(_, tid)| *tid == &transfer_id)
+                .filter(|(_, (tid, _))| tid == &transfer_id)
                 .map(|(sid, _)| *sid)
                 .collect();
             for sid in &search_ids {
@@ -12659,7 +12641,7 @@ async fn handle_command(
             // starting them until resumed. (L4: earlier comment wrongly
             // said paused downloads are "removed from pending_downloads".)
             let in_flight = state.download_source_searches.values()
-                .filter(|tid| *tid == &transfer_id)
+                .filter(|(tid, _)| tid == &transfer_id)
                 .count();
 
             info!(
@@ -12861,7 +12843,9 @@ async fn handle_command(
                         closest,
                     );
                     if sid != SearchId(0) {
-                        state.download_source_searches.insert(sid, transfer_id.clone());
+                        let mut fh = [0u8; 16];
+                        fh.copy_from_slice(&hash_bytes[..16]);
+                        state.download_source_searches.insert(sid, (transfer_id.clone(), fh));
                         stats_manager.add_overhead(crate::storage::statistics::OverheadCategory::FileRequest, crate::storage::statistics::OverheadDirection::Upload, 48);
                         info!("Started source search {} for download {}", sid.0, transfer_id);
                         let _ = app_handle.emit("transfer:source-search", serde_json::json!({
