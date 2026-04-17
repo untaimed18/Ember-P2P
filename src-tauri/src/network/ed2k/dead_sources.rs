@@ -20,6 +20,12 @@ pub const SOURCECLIENTREASKS_SECS: i64 = 2400;
 pub const DOWNLOADTIMEOUT_SECS: i64 = 100;
 /// Cleanup interval (5 minutes)
 const CLEANUP_INTERVAL_SECS: i64 = 300;
+/// D14: hard caps on map size. A long-running session with heavy churn
+/// (buggy swarms, IP filtering, mass failures) can otherwise grow these
+/// maps without bound. When we exceed the cap, oldest-expiring entries
+/// are dropped first — they're closest to becoming usable again anyway.
+const MAX_GLOBAL_DEAD_ENTRIES: usize = 20_000;
+const MAX_PER_FILE_DEAD_ENTRIES: usize = 20_000;
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 struct DeadSourceKey {
@@ -56,6 +62,39 @@ impl DeadSourceList {
         }
     }
 
+    /// Drop the soonest-to-expire entries until `self.sources` is under
+    /// `MAX_GLOBAL_DEAD_ENTRIES`. Used when cleanup alone can't keep up
+    /// (e.g. steady churn of new dead sources before any prior ones expire).
+    fn evict_global_overflow(&mut self) {
+        while self.sources.len() > MAX_GLOBAL_DEAD_ENTRIES {
+            if let Some((oldest_key, _)) = self
+                .sources
+                .iter()
+                .min_by_key(|(_, expiry)| **expiry)
+                .map(|(k, v)| (k.clone(), *v))
+            {
+                self.sources.remove(&oldest_key);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn evict_per_file_overflow(&mut self) {
+        while self.per_file.len() > MAX_PER_FILE_DEAD_ENTRIES {
+            if let Some((oldest_key, _)) = self
+                .per_file
+                .iter()
+                .min_by_key(|(_, expiry)| **expiry)
+                .map(|(k, v)| (k.clone(), *v))
+            {
+                self.per_file.remove(&oldest_key);
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Add a source to the global dead list.
     pub fn add_dead_source(&mut self, client_id: u32, ip: u32, port: u16, firewalled: bool) {
         let now = chrono::Utc::now().timestamp();
@@ -68,6 +107,7 @@ impl DeadSourceList {
         if now - self.last_cleanup > CLEANUP_INTERVAL_SECS {
             self.cleanup();
         }
+        self.evict_global_overflow();
     }
 
     /// Add a source to the per-file dead list (longer timeout, file-specific failure).
@@ -81,6 +121,7 @@ impl DeadSourceList {
         if now - self.last_cleanup > CLEANUP_INTERVAL_SECS {
             self.cleanup();
         }
+        self.evict_per_file_overflow();
     }
 
     /// Add a source to the per-file dead list with a shorter cooldown for
@@ -98,6 +139,7 @@ impl DeadSourceList {
         if now - self.last_cleanup > CLEANUP_INTERVAL_SECS {
             self.cleanup();
         }
+        self.evict_per_file_overflow();
     }
 
     /// Check if a source is dead globally (any file).
@@ -162,5 +204,62 @@ impl DeadSourceList {
     pub fn remove_for_file(&mut self, file_hash: &[u8; 16], ip: u32, port: u16) {
         let key = PerFileDeadKey { file_hash: *file_hash, ip, port };
         self.per_file.remove(&key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file_hash(b: u8) -> [u8; 16] { [b; 16] }
+
+    /// L6: a freshly added source is seen as dead until its window expires.
+    #[test]
+    fn add_and_check_global_dead() {
+        let mut d = DeadSourceList::new();
+        d.add_dead_source(0, 0x01020304, 4662, false);
+        assert!(d.is_dead_source(0, 0x01020304, 4662));
+        assert!(!d.is_dead_source(0, 0x01020305, 4662));
+    }
+
+    /// L6: per-file block set doesn't leak into other files.
+    #[test]
+    fn per_file_isolation() {
+        let mut d = DeadSourceList::new();
+        d.add_dead_source_for_file(file_hash(1), 0x11223344, 4662);
+        assert!(d.is_dead_source_for_file(&file_hash(1), 0x11223344, 4662));
+        assert!(!d.is_dead_source_for_file(&file_hash(2), 0x11223344, 4662));
+    }
+
+    /// L6 / D14: adding past `MAX_GLOBAL_DEAD_ENTRIES` does not grow the
+    /// global map without bound — the oldest-expiring entries are evicted.
+    #[test]
+    fn global_evicts_oldest_when_at_cap() {
+        let mut d = DeadSourceList::new();
+        for i in 0..(MAX_GLOBAL_DEAD_ENTRIES + 50) as u32 {
+            d.add_dead_source(0, i, 4662, false);
+        }
+        assert!(d.sources.len() <= MAX_GLOBAL_DEAD_ENTRIES);
+    }
+
+    /// L6 / D14: per-file map also caps.
+    #[test]
+    fn per_file_evicts_oldest_when_at_cap() {
+        let mut d = DeadSourceList::new();
+        for i in 0..(MAX_PER_FILE_DEAD_ENTRIES + 25) as u32 {
+            d.add_dead_source_for_file(file_hash(0), i, 4662);
+        }
+        assert!(d.per_file.len() <= MAX_PER_FILE_DEAD_ENTRIES);
+    }
+
+    /// L6: transient failures use the shorter cooldown, so a peer marked
+    /// dead once transiently is still covered but has less penalty than
+    /// a permanent failure. This test just asserts behaviour is consistent
+    /// (entry present after add).
+    #[test]
+    fn transient_entry_registers() {
+        let mut d = DeadSourceList::new();
+        d.add_transient_dead_source_for_file(file_hash(7), 0xFFEEDDCC, 4662);
+        assert!(d.is_dead_source_for_file(&file_hash(7), 0xFFEEDDCC, 4662));
     }
 }

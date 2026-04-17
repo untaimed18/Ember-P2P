@@ -18,11 +18,26 @@ const FT_GAPSTART: u8 = 0x09;
 const FT_GAPEND: u8 = 0x0A;
 const FT_TRANSFERRED: u8 = 0x08;
 const FT_STATUS: u8 = 0x14;
+/// Ember-private tag: per-part MD4 verified bitmap.
+/// eMule ignores unknown tag IDs, so this is safe as a forward-compatible
+/// extension. Encoded as a BLOB: first byte = byte count, then the raw
+/// bitmap bytes (LSB-first per byte).
+const FT_EMBER_VERIFIED_BITMAP: u8 = 0xEB;
 
 /// eMule tag types
 const TAGTYPE_UINT32: u8 = 0x03;
 const TAGTYPE_UINT64: u8 = 0x0B;
 const TAGTYPE_STRING: u8 = 0x02;
+const TAGTYPE_BLOB: u8 = 0x07;
+
+/// Hard cap on byte-gap list fragmentation. A hostile peer (or a long
+/// adversarial session) can split the gap list into O(n) tiny intervals
+/// by sending 1-byte chunks; every extra gap costs two tags in .part.met,
+/// so unbounded fragmentation blows up the metadata file. When we exceed
+/// this limit, small filled-between-two-gaps runs are re-invalidated to
+/// merge neighbouring gaps (they'll be re-requested, cheap on the wire,
+/// compared with an unusable .part.met).
+const MAX_GAP_ENTRIES: usize = 8192;
 
 /// Byte-level gap list matching eMule's CPartFile::m_gaplist.
 /// Each gap is a (start, end_exclusive) byte range that has NOT been received.
@@ -40,6 +55,19 @@ pub struct PartTracker {
     file_name: String,
     /// MD4 hashes for each part (stored in .part.met for eMule compatibility)
     part_hashes: Vec<[u8; 16]>,
+    /// Per-part MD4-verified flag. True only after the part's bytes fully
+    /// arrived AND `part_hashes[i]` matched (or for a single-part file,
+    /// after the file-level ed2k hash matched). Reset to false by
+    /// `mark_incomplete`, `invalidate_range`, or any gap change that
+    /// re-opens part bytes. Persisted via `FT_EMBER_VERIFIED_BITMAP` so a
+    /// resume after restart does not re-mark bytes as safe-to-upload until
+    /// the download verifies them again. `len() == part_count`.
+    part_verified: Vec<bool>,
+    /// Set when the final full-file ed2k hash passed; implies every part is
+    /// verified even when `part_hashes` is empty (single-part files).
+    /// Saved in `.part.met` only transiently — completion normally deletes
+    /// the `.met` via `delete_met()` before the next process start.
+    file_hash_verified: bool,
 }
 
 impl PartTracker {
@@ -61,6 +89,8 @@ impl PartTracker {
             file_hash: [0u8; 16],
             file_name: String::new(),
             part_hashes: Vec::new(),
+            part_verified: vec![false; part_count],
+            file_hash_verified: false,
         };
 
         tracker.load();
@@ -85,6 +115,8 @@ impl PartTracker {
             file_hash: [0u8; 16],
             file_name: String::new(),
             part_hashes: Vec::new(),
+            part_verified: vec![false; part_count],
+            file_hash_verified: false,
         }
     }
 
@@ -120,11 +152,77 @@ impl PartTracker {
     pub fn mark_incomplete(&mut self, part_idx: usize) {
         let (start, end) = self.part_range(part_idx);
         self.add_gap(start, end);
+        if part_idx < self.part_verified.len() {
+            self.part_verified[part_idx] = false;
+        }
+    }
+
+    /// Part has been fully received AND its MD4 hash was verified against
+    /// the authoritative hashset (or for a single-part file, the whole-file
+    /// ed2k hash passed — see `mark_file_hash_verified`). Callers that
+    /// serve bytes to peers MUST gate on this, not on `is_part_complete`,
+    /// to avoid re-uploading unverified (potentially corrupt) chunks.
+    pub fn is_part_verified(&self, part_idx: usize) -> bool {
+        part_idx < self.part_verified.len() && self.part_verified[part_idx]
+    }
+
+    /// Flip `part_verified[idx]` to `true`. Call this ONLY after the part's
+    /// MD4 matched `part_hashes[idx]` (or after the whole-file hash passed,
+    /// in which case `mark_file_hash_verified` is preferred for clarity).
+    pub fn set_part_verified(&mut self, part_idx: usize) {
+        if part_idx < self.part_verified.len() {
+            self.part_verified[part_idx] = true;
+        }
+    }
+
+    /// Return true iff every part overlapping `[start, end)` is both
+    /// complete and verified — the gate the upload path uses before
+    /// serving bytes back to peers.
+    pub fn is_range_safe_to_serve(&self, start: u64, end: u64) -> bool {
+        if start >= end || end > self.file_size || self.part_count == 0 {
+            return false;
+        }
+        let first = (start / PARTSIZE) as usize;
+        let last = ((end - 1) / PARTSIZE) as usize;
+        for p in first..=last.min(self.part_count - 1) {
+            if !self.is_part_complete(p) || !self.is_part_verified(p) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Per-part verified bitmap (diagnostics / tests).
+    #[allow(dead_code)]
+    pub fn verified_parts(&self) -> Vec<bool> {
+        self.part_verified.clone()
+    }
+
+    /// Mark every part as verified because the whole-file ed2k hash matched.
+    /// Used for < PARTSIZE single-part files (no hashset) and as a
+    /// belt-and-braces check after final file verification on any file.
+    pub fn mark_file_hash_verified(&mut self) {
+        self.file_hash_verified = true;
+        for flag in self.part_verified.iter_mut() {
+            *flag = true;
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn file_hash_verified(&self) -> bool {
+        self.file_hash_verified
     }
 
     /// Mark a byte range as not received (e.g. AICH-identified bad 180 KiB blocks inside a part).
     pub fn invalidate_range(&mut self, start: u64, end: u64) {
         self.add_gap(start, end);
+        if start < end && end <= self.file_size && !self.part_verified.is_empty() {
+            let first = (start / PARTSIZE) as usize;
+            let last = ((end - 1) / PARTSIZE) as usize;
+            for p in first..=last.min(self.part_count.saturating_sub(1)) {
+                self.part_verified[p] = false;
+            }
+        }
     }
 
     /// Record that bytes in [start, end) have been received.
@@ -150,7 +248,38 @@ impl PartTracker {
             }
         }
         self.gaps = new_gaps;
+        // Bound gap-list fragmentation (defense-in-depth against hostile
+        // peers that split the gap list with tiny fills). If we exceed
+        // MAX_GAP_ENTRIES, find the smallest filled-between-two-gaps run
+        // and re-invalidate it to merge its neighbours. Repeat until back
+        // under the cap. The coalesced bytes will be re-requested and any
+        // affected parts lose their `verified` flag, which is correct.
+        while self.gaps.len() > MAX_GAP_ENTRIES {
+            let Some(merge_idx) = self.find_smallest_coalesce_candidate() else { break };
+            let filled_start = self.gaps[merge_idx].1;
+            let filled_end = self.gaps[merge_idx + 1].0;
+            if filled_start >= filled_end { break; }
+            self.invalidate_range(filled_start, filled_end);
+        }
         newly_filled
+    }
+
+    /// Find the index `i` such that the filled span between `gaps[i]` and
+    /// `gaps[i + 1]` is the smallest — re-invalidating that span merges
+    /// two gaps into one with the smallest possible re-download cost.
+    /// Returns `None` if there are fewer than two gaps (nothing to merge).
+    fn find_smallest_coalesce_candidate(&self) -> Option<usize> {
+        if self.gaps.len() < 2 { return None; }
+        let mut best: Option<(usize, u64)> = None;
+        for i in 0..self.gaps.len() - 1 {
+            let gap_between = self.gaps[i + 1].0.saturating_sub(self.gaps[i].1);
+            match best {
+                None => best = Some((i, gap_between)),
+                Some((_, cur)) if gap_between < cur => best = Some((i, gap_between)),
+                _ => {}
+            }
+        }
+        best.map(|(i, _)| i)
     }
 
     /// Add a gap (mark bytes in [start, end) as missing). Merges with adjacent gaps.
@@ -312,6 +441,22 @@ impl PartTracker {
                 tag_count += 2;
             }
 
+            // Ember-private: per-part verified bitmap. eMule-family clients
+            // skip unknown tag IDs, so this extends the format without
+            // breaking interop. Omitted when nothing is verified yet — saves
+            // a tag on fresh downloads.
+            if self.part_verified.iter().any(|&v| v) {
+                let byte_count = (self.part_verified.len() + 7) / 8;
+                let mut bitmap = vec![0u8; byte_count];
+                for (i, &v) in self.part_verified.iter().enumerate() {
+                    if v {
+                        bitmap[i / 8] |= 1u8 << (i % 8);
+                    }
+                }
+                write_blob_tag(&mut cur, FT_EMBER_VERIFIED_BITMAP, &bitmap)?;
+                tag_count += 1;
+            }
+
             cur.seek(SeekFrom::Start(tag_count_pos as u64))?;
             cur.write_u32::<LittleEndian>(tag_count)?;
         }
@@ -436,6 +581,7 @@ impl PartTracker {
         let mut gap_starts: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
         let mut gap_ends: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
         let mut file_size_from_tags: Option<u64> = None;
+        let mut verified_bitmap_bytes: Option<Vec<u8>> = None;
         let mut tags_parsed: u32 = 0;
 
         for _ in 0..tag_count {
@@ -458,6 +604,7 @@ impl PartTracker {
                                 tracing::warn!("part.met: duplicate gap end index {idx} (was {prev}, now {val})");
                             }
                         }
+                        MetTag::VerifiedBitmap(bytes) => { verified_bitmap_bytes = Some(bytes); }
                         MetTag::Unknown => {}
                     }
                 },
@@ -535,10 +682,26 @@ impl PartTracker {
         }
         self.gaps = merged;
 
+        // Restore Ember-private per-part verified bitmap. Any bit that
+        // refers to a part that is currently incomplete is dropped — a part
+        // can only be "verified" if it's also fully present. This prevents a
+        // stale bitmap (e.g. .part hand-edited, .part.met survived a partial
+        // rewrite) from letting us serve unverified bytes to uploads.
+        if let Some(bytes) = verified_bitmap_bytes {
+            self.part_verified = vec![false; self.part_count];
+            for i in 0..self.part_count {
+                let byte = bytes.get(i / 8).copied().unwrap_or(0);
+                if byte & (1u8 << (i % 8)) != 0 && self.is_part_complete(i) {
+                    self.part_verified[i] = true;
+                }
+            }
+        }
+
         tracing::info!(
-            "Loaded eMule part.met: {} parts, {} completed, {} gaps ({} bytes remaining)",
+            "Loaded eMule part.met: {} parts, {} completed, {} verified, {} gaps ({} bytes remaining)",
             self.part_count,
             self.completed_count(),
+            self.part_verified.iter().filter(|v| **v).count(),
             self.gaps.len(),
             self.file_size.saturating_sub(self.completed_bytes()),
         );
@@ -576,6 +739,8 @@ enum MetTag {
     FileName(String),
     GapStart(usize, u64),
     GapEnd(usize, u64),
+    /// Ember-private per-part verified bitmap (LSB-first per byte).
+    VerifiedBitmap(Vec<u8>),
     Unknown,
 }
 
@@ -623,9 +788,18 @@ fn read_emule_tag(cursor: &mut Cursor<&[u8]>, _use_large: bool) -> anyhow::Resul
         }
         0x07 => {
             let blen = cursor.read_u32::<LittleEndian>()? as u64;
-            let new_pos = cursor.position().checked_add(blen)
+            let start_pos = cursor.position();
+            let new_pos = start_pos.checked_add(blen)
                 .filter(|&p| p <= cursor.get_ref().len() as u64)
                 .ok_or_else(|| anyhow::anyhow!("blob tag length exceeds data boundary"))?;
+            // Recognize the Ember-private verified-bitmap blob tag here so
+            // we can restore the verified set on resume. Cap the read size
+            // to 1 MiB (enough for 8 million parts — far beyond any real file).
+            if name_len == 1 && name_buf[0] == FT_EMBER_VERIFIED_BITMAP && blen <= 1_000_000 {
+                let mut buf = vec![0u8; blen as usize];
+                cursor.read_exact(&mut buf)?;
+                return Ok(MetTag::VerifiedBitmap(buf));
+            }
             cursor.set_position(new_pos);
             return Ok(MetTag::Unknown);
         }
@@ -708,6 +882,18 @@ fn write_string_tag(w: &mut impl Write, tag_id: u8, value: &str) -> anyhow::Resu
     let clamped = &bytes[..bytes.len().min(u16::MAX as usize)];
     w.write_u16::<LittleEndian>(clamped.len() as u16)?;
     w.write_all(clamped)?;
+    Ok(())
+}
+
+/// eMule TAGTYPE_BLOB: u32 length + bytes (for the Ember-private verified bitmap tag).
+fn write_blob_tag(w: &mut impl Write, tag_id: u8, data: &[u8]) -> anyhow::Result<()> {
+    w.write_u8(TAGTYPE_BLOB)?;
+    w.write_u16::<LittleEndian>(1)?;
+    w.write_u8(tag_id)?;
+    let len = u32::try_from(data.len())
+        .map_err(|_| anyhow::anyhow!("blob tag payload too large ({} bytes)", data.len()))?;
+    w.write_u32::<LittleEndian>(len)?;
+    w.write_all(data)?;
     Ok(())
 }
 

@@ -1833,8 +1833,14 @@
               {#if selectedDlTransfer.status === 'active' || selectedDlTransfer.progress > 0}
                 <div class="detail-row"><strong>Progress:</strong> {selectedDlTransfer.progress.toFixed(1)}% ({formatSize(selectedDlTransfer.transferred)} / {formatSize(selectedDlTransfer.total_size)})</div>
               {/if}
-              {#if selectedDlTransfer.speed > 0}
-                <div class="detail-row"><strong>Speed:</strong> {formatSpeed(selectedDlTransfer.speed)}</div>
+              <!--
+                D35: show speed for active rows even when `speed === 0`
+                (brief scheduling gaps) so the panel matches the behaviour
+                of the transfers page EWMA-backed cells. Falls back to
+                "—" so the user can see speed is intentionally zero.
+              -->
+              {#if selectedDlTransfer.status === 'active' || selectedDlTransfer.speed > 0}
+                <div class="detail-row"><strong>Speed:</strong> {selectedDlTransfer.speed > 0 ? formatSpeed(selectedDlTransfer.speed) : '—'}</div>
               {/if}
               {#if selectedDlTransfer.sources > 0}
                 <div class="detail-row"><strong>Sources:</strong> {selectedDlTransfer.active_sources || 0} active / {selectedDlTransfer.sources} total</div>

@@ -33,6 +33,51 @@ function isMoreAdvancedStatus(eventStatus: string, apiStatus: string): boolean {
   return (STATUS_PRIORITY[eventStatus] ?? 0) > (STATUS_PRIORITY[apiStatus] ?? 0);
 }
 
+/** Known backend Transfer statuses. Used to runtime-narrow event payloads
+ *  before casting to `Transfer['status']`, so an unexpected backend string
+ *  can never silently widen TypeScript's view of truth (D31). */
+const KNOWN_STATUSES = new Set<Transfer['status']>([
+  'searching',
+  'queued',
+  'active',
+  'paused',
+  'stopped',
+  'hashing',
+  'insufficient',
+  'noneneeded',
+  'failed',
+  'verifying',
+  'completing',
+  'completed',
+]);
+
+function narrowStatus(raw: string | undefined): Transfer['status'] | undefined {
+  if (!raw) return undefined;
+  return (KNOWN_STATUSES as Set<string>).has(raw) ? (raw as Transfer['status']) : undefined;
+}
+
+/** Terminal statuses that must not be downgraded by later events. D30:
+ *  once a transfer is `completed`, a late `transfer-failed` must not flip
+ *  it back to `failed`, and vice versa. */
+const TERMINAL_STATUSES = new Set<Transfer['status']>(['completed', 'failed']);
+
+function isTerminal(s: Transfer['status']): boolean {
+  return TERMINAL_STATUSES.has(s);
+}
+
+/** Statuses for which `transfer-speed-decay` should actually update `speed`.
+ *  Paused / stopped / completed / failed rows are intentionally frozen so
+ *  the UI can show the last-known speed (or zero) without the decay ticker
+ *  stomping it. D5. */
+const SPEED_DECAY_APPLIES: ReadonlySet<Transfer['status']> = new Set<Transfer['status']>([
+  'active',
+  'searching',
+  'queued',
+  'verifying',
+  'completing',
+  'hashing',
+]);
+
 interface TransferEventPayload {
   id: string;
   error?: string;
@@ -155,27 +200,34 @@ export async function initTransferStore() {
       markEventUpdate();
       const id = event.payload.id;
       transfers.update((list) =>
-        list.map((t) =>
-          t.id === id ? { ...t, status: 'completed' as const, progress: 100, speed: 0, transferred: t.total_size, completed_size: t.total_size } : t
-        )
+        list.map((t) => {
+          if (t.id !== id) return t;
+          // D30: never flip a row already in a terminal state (e.g. late
+          // `transfer-complete` after a `transfer-failed`).
+          if (isTerminal(t.status) && t.status !== 'completed') return t;
+          return { ...t, status: 'completed' as const, progress: 100, speed: 0, transferred: t.total_size, completed_size: t.total_size };
+        })
       );
     }),
     listen<TransferEventPayload>('transfer-failed', (event) => {
       markEventUpdate();
       const { id, error, failure_kind, failure_stage } = event.payload;
       transfers.update((list) =>
-        list.map((t) =>
-          t.id === id
-            ? {
-                ...t,
-                status: 'failed' as const,
-                speed: 0,
-                failure_reason: error,
-                failure_kind,
-                failure_stage,
-              }
-            : t
-        )
+        list.map((t) => {
+          if (t.id !== id) return t;
+          // D30: don't downgrade a completed row to failed if a stray
+          // late-arriving failure event shows up. Treat `failed` -> `failed`
+          // as idempotent so kind/stage metadata can still refresh.
+          if (isTerminal(t.status) && t.status !== 'failed') return t;
+          return {
+            ...t,
+            status: 'failed' as const,
+            speed: 0,
+            failure_reason: error,
+            failure_kind,
+            failure_stage,
+          };
+        })
       );
     }),
     listen<TransferEventPayload & { status?: string }>(
@@ -201,7 +253,17 @@ export async function initTransferStore() {
           list.map((t) => {
             if (t.id !== id) return t;
             const updated = { ...t };
-            if (status) updated.status = status as Transfer['status'];
+            // D31: runtime-narrow the status string so an unexpected
+            // backend value can't widen the UI's type view.
+            const narrowed = narrowStatus(status);
+            if (narrowed) {
+              // D30: reject downgrades from a terminal state via a
+              // transfer-status event too. Completed/failed are sticky
+              // until an explicit reset (remove / cancel).
+              if (!(isTerminal(t.status) && t.status !== narrowed)) {
+                updated.status = narrowed;
+              }
+            }
             if (peer_id) {
               updated.peer_id = peer_id;
             }
@@ -243,7 +305,15 @@ export async function initTransferStore() {
       markEventUpdate();
       const { id, speed } = event.payload;
       transfers.update((list) =>
-        list.map((t) => (t.id === id ? { ...t, speed } : t))
+        list.map((t) => {
+          if (t.id !== id) return t;
+          // D5: only apply decay-driven speed updates to rows that are
+          // actually transferring. Paused / stopped / completed / failed
+          // rows keep their last-known speed (or zero) so the row doesn't
+          // flicker as the decay ticker fires.
+          if (!SPEED_DECAY_APPLIES.has(t.status)) return t;
+          return { ...t, speed };
+        })
       );
     }),
     listen<{ id: string; sources: number; active_sources: number; queued_sources: number }>(

@@ -1775,6 +1775,11 @@ impl Ed2kDownload {
                 let mut sent_idx: usize = 0;
                 let mut total_sent_bytes: u64 = 0;
                 let mut total_received: u64 = 0;
+                // D12: credits accrue only for bytes that end up in a
+                // verified part. `pending_credit_bytes` accumulates received
+                // bytes; on part verification we flush to the credit
+                // ledger, on mismatch we drop the tally.
+                let mut pending_credit_bytes: u64 = 0;
                 let mut consecutive_bad_blocks: u32 = 0;
                 const MAX_CONSECUTIVE_BAD_BLOCKS: u32 = 5;
 
@@ -1875,6 +1880,17 @@ impl Ed2kDownload {
                                 if opcode == OP_SENDINGPART_I64 {
                                     parse_sending_part_i64(&payload)?
                                 } else {
+                                    // D19: a 32-bit SENDINGPART cannot
+                                    // address past 4 GiB; refuse it for
+                                    // larger files so a mis-negotiated or
+                                    // malicious peer can't silently wrap
+                                    // the offset and corrupt the part.
+                                    if self.file_size > u32::MAX as u64 {
+                                        anyhow::bail!(
+                                            "peer sent 32-bit OP_SENDINGPART for a {}-byte file (requires I64)",
+                                            self.file_size
+                                        );
+                                    }
                                     parse_sending_part_32(&payload)?
                                 };
                             if hash != self.file_hash {
@@ -1932,10 +1948,8 @@ impl Ed2kDownload {
                             blocks_received_in_current_req += 1;
                             speed_measure_bytes += piece_len;
 
-                            if let Some(cm) = &self.credit_manager {
-                                let mut cm = cm.write().await;
-                                cm.add_downloaded(peer_user_hash, piece_len);
-                            }
+                            // D12: defer credit until the part verifies.
+                            pending_credit_bytes = pending_credit_bytes.saturating_add(piece_len);
 
                             let _ = event_tx
                                 .send(DownloadEvent::Progress {
@@ -2014,10 +2028,8 @@ impl Ed2kDownload {
                             blocks_received_in_current_req += 1;
                             speed_measure_bytes += piece_len;
 
-                            if let Some(cm) = &self.credit_manager {
-                                let mut cm = cm.write().await;
-                                cm.add_downloaded(peer_user_hash, piece_len);
-                            }
+                            // D12: defer credit until the part verifies.
+                            pending_credit_bytes = pending_credit_bytes.saturating_add(piece_len);
 
                             let _ = event_tx
                                 .send(DownloadEvent::Progress {
@@ -2393,6 +2405,13 @@ impl Ed2kDownload {
                         tracker.mark_incomplete(part_idx);
                         tracker.save();
                         downloaded = tracker.completed_bytes();
+                        // D12: drop the pending credit tally — bytes that
+                        // didn't verify earn this peer nothing. Silenced
+                        // unused_assignments (compiler can't see the
+                        // next-iteration read via saturating_add through
+                        // the nested `continue` control flow).
+                        #[allow(unused_assignments)]
+                        { pending_credit_bytes = 0; }
                         let _ = event_tx
                             .send(DownloadEvent::PartCorrupted {
                                 file_hash: self.file_hash,
@@ -2416,6 +2435,19 @@ impl Ed2kDownload {
 
                 if part_verified {
                     tracker.mark_complete(part_idx);
+                    // Flip the persistent verified flag so the upload path
+                    // can safely serve this range.
+                    tracker.set_part_verified(part_idx);
+                    // D12: flush the peer's pending credit bytes now that
+                    // the part they contributed to actually verified.
+                    if pending_credit_bytes > 0 {
+                        if let Some(cm) = &self.credit_manager {
+                            let mut cm = cm.write().await;
+                            cm.add_downloaded(peer_user_hash, pending_credit_bytes);
+                        }
+                        #[allow(unused_assignments)]
+                        { pending_credit_bytes = 0; }
+                    }
                 }
                 tracker.save();
             }
@@ -2539,7 +2571,11 @@ impl Ed2kDownload {
             );
         }
 
-        // Verification passed — safe to move file and clean up resume state
+        // Verification passed — safe to move file and clean up resume state.
+        // Flip every part's verified flag (covers single-part < PARTSIZE
+        // files that have no per-part hashset, and acts as a belt-and-braces
+        // reset for multi-part files).
+        tracker.mark_file_hash_verified();
         {
             let pp = part_path.clone();
             let fp = final_path.clone();
@@ -2557,6 +2593,11 @@ impl Ed2kDownload {
     }
 }
 
+/// Per-connection cap on concurrent in-flight compressed blocks. Mirrors
+/// the `multi_source.rs` constant and defends against a hostile peer
+/// opening many distinct `start` offsets to multiply our buffer memory.
+const MAX_PENDING_COMPRESSED_BLOCKS: usize = 16;
+
 fn append_compressed_chunk(
     pending: &mut HashMap<u64, PendingCompressedBlock>,
     start: u64,
@@ -2569,6 +2610,13 @@ fn append_compressed_chunk(
     }
     if total_packed > MAX_DECOMPRESSED_PART {
         anyhow::bail!("packed size {total_packed} exceeds limit");
+    }
+    if !pending.contains_key(&start) && pending.len() >= MAX_PENDING_COMPRESSED_BLOCKS {
+        anyhow::bail!(
+            "too many concurrent compressed blocks from peer ({} open, max {})",
+            pending.len(),
+            MAX_PENDING_COMPRESSED_BLOCKS
+        );
     }
     let entry = pending.entry(start).or_insert_with(|| PendingCompressedBlock {
         compressed_total_size: total_packed_size,

@@ -218,13 +218,21 @@ fn recover_zip(
                 continue;
             }
 
+            // D17: strip any leading `/`, backslashes, and `..` path
+            // components from the inner entry name before carrying it into
+            // the recovered archive. A malicious .zip inside the original
+            // file could otherwise encode zip-slip paths (e.g.
+            // `../../etc/cron.d/evil`) and whatever extractor the user
+            // runs later would place them outside the extraction root.
+            let safe_file_name = sanitize_zip_entry_name(&file_name);
+
             entries.push(ZipLocalEntry {
                 compressed_size,
                 uncompressed_size,
                 crc32,
                 method,
                 flags,
-                file_name,
+                file_name: safe_file_name,
                 extra,
                 mod_time,
                 mod_date,
@@ -319,6 +327,39 @@ fn recover_zip(
 
     output.flush()?;
     Ok(entries.len())
+}
+
+/// D17: rewrite an inner ZIP entry name so it cannot zip-slip when a
+/// downstream extractor writes it out. We:
+///   * strip any leading `/` or drive-letter prefix,
+///   * drop backslashes (Windows path separators — ZIP spec mandates `/`),
+///   * remove `..` path components so the name cannot escape the target,
+///   * remove NUL bytes and other control characters.
+/// The result is always a relative path (or a single filename). Empty
+/// names fall back to `_` to keep the archive structurally valid.
+fn sanitize_zip_entry_name(raw: &[u8]) -> Vec<u8> {
+    // Treat as UTF-8 lossily for component splitting; write out as bytes.
+    let as_str = String::from_utf8_lossy(raw);
+    let mut parts: Vec<String> = Vec::new();
+    for seg in as_str.split(|c: char| c == '/' || c == '\\') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            continue;
+        }
+        // Strip Windows drive-letter prefix on the first segment (e.g. "C:")
+        // and drop control characters / NULs defensively.
+        let cleaned: String = seg
+            .chars()
+            .filter(|c| *c != '\0' && !c.is_control() && *c != ':')
+            .collect();
+        if cleaned.is_empty() { continue; }
+        parts.push(cleaned);
+    }
+    let joined = parts.join("/");
+    if joined.is_empty() {
+        b"_".to_vec()
+    } else {
+        joined.into_bytes()
+    }
 }
 
 fn validate_zip_crc(

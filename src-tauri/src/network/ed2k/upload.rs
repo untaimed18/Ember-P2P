@@ -2498,13 +2498,17 @@ impl UploadHandler {
                         }
 
                         if let Some(tracker) = part_tracker.as_ref() {
-                            let overlaps_gap = tracker
-                                .gap_list()
-                                .iter()
-                                .any(|&(gs, ge)| gs < end && ge > start);
-                            if overlaps_gap {
+                            // Only serve bytes that are BOTH complete AND
+                            // MD4-verified. Serving unverified-but-complete
+                            // bytes would let corrupt blocks (hashset not yet
+                            // received, or bytes that happened to land on
+                            // disk before their part's hash check) propagate
+                            // back to peers. is_range_safe_to_serve covers
+                            // both checks; the old gap-only check missed
+                            // the verified-but-unchecked case.
+                            if !tracker.is_range_safe_to_serve(start, end) {
                                 warn!(
-                                    "Rejected upload of incomplete part-file range {}-{} for {}",
+                                    "Rejected upload of incomplete or unverified range {}-{} for {}",
                                     start,
                                     end,
                                     file_path.display()

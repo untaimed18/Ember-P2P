@@ -77,6 +77,13 @@ impl DownloadSourceEntry {
         }
     }
 
+    /// D10: maximum wall time a source is allowed to sit in `Connecting`
+    /// (or `Downloading`) before we consider the driving task dead and
+    /// reconsider the source. A healthy TCP handshake plus hashset
+    /// exchange is comfortably under a minute; anything longer is a
+    /// stuck slot or an aborted task. 120 s gives generous slack.
+    const CONNECTING_WATCHDOG_SECS: u64 = 120;
+
     /// eMule GetTimeUntilReask(): seconds until this source should be reasked.
     /// Returns 0 when the source is ready for a new connection attempt.
     pub fn time_until_reask(&self) -> u64 {
@@ -813,6 +820,46 @@ impl SourceManager {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// D11: return LowID sources for a file that are eligible for a
+    /// callback, grouped by the server they were announced through. Lets
+    /// the caller switch eMule servers on the fly (or talk to multiple
+    /// servers) without losing track of a LowID source that was only ever
+    /// seen through a different server.
+    ///
+    /// Returns `Vec<(server_ip, server_port, Vec<client_id>)>`.
+    #[allow(dead_code)]
+    pub fn get_lowid_sources_by_server(
+        &self,
+        file_hash: &[u8; 16],
+        min_interval_secs: i64,
+    ) -> Vec<(u32, u16, Vec<u32>)> {
+        let now = chrono::Utc::now().timestamp();
+        let entries = match self.sources.get(file_hash) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        let mut grouped: std::collections::HashMap<(u32, u16), Vec<u32>> =
+            std::collections::HashMap::new();
+        for e in entries {
+            if e.client_id == 0 { continue; }
+            if now.saturating_sub(e.last_seen) >= SOURCE_EXPIRY_SECS { continue; }
+            if e.server_ip == 0 || e.server_port == 0 { continue; }
+            if e.last_callback_at != 0
+                && now.saturating_sub(e.last_callback_at) < min_interval_secs
+            {
+                continue;
+            }
+            grouped
+                .entry((e.server_ip, e.server_port))
+                .or_default()
+                .push(e.client_id);
+        }
+        grouped
+            .into_iter()
+            .map(|((ip, port), ids)| (ip, port, ids))
+            .collect()
     }
 
     /// Record that OP_CALLBACKREQUEST was sent for a LowID source.

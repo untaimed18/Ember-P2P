@@ -21,7 +21,12 @@
 
   function countryFlagSrc(code: string | undefined): string | null {
     if (!code || code.length !== 2) return null;
-    return `/flags/${code.toLowerCase()}.svg`;
+    // L9: only a-z codes map to /flags/*.svg; anything else is bogus
+    // (e.g. backend sending "??" or a numeric code). Guard upfront so we
+    // don't emit a broken <img> that causes an on-screen alt-text flash.
+    const lower = code.toLowerCase();
+    if (!/^[a-z]{2}$/.test(lower)) return null;
+    return `/flags/${lower}.svg`;
   }
 
   function netOriginSrc(origin: string | undefined): string | null {
@@ -193,13 +198,32 @@
       const d = event.payload;
       if (d.transfer_id !== expandedTransferId) return;
       const idx = expandedSources.findIndex((s) => s.ip === d.ip && s.port === d.port);
+      const status = d.status as SourceInfo['status'];
+      // D28: if the backend now reports a terminal status for this source,
+      // drop it from the visible list rather than accumulating dead rows
+      // that stay until the user collapses and re-opens the drawer.
+      const isDead = status === 'failed';
       if (idx >= 0) {
-        const s = expandedSources[idx];
-        const updated: SourceInfo = { ...s, status: d.status as SourceInfo['status'], queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software || s.client_software, peer_name: d.peer_name || s.peer_name, available_parts: d.available_parts ?? s.available_parts, total_parts: d.total_parts ?? s.total_parts, country_code: d.country_code ?? s.country_code };
-        expandedSources[idx] = updated;
-        expandedSources = expandedSources;
-      } else {
-        expandedSources = [...expandedSources, { ip: d.ip, port: d.port, status: d.status as SourceInfo['status'], queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software, peer_name: d.peer_name || '', available_parts: d.available_parts, total_parts: d.total_parts, country_code: d.country_code } as SourceInfo];
+        if (isDead) {
+          expandedSources = expandedSources.filter((_, i) => i !== idx);
+        } else {
+          const s = expandedSources[idx];
+          const updated: SourceInfo = { ...s, status, queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software || s.client_software, peer_name: d.peer_name || s.peer_name, available_parts: d.available_parts ?? s.available_parts, total_parts: d.total_parts ?? s.total_parts, country_code: d.country_code ?? s.country_code };
+          expandedSources[idx] = updated;
+          expandedSources = expandedSources;
+        }
+      } else if (!isDead) {
+        // L16: cap the expanded list so a transfer with hundreds of
+        // sources doesn't grow the DOM indefinitely. Drop the oldest
+        // idle entry first, falling back to head-trim.
+        const MAX_EXPANDED = 200;
+        if (expandedSources.length >= MAX_EXPANDED) {
+          const victim = expandedSources.findIndex((s) => s.speed === 0 && s.status !== 'transferring');
+          const next = [...expandedSources];
+          if (victim >= 0) next.splice(victim, 1); else next.shift();
+          expandedSources = next;
+        }
+        expandedSources = [...expandedSources, { ip: d.ip, port: d.port, status, queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software, peer_name: d.peer_name || '', available_parts: d.available_parts, total_parts: d.total_parts, country_code: d.country_code } as SourceInfo];
       }
     }).then((u) => { if (mounted) sourceUnlisten = u; else u(); }).catch(() => { /* backend may not be up yet; the store also listens for the same event */ });
 
@@ -248,7 +272,22 @@
   }
   let confirmCancel: { open: boolean; id: string; name: string } = $state({ open: false, id: '', name: '' });
   let confirmClearCompleted = $state(false);
-  let completedCollapsed = $state(false);
+  // D27: confirmation + in-flight tracker for archive recovery, which
+  // can take noticeable time for large partials and isn't reversible.
+  let confirmRecover: { open: boolean; id: string; name: string } = $state({ open: false, id: '', name: '' });
+  let recoveringIds: Set<string> = $state(new Set());
+  // L14: persist the Completed-section collapsed state so it survives
+  // navigation. Falls back to expanded on first load or invalid storage.
+  const COMPLETED_COLLAPSED_KEY = 'transfers-completed-collapsed';
+  function loadCompletedCollapsed(): boolean {
+    try {
+      return localStorage.getItem(COMPLETED_COLLAPSED_KEY) === '1';
+    } catch { return false; }
+  }
+  let completedCollapsed = $state(loadCompletedCollapsed());
+  $effect(() => {
+    try { localStorage.setItem(COMPLETED_COLLAPSED_KEY, completedCollapsed ? '1' : '0'); } catch { /* ignore */ }
+  });
 
   // --- Source detail panel (eMule-style) ---
   let expandedTransferId: string | null = $state(null);
@@ -306,7 +345,16 @@
   let activeDownloads = $derived(allDownloads.filter(t => t.status !== 'completed' && t.status !== 'failed'));
   let completedDownloads = $derived(allDownloads.filter(t => t.status === 'completed' || t.status === 'failed'));
   let hasCompletedDl = $derived(completedDownloads.some(t => t.status === 'completed'));
-  let transferFilter = $state('');
+  // L14: persist the filter so switching tabs and returning doesn't
+  // wipe a user's narrow-down.
+  const FILTER_KEY = 'transfers-filter';
+  function loadFilter(): string {
+    try { return localStorage.getItem(FILTER_KEY) ?? ''; } catch { return ''; }
+  }
+  let transferFilter = $state(loadFilter());
+  $effect(() => {
+    try { localStorage.setItem(FILTER_KEY, transferFilter); } catch { /* ignore */ }
+  });
   let selectedDownloadIds = $state<string[]>([]);
   let selectedDlIdSet = $derived(new Set(selectedDownloadIds));
   let lastClickedDlId = $state<string | null>(null);
@@ -396,26 +444,58 @@
   const EWMA_ALPHA = 0.3;
   const SPEED_STALE_MS = 12_000;
 
-  function liveSpeed(t: Transfer): number {
+  // D8: EWMA updates run in a single $effect keyed on `$transfers`, not
+  // inside sort comparators / templates. Previously every call site
+  // mutated speedHistory as a side effect of reading, which made sort
+  // order sensitive to call order and complicated reasoning.
+  $effect(() => {
+    const list = $transfers;
     const now = Date.now();
-    let entry = speedHistory.get(t.id);
-    if (!entry) {
-      entry = { ewma: 0, lastTransferred: t.transferred, lastTime: now };
-      speedHistory.set(t.id, entry);
-      return t.speed > 0 ? t.speed : 0;
+    for (const t of list) {
+      const entry = speedHistory.get(t.id);
+      if (!entry) {
+        speedHistory.set(t.id, { ewma: 0, lastTransferred: t.transferred, lastTime: now });
+        continue;
+      }
+      const dt = (now - entry.lastTime) / 1000;
+      if (dt < 0.5) continue;
+      const bytesThisPeriod = t.transferred - entry.lastTransferred;
+      if (bytesThisPeriod > 0) {
+        const measuredSpeed = bytesThisPeriod / dt;
+        entry.ewma = EWMA_ALPHA * measuredSpeed + (1 - EWMA_ALPHA) * entry.ewma;
+        entry.lastTransferred = t.transferred;
+        entry.lastTime = now;
+      } else if (now - entry.lastTime > SPEED_STALE_MS) {
+        entry.ewma = 0;
+      }
     }
-    const dt = (now - entry.lastTime) / 1000;
-    if (dt < 0.5) return entry.ewma > 0 ? entry.ewma : (t.speed > 0 ? t.speed : 0);
-    const bytesThisPeriod = t.transferred - entry.lastTransferred;
-    if (bytesThisPeriod > 0) {
-      const measuredSpeed = bytesThisPeriod / dt;
-      entry.ewma = EWMA_ALPHA * measuredSpeed + (1 - EWMA_ALPHA) * entry.ewma;
-      entry.lastTransferred = t.transferred;
-      entry.lastTime = now;
-    } else if (now - entry.lastTime > SPEED_STALE_MS) {
-      entry.ewma = 0;
+  });
+
+  /** Read the latest EWMA for a transfer. Pure — does not mutate
+   *  speedHistory; updates happen in the $effect above. Falls back to the
+   *  backend-reported `t.speed` when no EWMA is recorded yet. */
+  function liveSpeed(t: Transfer): number {
+    const entry = speedHistory.get(t.id);
+    if (!entry) return t.speed > 0 ? t.speed : 0;
+    if (entry.ewma > 0) return entry.ewma;
+    return t.speed > 0 ? t.speed : 0;
+  }
+
+  /** D23: pick the progress-bar fill colour for a download row. Respects
+   *  both status (paused/stopped/verifying/completing/failed) and health
+   *  (stalled / degraded) so an active row with bad health doesn't still
+   *  render the healthy accent colour. */
+  function downloadProgressColor(t: Transfer): string {
+    if (t.status === 'failed') return 'var(--danger)';
+    if (t.status === 'paused' || t.status === 'stopped') return 'var(--warning)';
+    if (t.status === 'verifying' || t.status === 'completing' || t.status === 'completed') {
+      return 'var(--success, #2ecc71)';
     }
-    return entry.ewma;
+    if (t.status === 'active') {
+      if (t.health === 'stalled') return 'var(--danger)';
+      if (t.health === 'degraded') return 'var(--warning)';
+    }
+    return 'var(--accent)';
   }
 
   function etaSeconds(t: Transfer): number {
@@ -426,39 +506,43 @@
     return (t.total_size - completed) / speed;
   }
 
-  let sortedActiveDownloads = $derived.by(() => {
-    const sorted = [...activeDownloads];
-    sorted.sort((a, b) => {
-      let cmp = 0;
-      switch (dlSortField) {
-        case 'file_name': cmp = a.file_name.localeCompare(b.file_name); break;
-        case 'total_size': cmp = a.total_size - b.total_size; break;
-        case 'transferred': cmp = a.transferred - b.transferred; break;
-        case 'completed_size': cmp = (a.completed_size || 0) - (b.completed_size || 0); break;
-        case 'speed': {
-          // Match the row display: prefer EWMA `liveSpeed`, fall back to raw
-          // backend `t.speed` so sort order agrees with what's visible.
-          const la = liveSpeed(a), lb = liveSpeed(b);
-          cmp = (la > 0 ? la : a.speed) - (lb > 0 ? lb : b.speed);
-          break;
-        }
-        case 'progress': cmp = a.progress - b.progress; break;
-        case 'sources': cmp = a.sources - b.sources; break;
-        case 'priority': cmp = (priorityOrder[a.priority] ?? 2) - (priorityOrder[b.priority] ?? 2); break;
-        case 'status': cmp = (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9); break;
-        case 'remaining': {
-          const ea = etaSeconds(a), eb = etaSeconds(b);
-          cmp = (isFinite(ea) ? ea : Number.MAX_SAFE_INTEGER) - (isFinite(eb) ? eb : Number.MAX_SAFE_INTEGER);
-          break;
-        }
-        case 'last_seen_complete': cmp = (a.last_seen_complete ?? 0) - (b.last_seen_complete ?? 0); break;
-        case 'last_received': cmp = (a.last_received ?? 0) - (b.last_received ?? 0); break;
-        case 'category': cmp = (a.category || '').localeCompare(b.category || ''); break;
-        case 'started_at': cmp = a.started_at - b.started_at; break;
+  /** Shared download-sort comparator. D25 applies the same order to the
+   *  Completed section so the user's sort preference isn't silently
+   *  ignored for finished rows. */
+  function compareDownloads(a: Transfer, b: Transfer): number {
+    let cmp = 0;
+    switch (dlSortField) {
+      case 'file_name': cmp = a.file_name.localeCompare(b.file_name); break;
+      case 'total_size': cmp = a.total_size - b.total_size; break;
+      case 'transferred': cmp = a.transferred - b.transferred; break;
+      case 'completed_size': cmp = (a.completed_size || 0) - (b.completed_size || 0); break;
+      case 'speed': {
+        const la = liveSpeed(a), lb = liveSpeed(b);
+        cmp = (la > 0 ? la : a.speed) - (lb > 0 ? lb : b.speed);
+        break;
       }
-      return dlSortAsc ? cmp : -cmp;
-    });
-    return sorted;
+      case 'progress': cmp = a.progress - b.progress; break;
+      case 'sources': cmp = a.sources - b.sources; break;
+      case 'priority': cmp = (priorityOrder[a.priority] ?? 2) - (priorityOrder[b.priority] ?? 2); break;
+      case 'status': cmp = (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9); break;
+      case 'remaining': {
+        const ea = etaSeconds(a), eb = etaSeconds(b);
+        cmp = (isFinite(ea) ? ea : Number.MAX_SAFE_INTEGER) - (isFinite(eb) ? eb : Number.MAX_SAFE_INTEGER);
+        break;
+      }
+      case 'last_seen_complete': cmp = (a.last_seen_complete ?? 0) - (b.last_seen_complete ?? 0); break;
+      case 'last_received': cmp = (a.last_received ?? 0) - (b.last_received ?? 0); break;
+      case 'category': cmp = (a.category || '').localeCompare(b.category || ''); break;
+      case 'started_at': cmp = a.started_at - b.started_at; break;
+    }
+    return dlSortAsc ? cmp : -cmp;
+  }
+
+  let sortedActiveDownloads = $derived.by(() => {
+    return [...activeDownloads].sort(compareDownloads);
+  });
+  let sortedCompletedDownloads = $derived.by(() => {
+    return [...completedDownloads].sort(compareDownloads);
   });
 
   let filteredActiveDownloads = $derived.by(() => {
@@ -469,16 +553,22 @@
       || t.file_hash.toLowerCase().includes(query)
       || (t.category || '').toLowerCase().includes(query)
       || dlStatusLabel(t).toLowerCase().includes(query)
+      // D24: also match peer fields so the shared filter actually works
+      // against visible peer-name cells.
+      || (t.peer_name || '').toLowerCase().includes(query)
+      || (t.peer_id || '').toLowerCase().includes(query)
     );
   });
   let filteredCompletedDownloads = $derived.by(() => {
     const query = transferFilter.trim().toLowerCase();
-    if (!query) return completedDownloads;
-    return completedDownloads.filter((t) =>
+    if (!query) return sortedCompletedDownloads;
+    return sortedCompletedDownloads.filter((t) =>
       t.file_name.toLowerCase().includes(query)
       || t.file_hash.toLowerCase().includes(query)
       || (t.category || '').toLowerCase().includes(query)
       || dlStatusLabel(t).toLowerCase().includes(query)
+      || (t.peer_name || '').toLowerCase().includes(query)
+      || (t.peer_id || '').toLowerCase().includes(query)
     );
   });
   let filteredActiveUploads = $derived.by(() => {
@@ -690,10 +780,15 @@
   }
 
   function sourcesLabel(t: Transfer): string {
-    if (!t.sources) return '\u2014';
     const active = t.active_sources || 0;
     const queued = t.queued_sources || 0;
     const current = active + queued;
+    if (!t.sources) {
+      // L11: if the backend reports 0 known sources but there's live
+      // activity (active/queued > 0), show what's live rather than an
+      // em-dash that disagrees with the tooltip.
+      return current > 0 ? `${current}` : '\u2014';
+    }
     let label: string;
     if (active > 0 && current !== t.sources) {
       label = `${current}/${t.sources}`;
@@ -791,9 +886,11 @@
         case 'preview': await previewFile(t.id); break;
         case 'toggle_preview_prio': { const live = $transfers.find(x => x.id === t.id); await setPreviewPriority(t.id, !(live ?? t).preview_priority); break; }
         case 'recover_archive': {
-          const path = await recoverArchive(t.id);
-          showInfo(`Archive recovered: ${path}`);
-          break;
+          // D27: confirm before a potentially-long rebuild; actual recovery
+          // fires from the dialog below. Shows a spinner overlay while the
+          // Rust task runs so the UI doesn't look frozen.
+          confirmRecover = { open: true, id: t.id, name: t.file_name };
+          return;
         }
         case 'clear_completed': confirmClearCompleted = true; return;
         case 'copy_link': {
@@ -803,7 +900,7 @@
         }
         case 'paste_link': {
           const text = await navigator.clipboard.readText();
-          if (text.startsWith('ed2k://')) {
+          if (text.trim().toLowerCase().startsWith('ed2k://')) {
             const info = await parseEd2kLink(text);
             const res = await startDownload(info.hash, info.name, info.size, '', 0);
             showInfo(res.already_queued
@@ -852,34 +949,52 @@
     }
   }
 
+  /** D29: render "Paused 5 of 6 transfers (1 failed: foo.zip)" so the
+   *  user knows which rows in a batch didn't get the action applied. */
+  function summarizeBatchResult(label: string, total: number, failed: { id: string; name: string; error: string }[]) {
+    if (failed.length === 0) {
+      showInfo(`${label} ${total} transfer${total === 1 ? '' : 's'}`);
+      return;
+    }
+    const firstName = failed[0].name || failed[0].id.slice(0, 8);
+    const rest = failed.length - 1;
+    const restSuffix = rest > 0 ? ` (+${rest} more)` : '';
+    transferError = `${label} ${total - failed.length} of ${total} transfers — failed: ${firstName}${restSuffix}: ${failed[0].error}`;
+  }
+
+  /** Run a per-id action in a bounded-concurrency loop so one bad id
+   *  doesn't block the rest of the batch. */
+  async function runBatchPerId(
+    ids: string[],
+    fn: (id: string) => Promise<void>,
+    label: string,
+  ): Promise<void> {
+    if (!ids.length) return;
+    const failed: { id: string; name: string; error: string }[] = [];
+    const byId = new Map($transfers.map((t) => [t.id, t.file_name] as const));
+    for (const id of ids) {
+      try {
+        await fn(id);
+      } catch (e: unknown) {
+        failed.push({ id, name: byId.get(id) ?? '', error: toErrorMsg(e) });
+      }
+    }
+    summarizeBatchResult(label, ids.length, failed);
+  }
+
   async function handleBatchPauseDownloads() {
     const ids = transfersForBatchAction().filter((t) => canPause(t)).map((t) => t.id);
-    if (!ids.length) return;
-    try {
-      await pauseTransfersBatch(ids);
-    } catch (e: unknown) {
-      transferError = toErrorMsg(e);
-    }
+    await runBatchPerId(ids, (id) => pauseTransfer(id), 'Paused');
   }
 
   async function handleBatchResumeDownloads() {
     const ids = transfersForBatchAction().filter((t) => canResume(t)).map((t) => t.id);
-    if (!ids.length) return;
-    try {
-      await resumeTransfersBatch(ids);
-    } catch (e: unknown) {
-      transferError = toErrorMsg(e);
-    }
+    await runBatchPerId(ids, (id) => resumeTransfer(id), 'Resumed');
   }
 
   async function handleBatchStopDownloads() {
     const ids = transfersForBatchAction().filter((t) => canStop(t)).map((t) => t.id);
-    if (!ids.length) return;
-    try {
-      await stopTransfersBatch(ids);
-    } catch (e: unknown) {
-      transferError = toErrorMsg(e);
-    }
+    await runBatchPerId(ids, (id) => stopTransfer(id), 'Stopped');
   }
 
   let confirmBatchCancel = $state({ open: false, ids: [] as string[], count: 0 });
@@ -1362,10 +1477,24 @@
 
   function dlStatusTooltip(t: Transfer): string {
     switch (t.status) {
-      case 'active':
+      case 'active': {
+        // D6: mirror dlStatusLabel's health-sensitive branches so the
+        // tooltip never contradicts the label (e.g. label "Stalled" +
+        // tooltip "Actively downloading").
+        if (t.health === 'stalled') {
+          return t.health_reason
+            ? `Stalled — no data received recently. ${t.health_reason}`
+            : 'Stalled — no data received recently';
+        }
+        if (t.health === 'degraded') {
+          return t.health_reason
+            ? `Downloading slowly or idle. ${t.health_reason}`
+            : 'Downloading slowly or idle';
+        }
         return t.health_reason
           ? `Actively downloading data from sources. ${t.health_reason}`
           : 'Actively downloading data from sources';
+      }
       case 'searching': {
         const conn = $networkStats.status === 'connected' || $networkStats.status === 'connecting';
         const base = conn ? 'Searching for sources on the network' : 'Waiting to connect before searching';
@@ -1438,6 +1567,11 @@
     if (next.length !== selectedDownloadIds.length) {
       selectedDownloadIds = next;
     }
+    // L12: keep the shift-range anchor in sync with selection pruning so
+    // Shift+Click doesn't reach back to a row that's no longer visible.
+    if (lastClickedDlId && !visible.has(lastClickedDlId)) {
+      lastClickedDlId = null;
+    }
   });
 </script>
 
@@ -1445,6 +1579,28 @@
   if (e.key === 'Escape') {
     if (ctxMenu) { closeCtx(); e.preventDefault(); }
     else if (columnMenu) { closeColumnMenu(); e.preventDefault(); }
+    return;
+  }
+  // D33: keyboard nav for download rows. Only hijack when focus is not
+  // in a text input and no dialogs are open, so we don't disrupt the
+  // filter box or confirm dialogs.
+  const target = e.target as HTMLElement | null;
+  const inEditable = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
+  if (inEditable || ctxMenu || confirmCancel.open || confirmClearCompleted || confirmBatchCancel.open || confirmRecover.open) return;
+  if (filteredActiveDownloads.length === 0) return;
+  const currentId = selectedDownloadIds[selectedDownloadIds.length - 1];
+  const idx = currentId ? filteredActiveDownloads.findIndex((t) => t.id === currentId) : -1;
+  if (e.key === 'ArrowDown') {
+    const next = filteredActiveDownloads[Math.min(filteredActiveDownloads.length - 1, idx + 1)];
+    if (next) { selectedDownloadIds = [next.id]; lastClickedDlId = next.id; e.preventDefault(); }
+  } else if (e.key === 'ArrowUp') {
+    const next = filteredActiveDownloads[Math.max(0, idx < 0 ? 0 : idx - 1)];
+    if (next) { selectedDownloadIds = [next.id]; lastClickedDlId = next.id; e.preventDefault(); }
+  } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedDownloadIds.length > 0) {
+    // Match the explicit UI control: prompt, don't just vaporize rows.
+    const ids = [...selectedDownloadIds];
+    confirmBatchCancel = { open: true, ids, count: ids.length };
+    e.preventDefault();
   }
 }} />
 
@@ -1469,8 +1625,13 @@
   <!-- TOP PANE: Downloads -->
   <div class="pane downloads-pane" style="flex: 0 0 {splitPercent}%;">
     <div class="transfer-overview-bar">
-      <span class="overview-chip"><span class="overview-label">DL</span> {formatSpeed(totalDownloadRate)}</span>
-      <span class="overview-chip"><span class="overview-label">UL</span> {formatSpeed(totalUploadRate)}</span>
+      <!--
+        D7: these chips are payload-only rates summed over active transfers.
+        The StatusBar shows the network rate (includes protocol overhead),
+        which is expected to be higher. Tooltip clarifies the distinction.
+      -->
+      <span class="overview-chip" title="Active download payload rate (status bar shows total network rate)"><span class="overview-label">DL</span> {formatSpeed(totalDownloadRate)}</span>
+      <span class="overview-chip" title="Active upload payload rate (status bar shows total network rate)"><span class="overview-label">UL</span> {formatSpeed(totalUploadRate)}</span>
       <span class="overview-chip"><span class="overview-label">Active</span> {transferringDownloads}</span>
       <span class="overview-chip"><span class="overview-label">Sources</span> {activeConnectedSources}/{totalKnownSources}</span>
       <label class="filter-wrap" aria-label="Filter transfers">
@@ -1478,7 +1639,7 @@
         <input
           class="filter-input"
           type="text"
-          placeholder="name, hash, category..."
+          placeholder="name, hash, category, peer..."
           bind:value={transferFilter}
         />
       </label>
@@ -1598,7 +1759,7 @@
                     {:else}
                       <ProgressBar
                         value={t.progress}
-                        color={t.status === 'paused' || t.status === 'stopped' ? 'var(--warning)' : t.status === 'verifying' || t.status === 'completing' ? 'var(--success, #2ecc71)' : 'var(--accent)'}
+                        color={downloadProgressColor(t)}
                       />
                     {/if}
                   </td>
@@ -1614,7 +1775,14 @@
                   </td>
                 {:else if column.key === 'remaining'}
                   {@const spd = liveSpeed(t)}
-                  <td class="num-cell">{formatRemaining(t.total_size, t.transferred, spd)}</td>
+                  <!--
+                    D22: use `completed_size` for byte accounting so the
+                    rendered Remaining matches what etaSeconds() uses for
+                    sort. `transferred` can include transient re-fetched
+                    ranges that later get invalidated, which shifts sort
+                    vs display apart.
+                  -->
+                  <td class="num-cell">{formatRemaining(t.total_size, t.completed_size ?? t.transferred, spd)}</td>
                 {:else if column.key === 'last_seen_complete'}
                   <td class="date-cell">{t.last_seen_complete ? formatDate(t.last_seen_complete) : '\u2014'}</td>
                 {:else if column.key === 'last_received'}
@@ -1739,9 +1907,14 @@
                     <td class="prio-cell">{'\u2014'}</td>
                   {:else if column.key === 'status'}
                     <td class="status-cell">
-                      <span class="status-label st-{t.status}" title={dlStatusTooltip(t)}>{dlStatusLabel(t)}</span>
+                      <span class="status-label st-{t.status}" title={dlStatusTooltip(t)} aria-label={`Status: ${dlStatusLabel(t)}. ${dlStatusTooltip(t)}`}>{dlStatusLabel(t)}</span>
+                      <!--
+                        L10: surface failure_kind / failure_stage in the
+                        tooltip so the user can distinguish transient from
+                        terminal failures without opening the context menu.
+                      -->
                       {#if t.status === 'failed' && t.failure_reason}
-                        <span class="failure-hint" title={t.failure_reason}>{t.failure_reason}</span>
+                        <span class="failure-hint" title={[t.failure_reason, t.failure_stage, t.failure_kind].filter(Boolean).join(' — ')}>{t.failure_reason}</span>
                       {:else if t.health !== 'healthy' && t.health_reason}
                         <span class="failure-hint" title={t.health_reason}>{t.health_reason}</span>
                       {/if}
@@ -2183,7 +2356,9 @@
         {ctxTransfer.preview_priority ? '✓ ' : ''}Preview Priority
       </button>
       {#if isArchive(ctxTransfer)}
-        <button class="ctx-item" onclick={() => ctxAction('recover_archive')}>Recover Archive</button>
+        <button class="ctx-item" disabled={recoveringIds.has(ctxTransfer.id)} onclick={() => ctxAction('recover_archive')}>
+          {recoveringIds.has(ctxTransfer.id) ? 'Recovering…' : 'Recover Archive'}
+        </button>
       {/if}
       <button class="ctx-item" onclick={() => ctxAction('open_location')}>Open File Location</button>
       <div class="ctx-sep"></div>
@@ -2225,7 +2400,12 @@
       <div class="ctx-sep"></div>
       <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>Clear Completed</button>
     {:else if ctxMenu.section === 'completed'}
-      {#if ctxTransfer.status === 'completed'}
+      <!--
+        D26: also offer Open File for failed downloads that have produced a
+        partial file on disk. If the file is truly missing, the backend
+        `open_file` command returns an error that surfaces via transferError.
+      -->
+      {#if ctxTransfer.status === 'completed' || ctxTransfer.status === 'failed'}
         <button class="ctx-item" onclick={() => ctxAction('open')}>Open File</button>
       {/if}
       <button class="ctx-item" onclick={() => ctxAction('open_location')}>Open File Location</button>
@@ -2266,13 +2446,47 @@
   onconfirm={async () => { try { await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) speedHistory.delete(id); return remaining; }); } catch (e: unknown) { transferError = toErrorMsg(e); } }}
 />
 
+<!-- D27: recover-archive confirm + async feedback -->
+<ConfirmDialog
+  bind:open={confirmRecover.open}
+  title="Recover Archive"
+  message="Rebuild a salvage copy of &quot;{confirmRecover.name}&quot; from the downloaded parts? This can take a minute or two for large files. The original .part file is not modified."
+  confirmLabel="Recover"
+  onconfirm={async () => {
+    const id = confirmRecover.id;
+    const next = new Set(recoveringIds); next.add(id); recoveringIds = next;
+    try {
+      const path = await recoverArchive(id);
+      showInfo(`Archive recovered: ${path}`);
+    } catch (e: unknown) {
+      transferError = toErrorMsg(e);
+    } finally {
+      const cleared = new Set(recoveringIds); cleared.delete(id); recoveringIds = cleared;
+    }
+  }}
+/>
+
 <ConfirmDialog
   bind:open={confirmBatchCancel.open}
   title="Cancel Downloads"
-  message="Cancel {confirmBatchCancel.count} download(s) and delete partial data?"
+  message="Cancel {confirmBatchCancel.count} {confirmBatchCancel.count === 1 ? 'download' : 'downloads'} and delete partial data?"
   confirmLabel="Cancel Downloads"
   danger={true}
-  onconfirm={async () => { const ids = confirmBatchCancel.ids; const idSet = new Set(ids); try { await cancelTransfersBatch(ids); for (const id of idSet) speedHistory.delete(id); transfers.update((list) => list.filter((x) => !idSet.has(x.id))); selectedDownloadIds = []; } catch (e: unknown) { transferError = toErrorMsg(e); } }}
+  onconfirm={async () => {
+    const ids = confirmBatchCancel.ids; const idSet = new Set(ids);
+    try {
+      await cancelTransfersBatch(ids);
+      for (const id of idSet) speedHistory.delete(id);
+      transfers.update((list) => list.filter((x) => !idSet.has(x.id)));
+      selectedDownloadIds = [];
+      lastClickedDlId = null;
+      // L13: move focus back to the page toolbar after destructive
+      // actions so keyboard users don't land on a detached element.
+      requestAnimationFrame(() => {
+        (document.querySelector('.filter-input') as HTMLInputElement | null)?.focus();
+      });
+    } catch (e: unknown) { transferError = toErrorMsg(e); }
+  }}
 />
 
 <style>
@@ -2701,8 +2915,10 @@
   .prio-release { color: #e09830; font-weight: 700; }
   .prio-high { color: var(--danger, #e74c3c); }
   .prio-normal { color: var(--text-secondary); }
-  .prio-low { color: var(--text-muted); }
-  .prio-verylow { color: var(--text-muted); opacity: 0.6; }
+  /* L8: distinguish prio-low from prio-verylow visually — prior rules
+     only differed in opacity and were hard to tell apart at a glance. */
+  .prio-low { color: var(--text-secondary); font-style: italic; }
+  .prio-verylow { color: var(--text-muted); opacity: 0.55; font-style: italic; }
   .prio-auto { color: var(--accent); }
 
   /* --- Section divider --- */

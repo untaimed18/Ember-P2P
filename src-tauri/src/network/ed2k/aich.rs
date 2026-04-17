@@ -614,6 +614,27 @@ mod tests {
         assert_eq!(corrupt, vec![0]);
     }
 
+    /// L5: ensure a final partial AICH block (not a multiple of
+    /// AICH_BLOCK_SIZE) is still validated correctly. The last chunk only
+    /// spans a few KiB of the 180 KiB AICH block size; `find_corrupt_blocks`
+    /// must consume the partial tail without panicking or mis-aligning.
+    #[test]
+    fn find_corrupt_blocks_final_partial_block() {
+        let partial = 12_345;
+        let full_blocks = 2;
+        let total = full_blocks * AICH_BLOCK_SIZE + partial;
+        let data: Vec<u8> = (0..total).map(|i| (i & 0xFF) as u8).collect();
+        let hs = AICHRecoveryHashSet::build_from_data(&data);
+        // Unmodified buffer: nothing corrupt.
+        assert!(hs.find_corrupt_blocks(0, &data, data.len()).is_empty());
+        // Flip one byte in the final partial block.
+        let mut bad = data.clone();
+        let flip_idx = full_blocks * AICH_BLOCK_SIZE + 7;
+        bad[flip_idx] ^= 0xFF;
+        let corrupt = hs.find_corrupt_blocks(0, &bad, bad.len());
+        assert_eq!(corrupt, vec![full_blocks]);
+    }
+
     #[test]
     fn corrupt_blocks_from_aich_recovery_roundtrip() {
         let data = vec![0x42u8; AICH_BLOCK_SIZE * 2];

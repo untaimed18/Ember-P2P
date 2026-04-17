@@ -67,6 +67,28 @@
       });
     }
   });
+
+  // D32: make background content inert while the dialog is open so
+  // screen readers and keyboard users can't reach behind the modal.
+  // Uses the `inert` attribute on the page's top-level children other
+  // than the overlay itself. Restores on close.
+  $effect(() => {
+    if (!open || typeof document === 'undefined') return;
+    const body = document.body;
+    const previous: { el: Element; had: boolean }[] = [];
+    for (const child of Array.from(body.children)) {
+      // Svelte mounts overlays as siblings; skip the active overlay itself
+      // (identified by our role attribute being set somewhere inside it).
+      if (child.querySelector('.confirm-overlay')) continue;
+      previous.push({ el: child, had: child.hasAttribute('inert') });
+      child.setAttribute('inert', '');
+    }
+    return () => {
+      for (const { el, had } of previous) {
+        if (!had) el.removeAttribute('inert');
+      }
+    };
+  });
 </script>
 
 {#if open}
