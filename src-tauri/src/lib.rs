@@ -143,6 +143,20 @@ pub fn run() {
                 settings.shared_folders.clone(),
             );
 
+            // known.met in-memory list. ember-V2's network module currently
+            // doesn't consume this (see `start_network` signature), but
+            // sharing/indexer and some cherry-picked commands still read it
+            // via `AppState::known_files`, so we materialise it here rather
+            // than leaking `Option<...>` all over the struct.
+            let known_files = {
+                let data_dir = directories::ProjectDirs::from("com", "ember", "p2p")
+                    .map(|d| d.data_dir().to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                Arc::new(RwLock::new(storage::known_files::KnownFileList::load(
+                    &data_dir.join("known.met"),
+                )))
+            };
+
             app.manage(AppState {
                 network_tx,
                 db: db.clone(),
@@ -160,6 +174,10 @@ pub fn run() {
                 spam_filter: spam_filter.clone(),
                 upload_shared_folders: upload_shared_folders.clone(),
                 friend_hashes: friend_hashes.clone(),
+                known_files,
+                shared_folder_watcher,
+                background_scans: Arc::new(RwLock::new(std::collections::HashMap::new())),
+                background_scan_seq: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             });
 
             let index_clone = local_index.clone();

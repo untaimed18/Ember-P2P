@@ -22,6 +22,7 @@ serde_json = "1"
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+blake3 = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 directories = "5"

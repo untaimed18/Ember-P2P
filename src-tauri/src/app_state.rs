@@ -11,6 +11,7 @@ use crate::sharing::manager::TransferManager;
 use crate::sharing::watcher::SharedFoldersWatcher;
 use crate::storage::config::AppConfig;
 use crate::storage::database::Database;
+use crate::storage::known_files::KnownFileList;
 use crate::storage::statistics::TransferStats;
 use crate::types::{FileInfo, KadContactInfo};
 
@@ -50,4 +51,80 @@ pub struct AppState {
     pub upload_shared_folders: SharedFolderList,
     /// Live friend user-hash set shared with the upload server for friend-slot priority.
     pub friend_hashes: SharedFriendHashes,
+    /// Shared known-file list (eMule known.met) so sharing commands and the
+    /// network loop both work from memory instead of re-reading from disk.
+    /// ember-V2's network task doesn't currently read through AppState for
+    /// this list (it loads its own copy), but the field is kept so
+    /// sharing-side code can grow into it without a schema change.
+    #[allow(dead_code)]
+    pub known_files: Arc<RwLock<KnownFileList>>,
+    /// Filesystem watcher over the currently shared folders. `None` if the
+    /// OS-level watcher could not be initialised at startup; in that case
+    /// the app still works but users must reload manually after changes.
+    pub shared_folder_watcher: Option<Arc<SharedFoldersWatcher>>,
+    /// JoinHandles for long-running background scan tasks (directory discovery
+    /// and hashing). Tracked so `await_background_scans` can wait for them on
+    /// shutdown or `reload_shared_files`, preventing races where a still-running
+    /// scan writes into `local_index`/`known_files` after we've started tearing
+    /// down. Tasks self-remove from this map on completion.
+    pub background_scans: Arc<RwLock<HashMap<u64, tokio::task::JoinHandle<()>>>>,
+    /// Monotonic counter for assigning unique ids in `background_scans`.
+    #[allow(dead_code)]
+    pub background_scan_seq: Arc<AtomicUsize>,
+}
+
+impl AppState {
+    /// Register a background scan task so it can be awaited on shutdown.
+    /// The caller spawns with `tokio::spawn` and passes the returned handle.
+    #[allow(dead_code)]
+    pub async fn register_background_scan(&self, handle: tokio::task::JoinHandle<()>) -> u64 {
+        let id = self.background_scan_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64;
+        self.background_scans.write().await.insert(id, handle);
+        id
+    }
+
+    /// Remove a background scan entry once it finishes; does not await.
+    #[allow(dead_code)]
+    pub async fn deregister_background_scan(&self, id: u64) {
+        self.background_scans.write().await.remove(&id);
+    }
+
+    /// Await all currently-tracked background scans. Aborts any still running
+    /// after a grace period so shutdown can't hang on a frozen hasher.
+    #[allow(dead_code)]
+    pub async fn await_background_scans(&self, grace: std::time::Duration) {
+        let handles: Vec<_> = {
+            let mut map = self.background_scans.write().await;
+            map.drain().map(|(_, h)| h).collect()
+        };
+        if handles.is_empty() {
+            return;
+        }
+        let fut = async {
+            for h in handles {
+                let _ = h.await;
+            }
+        };
+        if tokio::time::timeout(grace, fut).await.is_err() {
+            tracing::warn!("background scans still running after grace window; continuing shutdown");
+        }
+    }
+
+    /// Wait until `scanning_count` reaches zero or `grace` elapses. Used on
+    /// shutdown paths that don't own JoinHandles directly (e.g. the startup
+    /// scan spawned from `tauri::setup`).
+    #[allow(dead_code)]
+    pub async fn wait_scans_idle(&self, grace: std::time::Duration) {
+        let deadline = std::time::Instant::now() + grace;
+        while self.scanning_count.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "scan workers still active after {:?}; continuing shutdown",
+                    grace
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
 }

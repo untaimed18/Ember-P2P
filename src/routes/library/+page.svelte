@@ -15,6 +15,9 @@
     unshareFolder,
     openSharedFile,
     openSharedFolder,
+    republishFile,
+    scanMissingFiles,
+    removeMissingFiles,
   } from '$lib/api/sharing';
   import { getFileComments, setFileComment, type FileCommentInfo } from '$lib/api/comments';
   import { formatEd2kLink } from '$lib/api/search';
@@ -660,22 +663,34 @@
     return copy;
   });
 
-  let folderCounts = $derived.by(() => {
+  // Per-folder count AND size. Superset of the old `folderCounts` map;
+  // main's cherry-picked bulk-folder-delete handler reads `.counts` and
+  // `.sizes`, and ember-V2's tree UI reads `.counts` via the same derived
+  // store. Sort shared folders by depth (deepest first) so nested
+  // shared folders attribute each file to the most specific ancestor.
+  let folderStats = $derived.by(() => {
     const counts = new Map<string, number>();
-    const normalizedFolders = folders.map((folder) => ({
-      folder,
-      norm: normalizePathForMatch(folder),
-    }));
-    for (const { folder } of normalizedFolders) counts.set(folder, 0);
+    const sizes = new Map<string, number>();
+    if (folders.length === 0) return { counts, sizes };
+
+    const normalizedFolders = folders
+      .map((folder) => ({ folder, norm: normalizePathForMatch(folder) }))
+      .sort((a, b) => b.norm.length - a.norm.length);
+    for (const { folder } of normalizedFolders) {
+      counts.set(folder, 0);
+      sizes.set(folder, 0);
+    }
     for (const f of files) {
       const np = normalizePathForMatch(f.path);
       for (const { folder, norm } of normalizedFolders) {
         if (np === norm || np.startsWith(`${norm}/`)) {
           counts.set(folder, (counts.get(folder) ?? 0) + 1);
+          sizes.set(folder, (sizes.get(folder) ?? 0) + f.size);
+          break;
         }
       }
     }
-    return counts;
+    return { counts, sizes };
   });
   let activeFolderLabel = $derived(folderDisplayName(filterFolder));
 
@@ -1615,7 +1630,7 @@
               {folder.split(/[\\/]/).filter(Boolean).pop() || folder}
             </span>
           </span>
-          <span class="tree-count">{(folderCounts.get(folder) ?? 0).toLocaleString()}</span>
+          <span class="tree-count">{(folderStats.counts.get(folder) ?? 0).toLocaleString()}</span>
           <span class="tree-actions">
             <button
               class="tree-btn"
