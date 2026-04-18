@@ -663,6 +663,17 @@ impl Ed2kDownload {
             .unwrap_or(0);
 
         let peer_is_new_emule = initial_caps.emule_version_min > 0 || initial_caps.version_major > 0;
+        // `did_proactive_challenge` tracks whether `maybe_send_secident_challenge`
+        // fired inside the branches below (it does, for the classic pre-EmuleInfo
+        // peer path). After the match we send it unconditionally if we haven't
+        // already — so the modern-eMule "fast path" (where the peer's Hello
+        // carries CT_EMULE_VERSION and they short-circuit the EmuleInfo
+        // exchange entirely, sending OP_SECIDENTSTATE directly after their
+        // HelloAnswer — see BaseClient.cpp:659-664 / ListenSocket.cpp:284)
+        // still gets its SecIdent kick-off. Without this, eMule treats us as
+        // `IS_NOTAVAILABLE` on the download side and our peer sees us the
+        // same way, which is exactly the symptom we just fixed on uploads.
+        let mut did_proactive_challenge = false;
         if skip_emule_info || peer_is_new_emule {
             debug!("Skipping EmuleInfo exchange (already done via obfuscation or Hello eMule tags)");
         } else {
@@ -727,6 +738,7 @@ impl Ed2kDownload {
                     self.source_addr,
                     peer_secure_ident_level,
                 ).await?;
+                did_proactive_challenge = true;
             } else if proto2 == OP_EMULEPROT && opcode2 == OP_EMULEINFO {
                 // Peer sent OP_EMULEINFO instead of OP_EMULEINFOANSWER — parse
                 // their capabilities and reply with our OP_EMULEINFOANSWER.
@@ -766,10 +778,31 @@ impl Ed2kDownload {
                     self.source_addr,
                     peer_secure_ident_level,
                 ).await?;
+                did_proactive_challenge = true;
             } else {
                 debug!("Peer skipped EmuleInfoAnswer (got proto=0x{proto2:02X} op=0x{opcode2:02X}), deferring");
                 deferred_packet = Some((proto2, opcode2, payload2));
             }
+        }
+
+        // Fire the SecIdent kick-off if the branches above didn't already.
+        // Covers (a) `skip_emule_info || peer_is_new_emule` — the modern
+        // eMule fast path that never sends OP_EMULEINFO, and
+        // (b) the `else { deferred_packet }` branch where the peer sent an
+        // unrelated packet (often OP_SECIDENTSTATE itself). In both cases
+        // the peer is waiting for our OP_SECIDENTSTATE before it will ship
+        // its own OP_PUBLICKEY / OP_SIGNATURE, so without this call the
+        // handshake deadlocks and both sides settle at IS_NOTAVAILABLE.
+        // `maybe_send_secident_challenge` is a no-op when the peer doesn't
+        // advertise SecIdent or we have no local keypair.
+        if !did_proactive_challenge {
+            pending_secident_challenge = maybe_send_secident_challenge(
+                &mut writer,
+                self.credit_manager.as_ref(),
+                peer_user_hash,
+                self.source_addr,
+                peer_secure_ident_level,
+            ).await?;
         }
 
         // Handle secure identification packets that may arrive before file requests.
