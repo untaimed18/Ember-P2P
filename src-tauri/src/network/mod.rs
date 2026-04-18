@@ -105,6 +105,56 @@ fn matching_active_transfer_ids_for_hash(
         .collect()
 }
 
+/// How long an Ember peer entry is considered fresh in `known_ember_peers`
+/// before `prune_stale_ember_peers` evicts it. 24h gives enough headroom
+/// that a peer who briefly went offline (NAT renewal, brief uptime gap)
+/// is still in the mesh on their next visit, while keeping advertisements
+/// from being polluted with weeks-old dead addresses.
+const KNOWN_EMBER_PEER_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Hard cap on `known_ember_peers` size. Set to 10x `MAX_EPX_PEERS` so
+/// rebuilds have a diverse pool to rotate from while still keeping
+/// per-session memory bounded (≈12 KB worst case).
+const MAX_KNOWN_EMBER_PEERS: usize = 500;
+
+/// Insert or refresh an Ember peer in `known_ember_peers`. Returns true
+/// when this is the first time we've seen the address (caller uses that
+/// signal to mark `ember_payload_dirty`). When the map is at capacity
+/// and we're inserting a brand-new entry, the oldest existing entry is
+/// evicted to make room — matches the LRU-by-timestamp policy that the
+/// pruner enforces against TTL.
+fn record_known_ember_peer(
+    map: &mut HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    ip: Ipv4Addr,
+    port: u16,
+) -> bool {
+    let now = std::time::Instant::now();
+    let key = (ip, port);
+    if let Some(slot) = map.get_mut(&key) {
+        *slot = now;
+        return false;
+    }
+    if map.len() >= MAX_KNOWN_EMBER_PEERS {
+        if let Some(oldest_key) = map
+            .iter()
+            .min_by_key(|(_, ts)| *ts)
+            .map(|(k, _)| *k)
+        {
+            map.remove(&oldest_key);
+        }
+    }
+    map.insert(key, now);
+    true
+}
+
+/// Drop entries older than `KNOWN_EMBER_PEER_TTL`. Called lazily before
+/// the EPX rebuild iterates the map so we never advertise a peer we
+/// haven't heard about in a day.
+fn prune_stale_ember_peers(map: &mut HashMap<(Ipv4Addr, u16), std::time::Instant>) {
+    let now = std::time::Instant::now();
+    map.retain(|_, ts| now.duration_since(*ts) < KNOWN_EMBER_PEER_TTL);
+}
+
 /// Shared EPX source injection logic used by both DownloadEvent::EmberSources
 /// and UploadEventKind::EmberSources handlers.
 async fn handle_epx_sources(
@@ -227,7 +277,9 @@ async fn handle_epx_sources(
         }
     }
 
-    // Track discovered Ember peers for mesh building
+    // Track discovered Ember peers for mesh building. `record_known_ember_peer`
+    // refreshes the timestamp on existing entries so peers we still hear
+    // about don't get pruned by the TTL cycle.
     let mut new_peers = false;
     for &(ip, port) in ember_peers {
         if crate::security::is_special_use_v4(ip) {
@@ -236,7 +288,7 @@ async fn handle_epx_sources(
         if state.banned_ips.contains(&ip) {
             continue;
         }
-        if state.known_ember_peers.insert((ip, port)) {
+        if record_known_ember_peer(&mut state.known_ember_peers, ip, port) {
             new_peers = true;
         }
     }
@@ -718,6 +770,76 @@ mod tests {
             try_inject_source(Some(&tx), &sample_download_source()),
             SourceInjectionResult::Closed,
         );
+    }
+
+    #[test]
+    fn record_known_ember_peer_returns_true_for_new_entries() {
+        let mut map = HashMap::new();
+        let ip = Ipv4Addr::new(1, 2, 3, 4);
+        assert!(record_known_ember_peer(&mut map, ip, 4662));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn record_known_ember_peer_refreshes_existing_timestamp() {
+        let mut map = HashMap::new();
+        let ip = Ipv4Addr::new(1, 2, 3, 4);
+        assert!(record_known_ember_peer(&mut map, ip, 4662));
+        let first_ts = *map.get(&(ip, 4662)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        // Re-recording the same address must NOT report it as new (so we
+        // don't spuriously dirty the EPX payload), but it MUST move the
+        // timestamp forward so the pruner doesn't evict an active peer.
+        assert!(!record_known_ember_peer(&mut map, ip, 4662));
+        let second_ts = *map.get(&(ip, 4662)).unwrap();
+        assert!(second_ts > first_ts);
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn record_known_ember_peer_evicts_oldest_at_capacity() {
+        let mut map = HashMap::new();
+        // Fill exactly to the cap with sequentially-aged entries — the
+        // first insert is the oldest by timestamp. Use the high two bytes
+        // of the IPv4 address so we get enough unique addresses to
+        // exceed `MAX_KNOWN_EMBER_PEERS` (500) without overflowing u8.
+        for i in 0..MAX_KNOWN_EMBER_PEERS {
+            let i = i as u16;
+            let ip = Ipv4Addr::new(10, 0, (i >> 8) as u8, (i & 0xFF) as u8);
+            assert!(record_known_ember_peer(&mut map, ip, 4662));
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        let oldest = (Ipv4Addr::new(10, 0, 0, 0), 4662u16);
+        assert!(map.contains_key(&oldest));
+        assert_eq!(map.len(), MAX_KNOWN_EMBER_PEERS);
+
+        // Inserting one more brand-new address must evict the oldest
+        // entry, not the new one or anything in between.
+        let newcomer = Ipv4Addr::new(11, 0, 0, 1);
+        assert!(record_known_ember_peer(&mut map, newcomer, 4662));
+        assert_eq!(map.len(), MAX_KNOWN_EMBER_PEERS);
+        assert!(!map.contains_key(&oldest));
+        assert!(map.contains_key(&(newcomer, 4662)));
+    }
+
+    #[test]
+    fn prune_stale_ember_peers_drops_expired_entries() {
+        let mut map = HashMap::new();
+        let fresh_ip = Ipv4Addr::new(1, 2, 3, 4);
+        let stale_ip = Ipv4Addr::new(5, 6, 7, 8);
+        let now = std::time::Instant::now();
+        // Forge a stale entry by inserting with a timestamp older than
+        // the TTL. We use checked_sub to avoid panicking on systems where
+        // `Instant` was just initialised.
+        let stale_ts = now
+            .checked_sub(KNOWN_EMBER_PEER_TTL + std::time::Duration::from_secs(60))
+            .expect("clock supports a backdated Instant");
+        map.insert((fresh_ip, 4662), now);
+        map.insert((stale_ip, 4662), stale_ts);
+
+        prune_stale_ember_peers(&mut map);
+        assert!(map.contains_key(&(fresh_ip, 4662)));
+        assert!(!map.contains_key(&(stale_ip, 4662)));
     }
 
     #[test]
@@ -1309,8 +1431,15 @@ struct NetworkState {
     upload_max_slots: Arc<std::sync::atomic::AtomicUsize>,
     /// Whether the EPX payload needs rebuilding (set on source changes, cleared after rebuild)
     ember_payload_dirty: bool,
-    /// Known Ember peer addresses for peer discovery mesh building
-    known_ember_peers: std::collections::HashSet<(Ipv4Addr, u16)>,
+    /// Known Ember peer addresses for peer discovery mesh building.
+    /// Value is the last time we saw this peer (either by direct connect or
+    /// via EPX from another peer). Stale entries are pruned by
+    /// `prune_stale_ember_peers` against `KNOWN_EMBER_PEER_TTL` and the
+    /// total set is capped at `MAX_KNOWN_EMBER_PEERS` to prevent unbounded
+    /// growth on long-running sessions. The wire cap is much smaller
+    /// (`ember::MAX_EPX_PEERS = 50`); the in-memory headroom exists so we
+    /// can rotate which subset gets advertised across rebuilds.
+    known_ember_peers: HashMap<(Ipv4Addr, u16), std::time::Instant>,
     /// Mapping of ed2k file hash → AICH root hash for EPX payload
     aich_root_map: HashMap<[u8; 16], [u8; 20]>,
     /// Tracks KAD callback attempts per (buddy_hash, file_hash) to avoid
@@ -2401,7 +2530,7 @@ pub async fn start_network(
         aich_hash_sets: Vec::new(),
         upload_max_slots: Arc::new(std::sync::atomic::AtomicUsize::new(settings.max_concurrent_uploads as usize)),
         ember_payload_dirty: true,
-        known_ember_peers: std::collections::HashSet::new(),
+        known_ember_peers: HashMap::new(),
         aich_root_map: HashMap::new(),
         callback_buddy_attempts: HashMap::new(),
         firewall_connect_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
@@ -2604,6 +2733,7 @@ pub async fn start_network(
         let ul_server_addr = shared_server_addr.clone();
         let ul_friends = friend_hashes.clone();
         let ul_ember = shared_ember_payload.clone();
+        let ul_ember_gen = ember_payload_generation.clone();
         let ul_geoip = geoip.clone();
         let ul_ember_sessions = state.ember_sessions.clone();
         let ul_disconnected = state.upload_disconnected.clone();
@@ -2645,6 +2775,7 @@ pub async fn start_network(
                 ul_server_addr,
                 ul_friends,
                 ul_ember,
+                ul_ember_gen,
                 ul_geoip,
                 ul_ember_sessions,
                 ember_hash,
@@ -3564,7 +3695,7 @@ pub async fn start_network(
 
                 if let DownloadEvent::EmberPeerDiscovered { ip, tcp_port } = event {
                     if !crate::security::is_special_use_v4(ip) && !ip.is_multicast() {
-                        if state.known_ember_peers.insert((ip, tcp_port)) {
+                        if record_known_ember_peer(&mut state.known_ember_peers, ip, tcp_port) {
                             state.stats.ember_peers = state.known_ember_peers.len() as u32;
                             state.ember_payload_dirty = true;
                         }
@@ -4117,7 +4248,7 @@ pub async fn start_network(
 
                 if let UploadEventKind::EmberPeerDiscovered { ip, tcp_port } = event.kind {
                     if !crate::security::is_special_use_v4(ip) && !ip.is_multicast() {
-                        if state.known_ember_peers.insert((ip, tcp_port)) {
+                        if record_known_ember_peer(&mut state.known_ember_peers, ip, tcp_port) {
                             state.stats.ember_peers = state.known_ember_peers.len() as u32;
                             state.ember_payload_dirty = true;
                         }
@@ -9749,22 +9880,44 @@ pub async fn start_network(
                     file_entries
                 };
 
-                // Build peer discovery list from known Ember sessions + received peers
+                // Drop entries older than `KNOWN_EMBER_PEER_TTL` before
+                // building the wire list so we never advertise a peer
+                // we haven't heard from in a day. Cheap O(N) sweep — N
+                // is hard-capped at MAX_KNOWN_EMBER_PEERS = 500.
+                let pruned_before = state.known_ember_peers.len();
+                prune_stale_ember_peers(&mut state.known_ember_peers);
+                let pruned_after = state.known_ember_peers.len();
+                if pruned_after != pruned_before {
+                    state.stats.ember_peers = pruned_after as u32;
+                    tracing::debug!(
+                        "Pruned {} stale Ember peer(s) (now {})",
+                        pruned_before - pruned_after,
+                        pruned_after
+                    );
+                }
+
+                // Build peer discovery list from previously-discovered peers
+                // (we don't have IP:port for session keys — they're ember
+                // hashes — so the EPX peer section is sourced entirely from
+                // the timestamped `known_ember_peers` map). Prefer most
+                // recently-seen peers so the wire payload reflects current
+                // mesh activity rather than whatever the HashMap iteration
+                // order happens to surface.
                 let ember_peers: Vec<ember::EmberPeer> = {
-                    let sessions = state.ember_sessions.read().await;
-                    let mut peers: Vec<ember::EmberPeer> = Vec::new();
-                    // We don't have IP:port for session keys (they're ember hashes),
-                    // so use previously-discovered peers from EPX exchanges
-                    for &(ip, port) in &state.known_ember_peers {
-                        if peers.len() >= ember::MAX_EPX_PEERS {
-                            break;
-                        }
-                        if !crate::security::is_special_use_v4(ip) && !ip.is_multicast() {
-                            peers.push(ember::EmberPeer { ip, tcp_port: port });
-                        }
-                    }
-                    drop(sessions);
-                    peers
+                    let mut candidates: Vec<((Ipv4Addr, u16), std::time::Instant)> = state
+                        .known_ember_peers
+                        .iter()
+                        .filter(|((ip, _), _)| {
+                            !crate::security::is_special_use_v4(*ip) && !ip.is_multicast()
+                        })
+                        .map(|((ip, port), ts)| ((*ip, *port), *ts))
+                        .collect();
+                    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+                    candidates
+                        .into_iter()
+                        .take(ember::MAX_EPX_PEERS)
+                        .map(|((ip, port), _)| ember::EmberPeer { ip, tcp_port: port })
+                        .collect()
                 };
 
                 let payload = ember::build_exchange_payload(&entries, &ember_peers);
