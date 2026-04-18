@@ -472,3 +472,96 @@ pub async fn import_ipfilter_file(
 
     Ok("Imported and loaded IP filter — filter is now active".into())
 }
+
+// ----- Anti-leech client filter commands -----------------------------
+//
+// The filter logic and persistence live in `crate::security::antileech`.
+// These commands form the thin Tauri layer over a NetworkCommand round
+// trip so the network task remains the single owner of the runtime
+// state and the on-disk file. Going through `network_tx` (rather than
+// holding the filter `Arc` directly on `AppState`) keeps reload /
+// pattern-edit operations serialised against everything else the
+// network task is doing — no risk of a half-applied pattern set being
+// observed by an in-flight upload handshake.
+
+/// Snapshot the current pattern list for the Settings UI.
+#[tauri::command]
+pub async fn get_antileech_patterns(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::types::AntiLeechSnapshot, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::GetAntiLeechSnapshot { tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
+    rx.await.map_err(|_| "Failed to read anti-leech filter".to_string())
+}
+
+/// Replace the entire pattern list, persist to disk, and recompile.
+/// Returns any per-pattern compile errors so the UI can show which
+/// rows were rejected (the rest still take effect — partial-success
+/// is intentional so a single typo doesn't wipe the whole list).
+#[tauri::command]
+pub async fn set_antileech_patterns(
+    state: tauri::State<'_, AppState>,
+    patterns: Vec<String>,
+) -> Result<crate::types::AntiLeechReplaceResult, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::SetAntiLeechPatterns { patterns, tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
+    rx.await.map_err(|_| "Failed to update anti-leech filter".to_string())?
+}
+
+/// Toggle the filter on or off without touching the pattern list.
+/// Persists the new state to AppSettings + the on-disk config so the
+/// choice survives restarts.
+#[tauri::command]
+pub async fn set_antileech_enabled(
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::SetAntiLeechEnabled { enabled, tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
+    rx.await.map_err(|_| "Failed to toggle anti-leech filter".to_string())??;
+
+    // Persist the toggle to the config file so a restart preserves it.
+    // Done after the network task confirms the flip so a failure mid-
+    // toggle doesn't leave config and runtime out of sync.
+    let save_data = {
+        let mut cfg = state.config.write().await;
+        cfg.settings.antileech_enabled = enabled;
+        cfg.prepare_save()
+            .map_err(|e| format!("Failed to save config: {e}"))?
+    };
+    tokio::task::spawn_blocking(move || {
+        crate::storage::config::AppConfig::write_to_disk(
+            &save_data.0,
+            &save_data.1,
+            &save_data.2,
+        )
+    })
+    .await
+    .map_err(|e| format!("Config save task failed: {e}"))?
+    .map_err(|e| format!("Failed to write config: {e}"))?;
+    Ok(())
+}
+
+/// Reset the pattern list to the built-in defaults — the small,
+/// well-vetted set of "always block" leech mods. Useful as a recovery
+/// path if the user edits the file manually and breaks something.
+#[tauri::command]
+pub async fn reset_antileech_to_defaults(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::types::AntiLeechSnapshot, String> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::ResetAntiLeechToDefaults { tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
+    rx.await.map_err(|_| "Failed to reset anti-leech filter".to_string())?
+}

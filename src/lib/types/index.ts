@@ -228,6 +228,23 @@ export interface KnownClient {
   has_public_key: boolean;
 }
 
+/** Snapshot of the anti-leech client filter — the eMule-style
+ *  AntiLeech.dat equivalent. Populated by `invoke('get_antileech_patterns')`. */
+export interface AntiLeechSnapshot {
+  enabled: boolean;
+  patterns: string[];
+  file_path: string;
+  pattern_count: number;
+}
+
+/** Result of `invoke('set_antileech_patterns')`. The backend accepts as
+ *  many patterns as it can — patterns that fail to compile are surfaced
+ *  per-row in `compile_errors` instead of failing the whole replacement. */
+export interface AntiLeechReplaceResult {
+  snapshot: AntiLeechSnapshot;
+  compile_errors: Array<[string, string]>;
+}
+
 export interface AppSettings {
   nickname: string;
   shared_folders: string[];
@@ -255,6 +272,9 @@ export interface AppSettings {
   add_downloads_paused: boolean;
   remove_finished_downloads: boolean;
   skip_compress_video: boolean;
+  /** When on, peers whose advertised client-software string matches any
+   *  pattern in `<data_dir>/antileech.dat` are rejected at handshake. */
+  antileech_enabled: boolean;
   uss_enabled: boolean;
   filename_cleanups: string;
   spam_filter_enabled: boolean;
