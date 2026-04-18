@@ -176,7 +176,30 @@ impl CreditManager {
     }
 
     pub fn get_or_create(&mut self, user_hash: [u8; 16]) -> &mut CreditRecord {
-        self.credits.entry(user_hash).or_insert_with(|| CreditRecord::new(user_hash))
+        // Every mutating credit operation (set_public_key, set_ident_state,
+        // check_identity_ip, add_uploaded, add_downloaded) routes through
+        // here, so this is the single place to keep `last_seen` honest.
+        // Read-only paths (`get_score_ratio`, `get_current_ident_state`,
+        // `secident_request_state`, `verify_signature`) use
+        // `self.credits.get(...)` and therefore do NOT bump the timestamp,
+        // which is correct — those are just queries, not "we saw them now"
+        // events.
+        //
+        // Without this bump, `last_seen` was only ever advanced by
+        // `add_uploaded` / `add_downloaded`. Peers that connected, did a
+        // partial handshake, and never transferred bytes (Unknown / Failed
+        // / Needed states) kept their creation-time `last_seen` forever,
+        // so the 90-day `cleanup_stale` sweep evicted them by *first
+        // contact* age rather than *last contact* age — visible in the
+        // Known Clients tab as months-old "Unknown" rows for peers we
+        // actually still talked to recently.
+        let now = chrono::Utc::now().timestamp();
+        let record = self
+            .credits
+            .entry(user_hash)
+            .or_insert_with(|| CreditRecord::new(user_hash));
+        record.last_seen = now;
+        record
     }
 
     /// eMule: only accumulate credits when identity is verified via SecIdent.
@@ -197,7 +220,7 @@ impl CreditManager {
             return false;
         }
         record.uploaded = record.uploaded.saturating_add(bytes);
-        record.last_seen = chrono::Utc::now().timestamp();
+        // `last_seen` already bumped by `get_or_create` above.
         true
     }
 
@@ -212,7 +235,7 @@ impl CreditManager {
             return false;
         }
         record.downloaded = record.downloaded.saturating_add(bytes);
-        record.last_seen = chrono::Utc::now().timestamp();
+        // `last_seen` already bumped by `get_or_create` above.
         true
     }
 
@@ -724,5 +747,123 @@ mod tests {
         // A key that's already SPKI should come back byte-identical.
         let already_spki = normalize_public_key_to_spki(&spki).expect("idempotent normalise");
         assert_eq!(already_spki, spki);
+    }
+
+    /// Regression: every mutating credit operation must bump
+    /// `last_seen` so the 90-day `cleanup_stale` sweep evicts records
+    /// based on time-since-last-contact, not time-since-first-contact.
+    /// Before this was fixed, peers we connected with regularly but
+    /// never traded bytes with (Unknown / Failed / Needed states) kept
+    /// their creation-time timestamp forever and aged out at first
+    /// contact + 90d, surfacing in the Known Clients tab as months-old
+    /// entries we had in fact talked to that morning.
+    #[test]
+    fn last_seen_bumps_on_every_mutation() {
+        let mut cm = CreditManager::new();
+        let user = [0x42u8; 16];
+
+        // Seed a record dated to ~120 days ago by hand so any
+        // cleanup_stale(90) call would normally evict it. Each mutation
+        // below must push `last_seen` forward to roughly "now", proving
+        // the timestamp tracks contact freshness.
+        let stale_ts = chrono::Utc::now().timestamp() - 120 * 86400;
+        {
+            let r = cm.get_or_create(user);
+            r.last_seen = stale_ts;
+        }
+        let now_floor = chrono::Utc::now().timestamp() - 5;
+
+        // 1. set_public_key — the most common "we just heard from them" event.
+        {
+            let r = cm.get_or_create(user);
+            r.last_seen = stale_ts;
+        }
+        cm.set_public_key(user, vec![0xAB; 64]);
+        assert!(
+            cm.get_record(&user).unwrap().last_seen >= now_floor,
+            "set_public_key must bump last_seen",
+        );
+
+        // 2. set_ident_state — every state transition counts.
+        {
+            let r = cm.get_or_create(user);
+            r.last_seen = stale_ts;
+        }
+        cm.set_ident_state(user, IdentState::Verified);
+        assert!(
+            cm.get_record(&user).unwrap().last_seen >= now_floor,
+            "set_ident_state must bump last_seen",
+        );
+
+        // 3. check_identity_ip — a successful signature means we just
+        //    completed a SecIdent round trip with this peer.
+        {
+            let r = cm.get_or_create(user);
+            r.last_seen = stale_ts;
+        }
+        cm.check_identity_ip(user, 0x0100_0000);
+        assert!(
+            cm.get_record(&user).unwrap().last_seen >= now_floor,
+            "check_identity_ip must bump last_seen",
+        );
+
+        // 4 & 5. add_uploaded / add_downloaded must bump too — these are
+        //        the original paths that did so explicitly. After the
+        //        get_or_create refactor they bump via the helper, so
+        //        prove the path still works (regardless of accept/reject
+        //        outcome — the peer talked to us, that counts).
+        {
+            let r = cm.get_or_create(user);
+            r.last_seen = stale_ts;
+        }
+        let _ = cm.add_uploaded(user, 1024);
+        assert!(
+            cm.get_record(&user).unwrap().last_seen >= now_floor,
+            "add_uploaded must bump last_seen",
+        );
+        {
+            let r = cm.get_or_create(user);
+            r.last_seen = stale_ts;
+        }
+        let _ = cm.add_downloaded(user, 1024);
+        assert!(
+            cm.get_record(&user).unwrap().last_seen >= now_floor,
+            "add_downloaded must bump last_seen",
+        );
+
+        // Read-only queries must NOT bump — those don't represent
+        // contact, and bumping on every poll would defeat cleanup_stale
+        // entirely (a record would never expire as long as the UI was
+        // open). Re-stale and assert the timestamp survives a query.
+        {
+            let r = cm.get_or_create(user);
+            r.last_seen = stale_ts;
+        }
+        let _ = cm.get_score_ratio(&user, 0);
+        let _ = cm.get_current_ident_state(&user, 0);
+        let _ = cm.get_record(&user);
+        assert_eq!(
+            cm.get_record(&user).unwrap().last_seen,
+            stale_ts,
+            "read-only credit queries must NOT touch last_seen",
+        );
+    }
+
+    /// `cleanup_stale` evicts records past the cutoff regardless of
+    /// `ident_state`. Without `last_seen` being kept fresh on every
+    /// contact, the Known Clients list would slowly fill with months-
+    /// old "Unknown" entries — the symptom that surfaced in the UI.
+    #[test]
+    fn cleanup_stale_evicts_past_cutoff() {
+        let mut cm = CreditManager::new();
+        let fresh = [0x01u8; 16];
+        let stale = [0x02u8; 16];
+        let now = chrono::Utc::now().timestamp();
+        cm.get_or_create(fresh).last_seen = now;
+        cm.get_or_create(stale).last_seen = now - 100 * 86400;
+
+        cm.cleanup_stale(90);
+        assert!(cm.get_record(&fresh).is_some(), "fresh record must survive 90d cutoff");
+        assert!(cm.get_record(&stale).is_none(), "100d-old record must be pruned");
     }
 }
