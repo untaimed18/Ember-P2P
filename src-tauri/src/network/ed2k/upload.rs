@@ -977,6 +977,23 @@ pub async fn start_upload_server(
 
                         server.total_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let _ = stream.set_nodelay(true);
+                        // Cap the kernel TCP send buffer so our sender-side
+                        // `uploaded` counter (which advances when bytes are
+                        // handed to the OS, not when they hit the wire)
+                        // stays within a bounded window of what the peer has
+                        // actually received. Without this, Windows TCP
+                        // autotuning can grow SO_SNDBUF to several MB under
+                        // a fast uplink — uploads then appear "complete" on
+                        // our end while the peer is still draining the
+                        // kernel buffer. 256 KiB is big enough that a
+                        // 10 KiB packet write (see packet-splitting below)
+                        // never meaningfully back-pressures on a healthy
+                        // link, while keeping the queued-vs-wire gap
+                        // bounded to ~25 ms at 10 MB/s.
+                        {
+                            let sref = socket2::SockRef::from(&stream);
+                            let _ = sref.set_send_buffer_size(256 * 1024);
+                        }
                         debug!("Incoming ED2K connection from {peer_addr}");
                         tokio::spawn(async move {
                             let result = std::panic::AssertUnwindSafe(
@@ -2840,8 +2857,41 @@ impl UploadHandler {
                             }
                         };
 
+                        // Match eMule's wire convention for block delivery:
+                        // a single OP_REQUESTPARTS block (up to EMBLOCKSIZE,
+                        // ~180 KiB) is split into ~10 KiB on-wire packets in
+                        // both the compressed and uncompressed paths. See
+                        // UploadDiskIOThread::CreateStandardPackets and
+                        // CreatePackedPackets in emulesource/. Splitting:
+                        //   * keeps downloaders that count "blocks received"
+                        //     per-packet (rather than per-byte) happy,
+                        //   * lets `acquire_upload_bandwidth` throttle at
+                        //     packet granularity instead of bursting a full
+                        //     block then idling,
+                        //   * makes the sender-side `uploaded` counter track
+                        //     bytes-on-wire within ~10 KiB instead of
+                        //     ~180 KiB, which combined with the 256 KiB
+                        //     SO_SNDBUF cap on the listening socket keeps
+                        //     our progress close to what the peer actually
+                        //     sees,
+                        //   * is required for OP_COMPRESSEDPART compatibility
+                        //     with older downloaders that enforce a max
+                        //     packet size — eMule's format is a stream where
+                        //     each packet carries the SAME start offset and
+                        //     SAME total compressed size (`newsize`) and the
+                        //     downloader accumulates `newsize` compressed
+                        //     bytes across packets before decompressing.
+                        //
+                        // eMule's sizing rule (from CreateStandardPackets):
+                        //   nPacketSize = (togo < 13000) ? togo : 10240
+                        // i.e. if the remainder is < 13000 bytes, send it
+                        // all in one packet; otherwise send exactly 10240.
+                        const MAX_PACKET_DATA: usize = 10240;
+                        const SMALL_PACKET_THRESHOLD: usize = 13000;
+
                         // Skip compression for video files when configured (eMule: dontcompressavi)
                         let use_compression = peer_compression_ver > 0 && data.len() > 1024 && !(is_video_ext && self.skip_compress_video);
+                        let mut sent_compressed = false;
                         if use_compression {
                             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
                             if encoder.write_all(&data).is_ok() {
@@ -2849,101 +2899,163 @@ impl UploadHandler {
                                     // Only use compression if it actually saves space
                                     if compressed.len() < data.len() {
                                         let use_i64 = end > u32::MAX as u64;
-                                        let packed_size = compressed.len() as u32;
-                                        let mut part_payload = Vec::with_capacity(
-                                            if use_i64 { 28 } else { 24 } + compressed.len(),
-                                        );
-                                        part_payload.extend_from_slice(&hash);
-                                        if use_i64 {
-                                            part_payload.extend_from_slice(&start.to_le_bytes());
-                                        } else {
-                                            part_payload.extend_from_slice(&(start as u32).to_le_bytes());
-                                        }
-                                        part_payload.extend_from_slice(&packed_size.to_le_bytes());
-                                        part_payload.extend_from_slice(&compressed);
+                                        let newsize = compressed.len() as u32;
+                                        let header_len = if use_i64 { 28 } else { 24 };
+                                        let total_uncompressed = data.len() as u64;
+                                        let total_compressed = compressed.len() as u64;
 
-                                        self.acquire_upload_bandwidth(compressed.len() as u64).await;
-                                        write_packet_async(
-                                            &mut writer,
-                                            OP_EMULEPROT,
-                                            if use_i64 { OP_COMPRESSEDPART_I64 } else { OP_COMPRESSEDPART },
-                                            &part_payload,
-                                        )
-                                        .await?;
-
-                                        uploaded += data.len() as u64;
-                                        rate_tracker.record_send(data.len() as u64);
-                                        batch_credited_bytes =
-                                            batch_credited_bytes.saturating_add(data.len() as u64);
-
-                                        if let Some(tid) = &transfer_id {
-                                            let should_emit = match last_progress_emit {
-                                                None => true,
-                                                Some(last) => {
-                                                    last.elapsed() >= PROGRESS_EMIT_MIN_INTERVAL
-                                                }
+                                        let mut cursor = 0usize;
+                                        let mut uncompressed_accounted: u64 = 0;
+                                        while cursor < compressed.len() {
+                                            let remaining = compressed.len() - cursor;
+                                            let chunk_len = if remaining < SMALL_PACKET_THRESHOLD {
+                                                remaining
+                                            } else {
+                                                MAX_PACKET_DATA
                                             };
-                                            if should_emit {
-                                                last_progress_emit = Some(std::time::Instant::now());
-                                                last_progress_uploaded = uploaded;
-                                                let _ = self.upload_event_tx.send(UploadEvent {
-                                                    transfer_id: tid.clone(),
-                                                    kind: UploadEventKind::Progress {
-                                                        uploaded,
-                                                        total: total_size,
-                                                    },
-                                                }).await;
+                                            let chunk = &compressed[cursor..cursor + chunk_len];
+
+                                            let mut part_payload =
+                                                Vec::with_capacity(header_len + chunk_len);
+                                            part_payload.extend_from_slice(&hash);
+                                            if use_i64 {
+                                                part_payload.extend_from_slice(&start.to_le_bytes());
+                                            } else {
+                                                part_payload.extend_from_slice(&(start as u32).to_le_bytes());
+                                            }
+                                            // Every packet in the stream repeats the
+                                            // total compressed size — that's how the
+                                            // downloader knows when the block ends.
+                                            part_payload.extend_from_slice(&newsize.to_le_bytes());
+                                            part_payload.extend_from_slice(chunk);
+
+                                            self.acquire_upload_bandwidth(chunk_len as u64).await;
+                                            write_packet_async(
+                                                &mut writer,
+                                                OP_EMULEPROT,
+                                                if use_i64 { OP_COMPRESSEDPART_I64 } else { OP_COMPRESSEDPART },
+                                                &part_payload,
+                                            )
+                                            .await?;
+
+                                            cursor += chunk_len;
+
+                                            // Attribute uncompressed-byte progress
+                                            // proportionally to this packet's share
+                                            // of the compressed stream. eMule does
+                                            // the same thing for its own payload
+                                            // accounting (see CreatePackedPackets:
+                                            //   payloadSize = togo ? nPacketSize*oldSize/newsize
+                                            //               : oldSize - totalPayloadSize).
+                                            // The final packet gets the remainder so
+                                            // the sum over the block equals exactly
+                                            // data.len() with no rounding drift.
+                                            let share = if cursor < compressed.len() {
+                                                (chunk_len as u64)
+                                                    .saturating_mul(total_uncompressed)
+                                                    / total_compressed
+                                            } else {
+                                                total_uncompressed
+                                                    .saturating_sub(uncompressed_accounted)
+                                            };
+                                            uncompressed_accounted += share;
+                                            uploaded += share;
+                                            rate_tracker.record_send(share);
+                                            batch_credited_bytes =
+                                                batch_credited_bytes.saturating_add(share);
+
+                                            if let Some(tid) = &transfer_id {
+                                                let should_emit = match last_progress_emit {
+                                                    None => true,
+                                                    Some(last) => {
+                                                        last.elapsed() >= PROGRESS_EMIT_MIN_INTERVAL
+                                                    }
+                                                };
+                                                if should_emit {
+                                                    last_progress_emit =
+                                                        Some(std::time::Instant::now());
+                                                    last_progress_uploaded = uploaded;
+                                                    let _ = self.upload_event_tx.send(UploadEvent {
+                                                        transfer_id: tid.clone(),
+                                                        kind: UploadEventKind::Progress {
+                                                            uploaded,
+                                                            total: total_size,
+                                                        },
+                                                    }).await;
+                                                }
                                             }
                                         }
-                                        continue;
+                                        sent_compressed = true;
                                     }
                                 }
                             }
                         }
-
-                        let use_i64 = end > u32::MAX as u64;
-                        let mut part_payload =
-                            Vec::with_capacity(if use_i64 { 32 } else { 24 } + data.len());
-                        part_payload.extend_from_slice(&hash);
-                        if use_i64 {
-                            part_payload.extend_from_slice(&start.to_le_bytes());
-                            part_payload.extend_from_slice(&end.to_le_bytes());
-                        } else {
-                            part_payload.extend_from_slice(&(start as u32).to_le_bytes());
-                            part_payload.extend_from_slice(&(end as u32).to_le_bytes());
+                        if sent_compressed {
+                            continue;
                         }
-                        part_payload.extend_from_slice(&data);
 
-                        self.acquire_upload_bandwidth(data.len() as u64).await;
-                        write_packet_async(
-                            &mut writer,
-                            if use_i64 { OP_EMULEPROT } else { OP_EDONKEYHEADER },
-                            if use_i64 { OP_SENDINGPART_I64 } else { OP_SENDINGPART },
-                            &part_payload,
-                        )
-                        .await?;
+                        // Uncompressed OP_SENDINGPART path: split into 10 KiB
+                        // packets, each with its own start/end offset for the
+                        // sub-range it carries. (eMule's
+                        // CreateStandardPackets.)
+                        let use_i64 = end > u32::MAX as u64;
+                        let header_len = if use_i64 { 32 } else { 24 };
+                        let proto =
+                            if use_i64 { OP_EMULEPROT } else { OP_EDONKEYHEADER };
+                        let op =
+                            if use_i64 { OP_SENDINGPART_I64 } else { OP_SENDINGPART };
 
-                        uploaded += data.len() as u64;
-                        rate_tracker.record_send(data.len() as u64);
-                        batch_credited_bytes =
-                            batch_credited_bytes.saturating_add(data.len() as u64);
-
-                        if let Some(tid) = &transfer_id {
-                            let should_emit = match last_progress_emit {
-                                None => true,
-                                Some(last) => last.elapsed() >= PROGRESS_EMIT_MIN_INTERVAL,
+                        let mut cursor = 0usize;
+                        while cursor < data.len() {
+                            let remaining = data.len() - cursor;
+                            let chunk_len = if remaining < SMALL_PACKET_THRESHOLD {
+                                remaining
+                            } else {
+                                MAX_PACKET_DATA
                             };
-                            if should_emit {
-                                last_progress_emit = Some(std::time::Instant::now());
-                                last_progress_uploaded = uploaded;
-                                let _ = self.upload_event_tx.send(UploadEvent {
-                                    transfer_id: tid.clone(),
-                                    kind: UploadEventKind::Progress {
-                                        uploaded,
-                                        total: total_size,
-                                    },
-                                }).await;
+                            let chunk = &data[cursor..cursor + chunk_len];
+                            let chunk_start = start + cursor as u64;
+                            let chunk_end = chunk_start + chunk_len as u64;
+
+                            let mut part_payload =
+                                Vec::with_capacity(header_len + chunk_len);
+                            part_payload.extend_from_slice(&hash);
+                            if use_i64 {
+                                part_payload.extend_from_slice(&chunk_start.to_le_bytes());
+                                part_payload.extend_from_slice(&chunk_end.to_le_bytes());
+                            } else {
+                                part_payload.extend_from_slice(&(chunk_start as u32).to_le_bytes());
+                                part_payload.extend_from_slice(&(chunk_end as u32).to_le_bytes());
                             }
+                            part_payload.extend_from_slice(chunk);
+
+                            self.acquire_upload_bandwidth(chunk_len as u64).await;
+                            write_packet_async(&mut writer, proto, op, &part_payload).await?;
+
+                            uploaded += chunk_len as u64;
+                            rate_tracker.record_send(chunk_len as u64);
+                            batch_credited_bytes =
+                                batch_credited_bytes.saturating_add(chunk_len as u64);
+
+                            if let Some(tid) = &transfer_id {
+                                let should_emit = match last_progress_emit {
+                                    None => true,
+                                    Some(last) => last.elapsed() >= PROGRESS_EMIT_MIN_INTERVAL,
+                                };
+                                if should_emit {
+                                    last_progress_emit = Some(std::time::Instant::now());
+                                    last_progress_uploaded = uploaded;
+                                    let _ = self.upload_event_tx.send(UploadEvent {
+                                        transfer_id: tid.clone(),
+                                        kind: UploadEventKind::Progress {
+                                            uploaded,
+                                            total: total_size,
+                                        },
+                                    }).await;
+                                }
+                            }
+
+                            cursor += chunk_len;
                         }
                     }
 
