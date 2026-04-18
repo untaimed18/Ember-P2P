@@ -400,6 +400,12 @@ struct UploadHandler {
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     /// Pre-built Ember Peer Exchange payload (shared, read-only).
     ember_payload: crate::network::ember::SharedEmberPayload,
+    /// Generation counter for `ember_payload`; bumped each time the
+    /// background timer rebuilds the shared payload. The per-connection
+    /// resend logic compares its last-sent value against this so we only
+    /// ship updated EPX over an open upload session when there's
+    /// actually new data, not on every periodic check.
+    ember_payload_generation: crate::network::ember::EmberPayloadGeneration,
     /// eMule-style per-file request frequency tracker (AddRequestCount)
     file_request_tracker: Arc<tokio::sync::Mutex<FileRequestTracker>>,
     /// Notify queued clients when a slot becomes available (fired by UploadSlotGuard
@@ -798,6 +804,7 @@ pub async fn start_upload_server(
     shared_server_addr: Arc<RwLock<Option<SocketAddr>>>,
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     ember_payload: crate::network::ember::SharedEmberPayload,
+    ember_payload_generation: crate::network::ember::EmberPayloadGeneration,
     geoip: crate::geoip::GeoIpReader,
     ember_sessions: EmberSessionMap,
     ember_hash: [u8; 16],
@@ -864,6 +871,7 @@ pub async fn start_upload_server(
         ember_hash,
         friend_hashes,
         ember_payload,
+        ember_payload_generation,
         geoip,
         file_request_tracker: Arc::new(tokio::sync::Mutex::new(FileRequestTracker::new())),
         slot_notify,
@@ -1787,15 +1795,22 @@ impl UploadHandler {
             peer_secure_ident_level,
         ).await?;
 
-        // Ember Peer Exchange: send our source list to Ember peers
+        // Ember Peer Exchange: send our source list to Ember peers.
+        // Snapshot the generation we sent so the periodic resend loop
+        // below only re-ships when the shared payload has actually been
+        // rebuilt with new sources/peers, not on every timer tick.
         info!("Peer {peer_addr}: is_ember={}, mod_version='{}', ember_hash={}, client='{}'",
             hello_caps.is_ember, hello_caps.mod_version,
             peer_ember_hash.map(|h| hex::encode(h)).unwrap_or_else(|| "none".to_string()),
             ul_client_software);
+        let mut last_epx_generation: u64 = self
+            .ember_payload_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut last_epx_resend = std::time::Instant::now();
         if hello_caps.is_ember {
             let epx_data = self.ember_payload.read().await.clone();
             if !epx_data.is_empty() {
-                info!("Sending EPX to Ember peer {peer_addr} ({} bytes)", epx_data.len());
+                info!("Sending EPX to Ember peer {peer_addr} ({} bytes, gen {})", epx_data.len(), last_epx_generation);
                 let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await;
             } else {
                 info!("EPX payload empty, skipping EPX send to {peer_addr}");
@@ -1942,6 +1957,15 @@ impl UploadHandler {
             }
         });
 
+        // Periodic EPX resend cadence inside the upload session. eMule peers
+        // that download from us may stay connected for hours seeding/queueing,
+        // and during that time our shared payload typically rebuilds many
+        // times as we discover new sources/Ember peers. Without this loop,
+        // the only EPX they ever see is the one snapshot at handshake. 5 min
+        // matches the cadence used by `multi_source.rs` and `transfer.rs`
+        // for the symmetric "we're downloading" direction.
+        const EPX_RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
         loop {
             // eMule: terminate upload sessions when the network is disconnected.
             if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1954,6 +1978,39 @@ impl UploadHandler {
             // and all shared cleanup at function exit runs.
             if user_cancelled {
                 break;
+            }
+
+            // Re-share EPX with Ember peers when our shared payload has
+            // been rebuilt since we last sent. The check is two atomic
+            // loads + a compare; cheap enough to do every loop iteration
+            // (worst case: a 1s queued tick). We deliberately gate on
+            // `is_ember` so non-Ember peers never see the OP_EMBER_*
+            // opcode.
+            if hello_caps.is_ember && last_epx_resend.elapsed() >= EPX_RESEND_INTERVAL {
+                let current_gen = self
+                    .ember_payload_generation
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if current_gen != last_epx_generation {
+                    let epx_data = self.ember_payload.read().await.clone();
+                    if !epx_data.is_empty() {
+                        debug!(
+                            "Re-sending EPX to {peer_addr} (gen {}->{}, {} bytes)",
+                            last_epx_generation, current_gen, epx_data.len()
+                        );
+                        if write_packet_async(
+                            &mut writer,
+                            OP_EMULEPROT,
+                            OP_EMBER_SOURCEEXCHANGE,
+                            &*epx_data,
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            last_epx_generation = current_gen;
+                        }
+                    }
+                }
+                last_epx_resend = std::time::Instant::now();
             }
 
             let (proto, opcode, payload) = if let Some(pkt) = deferred_packet.take() {
