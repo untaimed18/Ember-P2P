@@ -1198,6 +1198,20 @@ struct NetworkState {
     obfuscation_enabled: bool,
     /// Shared firewall status that can be updated from spawned tasks
     firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared external IPv4 encoded as a little-endian u32 — the same
+    /// layout ed2k uses for a HighID `client_id` on the wire.
+    /// `0` means unknown (no trusted source has reported our public IP yet);
+    /// any non-zero value is our public IPv4 confirmed by a trusted source
+    /// (ed2k server HighID, multi-reporter KAD consensus, or UPnP→firewall
+    /// re-verification). The upload listener reads this atomic when building
+    /// an outgoing `OP_HELLOANSWER`: advertising our real ID here instead
+    /// of a hardcoded `0` lets strict eMule forks and older clients
+    /// correctly treat us as HighID in their queue scoring and callback
+    /// logic, rather than relying on BaseClient.cpp's forgiving
+    /// `m_nUserIDHybrid == 0 → use connect IP` auto-heal. Keeps this in
+    /// sync with `external_ip` via `set_external_ip` below so there is no
+    /// way to update one without the other.
+    external_ip_shared: Arc<std::sync::atomic::AtomicU32>,
     /// Whether we've done the initial self-lookup (FindNode for own ID)
     self_lookup_done: bool,
     /// Timestamp of last self-lookup (eMule repeats every 4 hours)
@@ -2339,6 +2353,7 @@ pub async fn start_network(
         banned_ips,
         obfuscation_enabled: settings.obfuscation_enabled,
         firewalled_shared: Arc::new(std::sync::atomic::AtomicBool::new(!upnp_success)),
+        external_ip_shared: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         self_lookup_done: false,
         last_self_lookup: 0,
         kad_started_at: chrono::Utc::now().timestamp(),
@@ -2582,6 +2597,7 @@ pub async fn start_network(
         let ul_download_folder = settings.download_folder.clone();
         let ul_fw_probes = firewall_probe_ips.clone();
         let ul_fw_shared = state.firewalled_shared.clone();
+        let ul_ext_ip_shared = state.external_ip_shared.clone();
         let ul_kad_cbs = pending_kad_callbacks.clone();
         let ul_kad_cb_tx = kad_callback_tx.clone();
         let ul_udp_fw_tx = udp_fw_check_tx.clone();
@@ -2621,6 +2637,7 @@ pub async fn start_network(
                 settings.filter_incoming_connections,
                 ul_fw_probes,
                 ul_fw_shared,
+                ul_ext_ip_shared,
                 ul_kad_cbs,
                 ul_kad_cb_tx,
                 ul_udp_fw_tx,
@@ -5551,7 +5568,7 @@ pub async fn start_network(
                     state.stats.tcp_status = format!("{:?}", tcp_status);
                     state.stats.udp_status = format!("{:?}", udp_status);
                     if let Some(ip) = state.firewall_checker.external_ip() {
-                        state.external_ip = Some(ip);
+                        set_external_ip(&mut state, Some(ip));
                         state.stats.external_ip = ip.to_string();
                         state.routing_table.set_external_ip(ip);
                     }
@@ -8859,13 +8876,12 @@ pub async fn start_network(
                             let ext_ip = Ipv4Addr::from(ip_bytes);
                             info!("Server HighID reports our IP as {}", ext_ip);
                             if !ext_ip.is_unspecified() && !ext_ip.is_loopback() {
-                                let was_none = state.external_ip.is_none();
-                                if was_none {
-                                    state.external_ip = Some(ext_ip);
+                                if state.external_ip.is_none() {
+                                    set_external_ip(&mut state, Some(ext_ip));
                                     state.stats.external_ip = ext_ip.to_string();
                                     info!("External IP set from server HighID: {}", ext_ip);
                                 } else if state.external_ip == Some(ext_ip) {
-                                    state.external_ip = Some(ext_ip);
+                                    set_external_ip(&mut state, Some(ext_ip));
                                     state.stats.external_ip = ext_ip.to_string();
                                 } else {
                                     info!("Server HighID IP {} differs from current external IP {:?} — not overwriting", ext_ip, state.external_ip);
@@ -10655,6 +10671,24 @@ fn build_kad_connect_options(state: &NetworkState) -> u8 {
     (direct_udp_callback << 3) | (requires_crypt << 2) | (requests_crypt << 1) | supports_crypt
 }
 
+/// Mutate `state.external_ip` AND publish the change to the shared atomic
+/// that long-lived subsystems (e.g. the upload listener's HelloAnswer path)
+/// read without holding a lock. Always use this instead of assigning to
+/// `state.external_ip` directly so the two views never drift. `None` clears
+/// the atomic back to `0`, which the Hello builder interprets as "advertise
+/// client_id=0 and let the peer's BaseClient auto-heal from the connect IP"
+/// — correct fallback behavior when we don't yet have a trusted public IP.
+fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
+    state.external_ip = ip;
+    let client_id_le = match ip {
+        Some(v4) => u32::from_le_bytes(v4.octets()),
+        None => 0,
+    };
+    state
+        .external_ip_shared
+        .store(client_id_le, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn update_publish_manager_state(state: &mut NetworkState) {
     state.publish_manager.firewalled = state.firewalled;
     state.publish_manager.use_extern_kad_port = matches!(state.external_udp_port, Some(port) if port != 0 && port != state.udp_port);
@@ -12376,7 +12410,7 @@ async fn handle_udp_packet(
             // mutating shared state.
             let prev_ip = state.external_ip;
             if let Some(confirmed) = state.firewall_checker.external_ip() {
-                state.external_ip = Some(confirmed);
+                set_external_ip(state, Some(confirmed));
                 state.stats.external_ip = confirmed.to_string();
                 if prev_ip != Some(confirmed) {
                     info!(
@@ -13626,7 +13660,7 @@ async fn handle_command(
 
             // Reset network state (eMule resets firewall, deletes routing zone)
             state.routing_table.clear();
-            state.external_ip = None;
+            set_external_ip(state, None);
             state.external_udp_port = None;
             state.firewalled = true;
             state.firewalled_shared.store(true, std::sync::atomic::Ordering::Relaxed);

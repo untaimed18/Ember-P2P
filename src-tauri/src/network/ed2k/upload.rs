@@ -374,6 +374,16 @@ struct UploadHandler {
     firewall_probe_ips: FirewallProbeSet,
     /// Shared atomic: set to false when TCP is proven open
     firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
+    /// Our current external IPv4 as a HighID-format little-endian u32, or
+    /// `0` when we don't yet have a trusted public IP. Read on every
+    /// incoming Hello so the `OP_HELLOANSWER` we send advertises our real
+    /// client_id — strict eMule forks and older clients rely on this value
+    /// for HighID/LowID classification, queue scoring, and callback-routing
+    /// decisions. When this is 0 we fall through to sending client_id=0,
+    /// which stock eMule (BaseClient.cpp:608) auto-heals to the connect IP
+    /// but other clients may interpret as LowID. Kept in sync with
+    /// `NetworkState::external_ip` via `set_external_ip`.
+    external_ip_shared: Arc<std::sync::atomic::AtomicU32>,
     /// IPs expected as incoming KAD callback connections (source -> file_hash)
     pending_kad_callbacks: PendingKadCallbacks,
     /// Channel to forward recognized KAD callback connections to network task
@@ -775,6 +785,12 @@ pub async fn start_upload_server(
     filter_incoming_connections: bool,
     firewall_probe_ips: FirewallProbeSet,
     firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
+    // Our current external IPv4 in ed2k HighID encoding (little-endian u32
+    // of the four IP octets), or 0 when we don't yet have a trusted public
+    // IP to advertise. Kept in sync with `NetworkState::external_ip` by
+    // `set_external_ip` in network/mod.rs so this listener always reads the
+    // freshest value without taking a lock.
+    external_ip_shared: Arc<std::sync::atomic::AtomicU32>,
     pending_kad_callbacks: PendingKadCallbacks,
     kad_callback_tx: tokio::sync::mpsc::Sender<KadCallbackParts>,
     udp_fw_check_tx: tokio::sync::mpsc::Sender<UdpFirewallCheckRequest>,
@@ -839,6 +855,7 @@ pub async fn start_upload_server(
         filter_incoming_connections,
         firewall_probe_ips,
         firewalled_shared,
+        external_ip_shared,
         pending_kad_callbacks,
         kad_callback_tx,
         udp_fw_check_tx,
@@ -1358,9 +1375,18 @@ impl UploadHandler {
 
                         let buddy = self.shared_buddy_info.read().await.clone();
                         let hello_options = self.hello_options().await;
+                        // Advertise our real HighID client_id when we have a
+                        // trusted public IP. Falls back to `0` pre-handshake,
+                        // which stock eMule auto-heals from the connect IP
+                        // (BaseClient.cpp:608) but strict/older clients may
+                        // interpret as LowID. See the
+                        // `external_ip_shared` field docs.
+                        let our_client_id = self
+                            .external_ip_shared
+                            .load(std::sync::atomic::Ordering::Relaxed);
                         let hello_payload = build_hello_answer_with_buddy_opts(
                             &self.user_hash,
-                            0,
+                            our_client_id,
                             self.tcp_port,
                             &self.nickname,
                             buddy,
@@ -1481,9 +1507,14 @@ impl UploadHandler {
 
                 let buddy = self.shared_buddy_info.read().await.clone();
                 let hello_options = self.hello_options().await;
+                // Advertise our real HighID client_id when known (see the
+                // matching block in the obfuscated path above for rationale).
+                let our_client_id = self
+                    .external_ip_shared
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 let hello_payload = build_hello_answer_with_buddy_opts(
                     &self.user_hash,
-                    0,
+                    our_client_id,
                     self.tcp_port,
                     &self.nickname,
                     buddy,
