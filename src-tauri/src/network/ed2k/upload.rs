@@ -2001,15 +2001,34 @@ impl UploadHandler {
             // specific opcodes, unrecognised keepalives, etc.). A
             // peer that holds a slot but never sends OP_REQUESTPARTS
             // would sit "Transferring" forever as long as it kept any
-            // packet trickle alive. Drop the slot when no part
-            // request has arrived in `SLOT_IDLE_TIMEOUT_SECS`,
-            // independent of read-side traffic.
-            if slot_guard.is_active()
+            // packet trickle alive.
+            //
+            // Two independent triggers:
+            //
+            //   * `slot_guard.is_active()` — peer holds a slot. We
+            //     want to rotate after SLOT_IDLE_TIMEOUT_SECS of no
+            //     useful activity even if the read side keeps getting
+            //     bumped by chatter.
+            //
+            //   * `uploaded > 0` — we already moved bytes for this
+            //     peer this session, so they exist in the UI's
+            //     "Transferring" pane. If the slot deactivated for
+            //     any reason (session preemption, score rotation)
+            //     but the connection is still up because the peer
+            //     keeps sending chatter, the row would otherwise
+            //     stay pinned at its last `transferred` value
+            //     until the much-coarser `CLIENT_TIMEOUT_SECS`
+            //     expired. The eMule Plus 1.2.5 case in the field
+            //     hit exactly this combination — slot dropped
+            //     after a couple of blocks but the peer kept the
+            //     socket alive with non-REQUESTPARTS traffic.
+            if (slot_guard.is_active() || uploaded > 0)
                 && last_part_request.elapsed().as_secs() >= SLOT_IDLE_TIMEOUT_SECS
             {
                 debug!(
-                    "Upload slot for {peer_addr} idle >{SLOT_IDLE_TIMEOUT_SECS}s with no \
-                     OP_REQUESTPARTS — closing to rotate slot (uploaded={uploaded} bytes)"
+                    "Upload to {peer_addr} idle >{SLOT_IDLE_TIMEOUT_SECS}s with no useful \
+                     activity (slot_active={}, uploaded={uploaded} bytes) — closing",
+                    slot_guard.is_active(),
                 );
                 break;
             }
@@ -2857,12 +2876,6 @@ impl UploadHandler {
                         .await?;
                         continue;
                     }
-                    // Bump the useful-activity gauge BEFORE serving so
-                    // the gate at the top of the loop never rotates a
-                    // peer mid-batch. See the field declaration for
-                    // why this exists separately from the read-side
-                    // SLOT_IDLE_TIMEOUT_SECS.
-                    last_part_request = std::time::Instant::now();
 
                     let offsets = if opcode == OP_REQUESTPARTS_I64 {
                         parse_request_parts_i64(&payload)?
@@ -3339,6 +3352,18 @@ impl UploadHandler {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .insert(peer_addr, rate_tracker.smoothed_rate());
+                        // Bump the useful-activity gauge ONLY after bytes
+                        // actually flowed. The earlier "bump on REQUESTPARTS
+                        // arrival" approach was defeated by clients that
+                        // ship REQUESTPARTS for ranges we filter out (past
+                        // EOF, zero-length, parts we won't serve, parts
+                        // already-served-this-batch deduplicated, etc.) —
+                        // those still bumped the gauge even though nothing
+                        // moved on the wire, leaving the slot pinned
+                        // forever (eMule Plus 1.2.5 was the canonical
+                        // repro). Tying the bump to `batch_credited_bytes`
+                        // means only real progress resets the timer.
+                        last_part_request = std::time::Instant::now();
                     }
 
                     // OP_REQUESTPARTS is the hot path. After the inner
