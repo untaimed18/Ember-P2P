@@ -410,13 +410,6 @@ impl CreditManager {
         self.credits.get(user_hash)
     }
 
-    /// Convenience: report whether SecIdent crypto is currently usable.
-    /// The "Known Clients" tab uses this to decide whether to display
-    /// `IdentState::Unknown` as "Unknown (no crypto)" vs "Unknown".
-    pub fn crypto_available(&self) -> bool {
-        self.crypto_available
-    }
-
     pub fn cleanup_stale(&mut self, max_age_days: i64) {
         let cutoff = chrono::Utc::now().timestamp() - (max_age_days * 86400);
         self.credits.retain(|_, r| r.last_seen > cutoff);

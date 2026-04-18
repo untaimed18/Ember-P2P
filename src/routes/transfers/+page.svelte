@@ -117,16 +117,19 @@
   ];
   // KNOWN_COLUMNS schema mirrors `KnownClient`: lifetime SecIdent records
   // sourced from clients.met. Independent of which peers are connected,
-  // so this view is the "credit ledger" view of the network.
-  const KNOWN_COLUMNS: TransferColumn[] = [
+  // so this view is the "credit ledger" view of the network. Every
+  // non-flag column is sortable; the user's last-used sort is persisted
+  // via `transfers-kn-sort-field` / `transfers-kn-sort-asc` (see the
+  // `KnSortField` type and `toggleKnSort` below).
+  const KNOWN_COLUMNS: TransferColumn<KnSortField>[] = [
     { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-k-flag' },
-    { key: 'user_hash', label: 'User Hash', width: 200, minWidth: 140, className: 'col-k-hash' },
-    { key: 'last_known_ip', label: 'Last IP', width: 130, minWidth: 110, className: 'col-k-ip' },
-    { key: 'uploaded', label: 'Uploaded To', width: 100, minWidth: 80, className: 'col-k-up' },
-    { key: 'downloaded', label: 'Downloaded From', width: 110, minWidth: 88, className: 'col-k-down' },
-    { key: 'credit_ratio', label: 'Score', width: 64, minWidth: 56, className: 'col-k-score' },
-    { key: 'ident_state', label: 'Identification', width: 110, minWidth: 96, className: 'col-k-ident' },
-    { key: 'last_seen', label: 'Last Seen', width: 140, minWidth: 110, className: 'col-k-seen' },
+    { key: 'user_hash', label: 'User Hash', width: 200, minWidth: 140, className: 'col-k-hash', sortField: 'user_hash' },
+    { key: 'last_known_ip', label: 'Last IP', width: 130, minWidth: 110, className: 'col-k-ip', sortField: 'last_known_ip' },
+    { key: 'uploaded', label: 'Uploaded To', width: 100, minWidth: 80, className: 'col-k-up', sortField: 'uploaded' },
+    { key: 'downloaded', label: 'Downloaded From', width: 110, minWidth: 88, className: 'col-k-down', sortField: 'downloaded' },
+    { key: 'credit_ratio', label: 'Score', width: 64, minWidth: 56, className: 'col-k-score', sortField: 'credit_ratio' },
+    { key: 'ident_state', label: 'Identification', width: 110, minWidth: 96, className: 'col-k-ident', sortField: 'ident_state' },
+    { key: 'last_seen', label: 'Last Seen', width: 140, minWidth: 110, className: 'col-k-seen', sortField: 'last_seen' },
   ];
   const CLIENT_COLUMNS: TransferColumn[] = [
     { key: 'peer_name', label: 'User Name', width: 150, minWidth: 120, className: 'col-c-client' },
@@ -546,16 +549,86 @@
     };
   });
 
+  // Sorted view of `knownClients` driven by the column-header click
+  // state. Comparators are picked per-field so numeric columns sort
+  // numerically (not lexicographically), date columns sort by the raw
+  // unix epoch the backend supplies, and string columns are compared
+  // case-insensitively. `null`/empty values are pushed to the end on
+  // ascending sort and to the start on descending sort so the UI never
+  // shows a block of "—" cells in the middle of the list.
+  const KNOWN_IDENT_ORDER: Record<string, number> = {
+    Verified: 0, Needed: 1, Unknown: 2, Failed: 3, BadGuy: 4,
+  };
+  let sortedKnownClients = $derived.by(() => {
+    if (knownClients.length === 0) return knownClients;
+    const sorted = [...knownClients];
+    const dir = knSortAsc ? 1 : -1;
+    const cmpStr = (a: string | null | undefined, b: string | null | undefined) => {
+      const ax = (a ?? '').toLowerCase();
+      const bx = (b ?? '').toLowerCase();
+      if (ax === bx) return 0;
+      // Empty values sort last regardless of direction.
+      if (!ax) return 1;
+      if (!bx) return -1;
+      return ax < bx ? -1 : 1;
+    };
+    const cmpNum = (a: number, b: number) => a === b ? 0 : (a < b ? -1 : 1);
+    sorted.sort((a, b) => {
+      let raw: number;
+      switch (knSortField) {
+        case 'user_hash':
+          raw = cmpStr(a.user_hash, b.user_hash);
+          break;
+        case 'last_known_ip':
+          raw = cmpStr(a.last_known_ip, b.last_known_ip);
+          break;
+        case 'uploaded':
+          raw = cmpNum(a.uploaded, b.uploaded);
+          break;
+        case 'downloaded':
+          raw = cmpNum(a.downloaded, b.downloaded);
+          break;
+        case 'credit_ratio':
+          raw = cmpNum(a.credit_ratio, b.credit_ratio);
+          break;
+        case 'ident_state':
+          raw = cmpNum(
+            KNOWN_IDENT_ORDER[a.ident_state] ?? 99,
+            KNOWN_IDENT_ORDER[b.ident_state] ?? 99,
+          );
+          break;
+        case 'last_seen':
+          raw = cmpNum(a.last_seen, b.last_seen);
+          break;
+      }
+      // Stable secondary sort by user_hash so equal primary keys produce
+      // a deterministic order across re-renders / re-polls.
+      if (raw === 0) return cmpStr(a.user_hash, b.user_hash);
+      return raw * dir;
+    });
+    return sorted;
+  });
+
   // --- Sorting ---
   type DlSortField = 'file_name' | 'total_size' | 'transferred' | 'completed_size' | 'speed' | 'progress' | 'sources' | 'priority' | 'status' | 'remaining' | 'last_seen_complete' | 'last_received' | 'category' | 'started_at';
   type UlSortField = 'peer_name' | 'file_name' | 'speed' | 'transferred' | 'waited' | 'upload_time' | 'status' | 'client_software';
+  type KnSortField = 'user_hash' | 'last_known_ip' | 'uploaded' | 'downloaded' | 'credit_ratio' | 'ident_state' | 'last_seen';
   const DL_SORT_FIELDS: DlSortField[] = ['file_name', 'total_size', 'transferred', 'completed_size', 'speed', 'progress', 'sources', 'priority', 'status', 'remaining', 'last_seen_complete', 'last_received', 'category', 'started_at'];
   const UL_SORT_FIELDS: UlSortField[] = ['peer_name', 'file_name', 'speed', 'transferred', 'waited', 'upload_time', 'status', 'client_software'];
+  const KN_SORT_FIELDS: KnSortField[] = ['user_hash', 'last_known_ip', 'uploaded', 'downloaded', 'credit_ratio', 'ident_state', 'last_seen'];
   function safeGetItem(key: string): string | null { try { return localStorage.getItem(key); } catch { return null; } }
   let dlSortField: DlSortField = $state(DL_SORT_FIELDS.includes(safeGetItem('transfers-dl-sort-field') as DlSortField) ? safeGetItem('transfers-dl-sort-field') as DlSortField : 'file_name');
   let dlSortAsc = $state(safeGetItem('transfers-dl-sort-asc') !== 'false');
   let ulSortField: UlSortField = $state(UL_SORT_FIELDS.includes(safeGetItem('transfers-ul-sort-field') as UlSortField) ? safeGetItem('transfers-ul-sort-field') as UlSortField : 'file_name');
   let ulSortAsc = $state(safeGetItem('transfers-ul-sort-asc') !== 'false');
+  // Default Known Clients sort: most-recently-seen first. Matches the
+  // backend snapshot's default ordering so the first paint is stable
+  // even before the user picks a column. `dlSortAsc` semantics: true =
+  // ascending in display order; for `last_seen` ascending means
+  // oldest-first, so we invert the default to false (descending = newest
+  // first) to match the backend.
+  let knSortField: KnSortField = $state(KN_SORT_FIELDS.includes(safeGetItem('transfers-kn-sort-field') as KnSortField) ? safeGetItem('transfers-kn-sort-field') as KnSortField : 'last_seen');
+  let knSortAsc = $state(safeGetItem('transfers-kn-sort-asc') === 'true');
 
   function toggleDlSort(field: DlSortField) {
     if (dlSortField === field) dlSortAsc = !dlSortAsc;
@@ -568,6 +641,20 @@
     else { ulSortField = field; ulSortAsc = true; }
     localStorage.setItem('transfers-ul-sort-field', ulSortField);
     localStorage.setItem('transfers-ul-sort-asc', String(ulSortAsc));
+  }
+  function toggleKnSort(field: KnSortField) {
+    if (knSortField === field) {
+      knSortAsc = !knSortAsc;
+    } else {
+      // First click on a new column picks the "natural" direction:
+      // numeric/date columns default to descending (largest first),
+      // string columns default to ascending (A-Z first). Matches the
+      // sorting UX in eMule and most file managers.
+      knSortField = field;
+      knSortAsc = field === 'user_hash' || field === 'last_known_ip' || field === 'ident_state';
+    }
+    localStorage.setItem('transfers-kn-sort-field', knSortField);
+    localStorage.setItem('transfers-kn-sort-asc', String(knSortAsc));
   }
   function sortArrow(current: string, field: string, asc: boolean): string {
     if (current !== field) return '';
@@ -1222,6 +1309,18 @@
     sortOnKey(event, () => toggleUlSort(sortField));
   }
 
+  function onKnownHeaderClick(column: TransferColumn<KnSortField>) {
+    if (Date.now() < suppressHeaderClickUntil) return;
+    if (!column.sortField) return;
+    toggleKnSort(column.sortField);
+  }
+
+  function onKnownHeaderKeydown(event: KeyboardEvent, column: TransferColumn<KnSortField>) {
+    const sortField = column.sortField;
+    if (!sortField) return;
+    sortOnKey(event, () => toggleKnSort(sortField));
+  }
+
   function getFixedColumnKey(table: TableKey): string {
     return TABLE_COLUMNS[table][0].key;
   }
@@ -1267,7 +1366,7 @@
   let visibleDownloadColumns = $derived.by(() => getVisibleColumns('downloads') as TransferColumn<DlSortField>[]);
   let visibleUploadColumns = $derived.by(() => getVisibleColumns('uploads') as TransferColumn<UlSortField>[]);
   let visibleQueueColumns = $derived.by(() => getVisibleColumns('queue'));
-  let visibleKnownColumns = $derived.by(() => getVisibleColumns('known'));
+  let visibleKnownColumns = $derived.by(() => getVisibleColumns('known') as TransferColumn<KnSortField>[]);
   let visibleClientColumns = $derived.by(() => getVisibleColumns('clients'));
 
   function getTableElement(table: TableKey): HTMLTableElement | undefined {
@@ -2376,18 +2475,25 @@
               {#each visibleKnownColumns as column (column.key)}
                 <th
                   class={column.className}
+                  class:sortable={Boolean(column.sortField)}
                   class:resizing={isResizingColumn('known', column.key)}
                   class:drag-enabled={canDragColumn('known', column.key)}
                   class:drop-before={isDropBefore('known', column.key)}
                   class:drop-after={isDropAfter('known', column.key)}
+                  tabindex={column.sortField ? 0 : undefined}
                   role="columnheader"
                   draggable={canDragColumn('known', column.key)}
+                  aria-sort={column.sortField ? ariaSortValue(knSortField, column.sortField, knSortAsc) : undefined}
+                  onclick={() => onKnownHeaderClick(column)}
+                  onkeydown={(e) => onKnownHeaderKeydown(e, column)}
                   ondragstart={(e) => handleColumnDragStart(e, 'known', column.key)}
                   ondragover={(e) => handleColumnDragOver(e, 'known', column.key)}
                   ondrop={(e) => handleColumnDrop(e, 'known', column.key)}
                   ondragend={handleColumnDragEnd}
                 >
-                  <span class="header-content">{column.label}</span>
+                  <span class="header-content">
+                    {column.label}{column.sortField ? sortArrow(knSortField, column.sortField, knSortAsc) : ''}
+                  </span>
                   <button
                     type="button"
                     class="col-resize-handle"
@@ -2402,7 +2508,7 @@
             </tr>
           </thead>
           <tbody>
-            {#each knownClients as kc (kc.user_hash)}
+            {#each sortedKnownClients as kc (kc.user_hash)}
               <tr class="client-row">
                 {#each visibleKnownColumns as column (column.key)}
                   {#if column.key === 'country'}
