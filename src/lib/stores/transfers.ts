@@ -134,6 +134,34 @@ const pendingProgress = new Map<string, PendingProgress>();
 const ORPHAN_PROGRESS_TTL_MS = 5000;
 let progressFlushScheduled = false;
 
+/** Upload IDs we've explicitly removed via terminal events (complete/fail).
+ *  Tracked with an expiry timestamp so the polling refresh below can
+ *  ignore stale `getTransfers()` snapshots that captured the row a few
+ *  ms before the backend dropped it from `mgr.completed`. Without this,
+ *  a poll started just before a `transfer-complete` could resurrect the
+ *  just-vanished upload row in the UI for a single poll cycle. The
+ *  TTL is ~3× the poll interval (3 s) so even a slow pollback can't
+ *  win the race. */
+const recentlyRemovedUploads = new Map<string, number>();
+const REMOVED_UPLOAD_TTL_MS = 10_000;
+function markUploadRemoved(id: string) {
+  recentlyRemovedUploads.set(id, Date.now() + REMOVED_UPLOAD_TTL_MS);
+}
+function pruneRemovedUploads(now: number) {
+  for (const [id, expiry] of recentlyRemovedUploads) {
+    if (expiry <= now) recentlyRemovedUploads.delete(id);
+  }
+}
+function wasRecentlyRemoved(id: string, now: number): boolean {
+  const expiry = recentlyRemovedUploads.get(id);
+  if (expiry === undefined) return false;
+  if (expiry <= now) {
+    recentlyRemovedUploads.delete(id);
+    return false;
+  }
+  return true;
+}
+
 function scheduleProgressFlush() {
   if (progressFlushScheduled) return;
   progressFlushScheduled = true;
@@ -238,7 +266,8 @@ export async function initTransferStore() {
           // Match eMule: an upload session ending — successfully or not —
           // immediately removes the row from the active uploads pane.
           // Cumulative upload totals live in the statistics view.
-          if (existing) pendingProgress.delete(id);
+          markUploadRemoved(id);
+          pendingProgress.delete(id);
           return list.filter((t) => t.id !== id);
         }
         return list.map((t) => {
@@ -274,7 +303,8 @@ export async function initTransferStore() {
           // sessions also disappear from the active list. The failure
           // reason is preserved in statistics and event logs, just not
           // as a sticky row in the upload pane.
-          if (existing) pendingProgress.delete(id);
+          markUploadRemoved(id);
+          pendingProgress.delete(id);
           return list.filter((t) => t.id !== id);
         }
         return list.map((t) => {
@@ -457,6 +487,7 @@ export function cleanupTransferStore() {
   }
   pollConsumers = 0;
   pendingProgress.clear();
+  recentlyRemovedUploads.clear();
   progressFlushScheduled = false;
   initialized = false;
   transfers.set([]);
@@ -492,32 +523,43 @@ export function startTransferPoll() {
         new Promise<never>((_, reject) => setTimeout(() => reject('timeout'), 4000)),
       ]);
       transfers.update((current) => {
+        const now = Date.now();
+        pruneRemovedUploads(now);
         const currentById = new Map(current.map((t) => [t.id, t]));
         const apiIds = new Set(all.map((t) => t.id));
-        const merged = all.map((apiItem) => {
-          const eventItem = currentById.get(apiItem.id);
-          if (!eventItem) return apiItem;
-          const preferEvent = isMoreAdvancedStatus(eventItem.status, apiItem.status);
-          return {
-            ...apiItem,
-            status: preferEvent ? eventItem.status : apiItem.status,
-            progress: Math.max(apiItem.progress, eventItem.progress),
-            speed: preferEvent ? eventItem.speed : apiItem.speed,
-            transferred: Math.max(apiItem.transferred, eventItem.transferred),
-            completed_size: Math.max(apiItem.completed_size || 0, eventItem.completed_size || 0),
-            health: eventItem.health ?? apiItem.health,
-            health_reason: eventItem.health_reason ?? apiItem.health_reason,
-            stalled_since: eventItem.stalled_since ?? apiItem.stalled_since,
-            failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
-            failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
-            failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
-          };
-        });
+        const merged = all
+          // Skip API items for upload rows we removed within the last
+          // ~10 s. Without this, a poll that fetched its snapshot just
+          // before a `transfer-complete` event would resurrect the
+          // just-vanished row for a single poll cycle, defeating the
+          // eMule-style auto-remove UX.
+          .filter((apiItem) => !wasRecentlyRemoved(apiItem.id, now))
+          .map((apiItem) => {
+            const eventItem = currentById.get(apiItem.id);
+            if (!eventItem) return apiItem;
+            const preferEvent = isMoreAdvancedStatus(eventItem.status, apiItem.status);
+            return {
+              ...apiItem,
+              status: preferEvent ? eventItem.status : apiItem.status,
+              progress: Math.max(apiItem.progress, eventItem.progress),
+              speed: preferEvent ? eventItem.speed : apiItem.speed,
+              transferred: Math.max(apiItem.transferred, eventItem.transferred),
+              completed_size: Math.max(apiItem.completed_size || 0, eventItem.completed_size || 0),
+              health: eventItem.health ?? apiItem.health,
+              health_reason: eventItem.health_reason ?? apiItem.health_reason,
+              stalled_since: eventItem.stalled_since ?? apiItem.stalled_since,
+              failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
+              failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
+              failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
+            };
+          });
         const terminalStatuses: Transfer['status'][] = ['completed', 'failed', 'stopped'];
+        const mergedIds = new Set(merged.map((t) => t.id));
         for (const t of current) {
-          if (!apiIds.has(t.id) && !terminalStatuses.includes(t.status)) {
-            merged.push(t);
-          }
+          if (mergedIds.has(t.id)) continue;
+          if (apiIds.has(t.id)) continue; // dropped by recently-removed filter
+          if (terminalStatuses.includes(t.status)) continue;
+          merged.push(t);
         }
         return merged;
       });

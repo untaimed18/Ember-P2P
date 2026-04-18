@@ -2408,7 +2408,7 @@
                   {#if column.key === 'country'}
                     <td class="flag-cell" title={kc.country_code ?? ''}>{#if countryFlagSrc(kc.country_code ?? undefined)}<img src={countryFlagSrc(kc.country_code ?? undefined)} alt={kc.country_code ?? ''} class="flag-img" />{/if}</td>
                   {:else if column.key === 'user_hash'}
-                    <td class="client-cell mono" title={kc.user_hash}>{kc.user_hash.slice(0, 16)}\u2026</td>
+                    <td class="client-cell mono" title={kc.user_hash}>{kc.user_hash.slice(0, 16) + '\u2026'}</td>
                   {:else if column.key === 'last_known_ip'}
                     <td class="client-cell" title={kc.last_known_ip ?? 'Never identified'}>{kc.last_known_ip ?? '\u2014'}</td>
                   {:else if column.key === 'uploaded'}
