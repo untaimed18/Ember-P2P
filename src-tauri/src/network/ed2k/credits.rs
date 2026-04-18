@@ -114,10 +114,41 @@ impl CreditManager {
                     if data.len() >= priv_off + 4 + priv_len {
                         let priv_key = data[priv_off + 4..priv_off + 4 + priv_len].to_vec();
                         if !pub_key.is_empty() && !priv_key.is_empty() {
-                            self.our_public_key = pub_key;
+                            // Normalise legacy PKCS#1 public keys from older
+                            // Ember builds to SPKI so peers' X509PublicKey
+                            // decoders accept them (see
+                            // `normalize_public_key_to_spki` and
+                            // `generate_rsa_keypair` for why this matters).
+                            // If re-encoding changes the bytes, rewrite the
+                            // keyfile atomically so the next launch starts
+                            // clean.
+                            let (final_pub, migrated) = match normalize_public_key_to_spki(&pub_key) {
+                                Some(n) => {
+                                    let migrated = n != pub_key;
+                                    (n, migrated)
+                                }
+                                None => (pub_key.clone(), false),
+                            };
+                            self.our_public_key = final_pub;
                             self.our_private_key = priv_key;
                             self.crypto_available = true;
                             tracing::info!("Loaded RSA keypair from {}", key_path.display());
+                            if migrated {
+                                let mut out = Vec::new();
+                                out.extend_from_slice(&(self.our_public_key.len() as u32).to_le_bytes());
+                                out.extend_from_slice(&self.our_public_key);
+                                out.extend_from_slice(&(self.our_private_key.len() as u32).to_le_bytes());
+                                out.extend_from_slice(&self.our_private_key);
+                                if let Err(e) = crate::security::atomic_write(&key_path, &out, true) {
+                                    tracing::warn!(
+                                        "Failed to persist SPKI-normalised keypair: {e}"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "Migrated cryptkey.dat public key from PKCS#1 to SPKI"
+                                    );
+                                }
+                            }
                             return;
                         }
                     }
@@ -447,8 +478,7 @@ impl CreditManager {
 }
 
 fn generate_rsa_keypair() -> (Vec<u8>, Vec<u8>) {
-    use rsa::pkcs1::EncodeRsaPublicKey;
-    use rsa::pkcs8::EncodePrivateKey;
+    use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
     use rsa::RsaPrivateKey;
 
     let mut rng = rand::thread_rng();
@@ -472,9 +502,20 @@ fn generate_rsa_keypair() -> (Vec<u8>, Vec<u8>) {
             return (Vec::new(), Vec::new());
         }
     };
-    // eMule uses raw PKCS#1 RSA public key DER {n, e} (Crypto++ Save()),
-    // NOT SPKI (SubjectPublicKeyInfo). Use to_pkcs1_der for compatibility.
-    let pub_der = match public_key.to_pkcs1_der() {
+    // Emit the public key as an X.509 SubjectPublicKeyInfo (SPKI) — the
+    // SEQUENCE { AlgorithmIdentifier{rsaEncryption,NULL}, BIT STRING{n,e} }
+    // envelope. That's what eMule's Crypto++ produces from
+    // `pubkey.GetMaterial().Save(asink)` in CClientCreditsList::InitalizeCrypting,
+    // and that's the format its `RSASSA_PKCS1v15_SHA_Verifier(StringSource&)`
+    // constructor feeds into X509PublicKey::BERDecode when verifying our
+    // signatures in CClientCreditsList::VerifyIdent. An earlier version of
+    // this code used the inner `to_pkcs1_der()` RSAPublicKey form — that
+    // parses fine with our own rsa-crate fallback on verify, but Crypto++'s
+    // X509PublicKey BERDecode refuses it, which silently tripped the
+    // `try {...} catch(...)` in VerifyIdent and pinned our peers at
+    // `Identification: Invalid` even though uploads were flowing. ~78 bytes
+    // for a 384-bit key, well within eMule's `MAXPUBKEYSIZE = 80`.
+    let pub_der = match public_key.to_public_key_der() {
         Ok(d) => d,
         Err(e) => {
             tracing::error!("RSA public key encode failed: {e}");
@@ -483,6 +524,28 @@ fn generate_rsa_keypair() -> (Vec<u8>, Vec<u8>) {
     };
 
     (pub_der.as_ref().to_vec(), priv_der.as_bytes().to_vec())
+}
+
+/// Re-encode a cached public key as SPKI if it's in the bare PKCS#1
+/// `RSAPublicKey` form. Users who ran an older build of Ember have an
+/// on-disk `cryptkey.dat` whose `our_public_key` field is PKCS#1 — valid
+/// cryptographically, but incompatible with eMule's X509PublicKey decoder
+/// (see `generate_rsa_keypair` above). On load we parse whichever form
+/// we find and normalise to SPKI in memory so every outgoing OP_PUBLICKEY
+/// uses the eMule-compatible envelope. Returns `None` and leaves the
+/// original bytes alone if the key parses as neither (likely corrupt,
+/// caller will regenerate).
+fn normalize_public_key_to_spki(pub_der: &[u8]) -> Option<Vec<u8>> {
+    use rsa::pkcs1::DecodeRsaPublicKey;
+    use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
+    use rsa::RsaPublicKey;
+
+    if RsaPublicKey::from_public_key_der(pub_der).is_ok() {
+        return Some(pub_der.to_vec());
+    }
+    let key = RsaPublicKey::from_pkcs1_der(pub_der).ok()?;
+    let spki = key.to_public_key_der().ok()?;
+    Some(spki.as_ref().to_vec())
 }
 
 fn sign_challenge(
@@ -568,4 +631,89 @@ fn verify_challenge(
     };
 
     verifying_key.verify(&msg, &sig).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// eMule's Crypto++ `RSASSA_PKCS1v15_SHA_Verifier(StringSource&)`
+    /// constructor feeds the raw OP_PUBLICKEY bytes into
+    /// `X509PublicKey::BERDecode`, which expects a SubjectPublicKeyInfo
+    /// envelope: `SEQUENCE { AlgorithmIdentifier{rsaEncryption, NULL},
+    /// BIT STRING { SEQUENCE { n, e } } }`. If we emit bare PKCS#1
+    /// `SEQUENCE { n, e }` eMule throws inside the try/catch and our
+    /// session ends up at IS_IDFAILED. Guard against regressing back to
+    /// PKCS#1 by asserting the generated key starts with the SPKI outer
+    /// SEQUENCE followed immediately by the algorithm-identifier
+    /// SEQUENCE whose contents start with the rsaEncryption OID.
+    #[test]
+    fn generated_public_key_is_spki_and_fits_emule_buffer() {
+        let (pub_der, priv_der) = generate_rsa_keypair();
+        assert!(!pub_der.is_empty() && !priv_der.is_empty(), "keygen failed");
+        assert!(
+            pub_der.len() <= 80,
+            "pub key {} bytes exceeds eMule MAXPUBKEYSIZE=80",
+            pub_der.len()
+        );
+
+        // SPKI byte-prefix sanity — not a full ASN.1 parse, just enough to
+        // distinguish PKCS#1 `SEQUENCE { INTEGER n, INTEGER e }` (which
+        // starts 0x30 <len> 0x02 ...) from SPKI `SEQUENCE { SEQUENCE {
+        // OID rsaEncryption, NULL }, BIT STRING ... }` (starts 0x30 <len>
+        // 0x30 0x0D 0x06 0x09 ...).
+        assert_eq!(pub_der[0], 0x30, "SPKI must start with SEQUENCE tag");
+        // Skip the outer SEQUENCE length (1 or 2 bytes depending on content size).
+        let algid_pos = if pub_der[1] & 0x80 == 0 {
+            2
+        } else {
+            2 + (pub_der[1] & 0x7F) as usize
+        };
+        assert_eq!(
+            pub_der[algid_pos], 0x30,
+            "SPKI body must begin with AlgorithmIdentifier SEQUENCE, got 0x{:02X} — \
+             we probably regressed to PKCS#1 output",
+            pub_der[algid_pos]
+        );
+        assert_eq!(pub_der[algid_pos + 2], 0x06, "AlgorithmIdentifier must start with OID");
+
+        // A round-trip through the decoder we actually use on verify must work:
+        // this is the same path eMule takes before it tries to crypto-verify us.
+        use rsa::pkcs8::DecodePublicKey;
+        rsa::RsaPublicKey::from_public_key_der(&pub_der).expect("generated key must parse as SPKI");
+    }
+
+    /// Confirm `normalize_public_key_to_spki` upgrades a legacy
+    /// PKCS#1-encoded public key (what older Ember builds persisted in
+    /// cryptkey.dat) to the SPKI envelope on load, so existing users
+    /// don't have to delete their keyfile to get secure identification
+    /// working.
+    #[test]
+    fn normalize_pkcs1_public_key_to_spki() {
+        use rsa::pkcs1::EncodeRsaPublicKey;
+        use rsa::pkcs8::DecodePublicKey;
+        use rsa::RsaPrivateKey;
+
+        let mut rng = rand::thread_rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 384).expect("keygen");
+        let pkcs1 = private_key
+            .to_public_key()
+            .to_pkcs1_der()
+            .expect("pkcs1 encode")
+            .as_ref()
+            .to_vec();
+        assert!(
+            rsa::RsaPublicKey::from_public_key_der(&pkcs1).is_err(),
+            "test fixture precondition: raw PKCS#1 must NOT parse as SPKI",
+        );
+
+        let spki = normalize_public_key_to_spki(&pkcs1).expect("normalisation returned None");
+        rsa::RsaPublicKey::from_public_key_der(&spki)
+            .expect("normalised key must parse as SPKI");
+        assert_ne!(spki, pkcs1, "normalisation must actually re-encode the key");
+
+        // A key that's already SPKI should come back byte-identical.
+        let already_spki = normalize_public_key_to_spki(&spki).expect("idempotent normalise");
+        assert_eq!(already_spki, spki);
+    }
 }
