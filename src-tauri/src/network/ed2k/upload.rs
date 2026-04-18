@@ -1702,14 +1702,7 @@ impl UploadHandler {
             }
         }
 
-        // SecureIdent per-session state (declared ahead of the EmuleInfo
-        // exchange so the proactive OP_SECIDENTSTATE kick-off below can
-        // populate `pending_secident_challenge`).
-        //
-        // `pending_secident_challenge` = the random 32-bit challenge we
-        // sent the peer in our outgoing OP_SECIDENTSTATE, consumed when
-        // their OP_SIGNATURE arrives so we can verify their sig over our
-        // pub key + challenge and mark them as identified.
+        // SecureIdent per-session state.
         //
         // `pending_peer_challenge` = an incoming OP_SECIDENTSTATE from the
         // peer that arrived before we had their RSA public key. eMule
@@ -1727,7 +1720,11 @@ impl UploadHandler {
         // handshake without deadlock. Without this, eMule's client
         // details dialog shows "Identification: Invalid" for our
         // session.
-        let mut pending_secident_challenge: Option<u32> = None;
+        //
+        // `pending_secident_challenge` is declared AFTER the EmuleInfo
+        // exchange below (it's initialised from our proactive
+        // OP_SECIDENTSTATE kick-off, so declaring it later avoids a
+        // dead-store warning for the initial `None`).
         let mut pending_peer_challenge: Option<(u32, u8)> = None;
 
         // Handle EmuleInfo exchange (or the peer may skip straight to file requests)
@@ -1746,30 +1743,49 @@ impl UploadHandler {
             }
             let emule_payload = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash), None);
             write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_payload).await?;
-
-            // Proactively challenge the peer's identity now that the
-            // Hello + EmuleInfo exchange is complete — this is what eMule
-            // does in CUpDownClient::InfoPacketsReceived
-            // (BaseClient.cpp:2030-2039). Without our own OP_SECIDENTSTATE
-            // the peer never sends us their OP_PUBLICKEY, and without
-            // their pub key we can't sign whichever challenge THEY send
-            // us, leaving eMule's client-details dialog showing
-            // `Identification: Invalid` (the IS_IDFAILED/IS_IDNEEDED
-            // state) for this session. Our `pending_peer_challenge`
-            // slot (set in the OP_SECIDENTSTATE handler below) is the
-            // receiver side of the same dance: if their challenge
-            // happens to arrive before their key does, we replay the
-            // signing from the OP_PUBLICKEY handler.
-            pending_secident_challenge = super::transfer::maybe_send_secident_challenge(
-                &mut writer,
-                Some(&self.credit_manager),
-                peer_user_hash,
-                peer_addr,
-                peer_secure_ident_level,
-            ).await?;
         } else {
             deferred_packet = Some((proto2, opcode2, payload2));
         }
+
+        // Proactively challenge the peer's identity — fire this AFTER the
+        // Hello+EmuleInfo exchange regardless of which branch ran above.
+        //
+        // A modern eMule connector treats our CT_EMULE_VERSION tag inside
+        // the Hello payload as enough to set IP_EMULEPROTPACK directly in
+        // `ProcessHelloTypePacket` (see BaseClient.cpp:659-664). That means
+        // as soon as it processes our OP_HELLOANSWER, it flips
+        // `m_byInfopacketsReceived == IP_BOTH`, invokes
+        // `InfoPacketsReceived()` (BaseClient.cpp:2030-2039), and sends us
+        // `OP_SECIDENTSTATE` **without** ever sending an `OP_EMULEINFO` —
+        // the "fast path" new-eMule handshake. So in that case `proto2`
+        // above is `OP_SECIDENTSTATE` and we hit the `else { defer }`
+        // branch, previously skipping our own proactive challenge.
+        //
+        // That was the bug behind "Identification: Not supported or
+        // disabled" on the peer side: without our OP_SECIDENTSTATE,
+        // eMule never sends us their OP_PUBLICKEY (which is only ever
+        // sent in response to our challenge, per ListenSocket.cpp:1138),
+        // our OP_SECIDENTSTATE handler parks their challenge in
+        // `pending_peer_challenge` waiting for a key that never arrives,
+        // and our OP_PUBLICKEY + OP_SIGNATURE never go out — so eMule's
+        // `CClientCredits::IdentState` stays at the default
+        // `IS_NOTAVAILABLE` for our user hash.
+        //
+        // `maybe_send_secident_challenge` already guards against sending
+        // when the peer doesn't advertise SecIdent (`peer_level == 0`)
+        // or when we have no local RSA keypair, so it's safe to call
+        // unconditionally here. `peer_secure_ident_level` is populated
+        // from the Hello's MISCOPTIONS1 bits 16-19 (both Hello and
+        // EmuleInfo advertise the same level on a stock eMule, and the
+        // EMULEINFO branch above refreshes it if the peer chose to send
+        // one).
+        let mut pending_secident_challenge: Option<u32> = super::transfer::maybe_send_secident_challenge(
+            &mut writer,
+            Some(&self.credit_manager),
+            peer_user_hash,
+            peer_addr,
+            peer_secure_ident_level,
+        ).await?;
 
         // Ember Peer Exchange: send our source list to Ember peers
         info!("Peer {peer_addr}: is_ember={}, mod_version='{}', ember_hash={}, client='{}'",
