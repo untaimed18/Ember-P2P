@@ -2184,31 +2184,21 @@ impl UploadHandler {
                     // OP_PUBLICKEY only in response to our own
                     // OP_SECIDENTSTATE). Park the challenge in
                     // `pending_peer_challenge` and let the OP_PUBLICKEY
-                    // handler replay it once their key lands. We still
-                    // need to send OP_PUBLICKEY if they asked for ours
-                    // (state >= 2), so fall through into
-                    // `respond_to_secident_challenge` with an empty
-                    // peer_user_hash-keyed record — signing will no-op,
-                    // but our pub key still goes out.
-                    let need_defer = state >= 2 && {
+                    // handler replay the whole OP_PUBLICKEY + OP_SIGNATURE
+                    // response once their key lands. Matching transfer.rs
+                    // we skip the immediate send entirely on defer —
+                    // eMule's SendSignaturePacket won't fire for our
+                    // outgoing SECIDENTSTATE challenge until it sees our
+                    // OP_PUBLICKEY anyway (BaseClient.cpp:1851), so there's
+                    // no timing benefit to sending ours twice.
+                    let missing_peer_key = if state >= 2 {
                         let cm = self.credit_manager.read().await;
                         !cm.has_public_key(&peer_user_hash)
+                    } else {
+                        false
                     };
-                    if need_defer {
+                    if missing_peer_key {
                         pending_peer_challenge = Some((challenge, state));
-                        // Still send our OP_PUBLICKEY (they asked for it);
-                        // the signature portion will be a no-op here and
-                        // is replayed once we receive OP_PUBLICKEY.
-                        super::transfer::respond_to_secident_challenge(
-                            &mut writer,
-                            Some(&self.credit_manager),
-                            state,
-                            challenge,
-                            peer_addr,
-                            peer_user_hash,
-                            peer_secure_ident_level,
-                            0u32,
-                        ).await?;
                         debug!(
                             "Deferred SecIdent challenge from {peer_addr} — awaiting their public key"
                         );
