@@ -2455,6 +2455,21 @@ pub async fn start_network(
     let mut stats_manager = StatsManager::new();
     stats_manager.load_cumulative(&db);
 
+    // Rate-limit DB persistence of download progress. DownloadEvent::Progress
+    // fires many times per second per active download (one per block landing
+    // across all sources); the old code ran a synchronous SQLite UPDATE per
+    // event inside this main select! loop, serialising the entire network
+    // task on the DB mutex. The persisted `transferred / progress / speed`
+    // values have no operational use — crash recovery rebuilds them from the
+    // `.part.met` via `PartTracker::new` at `start_network` resume, and the
+    // live UI reads from `transfer_manager` (commands/transfers.rs).
+    // Keep a per-transfer "last persisted at" map and only flush to SQLite
+    // once per `DB_PROGRESS_PERSIST_INTERVAL`, plus always at terminal
+    // state transitions (handled separately via `update_transfer_status`).
+    const DB_PROGRESS_PERSIST_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(3);
+    let mut db_progress_last_persist: HashMap<String, std::time::Instant> = HashMap::new();
+
     // Load comments from database
     if let Ok(rows) = db.load_file_comments() {
         state.comment_manager.write().await.load_from_db_rows(rows);
@@ -3898,7 +3913,7 @@ pub async fn start_network(
                 };
                 let was_completed = completed_file_hash.is_some();
                 let mut promoted = Vec::new();
-                handle_download_event(event, &app_handle, &transfer_manager, &db, &bandwidth_limiter, &mut promoted, &mut stats_manager, settings.remove_finished_downloads, &a4af_shared, &settings.download_folder).await;
+                handle_download_event(event, &app_handle, &transfer_manager, &db, &mut promoted, &mut stats_manager, settings.remove_finished_downloads, &a4af_shared, &settings.download_folder, &mut db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL).await;
 
                 if let Some(ref file_hash) = completed_file_hash {
                     let mut sf = spam_filter.write().await;
@@ -4010,8 +4025,24 @@ pub async fn start_network(
                                     let mut idx = local_index.write().await;
                                     idx.apply_upload_share_deltas(file_hash, inc_requests, inc_accepted);
                                 }
-                                let snap = local_index.read().await.all_files().to_vec();
-                                *shared_files.write().await = snap;
+                                // Target-update only the matching rows in the
+                                // cached snapshot rather than cloning the
+                                // entire file list. The old `all_files().to_vec()`
+                                // reallocated every FileInfo (often thousands
+                                // of entries with strings) for every peer file
+                                // request; counters on the one file that
+                                // changed are all the UI needs.
+                                {
+                                    let mut cached = shared_files.write().await;
+                                    for f in cached.iter_mut() {
+                                        if f.hash == *file_hash {
+                                            f.requests = f.requests.saturating_add(inc_requests);
+                                            f.accepted = f.accepted.saturating_add(inc_accepted);
+                                            f.alltime_requests = f.alltime_requests.saturating_add(inc_requests);
+                                            f.alltime_accepted = f.alltime_accepted.saturating_add(inc_accepted);
+                                        }
+                                    }
+                                }
                                 let _ = app_handle.emit("shared-files-changed", serde_json::json!({
                                     "phase": "upload-stats",
                                     "count": 1,
@@ -4042,8 +4073,17 @@ pub async fn start_network(
                                     let mut idx = local_index.write().await;
                                     idx.apply_upload_completed_bytes(&hash_hex, uploaded_bytes);
                                 }
-                                let snap = local_index.read().await.all_files().to_vec();
-                                *shared_files.write().await = snap;
+                                // Target-update the cached snapshot in place
+                                // (see ShareInterest above for rationale).
+                                {
+                                    let mut cached = shared_files.write().await;
+                                    for f in cached.iter_mut() {
+                                        if f.hash == hash_hex {
+                                            f.bytes_transferred = f.bytes_transferred.saturating_add(uploaded_bytes);
+                                            f.alltime_transferred = f.alltime_transferred.saturating_add(uploaded_bytes);
+                                        }
+                                    }
+                                }
                                 let _ = app_handle.emit("shared-files-changed", serde_json::json!({
                                     "phase": "upload-complete",
                                     "count": 1,
@@ -4302,7 +4342,7 @@ pub async fn start_network(
                 }
 
                 let mut promoted = Vec::new();
-                handle_upload_event(event, &app_handle, &transfer_manager, &bandwidth_limiter, &mut promoted, &mut stats_manager).await;
+                handle_upload_event(event, &app_handle, &transfer_manager, &mut promoted, &mut stats_manager).await;
                 for t in promoted {
                     let control = TransferControl::new();
                     {
@@ -14319,20 +14359,26 @@ async fn handle_command(
                     return Err("Part file not found — download may not have started".to_string());
                 }
 
-                let tracker = ed2k::part_tracker::PartTracker::new(file_size, &part_path);
-                let filled_ranges: Vec<ed2k::preview::FilledRange> = tracker
-                    .filled_ranges()
-                    .into_iter()
-                    .map(|(start, end)| ed2k::preview::FilledRange { start, end })
-                    .collect();
-
-                let completed_bytes = tracker.completed_bytes();
-
-                // Preview must be gated on MD4 verification of the covered
-                // parts — without this a malicious peer could feed arbitrary
-                // bytes that we then hand to the OS default media handler.
-                let has_part_hashes = !tracker.part_hashes().is_empty();
-                let verified_complete_parts = tracker.completed_parts();
+                // `PartTracker::new` reads and parses the `.part.met` file
+                // from disk; run it on the blocking pool so the main network
+                // loop isn't stalled on sync file IO while the user opens a
+                // preview.
+                let pp_owned = part_path.clone();
+                let tracker_bundle = tokio::task::spawn_blocking(move || {
+                    let tracker = ed2k::part_tracker::PartTracker::new(file_size, &pp_owned);
+                    let filled_ranges: Vec<ed2k::preview::FilledRange> = tracker
+                        .filled_ranges()
+                        .into_iter()
+                        .map(|(start, end)| ed2k::preview::FilledRange { start, end })
+                        .collect();
+                    let completed_bytes = tracker.completed_bytes();
+                    let has_part_hashes = !tracker.part_hashes().is_empty();
+                    let verified_complete_parts = tracker.completed_parts();
+                    (filled_ranges, completed_bytes, has_part_hashes, verified_complete_parts)
+                })
+                .await
+                .map_err(|e| format!("Preview task panicked: {e}"))?;
+                let (filled_ranges, completed_bytes, has_part_hashes, verified_complete_parts) = tracker_bundle;
                 let part_size = ed2k::hash::PARTSIZE;
 
                 if !ed2k::preview::can_preview(
@@ -14943,12 +14989,13 @@ async fn handle_download_event(
     app_handle: &tauri::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     db: &Arc<Database>,
-    bandwidth_limiter: &Arc<BandwidthLimiter>,
     promoted_out: &mut Vec<Transfer>,
     stats_manager: &mut StatsManager,
     remove_finished: bool,
     a4af: &Arc<RwLock<ed2k::a4af::A4AFManager>>,
     download_folder: &str,
+    db_progress_last_persist: &mut HashMap<String, std::time::Instant>,
+    db_progress_persist_interval: std::time::Duration,
 ) {
     match event {
         DownloadEvent::Progress {
@@ -14971,17 +15018,33 @@ async fn handle_download_event(
             } else {
                 0.0
             };
-            let _ = db.update_transfer_progress(&transfer_id, capped_downloaded, progress, speed);
+            // Rate-limit the SQLite UPDATE: DownloadEvent::Progress fires many
+            // times per second per active download, and we already keep the
+            // authoritative in-memory state on `transfer_manager`. The DB
+            // copy is only consulted at startup recovery, where the
+            // `.part.met` (via PartTracker::new) supersedes it anyway. Flush
+            // at most once per `db_progress_persist_interval` per transfer,
+            // plus on completion/fail/verifying via the dedicated paths.
+            let should_persist_db = match db_progress_last_persist.get(&transfer_id) {
+                None => true,
+                Some(last) => last.elapsed() >= db_progress_persist_interval,
+            };
+            if should_persist_db {
+                let _ = db.update_transfer_progress(&transfer_id, capped_downloaded, progress, speed);
+                db_progress_last_persist.insert(transfer_id.clone(), std::time::Instant::now());
+            }
             let _ = app_handle.emit(
                 "transfer-progress",
-                serde_json::json!({
-                    "id": transfer_id,
-                    "downloaded": capped_downloaded,
-                    "total": total,
-                    "progress": progress,
-                    "speed": speed,
-                    "global_download_speed": bandwidth_limiter.download_speed(),
-                }),
+                &crate::types::TransferProgressPayload {
+                    id: &transfer_id,
+                    downloaded: capped_downloaded,
+                    total,
+                    progress,
+                    speed,
+                    uploaded: None,
+                    direction: None,
+                    upload_time: None,
+                },
             );
         }
         DownloadEvent::Verifying { transfer_id } => {
@@ -15010,12 +15073,12 @@ async fn handle_download_event(
             }
             let _ = app_handle.emit(
                 "transfer-sources",
-                serde_json::json!({
-                    "id": transfer_id,
-                    "sources": total,
-                    "active_sources": active,
-                    "queued_sources": queued,
-                }),
+                &crate::types::TransferSourcesPayload {
+                    id: &transfer_id,
+                    sources: total,
+                    active_sources: active,
+                    queued_sources: queued,
+                },
             );
         }
         DownloadEvent::SourceDetail {
@@ -15093,6 +15156,19 @@ async fn handle_download_event(
         }
         DownloadEvent::Completed { transfer_id } => {
             stats_manager.record_completed_download();
+            // Flush the final in-memory progress snapshot to the DB before
+            // changing status. Progress persistence is rate-limited during
+            // the download, so the last persisted row could be up to a few
+            // seconds stale; make sure the terminal state reflects reality.
+            let final_progress = {
+                let mgr = transfer_manager.read().await;
+                mgr.get_transfer(&transfer_id)
+                    .map(|t| (t.transferred, t.progress, t.speed))
+            };
+            if let Some((transferred, progress, speed)) = final_progress {
+                let _ = db.update_transfer_progress(&transfer_id, transferred, progress, speed);
+            }
+            db_progress_last_persist.remove(&transfer_id);
             if let Some(promoted) = {
                 let mut mgr = transfer_manager.write().await;
                 mgr.complete(&transfer_id)
@@ -15153,6 +15229,18 @@ async fn handle_download_event(
             if matches!(current_status, Some(TransferStatus::Paused | TransferStatus::Stopped)) {
                 return;
             }
+            // Flush final progress snapshot (see Completed above) and drop
+            // the rate-limit cache entry so a re-queue of the same id starts
+            // with a fresh budget.
+            let final_progress = {
+                let mgr = transfer_manager.read().await;
+                mgr.get_transfer(&transfer_id)
+                    .map(|t| (t.transferred, t.progress, t.speed))
+            };
+            if let Some((transferred, progress, speed)) = final_progress {
+                let _ = db.update_transfer_progress(&transfer_id, transferred, progress, speed);
+            }
+            db_progress_last_persist.remove(&transfer_id);
             if let Some(promoted) = {
                 let mut mgr = transfer_manager.write().await;
                 mgr.fail(
@@ -15203,7 +15291,6 @@ async fn handle_upload_event(
     event: UploadEvent,
     app_handle: &tauri::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
-    bandwidth_limiter: &Arc<BandwidthLimiter>,
     promoted_out: &mut Vec<Transfer>,
     stats_manager: &mut StatsManager,
 ) {
@@ -15286,17 +15373,16 @@ async fn handle_upload_event(
             };
             let _ = app_handle.emit(
                 "transfer-progress",
-                serde_json::json!({
-                    "id": event.transfer_id,
-                    "downloaded": 0,
-                    "uploaded": capped_uploaded,
-                    "total": total,
-                    "progress": progress,
-                    "speed": speed,
-                    "direction": "upload",
-                    "global_upload_speed": bandwidth_limiter.upload_speed(),
-                    "upload_time": upload_time_ms,
-                }),
+                &crate::types::TransferProgressPayload {
+                    id: &event.transfer_id,
+                    downloaded: 0,
+                    total,
+                    progress,
+                    speed,
+                    uploaded: Some(capped_uploaded),
+                    direction: Some("upload"),
+                    upload_time: Some(upload_time_ms),
+                },
             );
         }
         UploadEventKind::ShareInterest { .. } => {}

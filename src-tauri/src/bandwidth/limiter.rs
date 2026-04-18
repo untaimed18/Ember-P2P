@@ -181,10 +181,16 @@ impl BandwidthLimiter {
         self.total_downloaded.load(Ordering::Relaxed)
     }
 
+    /// Per-second upload delta (raw, unsmoothed). Kept as part of the
+    /// limiter's public API for future consumers; `smoothed_upload_speed` is
+    /// what the UI currently reads.
+    #[allow(dead_code)]
     pub fn upload_speed(&self) -> u64 {
         self.upload_speed.load(Ordering::Relaxed)
     }
 
+    /// Per-second download delta (raw, unsmoothed). See `upload_speed`.
+    #[allow(dead_code)]
     pub fn download_speed(&self) -> u64 {
         self.download_speed.load(Ordering::Relaxed)
     }

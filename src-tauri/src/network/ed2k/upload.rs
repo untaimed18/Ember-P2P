@@ -1061,7 +1061,7 @@ impl UploadHandler {
             }
             return Some(ResolvedUploadFile {
                 name: file.name,
-                path: path.clone(),
+                path,
                 size: file.size,
                 aich_hash_hex: file.aich_hash,
                 is_partial,
@@ -1774,6 +1774,34 @@ impl UploadHandler {
         let mut recorded_share_request: Option<[u8; 16]> = None;
         let mut last_preempt_check: std::time::Instant = std::time::Instant::now();
         let mut epx_packets_received: u8 = 0;
+
+        // Session-local caches populated lazily on OP_REQUESTPARTS and reused
+        // across batches / blocks so we don't re-open the serve file, re-read
+        // the `.part.met`, or re-compute the video-extension flag for every
+        // 180 KiB block.
+        //
+        // - `cached_serve_file`: persistent `std::fs::File` handle keyed on
+        //   file path, moved in/out of `spawn_blocking` per read (tokio tasks
+        //   need `'static` owned values). Under steady state this replaces
+        //   `File::open + seek + read_exact + close` per block with just
+        //   `seek + read_exact` per block, saving one open/close syscall and
+        //   one FD allocation per ~180 KiB.
+        // - `cached_part_tracker`: reused across batches on the same file.
+        //   Rebuilt every `PART_TRACKER_REFRESH` so that newly-completed
+        //   parts of a partial file (when we are both uploading and
+        //   downloading it) become advertisable within a bounded delay.
+        // - `cached_is_video_ext`: cheap bool, hoisted out of the per-block
+        //   loop in OP_REQUESTPARTS.
+        //
+        // All three are keyed on `PathBuf` rather than `file_hash` so they
+        // survive the `current_file_hash = Some(same_hash)` reassigns that
+        // happen after every handshake opcode; they invalidate when the peer
+        // switches to a different file path mid-session.
+        let mut cached_serve_file: Option<(PathBuf, std::fs::File)> = None;
+        let mut cached_part_tracker: Option<(PathBuf, super::part_tracker::PartTracker, std::time::Instant)>
+            = None;
+        let mut cached_is_video_ext: Option<(PathBuf, bool)> = None;
+        const PART_TRACKER_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
 
         // Dedicated reader task: ed2k framing requires four sequential awaits
         // (proto, length, opcode, payload). The main loop uses tokio::select!
@@ -2645,22 +2673,90 @@ impl UploadHandler {
                             continue;
                         }
                     };
-                    let file_path = resolved.path.clone();
+                    let file_path = resolved.path;
 
-                    let part_tracker = if file_path.extension().map(|e| e == "part").unwrap_or(false)
-                        && total_size > 0
-                    {
-                        Some(super::part_tracker::PartTracker::new(total_size, &file_path))
+                    // Refresh-or-reuse the cached `PartTracker` for the
+                    // current file. Rebuilt after PART_TRACKER_REFRESH so
+                    // newly-completed parts of a partial file we're
+                    // simultaneously downloading become advertisable within
+                    // a bounded delay. Outside of that window we reuse the
+                    // parsed tracker across batches and blocks — the old
+                    // code re-read `.part.met` on every OP_REQUESTPARTS.
+                    let is_partial_serve =
+                        file_path.extension().map(|e| e == "part").unwrap_or(false)
+                        && total_size > 0;
+                    if !is_partial_serve {
+                        cached_part_tracker = None;
                     } else {
-                        None
-                    };
+                        let need_rebuild = match cached_part_tracker.as_ref() {
+                            Some((p, _, at)) => {
+                                p != &file_path || at.elapsed() >= PART_TRACKER_REFRESH
+                            }
+                            None => true,
+                        };
+                        if need_rebuild {
+                            cached_part_tracker = Some((
+                                file_path.clone(),
+                                super::part_tracker::PartTracker::new(total_size, &file_path),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    }
+                    let part_tracker_ref = cached_part_tracker.as_ref().map(|(_, t, _)| t);
+
+                    // Hoist video-ext computation out of the per-block loop:
+                    // it's a property of the file, not the block, and
+                    // `to_lowercase()` allocates a fresh String per call.
+                    if cached_is_video_ext.as_ref().map(|(p, _)| p != &file_path).unwrap_or(true) {
+                        let is_video = file_path.extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| {
+                                let e = e.to_lowercase();
+                                matches!(e.as_str(), "avi" | "mp4" | "mkv" | "wmv" | "mpg" |
+                                    "mpeg" | "mov" | "flv" | "webm" | "m4v" | "divx" | "ts" | "vob")
+                            })
+                            .unwrap_or(false);
+                        cached_is_video_ext = Some((file_path.clone(), is_video));
+                    }
+                    let is_video_ext = cached_is_video_ext.as_ref().map(|(_, v)| *v).unwrap_or(false);
+
+                    // Drop a stale cached File handle if the peer switched to
+                    // a different file within this TCP session. We also
+                    // DO NOT cache the handle for `.part` files: on Windows,
+                    // holding a read handle open across a long-lived upload
+                    // session would block the concurrent download side's
+                    // `std::fs::rename(.part -> final)` when the file
+                    // completes (see `ed2k::transfer::move_part_to_final`).
+                    // Opening per block for partial-file seeds only loses a
+                    // few microseconds on the hot path and keeps the classic
+                    // race window (microseconds between close and the
+                    // download's rename) unchanged.
+                    if is_partial_serve {
+                        cached_serve_file = None;
+                    } else if cached_serve_file
+                        .as_ref()
+                        .map(|(p, _)| p != &file_path)
+                        .unwrap_or(false)
+                    {
+                        cached_serve_file = None;
+                    }
+
+                    // Batch credit and slot-rate accumulators. The old code
+                    // took `credit_manager.write().await` (an async RwLock)
+                    // and `slot_rates.lock()` (a std Mutex) per block — with
+                    // K concurrent slots that's K lock acquires per block
+                    // wire-time. One per OP_REQUESTPARTS batch is equivalent
+                    // for scoring purposes (credits are a cumulative u64;
+                    // slot_rate is a smoothed EWMA that doesn't need
+                    // block-granular updates).
+                    let mut batch_credited_bytes: u64 = 0;
 
                     for (start, end) in offsets {
                         if start >= end {
                             continue;
                         }
 
-                        if let Some(tracker) = part_tracker.as_ref() {
+                        if let Some(tracker) = part_tracker_ref {
                             // Only serve bytes that are BOTH complete AND
                             // MD4-verified. Serving unverified-but-complete
                             // bytes would let corrupt blocks (hashset not yet
@@ -2701,35 +2797,50 @@ impl UploadHandler {
 
                         let len = ((end - start) as usize).min(PARTSIZE as usize);
 
-                        let read_result = {
-                            let fp = file_path.clone();
-                            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-                                let mut f = std::fs::File::open(&fp)?;
+                        // Move the session-cached `File` into `spawn_blocking`
+                        // (a `&mut File` isn't `'static`, so we take-and-put
+                        // it back via the task return value). This reuses a
+                        // single open handle across every block in the
+                        // session instead of `File::open` per block — saves
+                        // one open + one close syscall + one FD cycle per
+                        // ~180 KiB on the hot path.
+                        let taken_file = cached_serve_file.take().map(|(_, f)| f);
+                        let fp_for_task = file_path.clone();
+                        let read_result = tokio::task::spawn_blocking(
+                            move || -> anyhow::Result<(std::fs::File, Vec<u8>)> {
+                                let mut f = match taken_file {
+                                    Some(f) => f,
+                                    None => std::fs::File::open(&fp_for_task)?,
+                                };
                                 f.seek(SeekFrom::Start(start))?;
                                 let mut buf = vec![0u8; len];
                                 f.read_exact(&mut buf)?;
-                                Ok(buf)
-                            })
-                            .await?
-                        };
+                                Ok((f, buf))
+                            },
+                        )
+                        .await?;
 
                         let data = match read_result {
-                            Ok(d) => d,
+                            Ok((f, d)) => {
+                                // Only reuse the handle across blocks for
+                                // complete (non-.part) files — see the
+                                // comment where `cached_serve_file` is
+                                // cleared above for the Windows rename-race
+                                // rationale. For partial files we drop `f`
+                                // here so the next block re-opens.
+                                if !is_partial_serve {
+                                    cached_serve_file = Some((file_path.clone(), f));
+                                }
+                                d
+                            }
                             Err(e) => {
                                 warn!("Failed to read file chunk: {e}");
+                                // Handle is gone; next iteration will re-open.
                                 break;
                             }
                         };
 
                         // Skip compression for video files when configured (eMule: dontcompressavi)
-                        let is_video_ext = file_path.extension()
-                            .and_then(|e| e.to_str())
-                            .map(|e| {
-                                let e = e.to_lowercase();
-                                matches!(e.as_str(), "avi" | "mp4" | "mkv" | "wmv" | "mpg" |
-                                    "mpeg" | "mov" | "flv" | "webm" | "m4v" | "divx" | "ts" | "vob")
-                            })
-                            .unwrap_or(false);
                         let use_compression = peer_compression_ver > 0 && data.len() > 1024 && !(is_video_ext && self.skip_compress_video);
                         if use_compression {
                             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -2762,11 +2873,8 @@ impl UploadHandler {
 
                                         uploaded += data.len() as u64;
                                         rate_tracker.record_send(data.len() as u64);
-                                        self.slot_rates.lock().unwrap_or_else(|e| e.into_inner()).insert(peer_addr, rate_tracker.smoothed_rate());
-                                        {
-                                            let mut cm = self.credit_manager.write().await;
-                                            cm.add_uploaded(peer_user_hash, data.len() as u64);
-                                        }
+                                        batch_credited_bytes =
+                                            batch_credited_bytes.saturating_add(data.len() as u64);
 
                                         if let Some(tid) = &transfer_id {
                                             let should_emit = match last_progress_emit {
@@ -2817,11 +2925,8 @@ impl UploadHandler {
 
                         uploaded += data.len() as u64;
                         rate_tracker.record_send(data.len() as u64);
-                        self.slot_rates.lock().unwrap_or_else(|e| e.into_inner()).insert(peer_addr, rate_tracker.smoothed_rate());
-                        {
-                            let mut cm = self.credit_manager.write().await;
-                            cm.add_uploaded(peer_user_hash, data.len() as u64);
-                        }
+                        batch_credited_bytes =
+                            batch_credited_bytes.saturating_add(data.len() as u64);
 
                         if let Some(tid) = &transfer_id {
                             let should_emit = match last_progress_emit {
@@ -2840,6 +2945,21 @@ impl UploadHandler {
                                 }).await;
                             }
                         }
+                    }
+
+                    // Flush the batched credit + slot-rate updates once per
+                    // OP_REQUESTPARTS batch. These used to be taken per block
+                    // (see inside the loop above) and showed up as real
+                    // contention under multi-slot uploads.
+                    if batch_credited_bytes > 0 {
+                        {
+                            let mut cm = self.credit_manager.write().await;
+                            cm.add_uploaded(peer_user_hash, batch_credited_bytes);
+                        }
+                        self.slot_rates
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(peer_addr, rate_tracker.smoothed_rate());
                     }
 
                     // OP_REQUESTPARTS is the hot path. After the inner

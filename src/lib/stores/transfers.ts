@@ -78,6 +78,22 @@ const SPEED_DECAY_APPLIES: ReadonlySet<Transfer['status']> = new Set<Transfer['s
   'hashing',
 ]);
 
+/** Statuses that should NOT accept `transfer-progress` payloads. Hoisted to
+ *  module scope (was rebuilt inside `flushProgress` on every frame) and
+ *  stored as a Set so the per-row membership check in the flush loop is
+ *  O(1) instead of a linear scan. */
+const PROGRESS_SKIP_STATUSES: ReadonlySet<Transfer['status']> = new Set<Transfer['status']>([
+  'paused',
+  'stopped',
+  'completed',
+  'failed',
+  'verifying',
+  'completing',
+  'hashing',
+  'insufficient',
+  'noneneeded',
+]);
+
 interface TransferEventPayload {
   id: string;
   error?: string;
@@ -131,11 +147,20 @@ function flushProgress() {
   const retained = new Map<string, PendingProgress>();
   transfers.update((list) => {
     let changed = false;
-    const skipStatuses: Transfer['status'][] = ['paused', 'stopped', 'completed', 'failed', 'verifying', 'completing', 'hashing', 'insufficient', 'noneneeded'];
+    // Build a one-shot id -> index lookup. The old code did
+    // `list.findIndex(...)` per pending payload, making the flush
+    // O(P * N) where P = payloads queued this frame and N = total
+    // transfers. With ~100 transfers and a burst of ~100 payloads coalesced
+    // into one frame that's ~10k scans per 16 ms frame. O(P + N) via a Map
+    // is roughly an order of magnitude cheaper.
+    const indexById = new Map<string, number>();
+    for (let i = 0; i < list.length; i++) {
+      indexById.set(list[i].id, i);
+    }
     for (const [id, entry] of batch) {
       const p = entry.payload;
-      const idx = list.findIndex((t) => t.id === id);
-      if (idx < 0) {
+      const idx = indexById.get(id);
+      if (idx === undefined) {
         // No matching row yet. Keep the latest payload and re-try on the
         // next frame unless the race window has clearly expired.
         if (now - entry.firstSeen < ORPHAN_PROGRESS_TTL_MS) {
@@ -144,7 +169,7 @@ function flushProgress() {
         continue;
       }
       const existing = list[idx];
-      if (skipStatuses.includes(existing.status)) continue;
+      if (PROGRESS_SKIP_STATUSES.has(existing.status)) continue;
       const rawTransferred = existing.direction === 'upload' ? (p.uploaded ?? p.downloaded ?? 0) : (p.downloaded ?? 0);
       const transferred = Math.max(rawTransferred, existing.transferred || 0);
       const completedSize = Math.max(transferred, existing.completed_size || 0);

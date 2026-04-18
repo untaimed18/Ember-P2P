@@ -341,10 +341,32 @@
   }
 
   // --- Downloads ---
-  let allDownloads = $derived($transfers.filter(t => t.direction === 'download'));
-  let activeDownloads = $derived(allDownloads.filter(t => t.status !== 'completed' && t.status !== 'failed'));
-  let completedDownloads = $derived(allDownloads.filter(t => t.status === 'completed' || t.status === 'failed'));
-  let hasCompletedDl = $derived(completedDownloads.some(t => t.status === 'completed'));
+  // Single-pass partition: every progress flush replaces `$transfers` with a
+  // new array (`transfers.ts` spreads on update for reactivity), so each
+  // `$derived` filter above ran a full scan over the whole list. With N
+  // transfers that was 4 scans per flush just for the download buckets (plus
+  // 6 more for uploads); do one scan and drop them all into the right bins.
+  let downloadPartition = $derived.by(() => {
+    const all: Transfer[] = [];
+    const active: Transfer[] = [];
+    const completed: Transfer[] = [];
+    let anyCompleted = false;
+    for (const t of $transfers) {
+      if (t.direction !== 'download') continue;
+      all.push(t);
+      if (t.status === 'completed' || t.status === 'failed') {
+        completed.push(t);
+        if (t.status === 'completed') anyCompleted = true;
+      } else {
+        active.push(t);
+      }
+    }
+    return { all, active, completed, anyCompleted };
+  });
+  let allDownloads = $derived(downloadPartition.all);
+  let activeDownloads = $derived(downloadPartition.active);
+  let completedDownloads = $derived(downloadPartition.completed);
+  let hasCompletedDl = $derived(downloadPartition.anyCompleted);
   // L14: persist the filter so switching tabs and returning doesn't
   // wipe a user's narrow-down.
   const FILTER_KEY = 'transfers-filter';
@@ -360,14 +382,37 @@
   let lastClickedDlId = $state<string | null>(null);
 
   // --- Uploads ---
-  let allUploads = $derived($transfers.filter(t => t.direction === 'upload'));
   function isUploadFinished(t: Transfer): boolean {
     return t.status === 'completed' || t.status === 'failed' || (t.status === 'active' && t.total_size > 0 && t.transferred >= t.total_size);
   }
-  let activeUploads = $derived(allUploads.filter(t => !isUploadFinished(t) && t.status !== 'queued'));
-  let completedUploads = $derived(allUploads.filter(t => isUploadFinished(t) && t.status !== 'failed'));
-  let failedUploads = $derived(allUploads.filter(t => t.status === 'failed'));
-  let queuedUploads = $derived(allUploads.filter(t => t.status === 'queued'));
+  // Single-pass partition (same rationale as `downloadPartition` above).
+  let uploadPartition = $derived.by(() => {
+    const all: Transfer[] = [];
+    const active: Transfer[] = [];
+    const completed: Transfer[] = [];
+    const failed: Transfer[] = [];
+    const queued: Transfer[] = [];
+    for (const t of $transfers) {
+      if (t.direction !== 'upload') continue;
+      all.push(t);
+      if (t.status === 'queued') {
+        queued.push(t);
+      } else if (t.status === 'failed') {
+        failed.push(t);
+      } else if (isUploadFinished(t)) {
+        // completed && failed already handled above
+        completed.push(t);
+      } else {
+        active.push(t);
+      }
+    }
+    return { all, active, completed, failed, queued };
+  });
+  let allUploads = $derived(uploadPartition.all);
+  let activeUploads = $derived(uploadPartition.active);
+  let completedUploads = $derived(uploadPartition.completed);
+  let failedUploads = $derived(uploadPartition.failed);
+  let queuedUploads = $derived(uploadPartition.queued);
 
   // --- Bottom pane view tabs (eMule style) ---
   type BottomView = 'uploading' | 'on_queue' | 'download_clients';

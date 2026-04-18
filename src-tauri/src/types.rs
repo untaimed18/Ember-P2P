@@ -636,3 +636,45 @@ impl Default for AppSettings {
         }
     }
 }
+
+// -------------------------------------------------------------------------
+// Typed event payloads
+//
+// These mirror the shapes previously built ad-hoc with `serde_json::json!`
+// for the very highest-frequency `app_handle.emit(...)` sites — per-block
+// download and upload progress. `serde_json::json!` builds a tagged
+// `serde_json::Value` tree (one Box/HashMap allocation per field, plus the
+// string keys) which Tauri then re-serialises to JSON for the webview.
+// With typed structs the JSON is emitted in a single serde pass and field
+// keys are known statically, so these events allocate much less under load.
+//
+// Field names use `camelCase`-free snake_case to match the existing JSON
+// keys on the frontend (see `src/lib/stores/transfers.ts`); renaming would
+// be a behavioural change.
+// -------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TransferProgressPayload<'a> {
+    pub id: &'a str,
+    pub downloaded: u64,
+    pub total: u64,
+    pub progress: f64,
+    pub speed: u64,
+    /// Only populated for upload-direction events so existing frontend
+    /// consumers (`payload.uploaded ?? payload.downloaded`) keep working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uploaded: Option<u64>,
+    /// `"upload"` for upload progress events; omitted for downloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_time: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TransferSourcesPayload<'a> {
+    pub id: &'a str,
+    pub sources: u32,
+    pub active_sources: u32,
+    pub queued_sources: u32,
+}
