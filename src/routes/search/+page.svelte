@@ -1273,6 +1273,14 @@
     filterText !== ''
   );
 
+  // The visible result count and the raw search count can differ for
+  // two reasons that aren't covered by `hasActiveFilters`: the spam
+  // filter (`hideSpam`) and local-only entries that the pipeline always
+  // drops. When they differ, the "(filtered from N)" suffix should show
+  // even if no explicit filter chip is set, so the user understands why
+  // the table isn't showing the headline number.
+  let resultsHidden = $derived(searchResultsList.length - filteredResults.length);
+
   let advancedFilterCount = $derived(
     (filterColumn !== 'all' && filterText !== '' ? 1 : 0) +
     (filterMinSize !== '' ? 1 : 0) +
@@ -1609,11 +1617,11 @@
           <span class="searching-indicator">Searching...</span>
         {/if}
         {#if filteredResults.length > 0}
-          Showing {filteredResults.length} results{#if hasActiveFilters} (filtered from {searchResultsList.length}){/if}
-        {:else if hasActiveFilters}
-          0 of {searchResultsList.length} results match filters
+          Showing {filteredResults.length} result{filteredResults.length === 1 ? '' : 's'}{#if resultsHidden > 0} (filtered from {searchResultsList.length}){/if}
+        {:else if searchResultsList.length > 0}
+          0 of {searchResultsList.length} result{searchResultsList.length === 1 ? '' : 's'} match {hasActiveFilters ? 'filters' : 'visibility rules'}
         {:else}
-          {searchResultsList.length} results
+          0 results
         {/if}
       </span>
       <button class="ghost clear-results-btn" onclick={requestClearResults}>Clear Results</button>

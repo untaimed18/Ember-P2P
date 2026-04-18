@@ -1124,6 +1124,14 @@
         if (typeof parsed.showDuplicatesOnly === 'boolean') {
           showDuplicatesOnly = parsed.showDuplicatesOnly;
         }
+        // Restore "missing only" only if the user actually has missing
+        // files; otherwise the toggle would re-enable a filter that
+        // immediately matches zero rows. The clearing in the onMount
+        // effect (~line 221) handles the case where missing files
+        // disappear later in the session.
+        if (typeof parsed.showMissingOnly === 'boolean') {
+          showMissingOnly = parsed.showMissingOnly;
+        }
         if (typeof parsed.topPanelOpen === 'boolean') {
           topPanelOpen = parsed.topPanelOpen;
         }
@@ -1148,6 +1156,7 @@
         sortField,
         sortAsc,
         showDuplicatesOnly,
+        showMissingOnly,
         topPanelOpen,
         topPanelMetric,
         topPanelScope,
@@ -1158,7 +1167,7 @@
   $effect(() => {
     if (!filtersRestored) return;
     // Track dependencies explicitly so this effect re-runs when any filter/sort changes.
-    void typeFilter; void filterFolder; void searchQuery; void sortField; void sortAsc; void showDuplicatesOnly;
+    void typeFilter; void filterFolder; void searchQuery; void sortField; void sortAsc; void showDuplicatesOnly; void showMissingOnly;
     void topPanelOpen; void topPanelMetric; void topPanelScope;
     persistFilters();
   });
@@ -1607,7 +1616,12 @@
         onclick={() => filterFolder = null}
         role="button"
         tabindex="0"
-        onkeydown={(e) => { if (e.key === 'Enter') filterFolder = null; }}
+        onkeydown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            filterFolder = null;
+          }
+        }}
       >
         <span class="tree-main">
           <span class="tree-icon">◧</span>
@@ -1622,7 +1636,12 @@
           onclick={() => filterFolder = folder}
           role="button"
           tabindex="0"
-          onkeydown={(e) => { if (e.key === 'Enter') filterFolder = folder; }}
+          onkeydown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              filterFolder = folder;
+            }
+          }}
         >
           <span class="tree-main">
             <span class="tree-icon">◨</span>

@@ -288,9 +288,18 @@
     }
   }
 
-  async function handleResetSpamData() {
-    const ok = window.confirm('Clear all learned spam filter data? This cannot be undone.');
-    if (!ok) return;
+  // Spam reset uses the themed `ConfirmDialog` (rather than the
+  // browser's `window.confirm`) so the prompt matches every other
+  // destructive confirmation in Ember (transfers cancel, library
+  // delete, IP-filter range remove, etc.) — same focus trap, same dark
+  // theme, same Escape-to-cancel.
+  let spamResetConfirmOpen = $state(false);
+
+  function handleResetSpamData() {
+    spamResetConfirmOpen = true;
+  }
+
+  async function confirmResetSpamData() {
     spamResetting = true;
     try {
       await resetSpamFilter();
@@ -312,7 +321,13 @@
         settings.download_folder = selected as string;
       }
     } catch (e) {
+      // Surface the failure in the same toast row that other settings
+      // actions use; previously this only logged to the console, so a
+      // denied permission or a missing dialog plugin looked silent to
+      // the user.
       console.error('Folder pick failed:', e);
+      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to open folder picker';
+      showSaveMsg(`Folder picker: ${msg}`, true, 5000);
     }
   }
 
@@ -524,12 +539,13 @@
     </div>
   {:else}
     <div class="settings-layout">
-      <aside class="settings-nav">
+      <aside class="settings-nav" aria-label="Settings sections">
         <div class="settings-nav-title">Settings</div>
         {#each sections as section}
           <button
             class="settings-nav-item"
             class:active={activeSection === section.id}
+            aria-current={activeSection === section.id ? 'page' : undefined}
             onclick={() => activeSection = section.id}
           >
             <span class="settings-nav-icon" aria-hidden="true">
@@ -688,21 +704,21 @@
               <span class="toggle-title">Add Downloads Paused</span>
               <span class="hint">New downloads start paused until manually resumed.</span>
             </div>
-            <ToggleSwitch bind:checked={settings.add_downloads_paused} />
+            <ToggleSwitch bind:checked={settings.add_downloads_paused} ariaLabel="Add Downloads Paused" />
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">
               <span class="toggle-title">Auto-Remove Completed</span>
               <span class="hint">Automatically remove finished downloads from the transfer list.</span>
             </div>
-            <ToggleSwitch bind:checked={settings.remove_finished_downloads} />
+            <ToggleSwitch bind:checked={settings.remove_finished_downloads} ariaLabel="Auto-Remove Completed" />
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">
               <span class="toggle-title">Skip Compress Video</span>
               <span class="hint">Don't compress AVI/MKV/MP4 during uploads (already compressed).</span>
             </div>
-            <ToggleSwitch bind:checked={settings.skip_compress_video} />
+            <ToggleSwitch bind:checked={settings.skip_compress_video} ariaLabel="Skip Compress Video" />
           </div>
 
           <div class="divider"></div>
@@ -759,7 +775,7 @@
               <span class="toggle-title">Search Spam Filter</span>
               <span class="hint">Score search results against known spam patterns (eMule-compatible).</span>
             </div>
-            <ToggleSwitch bind:checked={settings.spam_filter_enabled} />
+            <ToggleSwitch bind:checked={settings.spam_filter_enabled} ariaLabel="Search Spam Filter" />
           </div>
           <div class="field">
             <label for="spam-filter-profile">Spam filter profile</label>
@@ -838,7 +854,7 @@
               <span class="toggle-title">Upload Speed Sense (USS)</span>
               <span class="hint">Automatically adjusts upload speed based on network latency to prevent congestion. Requires an upload speed limit to be set.</span>
             </div>
-            <ToggleSwitch bind:checked={settings.uss_enabled} />
+            <ToggleSwitch bind:checked={settings.uss_enabled} ariaLabel="Upload Speed Sense (USS)" />
           </div>
           <div class="field speed-test-section">
             <div class="speed-test-header">
@@ -906,7 +922,7 @@
               <span class="toggle-title">UPnP Port Mapping <span class="restart-badge">Restart</span></span>
               <span class="hint">Auto-configure router ports. Disable for manual forwarding.</span>
             </div>
-            <ToggleSwitch bind:checked={settings.upnp_enabled} />
+            <ToggleSwitch bind:checked={settings.upnp_enabled} ariaLabel="UPnP Port Mapping" />
           </div>
 
           <div class="field toggle-row">
@@ -914,7 +930,7 @@
               <span class="toggle-title">Auto-Connect KAD <span class="restart-badge">Restart</span></span>
               <span class="hint">Automatically bootstrap KAD on startup. When off, press Connect to start.</span>
             </div>
-            <ToggleSwitch bind:checked={settings.auto_connect_kad} />
+            <ToggleSwitch bind:checked={settings.auto_connect_kad} ariaLabel="Auto-Connect KAD" />
           </div>
 
           <div class="field toggle-row">
@@ -1027,7 +1043,7 @@
               <span class="toggle-title">Protocol Obfuscation <span class="restart-badge">Restart</span></span>
               <span class="hint">Encrypt KAD UDP traffic with RC4. Compatible with eMule.</span>
             </div>
-            <ToggleSwitch bind:checked={settings.obfuscation_enabled} />
+            <ToggleSwitch bind:checked={settings.obfuscation_enabled} ariaLabel="Protocol Obfuscation" />
           </div>
 
           <div class="divider"></div>
@@ -1037,7 +1053,7 @@
               <span class="toggle-title">IP Filter <span class="restart-badge">Restart</span></span>
               <span class="hint">Block known-bad IP ranges via ipfilter.dat</span>
             </div>
-            <ToggleSwitch bind:checked={settings.ip_filter_enabled} />
+            <ToggleSwitch bind:checked={settings.ip_filter_enabled} ariaLabel="IP Filter" />
           </div>
           {#if settings.ip_filter_enabled}
             <div class="field nested">
@@ -1056,7 +1072,7 @@
               <span class="toggle-title">Filter Incoming Connections <span class="restart-badge">Restart</span></span>
               <span class="hint">Apply IP filter to incoming peer connections. VPN users may need to disable this since VPN IPs often appear in filter lists.</span>
             </div>
-            <ToggleSwitch bind:checked={settings.filter_incoming_connections} />
+            <ToggleSwitch bind:checked={settings.filter_incoming_connections} ariaLabel="Filter Incoming Connections" />
           </div>
 
           <div class="field toggle-row">
@@ -1064,7 +1080,7 @@
               <span class="toggle-title">Block Private IPs <span class="restart-badge">Restart</span></span>
               <span class="hint">Reject 10.x, 192.168.x, etc. from the routing table.</span>
             </div>
-            <ToggleSwitch bind:checked={settings.block_private_ips} />
+            <ToggleSwitch bind:checked={settings.block_private_ips} ariaLabel="Block Private IPs" />
           </div>
 
           <div class="divider"></div>
@@ -1085,7 +1101,7 @@
                 hold rank, don't move bytes.
               </span>
             </div>
-            <ToggleSwitch bind:checked={settings.antileech_enabled} />
+            <ToggleSwitch bind:checked={settings.antileech_enabled} ariaLabel="Anti-Leech Filter" />
           </div>
           {#if settings.antileech_enabled}
             <div class="field nested antileech-block">
@@ -1153,7 +1169,7 @@
               <span class="toggle-title">Require Approval for Friend Requests</span>
               <span class="hint">Always show incoming friend requests on the Friends page for explicit accept. When off, requests from peers you already added as a friend auto-confirm. Recommended on because the peer-supplied Ember Hash cannot yet be cryptographically verified.</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_require_approval} />
+            <ToggleSwitch bind:checked={settings.friend_require_approval} ariaLabel="Require Approval for Friend Requests" />
           </div>
 
           <div class="field toggle-row">
@@ -1161,7 +1177,7 @@
               <span class="toggle-title">Online Notifications</span>
               <span class="hint">Show a toast when a friend comes online.</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_online_notifications} />
+            <ToggleSwitch bind:checked={settings.friend_online_notifications} ariaLabel="Online Notifications" />
           </div>
 
           <div class="field toggle-row">
@@ -1169,7 +1185,7 @@
               <span class="toggle-title">Disable Friend Chat</span>
               <span class="hint">Ignore incoming chat messages from friends. You won't be able to send messages either.</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_chat_disabled} />
+            <ToggleSwitch bind:checked={settings.friend_chat_disabled} ariaLabel="Disable Friend Chat" />
           </div>
 
           <div class="field toggle-row">
@@ -1177,7 +1193,7 @@
               <span class="toggle-title">Disable Friend Browse</span>
               <span class="hint">Don't respond to browse-shares requests from friends. Your shared file list stays private.</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_browse_disabled} />
+            <ToggleSwitch bind:checked={settings.friend_browse_disabled} ariaLabel="Disable Friend Browse" />
           </div>
 
           <div class="field toggle-row">
@@ -1185,7 +1201,7 @@
               <span class="toggle-title">Encrypt Friend Sessions</span>
               <span class="hint">Wrap friend connections with RC4 obfuscation to prevent casual packet inspection.</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_session_encryption} />
+            <ToggleSwitch bind:checked={settings.friend_session_encryption} ariaLabel="Encrypt Friend Sessions" />
           </div>
 
           <div class="field">
@@ -1240,6 +1256,15 @@
   cancelLabel="Later"
   onconfirm={performRestart}
   oncancel={dismissRestartPrompt}
+/>
+
+<ConfirmDialog
+  bind:open={spamResetConfirmOpen}
+  title="Reset learned spam data?"
+  message="Clear all learned spam filter data — hashes, filenames, and source IPs. The filter will start from scratch and re-learn from your actions. This cannot be undone."
+  confirmLabel="Reset"
+  danger={true}
+  onconfirm={confirmResetSpamData}
 />
 
 <!--
