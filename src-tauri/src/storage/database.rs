@@ -685,12 +685,27 @@ impl Database {
         Ok(())
     }
 
+    /// Persist the full credit ledger as a single atomic replacement.
+    /// The previous implementation only ran `INSERT OR REPLACE` per row,
+    /// which meant rows pruned in memory by `CreditManager::cleanup_stale`
+    /// were left behind in the database. On the next launch the loader
+    /// would resurrect those stale rows and the in-memory eviction
+    /// would have to run again — visible as a Known Clients tab that
+    /// kept showing months-old "Unknown" peers across restarts even
+    /// after the periodic pruner had supposedly cleaned them up.
+    ///
+    /// `DELETE FROM credits` followed by the INSERTs inside one
+    /// transaction guarantees the table mirrors the in-memory snapshot
+    /// exactly. SQLite's transaction guarantees that either the whole
+    /// replacement lands or nothing changes, so a crash mid-flush won't
+    /// leave the table empty.
     pub fn save_all_credits(&self, credits: &[(&[u8; 16], u64, u64, i64, &[u8])]) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM credits", [])?;
         {
             let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO credits (user_hash, uploaded, downloaded, last_seen, public_key) VALUES (?1, ?2, ?3, ?4, ?5)"
+                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key) VALUES (?1, ?2, ?3, ?4, ?5)"
             )?;
             for (hash, uploaded, downloaded, last_seen, public_key) in credits {
                 stmt.execute(params![&hash[..], i64::try_from(*uploaded).unwrap_or(i64::MAX), i64::try_from(*downloaded).unwrap_or(i64::MAX), *last_seen, *public_key])?;
@@ -981,5 +996,83 @@ impl Database {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM download_history WHERE status = ?1", params![status])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a `Database` backed by an in-memory SQLite connection plus
+    /// just the `credits` table, so we can exercise the credit save /
+    /// load round-trip without needing a `tauri::AppHandle`.
+    fn credits_only_db() -> Database {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            "CREATE TABLE credits (
+                user_hash BLOB PRIMARY KEY,
+                uploaded INTEGER NOT NULL DEFAULT 0,
+                downloaded INTEGER NOT NULL DEFAULT 0,
+                last_seen INTEGER NOT NULL DEFAULT 0,
+                public_key BLOB NOT NULL DEFAULT x''
+            );",
+        )
+        .expect("create schema");
+        Database { conn: Mutex::new(conn) }
+    }
+
+    /// Regression: `save_all_credits` MUST act as a full replacement so
+    /// records pruned in memory by `CreditManager::cleanup_stale` are
+    /// also dropped from the persisted table. Before this was a bare
+    /// `INSERT OR REPLACE`, the database accumulated stale rows
+    /// indefinitely — visible as a Known Clients tab that kept showing
+    /// months-old peers across restarts even though the in-memory
+    /// pruner was running on the periodic timer.
+    #[test]
+    fn save_all_credits_is_a_full_replacement() {
+        let db = credits_only_db();
+        let h1 = [0x01u8; 16];
+        let h2 = [0x02u8; 16];
+        let h3 = [0x03u8; 16];
+        let pk: &[u8] = &[0xAA; 4];
+
+        // Seed three records.
+        db.save_all_credits(&[
+            (&h1, 100, 200, 1_700_000_000, pk),
+            (&h2, 300, 400, 1_700_000_001, pk),
+            (&h3, 500, 600, 1_700_000_002, pk),
+        ])
+        .expect("seed");
+        let loaded = db.load_credits().expect("reload after seed");
+        assert_eq!(loaded.len(), 3, "seed must persist three records");
+
+        // Re-save with only one of the three. The other two represent
+        // stale records the in-memory pruner has just dropped — they
+        // must NOT survive in the database.
+        db.save_all_credits(&[(&h2, 999, 888, 1_700_000_999, pk)])
+            .expect("replace");
+        let after = db.load_credits().expect("reload after replace");
+        assert_eq!(after.len(), 1, "stale records must not persist");
+        assert_eq!(after[0].0, h2);
+        // And the surviving row must reflect the latest values, not a
+        // mix of the original seed and the new save.
+        assert_eq!(after[0].1, 999);
+        assert_eq!(after[0].2, 888);
+        assert_eq!(after[0].3, 1_700_000_999);
+    }
+
+    /// Saving an empty slice must clear every existing row — the only
+    /// way to "wipe credits" is to flush an empty `CreditManager`, and
+    /// that has to actually empty the table.
+    #[test]
+    fn save_all_credits_with_empty_input_clears_table() {
+        let db = credits_only_db();
+        let h1 = [0x01u8; 16];
+        db.save_all_credits(&[(&h1, 1, 1, 0, &[])])
+            .expect("seed");
+        assert_eq!(db.load_credits().expect("reload").len(), 1);
+
+        db.save_all_credits(&[]).expect("empty save");
+        assert!(db.load_credits().expect("reload empty").is_empty());
     }
 }
