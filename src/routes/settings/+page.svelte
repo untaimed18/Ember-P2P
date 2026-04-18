@@ -689,8 +689,13 @@
           <div class="field-row">
             <div class="field half">
               <label for="max-sources">Max Sources / File</label>
-              <input id="max-sources" type="number" min="1" max="2000" bind:value={settings.max_sources_per_file} />
-              <span class="hint">Max tracked sources per download (default 400)</span>
+              <!-- The DOM `max` is the backend's hard cap (10000 in
+                   `validateSettings`). The previous UI cap of 2000
+                   contradicted the actual rule; users could enter
+                   higher values from the backend perspective but the
+                   spinner clamped them silently. -->
+              <input id="max-sources" type="number" min="1" max="10000" bind:value={settings.max_sources_per_file} />
+              <span class="hint">Max tracked sources per download (default 400, max 10000)</span>
             </div>
             <div class="field half">
               <label for="max-dl-gib">Max File Size (GiB)</label>

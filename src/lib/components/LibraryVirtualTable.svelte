@@ -138,6 +138,23 @@
     }
   });
 
+  // Public: nudge a row into view if it isn't already visible. Used by
+  // the parent page when the user moves keyboard selection with the
+  // arrow keys — without this, the new selection can scroll out of
+  // sight because the table is virtualized.
+  export function scrollRowIntoView(index: number) {
+    if (!scrollContainer || index < 0 || index >= sortedFiles.length) return;
+    const rowTop = index * ROW_HEIGHT;
+    const rowBottom = rowTop + ROW_HEIGHT;
+    const viewTop = scrollContainer.scrollTop;
+    const viewBottom = viewTop + scrollContainer.clientHeight;
+    if (rowTop < viewTop) {
+      scrollContainer.scrollTop = rowTop;
+    } else if (rowBottom > viewBottom) {
+      scrollContainer.scrollTop = rowBottom - scrollContainer.clientHeight;
+    }
+  }
+
   $effect(() => {
     const el = scrollContainer;
     if (!el) return;
