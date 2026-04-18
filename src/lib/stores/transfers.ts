@@ -233,18 +233,40 @@ export async function initTransferStore() {
   if (initialized) return;
   initialized = true;
 
-  let unsubs: UnlistenFn[];
+  // Sequential `await listen(...)` with explicit rollback instead of
+  // `Promise.all`. With Promise.all, a single rejected `listen` after
+  // earlier ones resolved leaves those resolved subscriptions registered
+  // in Tauri's WebView (their UnlistenFn is unreachable inside the
+  // rejected aggregate promise). On retry — or just for the rest of the
+  // session — events would fire on orphaned handlers we can never
+  // unlisten. The per-step rollback below guarantees that on any failure
+  // we drop every listener we already registered and surface the error.
+  const registered: UnlistenFn[] = [];
+  const safeListen = async <T>(
+    event: string,
+    handler: Parameters<typeof listen<T>>[1],
+  ): Promise<void> => {
+    try {
+      const unlisten = await listen<T>(event, handler);
+      registered.push(unlisten);
+    } catch (e) {
+      for (const u of registered) {
+        try { u(); } catch { /* ignore */ }
+      }
+      registered.length = 0;
+      throw e;
+    }
+  };
   try {
-    unsubs = await Promise.all([
-    listen<Transfer>('transfer-started', (event) => {
+    await safeListen<Transfer>('transfer-started', (event) => {
       markEventUpdate();
       const t = event.payload;
       transfers.update((list) => {
         if (list.some((x) => x.id === t.id)) return list;
         return [...list, t];
       });
-    }),
-    listen<ProgressPayload>('transfer-progress', (event) => {
+    });
+    await safeListen<ProgressPayload>('transfer-progress', (event) => {
       markEventUpdate();
       const p = event.payload;
       const existing = pendingProgress.get(p.id);
@@ -253,8 +275,8 @@ export async function initTransferStore() {
         firstSeen: existing?.firstSeen ?? Date.now(),
       });
       scheduleProgressFlush();
-    }),
-    listen<TransferEventPayload>('transfer-complete', (event) => {
+    });
+    await safeListen<TransferEventPayload>('transfer-complete', (event) => {
       markEventUpdate();
       const { id, direction } = event.payload;
       transfers.update((list) => {
@@ -291,8 +313,8 @@ export async function initTransferStore() {
           return { ...t, status: 'completed' as const, speed: 0 };
         });
       });
-    }),
-    listen<TransferEventPayload>('transfer-failed', (event) => {
+    });
+    await safeListen<TransferEventPayload>('transfer-failed', (event) => {
       markEventUpdate();
       const { id, error, failure_kind, failure_stage, direction } = event.payload;
       transfers.update((list) => {
@@ -323,8 +345,8 @@ export async function initTransferStore() {
           };
         });
       });
-    }),
-    listen<TransferEventPayload & { status?: string }>(
+    });
+    await safeListen<TransferEventPayload & { status?: string }>(
       'transfer-status',
       (event) => {
         markEventUpdate();
@@ -374,9 +396,9 @@ export async function initTransferStore() {
             return updated;
           })
         );
-      }
-    ),
-    listen<TransferEventPayload>('transfer-health', (event) => {
+      },
+    );
+    await safeListen<TransferEventPayload>('transfer-health', (event) => {
       markEventUpdate();
       const { id, error, failure_reason, failure_kind, failure_stage, health, health_reason, stalled_since } = event.payload;
       transfers.update((list) =>
@@ -394,8 +416,8 @@ export async function initTransferStore() {
             : t
         )
       );
-    }),
-    listen<{ id: string; speed: number }>('transfer-speed-decay', (event) => {
+    });
+    await safeListen<{ id: string; speed: number }>('transfer-speed-decay', (event) => {
       markEventUpdate();
       const { id, speed } = event.payload;
       transfers.update((list) =>
@@ -409,8 +431,8 @@ export async function initTransferStore() {
           return { ...t, speed };
         })
       );
-    }),
-    listen<{ id: string; sources: number; active_sources: number; queued_sources: number }>(
+    });
+    await safeListen<{ id: string; sources: number; active_sources: number; queued_sources: number }>(
       'transfer-sources',
       (event) => {
         markEventUpdate();
@@ -421,9 +443,9 @@ export async function initTransferStore() {
             return { ...t, sources, active_sources, queued_sources };
           })
         );
-      }
-    ),
-    listen<{ transfer_id: string; queue_rank?: number }>(
+      },
+    );
+    await safeListen<{ transfer_id: string; queue_rank?: number }>(
       'transfer-source-detail',
       (event) => {
         const { transfer_id, queue_rank } = event.payload;
@@ -432,14 +454,13 @@ export async function initTransferStore() {
         transfers.update((list) =>
           list.map((t) => (t.id === transfer_id ? { ...t, queue_rank } : t))
         );
-      }
-    ),
-    ]);
+      },
+    );
   } catch (e) {
     initialized = false;
     throw e;
   }
-  unlisteners.push(...unsubs);
+  unlisteners.push(...registered);
 
   try {
     const all = await getTransfers();

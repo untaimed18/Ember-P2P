@@ -3477,6 +3477,38 @@ pub async fn start_network(
                         info!("Network shutting down");
                         break;
                     }
+                    // `UpdateSettings` mutates the loop-owned `settings` variable
+                    // and several `state` fields the dispatched `handle_command`
+                    // does not have access to. The try_recv drain above already
+                    // handles this case inline; the dispatched `handle_command`
+                    // arm for `UpdateSettings` is empty. Without this branch a
+                    // settings update that arrives between `try_recv` returning
+                    // empty and `select!` re-arming would be silently dropped
+                    // (obfuscation toggle, USS toggle, max-uploads slider all
+                    // had no effect until the next message woke the loop).
+                    Some(NetworkCommand::UpdateSettings { settings: new_settings }) => {
+                        state.obfuscation_enabled = new_settings.obfuscation_enabled;
+                        state.uss_enabled_flag.store(
+                            new_settings.uss_enabled,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        state.upload_max_slots.store(
+                            new_settings.max_concurrent_uploads as usize,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        if !new_settings.uss_enabled {
+                            state.uss_host = None;
+                            state.pending_uss_pings.clear();
+                        }
+                        info!(
+                            "Network settings updated (recv): obfuscation={}, uss={}, nickname={}, max_uploads={}",
+                            new_settings.obfuscation_enabled,
+                            new_settings.uss_enabled,
+                            new_settings.nickname,
+                            new_settings.max_concurrent_uploads,
+                        );
+                        settings = new_settings;
+                    }
                     Some(cmd) => {
                         handle_command(
                             &udp_socket,
@@ -15169,8 +15201,23 @@ async fn handle_command(
                                             let size: u32 = 1;
                                             packet.extend_from_slice(&size.to_le_bytes());
                                             packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
-                                            let _ = handle.outbound_tx.try_send(packet);
-                                            let _ = tx.send(Ok(()));
+                                            // Surface a real error to the caller if the
+                                            // browse packet couldn't even be queued
+                                            // (channel full or session closed mid-spawn).
+                                            // The previous `let _ = ...; tx.send(Ok(()))`
+                                            // pattern reported success unconditionally,
+                                            // and the UI had no way to know the request
+                                            // never went out.
+                                            match handle.outbound_tx.try_send(packet) {
+                                                Ok(()) => {
+                                                    let _ = tx.send(Ok(()));
+                                                }
+                                                Err(e) => {
+                                                    let _ = tx.send(Err(format!(
+                                                        "Friend session opened but browse request could not be queued: {e}"
+                                                    )));
+                                                }
+                                            }
                                         }
                                         Err(e) => {
                                             info!("Auto-connect for browse to {} failed: {e}", hex::encode(friend_eh));
@@ -15215,11 +15262,23 @@ async fn handle_command(
                                                 let size: u32 = 1;
                                                 packet.extend_from_slice(&size.to_le_bytes());
                                                 packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
-                                                let _ = handle.outbound_tx.try_send(packet);
-                                                let _ = app2.emit("ember:friend-online", serde_json::json!({
-                                                    "user_hash": hex::encode(friend_eh),
-                                                }));
-                                                let _ = tx.send(Ok(()));
+                                                // See sibling tx.send() above — surface a
+                                                // real error rather than reporting success
+                                                // when the outbound channel rejected the
+                                                // browse packet.
+                                                match handle.outbound_tx.try_send(packet) {
+                                                    Ok(()) => {
+                                                        let _ = app2.emit("ember:friend-online", serde_json::json!({
+                                                            "user_hash": hex::encode(friend_eh),
+                                                        }));
+                                                        let _ = tx.send(Ok(()));
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = tx.send(Err(format!(
+                                                            "Friend session opened but browse request could not be queued: {e}"
+                                                        )));
+                                                    }
+                                                }
                                             }
                                             Err(e) => {
                                                 let _ = tx.send(Err(format!("Could not connect: {e}")));
