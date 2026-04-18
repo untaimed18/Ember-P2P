@@ -970,12 +970,18 @@ impl Ed2kDownload {
             }
         }
 
-        // Ember Peer Exchange: if peer is a Ember client, send our source list
+        // Ember Peer Exchange: if peer is a Ember client, send our source list.
+        // Snapshot the generation we sent so the periodic-resend loop below
+        // can detect rebuilds that happen during file-status / queue wait.
+        // (See `multi_source.rs` for the symmetric fix.)
+        let mut initial_epx_sent_generation: Option<u64> = None;
         if peer_is_ember {
+            let sent_gen = self.ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed);
             let epx_data = self.ember_payload.read().await.clone();
             if !epx_data.is_empty() {
-                debug!("Sending Ember Peer Exchange to {} ({} bytes)", self.source_addr, epx_data.len());
+                debug!("Sending Ember Peer Exchange to {} ({} bytes, gen {})", self.source_addr, epx_data.len(), sent_gen);
                 let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await;
+                initial_epx_sent_generation = Some(sent_gen);
             }
             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                 let peer_tcp = self.source_addr.port();
@@ -1733,7 +1739,12 @@ impl Ed2kDownload {
         let mut last_periodic_save = std::time::Instant::now();
         const PERIODIC_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
         let mut last_epx_resend = std::time::Instant::now();
-        let mut last_epx_generation = self.ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed);
+        // Use the generation we sent at handshake as the resend baseline so
+        // any rebuild during file-status / queue wait gets re-sent on the
+        // first periodic check. Falls back to current generation when we
+        // never sent (peer not Ember, or our payload was empty at the time).
+        let mut last_epx_generation = initial_epx_sent_generation
+            .unwrap_or_else(|| self.ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed));
         const EPX_RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
         for retry_round in 0..=max_part_rounds {

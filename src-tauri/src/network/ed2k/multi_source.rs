@@ -1923,15 +1923,25 @@ async fn download_parts_from_source(
         }
     }
 
-    // Ember Peer Exchange: if peer is a Ember client, send our source list
+    // Ember Peer Exchange: if peer is a Ember client, send our source list.
+    // Snapshot the generation we sent so the periodic-resend loop below
+    // (line ~3192) can correctly detect rebuilds that happen during the
+    // file-status-wait / queue-wait window. Capturing the generation at
+    // data-loop start instead — which the original code did — silently
+    // lost every EPX update produced while we were queued (often the
+    // most useful ones, since other sources arrived and shifted the
+    // shareable set).
     info!("Source {}: is_ember={}, mod_version='{}', ember_hash={}",
         _src_idx, hello_caps.is_ember, hello_caps.mod_version,
         peer_ember_hash.map(|h| hex::encode(h)).unwrap_or_else(|| "none".to_string()));
+    let mut initial_epx_sent_generation: Option<u64> = None;
     if hello_caps.is_ember {
+        let sent_gen = ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed);
         let epx_data = ember_payload.read().await.clone();
         if !epx_data.is_empty() {
-            info!("Sending EPX to Ember source {} ({} bytes)", _src_idx, epx_data.len());
+            info!("Sending EPX to Ember source {} ({} bytes, gen {})", _src_idx, epx_data.len(), sent_gen);
             let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await;
+            initial_epx_sent_generation = Some(sent_gen);
         } else {
             info!("EPX payload empty, skipping EPX send to source {}", _src_idx);
         }
@@ -2801,7 +2811,13 @@ async fn download_parts_from_source(
         // faster than eMule's full 100s.
         const INITIAL_DATA_TIMEOUT_SECS: u64 = 60;
         let mut last_epx_resend = std::time::Instant::now();
-        let mut last_epx_generation = ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed);
+        // Use the generation we sent at handshake time as the resend
+        // baseline so any rebuild that happened during file-status / queue
+        // wait gets re-sent on the first periodic check. Falls back to
+        // current generation when we never sent an initial EPX (peer is
+        // not Ember, or our payload was empty at the time).
+        let mut last_epx_generation = initial_epx_sent_generation
+            .unwrap_or_else(|| ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed));
         const EPX_RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
         while total_received < total_sent_bytes {
