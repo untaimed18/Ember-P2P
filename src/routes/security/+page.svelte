@@ -299,11 +299,20 @@
     {#if showAddForm}
       <div class="add-form">
         <div class="add-form-inner">
-          <input bind:value={newStartIp} placeholder="Start IP (e.g. 1.0.0.0)" class="ip-input" />
-          <span class="range-sep">&mdash;</span>
-          <input bind:value={newEndIp} placeholder="End IP (e.g. 1.0.0.255)" class="ip-input" />
-          <input bind:value={newDescription} placeholder="Description (optional)" class="desc-input" />
-          <button onclick={handleAddRange}>Add</button>
+          <label class="add-field">
+            <span class="add-field-label">Start IP</span>
+            <input bind:value={newStartIp} placeholder="e.g. 1.0.0.0" class="ip-input" aria-label="Start IP" />
+          </label>
+          <span class="range-sep" aria-hidden="true">&mdash;</span>
+          <label class="add-field">
+            <span class="add-field-label">End IP</span>
+            <input bind:value={newEndIp} placeholder="e.g. 1.0.0.255" class="ip-input" aria-label="End IP" />
+          </label>
+          <label class="add-field add-field-grow">
+            <span class="add-field-label">Description (optional)</span>
+            <input bind:value={newDescription} placeholder="Why is this range blocked?" class="desc-input" aria-label="Description" />
+          </label>
+          <button class="add-form-submit" onclick={handleAddRange}>Add</button>
         </div>
       </div>
     {/if}
@@ -324,7 +333,7 @@
           oninput={() => (currentPage = 0)}
         />
         {#if searchQuery}
-          <button class="search-clear" onclick={() => { searchQuery = ''; currentPage = 0; }} title="Clear search">&times;</button>
+          <button class="search-clear" onclick={() => { searchQuery = ''; currentPage = 0; }} title="Clear search" aria-label="Clear search">&times;</button>
         {/if}
       </div>
       <span class="result-count">
@@ -385,14 +394,24 @@
                 </td>
                 <td class="desc-cell" title={entry.description}>{entry.description || '\u2014'}</td>
                 <td class="hits-cell">
-                  {#if entry.hits > 0}
-                    <span class="hit-count">{entry.hits.toLocaleString()}</span>
-                  {:else}
+                  {#if entry.hits === 0}
                     <span class="no-hits">0</span>
+                  {:else if entry.hits >= 100}
+                    <!-- Reserve the "danger" red for ranges that are
+                         actually doing meaningful blocking; otherwise
+                         every populated table reads as alarming. -->
+                    <span class="hit-count hit-count-high">{entry.hits.toLocaleString()}</span>
+                  {:else}
+                    <span class="hit-count">{entry.hits.toLocaleString()}</span>
                   {/if}
                 </td>
                 <td class="actions-cell">
-                  <button class="ghost danger btn-remove" onclick={() => handleRemoveRange(entry)} title="Remove this range">&times;</button>
+                  <button
+                    class="ghost danger btn-remove"
+                    onclick={() => handleRemoveRange(entry)}
+                    title="Remove this range"
+                    aria-label={`Remove range ${entry.start_ip} to ${entry.end_ip}`}
+                  >&times;</button>
                 </td>
               </tr>
             {/each}
@@ -548,20 +567,40 @@
     gap: 8px;
     flex-wrap: wrap;
   }
+  .add-field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .add-field-grow {
+    flex: 1;
+    min-width: 140px;
+  }
+  .add-field-label {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
   .ip-input {
     width: 156px;
     font-family: var(--font-mono);
     font-size: 12px;
   }
   .desc-input {
-    width: 200px;
-    flex: 1;
-    min-width: 140px;
+    width: 100%;
+    font-size: 12px;
   }
   .range-sep {
     color: var(--text-muted);
     font-size: 14px;
     flex-shrink: 0;
+    align-self: end;
+    padding-bottom: 6px;
+  }
+  .add-form-submit {
+    align-self: end;
   }
 
   /* --- Search toolbar --- */
@@ -722,8 +761,11 @@
     font-variant-numeric: tabular-nums;
   }
   .hit-count {
-    color: var(--danger);
+    color: var(--text-primary);
     font-weight: 600;
+  }
+  .hit-count-high {
+    color: var(--danger);
   }
   .no-hits {
     color: var(--text-muted);
@@ -731,6 +773,9 @@
   .actions-cell {
     text-align: center;
   }
+  /* Remove button stays visible (no opacity-0 default) so touch and
+     keyboard users can reach it without first hovering the row. Faded
+     baseline keeps it from competing with the IP/description text. */
   .btn-remove {
     padding: 2px 6px;
     font-size: 14px;
@@ -738,7 +783,9 @@
     opacity: 0.5;
     transition: opacity 0.15s;
   }
-  .ip-table tbody tr:hover .btn-remove {
+  .ip-table tbody tr:hover .btn-remove,
+  .ip-table tbody tr:focus-within .btn-remove,
+  .btn-remove:focus-visible {
     opacity: 1;
   }
 

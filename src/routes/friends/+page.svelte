@@ -592,7 +592,7 @@
             placeholder="Search&hellip;"
           />
           {#if searchQuery}
-            <button class="search-clear" onclick={() => { searchQuery = ''; }} title="Clear search">&times;</button>
+            <button class="search-clear" onclick={() => { searchQuery = ''; }} title="Clear search" aria-label="Clear search">&times;</button>
           {/if}
         </div>
       {/if}
@@ -705,7 +705,12 @@
               <span class="card-unread-preview">{unreadCounts.get(f.user_hash)} unread message{(unreadCounts.get(f.user_hash) ?? 0) > 1 ? 's' : ''}</span>
             {/if}
           </div>
-          <button class="icon-btn copy-hash-btn" onclick={() => copyHash(f.user_hash)} title={copiedHash === f.user_hash ? 'Copied!' : 'Copy Friend ID'}>
+          <button
+            class="icon-btn copy-hash-btn"
+            onclick={() => copyHash(f.user_hash)}
+            title={copiedHash === f.user_hash ? 'Copied!' : 'Copy Friend ID'}
+            aria-label={copiedHash === f.user_hash ? 'Copied Friend ID' : `Copy Friend ID for ${f.nickname || f.user_hash.slice(0, 8)}`}
+          >
             {#if copiedHash === f.user_hash}
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <polyline points="3 8 7 12 13 4"/>
@@ -717,7 +722,12 @@
               </svg>
             {/if}
           </button>
-          <button class="icon-btn danger remove-btn" onclick={() => confirmRemoveFriend(f)} title="Remove friend">
+          <button
+            class="icon-btn danger remove-btn"
+            onclick={() => confirmRemoveFriend(f)}
+            title="Remove friend"
+            aria-label={`Remove friend ${f.nickname || f.user_hash.slice(0, 8)}`}
+          >
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <line x1="4" y1="4" x2="12" y2="12"/>
               <line x1="12" y1="4" x2="4" y2="12"/>
@@ -1175,12 +1185,15 @@
     box-shadow: 0 0 0 2px var(--accent-dim);
   }
 
+  /* Same touch/keyboard reasoning as `.copy-hash-btn` above. */
   .remove-btn {
-    opacity: 0;
+    opacity: 0.55;
     transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
   }
 
-  .friend-card:hover .remove-btn {
+  .friend-card:hover .remove-btn,
+  .friend-card:focus-within .remove-btn,
+  .remove-btn:focus-visible {
     opacity: 1;
   }
 
@@ -1321,9 +1334,12 @@
     border: 2px solid var(--success);
   }
 
+  /* Offline avatars use a muted neutral border instead of red.
+     Reserving --danger for actual errors stops "offline" from reading
+     as "broken" and keeps the page calm when most friends are offline. */
   .avatar-offline {
-    border: 2px solid var(--danger);
-    opacity: 0.7;
+    border: 2px solid var(--border-light);
+    opacity: 0.85;
   }
 
   .status-dot {
@@ -1341,7 +1357,7 @@
   }
 
   .dot-offline {
-    background: var(--danger);
+    background: var(--text-muted);
   }
 
   .friend-card.online {
@@ -1382,8 +1398,7 @@
   }
 
   .offline-dot-label {
-    background: var(--danger);
-    opacity: 0.6;
+    background: var(--text-muted);
   }
 
   .section-label {
@@ -1408,13 +1423,25 @@
     animation: badge-pulse 2s ease-in-out infinite;
   }
 
-  /* --- Copy hash button in header --- */
+  @media (prefers-reduced-motion: reduce) {
+    .status-searching {
+      animation: none;
+    }
+  }
+
+  /* --- Copy hash button in header ---
+     Always present (not opacity 0) so touch users and keyboard
+     navigation can reach it without first triggering hover. Faded by
+     default to avoid competing with primary content; resolves to full
+     opacity on hover OR focus-within so keyboard tabbing reveals it. */
   .copy-hash-btn {
-    opacity: 0;
+    opacity: 0.55;
     transition: opacity var(--transition-fast), background var(--transition-fast), color var(--transition-fast);
   }
 
-  .friend-card:hover .copy-hash-btn {
+  .friend-card:hover .copy-hash-btn,
+  .friend-card:focus-within .copy-hash-btn,
+  .copy-hash-btn:focus-visible {
     opacity: 1;
   }
 

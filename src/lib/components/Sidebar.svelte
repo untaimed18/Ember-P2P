@@ -4,6 +4,7 @@
   import AboutDialog from '$lib/components/AboutDialog.svelte';
   import { transfers } from '$lib/stores/transfers';
   import { networkStats } from '$lib/stores/network';
+  import { onMount } from 'svelte';
 
   let aboutOpen = $state(false);
 
@@ -27,8 +28,7 @@
     return pathname === item.href;
   }
 
-  function navigate(e: MouseEvent, href: string) {
-    e.preventDefault();
+  function navigateTo(href: string) {
     const current = $page.url.pathname;
     if (current === href) return;
     const item = navItems.find(i => i.href === href);
@@ -37,6 +37,39 @@
       window.location.href = href;
     });
   }
+
+  function navigate(e: MouseEvent, href: string) {
+    e.preventDefault();
+    navigateTo(href);
+  }
+
+  // Alt+1..9 jumps to the corresponding sidebar entry. Mirrors the
+  // workspace-switching convention from Discord/Slack/etc., and stays
+  // out of the way of in-page Ctrl-shortcuts (Ctrl+S in settings,
+  // Ctrl+A/C/D in library, etc.). Skipped while the user is typing in
+  // an input/textarea/contenteditable so it doesn't eat regular Alt
+  // keystrokes (special characters, menu access keys).
+  function isTypingTarget(t: EventTarget | null): boolean {
+    if (!(t instanceof HTMLElement)) return false;
+    const tag = t.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (t.isContentEditable) return true;
+    return false;
+  }
+
+  function onShortcutKey(e: KeyboardEvent) {
+    if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    if (isTypingTarget(e.target)) return;
+    const n = Number.parseInt(e.key, 10);
+    if (!Number.isFinite(n) || n < 1 || n > navItems.length) return;
+    e.preventDefault();
+    navigateTo(navItems[n - 1].href);
+  }
+
+  onMount(() => {
+    window.addEventListener('keydown', onShortcutKey);
+    return () => window.removeEventListener('keydown', onShortcutKey);
+  });
 </script>
 
 <nav class="sidebar" aria-label="Primary">
@@ -46,14 +79,15 @@
   </a>
 
   <ul class="nav-list">
-    {#each navItems as item}
+    {#each navItems as item, i}
       <li>
         <a
           href={item.href}
           class:active={isActive(item, $page.url.pathname)}
           aria-current={isActive(item, $page.url.pathname) ? 'page' : undefined}
+          aria-keyshortcuts={i < 9 ? `Alt+${i + 1}` : undefined}
           onclick={(e: MouseEvent) => navigate(e, item.href)}
-          title={item.label}
+          title={i < 9 ? `${item.label} (Alt+${i + 1})` : item.label}
         >
           <span class="nav-icon" aria-hidden="true">
             {#if item.id === 'kad'}
@@ -343,6 +377,12 @@
       0 0 0 2px color-mix(in srgb, #f0b93f 22%, transparent),
       0 0 8px color-mix(in srgb, #f0b93f 55%, transparent);
     animation: nav-dot-pulse 1.5s ease-in-out infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .nav-dot.connecting {
+      animation: none;
+    }
   }
 
   .nav-dot.disconnected {

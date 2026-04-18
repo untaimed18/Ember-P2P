@@ -1,13 +1,26 @@
 <script lang="ts">
+  // `label` renders a visible string next to the switch AND is used as
+  // the accessible name. `ariaLabel` is for callers that already render
+  // their own visible label (e.g. the settings toggle rows where the
+  // title sits in a separate `.toggle-title` element); they pass an
+  // accessible name without duplicating the visible text.
+  // `ariaLabelledby` is for callers that have an existing element id
+  // they want to use as the accessible name.
   let {
     checked = $bindable(false),
     disabled = false,
     label = '',
+    ariaLabel = '',
+    ariaLabelledby = '',
   }: {
     checked: boolean;
     disabled?: boolean;
     label?: string;
+    ariaLabel?: string;
+    ariaLabelledby?: string;
   } = $props();
+
+  let computedAriaLabel = $derived(ariaLabel || label || undefined);
 </script>
 
 <label class="toggle" class:disabled>
@@ -15,7 +28,8 @@
     type="button"
     role="switch"
     aria-checked={checked}
-    aria-label={label}
+    aria-label={ariaLabelledby ? undefined : computedAriaLabel}
+    aria-labelledby={ariaLabelledby || undefined}
     {disabled}
     class="track"
     class:on={checked}

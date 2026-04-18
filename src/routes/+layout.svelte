@@ -39,7 +39,11 @@
   onMount(() => {
     initTheme();
     const splashStartedAt = performance.now();
-    const minSplashMs = 1200;
+    // The splash exists to mask the first paint, not to delay it. Once
+    // the stores have initialized we want the app visible immediately;
+    // the floor is only there to avoid a sub-frame flash when the init
+    // races to completion.
+    const minSplashMs = 400;
     const splashExitMs = 260;
 
     let stopPoll: (() => void) | null = null;

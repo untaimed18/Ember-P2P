@@ -81,6 +81,21 @@
     return (part / totalOverhead) * 100;
   }
 
+  // Render overhead rows in descending size so the biggest contributor
+  // sits at the top — quicker to read at a glance than a fixed
+  // protocol-defined order.
+  type OverheadRow = { key: string; label: string; value: number; cls: string };
+  let overheadRows = $derived.by<OverheadRow[]>(() => {
+    if (!stats) return [];
+    const rows: OverheadRow[] = [
+      { key: 'server', label: 'Server', value: stats.overhead_server, cls: 'oh-server' },
+      { key: 'kad', label: 'KAD', value: stats.overhead_kad, cls: 'oh-kad' },
+      { key: 'srcex', label: 'Source Exchange', value: stats.overhead_source_exchange, cls: 'oh-srcex' },
+      { key: 'freq', label: 'File Requests', value: stats.overhead_file_request, cls: 'oh-freq' },
+    ];
+    return rows.filter((r) => r.value > 0).sort((a, b) => b.value - a.value);
+  });
+
   function formatSessionTime(secs: number): string {
     if (secs <= 0) return '0s';
     const h = Math.floor(secs / 3600);
@@ -112,28 +127,52 @@
     <!-- Hero cards -->
     <div class="hero-row">
       <div class="hero-card">
-        <div class="hero-icon down-icon">&#x2193;</div>
+        <div class="hero-icon down-icon" aria-hidden="true">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="10" y1="3" x2="10" y2="15"/>
+            <polyline points="5,10 10,15 15,10"/>
+          </svg>
+        </div>
         <div class="hero-body">
           <span class="hero-value">{formatRate(stats.session_down_rate)}</span>
           <span class="hero-label">Download Rate</span>
         </div>
       </div>
       <div class="hero-card">
-        <div class="hero-icon up-icon">&#x2191;</div>
+        <div class="hero-icon up-icon" aria-hidden="true">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="10" y1="17" x2="10" y2="5"/>
+            <polyline points="5,10 10,5 15,10"/>
+          </svg>
+        </div>
         <div class="hero-body">
           <span class="hero-value">{formatRate(stats.session_up_rate)}</span>
           <span class="hero-label">Upload Rate</span>
         </div>
       </div>
       <div class="hero-card">
-        <div class="hero-icon time-icon">&#x23F1;</div>
+        <div class="hero-icon time-icon" aria-hidden="true">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="10" cy="11" r="6.5"/>
+            <line x1="10" y1="11" x2="10" y2="7"/>
+            <line x1="10" y1="11" x2="13" y2="11"/>
+            <line x1="8" y1="2.5" x2="12" y2="2.5"/>
+          </svg>
+        </div>
         <div class="hero-body">
           <span class="hero-value">{formatSessionTime(sessionTime)}</span>
           <span class="hero-label">Session Time</span>
         </div>
       </div>
       <div class="hero-card">
-        <div class="hero-icon ratio-icon">&#x21C5;</div>
+        <div class="hero-icon ratio-icon" aria-hidden="true">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="6" y1="3.5" x2="6" y2="15"/>
+            <polyline points="3.5,6 6,3.5 8.5,6"/>
+            <line x1="14" y1="16.5" x2="14" y2="5"/>
+            <polyline points="11.5,14 14,16.5 16.5,14"/>
+          </svg>
+        </div>
         <div class="hero-body">
           <span class="hero-value" class:ratio-good={ratio !== null && ratio >= 1} class:ratio-low={ratio !== null && ratio < 1}>{ratioLabel}</span>
           <span class="hero-label">Upload Ratio</span>
@@ -145,7 +184,13 @@
     <div class="section-row">
       <section class="card transfer-card">
         <div class="card-head">
-          <span class="section-icon">&#x2913;</span>
+          <span class="section-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="8" y1="2.5" x2="8" y2="11"/>
+              <polyline points="4.5,7.5 8,11 11.5,7.5"/>
+              <line x1="3" y1="13.5" x2="13" y2="13.5"/>
+            </svg>
+          </span>
           <h3>Session Downloads</h3>
         </div>
         <div class="transfer-grid">
@@ -162,7 +207,13 @@
 
       <section class="card transfer-card">
         <div class="card-head">
-          <span class="section-icon">&#x2912;</span>
+          <span class="section-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="8" y1="13.5" x2="8" y2="5"/>
+              <polyline points="4.5,8.5 8,5 11.5,8.5"/>
+              <line x1="3" y1="2.5" x2="13" y2="2.5"/>
+            </svg>
+          </span>
           <h3>Session Uploads</h3>
         </div>
         <div class="transfer-grid">
@@ -181,7 +232,11 @@
     <!-- Cumulative -->
     <section class="card">
       <div class="card-head">
-        <span class="section-icon">&#x03A3;</span>
+        <span class="section-icon" aria-hidden="true">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="3,3 13,3 8,8 13,13 3,13"/>
+          </svg>
+        </span>
         <h3>All-Time Totals</h3>
       </div>
       <div class="cum-grid">
@@ -216,48 +271,25 @@
     <!-- Overhead -->
     <section class="card">
       <div class="card-head">
-        <span class="section-icon">&#x26A1;</span>
+        <span class="section-icon" aria-hidden="true">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="9,1.5 4,9 8,9 7,14.5 12,7 8,7"/>
+          </svg>
+        </span>
         <h3>Protocol Overhead</h3>
         <span class="head-aside">{formatBytes(totalOverhead)} total</span>
       </div>
 
       <div class="overhead-bars">
-        {#if stats.overhead_server > 0}
-        <div class="oh-row">
-          <span class="oh-label">Server</span>
-          <div class="oh-track">
-            <div class="oh-fill oh-server" style="width: {overheadPct(stats.overhead_server)}%"></div>
+        {#each overheadRows as row (row.key)}
+          <div class="oh-row">
+            <span class="oh-label">{row.label}</span>
+            <div class="oh-track">
+              <div class="oh-fill {row.cls}" style="width: {overheadPct(row.value)}%"></div>
+            </div>
+            <span class="oh-value">{formatBytes(row.value)}</span>
           </div>
-          <span class="oh-value">{formatBytes(stats.overhead_server)}</span>
-        </div>
-        {/if}
-        {#if stats.overhead_kad > 0}
-        <div class="oh-row">
-          <span class="oh-label">KAD</span>
-          <div class="oh-track">
-            <div class="oh-fill oh-kad" style="width: {overheadPct(stats.overhead_kad)}%"></div>
-          </div>
-          <span class="oh-value">{formatBytes(stats.overhead_kad)}</span>
-        </div>
-        {/if}
-        {#if stats.overhead_source_exchange > 0}
-        <div class="oh-row">
-          <span class="oh-label">Source Exchange</span>
-          <div class="oh-track">
-            <div class="oh-fill oh-srcex" style="width: {overheadPct(stats.overhead_source_exchange)}%"></div>
-          </div>
-          <span class="oh-value">{formatBytes(stats.overhead_source_exchange)}</span>
-        </div>
-        {/if}
-        {#if stats.overhead_file_request > 0}
-        <div class="oh-row">
-          <span class="oh-label">File Requests</span>
-          <div class="oh-track">
-            <div class="oh-fill oh-freq" style="width: {overheadPct(stats.overhead_file_request)}%"></div>
-          </div>
-          <span class="oh-value">{formatBytes(stats.overhead_file_request)}</span>
-        </div>
-        {/if}
+        {/each}
         {#if totalOverhead === 0}
           <p class="oh-empty">No overhead recorded yet</p>
         {/if}
@@ -310,8 +342,11 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 22px;
     flex-shrink: 0;
+  }
+  .hero-icon :global(svg) {
+    width: 22px;
+    height: 22px;
   }
   .down-icon  { background: color-mix(in srgb, var(--accent)  14%, transparent); color: var(--accent); }
   .up-icon    { background: color-mix(in srgb, var(--success) 14%, transparent); color: var(--success); }
@@ -355,8 +390,14 @@
     margin: 0;
   }
   .section-icon {
-    font-size: 1.1rem;
-    opacity: 0.6;
+    display: inline-flex;
+    align-items: center;
+    color: var(--text-secondary);
+    opacity: 0.7;
+  }
+  .section-icon :global(svg) {
+    width: 16px;
+    height: 16px;
   }
   .head-aside {
     margin-left: auto;

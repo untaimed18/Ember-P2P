@@ -28,15 +28,73 @@
   let sendError: string | null = $state(null);
   let messagesEnd: HTMLDivElement | undefined = $state();
   let chatInputEl: HTMLInputElement | undefined = $state();
+  let panelEl: HTMLDivElement | undefined = $state();
   let unlisten: UnlistenFn | null = null;
   let loadGen = 0;
   let msgIdCounter = 0;
+  // Captured opener so focus returns to wherever the user came from
+  // when the sidebar closes. Without this, focus snaps back to <body>
+  // and keyboard users lose their place in the friends grid.
+  let returnFocusEl: HTMLElement | null = null;
+  // Stable instance id for `aria-labelledby` so screen readers announce
+  // the sidebar with the friend's name when it opens.
+  const titleId = `chat-title-${Math.random().toString(36).slice(2, 10)}`;
 
   $effect(() => {
     if (open && chatInputEl) {
       requestAnimationFrame(() => chatInputEl?.focus());
     }
   });
+
+  // Capture the focused element when the sidebar opens; restore it on close.
+  $effect(() => {
+    if (open && typeof document !== 'undefined') {
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && active !== document.body) {
+        returnFocusEl = active;
+      }
+    }
+    return () => {
+      if (returnFocusEl) {
+        const el = returnFocusEl;
+        returnFocusEl = null;
+        // requestAnimationFrame defers focus until after the panel
+        // unmounts, otherwise the browser may reject the focus call
+        // because the active element is being torn down.
+        requestAnimationFrame(() => {
+          if (typeof document !== 'undefined' && document.contains(el)) {
+            el.focus();
+          }
+        });
+      }
+    };
+  });
+
+  // Tab focus trap: keep keyboard focus inside the panel while it's
+  // open. Mirrors the trap used in the KAD bootstrap modal so the
+  // behaviour is identical across dialog-style overlays.
+  function onPanelKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      onclose();
+      return;
+    }
+    if (e.key !== 'Tab' || !panelEl) return;
+    const focusables = panelEl.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    );
+    if (focusables.length === 0) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    const active = document.activeElement as HTMLElement | null;
+    if (e.shiftKey && active === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && active === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
 
   $effect(() => {
     if (open && friendHash) {
@@ -167,17 +225,27 @@
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="chat-overlay" onclick={onclose}></div>
-  <div class="chat-sidebar">
+  <div
+    class="chat-sidebar"
+    bind:this={panelEl}
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby={titleId}
+    tabindex="-1"
+    onkeydown={onPanelKeydown}
+  >
     <div class="chat-header">
       <div class="chat-header-info">
-        <div class="chat-avatar">
+        <div class="chat-avatar" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.418 3.582-8 8-8s8 3.582 8 8"/>
           </svg>
         </div>
-        <span class="chat-name">{friendName || friendHash.slice(0, 8) + '\u2026'}</span>
+        <span class="chat-name" id={titleId}>
+          <span class="sr-only">Chat with </span>{friendName || friendHash.slice(0, 8) + '\u2026'}
+        </span>
       </div>
-      <button class="chat-close" onclick={onclose} title="Close chat">
+      <button class="chat-close" onclick={onclose} title="Close chat" aria-label="Close chat">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
           <line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/>
         </svg>
@@ -215,7 +283,7 @@
         maxlength="4096"
         disabled={sending}
       />
-      <button class="chat-send" onclick={handleSend} disabled={!inputText.trim() || sending} title="Send">
+      <button class="chat-send" onclick={handleSend} disabled={!inputText.trim() || sending} title="Send" aria-label="Send message">
         <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M3 10l14-7-7 14-2-5z"/><line x1="10" y1="17" x2="17" y2="3"/>
         </svg>
