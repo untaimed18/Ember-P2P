@@ -1908,6 +1908,21 @@ impl UploadHandler {
         let mut last_preempt_check: std::time::Instant = std::time::Instant::now();
         let mut epx_packets_received: u8 = 0;
 
+        // Time-of-last-useful-peer-activity gauge. The read-side
+        // `tokio::time::timeout(SLOT_IDLE_TIMEOUT_SECS, pkt_rx.recv())`
+        // resets on every packet, so a peer that holds a slot but
+        // sends only chatter (mod-specific keepalives, OP_REASKFILEPING,
+        // unknown opcodes) was able to pin the slot indefinitely while
+        // never actually requesting more parts. This gauge is bumped
+        // ONLY when the peer requests data (`OP_REQUESTPARTS` /
+        // `_I64`); the per-loop gate below rotates the slot when no
+        // such request has arrived in `SLOT_IDLE_TIMEOUT_SECS`,
+        // independent of how chatty the peer is otherwise. Visible
+        // symptom before this fix: an upload row that sat at a few
+        // hundred KB transferred with status "Transferring" for many
+        // minutes and only cleared when the app closed.
+        let mut last_part_request: std::time::Instant = std::time::Instant::now();
+
         // Session-local caches populated lazily on OP_REQUESTPARTS and reused
         // across batches / blocks so we don't re-open the serve file, re-read
         // the `.part.met`, or re-compute the video-extension flag for every
@@ -1978,6 +1993,24 @@ impl UploadHandler {
             // we also leave the outer packet loop so the connection closes
             // and all shared cleanup at function exit runs.
             if user_cancelled {
+                break;
+            }
+
+            // No-useful-activity rotation gate. The read-side timeout
+            // resets on every packet — even ones we ignore (mod-
+            // specific opcodes, unrecognised keepalives, etc.). A
+            // peer that holds a slot but never sends OP_REQUESTPARTS
+            // would sit "Transferring" forever as long as it kept any
+            // packet trickle alive. Drop the slot when no part
+            // request has arrived in `SLOT_IDLE_TIMEOUT_SECS`,
+            // independent of read-side traffic.
+            if slot_guard.is_active()
+                && last_part_request.elapsed().as_secs() >= SLOT_IDLE_TIMEOUT_SECS
+            {
+                debug!(
+                    "Upload slot for {peer_addr} idle >{SLOT_IDLE_TIMEOUT_SECS}s with no \
+                     OP_REQUESTPARTS — closing to rotate slot (uploaded={uploaded} bytes)"
+                );
                 break;
             }
 
@@ -2126,6 +2159,11 @@ impl UploadHandler {
                                         queue_wait_at_grant = queue_join_time.elapsed().as_secs();
                                         session_start = Some(std::time::Instant::now());
                                         rate_tracker = SessionRateTracker::new();
+                                        // Reset the useful-activity gauge on slot grant
+                                        // so a freshly-promoted peer gets the full
+                                        // SLOT_IDLE_TIMEOUT_SECS window to send their
+                                        // first OP_REQUESTPARTS.
+                                        last_part_request = std::time::Instant::now();
 
                                         if let Some(hash) = current_file_hash {
                                             let tid = uuid::Uuid::new_v4().to_string();
@@ -2768,6 +2806,9 @@ impl UploadHandler {
                     queue_wait_at_grant = queue_join_time.elapsed().as_secs();
                     session_start = Some(std::time::Instant::now());
                     rate_tracker = SessionRateTracker::new();
+                    // Reset the useful-activity gauge on slot grant — see
+                    // sibling activate() above for rationale.
+                    last_part_request = std::time::Instant::now();
 
                     if let Some(hash) = current_file_hash {
                         let tid = uuid::Uuid::new_v4().to_string();
@@ -2816,6 +2857,12 @@ impl UploadHandler {
                         .await?;
                         continue;
                     }
+                    // Bump the useful-activity gauge BEFORE serving so
+                    // the gate at the top of the loop never rotates a
+                    // peer mid-batch. See the field declaration for
+                    // why this exists separately from the read-side
+                    // SLOT_IDLE_TIMEOUT_SECS.
+                    last_part_request = std::time::Instant::now();
 
                     let offsets = if opcode == OP_REQUESTPARTS_I64 {
                         parse_request_parts_i64(&payload)?
