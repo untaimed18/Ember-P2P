@@ -472,6 +472,8 @@ pub fn run() {
             commands::transfers::cancel_transfer,
             commands::transfers::remove_transfer,
             commands::transfers::get_transfers,
+            commands::transfers::get_upload_queue,
+            commands::transfers::get_known_clients,
             commands::transfers::clear_completed,
             commands::transfers::get_transfer_sources,
             commands::transfers::set_transfer_priority,

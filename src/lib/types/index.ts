@@ -195,6 +195,39 @@ export interface ServerInfo {
   is_low_id: boolean;
 }
 
+/** Row in the upload-pane "Queued" tab. Mirrors `crate::types::UploadQueueClient`
+ *  in the Rust backend; populated by `invoke('get_upload_queue')`. */
+export interface UploadQueueClient {
+  user_hash: string;
+  peer_ip: string;
+  peer_port: number;
+  file_hash: string;
+  file_name: string;
+  wait_seconds: number;
+  queue_rank: number | null;
+  credit_ratio: number;
+  uploaded: number;
+  downloaded: number;
+  ident_state: string;
+  country_code: string | null;
+  is_friend: boolean;
+  emule_version: number;
+}
+
+/** Row in the upload-pane "Known Clients" tab. Mirrors
+ *  `crate::types::KnownClient`. Populated by `invoke('get_known_clients')`. */
+export interface KnownClient {
+  user_hash: string;
+  downloaded: number;
+  uploaded: number;
+  credit_ratio: number;
+  last_seen: number;
+  ident_state: string;
+  last_known_ip: string | null;
+  country_code: string | null;
+  has_public_key: boolean;
+}
+
 export interface AppSettings {
   nickname: string;
   shared_folders: string[];

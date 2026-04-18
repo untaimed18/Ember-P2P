@@ -798,6 +798,37 @@ pub async fn get_transfers(
     Ok(manager.get_all())
 }
 
+/// Snapshot of peers currently waiting in our upload queue. Backs the
+/// "Queued" tab in the transfers/uploads pane. Each row already carries
+/// resolved file name + credit info so the frontend doesn't need any
+/// follow-up commands per row.
+#[tauri::command]
+pub async fn get_upload_queue(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<UploadQueueClient>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::GetUploadQueueSnapshot { tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
+    rx.await.map_err(|_| "Failed to get upload queue".to_string())
+}
+
+/// Snapshot of every persisted SecIdent credit record. Backs the
+/// "Known Clients" tab — this is the lifetime view of every peer
+/// we've ever traded credit with, sorted by most-recently-seen.
+#[tauri::command]
+pub async fn get_known_clients(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<KnownClient>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::GetKnownClientsSnapshot { tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
+    rx.await.map_err(|_| "Failed to get known clients".to_string())
+}
+
 #[tauri::command]
 pub async fn set_transfer_priority(
     state: tauri::State<'_, AppState>,

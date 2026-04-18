@@ -529,6 +529,72 @@ pub struct ServerInfo {
     pub is_low_id: bool,
 }
 
+/// One row in the upload-pane "Queued" tab — a peer that has joined our
+/// upload queue but doesn't currently hold a slot. Snapshot taken on
+/// demand from `UploadQueueRef`; `wait_seconds` is computed at snapshot
+/// time so the UI doesn't need access to monotonic `Instant`s.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadQueueClient {
+    /// 32-char hex ed2k user hash, or empty when the peer didn't
+    /// advertise one (queue identity falls back to IP in that case).
+    pub user_hash: String,
+    pub peer_ip: String,
+    pub peer_port: u16,
+    pub file_hash: String,
+    pub file_name: String,
+    pub wait_seconds: u64,
+    /// 1-based queue rank computed via the eMule scoring rules
+    /// (`compute_queue_rank` in the upload module). `None` when the
+    /// peer is currently disconnected and only `m_bAddNextConnect` is
+    /// keeping their slot warm.
+    pub queue_rank: Option<u32>,
+    /// SecIdent credit ratio (1.0–10.0). 1.0 for first-time peers.
+    pub credit_ratio: f64,
+    /// Lifetime bytes we have uploaded TO this peer across all sessions.
+    pub uploaded: u64,
+    /// Lifetime bytes we have downloaded FROM this peer across all sessions.
+    pub downloaded: u64,
+    /// "Verified" | "Failed" | "Unknown" | "BadGuy" | "Needed"
+    pub ident_state: String,
+    /// ISO 3166-1 alpha-2 country code, geoip-resolved from `peer_ip`.
+    pub country_code: Option<String>,
+    pub is_friend: bool,
+    /// Raw eMule version byte (Hello CT_EMULE_VERSION). Surfaces in the UI
+    /// as a tooltip / column for diagnosing legacy-client penalties.
+    pub emule_version: u8,
+}
+
+/// One row in the upload-pane "Known Clients" tab — a SecIdent credit
+/// record. These are persistent across sessions (clients.met) so the
+/// list is the lifetime view of every peer we've ever traded credit
+/// with, not just currently-connected peers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnownClient {
+    /// 32-char hex ed2k user hash.
+    pub user_hash: String,
+    /// Bytes WE downloaded from them across all sessions (eMule's
+    /// `m_nDownloaded`). This is the value that buys us upload-queue
+    /// priority on their side.
+    pub downloaded: u64,
+    /// Bytes WE uploaded to them across all sessions (`m_nUploaded`).
+    pub uploaded: u64,
+    /// Cached `get_score_ratio` for the IP we last identified them at.
+    pub credit_ratio: f64,
+    /// Unix epoch seconds; the freshest of the per-session timestamps.
+    pub last_seen: i64,
+    /// "Verified" | "Failed" | "Unknown" | "BadGuy" | "Needed"
+    pub ident_state: String,
+    /// Last IPv4 we successfully verified the peer at, or `None` for
+    /// records that exist only because of pre-SecIdent traffic.
+    pub last_known_ip: Option<String>,
+    /// ISO 3166-1 alpha-2, geoip-resolved from `last_known_ip`.
+    pub country_code: Option<String>,
+    /// True iff we have their RSA public key cached (a prerequisite for
+    /// Verified state — useful for diagnosing why a record is stuck at
+    /// Unknown after several connections).
+    pub has_public_key: bool,
+}
+
 fn default_max_uploads() -> u32 {
     5
 }

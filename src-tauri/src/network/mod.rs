@@ -1013,6 +1013,19 @@ pub enum NetworkCommand {
     GetNetworkStatsSnapshot {
         tx: oneshot::Sender<NetworkStats>,
     },
+    /// Snapshot of the current upload queue (peers waiting for an upload
+    /// slot). Backs the "Queued" tab in the transfers/uploads pane.
+    /// Returns rows with wait time, queue rank, and credit info already
+    /// resolved so the UI doesn't need to invoke any further commands.
+    GetUploadQueueSnapshot {
+        tx: oneshot::Sender<Vec<crate::types::UploadQueueClient>>,
+    },
+    /// Snapshot of every persistent SecIdent credit record. Backs the
+    /// "Known Clients" tab — this is the lifetime view from clients.met,
+    /// independent of which peers are currently connected.
+    GetKnownClientsSnapshot {
+        tx: oneshot::Sender<Vec<crate::types::KnownClient>>,
+    },
     GetKadContactsSnapshot {
         tx: oneshot::Sender<Vec<KadContactInfo>>,
     },
@@ -2089,6 +2102,204 @@ async fn peers_snapshot(state: &NetworkState, db: &Arc<Database>) -> Vec<PeerInf
     peers
 }
 
+/// Map a `IdentState` enum value into the short label the UI displays
+/// in the upload-pane "Queued" / "Known Clients" tabs. Mirrors the
+/// strings eMule itself uses in its "Identification" client-detail
+/// row so existing eMule users immediately recognise them.
+fn ident_state_label(state: ed2k::credits::IdentState) -> &'static str {
+    use ed2k::credits::IdentState;
+    match state {
+        IdentState::Verified => "Verified",
+        IdentState::Failed => "Failed",
+        IdentState::BadGuy => "BadGuy",
+        IdentState::Needed => "Needed",
+        IdentState::Unknown => "Unknown",
+    }
+}
+
+/// Build the on-demand snapshot for the upload-pane "Queued" tab.
+/// Walks the upload queue once with a single read lock on each shared
+/// resource (`upload_queue`, `credit_manager`, `local_index`,
+/// `friend_hashes`) and resolves all per-row data the UI needs:
+///   - file name (via local index)
+///   - lifetime credit ratio + uploaded/downloaded totals
+///   - 1-based queue rank computed via the same scoring rules the
+///     upload server uses for slot allocation, so the rank shown here
+///     matches the rank the peer sees in their own client UI
+///   - geoip country code
+///
+/// Returns rows in the queue's natural insertion order; the UI is free
+/// to re-sort by any column.
+async fn upload_queue_snapshot(
+    queue: &ed2k::upload::UploadQueueRef,
+    credit_manager: &Arc<RwLock<ed2k::credits::CreditManager>>,
+    _transfer_manager: &Arc<RwLock<TransferManager>>,
+    local_index: &Arc<RwLock<LocalIndex>>,
+    friend_hashes: &crate::app_state::SharedFriendHashes,
+    geoip: &crate::geoip::GeoIpReader,
+) -> Vec<crate::types::UploadQueueClient> {
+    // Snapshot the queue under a short-lived lock so we don't hold the
+    // upload server's mutex while we're awaiting other RwLocks (which
+    // could otherwise deadlock against `start_uploading_to_peer`).
+    let queue_snapshot: Vec<ed2k::upload::QueueEntry> = {
+        let q = queue.lock().await;
+        q.clone()
+    };
+    if queue_snapshot.is_empty() {
+        return Vec::new();
+    }
+    let cm = credit_manager.read().await;
+    let idx = local_index.read().await;
+    let friends = friend_hashes.read().await;
+
+    let mut out = Vec::with_capacity(queue_snapshot.len());
+    for entry in &queue_snapshot {
+        let wait_secs = entry.join_time.elapsed().as_secs();
+        let score = ed2k::upload::score_queue_entry(
+            &cm,
+            &idx,
+            &entry.user_hash,
+            entry.file_hash,
+            wait_secs,
+            entry.current_addr,
+            entry.emule_version,
+            entry.is_friend_slot,
+        );
+        let rank = ed2k::upload::compute_queue_rank(
+            &cm,
+            &idx,
+            &queue_snapshot,
+            &entry.identity,
+            score,
+            entry.join_time,
+        );
+        // Treat "no current connection" as no rank — matches eMule's UI
+        // where a queued LowID waiting for callback shows '?' instead of
+        // a number until they reconnect.
+        let queue_rank: Option<u32> = if entry.current_addr.is_some() {
+            Some(rank as u32)
+        } else {
+            None
+        };
+
+        let (peer_ip_str, peer_port, peer_ip_v4) = match entry.current_addr {
+            Some(addr) => {
+                let v4 = match addr.ip() {
+                    std::net::IpAddr::V4(v4) => Some(v4),
+                    std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+                };
+                (addr.ip().to_string(), addr.port(), v4)
+            }
+            None => match &entry.identity {
+                ed2k::upload::QueueIdentity::Ip(ip) => {
+                    let v4 = match ip {
+                        std::net::IpAddr::V4(v4) => Some(*v4),
+                        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+                    };
+                    (ip.to_string(), 0u16, v4)
+                }
+                ed2k::upload::QueueIdentity::UserHash(_) => (String::new(), 0u16, None),
+            },
+        };
+        let peer_ip_u32 = peer_ip_v4
+            .map(|v4| u32::from_be_bytes(v4.octets()))
+            .unwrap_or(0);
+        let credit_ratio = cm.get_score_ratio(&entry.user_hash, peer_ip_u32);
+        let ident_state = ident_state_label(
+            cm.get_current_ident_state(&entry.user_hash, peer_ip_u32),
+        ).to_string();
+        let (uploaded, downloaded) = cm
+            .get_record(&entry.user_hash)
+            .map(|r| (r.uploaded, r.downloaded))
+            .unwrap_or((0, 0));
+
+        let file_hash_hex = hex::encode(entry.file_hash);
+        let file_name = idx
+            .get_by_hash(&file_hash_hex)
+            .map(|f| f.name.clone())
+            .unwrap_or_else(|| String::from("(unknown file)"));
+
+        let country_code = peer_ip_v4
+            .map(|v4| std::net::IpAddr::V4(v4))
+            .and_then(|ip| crate::geoip::lookup_country(geoip, ip));
+
+        let user_hash_hex = if entry.user_hash == [0u8; 16] {
+            String::new()
+        } else {
+            hex::encode(entry.user_hash)
+        };
+        let is_friend = entry.user_hash != [0u8; 16] && friends.contains(&entry.user_hash);
+
+        out.push(crate::types::UploadQueueClient {
+            user_hash: user_hash_hex,
+            peer_ip: peer_ip_str,
+            peer_port,
+            file_hash: file_hash_hex,
+            file_name,
+            wait_seconds: wait_secs,
+            queue_rank,
+            credit_ratio,
+            uploaded,
+            downloaded,
+            ident_state,
+            country_code,
+            is_friend,
+            emule_version: entry.emule_version,
+        });
+    }
+    out
+}
+
+/// Build the on-demand snapshot for the upload-pane "Known Clients"
+/// tab. Reads every persisted SecIdent credit record (eMule's
+/// clients.met) so this tab is the lifetime view of every peer we've
+/// ever traded credit with — independent of which peers happen to be
+/// connected right now.
+async fn known_clients_snapshot(
+    credit_manager: &Arc<RwLock<ed2k::credits::CreditManager>>,
+    geoip: &crate::geoip::GeoIpReader,
+) -> Vec<crate::types::KnownClient> {
+    let cm = credit_manager.read().await;
+    let mut out: Vec<crate::types::KnownClient> = cm
+        .all_records()
+        .iter()
+        .map(|record| {
+            let ident_state = ident_state_label(
+                cm.get_current_ident_state(&record.user_hash, record.ident_ip),
+            ).to_string();
+            let credit_ratio = cm.get_score_ratio(&record.user_hash, record.ident_ip);
+            let last_known_ip = if record.ident_ip != 0 {
+                let octets = record.ident_ip.to_be_bytes();
+                Some(std::net::Ipv4Addr::from(octets).to_string())
+            } else {
+                None
+            };
+            let country_code = if record.ident_ip != 0 {
+                let octets = record.ident_ip.to_be_bytes();
+                let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets));
+                crate::geoip::lookup_country(geoip, ip)
+            } else {
+                None
+            };
+            crate::types::KnownClient {
+                user_hash: hex::encode(record.user_hash),
+                downloaded: record.downloaded,
+                uploaded: record.uploaded,
+                credit_ratio,
+                last_seen: record.last_seen,
+                ident_state,
+                last_known_ip,
+                country_code,
+                has_public_key: !record.public_key.is_empty(),
+            }
+        })
+        .collect();
+    // Stable, useful default order: most-recently-seen first. The UI
+    // can re-sort by any column.
+    out.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+    out
+}
+
 pub async fn start_network(
     app_handle: tauri::AppHandle,
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
@@ -3135,6 +3346,7 @@ pub async fn start_network(
                         &ul_event_tx,
                         ed25519_pubkey,
                         ed25519_secret_key,
+                        &upload_queue_handle,
                     ).await;
                 }
             }
@@ -3244,6 +3456,7 @@ pub async fn start_network(
                             &ul_event_tx,
                             ed25519_pubkey,
                             ed25519_secret_key,
+                            &upload_queue_handle,
                         ).await;
                     }
                 }
@@ -4109,6 +4322,7 @@ pub async fn start_network(
                         &ul_event_tx,
                         ed25519_pubkey,
                         ed25519_secret_key,
+                        &upload_queue_handle,
                     ).await;
                 }
 
@@ -4533,6 +4747,7 @@ pub async fn start_network(
                         &ul_event_tx,
                         ed25519_pubkey,
                         ed25519_secret_key,
+                        &upload_queue_handle,
                     ).await;
                 }
             }
@@ -12877,6 +13092,7 @@ async fn handle_command(
     ul_event_tx: &mpsc::Sender<upload_server::UploadEvent>,
     ed25519_pubkey: [u8; 32],
     ed25519_secret_key: [u8; 32],
+    upload_queue: &ed2k::upload::UploadQueueRef,
 ) {
     match cmd {
         NetworkCommand::SearchFiles { query, method, request_id, tx, search_filters } => {
@@ -13560,6 +13776,23 @@ async fn handle_command(
 
         NetworkCommand::GetNetworkStatsSnapshot { tx } => {
             let _ = tx.send(state.stats.clone());
+        }
+
+        NetworkCommand::GetUploadQueueSnapshot { tx } => {
+            let snap = upload_queue_snapshot(
+                upload_queue,
+                credit_manager,
+                transfer_manager,
+                local_index,
+                friend_hashes,
+                geoip,
+            ).await;
+            let _ = tx.send(snap);
+        }
+
+        NetworkCommand::GetKnownClientsSnapshot { tx } => {
+            let snap = known_clients_snapshot(credit_manager, geoip).await;
+            let _ = tx.send(snap);
         }
 
         NetworkCommand::GetKadContactsSnapshot { tx } => {
@@ -15582,9 +15815,20 @@ async fn handle_upload_event(
         UploadEventKind::ShareInterest { .. } => {}
         UploadEventKind::Completed => {
             stats_manager.record_completed_upload();
+            // Match eMule's "session ends → row vanishes" UX. We still
+            // call `mgr.complete()` so the queued-promotion logic fires
+            // and stats are accurate, but we then immediately drop the
+            // transfer from `mgr.completed` so a subsequent `get_all()`
+            // poll doesn't resurrect the row in the upload pane after
+            // the frontend has already removed it on `transfer-complete`.
+            // Cumulative byte totals live in `StatsManager`, not in the
+            // per-session `Transfer`, so dropping the row loses no
+            // historical data.
             let promoted = match {
                 let mut mgr = transfer_manager.write().await;
-                mgr.complete(&event.transfer_id)
+                let promoted = mgr.complete(&event.transfer_id);
+                mgr.completed.retain(|t| t.id != event.transfer_id);
+                promoted
             } {
                 Some(promoted) => promoted,
                 None => return,
@@ -15599,9 +15843,18 @@ async fn handle_upload_event(
             );
         }
         UploadEventKind::Failed { error } => {
+            // Same removal rationale as `Completed` above. The previous
+            // 5s sleep before `completed.retain(..)` was meant to let
+            // the failure surface in the UI for a moment, but with the
+            // frontend now actively dropping upload rows on the
+            // `transfer-failed` event (matching eMule), keeping the
+            // backend record around for 5s only created a window where
+            // a poll could re-add the failed row to the store.
             let promoted = match {
                 let mut mgr = transfer_manager.write().await;
-                mgr.fail(&event.transfer_id, &error, None, None)
+                let promoted = mgr.fail(&event.transfer_id, &error, None, None);
+                mgr.completed.retain(|t| t.id != event.transfer_id);
+                promoted
             } {
                 Some(promoted) => promoted,
                 None => return,
@@ -15614,13 +15867,6 @@ async fn handle_upload_event(
                 "transfer-failed",
                 serde_json::json!({ "id": event.transfer_id, "error": error, "direction": "upload" }),
             );
-            let tm = Arc::clone(transfer_manager);
-            let tid = event.transfer_id.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let mut mgr = tm.write().await;
-                mgr.completed.retain(|t| t.id != tid);
-            });
         }
         UploadEventKind::EmberSources { .. }
         | UploadEventKind::EmberPeerDiscovered { .. }
