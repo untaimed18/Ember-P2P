@@ -2905,6 +2905,13 @@ pub async fn start_network(
         cm.load_or_create_keypair(&data_dir);
         if let Ok(records) = db.load_credits() {
             for (hash, uploaded, downloaded, last_seen, public_key) in records {
+                // `get_or_create` bumps `last_seen` to "now" — the right
+                // behaviour for live mutations but wrong on a startup
+                // load. The explicit `record.last_seen = last_seen`
+                // overwrite below restores the persisted timestamp
+                // before the cleanup below so the 90-day prune sees the
+                // real ages. Don't reorder these lines without also
+                // splitting the helper.
                 let record = cm.get_or_create(hash);
                 record.uploaded = uploaded;
                 record.downloaded = downloaded;
@@ -2919,6 +2926,23 @@ pub async fn start_network(
                 Ok(n) => info!("Loaded {n} credit records from clients.met"),
                 Err(e) => debug!("Could not load clients.met: {e}"),
             }
+        }
+        // Prune anything older than the 90-day cutoff right now instead
+        // of waiting for the first `credit_save_timer` tick (60 s in).
+        // Without this, the Known Clients tab would render with stale
+        // rows for the first minute of every session — annoying when
+        // the user just wants to see their current peer ledger. The
+        // periodic prune at `credit_save_timer` still runs, but this
+        // makes the steady state correct from second one.
+        let pruned_before = cm.all_records().len();
+        cm.cleanup_stale(90);
+        let pruned_after = cm.all_records().len();
+        if pruned_before != pruned_after {
+            info!(
+                "Pruned {} stale credit record(s) on startup (now {})",
+                pruned_before - pruned_after,
+                pruned_after
+            );
         }
         Arc::new(RwLock::new(cm))
     };
