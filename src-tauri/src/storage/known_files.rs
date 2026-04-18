@@ -310,6 +310,49 @@ impl KnownFileList {
         self.files.get(hash)
     }
 
+    pub fn find_by_hash_mut(&mut self, hash: &[u8; 16]) -> Option<&mut KnownFileRecord> {
+        self.files.get_mut(hash)
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Decide whether the on-disk known-file record matches what we just
+    /// discovered for this file, or whether we need to refresh the
+    /// record. Returns `true` if any of `file_path`, `modified_at`,
+    /// `file_size`, `file_name`, or `aich_hash` (when the discovery
+    /// supplies one) has drifted from the stored value.
+    ///
+    /// Used by the `SharedFilesChanged` handler to break the
+    /// "permanent rehash loop" that fires whenever any external
+    /// process (Defender, indexing, cloud sync, copy-with-mtime-
+    /// preserved) touches a shared file's metadata: the next
+    /// discovery's `find_by_path_and_meta` rejects the stale `mtime`,
+    /// the rehash produces an identical hash, and without a refresh
+    /// here the record's `modified_at` would stay stale forever and
+    /// every subsequent reload would rehash the same files again.
+    pub fn record_needs_refresh(
+        &self,
+        hash: &[u8; 16],
+        discovered_path: &str,
+        discovered_size: u64,
+        discovered_mtime: i64,
+        discovered_name: &str,
+        discovered_aich: &str,
+    ) -> bool {
+        match self.files.get(hash) {
+            None => true,
+            Some(record) => {
+                record.file_path != discovered_path
+                    || record.modified_at != discovered_mtime
+                    || record.file_size != discovered_size
+                    || record.file_name != discovered_name
+                    || (!discovered_aich.is_empty() && record.aich_hash != discovered_aich)
+            }
+        }
+    }
+
     pub fn add_or_update(&mut self, record: KnownFileRecord) {
         let hash = record.file_hash;
         let new_path = record.file_path.clone();
@@ -597,4 +640,128 @@ fn write_u64_tag(buf: &mut Vec<u8>, name_id: u8, value: u64) -> anyhow::Result<(
     buf.push(name_id);
     buf.write_u64::<LittleEndian>(value)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_record() -> KnownFileRecord {
+        KnownFileRecord {
+            file_hash: [0x42; 16],
+            part_hashes: Vec::new(),
+            file_name: "movie.mkv".to_string(),
+            file_size: 1024 * 1024,
+            file_path: "C:/Library/movie.mkv".to_string(),
+            aich_hash: "aichaichaichaichaichaichaichaichaichaich".to_string(),
+            modified_at: 1_700_000_000,
+            all_time_transferred: 0,
+            all_time_requested: 0,
+            all_time_accepted: 0,
+            upload_priority: 0,
+            last_publish_src: 0,
+            last_shared: 0,
+        }
+    }
+
+    #[test]
+    fn record_needs_refresh_returns_true_when_hash_unknown() {
+        let kf = KnownFileList::new();
+        assert!(kf.record_needs_refresh(
+            &[0; 16],
+            "C:/Library/movie.mkv",
+            1024 * 1024,
+            1_700_000_000,
+            "movie.mkv",
+            "",
+        ));
+    }
+
+    #[test]
+    fn record_needs_refresh_returns_false_when_everything_matches() {
+        let mut kf = KnownFileList::new();
+        let r = sample_record();
+        let hash = r.file_hash;
+        let path = r.file_path.clone();
+        let aich = r.aich_hash.clone();
+        kf.add_or_update(r);
+        assert!(!kf.record_needs_refresh(
+            &hash,
+            &path,
+            1024 * 1024,
+            1_700_000_000,
+            "movie.mkv",
+            &aich,
+        ));
+    }
+
+    /// Regression for the "permanent rehash loop" described above:
+    /// when `mtime` drifts (the typical case — Defender / indexing /
+    /// cloud sync touches the file), the helper must report a refresh
+    /// is needed so the SharedFilesChanged handler updates the record.
+    /// Before the helper existed, the handler skipped the update on
+    /// hash-match and the file would re-hash on every reload forever.
+    #[test]
+    fn record_needs_refresh_on_mtime_drift() {
+        let mut kf = KnownFileList::new();
+        let r = sample_record();
+        let hash = r.file_hash;
+        let path = r.file_path.clone();
+        let aich = r.aich_hash.clone();
+        kf.add_or_update(r);
+        assert!(
+            kf.record_needs_refresh(
+                &hash,
+                &path,
+                1024 * 1024,
+                1_700_000_500, // <-- drifted
+                "movie.mkv",
+                &aich,
+            ),
+            "mtime drift must trigger a refresh — otherwise the next \
+             discovery's find_by_path_and_meta will reject the stale \
+             mtime, the rehash will produce an identical hash, and the \
+             record will stay stale indefinitely (permanent rehash loop)",
+        );
+    }
+
+    #[test]
+    fn record_needs_refresh_on_path_change() {
+        let mut kf = KnownFileList::new();
+        let r = sample_record();
+        let hash = r.file_hash;
+        let aich = r.aich_hash.clone();
+        kf.add_or_update(r);
+        // Same hash, different path — file was moved/renamed.
+        assert!(kf.record_needs_refresh(
+            &hash,
+            "C:/Library/Subfolder/movie.mkv",
+            1024 * 1024,
+            1_700_000_000,
+            "movie.mkv",
+            &aich,
+        ));
+    }
+
+    #[test]
+    fn record_needs_refresh_ignores_empty_aich_in_discovery() {
+        // If discovery doesn't supply an AICH (e.g. the file hasn't
+        // been AICH-hashed yet on this pass), don't flag a refresh
+        // just because the stored record has one. Otherwise we'd
+        // wipe a known AICH every time the watcher fires before AICH
+        // has caught up.
+        let mut kf = KnownFileList::new();
+        let r = sample_record();
+        let hash = r.file_hash;
+        let path = r.file_path.clone();
+        kf.add_or_update(r);
+        assert!(!kf.record_needs_refresh(
+            &hash,
+            &path,
+            1024 * 1024,
+            1_700_000_000,
+            "movie.mkv",
+            "", // <-- discovery hasn't computed AICH yet
+        ));
+    }
 }
