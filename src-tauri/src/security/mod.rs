@@ -359,8 +359,21 @@ pub fn atomic_write(final_path: &Path, data: &[u8], restrict: bool) -> std::io::
             .create(true)
             .truncate(true)
             .open(&tmp)?;
-        f.write_all(data)?;
-        let _ = f.sync_all();
+        if let Err(e) = f.write_all(data) {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        // Propagate `sync_all` failures rather than swallowing them. The
+        // previous `let _ = f.sync_all()` could leave the OS-level file
+        // page-cache holding bytes that aren't durable, then the rename
+        // below would publish a half-flushed file. On a power loss the
+        // user would see truncated/empty `known.met`, `clients.met`, etc.
+        if let Err(e) = f.sync_all() {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         drop(f);
         if restrict {
             restrict_file_permissions(&tmp);
