@@ -1420,6 +1420,16 @@ async fn download_parts_from_source(
     let mut pending_credit_bytes: u64 = 0;
     let mut early_upload_accept = false;
     let mut pending_secident_challenge: Option<u32> = None;
+    // Parks an incoming OP_SECIDENTSTATE when the peer's RSA public key
+    // hasn't arrived yet. Our signature response is over
+    // `peer_pub_key || challenge` (eMule `CreateSignature`), which we
+    // cannot construct without that key. Once the peer's OP_PUBLICKEY
+    // shows up, the handler below replays the parked `(challenge, state)`
+    // through `respond_to_secident_challenge`. Matches the deferred-sign
+    // path in BaseClient.cpp:1907+ and is what lets the chicken-and-egg
+    // "neither side has the other's key yet" case complete without
+    // deadlock.
+    let mut pending_peer_challenge: Option<(u32, u8)> = None;
     let mut epx_packets_received: u8 = 0;
 
     let is_sx_rejected = |ip: &Ipv4Addr, port: u16| -> bool {
@@ -1677,6 +1687,31 @@ async fn download_parts_from_source(
         }
     }
 
+    // Proactive SecIdent kick-off for paths that didn't already fire one.
+    // Covers the modern-eMule fast path where the peer's HelloAnswer
+    // carries CT_EMULE_VERSION — they treat `m_byInfopacketsReceived ==
+    // IP_BOTH` as soon as Hello is processed (BaseClient.cpp:659-664)
+    // and send OP_SECIDENTSTATE directly, so our first post-Hello
+    // read arrives on a non-EmuleInfo opcode and we take the
+    // `deferred_packet = Some(..)` branch above without challenging.
+    // Without this call the peer sits waiting for our OP_SECIDENTSTATE
+    // (it only ships OP_PUBLICKEY in response to ours, per
+    // ListenSocket.cpp:1138), our deferred incoming SECIDENTSTATE
+    // never gets replayed, and both sides settle at IS_NOTAVAILABLE —
+    // downloads keep working but no credit-verified identity is ever
+    // established for this peer. `maybe_send_secident_challenge` is a
+    // no-op when the peer didn't advertise SecIdent or we have no
+    // local keypair.
+    if pending_secident_challenge.is_none() {
+        pending_secident_challenge = super::transfer::maybe_send_secident_challenge(
+            &mut *writer,
+            credit_mgr.as_ref(),
+            peer_user_hash,
+            addr,
+            peer_secure_ident_level,
+        ).await?;
+    }
+
     // Handle pre-file-control packets which may arrive before file requests.
     for _ in 0..3 {
         let (proto, opcode, payload) = if let Some(pkt) = deferred_packet.take() {
@@ -1695,17 +1730,47 @@ async fn download_parts_from_source(
 
         match (proto, opcode) {
             (OP_EMULEPROT, OP_SECIDENTSTATE) if payload.len() >= 5 => {
-                super::transfer::respond_to_secident_challenge(
-                    &mut *writer,
-                    credit_mgr.as_ref(),
-                    payload[0],
-                    u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]),
-                    addr,
-                    peer_user_hash,
-                    peer_secure_ident_level,
-                    our_client_id,
-                ).await?;
-                debug!("Responded to SecIdent challenge from source {}", _src_idx);
+                let state = payload[0];
+                let challenge =
+                    u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                // When the peer's state is IS_KEYANDSIGNEEDED (2) we have to
+                // sign a message that includes THEIR public key, which only
+                // arrives on OP_PUBLICKEY. If we haven't received their key
+                // yet, park the challenge and replay from the OP_PUBLICKEY
+                // handler below. Otherwise respond immediately. Without
+                // this, `respond_to_secident_challenge` silently drops the
+                // OP_SIGNATURE (sig len = 0) when `record.public_key` is
+                // empty, the peer never gets our signature, and the
+                // handshake never completes.
+                let missing_peer_key = if state >= 2 {
+                    if let Some(cm) = &credit_mgr {
+                        let cm = cm.read().await;
+                        !cm.has_public_key(&peer_user_hash)
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                };
+                if missing_peer_key {
+                    pending_peer_challenge = Some((challenge, state));
+                    debug!(
+                        "Deferred SecIdent challenge from source {} — awaiting their public key",
+                        _src_idx
+                    );
+                } else {
+                    super::transfer::respond_to_secident_challenge(
+                        &mut *writer,
+                        credit_mgr.as_ref(),
+                        state,
+                        challenge,
+                        addr,
+                        peer_user_hash,
+                        peer_secure_ident_level,
+                        our_client_id,
+                    ).await?;
+                    debug!("Responded to SecIdent challenge from source {}", _src_idx);
+                }
             }
             (OP_EMULEPROT, OP_PUBLICKEY) if payload.len() >= 2 => {
                 let key_len = payload[0] as usize;
@@ -1713,6 +1778,25 @@ async fn download_parts_from_source(
                     if let Some(cm) = &credit_mgr {
                         let mut cm = cm.write().await;
                         cm.set_public_key(peer_user_hash, payload[1..1 + key_len].to_vec());
+                    }
+                    // Replay a challenge we parked earlier because we
+                    // didn't yet have the peer's key — now we can sign
+                    // it and the peer finally gets our OP_SIGNATURE.
+                    if let Some((challenge, state)) = pending_peer_challenge.take() {
+                        super::transfer::respond_to_secident_challenge(
+                            &mut *writer,
+                            credit_mgr.as_ref(),
+                            state,
+                            challenge,
+                            addr,
+                            peer_user_hash,
+                            peer_secure_ident_level,
+                            our_client_id,
+                        ).await?;
+                        debug!(
+                            "Replayed deferred SecIdent response to source {} after receiving their public key",
+                            _src_idx
+                        );
                     }
                     if pending_secident_challenge.is_none() {
                         pending_secident_challenge = super::transfer::maybe_send_secident_challenge(
@@ -2019,6 +2103,25 @@ async fn download_parts_from_source(
                 let mut cm = cm.write().await;
                 cm.set_public_key(peer_user_hash, key);
             }
+            // Replay any parked challenge now that we have the peer's key
+            // (same deferred-sign path as the pre-file-control handler
+            // above — see that block's comment for the full rationale).
+            if let Some((challenge, state)) = pending_peer_challenge.take() {
+                super::transfer::respond_to_secident_challenge(
+                    &mut *writer,
+                    credit_mgr.as_ref(),
+                    state,
+                    challenge,
+                    addr,
+                    peer_user_hash,
+                    peer_secure_ident_level,
+                    our_client_id,
+                ).await?;
+                debug!(
+                    "Replayed deferred SecIdent response to source {} during file-status wait",
+                    _src_idx
+                );
+            }
             if pending_secident_challenge.is_none() {
                 pending_secident_challenge = super::transfer::maybe_send_secident_challenge(
                     &mut *writer,
@@ -2031,16 +2134,32 @@ async fn download_parts_from_source(
             continue;
         }
         if proto == OP_EMULEPROT && opcode == OP_SECIDENTSTATE && _payload.len() >= 5 {
-            super::transfer::respond_to_secident_challenge(
-                &mut *writer,
-                credit_mgr.as_ref(),
-                _payload[0],
-                u32::from_le_bytes([_payload[1], _payload[2], _payload[3], _payload[4]]),
-                addr,
-                peer_user_hash,
-                peer_secure_ident_level,
-                our_client_id,
-            ).await?;
+            let state = _payload[0];
+            let challenge = u32::from_le_bytes([_payload[1], _payload[2], _payload[3], _payload[4]]);
+            let missing_peer_key = if state >= 2 {
+                if let Some(cm) = &credit_mgr {
+                    let cm = cm.read().await;
+                    !cm.has_public_key(&peer_user_hash)
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+            if missing_peer_key {
+                pending_peer_challenge = Some((challenge, state));
+            } else {
+                super::transfer::respond_to_secident_challenge(
+                    &mut *writer,
+                    credit_mgr.as_ref(),
+                    state,
+                    challenge,
+                    addr,
+                    peer_user_hash,
+                    peer_secure_ident_level,
+                    our_client_id,
+                ).await?;
+            }
             continue;
         }
         if proto == OP_EMULEPROT && opcode == OP_SIGNATURE && _payload.len() >= 2 {
