@@ -11217,9 +11217,16 @@ async fn handle_udp_packet(
                     }
                 }
             } else {
+                // Demoted from warn: a packet with a valid KAD header byte
+                // (0xE4/0xE5) that we can't parse and can't decrypt as
+                // obfuscated KAD is almost always a remote peer running an
+                // exotic mod or sending malformed bytes — nothing we can act
+                // on, and a single misbehaving peer can spam this for the
+                // entire session. Match the non-KAD-header branch below and
+                // log at debug only.
                 let header = data.first().copied().unwrap_or(0);
                 if header == 0xE4 || header == 0xE5 {
-                    warn!("Failed to decode KAD packet from {from} ({} bytes): {_first_err}", data.len());
+                    debug!("Failed to decode KAD packet from {from} ({} bytes): {_first_err}", data.len());
                 } else {
                     debug!("Unreadable packet from {from} ({} bytes, header 0x{header:02X})", data.len());
                 }
