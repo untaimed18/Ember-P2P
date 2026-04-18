@@ -45,6 +45,19 @@ export function formatDate(ts: number): string {
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
+/** Format a unix timestamp for long-lived ledger views (e.g. the Known
+ *  Clients tab) where rows can persist for months. Always includes the
+ *  year so users can immediately tell a stale row from a fresh one —
+ *  the year-less variant above hides exactly the information you need
+ *  when triaging a months-old row. Drops the time portion entirely:
+ *  for ledger rows the date alone is what matters, and the time would
+ *  just push the column wider for no real signal. */
+export function formatDateWithYear(ts: number): string {
+  if (!ts || ts <= 0) return '\u2014';
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
 /**
  * Format milliseconds as HH:MM (eMule CastSecondsToHM style).
  * Returns "\u2014" for zero or invalid values.

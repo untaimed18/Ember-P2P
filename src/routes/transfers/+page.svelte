@@ -14,7 +14,7 @@
   import { previewFile } from '$lib/api/preview';
   import { addFriend } from '$lib/api/friends';
   import { banPeer } from '$lib/api/kad';
-  import { formatSize, formatSpeed, formatDate, formatDuration, formatRemaining } from '$lib/utils';
+  import { formatSize, formatSpeed, formatDate, formatDateWithYear, formatDuration, formatRemaining } from '$lib/utils';
   import { onMount, onDestroy } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import type { UnlistenFn } from '@tauri-apps/api/event';
@@ -2526,7 +2526,17 @@
                   {:else if column.key === 'ident_state'}
                     <td class="status-cell"><span class="status-label ident-{kc.ident_state.toLowerCase()}" title={!kc.has_public_key ? 'No public key cached' : ''}>{kc.ident_state}</span></td>
                   {:else if column.key === 'last_seen'}
-                    <td class="date-cell">{kc.last_seen > 0 ? formatDate(kc.last_seen * 1000) : '\u2014'}</td>
+                    <!-- Use `formatDateWithYear` (not the year-omitting
+                         `formatDate`) because Known Clients rows can be
+                         months or years old, and the previous label
+                         hid exactly the information needed to spot a
+                         stale row. The earlier `kc.last_seen * 1000`
+                         double-multiply through `formatDate` landed
+                         every row in year ~56,000 with the year hidden,
+                         producing convincing-looking "current year"
+                         labels for records that had genuinely been
+                         pruned-eligible for ages. -->
+                    <td class="date-cell">{kc.last_seen > 0 ? formatDateWithYear(kc.last_seen) : '\u2014'}</td>
                   {/if}
                 {/each}
               </tr>
