@@ -2,11 +2,13 @@
   import { getSettings, updateSettings, downloadNodesDat, downloadIpfilter } from '$lib/api/settings';
   import { getSpamStats, resetSpamFilter, clearDownloadHistory } from '$lib/api/search';
   import { invoke } from '@tauri-apps/api/core';
+  import { relaunch } from '@tauri-apps/plugin-process';
   import type { AppSettings, SpamStats } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import { theme, applyTheme, type Theme } from '$lib/stores/theme';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import SpeedInput from '$lib/components/SpeedInput.svelte';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
 
   let settings: AppSettings | null = $state(null);
   let pageContentEl: HTMLDivElement | null = $state(null);
@@ -18,6 +20,17 @@
   let downloadingNodes = $state(false);
   let nodesResult: string | null = $state(null);
   let nodesError: string | null = $state(null);
+
+  // Restart-prompt state. Populated by `handleSave` when a save changes
+  // either the TCP or UDP port — those are the two settings that the
+  // network stack only reads once at startup (the upload listener binds
+  // them in `start_upload_server` before any settings hot-reload path
+  // can touch them), so a port change has no effect until the process
+  // is restarted. Using the same `relaunch` flow as `SetupWizard.svelte`
+  // so the experience is identical to first-time setup.
+  let showRestartPrompt = $state(false);
+  let restarting = $state(false);
+  let pendingRestartReason = $state('');
 
   let historyClearMsg: string | null = $state(null);
 
@@ -167,6 +180,21 @@
       showSaveMsg(validationError, true, 5000);
       return;
     }
+    // Snapshot the previous port values BEFORE we overwrite
+    // `originalSettings` below — that's the only post-save signal we have
+    // for whether the user actually changed a port (vs. just touched the
+    // input and reverted, or saved unrelated fields).
+    let previousTcpPort: number | undefined;
+    let previousUdpPort: number | undefined;
+    try {
+      const prev = JSON.parse(originalSettings) as AppSettings;
+      previousTcpPort = prev.tcp_port;
+      previousUdpPort = prev.udp_port;
+    } catch {
+      // originalSettings was empty/corrupt — treat as "no previous value
+      // to compare", which means we won't prompt for restart on the very
+      // first save after load.
+    }
     saving = true;
     saveMessage = null;
     const snapshot = JSON.stringify(settings);
@@ -175,12 +203,64 @@
       originalSettings = snapshot;
       const isWarn = result.toLowerCase().includes('restart');
       showSaveMsg(result, isWarn, isWarn ? 8000 : 3000);
+
+      // Compare the snapshot we took above against the saved settings.
+      // The TCP/UDP ports drive `start_upload_server` (TCP listen socket)
+      // and the KAD/server UDP socket; both are bound exactly once during
+      // app startup, so a hot save here updates the persisted value but
+      // not the running listener. Prompt the user to restart.
+      const tcpChanged =
+        previousTcpPort !== undefined && previousTcpPort !== settings.tcp_port;
+      const udpChanged =
+        previousUdpPort !== undefined && previousUdpPort !== settings.udp_port;
+      if (tcpChanged || udpChanged) {
+        const parts: string[] = [];
+        if (tcpChanged) parts.push(`TCP port (${previousTcpPort} → ${settings.tcp_port})`);
+        if (udpChanged) parts.push(`UDP port (${previousUdpPort} → ${settings.udp_port})`);
+        pendingRestartReason = parts.join(' and ');
+        showRestartPrompt = true;
+      }
     } catch (e) {
       console.error('Failed to save:', e);
       showSaveMsg(e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to save settings', true, 5000);
     } finally {
       saving = false;
     }
+  }
+
+  /// Triggered from the restart confirmation modal. Mirrors SetupWizard's
+  /// final-step behaviour: show a full-screen "Restarting Ember" overlay
+  /// for ~600ms (so the user sees acknowledgement, not just an instant
+  /// window disappearance), then call Tauri's `relaunch()` which kills
+  /// the current process and spawns a fresh one. If `relaunch` fails for
+  /// any reason (rare — usually only when the user lacks permission to
+  /// re-spawn) we surface the error and let them save again or restart
+  /// manually.
+  async function performRestart() {
+    showRestartPrompt = false;
+    restarting = true;
+    try {
+      // Brief delay so the overlay has time to paint before the process
+      // dies — purely cosmetic, matches the wizard.
+      await new Promise(r => setTimeout(r, 600));
+      await relaunch();
+    } catch (e) {
+      restarting = false;
+      showSaveMsg(
+        `Restart failed: ${e instanceof Error ? e.message : String(e)}. Please close and reopen Ember manually for the new ports to take effect.`,
+        true,
+        10000,
+      );
+    }
+  }
+
+  function dismissRestartPrompt() {
+    showRestartPrompt = false;
+    showSaveMsg(
+      'Settings saved. The new port(s) will take effect the next time you launch Ember.',
+      true,
+      6000,
+    );
   }
 
   function resetChanges() {
@@ -940,6 +1020,38 @@
   {/if}
 </div>
 
+<!--
+  Restart confirmation prompt — fires after `handleSave` notices the
+  user changed `tcp_port` or `udp_port`. Both ports are bound only at
+  process startup, so a hot save persists the value but the active
+  listener keeps using the old port until restart. Same UX as the
+  setup wizard's "Launch Ember" relaunch step.
+-->
+<ConfirmDialog
+  bind:open={showRestartPrompt}
+  title="Restart Ember to apply port change?"
+  message={`You changed your ${pendingRestartReason}. Ember binds the listening sockets when the app starts, so the new port(s) won't take effect until the app is restarted. Restart now?`}
+  confirmLabel="Restart now"
+  cancelLabel="Later"
+  onconfirm={performRestart}
+  oncancel={dismissRestartPrompt}
+/>
+
+<!--
+  Full-screen "Restarting Ember" overlay shown while `relaunch()` is in
+  flight. Identical layout/copy to SetupWizard's relaunch overlay so
+  the visual transition feels the same in both places.
+-->
+{#if restarting}
+  <div class="restart-overlay" role="status" aria-label="Restarting Ember">
+    <div class="restart-card">
+      <div class="restart-spinner"></div>
+      <h2 class="restart-title">Restarting Ember</h2>
+      <p class="restart-sub">Applying your new port settings…</p>
+    </div>
+  </div>
+{/if}
+
 <style>
   /* ── Sticky header ─────────────────────────────── */
   .sticky-header {
@@ -1573,5 +1685,45 @@
       padding: 7px 10px;
       font-size: 12px;
     }
+  }
+
+  /* Restart overlay (matches SetupWizard's relaunch screen) */
+  .restart-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 99999;
+    display: grid;
+    place-items: center;
+    background: var(--bg-primary);
+    padding: 20px;
+  }
+
+  .restart-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .restart-spinner {
+    width: 40px;
+    height: 40px;
+    border: 4px solid rgba(255, 255, 255, 0.15);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+
+  .restart-title {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--accent);
+    margin: 0;
+  }
+
+  .restart-sub {
+    font-size: 14px;
+    color: var(--text-muted);
+    margin: 0;
   }
 </style>

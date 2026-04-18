@@ -34,7 +34,7 @@ pub async fn connect_and_send_friend_request(
     )
     .await
     .map_err(|_| anyhow::anyhow!("TCP connect timeout"))??;
-    let _ = stream.set_nodelay(true);
+    super::multi_source::tune_peer_stream(&stream);
 
     let (raw_r, raw_w) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(raw_r);
@@ -174,7 +174,7 @@ pub async fn open_and_run_friend_session(
     )
     .await
     .map_err(|_| anyhow::anyhow!("TCP connect timeout"))??;
-    let _ = stream.set_nodelay(true);
+    super::multi_source::tune_peer_stream(&stream);
 
     let (raw_r, raw_w) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(raw_r);

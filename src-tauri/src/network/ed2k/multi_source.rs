@@ -35,6 +35,33 @@ const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
 const MAX_CONCURRENT_SOURCES: usize = 10;
 const SOURCE_INJECTION_WAIT_SECS: u64 = 10;
 
+/// Target kernel TCP receive buffer for outbound peer sockets.
+///
+/// Windows' TCP auto-tuning ramps the receive window in stages and starts
+/// from ~64 KiB, which is tight for high-bandwidth ED2K peers (at 10 MB/s
+/// on a LAN-ish RTT a 64 KiB window caps us near 6 MB/s regardless of
+/// what the peer is willing to ship). Pre-sizing to 1 MiB removes that
+/// slow-ramp window without harming anything at low speeds — the kernel
+/// only uses as much as the sender is actually filling, and `SockRef`'s
+/// `set_recv_buffer_size` is advisory (the OS is free to clamp lower, it
+/// just won't clamp higher-than-default). Mirrors the 256 KiB SO_SNDBUF
+/// cap we apply to accepted upload sockets in `upload.rs`.
+const PEER_RECV_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Apply the standard low-latency + high-throughput socket tuning to a
+/// freshly-connected outbound peer TCP stream: disable Nagle's algorithm
+/// (OP_SENDINGPART packets are bursty, we don't want 40 ms per-batch
+/// coalescing) and pre-size the receive buffer so the TCP window can grow
+/// past Windows' stingy initial 64 KiB. Both are best-effort — `let _ =`
+/// — because a failure here is never worth aborting a peer connection
+/// over, and both are compatible with every ED2K peer we've ever seen
+/// (they're strictly local socket-level knobs, invisible on the wire).
+pub(crate) fn tune_peer_stream(stream: &tokio::net::TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let sref = socket2::SockRef::from(stream);
+    let _ = sref.set_recv_buffer_size(PEER_RECV_BUFFER_BYTES);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InjectionWaitAction {
     Continue,
@@ -1495,7 +1522,7 @@ async fn download_parts_from_source(
     )
     .await
     {
-        Ok(Ok(s)) => { let _ = s.set_nodelay(true); s },
+        Ok(Ok(s)) => { tune_peer_stream(&s); s },
         Ok(Err(e)) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout {e}")),
         Err(_) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout timeout")),
     };
@@ -1545,7 +1572,7 @@ async fn download_parts_from_source(
                 )
                 .await
                 {
-                    Ok(Ok(s)) => { let _ = s.set_nodelay(true); s },
+                    Ok(Ok(s)) => { tune_peer_stream(&s); s },
                     Ok(Err(err)) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout {err}")),
                     Err(_) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout timeout")),
                 };
@@ -3640,6 +3667,20 @@ fn outstanding_requests_for_speed_ms(
     use super::messages::PARTSIZE;
     // eMule block counts per speed tier (DownloadClient.cpp:804-810),
     // extended with higher tiers for modern broadband connections.
+    //
+    // Cold-start treatment: the measurement window updates every 2 seconds
+    // (see `speed_start.elapsed().as_millis() >= 2000` in the download
+    // loop), so at `speed == 0` we'd otherwise sit at the lowest-tier
+    // pipeline depth for the entire first window. On a high-bandwidth
+    // peer that's a multi-second underutilisation: at 10 MB/s, 1 packet
+    // (540 KiB of blocks) fills ~50 ms, after which the peer's upload
+    // pipeline stalls waiting for our refill. Treat the unknown-speed
+    // case as if we were already in the mid 75 KiB/s tier — 6 blocks
+    // outstanding, which rounds to 2 OP_REQUESTPARTS packets. Still
+    // compatible with stock eMule: `AddReqBlock` (UploadClient.cpp:320+)
+    // has no hard queue cap, and their `StartCreateNextBlockPackage`
+    // BIGBUFFER limit of 900 KiB naturally absorbs up to 5 blocks before
+    // back-pressuring disk reads.
     let mut blocks = if remaining_parts <= 4 {
         if speed < 600 {
             1
@@ -3656,6 +3697,8 @@ fn outstanding_requests_for_speed_ms(
         } else {
             9
         }
+    } else if speed == 0 {
+        6
     } else if speed < 4 * 1024 {
         1
     } else if speed < 9 * 1024 {
@@ -3858,6 +3901,39 @@ mod tests {
         assert_eq!(
             injection_wait_action(true, true, true, true),
             InjectionWaitAction::Break,
+        );
+    }
+
+    /// Cold-start (speed == 0) must issue at least 2 concurrent
+    /// OP_REQUESTPARTS packets when there's enough gap material in the
+    /// file to fill them. Regressing this to 1 would recreate the
+    /// multi-second cold-pipe-stall on high-bandwidth peers.
+    #[test]
+    fn outstanding_requests_cold_start_uses_mid_tier_pipeline() {
+        // Normal file: plenty of remaining parts, plenty of gap bytes.
+        let packets = outstanding_requests_for_speed_ms(
+            0,
+            100,                         // remaining_parts > 4
+            1024 * 1024 * 1024,          // plenty of gap to pull from
+        );
+        assert!(
+            packets >= 2,
+            "cold-start packet count should be at least 2, got {packets}",
+        );
+    }
+
+    /// ...but small-file / endgame cases (remaining_parts <= 4) must stay
+    /// conservative — the inner clamp at the bottom of the function
+    /// caps to 3 packets when remaining_parts <= 2, and to 6 when
+    /// <= 4, so the unknown-speed branch shouldn't leak the larger
+    /// `blocks = 6` default in there and start over-requesting the tail
+    /// of a small file.
+    #[test]
+    fn outstanding_requests_cold_start_respects_small_file_clamp() {
+        let packets = outstanding_requests_for_speed_ms(0, 2, 1024);
+        assert_eq!(
+            packets, 1,
+            "endgame with tiny gap should stay at a single outstanding request, got {packets}",
         );
     }
 }
