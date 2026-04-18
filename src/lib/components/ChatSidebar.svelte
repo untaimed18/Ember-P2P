@@ -26,8 +26,11 @@
   let loading = $state(false);
   let sending = $state(false);
   let sendError: string | null = $state(null);
+  // Surfaced when `loadMessages` fails so users know the empty list
+  // isn't actually empty — previously failures became a silent zero.
+  let loadError: string | null = $state(null);
   let messagesEnd: HTMLDivElement | undefined = $state();
-  let chatInputEl: HTMLInputElement | undefined = $state();
+  let chatInputEl: HTMLTextAreaElement | undefined = $state();
   let panelEl: HTMLDivElement | undefined = $state();
   let unlisten: UnlistenFn | null = null;
   let loadGen = 0;
@@ -156,17 +159,27 @@
 
   async function loadMessages(gen: number) {
     loading = true;
+    loadError = null;
     try {
       const rows = await getChatMessages(friendHash, 100);
       if (gen !== loadGen) return;
       messages = rows.reverse();
       scrollToBottom();
-    } catch {
+    } catch (e: unknown) {
       if (gen !== loadGen) return;
       messages = [];
+      loadError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to load messages';
     } finally {
       if (gen === loadGen) loading = false;
     }
+  }
+
+  async function retryLoad() {
+    if (!friendHash) return;
+    const gen = ++loadGen;
+    await loadMessages(gen);
+    if (gen !== loadGen) return;
+    setupListener(gen);
   }
 
   async function markAsRead() {
@@ -195,12 +208,12 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    // Enter sends; Shift+Enter inserts a newline. The textarea handles
+    // the newline natively when we don't preventDefault. Escape is
+    // handled by the panel-level `onPanelKeydown` (it bubbles up).
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
-    }
-    if (e.key === 'Escape') {
-      onclose();
     }
   }
 
@@ -255,6 +268,11 @@
     <div class="chat-messages">
       {#if loading}
         <div class="chat-loading">Loading messages...</div>
+      {:else if loadError}
+        <div class="chat-load-error" role="alert">
+          <span>Couldn't load messages — {loadError}</span>
+          <button class="chat-load-retry" onclick={retryLoad} type="button">Retry</button>
+        </div>
       {:else if messages.length === 0}
         <div class="chat-empty">No messages yet. Say hello!</div>
       {:else}
@@ -273,17 +291,22 @@
     {/if}
 
     <div class="chat-input-area">
-      <input
-        type="text"
+      <!-- Multi-line textarea so longer messages don't scroll
+           horizontally inside a single-line input. Enter sends,
+           Shift+Enter inserts a newline (handled in handleKeydown).
+           The hint below the box documents the convention so users
+           don't lose work to a stray Enter. -->
+      <textarea
         class="chat-input"
         bind:value={inputText}
         bind:this={chatInputEl}
         onkeydown={handleKeydown}
-        placeholder="Type a message..."
+        placeholder="Type a message... (Enter to send, Shift+Enter for newline)"
         maxlength="4096"
+        rows="2"
         disabled={sending}
-      />
-      <button class="chat-send" onclick={handleSend} disabled={!inputText.trim() || sending} title="Send" aria-label="Send message">
+      ></textarea>
+      <button class="chat-send" onclick={handleSend} disabled={!inputText.trim() || sending} title="Send (Enter)" aria-label="Send message">
         <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M3 10l14-7-7 14-2-5z"/><line x1="10" y1="17" x2="17" y2="3"/>
         </svg>
@@ -464,11 +487,36 @@
     color: var(--text-primary);
     font-size: 13px;
     font-family: inherit;
+    /* textarea-specific: vertical resize only and a sensible upper
+       bound so a long paste doesn't push the input area off-screen. */
+    resize: vertical;
+    min-height: 38px;
+    max-height: 180px;
+    line-height: 1.4;
   }
 
   .chat-input:focus {
     border-color: var(--accent);
     outline: none;
+  }
+
+  /* Surfaced when message-history fetch fails. Mirrors the inline
+     error pattern used elsewhere (e.g. KAD bootstrap), with a Retry
+     button next to the message so users don't have to close + reopen
+     the sidebar to recover. */
+  .chat-load-error {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 24px 16px;
+    color: var(--danger);
+    font-size: 13px;
+    text-align: center;
+  }
+  .chat-load-retry {
+    padding: 4px 14px;
+    font-size: 12px;
   }
 
   .chat-send {

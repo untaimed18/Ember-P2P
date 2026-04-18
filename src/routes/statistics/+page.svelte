@@ -96,6 +96,18 @@
     return rows.filter((r) => r.value > 0).sort((a, b) => b.value - a.value);
   });
 
+  // Friendly "Apr 18, 2026" rendering for the cumulative-since label.
+  // Returns an em-dash if we don't have a reset timestamp yet (fresh
+  // install before the first session ends).
+  function formatSinceDate(ts: number): string {
+    if (!ts) return '\u2014';
+    return new Date(ts * 1000).toLocaleDateString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    });
+  }
+
   function formatSessionTime(secs: number): string {
     if (secs <= 0) return '0s';
     const h = Math.floor(secs / 3600);
@@ -238,6 +250,12 @@
           </svg>
         </span>
         <h3>All-Time Totals</h3>
+        {#if stats.stat_last_reset}
+          <span
+            class="head-aside"
+            title={`Cumulative counters started on ${new Date(stats.stat_last_reset * 1000).toLocaleString()}`}
+          >Since {formatSinceDate(stats.stat_last_reset)}</span>
+        {/if}
       </div>
       <div class="cum-grid">
         <div class="cum-item">

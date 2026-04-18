@@ -1152,6 +1152,33 @@
     try { await resumeAllTransfers(); } catch (e: unknown) { transferError = toErrorMsg(e); }
   }
 
+  // Header-level "Paste link" — same flow as the row context-menu's
+  // `paste_link` action, hoisted to a visible button so users don't
+  // have to right-click an existing transfer (which is the only place
+  // the action is otherwise discoverable). Reads ed2k:// from the
+  // clipboard and queues a download.
+  let pasteLinkBusy = $state(false);
+  async function handlePasteLinkFromHeader() {
+    if (pasteLinkBusy) return;
+    pasteLinkBusy = true;
+    try {
+      const text = (await navigator.clipboard.readText()).trim();
+      if (!text.toLowerCase().startsWith('ed2k://')) {
+        transferError = 'Clipboard does not contain an ed2k:// link';
+        return;
+      }
+      const info = await parseEd2kLink(text);
+      const res = await startDownload(info.hash, info.name, info.size, '', 0);
+      showInfo(res.already_queued
+        ? `Already in download list: ${info.name}`
+        : `Queued from clipboard: ${info.name}`);
+    } catch (e: unknown) {
+      transferError = toErrorMsg(e);
+    } finally {
+      pasteLinkBusy = false;
+    }
+  }
+
   async function runSelectedAction(action: 'pause' | 'resume' | 'stop' | 'sources' | 'preview') {
     if (!selectedTransfer) return;
     try {
@@ -1838,6 +1865,24 @@
 
 <div class="page-header">
   <h2>Transfers</h2>
+  <div class="header-actions">
+    <button
+      class="ghost paste-link-btn"
+      onclick={handlePasteLinkFromHeader}
+      disabled={pasteLinkBusy}
+      title="Read an ed2k:// link from the clipboard and start downloading"
+    >
+      <span class="paste-link-icon" aria-hidden="true">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4" y="3" width="8" height="11" rx="1.5"/>
+          <path d="M6 3v-.5a1 1 0 011-1h2a1 1 0 011 1V3"/>
+          <line x1="6.5" y1="7.5" x2="9.5" y2="7.5"/>
+          <line x1="6.5" y1="10" x2="9.5" y2="10"/>
+        </svg>
+      </span>
+      {pasteLinkBusy ? 'Pasting…' : 'Paste eD2K Link'}
+    </button>
+  </div>
 </div>
 
 {#if transferError}
@@ -2227,32 +2272,90 @@
        only while the matching tab is visible — see the `$effect`s above. -->
   <div class="pane uploads-pane" style="flex: 1;">
     <div class="pane-toolbar">
-      <div class="bottom-tabs">
+      <!--
+        ARIA tablist semantics: each `<button>` is a `tab` inside a
+        `tablist`, the active tab gets `aria-selected="true"` and a
+        roving tabindex (only the selected tab is in the tab order;
+        the others are reachable with Left/Right arrow). The pane body
+        below is implicitly the tabpanel — wired via aria-controls
+        pointing at its DOM id. Without these roles, screen readers
+        announce four unrelated buttons rather than "tab 1 of 4".
+      -->
+      <div
+        class="bottom-tabs"
+        role="tablist"
+        aria-label="Bottom pane view"
+        tabindex="-1"
+        onkeydown={(e) => {
+          const order: typeof bottomView[] = ['uploading', 'queued', 'known_clients', 'download_clients'];
+          const idx = order.indexOf(bottomView);
+          if (idx < 0) return;
+          if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+            e.preventDefault();
+            bottomView = order[(idx + 1) % order.length];
+          } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            bottomView = order[(idx - 1 + order.length) % order.length];
+          } else if (e.key === 'Home') {
+            e.preventDefault();
+            bottomView = order[0];
+          } else if (e.key === 'End') {
+            e.preventDefault();
+            bottomView = order[order.length - 1];
+          }
+        }}
+      >
         <button
           class="tab-btn"
           class:active={bottomView === 'uploading'}
+          role="tab"
+          aria-selected={bottomView === 'uploading'}
+          aria-controls="bottom-pane-content"
+          tabindex={bottomView === 'uploading' ? 0 : -1}
           onclick={() => bottomView = 'uploading'}
         >Uploading ({filteredActiveUploads.length})</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'queued'}
+          role="tab"
+          aria-selected={bottomView === 'queued'}
+          aria-controls="bottom-pane-content"
+          tabindex={bottomView === 'queued' ? 0 : -1}
           onclick={() => bottomView = 'queued'}
           title="Peers waiting in our upload queue"
         >Queued{uploadQueueLoaded ? ` (${uploadQueueClients.length})` : ''}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'known_clients'}
+          role="tab"
+          aria-selected={bottomView === 'known_clients'}
+          aria-controls="bottom-pane-content"
+          tabindex={bottomView === 'known_clients' ? 0 : -1}
           onclick={() => bottomView = 'known_clients'}
           title="Every peer with a SecIdent credit record (lifetime)"
         >Known Clients{knownClientsLoaded ? ` (${knownClients.length})` : ''}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'download_clients'}
+          role="tab"
+          aria-selected={bottomView === 'download_clients'}
+          aria-controls="bottom-pane-content"
+          tabindex={bottomView === 'download_clients' ? 0 : -1}
           onclick={() => bottomView = 'download_clients'}
         >Download Clients</button>
       </div>
     </div>
-    <div class="pane-content scroll-shadows">
+    <div
+      class="pane-content scroll-shadows"
+      id="bottom-pane-content"
+      role="tabpanel"
+      aria-label={
+        bottomView === 'uploading' ? 'Uploading'
+        : bottomView === 'queued' ? 'Queued'
+        : bottomView === 'known_clients' ? 'Known Clients'
+        : 'Download Clients'
+      }
+    >
       {#if bottomView === 'uploading'}
         <!-- UPLOADING VIEW -->
         <table
@@ -3293,6 +3396,29 @@
     .searching-label {
       animation: none;
     }
+  }
+
+  /* --- Page header actions --- */
+  .header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .paste-link-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    padding: 5px 12px;
+  }
+  .paste-link-icon {
+    display: inline-flex;
+    align-items: center;
+    color: currentColor;
+  }
+  .paste-link-icon :global(svg) {
+    width: 13px;
+    height: 13px;
   }
 
   /* --- Error banner --- */

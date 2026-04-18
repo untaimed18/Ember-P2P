@@ -4,6 +4,7 @@
   import AboutDialog from '$lib/components/AboutDialog.svelte';
   import { transfers } from '$lib/stores/transfers';
   import { networkStats } from '$lib/stores/network';
+  import { friendRequests } from '$lib/stores/friends';
   import { onMount } from 'svelte';
 
   let aboutOpen = $state(false);
@@ -11,6 +12,12 @@
   let activeDownloadCount = $derived(
     $transfers.filter(t => t.direction === 'download' && t.status !== 'completed' && t.status !== 'failed').length
   );
+
+  // Pending incoming friend-request count. Mirrors the transfers badge
+  // pattern so users notice new requests without leaving the current
+  // page. Uses the same friends store the Friends page consumes, so
+  // the badge clears the moment the request is accepted/rejected.
+  let pendingFriendRequestCount = $derived($friendRequests.length);
 
   const navItems = [
     { href: '/', label: 'KAD Network', id: 'kad' },
@@ -157,6 +164,12 @@
           {/if}
           {#if item.id === 'transfers' && activeDownloadCount > 0}
             <span class="nav-badge">{activeDownloadCount}</span>
+          {/if}
+          {#if item.id === 'friends' && pendingFriendRequestCount > 0}
+            <span
+              class="nav-badge nav-badge-attention"
+              title="{pendingFriendRequestCount} pending friend request{pendingFriendRequestCount === 1 ? '' : 's'}"
+            >{pendingFriendRequestCount}</span>
           {/if}
         </a>
       </li>
@@ -351,6 +364,15 @@
     justify-content: center;
     line-height: 1;
     flex-shrink: 0;
+  }
+
+  /* Pending friend requests use the warning hue so they read as
+     "needs your attention" rather than just "running activity" — the
+     same visual rule as the connecting-state KAD dot. The accent
+     badge stays for transfer counts (steady-state work). */
+  .nav-badge.nav-badge-attention {
+    background: var(--warning);
+    color: #1a1a1a;
   }
 
   .nav-dot {

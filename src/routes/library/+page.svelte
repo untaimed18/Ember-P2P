@@ -36,6 +36,10 @@
   let scanning = $state(false);
   let error: string | null = $state(null);
   let selectedPath: string | null = $state(null);
+  // Bound to the virtualized file table; used by arrow-key navigation
+  // to scroll the new selection into view (the row may not exist in
+  // the DOM yet because the table is virtualized).
+  let libraryTableRef: { scrollRowIntoView: (i: number) => void } | undefined = $state(undefined);
   let filterFolder: string | null = $state(null);
   let hashProgress: { current: number; total: number; file_name: string } | null = $state(null);
   let stoppedByUser = $state(false);
@@ -1015,6 +1019,41 @@
       toggleCheck(selectedFile.path, false);
       return;
     }
+
+    // Arrow-key navigation: move `selectedPath` through `sortedFiles`
+    // and ask the virtual table to scroll the new row into view (the
+    // table is virtualized, so the row may not be in the DOM yet).
+    // Home / End jump to the boundaries; Shift+Arrow extends the
+    // checkbox selection along the way (useful for keyboard-driven
+    // bulk actions). PageUp/PageDown move ten rows for big lists.
+    if (sortedFiles.length > 0 && (
+      e.key === 'ArrowDown' || e.key === 'ArrowUp' ||
+      e.key === 'Home' || e.key === 'End' ||
+      e.key === 'PageDown' || e.key === 'PageUp'
+    )) {
+      const currentIdx = selectedPath
+        ? sortedFiles.findIndex(f => f.path === selectedPath)
+        : -1;
+      let nextIdx = currentIdx;
+      if (e.key === 'ArrowDown') nextIdx = currentIdx < 0 ? 0 : Math.min(sortedFiles.length - 1, currentIdx + 1);
+      else if (e.key === 'ArrowUp') nextIdx = currentIdx <= 0 ? 0 : currentIdx - 1;
+      else if (e.key === 'Home') nextIdx = 0;
+      else if (e.key === 'End') nextIdx = sortedFiles.length - 1;
+      else if (e.key === 'PageDown') nextIdx = currentIdx < 0 ? 0 : Math.min(sortedFiles.length - 1, currentIdx + 10);
+      else if (e.key === 'PageUp') nextIdx = currentIdx <= 0 ? 0 : Math.max(0, currentIdx - 10);
+      if (nextIdx !== currentIdx && nextIdx >= 0) {
+        e.preventDefault();
+        const next = sortedFiles[nextIdx];
+        selectedPath = next.path;
+        if (e.shiftKey) {
+          // Extending selection — toggle along the path the way the
+          // mouse Shift+click code does, but row-by-row.
+          toggleCheck(next.path, false);
+        }
+        libraryTableRef?.scrollRowIntoView(nextIdx);
+      }
+      return;
+    }
   }
 
   async function ctxAction(action: string, extra?: string) {
@@ -1810,6 +1849,7 @@
       <div class="empty-state"><p>Waiting for scan results&hellip;</p></div>
     {:else}
       <LibraryVirtualTable
+        bind:this={libraryTableRef}
         {sortedFiles}
         {selectedPath}
         onSelectPath={(path) => { selectedPath = path; }}
@@ -1943,13 +1983,23 @@
                   {/if}
                 </div>
                 <div class="comment-input-row">
-                  <input
-                    type="text"
+                  <!-- textarea so multi-line comments don't collapse
+                       to a single line. Ctrl/Cmd+Enter saves to keep
+                       a quick keyboard path; plain Enter inserts a
+                       newline (matches how every other multi-line
+                       editor in the app behaves). -->
+                  <textarea
                     class="comment-input"
-                    placeholder="Add a comment…"
+                    placeholder="Add a comment… (Ctrl+Enter to save)"
                     bind:value={ourComment}
-                    onkeydown={(e) => { if (e.key === 'Enter') handleSaveComment(); }}
-                  />
+                    rows="2"
+                    onkeydown={(e) => {
+                      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                        e.preventDefault();
+                        handleSaveComment();
+                      }
+                    }}
+                  ></textarea>
                   <button class="comment-save" onclick={handleSaveComment} disabled={commentSaveState === 'saving'}>
                     {commentSaveState === 'saving' ? 'Saving\u2026' : 'Save'}
                   </button>
@@ -2874,21 +2924,28 @@
   .star-clear:hover { color: var(--danger, #e74c3c); }
   .comment-input-row {
     display: flex;
+    align-items: flex-end;
     gap: 6px;
   }
   .comment-input {
     flex: 1;
-    padding: 4px 8px;
+    padding: 6px 8px;
     font-size: 12px;
+    font-family: inherit;
     border: 1px solid var(--border);
     border-radius: 4px;
     background: var(--bg-primary, #1e1e1e);
     color: inherit;
     outline: none;
+    /* textarea-specific: vertical resize only with a sensible cap. */
+    resize: vertical;
+    min-height: 44px;
+    max-height: 160px;
+    line-height: 1.4;
   }
   .comment-input:focus { border-color: var(--accent, #3498db); }
   .comment-save {
-    padding: 4px 12px;
+    padding: 6px 12px;
     font-size: 11px;
     border: 1px solid var(--accent, #3498db);
     border-radius: 6px;

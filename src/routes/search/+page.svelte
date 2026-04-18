@@ -1667,6 +1667,7 @@
             Sources{sortIndicator('sources')}
           </th>
           <th class="col-history">History</th>
+          <th class="col-action" aria-label="Actions"></th>
         </tr>
       </thead>
       <tbody title="Double-click a row to download. Right-click for more options. Shift+click checkboxes to select a range.">
@@ -1751,6 +1752,59 @@
                 <span class="history-badge history-completed" title="Previously downloaded">Downloaded</span>
               {:else if downloadHistoryMap[result.file.hash] === 'cancelled'}
                 <span class="history-badge history-cancelled" title="Previously cancelled">Cancelled</span>
+              {/if}
+            </td>
+            <td class="col-action">
+              <!-- Visible per-row download trigger so the primary
+                   action isn't only discoverable via double-click or
+                   the right-click menu. Disabled-state mirrors the
+                   `download()` function's early-exit checks so the
+                   button is faithful to what the action would do. -->
+              {#if result.result_origin?.includes('Local')}
+                <button
+                  class="row-dl-btn"
+                  type="button"
+                  disabled
+                  title="Already in your library"
+                  aria-label="Already in library: {result.clean_name || result.file.name}"
+                >
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <polyline points="3,8 7,12 13,4"/>
+                  </svg>
+                </button>
+              {:else if dlTransfer}
+                <button
+                  class="row-dl-btn"
+                  type="button"
+                  disabled
+                  title="Already downloading"
+                  aria-label="Already downloading: {result.clean_name || result.file.name}"
+                >
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="8" cy="8" r="6.5"/>
+                    <line x1="8" y1="4.5" x2="8" y2="9"/>
+                    <line x1="8" y1="9" x2="11" y2="11"/>
+                  </svg>
+                </button>
+              {:else}
+                <button
+                  class="row-dl-btn row-dl-btn-active"
+                  type="button"
+                  onclick={(e) => { e.stopPropagation(); download(result); }}
+                  disabled={downloadPending[rKey]}
+                  title="Download"
+                  aria-label="Download {result.clean_name || result.file.name}"
+                >
+                  {#if downloadPending[rKey]}
+                    <span class="row-dl-spinner" aria-hidden="true"></span>
+                  {:else}
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <line x1="8" y1="2.5" x2="8" y2="11"/>
+                      <polyline points="4.5,7.5 8,11 11.5,7.5"/>
+                      <line x1="3" y1="13.5" x2="13" y2="13.5"/>
+                    </svg>
+                  {/if}
+                </button>
               {/if}
             </td>
           </tr>
@@ -2390,6 +2444,59 @@
     text-align: center;
   }
 
+  .col-action {
+    width: 36px;
+    text-align: center;
+    padding: 0 4px;
+  }
+
+  .row-dl-btn {
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+  }
+  .row-dl-btn :global(svg) {
+    width: 14px;
+    height: 14px;
+  }
+  .row-dl-btn-active {
+    color: var(--accent);
+  }
+  .row-dl-btn-active:hover {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 32%, transparent);
+    color: var(--accent);
+  }
+  .row-dl-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -1px;
+  }
+  .row-dl-btn:disabled {
+    cursor: default;
+    opacity: 0.6;
+  }
+  .row-dl-spinner {
+    width: 12px;
+    height: 12px;
+    border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: row-dl-spin 0.7s linear infinite;
+  }
+  @keyframes row-dl-spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .row-dl-spinner { animation: none; }
+  }
+
   .history-badge {
     display: inline-block;
     padding: 1px 6px;
@@ -2886,11 +2993,16 @@
     box-shadow: var(--shadow-md);
   }
 
+  /* Spam rows stay faded enough to de-prioritize but don't strike out
+     the filename (line-through hurts readability and was the only
+     non-color signal — we already have a "Spam" badge in the name
+     cell). A left-border accent in the warning hue carries the row's
+     status without painting the whole cell. */
   :global(tr.spam-row) {
-    opacity: 0.45;
+    opacity: 0.7;
   }
-  :global(tr.spam-row td) {
-    text-decoration: line-through;
+  :global(tr.spam-row td:first-child) {
+    box-shadow: inset 3px 0 0 0 var(--warning);
   }
 
   .dl-status-badge {
