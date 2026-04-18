@@ -337,6 +337,15 @@ pub fn build_hello_answer_with_buddy_opts(
     build_hello_inner(user_hash, client_id, tcp_port, nickname, false, buddy, options)
 }
 
+/// ET_COMPATIBLECLIENT byte advertised by Ember. eMule maps a small set of
+/// values to named clients (0=eMule, 1=cDonkey, 2=xMule, 3=aMule, 4/40=Shareaza,
+/// 10=MLdonkey, 20=lphant — see ClientStateDefs.h `EClientSoftware`); any
+/// other non-zero value falls through to the `"eMule Compat"` label in
+/// BaseClient.cpp InitClientSoftwareVersion, which is exactly what we want:
+/// we're an eMule-compatible client, not eMule itself. 0xC5 is outside all
+/// the well-known IDs and survives eMule's uint8 truncation cleanly.
+pub(crate) const COMPAT_CLIENT_EMBER: u8 = 0xC5;
+
 /// Compute CT_EMULE_MISCOPTIONS1 matching eMule BaseClient.cpp SendHelloTypePacket.
 pub fn build_misc_options1() -> u32 {
       (1u32 << 29)   // AICH ver 1
@@ -408,11 +417,18 @@ fn build_hello_inner(
     write_ed2k_tag(&mut buf, 0xFA, &Ed2kTagValue::Uint32(build_misc_options1()));
     // Tag 5: CT_EMULE_MISCOPTIONS2 (0xFE)
     write_ed2k_tag(&mut buf, 0xFE, &Ed2kTagValue::Uint32(build_misc_options2(options)));
-    // Tag 6: CT_EMULE_VERSION (0xFB) - claim 0.50a (last official eMule release).
+    // Tag 6: CT_EMULE_VERSION (0xFB).
     // Layout from BaseClient.cpp: (compat << 24) | (major << 17) | (minor << 10) | (update << 7).
-    // For 0.50a: major=0, minor=50, update=1 (the 'a' suffix); compat=0 (standard eMule).
-    // Using a real version avoids anti-leecher detection for impossible version numbers.
-    let emule_version: u32 = (50u32 << 10) | (1u32 << 7);
+    // Use minor=50, update=1 (a real, recent eMule protocol level so anti-leecher
+    // heuristics that look for impossible version numbers don't flag us) and set
+    // the top "compatible client" byte to COMPAT_CLIENT_EMBER so eMule renders
+    // the peer Software as "eMule Compat" instead of "eMule" — we're not an
+    // eMule build, we just speak its wire protocol. ET_COMPATIBLECLIENT in the
+    // EmuleInfo below carries the same value (and, being processed later, is
+    // what eMule actually displays); this Hello-side byte is the fallback for
+    // peers that drop the EmuleInfo tag.
+    let emule_version: u32 =
+        ((COMPAT_CLIENT_EMBER as u32) << 24) | (50u32 << 10) | (1u32 << 7);
     write_ed2k_tag(&mut buf, 0xFB, &Ed2kTagValue::Uint32(emule_version));
 
     // Optional buddy tags
@@ -468,7 +484,12 @@ pub fn build_emule_info(udp_port: u16, obfuscation_enabled: bool, ember_hash: Op
     buf.write_u8(0x32).unwrap();
     buf.write_u8(0x01).unwrap();
 
-    let tag_count: u32 = 8
+    // Base tag count: 8 standard ET_ tags + ET_COMPATIBLECLIENT (always)
+    // + ET_EMBER_HASH when present + ET_EMBER_PUBKEY when present. The
+    // ET_COMPATIBLECLIENT tag makes eMule label our Software as
+    // "eMule Compat" instead of "eMule" in the client details dialog —
+    // see BaseClient.cpp InitClientSoftwareVersion.
+    let tag_count: u32 = 9
         + ember_hash.is_some() as u32
         + ed25519_pubkey.is_some() as u32;
     buf.write_u32::<LittleEndian>(tag_count).unwrap();
@@ -485,6 +506,11 @@ pub fn build_emule_info(udp_port: u16, obfuscation_enabled: bool, ember_hash: Op
     write_ed2k_tag(&mut buf, 0x24, &Ed2kTagValue::Uint8(1));
     // ET_EXTENDEDREQUEST (0x25) = 2
     write_ed2k_tag(&mut buf, 0x25, &Ed2kTagValue::Uint8(2));
+    // ET_COMPATIBLECLIENT (0x26) — top byte that drives eMule's Software label.
+    // Sent as a full u32 (eMule reads it as an int) so it overwrites the
+    // high byte of CT_EMULE_VERSION parsed from Hello (EmuleInfo is processed
+    // after Hello in BaseClient.cpp, so this tag wins).
+    write_ed2k_tag(&mut buf, 0x26, &Ed2kTagValue::Uint32(COMPAT_CLIENT_EMBER as u32));
     // ET_FEATURES (0x27): bits 0-1 = SecureIdent level, bit 2 = preview,
     // bit 3 = SupportsCryptLayer, bit 4 = RequestsCryptLayer, bit 5 = RequiresCryptLayer
     let features: u8 = 3        // SecIdent level 3

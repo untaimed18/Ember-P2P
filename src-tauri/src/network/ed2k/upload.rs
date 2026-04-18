@@ -1671,20 +1671,71 @@ impl UploadHandler {
             }
         }
 
+        // SecureIdent per-session state (declared ahead of the EmuleInfo
+        // exchange so the proactive OP_SECIDENTSTATE kick-off below can
+        // populate `pending_secident_challenge`).
+        //
+        // `pending_secident_challenge` = the random 32-bit challenge we
+        // sent the peer in our outgoing OP_SECIDENTSTATE, consumed when
+        // their OP_SIGNATURE arrives so we can verify their sig over our
+        // pub key + challenge and mark them as identified.
+        //
+        // `pending_peer_challenge` = an incoming OP_SECIDENTSTATE from the
+        // peer that arrived before we had their RSA public key. eMule
+        // doesn't volunteer its public key — it ships OP_PUBLICKEY only
+        // in response to our own OP_SECIDENTSTATE (see eMule's
+        // ListenSocket.cpp OP_SECIDENTSTATE branch). If the peer's
+        // challenge arrives before our challenge elicits their key, we
+        // can't sign theirs yet (CreateSignature in eMule's
+        // ClientCredits.cpp needs the verifier's pub key). Park the
+        // `(challenge, state)` here and replay it from the OP_PUBLICKEY
+        // handler once their key lands — mirrors eMule's own deferred
+        // sign in CUpDownClient::ProcessPublicKeyPacket
+        // (BaseClient.cpp:1907+), and is the standard way two peers
+        // that have never seen each other complete the chicken-and-egg
+        // handshake without deadlock. Without this, eMule's client
+        // details dialog shows "Identification: Invalid" for our
+        // session.
+        let mut pending_secident_challenge: Option<u32> = None;
+        let mut pending_peer_challenge: Option<(u32, u8)> = None;
+
         // Handle EmuleInfo exchange (or the peer may skip straight to file requests)
         let (proto2, opcode2, payload2) = read_packet_timeout(&mut reader).await?;
         let mut deferred_packet: Option<(u8, u8, Vec<u8>)> = None;
         let mut peer_ember_hash: Option<[u8; 16]> = hello_caps.ember_hash.or(obf_ember_hash);
+        let mut peer_secure_ident_level = peer_secure_ident_level;
         if proto2 == OP_EMULEPROT && opcode2 == OP_EMULEINFO {
             let incoming_caps = parse_emule_info(&payload2);
             merge_caps(&mut hello_caps, incoming_caps);
             peer_ember_hash = hello_caps.ember_hash;
+            peer_secure_ident_level = hello_caps.secure_ident_level;
             ul_client_software = client_software_from_caps(&hello_caps);
             if !hello_caps.peer_name.is_empty() {
                 ul_peer_name = hello_caps.peer_name.clone();
             }
             let emule_payload = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash), None);
             write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_payload).await?;
+
+            // Proactively challenge the peer's identity now that the
+            // Hello + EmuleInfo exchange is complete — this is what eMule
+            // does in CUpDownClient::InfoPacketsReceived
+            // (BaseClient.cpp:2030-2039). Without our own OP_SECIDENTSTATE
+            // the peer never sends us their OP_PUBLICKEY, and without
+            // their pub key we can't sign whichever challenge THEY send
+            // us, leaving eMule's client-details dialog showing
+            // `Identification: Invalid` (the IS_IDFAILED/IS_IDNEEDED
+            // state) for this session. Our `pending_peer_challenge`
+            // slot (set in the OP_SECIDENTSTATE handler below) is the
+            // receiver side of the same dance: if their challenge
+            // happens to arrive before their key does, we replay the
+            // signing from the OP_PUBLICKEY handler.
+            pending_secident_challenge = super::transfer::maybe_send_secident_challenge(
+                &mut writer,
+                Some(&self.credit_manager),
+                peer_user_hash,
+                peer_addr,
+                peer_secure_ident_level,
+            ).await?;
         } else {
             deferred_packet = Some((proto2, opcode2, payload2));
         }
@@ -1780,7 +1831,9 @@ impl UploadHandler {
         let mut slot_guard = UploadSlotGuard::new(self.active_count.clone(), self.slot_notify.clone());
         let mut session_start: Option<std::time::Instant> = None;
         let mut rate_tracker = SessionRateTracker::new();
-        let mut pending_secident_challenge: Option<u32> = None;
+        // (SecureIdent state `pending_secident_challenge` / `pending_peer_challenge`
+        // declared above the EmuleInfo exchange block so the proactive
+        // challenge there can populate `pending_secident_challenge`.)
         let queue_identity = QueueIdentity::from_peer(peer_user_hash, peer_addr);
         let mut queued_identity: Option<QueueIdentity> = None;
         let queue_join_time: std::time::Instant = std::time::Instant::now();
@@ -2077,29 +2130,101 @@ impl UploadHandler {
                         cm.set_ident_state(peer_user_hash, super::credits::IdentState::Needed);
                         drop(cm);
 
-                        pending_secident_challenge = super::transfer::maybe_send_secident_challenge(
-                            &mut writer,
-                            Some(&self.credit_manager),
-                            peer_user_hash,
-                            peer_addr,
-                            peer_secure_ident_level,
-                        ).await?;
-                        debug!("Received public key and sent SecIdent challenge to {peer_addr}");
+                        // Replay any SECIDENTSTATE the peer sent us before
+                        // we had their key. Now that their key is stored,
+                        // `respond_to_secident_challenge` can sign the
+                        // challenge over `peer_pub_key || challenge` and
+                        // ship the OP_SIGNATURE they've been waiting on —
+                        // the piece that, when missing, leaves eMule
+                        // stuck in IS_IDNEEDED / IS_IDFAILED and renders
+                        // "Identification: Invalid".
+                        if let Some((challenge, state)) = pending_peer_challenge.take() {
+                            super::transfer::respond_to_secident_challenge(
+                                &mut writer,
+                                Some(&self.credit_manager),
+                                state,
+                                challenge,
+                                peer_addr,
+                                peer_user_hash,
+                                peer_secure_ident_level,
+                                0u32,
+                            ).await?;
+                            debug!("Replayed deferred SecIdent challenge response to {peer_addr}");
+                        }
+
+                        // Only challenge them for our own identity if we
+                        // haven't already sent one (the proactive kick-off
+                        // after EmuleInfoAnswer normally covers this) —
+                        // otherwise a second OP_SECIDENTSTATE confuses the
+                        // peer's state machine (eMule only tracks one
+                        // outstanding `m_dwCryptRndChallengeFor`).
+                        if pending_secident_challenge.is_none() {
+                            pending_secident_challenge = super::transfer::maybe_send_secident_challenge(
+                                &mut writer,
+                                Some(&self.credit_manager),
+                                peer_user_hash,
+                                peer_addr,
+                                peer_secure_ident_level,
+                            ).await?;
+                        }
+                        debug!("Received public key from {peer_addr}");
                     }
                 }
 
                 (OP_EMULEPROT, OP_SECIDENTSTATE) if payload.len() >= 5 => {
-                    super::transfer::respond_to_secident_challenge(
-                        &mut writer,
-                        Some(&self.credit_manager),
-                        payload[0],
-                        u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]),
-                        peer_addr,
-                        peer_user_hash,
-                        peer_secure_ident_level,
-                        0u32,
-                    ).await?;
-                    debug!("Responded to SecIdent challenge from {peer_addr}");
+                    let state = payload[0];
+                    let challenge =
+                        u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+
+                    // We can only sign the peer's challenge if we already
+                    // have their RSA public key cached — our signature is
+                    // over `peer_pub_key || challenge`, same as eMule's
+                    // CClientCreditsList::CreateSignature. On a first-time
+                    // connection we won't have their key yet (eMule ships
+                    // OP_PUBLICKEY only in response to our own
+                    // OP_SECIDENTSTATE). Park the challenge in
+                    // `pending_peer_challenge` and let the OP_PUBLICKEY
+                    // handler replay it once their key lands. We still
+                    // need to send OP_PUBLICKEY if they asked for ours
+                    // (state >= 2), so fall through into
+                    // `respond_to_secident_challenge` with an empty
+                    // peer_user_hash-keyed record — signing will no-op,
+                    // but our pub key still goes out.
+                    let need_defer = state >= 2 && {
+                        let cm = self.credit_manager.read().await;
+                        !cm.has_public_key(&peer_user_hash)
+                    };
+                    if need_defer {
+                        pending_peer_challenge = Some((challenge, state));
+                        // Still send our OP_PUBLICKEY (they asked for it);
+                        // the signature portion will be a no-op here and
+                        // is replayed once we receive OP_PUBLICKEY.
+                        super::transfer::respond_to_secident_challenge(
+                            &mut writer,
+                            Some(&self.credit_manager),
+                            state,
+                            challenge,
+                            peer_addr,
+                            peer_user_hash,
+                            peer_secure_ident_level,
+                            0u32,
+                        ).await?;
+                        debug!(
+                            "Deferred SecIdent challenge from {peer_addr} — awaiting their public key"
+                        );
+                    } else {
+                        super::transfer::respond_to_secident_challenge(
+                            &mut writer,
+                            Some(&self.credit_manager),
+                            state,
+                            challenge,
+                            peer_addr,
+                            peer_user_hash,
+                            peer_secure_ident_level,
+                            0u32,
+                        ).await?;
+                        debug!("Responded to SecIdent challenge from {peer_addr}");
+                    }
                 }
 
                 (OP_EMULEPROT, OP_SIGNATURE) if payload.len() >= 2 => {
