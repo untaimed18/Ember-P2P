@@ -21,8 +21,8 @@
       KAD
       <span class="dot {$networkStats.status}" aria-label="{$networkStats.status}"></span>
     </span>
-    <span class="status-label" title="ED2K Peer Exchange: {$serverStatus}">
-      ED2K Peer Exchange
+    <span class="status-label" title="ED2K: {$serverStatus}">
+      ED2K
       <span class="dot {$serverStatus}" aria-label="{$serverStatus}"></span>
     </span>
     <span class="status-label" title={epxTitle($networkStats)}>
