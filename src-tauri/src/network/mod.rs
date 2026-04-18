@@ -843,6 +843,33 @@ mod tests {
     }
 
     #[test]
+    fn ident_state_label_covers_every_variant() {
+        // Lock the UI labels for the upload-pane Queued / Known Clients
+        // tabs against accidental rename. eMule users recognise these
+        // exact strings from the Identification row of their own client
+        // details dialog.
+        use ed2k::credits::IdentState;
+        assert_eq!(ident_state_label(IdentState::Verified), "Verified");
+        assert_eq!(ident_state_label(IdentState::Failed), "Failed");
+        assert_eq!(ident_state_label(IdentState::BadGuy), "BadGuy");
+        assert_eq!(ident_state_label(IdentState::Needed), "Needed");
+        assert_eq!(ident_state_label(IdentState::Unknown), "Unknown");
+        // Sanity: the lowercased form drives the `ident-*` CSS classes
+        // in the transfers page; a label that lower-cases to a class
+        // we don't have CSS for is rendered with the default text colour.
+        for label in [
+            ident_state_label(IdentState::Verified),
+            ident_state_label(IdentState::Failed),
+            ident_state_label(IdentState::BadGuy),
+            ident_state_label(IdentState::Needed),
+            ident_state_label(IdentState::Unknown),
+        ] {
+            assert!(label.chars().all(|c| c.is_ascii_alphanumeric()),
+                "label {label} contains non-alphanumeric chars (would break ident-* class lookup)");
+        }
+    }
+
+    #[test]
     fn note_results_keep_requested_file_hash() {
         let file_hash = KadId([0x11; 16]);
         let publisher = KadId([0x22; 16]);
@@ -2133,7 +2160,6 @@ fn ident_state_label(state: ed2k::credits::IdentState) -> &'static str {
 async fn upload_queue_snapshot(
     queue: &ed2k::upload::UploadQueueRef,
     credit_manager: &Arc<RwLock<ed2k::credits::CreditManager>>,
-    _transfer_manager: &Arc<RwLock<TransferManager>>,
     local_index: &Arc<RwLock<LocalIndex>>,
     friend_hashes: &crate::app_state::SharedFriendHashes,
     geoip: &crate::geoip::GeoIpReader,
@@ -13782,7 +13808,6 @@ async fn handle_command(
             let snap = upload_queue_snapshot(
                 upload_queue,
                 credit_manager,
-                transfer_manager,
                 local_index,
                 friend_hashes,
                 geoip,
