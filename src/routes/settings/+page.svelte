@@ -1,6 +1,13 @@
 <script lang="ts">
   import { getSettings, updateSettings, downloadNodesDat, downloadIpfilter } from '$lib/api/settings';
   import { getSpamStats, resetSpamFilter, clearDownloadHistory } from '$lib/api/search';
+  import {
+    getAntileechPatterns,
+    setAntileechPatterns,
+    setAntileechEnabled,
+    resetAntileechToDefaults,
+  } from '$lib/api/security';
+  import type { AntiLeechSnapshot } from '$lib/types';
   import { invoke } from '@tauri-apps/api/core';
   import { relaunch } from '@tauri-apps/plugin-process';
   import type { AppSettings, SpamStats } from '$lib/types';
@@ -323,6 +330,136 @@
       downloadingFilter = false;
     }
   }
+
+  // Anti-leech filter state — loaded lazily when the Security section
+  // is first opened so the rest of Settings doesn't pay the IPC round
+  // trip. The textarea below is bound to `antileechDraft` (newline-
+  // joined patterns); we only push to the backend when the user clicks
+  // Save, so the pattern list isn't recompiled on every keystroke.
+  let antileechSnapshot: AntiLeechSnapshot | null = $state(null);
+  let antileechDraft = $state('');
+  let antileechSaving = $state(false);
+  let antileechMessage: { kind: 'ok' | 'warn' | 'err'; text: string } | null = $state(null);
+  let antileechCompileErrors: Array<[string, string]> = $state([]);
+  let antileechLoaded = $state(false);
+
+  async function loadAntileech() {
+    try {
+      const snap = await getAntileechPatterns();
+      antileechSnapshot = snap;
+      antileechDraft = snap.patterns.join('\n');
+      antileechLoaded = true;
+    } catch (e: unknown) {
+      antileechMessage = {
+        kind: 'err',
+        text: `Failed to load anti-leech filter: ${e instanceof Error ? e.message : String(e)}`,
+      };
+    }
+  }
+
+  async function handleSaveAntileech() {
+    antileechSaving = true;
+    antileechMessage = null;
+    antileechCompileErrors = [];
+    try {
+      const patterns = antileechDraft
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        // Backend ignores blanks + #-comments too, but stripping them
+        // here keeps the on-disk file clean when round-tripped.
+        .filter((line) => line.length > 0 && !line.startsWith('#'));
+      const result = await setAntileechPatterns(patterns);
+      antileechSnapshot = result.snapshot;
+      antileechDraft = result.snapshot.patterns.join('\n');
+      antileechCompileErrors = result.compile_errors;
+      if (result.compile_errors.length > 0) {
+        antileechMessage = {
+          kind: 'warn',
+          text: `Saved ${result.snapshot.pattern_count} pattern(s); ${result.compile_errors.length} rejected — see below.`,
+        };
+      } else {
+        antileechMessage = {
+          kind: 'ok',
+          text: `Saved ${result.snapshot.pattern_count} pattern(s).`,
+        };
+        trackedTimeout(() => (antileechMessage = null), 4000);
+      }
+    } catch (e: unknown) {
+      antileechMessage = {
+        kind: 'err',
+        text: `Save failed: ${e instanceof Error ? e.message : String(e)}`,
+      };
+    } finally {
+      antileechSaving = false;
+    }
+  }
+
+  async function handleAntileechToggle(checked: boolean) {
+    try {
+      await setAntileechEnabled(checked);
+      if (settings) settings.antileech_enabled = checked;
+      // Also refresh the snapshot so the on-disk badge stays in sync.
+      if (antileechLoaded) {
+        const snap = await getAntileechPatterns();
+        antileechSnapshot = snap;
+      }
+    } catch (e: unknown) {
+      antileechMessage = {
+        kind: 'err',
+        text: `Toggle failed: ${e instanceof Error ? e.message : String(e)}`,
+      };
+      // Revert UI toggle state since the backend refused the change.
+      if (settings) settings.antileech_enabled = !checked;
+    }
+  }
+
+  async function handleResetAntileech() {
+    antileechSaving = true;
+    antileechMessage = null;
+    antileechCompileErrors = [];
+    try {
+      const snap = await resetAntileechToDefaults();
+      antileechSnapshot = snap;
+      antileechDraft = snap.patterns.join('\n');
+      antileechMessage = {
+        kind: 'ok',
+        text: `Restored ${snap.pattern_count} default pattern(s).`,
+      };
+      trackedTimeout(() => (antileechMessage = null), 4000);
+    } catch (e: unknown) {
+      antileechMessage = {
+        kind: 'err',
+        text: `Reset failed: ${e instanceof Error ? e.message : String(e)}`,
+      };
+    } finally {
+      antileechSaving = false;
+    }
+  }
+
+  // Lazy-load the snapshot the first time the Security section is opened
+  // (or on initial load if it's the active section). Avoids paying the
+  // backend round-trip just to render the rest of Settings.
+  $effect(() => {
+    if (activeSection === 'security' && !antileechLoaded) {
+      loadAntileech();
+    }
+  });
+
+  // Push the enabled-flag to the backend whenever the toggle moves.
+  // Done as an effect so the ToggleSwitch can stay generic
+  // (`bind:checked`) without needing an onchange prop. We snapshot
+  // `lastAppliedAntileechToggle` to debounce same-state writes (e.g.
+  // on initial load or when `loadSettings` re-applies the persisted
+  // value) and to avoid firing the API call before settings have
+  // loaded for the first time.
+  let lastAppliedAntileechToggle: boolean | null = $state(null);
+  $effect(() => {
+    if (!settings) return;
+    const want = settings.antileech_enabled;
+    if (lastAppliedAntileechToggle === want) return;
+    lastAppliedAntileechToggle = want;
+    void handleAntileechToggle(want);
+  });
 
   async function handleDownloadNodes() {
     downloadingNodes = true;
@@ -930,6 +1067,74 @@
             <ToggleSwitch bind:checked={settings.block_private_ips} />
           </div>
 
+          <div class="divider"></div>
+
+          <!--
+            Anti-Leech filter — eMule's `AntiLeech.dat` equivalent.
+            Pattern editing is independent of the main Save button so a
+            user can hot-reload patterns without touching unrelated
+            settings; the toggle does go through the main settings
+            object so it's saved/restored alongside everything else.
+          -->
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Anti-Leech Filter</span>
+              <span class="hint">
+                Reject incoming peer connections whose advertised client-software string matches any pattern below
+                (eMule's <code>AntiLeech.dat</code> equivalent). Closed at handshake — leech mods don't queue, don't
+                hold rank, don't move bytes.
+              </span>
+            </div>
+            <ToggleSwitch bind:checked={settings.antileech_enabled} />
+          </div>
+          {#if settings.antileech_enabled}
+            <div class="field nested antileech-block">
+              {#if !antileechLoaded}
+                <div class="hint">Loading patterns…</div>
+              {:else}
+                <label for="antileech-textarea" class="antileech-label">
+                  Patterns — one regex per line. <code>#</code> starts a comment.
+                </label>
+                <textarea
+                  id="antileech-textarea"
+                  class="antileech-textarea"
+                  bind:value={antileechDraft}
+                  rows="10"
+                  spellcheck="false"
+                  placeholder={`# Examples:\nVeryCD\nMagicMule\n^eMule 0\\.[0-2]\\d`}
+                ></textarea>
+                <div class="antileech-actions">
+                  <button class="action-btn" onclick={handleSaveAntileech} disabled={antileechSaving}>
+                    {antileechSaving ? 'Saving…' : 'Save patterns'}
+                  </button>
+                  <button class="action-btn ghost" onclick={handleResetAntileech} disabled={antileechSaving}>
+                    Restore defaults
+                  </button>
+                  {#if antileechSnapshot}
+                    <span class="hint antileech-path" title={antileechSnapshot.file_path}>
+                      File: {antileechSnapshot.file_path}
+                    </span>
+                  {/if}
+                </div>
+                {#if antileechMessage}
+                  <span class="feedback {antileechMessage.kind === 'err' ? 'error' : antileechMessage.kind === 'warn' ? 'warning' : 'success'}">
+                    {antileechMessage.text}
+                  </span>
+                {/if}
+                {#if antileechCompileErrors.length > 0}
+                  <div class="antileech-errors">
+                    <div class="antileech-errors-title">Patterns rejected by the regex compiler:</div>
+                    <ul>
+                      {#each antileechCompileErrors as [pattern, error]}
+                        <li><code>{pattern}</code> — {error}</li>
+                      {/each}
+                    </ul>
+                  </div>
+                {/if}
+              {/if}
+            </div>
+          {/if}
+
         </div>
       </section>
 
@@ -1441,6 +1646,73 @@
 
   .feedback.success { color: var(--success); }
   .feedback.error { color: var(--danger); }
+  .feedback.warning { color: var(--warning, #f0a020); }
+
+  /* ── Anti-Leech filter editor ────────────────────── */
+  .antileech-block {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .antileech-label {
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .antileech-textarea {
+    width: 100%;
+    min-height: 180px;
+    padding: 8px 10px;
+    font-family: var(--font-mono, ui-monospace, 'Cascadia Code', Consolas, monospace);
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    resize: vertical;
+  }
+  .antileech-textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .antileech-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .antileech-path {
+    font-size: 11px;
+    margin-left: auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 50%;
+  }
+  .antileech-errors {
+    margin-top: 6px;
+    padding: 8px 10px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--danger, #e74c3c);
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+  }
+  .antileech-errors-title {
+    color: var(--danger, #e74c3c);
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .antileech-errors ul {
+    margin: 0;
+    padding-left: 18px;
+  }
+  .antileech-errors code {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    color: var(--text-primary);
+  }
+  .action-btn.ghost {
+    background: transparent;
+  }
 
   /* ── Theme picker ──────────────────────────────── */
   .theme-picker {

@@ -1,6 +1,8 @@
 #[cfg(target_os = "windows")]
 pub mod firewall;
 
+pub mod antileech;
+
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 

@@ -434,6 +434,13 @@ pub struct AppSettings {
     /// Skip compressing video files during upload (eMule: dontcompressavi)
     #[serde(default)]
     pub skip_compress_video: bool,
+    /// Enable the AntiLeech client-software filter. Pattern list lives in
+    /// `<data_dir>/antileech.dat` and is loaded at startup; toggling this
+    /// at runtime is supported via the `set_antileech_enabled` Tauri
+    /// command. Off by default — opt-in to avoid surprising regressions
+    /// for users who didn't ask to filter peers.
+    #[serde(default)]
+    pub antileech_enabled: bool,
     /// Upload Speed Sense: dynamically adjust upload limit based on network latency
     #[serde(default)]
     pub uss_enabled: bool,
@@ -527,6 +534,31 @@ pub struct ServerInfo {
     pub client_id: u32,
     #[serde(default)]
     pub is_low_id: bool,
+}
+
+/// Snapshot of the AntiLeech filter for the Settings UI. Carries the
+/// raw pattern list (so the user can edit it verbatim), the
+/// enabled-flag, and the resolved on-disk file path so the UI can show
+/// "the file you're editing lives at …" for users who want to manage
+/// the list externally.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AntiLeechSnapshot {
+    pub enabled: bool,
+    pub patterns: Vec<String>,
+    pub file_path: String,
+    pub pattern_count: u32,
+}
+
+/// Result of `set_antileech_patterns`. The backend accepts the new
+/// list as much as it can — patterns that fail to compile are
+/// reported here per-row instead of failing the whole replacement, so
+/// a user can fix typos one at a time without losing the rest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AntiLeechReplaceResult {
+    pub snapshot: AntiLeechSnapshot,
+    /// `(pattern, error_message)` pairs for any patterns the regex
+    /// engine refused to compile.
+    pub compile_errors: Vec<(String, String)>,
 }
 
 /// One row in the upload-pane "Queued" tab — a peer that has joined our
@@ -682,6 +714,7 @@ impl Default for AppSettings {
             add_downloads_paused: false,
             remove_finished_downloads: false,
             skip_compress_video: false,
+            antileech_enabled: false,
             uss_enabled: false,
             filename_cleanups: default_filename_cleanups(),
             spam_filter_enabled: true,

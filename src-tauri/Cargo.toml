@@ -67,6 +67,11 @@ maxminddb = "0.24"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 parking_lot = "0.12"
 notify-debouncer-mini = { version = "0.7", default-features = false }
+# Used by the AntiLeech filter to compile the user-editable pattern list
+# into matchable regex automata. `default-features = false` strips the
+# Unicode tables we don't need (we match ASCII-only client-software
+# strings) — saves ~250 KiB binary and ~50 ms startup compile time.
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
 
 [profile.release]
 strip = true

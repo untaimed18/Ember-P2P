@@ -1053,6 +1053,26 @@ pub enum NetworkCommand {
     GetKnownClientsSnapshot {
         tx: oneshot::Sender<Vec<crate::types::KnownClient>>,
     },
+    /// Anti-leech client filter — read the current pattern list + flag
+    /// for the Settings UI.
+    GetAntiLeechSnapshot {
+        tx: oneshot::Sender<crate::types::AntiLeechSnapshot>,
+    },
+    /// Anti-leech: replace the entire pattern list, persist to disk,
+    /// recompile. Per-pattern compile errors come back via the result.
+    SetAntiLeechPatterns {
+        patterns: Vec<String>,
+        tx: oneshot::Sender<Result<crate::types::AntiLeechReplaceResult, String>>,
+    },
+    /// Anti-leech: toggle on/off without modifying the pattern list.
+    SetAntiLeechEnabled {
+        enabled: bool,
+        tx: oneshot::Sender<Result<(), String>>,
+    },
+    /// Anti-leech: discard the current list and reload built-in defaults.
+    ResetAntiLeechToDefaults {
+        tx: oneshot::Sender<Result<crate::types::AntiLeechSnapshot, String>>,
+    },
     GetKadContactsSnapshot {
         tx: oneshot::Sender<Vec<KadContactInfo>>,
     },
@@ -1480,6 +1500,11 @@ struct NetworkState {
     /// (`ember::MAX_EPX_PEERS = 50`); the in-memory headroom exists so we
     /// can rotate which subset gets advertised across rebuilds.
     known_ember_peers: HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    /// Shared anti-leech client-software filter. Held here so the
+    /// settings command path can hot-swap the pattern list without the
+    /// upload listener needing to re-subscribe; the upload server
+    /// already holds an `Arc` clone of this same handle.
+    antileech: crate::security::antileech::SharedAntiLeechFilter,
     /// Mapping of ed2k file hash → AICH root hash for EPX payload
     aich_root_map: HashMap<[u8; 16], [u8; 20]>,
     /// Tracks KAD callback attempts per (buddy_hash, file_hash) to avoid
@@ -2326,6 +2351,77 @@ async fn known_clients_snapshot(
     out
 }
 
+// ----- AntiLeech filter command helpers ----------------------------
+//
+// All four helpers run on the network task (synchronous; the
+// `parking_lot` lock around the filter is non-blocking) so the upload
+// hot path can never observe a half-applied state.
+
+fn antileech_file_path(state: &NetworkState) -> std::path::PathBuf {
+    state
+        .data_dir
+        .join(crate::security::antileech::DEFAULT_FILE_NAME)
+}
+
+fn antileech_snapshot(state: &NetworkState) -> crate::types::AntiLeechSnapshot {
+    let f = state.antileech.read();
+    crate::types::AntiLeechSnapshot {
+        enabled: f.enabled(),
+        patterns: f.patterns().to_vec(),
+        file_path: antileech_file_path(state).to_string_lossy().to_string(),
+        pattern_count: f.pattern_count() as u32,
+    }
+}
+
+fn antileech_set_patterns(
+    state: &NetworkState,
+    patterns: Vec<String>,
+) -> Result<crate::types::AntiLeechReplaceResult, String> {
+    let errors = {
+        let mut f = state.antileech.write();
+        f.replace_patterns(patterns)
+    };
+    {
+        let f = state.antileech.read();
+        if let Err(e) = f.save_to_file(&antileech_file_path(state)) {
+            return Err(format!("Filter updated in memory but persist failed: {e}"));
+        }
+    }
+    Ok(crate::types::AntiLeechReplaceResult {
+        snapshot: antileech_snapshot(state),
+        compile_errors: errors
+            .into_iter()
+            .map(|(p, e)| (p, e.to_string()))
+            .collect(),
+    })
+}
+
+fn antileech_set_enabled(state: &NetworkState, enabled: bool) -> Result<(), String> {
+    {
+        let mut f = state.antileech.write();
+        f.set_enabled(enabled);
+    }
+    Ok(())
+}
+
+fn antileech_reset_defaults(
+    state: &NetworkState,
+) -> Result<crate::types::AntiLeechSnapshot, String> {
+    let was_enabled = state.antileech.read().enabled();
+    let defaults = crate::security::antileech::AntiLeechFilter::with_defaults(was_enabled);
+    {
+        let mut f = state.antileech.write();
+        *f = defaults;
+    }
+    {
+        let f = state.antileech.read();
+        if let Err(e) = f.save_to_file(&antileech_file_path(state)) {
+            return Err(format!("Defaults restored in memory but persist failed: {e}"));
+        }
+    }
+    Ok(antileech_snapshot(state))
+}
+
 pub async fn start_network(
     app_handle: tauri::AppHandle,
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
@@ -2631,6 +2727,22 @@ pub async fn start_network(
     let shared_banned_hashes: ed2k::upload::SharedBannedHashes =
         Arc::new(std::sync::RwLock::new(banned_hashes));
 
+    // AntiLeech client-software filter — eMule's `AntiLeech.dat`
+    // equivalent. Loads from `<data_dir>/antileech.dat` (seeded with the
+    // built-in defaults the first time the file doesn't exist), then
+    // wraps in a `parking_lot::RwLock` so the upload server can hot-read
+    // on every handshake while the settings UI hot-swaps the pattern
+    // list. The filter is disabled by default — users have to opt in
+    // via Settings — to avoid surprising regressions for anyone who
+    // didn't ask for it. The defaults are conservative regardless.
+    let shared_antileech: crate::security::antileech::SharedAntiLeechFilter = {
+        let initial = crate::security::antileech::load_or_seed_defaults(
+            &data_dir,
+            settings.antileech_enabled,
+        );
+        Arc::new(parking_lot::RwLock::new(initial))
+    };
+
     let comment_manager = Arc::new(RwLock::new(CommentManager::new()));
 
     // Load the persisted server list from `<data_dir>/server.met` so
@@ -2768,6 +2880,7 @@ pub async fn start_network(
         upload_max_slots: Arc::new(std::sync::atomic::AtomicUsize::new(settings.max_concurrent_uploads as usize)),
         ember_payload_dirty: true,
         known_ember_peers: HashMap::new(),
+        antileech: shared_antileech.clone(),
         aich_root_map: HashMap::new(),
         callback_buddy_attempts: HashMap::new(),
         firewall_connect_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
@@ -2983,6 +3096,7 @@ pub async fn start_network(
         let ul_ip_filter = shared_ip_filter.clone();
         let ul_banned = shared_banned_ips.clone();
         let ul_banned_hashes = shared_banned_hashes.clone();
+        let ul_antileech = shared_antileech.clone();
         let ul_skip_compress = settings.skip_compress_video;
         let ul_download_folder = settings.download_folder.clone();
         let ul_fw_probes = firewall_probe_ips.clone();
@@ -3024,6 +3138,7 @@ pub async fn start_network(
                 ul_ip_filter,
                 ul_banned,
                 ul_banned_hashes,
+                ul_antileech,
                 ul_skip_compress,
                 settings.filter_incoming_connections,
                 ul_fw_probes,
@@ -13874,6 +13989,22 @@ async fn handle_command(
         NetworkCommand::GetKnownClientsSnapshot { tx } => {
             let snap = known_clients_snapshot(credit_manager, geoip).await;
             let _ = tx.send(snap);
+        }
+
+        NetworkCommand::GetAntiLeechSnapshot { tx } => {
+            let _ = tx.send(antileech_snapshot(state));
+        }
+
+        NetworkCommand::SetAntiLeechPatterns { patterns, tx } => {
+            let _ = tx.send(antileech_set_patterns(state, patterns));
+        }
+
+        NetworkCommand::SetAntiLeechEnabled { enabled, tx } => {
+            let _ = tx.send(antileech_set_enabled(state, enabled));
+        }
+
+        NetworkCommand::ResetAntiLeechToDefaults { tx } => {
+            let _ = tx.send(antileech_reset_defaults(state));
         }
 
         NetworkCommand::GetKadContactsSnapshot { tx } => {

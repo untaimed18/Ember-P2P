@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import type { AntiLeechSnapshot, AntiLeechReplaceResult } from '$lib/types';
 
 export interface IpFilterEntry {
   start_ip: string;
@@ -45,4 +46,22 @@ export async function downloadAndLoadIpfilter(): Promise<string> {
 
 export async function importIpfilterFile(filePath: string): Promise<string> {
   return invoke('import_ipfilter_file', { filePath });
+}
+
+// ----- Anti-leech client filter ------------------------------------
+
+export async function getAntileechPatterns(): Promise<AntiLeechSnapshot> {
+  return invoke('get_antileech_patterns');
+}
+
+export async function setAntileechPatterns(patterns: string[]): Promise<AntiLeechReplaceResult> {
+  return invoke('set_antileech_patterns', { patterns });
+}
+
+export async function setAntileechEnabled(enabled: boolean): Promise<void> {
+  return invoke('set_antileech_enabled', { enabled });
+}
+
+export async function resetAntileechToDefaults(): Promise<AntiLeechSnapshot> {
+  return invoke('reset_antileech_to_defaults');
 }

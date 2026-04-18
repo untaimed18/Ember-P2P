@@ -367,6 +367,10 @@ struct UploadHandler {
     banned_ips: SharedBannedIps,
     /// Shared banned user hashes for upload-only enforcement after Hello
     banned_hashes: SharedBannedHashes,
+    /// Anti-leech client-software pattern filter. Checked once per session
+    /// after Hello/EmuleInfo, before any slot is granted or queue position
+    /// is held. Hot-reloadable from disk via the Settings UI.
+    antileech: crate::security::antileech::SharedAntiLeechFilter,
     /// eMule: dontcompressavi — skip compression for video files
     skip_compress_video: bool,
     /// Apply IP filter to incoming TCP connections (when false, only outbound is filtered)
@@ -788,6 +792,7 @@ pub async fn start_upload_server(
     shared_ip_filter: SharedIpFilter,
     banned_ips: SharedBannedIps,
     banned_hashes: SharedBannedHashes,
+    antileech: crate::security::antileech::SharedAntiLeechFilter,
     skip_compress_video: bool,
     filter_incoming_connections: bool,
     firewall_probe_ips: FirewallProbeSet,
@@ -859,6 +864,7 @@ pub async fn start_upload_server(
         shared_ip_filter,
         banned_ips,
         banned_hashes,
+        antileech,
         skip_compress_video,
         filter_incoming_connections,
         firewall_probe_ips,
@@ -1754,6 +1760,31 @@ impl UploadHandler {
             write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_payload).await?;
         } else {
             deferred_packet = Some((proto2, opcode2, payload2));
+        }
+
+        // Anti-leech client-software filter. eMule's `AntiLeech.dat`
+        // equivalent — match the rendered software label against the
+        // user's pattern list and close the connection at handshake
+        // time if anything matches. Done HERE (after the optional
+        // EmuleInfo round-trip) so we have the most complete `mod_version`
+        // string possible; the fast-path branch above leaves
+        // `mod_version` empty and would let some patterns fail to match
+        // a peer that's actually identifiable. Closing pre-slot-grant
+        // means a leech mod can't briefly claim a slot, can't move
+        // bytes, and can't sit in the queue holding rank.
+        let leech_match = self.antileech.read().check(&ul_client_software);
+        if let Some(m) = leech_match {
+            info!(
+                "AntiLeech: rejecting upload session with {peer_addr} — \
+                 client software {ul_client_software:?} matched pattern {:?}",
+                m.pattern,
+            );
+            // Best-effort soft-close: send OP_QUEUEFULL so well-behaved
+            // peers stop trying immediately rather than retrying with a
+            // backoff. Ignore any write error — we're disconnecting
+            // either way.
+            let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[]).await;
+            return Ok(());
         }
 
         // Proactively challenge the peer's identity — fire this AFTER the
