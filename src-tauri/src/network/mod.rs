@@ -14638,25 +14638,72 @@ async fn handle_command(
                     if hash_bytes.len() == 16 {
                         let mut fh = [0u8; 16];
                         fh.copy_from_slice(&hash_bytes);
-                        if known_files.find_by_hash(&fh).is_none() {
-                            if known_files.find_by_path_and_meta(&f.path, f.size, f.modified_at).is_none() {
-                                use crate::storage::known_files::KnownFileRecord;
-                                known_files.add_or_update(KnownFileRecord {
-                                    file_hash: fh,
-                                    part_hashes: Vec::new(),
-                                    file_name: f.name.clone(),
-                                    file_size: f.size,
-                                    file_path: f.path.clone(),
-                                    aich_hash: f.aich_hash.clone(),
-                                    modified_at: f.modified_at,
-                                    all_time_transferred: f.bytes_transferred,
-                                    all_time_requested: f.requests,
-                                    all_time_accepted: f.accepted,
-                                    upload_priority: 0,
-                                    last_publish_src: 0,
-                                    last_shared: chrono::Utc::now().timestamp() as u32,
-                                });
-                            }
+                        // Refresh-on-drift fix: if a record already
+                        // exists for this hash but its `file_path`
+                        // or `modified_at` no longer match what we
+                        // just discovered on disk, rewrite the
+                        // record with the current values. See
+                        // `KnownFileList::record_needs_refresh` for
+                        // the full rationale — short version, this
+                        // breaks the "permanent rehash loop" that
+                        // surfaces whenever an external process
+                        // touches a shared file's metadata.
+                        if known_files.record_needs_refresh(
+                            &fh,
+                            &f.path,
+                            f.size,
+                            f.modified_at,
+                            &f.name,
+                            &f.aich_hash,
+                        ) {
+                            use crate::storage::known_files::KnownFileRecord;
+                            // Preserve cumulative counters from the
+                            // existing record (uploaded bytes /
+                            // request totals shouldn't reset just
+                            // because mtime drifted).
+                            let existing = known_files.find_by_hash(&fh).cloned();
+                            let (att, atr, ata, prio, lps) = match &existing {
+                                Some(r) => (
+                                    r.all_time_transferred.max(f.bytes_transferred),
+                                    r.all_time_requested.max(f.requests),
+                                    r.all_time_accepted.max(f.accepted),
+                                    r.upload_priority,
+                                    r.last_publish_src,
+                                ),
+                                None => (
+                                    f.bytes_transferred,
+                                    f.requests,
+                                    f.accepted,
+                                    0,
+                                    0,
+                                ),
+                            };
+                            let part_hashes = existing
+                                .as_ref()
+                                .map(|r| r.part_hashes.clone())
+                                .unwrap_or_default();
+                            known_files.add_or_update(KnownFileRecord {
+                                file_hash: fh,
+                                part_hashes,
+                                file_name: f.name.clone(),
+                                file_size: f.size,
+                                file_path: f.path.clone(),
+                                aich_hash: if !f.aich_hash.is_empty() {
+                                    f.aich_hash.clone()
+                                } else {
+                                    existing
+                                        .as_ref()
+                                        .map(|r| r.aich_hash.clone())
+                                        .unwrap_or_default()
+                                },
+                                modified_at: f.modified_at,
+                                all_time_transferred: att,
+                                all_time_requested: atr,
+                                all_time_accepted: ata,
+                                upload_priority: prio,
+                                last_publish_src: lps,
+                                last_shared: chrono::Utc::now().timestamp() as u32,
+                            });
                         }
                     }
                 }
