@@ -1,5 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Transfer, SourceInfo, StartDownloadResponse } from '$lib/types';
+import type {
+  Transfer,
+  SourceInfo,
+  StartDownloadResponse,
+  UploadQueueClient,
+  KnownClient,
+} from '$lib/types';
 
 export async function startDownload(
   fileHash: string,
@@ -39,6 +45,19 @@ export async function removeTransfer(transferId: string): Promise<void> {
 
 export async function getTransfers(): Promise<Transfer[]> {
   return invoke('get_transfers');
+}
+
+/** Snapshot of peers waiting in our upload queue (transfers/uploads pane,
+ *  "Queued" tab). Polled on demand while the tab is visible. */
+export async function getUploadQueue(): Promise<UploadQueueClient[]> {
+  return invoke('get_upload_queue');
+}
+
+/** Snapshot of every persistent SecIdent credit record (transfers/uploads
+ *  pane, "Known Clients" tab). Lifetime view independent of which peers
+ *  are connected right now. */
+export async function getKnownClients(): Promise<KnownClient[]> {
+  return invoke('get_known_clients');
 }
 
 export async function clearCompleted(): Promise<number> {

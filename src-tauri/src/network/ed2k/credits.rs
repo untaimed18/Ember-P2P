@@ -401,6 +401,22 @@ impl CreditManager {
         self.credits.values().collect()
     }
 
+    /// Lookup a single credit record by user hash. Returns `None` for
+    /// peers we have not yet recorded any credit data for (the upload
+    /// pane uses this to populate the per-row uploaded/downloaded
+    /// totals on the Queued tab without round-tripping through
+    /// `all_records`).
+    pub fn get_record(&self, user_hash: &[u8; 16]) -> Option<&CreditRecord> {
+        self.credits.get(user_hash)
+    }
+
+    /// Convenience: report whether SecIdent crypto is currently usable.
+    /// The "Known Clients" tab uses this to decide whether to display
+    /// `IdentState::Unknown` as "Unknown (no crypto)" vs "Unknown".
+    pub fn crypto_available(&self) -> bool {
+        self.crypto_available
+    }
+
     pub fn cleanup_stale(&mut self, max_age_days: i64) {
         let cutoff = chrono::Utc::now().timestamp() - (max_age_days * 86400);
         self.credits.retain(|_, r| r.last_seen > cutoff);

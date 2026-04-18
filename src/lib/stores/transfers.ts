@@ -107,6 +107,11 @@ interface TransferEventPayload {
   active_sources?: number;
   queued_sources?: number;
   peer_id?: string;
+  /** Backend tags upload-direction terminal events so the store can
+   *  vanish the row on completion (matches eMule UX where finished
+   *  upload sessions disappear from the active list). Falls back to
+   *  the in-store row's `direction` when the payload doesn't carry it. */
+  direction?: string;
 }
 
 export const transfers = writable<Transfer[]>([]);
@@ -223,9 +228,20 @@ export async function initTransferStore() {
     }),
     listen<TransferEventPayload>('transfer-complete', (event) => {
       markEventUpdate();
-      const id = event.payload.id;
-      transfers.update((list) =>
-        list.map((t) => {
+      const { id, direction } = event.payload;
+      transfers.update((list) => {
+        // Find the row (if any) so we can decide whether to drop it
+        // outright (uploads) or simply mark it completed (downloads).
+        const existing = list.find((t) => t.id === id);
+        const isUpload = direction === 'upload' || existing?.direction === 'upload';
+        if (isUpload) {
+          // Match eMule: an upload session ending — successfully or not —
+          // immediately removes the row from the active uploads pane.
+          // Cumulative upload totals live in the statistics view.
+          if (existing) pendingProgress.delete(id);
+          return list.filter((t) => t.id !== id);
+        }
+        return list.map((t) => {
           if (t.id !== id) return t;
           // D30: never flip a row already in a terminal state (e.g. late
           // `transfer-complete` after a `transfer-failed`).
@@ -244,14 +260,24 @@ export async function initTransferStore() {
           // misleading success line. Trust whatever `transferred` the
           // backend last reported via `transfer-progress`.
           return { ...t, status: 'completed' as const, speed: 0 };
-        })
-      );
+        });
+      });
     }),
     listen<TransferEventPayload>('transfer-failed', (event) => {
       markEventUpdate();
-      const { id, error, failure_kind, failure_stage } = event.payload;
-      transfers.update((list) =>
-        list.map((t) => {
+      const { id, error, failure_kind, failure_stage, direction } = event.payload;
+      transfers.update((list) => {
+        const existing = list.find((t) => t.id === id);
+        const isUpload = direction === 'upload' || existing?.direction === 'upload';
+        if (isUpload) {
+          // Mirror the `transfer-complete` upload path: failed upload
+          // sessions also disappear from the active list. The failure
+          // reason is preserved in statistics and event logs, just not
+          // as a sticky row in the upload pane.
+          if (existing) pendingProgress.delete(id);
+          return list.filter((t) => t.id !== id);
+        }
+        return list.map((t) => {
           if (t.id !== id) return t;
           // D30: don't downgrade a completed row to failed if a stray
           // late-arriving failure event shows up. Treat `failed` -> `failed`
@@ -265,8 +291,8 @@ export async function initTransferStore() {
             failure_kind,
             failure_stage,
           };
-        })
-      );
+        });
+      });
     }),
     listen<TransferEventPayload & { status?: string }>(
       'transfer-status',

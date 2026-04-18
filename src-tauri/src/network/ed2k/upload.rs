@@ -227,18 +227,19 @@ pub(crate) type UploadQueueRef = Arc<tokio::sync::Mutex<Vec<QueueEntry>>>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct QueueEntry {
-    identity: QueueIdentity,
-    current_addr: Option<SocketAddr>,
-    user_hash: [u8; 16],
-    file_hash: [u8; 16],
-    join_time: std::time::Instant,
+    pub(crate) identity: QueueIdentity,
+    pub(crate) current_addr: Option<SocketAddr>,
+    pub(crate) user_hash: [u8; 16],
+    pub(crate) file_hash: [u8; 16],
+    pub(crate) join_time: std::time::Instant,
     /// eMule m_bAddNextConnect: Low-ID client that scored highest while
     /// disconnected; gets priority slot on reconnect.
-    add_next_connect: bool,
+    #[allow(dead_code)]
+    pub(crate) add_next_connect: bool,
     /// eMule m_byEmuleVersion from Hello, for legacy client penalty.
-    emule_version: u8,
+    pub(crate) emule_version: u8,
     /// True if this peer is a friend with an active friend slot.
-    is_friend_slot: bool,
+    pub(crate) is_friend_slot: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -628,7 +629,7 @@ pub(crate) fn priority_weight(priority: &str) -> f64 {
 /// All code paths that compare or rank queue entries MUST use this function
 /// to avoid scoring asymmetry (eMule version penalty, friend slot, download
 /// bonus).  `cm` provides credit ratio; `idx` provides file priority.
-fn score_queue_entry(
+pub(crate) fn score_queue_entry(
     cm: &CreditManager,
     idx: &LocalIndex,
     user_hash: &[u8; 16],
@@ -671,7 +672,7 @@ fn score_queue_entry(
 
 /// Compute score-based queue rank: 1 + count of entries with strictly higher
 /// score.  Ties are broken by earlier join_time (lower = better rank).
-fn compute_queue_rank(
+pub(crate) fn compute_queue_rank(
     cm: &CreditManager,
     idx: &LocalIndex,
     queue: &[QueueEntry],

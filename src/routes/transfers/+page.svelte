@@ -8,6 +8,7 @@
     clearCompleted, setTransferPriority, setTransferCategory, setPreviewPriority, pauseAllTransfers, resumeAllTransfers,
     pauseTransfersBatch, resumeTransfersBatch, stopTransfersBatch, cancelTransfersBatch,
     getTransferSources, openFile, openTransferFileLocation, recoverArchive, startDownload,
+    getUploadQueue, getKnownClients,
   } from '$lib/api/transfers';
   import { findSources, parseEd2kLink, formatEd2kLink } from '$lib/api/search';
   import { previewFile } from '$lib/api/preview';
@@ -17,7 +18,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import type { UnlistenFn } from '@tauri-apps/api/event';
-  import type { Transfer, SourceInfo } from '$lib/types';
+  import type { Transfer, SourceInfo, UploadQueueClient, KnownClient } from '$lib/types';
 
   function countryFlagSrc(code: string | undefined): string | null {
     if (!code || code.length !== 2) return null;
@@ -45,7 +46,7 @@
   let searchUnlisten: UnlistenFn | null = null;
   let showAdvancedDlCols = $state(true);
 
-  type TableKey = 'downloads' | 'uploads' | 'queue' | 'clients';
+  type TableKey = 'downloads' | 'uploads' | 'queue' | 'known' | 'clients';
   type TransferColumn<TSort extends string = string> = {
     key: string;
     label: string;
@@ -98,12 +99,34 @@
     { key: 'status', label: 'Status', width: 100, minWidth: 84, className: 'col-ul-status', sortField: 'status' },
     { key: 'up_status', label: 'Up Status', width: 170, minWidth: 120, className: 'col-ul-bar' },
   ];
+  // QUEUE_COLUMNS schema is for `UploadQueueClient` rows (the real
+  // upload-server queue snapshot), NOT the legacy `Transfer` rows it
+  // used to render. Storage keys were bumped to `QueueListCtrlV2` so any
+  // user with persisted column widths from the old "On Queue" placeholder
+  // tab gets defaults instead of a stale layout that doesn't match the
+  // new column set.
   const QUEUE_COLUMNS: TransferColumn[] = [
-    { key: 'peer_name', label: 'User Name', width: 150, minWidth: 120, className: 'col-q-client' },
+    { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-q-flag' },
+    { key: 'user_name', label: 'User Name', width: 150, minWidth: 120, className: 'col-q-client' },
     { key: 'file_name', label: 'File', width: 260, minWidth: 160, className: 'col-q-file' },
-    { key: 'priority', label: 'File Priority', width: 60, minWidth: 60, className: 'col-q-prio' },
-    { key: 'entered_queue', label: 'Entered Queue', width: 110, minWidth: 96, className: 'col-q-entered' },
-    { key: 'up_status', label: 'Up Status', width: 170, minWidth: 120, className: 'col-q-bar' },
+    { key: 'wait_time', label: 'Wait Time', width: 90, minWidth: 72, className: 'col-q-wait' },
+    { key: 'queue_rank', label: 'Rank', width: 60, minWidth: 50, className: 'col-q-rank' },
+    { key: 'credit_ratio', label: 'Score', width: 64, minWidth: 56, className: 'col-q-score' },
+    { key: 'transfer_history', label: 'Up / Down', width: 130, minWidth: 110, className: 'col-q-hist' },
+    { key: 'ident_state', label: 'Identification', width: 110, minWidth: 96, className: 'col-q-ident' },
+  ];
+  // KNOWN_COLUMNS schema mirrors `KnownClient`: lifetime SecIdent records
+  // sourced from clients.met. Independent of which peers are connected,
+  // so this view is the "credit ledger" view of the network.
+  const KNOWN_COLUMNS: TransferColumn[] = [
+    { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-k-flag' },
+    { key: 'user_hash', label: 'User Hash', width: 200, minWidth: 140, className: 'col-k-hash' },
+    { key: 'last_known_ip', label: 'Last IP', width: 130, minWidth: 110, className: 'col-k-ip' },
+    { key: 'uploaded', label: 'Uploaded To', width: 100, minWidth: 80, className: 'col-k-up' },
+    { key: 'downloaded', label: 'Downloaded From', width: 110, minWidth: 88, className: 'col-k-down' },
+    { key: 'credit_ratio', label: 'Score', width: 64, minWidth: 56, className: 'col-k-score' },
+    { key: 'ident_state', label: 'Identification', width: 110, minWidth: 96, className: 'col-k-ident' },
+    { key: 'last_seen', label: 'Last Seen', width: 140, minWidth: 110, className: 'col-k-seen' },
   ];
   const CLIENT_COLUMNS: TransferColumn[] = [
     { key: 'peer_name', label: 'User Name', width: 150, minWidth: 120, className: 'col-c-client' },
@@ -119,24 +142,28 @@
     downloads: DOWNLOAD_COLUMNS,
     uploads: UPLOAD_COLUMNS,
     queue: QUEUE_COLUMNS,
+    known: KNOWN_COLUMNS,
     clients: CLIENT_COLUMNS,
   };
   const COLUMN_STORAGE_KEYS: Record<TableKey, string> = {
     downloads: 'transfers-columns-DownloadListCtrl',
     uploads: 'transfers-columns-UploadListCtrl',
-    queue: 'transfers-columns-QueueListCtrl',
+    queue: 'transfers-columns-QueueListCtrlV2',
+    known: 'transfers-columns-KnownClientsCtrl',
     clients: 'transfers-columns-DownloadClientsCtrl',
   };
   const COLUMN_HIDDEN_STORAGE_KEYS: Record<TableKey, string> = {
     downloads: 'transfers-column-hidden-DownloadListCtrl',
     uploads: 'transfers-column-hidden-UploadListCtrl',
-    queue: 'transfers-column-hidden-QueueListCtrl',
+    queue: 'transfers-column-hidden-QueueListCtrlV2',
+    known: 'transfers-column-hidden-KnownClientsCtrl',
     clients: 'transfers-column-hidden-DownloadClientsCtrl',
   };
   const COLUMN_ORDER_STORAGE_KEYS: Record<TableKey, string> = {
     downloads: 'transfers-column-order-DownloadListCtrl',
     uploads: 'transfers-column-order-UploadListCtrl',
-    queue: 'transfers-column-order-QueueListCtrl',
+    queue: 'transfers-column-order-QueueListCtrlV2',
+    known: 'transfers-column-order-KnownClientsCtrl',
     clients: 'transfers-column-order-DownloadClientsCtrl',
   };
 
@@ -156,23 +183,27 @@
     downloads: createDefaultWidths(DOWNLOAD_COLUMNS),
     uploads: createDefaultWidths(UPLOAD_COLUMNS),
     queue: createDefaultWidths(QUEUE_COLUMNS),
+    known: createDefaultWidths(KNOWN_COLUMNS),
     clients: createDefaultWidths(CLIENT_COLUMNS),
   });
   let hiddenColumns = $state<Record<TableKey, Record<string, boolean>>>({
     downloads: createDefaultHidden(DOWNLOAD_COLUMNS),
     uploads: createDefaultHidden(UPLOAD_COLUMNS),
     queue: createDefaultHidden(QUEUE_COLUMNS),
+    known: createDefaultHidden(KNOWN_COLUMNS),
     clients: createDefaultHidden(CLIENT_COLUMNS),
   });
   let columnOrder = $state<Record<TableKey, string[]>>({
     downloads: createDefaultOrder(DOWNLOAD_COLUMNS),
     uploads: createDefaultOrder(UPLOAD_COLUMNS),
     queue: createDefaultOrder(QUEUE_COLUMNS),
+    known: createDefaultOrder(KNOWN_COLUMNS),
     clients: createDefaultOrder(CLIENT_COLUMNS),
   });
   let downloadTableEl: HTMLTableElement | undefined = $state(undefined);
   let uploadTableEl: HTMLTableElement | undefined = $state(undefined);
   let queueTableEl: HTMLTableElement | undefined = $state(undefined);
+  let knownTableEl: HTMLTableElement | undefined = $state(undefined);
   let clientsTableEl: HTMLTableElement | undefined = $state(undefined);
   let columnDragCleanup: (() => void) | null = $state(null);
   let activeColumnResize: { table: TableKey; columnKey: string } | null = $state(null);
@@ -410,17 +441,30 @@
   });
   let allUploads = $derived(uploadPartition.all);
   let activeUploads = $derived(uploadPartition.active);
-  let completedUploads = $derived(uploadPartition.completed);
-  let failedUploads = $derived(uploadPartition.failed);
-  let queuedUploads = $derived(uploadPartition.queued);
+  // `completedUploads`, `failedUploads`, `queuedUploads` were derivations
+  // for the old upload-pane "Completed"/"Failed"/"On Queue" placeholder
+  // sections. With the auto-remove change (terminal upload-direction
+  // events drop the row from the store immediately) `completed`/`failed`
+  // are always empty, and the real upload queue is now sourced from
+  // `uploadQueueClients` via `getUploadQueue()` rather than from
+  // `Transfer.status === 'queued'` rows. Kept the partition itself
+  // because `uploadPartition.all` and `.active` are still used.
 
   // --- Bottom pane view tabs (eMule style) ---
-  type BottomView = 'uploading' | 'on_queue' | 'download_clients';
+  // Migrated from `'on_queue'` (which was always-empty placeholder data
+  // derived from `Transfer.status === 'queued'`) to `'queued'` (real
+  // upload-server queue snapshot via `getUploadQueue()`). `'known_clients'`
+  // is new — surfaces the SecIdent credit ledger so users can see who
+  // they've earned upload priority with on the wider eMule network.
+  type BottomView = 'uploading' | 'queued' | 'known_clients' | 'download_clients';
   const BOTTOM_VIEW_KEY = 'transfers-bottom-view';
   function loadBottomView(): BottomView {
     try {
       const v = localStorage.getItem(BOTTOM_VIEW_KEY);
-      if (v === 'uploading' || v === 'on_queue' || v === 'download_clients') return v;
+      if (v === 'uploading' || v === 'queued' || v === 'known_clients' || v === 'download_clients') return v;
+      // Migrate the legacy 'on_queue' key (replaced by 'queued') so users
+      // with a stored preference don't get bumped back to the default tab.
+      if (v === 'on_queue') return 'queued';
     } catch { /* ignore */ }
     return 'uploading';
   }
@@ -429,13 +473,77 @@
     try { localStorage.setItem(BOTTOM_VIEW_KEY, bottomView); } catch { /* ignore */ }
   });
 
-  // If "On Queue" is currently hidden (no queued rows — see below) but
-  // was the last active tab, snap to "Uploading" so the user doesn't see
-  // an empty pane with no highlighted tab button.
-  $effect(() => {
-    if (bottomView === 'on_queue' && queuedUploads.length === 0) {
-      bottomView = 'uploading';
+  // --- Upload queue + known clients data (polled while the matching
+  //     tab is visible). The backend snapshot commands are cheap (single
+  //     read lock + already-resolved data) but we still gate on tab
+  //     visibility so background tabs don't keep the network task busy.
+  let uploadQueueClients: UploadQueueClient[] = $state([]);
+  let knownClients: KnownClient[] = $state([]);
+  let uploadQueueLoaded = $state(false);
+  let knownClientsLoaded = $state(false);
+  let queuePollHandle: ReturnType<typeof setInterval> | null = null;
+  let knownPollHandle: ReturnType<typeof setInterval> | null = null;
+  const QUEUE_POLL_INTERVAL_MS = 3000;
+  const KNOWN_POLL_INTERVAL_MS = 8000;
+
+  async function refreshUploadQueue() {
+    try {
+      uploadQueueClients = await getUploadQueue();
+      uploadQueueLoaded = true;
+    } catch (e) {
+      // Network task may be momentarily busy (try_send full). Leave the
+      // last good snapshot in place rather than flashing the table empty.
+      console.warn('Failed to refresh upload queue:', e);
     }
+  }
+  async function refreshKnownClients() {
+    try {
+      knownClients = await getKnownClients();
+      knownClientsLoaded = true;
+    } catch (e) {
+      console.warn('Failed to refresh known clients:', e);
+    }
+  }
+
+  $effect(() => {
+    // Poll the upload queue only while its tab is visible. Refresh
+    // immediately on activation so the table is populated before the
+    // next interval tick fires.
+    if (bottomView === 'queued') {
+      refreshUploadQueue();
+      if (queuePollHandle === null) {
+        queuePollHandle = setInterval(refreshUploadQueue, QUEUE_POLL_INTERVAL_MS);
+      }
+    } else if (queuePollHandle !== null) {
+      clearInterval(queuePollHandle);
+      queuePollHandle = null;
+    }
+    return () => {
+      if (queuePollHandle !== null) {
+        clearInterval(queuePollHandle);
+        queuePollHandle = null;
+      }
+    };
+  });
+
+  $effect(() => {
+    // Same pattern as the queue poll; longer interval because credit
+    // records change far less often than queue rank.
+    if (bottomView === 'known_clients') {
+      refreshKnownClients();
+      if (knownPollHandle === null) {
+        knownPollHandle = setInterval(refreshKnownClients, KNOWN_POLL_INTERVAL_MS);
+      }
+    } else if (knownPollHandle !== null) {
+      clearInterval(knownPollHandle);
+      knownPollHandle = null;
+    }
+    return () => {
+      if (knownPollHandle !== null) {
+        clearInterval(knownPollHandle);
+        knownPollHandle = null;
+      }
+    };
   });
 
   // --- Sorting ---
@@ -627,35 +735,11 @@
       || ulStatusLabel(t).toLowerCase().includes(query)
     );
   });
-  let filteredFailedUploads = $derived.by(() => {
-    const query = transferFilter.trim().toLowerCase();
-    if (!query) return failedUploads;
-    return failedUploads.filter((t) =>
-      t.file_name.toLowerCase().includes(query)
-      || (t.peer_name || '').toLowerCase().includes(query)
-      || (t.peer_id || '').toLowerCase().includes(query)
-      || (t.failure_reason || '').toLowerCase().includes(query)
-    );
-  });
-  let filteredCompletedUploads = $derived.by(() => {
-    const query = transferFilter.trim().toLowerCase();
-    if (!query) return completedUploads;
-    return completedUploads.filter((t) =>
-      t.file_name.toLowerCase().includes(query)
-      || (t.peer_name || '').toLowerCase().includes(query)
-      || (t.peer_id || '').toLowerCase().includes(query)
-      || ulStatusLabel(t).toLowerCase().includes(query)
-    );
-  });
-  let filteredQueuedUploads = $derived.by(() => {
-    const query = transferFilter.trim().toLowerCase();
-    if (!query) return queuedUploads;
-    return queuedUploads.filter((t) =>
-      t.file_name.toLowerCase().includes(query)
-      || (t.peer_name || '').toLowerCase().includes(query)
-      || (t.peer_id || '').toLowerCase().includes(query)
-    );
-  });
+  // Removed `filteredCompletedUploads`, `filteredFailedUploads`,
+  // `filteredQueuedUploads` derivations — they fed UI sections that no
+  // longer exist (terminal upload rows are dropped from the store, and
+  // the queued tab now uses `uploadQueueClients` from a backend snapshot
+  // rather than a `Transfer`-status filter).
 
   let visibleActiveDownloadIds = $derived.by(() => new Set(filteredActiveDownloads.map((t) => t.id)));
 
@@ -1183,6 +1267,7 @@
   let visibleDownloadColumns = $derived.by(() => getVisibleColumns('downloads') as TransferColumn<DlSortField>[]);
   let visibleUploadColumns = $derived.by(() => getVisibleColumns('uploads') as TransferColumn<UlSortField>[]);
   let visibleQueueColumns = $derived.by(() => getVisibleColumns('queue'));
+  let visibleKnownColumns = $derived.by(() => getVisibleColumns('known'));
   let visibleClientColumns = $derived.by(() => getVisibleColumns('clients'));
 
   function getTableElement(table: TableKey): HTMLTableElement | undefined {
@@ -1190,6 +1275,7 @@
       case 'downloads': return downloadTableEl;
       case 'uploads': return uploadTableEl;
       case 'queue': return queueTableEl;
+      case 'known': return knownTableEl;
       case 'clients': return clientsTableEl;
     }
   }
@@ -1317,7 +1403,8 @@
     switch (table) {
       case 'downloads': return 'Download Columns';
       case 'uploads': return 'Upload Columns';
-      case 'queue': return 'Queue Columns';
+      case 'queue': return 'Queued Columns';
+      case 'known': return 'Known Clients Columns';
       case 'clients': return 'Client Columns';
     }
   }
@@ -1595,6 +1682,7 @@
   let dlColCount = $derived(visibleDownloadColumns.length + 1);
   let ulColCount = $derived(visibleUploadColumns.length);
   let queueColCount = $derived(visibleQueueColumns.length);
+  let knownColCount = $derived(visibleKnownColumns.length);
   let clientColCount = $derived(visibleClientColumns.length);
 
   $effect(() => {
@@ -2034,7 +2122,10 @@
     aria-label="Resize transfer panes"
   ></button>
 
-  <!-- BOTTOM PANE: Uploads / On Queue / Download Clients (eMule tabs) -->
+  <!-- BOTTOM PANE: Uploading / Queued / Known Clients / Download Clients
+       (eMule-style tabs). Queued + Known Clients are backed by on-demand
+       backend snapshots (`get_upload_queue`, `get_known_clients`) polled
+       only while the matching tab is visible — see the `$effect`s above. -->
   <div class="pane uploads-pane" style="flex: 1;">
     <div class="pane-toolbar">
       <div class="bottom-tabs">
@@ -2043,21 +2134,18 @@
           class:active={bottomView === 'uploading'}
           onclick={() => bottomView = 'uploading'}
         >Uploading ({filteredActiveUploads.length})</button>
-        <!--
-          "On Queue" is hidden until the backend emits upload-queue events
-          (`UploadEventKind::Queued` / rank updates). Until then the table
-          would always be empty and misleading — the queued peer list lives
-          only inside the upload server task. Tracked as a follow-up. The
-          tab is still rendered when any queued upload rows do exist so a
-          future backend change light up the UI without a frontend edit.
-        -->
-        {#if filteredQueuedUploads.length > 0}
-          <button
-            class="tab-btn"
-            class:active={bottomView === 'on_queue'}
-            onclick={() => bottomView = 'on_queue'}
-          >On Queue ({filteredQueuedUploads.length})</button>
-        {/if}
+        <button
+          class="tab-btn"
+          class:active={bottomView === 'queued'}
+          onclick={() => bottomView = 'queued'}
+          title="Peers waiting in our upload queue"
+        >Queued{uploadQueueLoaded ? ` (${uploadQueueClients.length})` : ''}</button>
+        <button
+          class="tab-btn"
+          class:active={bottomView === 'known_clients'}
+          onclick={() => bottomView = 'known_clients'}
+          title="Every peer with a SecIdent credit record (lifetime)"
+        >Known Clients{knownClientsLoaded ? ` (${knownClients.length})` : ''}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'download_clients'}
@@ -2169,75 +2257,32 @@
                 {/each}
               </tr>
             {/each}
-            {#if filteredCompletedUploads.length > 0}
-              <tr class="section-divider-row"><td colspan={ulColCount}>Completed ({filteredCompletedUploads.length})</td></tr>
-              {#each filteredCompletedUploads as t (t.id)}
-                <tr class="ul-row completed-row">
-                  {#each visibleUploadColumns as column (column.key)}
-                    {#if column.key === 'country'}
-                      <td class="flag-cell" title={t.country_code ?? ''}>{#if countryFlagSrc(t.country_code)}<img src={countryFlagSrc(t.country_code)} alt={t.country_code ?? ''} class="flag-img" />{/if}</td>
-                    {:else if column.key === 'peer_name'}
-                      <td class="client-cell" title={t.peer_name || t.peer_id}>{t.peer_name || t.peer_id || '\u2014'}</td>
-                    {:else if column.key === 'file_name'}
-                      <td class="name-cell" title={t.file_name}>{t.file_name}</td>
-                    {:else if column.key === 'client_software'}
-                      <td class="sw-cell" title={t.client_software || ''}>{t.client_software || '\u2014'}</td>
-                    {:else if column.key === 'speed'}
-                      <td class="num-cell">{'\u2014'}</td>
-                    {:else if column.key === 'transferred'}
-                      <td class="num-cell">{formatSize(t.transferred)}</td>
-                    {:else if column.key === 'total_size'}
-                      <td class="num-cell">{formatSize(t.total_size)}</td>
-                    {:else if column.key === 'upload_time'}
-                      <td class="num-cell">{formatDuration(t.upload_time)}</td>
-                    {:else if column.key === 'status'}
-                      <td class="status-cell"><span class="status-label st-{t.status}" title={ulStatusTooltip(t)}>{ulStatusLabel(t)}</span></td>
-                    {:else if column.key === 'up_status'}
-                      <td class="bar-cell"><span class="no-bar">—</span></td>
-                    {/if}
-                  {/each}
-                </tr>
-              {/each}
-            {/if}
-            {#if filteredFailedUploads.length > 0}
-              <tr class="section-divider-row failed-divider"><td colspan={ulColCount}>Failed ({filteredFailedUploads.length})</td></tr>
-              {#each filteredFailedUploads as t (t.id)}
-                <tr class="ul-row failed-row">
-                  {#each visibleUploadColumns as column (column.key)}
-                    {#if column.key === 'country'}
-                      <td class="flag-cell" title={t.country_code ?? ''}>{#if countryFlagSrc(t.country_code)}<img src={countryFlagSrc(t.country_code)} alt={t.country_code ?? ''} class="flag-img" />{/if}</td>
-                    {:else if column.key === 'peer_name'}
-                      <td class="client-cell" title={t.peer_name || t.peer_id}>{t.peer_name || t.peer_id || '\u2014'}</td>
-                    {:else if column.key === 'file_name'}
-                      <td class="name-cell" title={t.file_name}>{t.file_name}</td>
-                    {:else if column.key === 'client_software'}
-                      <td class="sw-cell" title={t.client_software || ''}>{t.client_software || '\u2014'}</td>
-                    {:else if column.key === 'speed'}
-                      <td class="num-cell">{'\u2014'}</td>
-                    {:else if column.key === 'transferred'}
-                      <td class="num-cell">{formatSize(t.transferred)}</td>
-                    {:else if column.key === 'total_size'}
-                      <td class="num-cell">{formatSize(t.total_size)}</td>
-                    {:else if column.key === 'upload_time'}
-                      <td class="num-cell">{formatDuration(t.upload_time)}</td>
-                    {:else if column.key === 'status'}
-                      <td class="status-cell"><span class="status-label st-failed" title={ulStatusTooltip(t)}>{ulStatusLabel(t)}</span></td>
-                    {:else if column.key === 'up_status'}
-                      <td class="bar-cell"><span class="no-bar">—</span></td>
-                    {/if}
-                  {/each}
-                </tr>
-              {/each}
-            {/if}
-            {#if allUploads.length === 0}
+            <!--
+              Completed and failed upload rows are dropped from the
+              transfers store as soon as their `transfer-complete` /
+              `transfer-failed` event arrives (see lib/stores/transfers.ts —
+              upload-direction terminal events `filter` the row out
+              instead of stamping it with a sticky status). This matches
+              eMule's "session ends → row vanishes" behaviour: the
+              cumulative byte counters live in the Statistics view, not
+              as forever-pinned rows in the active uploads pane. The
+              previous "Completed (N)" and "Failed (N)" section
+              dividers were therefore guaranteed to render zero items
+              once the auto-remove landed and have been removed.
+            -->
+            {#if activeUploads.length === 0}
               <tr><td colspan={ulColCount} class="empty-cell">No uploads</td></tr>
-            {:else if filteredActiveUploads.length === 0 && filteredCompletedUploads.length === 0 && filteredFailedUploads.length === 0}
+            {:else if filteredActiveUploads.length === 0}
               <tr><td colspan={ulColCount} class="empty-cell">No uploads match this filter</td></tr>
             {/if}
           </tbody>
         </table>
-      {:else if bottomView === 'on_queue'}
-        <!-- ON QUEUE VIEW (eMule upload queue) -->
+      {:else if bottomView === 'queued'}
+        <!-- QUEUED VIEW: peers waiting in our upload queue. Polled from
+             the upload-server snapshot via `getUploadQueue()`; rows are
+             passive (no per-row context-menu actions yet — eMule's queue
+             doesn't really have any either, since promotion happens by
+             score). -->
         <table
           class="transfer-table queue-table"
           bind:this={queueTableEl}
@@ -2279,27 +2324,109 @@
             </tr>
           </thead>
           <tbody>
-            {#each filteredQueuedUploads as t (t.id)}
-              <tr class="ul-row" oncontextmenu={(e) => onCtx(e, t, 'upload')}>
+            {#each uploadQueueClients as q (q.user_hash + ':' + q.peer_ip + ':' + q.peer_port + ':' + q.file_hash)}
+              <tr class="ul-row">
                 {#each visibleQueueColumns as column (column.key)}
-                  {#if column.key === 'peer_name'}
-                    <td class="client-cell" title={t.peer_name || t.peer_id}>{t.peer_name || t.peer_id || '\u2014'}</td>
+                  {#if column.key === 'country'}
+                    <td class="flag-cell" title={q.country_code ?? ''}>{#if countryFlagSrc(q.country_code ?? undefined)}<img src={countryFlagSrc(q.country_code ?? undefined)} alt={q.country_code ?? ''} class="flag-img" />{/if}</td>
+                  {:else if column.key === 'user_name'}
+                    {@const label = q.user_hash ? q.user_hash.slice(0, 8) + '\u2026' : (q.peer_ip || '\u2014')}
+                    <td class="client-cell" title={q.user_hash || q.peer_ip}>{q.is_friend ? '\u2605 ' : ''}{label}</td>
                   {:else if column.key === 'file_name'}
-                    <td class="name-cell" title={t.file_name}>{t.file_name}</td>
-                  {:else if column.key === 'priority'}
-                    <td class="prio-cell">
-                      <span class="prio-badge prio-{t.priority}" title={priorityTooltip(t.priority)}>{t.priority.charAt(0).toUpperCase() + t.priority.slice(1)}</span>
+                    <td class="name-cell" title={q.file_name}>{q.file_name}</td>
+                  {:else if column.key === 'wait_time'}
+                    <td class="num-cell">{formatDuration(q.wait_seconds * 1000)}</td>
+                  {:else if column.key === 'queue_rank'}
+                    <td class="num-cell" title={q.queue_rank == null ? 'Disconnected — waiting for callback' : ''}>{q.queue_rank == null ? '?' : q.queue_rank}</td>
+                  {:else if column.key === 'credit_ratio'}
+                    <td class="num-cell" title={`Credit ratio (1.0 = no history, 10.0 = max)`}>{q.credit_ratio.toFixed(2)}</td>
+                  {:else if column.key === 'transfer_history'}
+                    <td class="num-cell" title={`We've uploaded ${formatSize(q.uploaded)} to and downloaded ${formatSize(q.downloaded)} from this peer`}>
+                      {formatSize(q.uploaded)} / {formatSize(q.downloaded)}
                     </td>
-                  {:else if column.key === 'entered_queue'}
-                    <td class="date-cell">{formatDate(t.started_at)}</td>
-                  {:else if column.key === 'up_status'}
-                    <td class="bar-cell"><span class="no-bar">—</span></td>
+                  {:else if column.key === 'ident_state'}
+                    <td class="status-cell"><span class="status-label ident-{q.ident_state.toLowerCase()}">{q.ident_state}</span></td>
                   {/if}
                 {/each}
               </tr>
             {/each}
-            {#if filteredQueuedUploads.length === 0}
-              <tr><td colspan={queueColCount} class="empty-cell">No clients are waiting in the upload queue.</td></tr>
+            {#if uploadQueueClients.length === 0}
+              <tr><td colspan={queueColCount} class="empty-cell">{uploadQueueLoaded ? 'No peers are waiting in the upload queue.' : 'Loading…'}</td></tr>
+            {/if}
+          </tbody>
+        </table>
+      {:else if bottomView === 'known_clients'}
+        <!-- KNOWN CLIENTS VIEW: lifetime SecIdent credit ledger (every
+             peer in clients.met). Independent of which peers are
+             connected; this is the cumulative view that drives upload
+             priority across sessions. Polled at a longer cadence than
+             the queue tab because credit records change far less often. -->
+        <table
+          class="transfer-table clients-table"
+          bind:this={knownTableEl}
+          style={`min-width: max(100%, ${getTableMinWidth('known', visibleKnownColumns)}px);`}
+        >
+          <colgroup>
+            {#each visibleKnownColumns as column (column.key)}
+              <col style={`width: ${getColumnWidth('known', column.key)}px;`} />
+            {/each}
+          </colgroup>
+          <thead oncontextmenu={(e) => openColumnMenu(e, 'known')}>
+            <tr>
+              {#each visibleKnownColumns as column (column.key)}
+                <th
+                  class={column.className}
+                  class:resizing={isResizingColumn('known', column.key)}
+                  class:drag-enabled={canDragColumn('known', column.key)}
+                  class:drop-before={isDropBefore('known', column.key)}
+                  class:drop-after={isDropAfter('known', column.key)}
+                  role="columnheader"
+                  draggable={canDragColumn('known', column.key)}
+                  ondragstart={(e) => handleColumnDragStart(e, 'known', column.key)}
+                  ondragover={(e) => handleColumnDragOver(e, 'known', column.key)}
+                  ondrop={(e) => handleColumnDrop(e, 'known', column.key)}
+                  ondragend={handleColumnDragEnd}
+                >
+                  <span class="header-content">{column.label}</span>
+                  <button
+                    type="button"
+                    class="col-resize-handle"
+                    tabindex="-1"
+                    aria-label={`Resize ${column.label} column`}
+                    onmousedown={(e) => beginColumnResize(e, 'known', column.key)}
+                    ondblclick={(e) => autoSizeColumn(e, 'known', column.key)}
+                    onclick={swallowResizeClick}
+                  ></button>
+                </th>
+              {/each}
+            </tr>
+          </thead>
+          <tbody>
+            {#each knownClients as kc (kc.user_hash)}
+              <tr class="client-row">
+                {#each visibleKnownColumns as column (column.key)}
+                  {#if column.key === 'country'}
+                    <td class="flag-cell" title={kc.country_code ?? ''}>{#if countryFlagSrc(kc.country_code ?? undefined)}<img src={countryFlagSrc(kc.country_code ?? undefined)} alt={kc.country_code ?? ''} class="flag-img" />{/if}</td>
+                  {:else if column.key === 'user_hash'}
+                    <td class="client-cell mono" title={kc.user_hash}>{kc.user_hash.slice(0, 16)}\u2026</td>
+                  {:else if column.key === 'last_known_ip'}
+                    <td class="client-cell" title={kc.last_known_ip ?? 'Never identified'}>{kc.last_known_ip ?? '\u2014'}</td>
+                  {:else if column.key === 'uploaded'}
+                    <td class="num-cell" title={`Lifetime bytes we've uploaded to this peer`}>{kc.uploaded > 0 ? formatSize(kc.uploaded) : '\u2014'}</td>
+                  {:else if column.key === 'downloaded'}
+                    <td class="num-cell" title={`Lifetime bytes we've downloaded from this peer`}>{kc.downloaded > 0 ? formatSize(kc.downloaded) : '\u2014'}</td>
+                  {:else if column.key === 'credit_ratio'}
+                    <td class="num-cell" title={!kc.has_public_key ? 'No public key cached — credit floor at 1.0' : ''}>{kc.credit_ratio.toFixed(2)}</td>
+                  {:else if column.key === 'ident_state'}
+                    <td class="status-cell"><span class="status-label ident-{kc.ident_state.toLowerCase()}" title={!kc.has_public_key ? 'No public key cached' : ''}>{kc.ident_state}</span></td>
+                  {:else if column.key === 'last_seen'}
+                    <td class="date-cell">{kc.last_seen > 0 ? formatDate(kc.last_seen * 1000) : '\u2014'}</td>
+                  {/if}
+                {/each}
+              </tr>
+            {/each}
+            {#if knownClients.length === 0}
+              <tr><td colspan={knownColCount} class="empty-cell">{knownClientsLoaded ? 'No SecIdent credit records yet. Records appear after peers verify their identity with us.' : 'Loading…'}</td></tr>
             {/if}
           </tbody>
         </table>
@@ -2960,6 +3087,17 @@
   .st-hashing { color: var(--text-secondary); }
   .st-insufficient { color: var(--danger, #e74c3c); }
   .st-noneneeded { color: var(--text-muted); }
+  /* SecIdent status badge colours used in Queued + Known Clients tabs.
+     Verified is the only "good" state; Failed and BadGuy are red flags
+     for credit accounting. Unknown is the default/no-handshake state. */
+  .ident-verified { color: var(--success, #2ecc71); }
+  .ident-failed { color: var(--danger, #e74c3c); }
+  .ident-badguy { color: var(--danger, #e74c3c); }
+  .ident-needed { color: var(--warning); }
+  .ident-unknown { color: var(--text-muted); }
+  /* Monospace cell — used for raw user-hash columns where alignment
+     across rows matters more than narrow rendering. */
+  .mono { font-family: var(--font-mono, ui-monospace, 'Cascadia Code', Consolas, monospace); font-size: 11px; }
   .failure-hint {
     font-size: 10px;
     color: var(--danger, #e74c3c);
