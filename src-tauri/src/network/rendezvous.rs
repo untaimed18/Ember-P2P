@@ -5,11 +5,15 @@ use tracing::{debug, info, warn};
 
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Hard byte cap on rendezvous responses. Payloads are always small JSON
-/// blobs (at most a few dozen bytes today); 64 KiB leaves orders of
-/// magnitude of headroom for future fields while still making us
-/// resistant to a hostile server that streams megabytes at us.
-const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+/// Hard byte cap on rendezvous responses. Every payload this client
+/// consumes is a small JSON blob (lookup result is < 200 bytes; relay
+/// invite list is bounded server-side). 8 KiB leaves ~40x headroom
+/// over the largest realistic response while making us decisively
+/// hostile to a malicious or misbehaving rendezvous that tries to
+/// stream megabytes at us. The previous 64 KiB cap was chosen for
+/// "future-proof" reasons but no current code path needs that much
+/// — the smaller cap matches main and shrinks the DoS surface.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024;
 
 pub fn hashed_id(ember_hash: &[u8; 16]) -> String {
     let mut hasher = Sha256::new();
