@@ -15,6 +15,9 @@
     unshareFolder,
     openSharedFile,
     openSharedFolder,
+    batchSetPriority,
+    batchShare,
+    batchUnshare,
     republishFile,
     scanMissingFiles,
     removeMissingFiles,
@@ -81,7 +84,6 @@
     } catch (e: unknown) {
       toastError(toErr(e));
       loadedCollection = null;
-      collectionsOpen = false;
     } finally {
       collectionLoading = false;
     }
@@ -409,13 +411,7 @@
     hashProgress = null;
     stoppedByUser = true;
     try {
-      const incompleteFolders = await stopHashing();
-      for (const folder of incompleteFolders) {
-        try {
-          await removeSharedFolder(folder);
-          if (filterFolder === folder) filterFolder = null;
-        } catch {}
-      }
+      await stopHashing();
       if (mounted) {
         stoppedByUser = false;
         await refresh();
@@ -543,9 +539,9 @@
     const targets = getCheckedFiles().filter(f => !!f.hash);
     if (targets.length === 0) return;
     try {
-      await Promise.all(targets.map(f => setFilePriority(f.path, priority)));
+      const count = await batchSetPriority(targets.map(f => f.path), priority);
       await refresh();
-      toastSuccess(`Set priority to ${priorityLabel(priority)} for ${targets.length} file${targets.length !== 1 ? 's' : ''}`);
+      toastSuccess(`Set priority to ${priorityLabel(priority)} for ${count} file${count !== 1 ? 's' : ''}`);
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -553,9 +549,9 @@
     const targets = getCheckedFiles().filter(f => !!f.hash && !f.shared);
     if (targets.length === 0) return;
     try {
-      await Promise.all(targets.map(f => shareFile(f.path)));
+      const count = await batchShare(targets.map(f => f.path));
       await refresh();
-      toastSuccess(`Shared ${targets.length} file${targets.length !== 1 ? 's' : ''}`);
+      toastSuccess(`Shared ${count} file${count !== 1 ? 's' : ''}`);
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -563,9 +559,9 @@
     const targets = getCheckedFiles().filter(f => !!f.hash && f.shared);
     if (targets.length === 0) return;
     try {
-      await Promise.all(targets.map(f => unshareFile(f.path, f.hash || undefined)));
+      const count = await batchUnshare(targets.map(f => f.path));
       await refresh();
-      toastSuccess(`Unshared ${targets.length} file${targets.length !== 1 ? 's' : ''}`);
+      toastSuccess(`Unshared ${count} file${count !== 1 ? 's' : ''}`);
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -1688,7 +1684,7 @@
               {folder.split(/[\\/]/).filter(Boolean).pop() || folder}
             </span>
           </span>
-          <span class="tree-count">{(folderStats.counts.get(folder) ?? 0).toLocaleString()}</span>
+          <span class="tree-count">{(folderStats.counts.get(folder) ?? 0).toLocaleString()} &middot; {formatSize(folderStats.sizes.get(folder) ?? 0)}</span>
           <span class="tree-actions">
             <button
               class="tree-btn"
@@ -1957,6 +1953,23 @@
               {selectedFile.complete_sources.toLocaleString()} with a copy
             </span>
           {/if}
+        </div>
+
+        <div class="drawer-actions">
+          <button class="drawer-action-btn" onclick={() => openSharedFile(selectedFile.path)} title="Open this file">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+              <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>
+              <path d="M6 8.5l2 2 2-2"/>
+              <line x1="8" y1="5" x2="8" y2="10.5"/>
+            </svg>
+            Open File
+          </button>
+          <button class="drawer-action-btn" onclick={() => openSharedFolder(selectedFile.path)} title="Open containing folder">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+              <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>
+            </svg>
+            Open Folder
+          </button>
         </div>
 
         {#if selectedHash}
@@ -2850,6 +2863,33 @@
     gap: 6px;
     font-family: var(--font-mono, monospace);
     font-size: 11px;
+  }
+  .drawer-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 12px;
+  }
+  .drawer-action-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+  }
+  .drawer-action-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+    border-color: var(--accent);
+  }
+  .drawer-action-btn svg {
+    flex-shrink: 0;
   }
   .copy-btn {
     font-size: 10px;

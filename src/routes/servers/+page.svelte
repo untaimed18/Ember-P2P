@@ -119,7 +119,7 @@
             if (logArea) logArea.scrollTop = logArea.scrollHeight;
           });
         }),
-        listen<{ status: string }>('server-status-changed', (event) => {
+        listen<{ status: 'connected' | 'connecting' | 'disconnected' }>('server-status-changed', (_event) => {
           if (!mounted) return;
           refresh();
         }),

@@ -45,6 +45,18 @@ export async function shareFile(filePath: string): Promise<void> {
   return invoke('share_file', { filePath });
 }
 
+export async function batchSetPriority(filePaths: string[], priority: string): Promise<number> {
+  return invoke('batch_set_priority', { filePaths, priority });
+}
+
+export async function batchShare(filePaths: string[]): Promise<number> {
+  return invoke('batch_share', { filePaths });
+}
+
+export async function batchUnshare(filePaths: string[]): Promise<number> {
+  return invoke('batch_unshare', { filePaths });
+}
+
 export async function unshareFolder(path: string): Promise<void> {
   return invoke('unshare_folder', { path });
 }

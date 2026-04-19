@@ -38,8 +38,6 @@
   function navigateTo(href: string) {
     const current = $page.url.pathname;
     if (current === href) return;
-    const item = navItems.find(i => i.href === href);
-    if ((item as any)?.aliases?.some((a: string) => current === a)) return;
     goto(href).catch(() => {
       window.location.href = href;
     });
