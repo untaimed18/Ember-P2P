@@ -7046,11 +7046,28 @@ pub async fn start_network(
 
                     // Per-server breakdown so the user can see which
                     // entries in their server.met are actually
-                    // responding to UDP. Only logs when the
-                    // discovery counters changed (gated above), so
-                    // it doesn't spam during long quiet periods.
+                    // useful for source discovery. Three categories:
+                    //   * source-responsive: ever returned
+                    //     OP_GLOBFOUNDSOURCES (= actually has source
+                    //     data we can use). The good column.
+                    //   * status-only: responds to status pings but
+                    //     never to GETSOURCES — server is alive but
+                    //     doesn't index our specific file hashes.
+                    //     Most servers fall here for any given user
+                    //     because the long tail of file hashes is
+                    //     vast and individual servers index small
+                    //     subsets.
+                    //   * silent: never replied to anything.
+                    //   * pruned: > MAX_UDP_CONSECUTIVE_FAILURES
+                    //     consecutive unanswered queries.
+                    //
+                    // Previously this was one "alive" bucket which
+                    // misled readers into thinking source discovery
+                    // was working when servers were just answering
+                    // status pings.
                     let now_ts = chrono::Utc::now().timestamp();
-                    let mut alive: Vec<String> = Vec::new();
+                    let mut source_responsive: Vec<String> = Vec::new();
+                    let mut status_only: Vec<String> = Vec::new();
                     let mut silent: Vec<String> = Vec::new();
                     let mut pruned: Vec<String> = Vec::new();
                     for s in state.server_list.servers().iter() {
@@ -7061,19 +7078,25 @@ pub async fn start_network(
                         };
                         if s.udp_consecutive_failures >= MAX_UDP_CONSECUTIVE_FAILURES {
                             pruned.push(label);
+                        } else if s.last_udp_source_reply_at > 0 {
+                            let ago = (now_ts - s.last_udp_source_reply_at).max(0);
+                            source_responsive.push(format!("{label} (last sources {ago}s ago)"));
                         } else if s.last_udp_reply_at > 0 {
                             let ago = (now_ts - s.last_udp_reply_at).max(0);
-                            alive.push(format!("{label} (last reply {ago}s ago)"));
+                            status_only.push(format!("{label} (status reply {ago}s ago, never returned sources)"));
                         } else {
                             silent.push(format!("{label} (fails={})", s.udp_consecutive_failures));
                         }
                     }
                     info!(
-                        "UDP server health: {} alive, {} silent (no UDP reply yet), {} pruned (>= {MAX_UDP_CONSECUTIVE_FAILURES} unanswered queries)",
-                        alive.len(), silent.len(), pruned.len(),
+                        "UDP server health: {} source-responsive, {} status-only (alive but never returned sources), {} silent, {} pruned (>= {MAX_UDP_CONSECUTIVE_FAILURES} unanswered queries)",
+                        source_responsive.len(), status_only.len(), silent.len(), pruned.len(),
                     );
-                    if !alive.is_empty() {
-                        info!("UDP alive servers: {}", alive.join("; "));
+                    if !source_responsive.is_empty() {
+                        info!("UDP source-responsive servers: {}", source_responsive.join("; "));
+                    }
+                    if !status_only.is_empty() {
+                        info!("UDP status-only servers: {}", status_only.join("; "));
                     }
                     if !silent.is_empty() {
                         info!("UDP silent servers: {}", silent.join("; "));
@@ -9777,6 +9800,18 @@ pub async fn start_network(
                             state.udp_discovery_sources_found = state
                                 .udp_discovery_sources_found
                                 .saturating_add(sources.len() as u64);
+                            // Distinct from `record_udp_reply` (which
+                            // fires above for ANY UDP reply): this
+                            // marks the server as actually USEFUL for
+                            // source discovery, not just reachable.
+                            // Lets the per-server health log
+                            // distinguish "alive" from "alive AND has
+                            // returned source data".
+                            {
+                                let ip_str = addr.ip().to_string();
+                                let tcp_port = addr.port().saturating_sub(4);
+                                state.server_list.record_udp_source_reply(&ip_str, tcp_port);
+                            }
                             {
                                 let hash_hex_udp = hex::encode(file_hash);
                                 let matching: Vec<String> = state.pending_downloads.iter()
