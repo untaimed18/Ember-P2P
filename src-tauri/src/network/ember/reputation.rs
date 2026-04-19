@@ -224,6 +224,15 @@ impl ReputationManager {
     }
 
     /// Load reputation data from disk. Returns a new manager on any error.
+    ///
+    /// Loaded entries are normalized: `score` is clamped to
+    /// `[MIN_REPUTATION, MAX_REPUTATION]` and `banned_until` is
+    /// capped to at most `now + BAN_DURATION` (with 1-hour skew
+    /// allowance). This prevents a tampered or hand-edited
+    /// `reputation.json` from bypassing the runtime invariants
+    /// enforced by `apply_event`/`record_event` (e.g. setting
+    /// `banned_until = u64::MAX` for a permanent ban, or
+    /// `score = i32::MAX` to whitewash a known-bad peer).
     pub fn load(path: &Path) -> Self {
         let data = match std::fs::read_to_string(path) {
             Ok(d) => d,
@@ -233,14 +242,27 @@ impl ReputationManager {
             Ok(e) => e,
             Err(_) => return Self::new(),
         };
+        let now = now_secs();
+        let max_ban = now.saturating_add(BAN_DURATION.as_secs() + 3600);
         let mut peers = HashMap::with_capacity(entries.len());
-        for entry in entries {
+        for mut entry in entries {
+            entry.score = entry.score.clamp(MIN_REPUTATION, MAX_REPUTATION);
+            entry.banned_until = entry.banned_until.map(|until| {
+                if until > max_ban { max_ban } else { until }
+            });
             peers.insert(entry.node_id, entry);
         }
-        Self {
+        let mut mgr = Self {
             peers,
-            last_decay: now_secs(),
+            last_decay: now,
+        };
+        // Defensive: enforce the per-load size cap too in case the
+        // file claims more peers than the runtime cap (also a
+        // potential memory-exhaustion vector via JSON parse).
+        if mgr.peers.len() > MAX_TRACKED_PEERS {
+            mgr.evict_stale();
         }
+        mgr
     }
 
     /// Remove the oldest, lowest-scoring peers to stay under the limit.

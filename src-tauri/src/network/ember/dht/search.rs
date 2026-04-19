@@ -67,6 +67,13 @@ pub struct IterativeSearch {
     pub started_at: Instant,
     /// True when the search has converged or found enough results.
     pub complete: bool,
+    /// Monotonic per-search request-ID counter. Per-call random
+    /// `u32`s collide with measurable probability over a long
+    /// search; on collision the previous mapping was silently
+    /// overwritten and the displaced node became un-ackable until
+    /// timeout. Using a counter scoped to the search makes
+    /// collisions impossible within one search lifetime.
+    next_request_id: u32,
     /// Request IDs we've sent mapped to the node we sent them to.
     pending_requests: HashMap<u32, EmberNodeId>,
 }
@@ -104,6 +111,7 @@ impl IterativeSearch {
             started_at: Instant::now(),
             complete: false,
             pending_requests: HashMap::new(),
+            next_request_id: 1,
         }
     }
 
@@ -129,7 +137,8 @@ impl IterativeSearch {
             if entry.state == NodeState::Pending && !self.queried.contains(&entry.contact.node_id) {
                 entry.state = NodeState::InFlight;
                 self.queried.insert(entry.contact.node_id);
-                let req_id = rand::random::<u32>();
+                let req_id = self.next_request_id;
+                self.next_request_id = self.next_request_id.wrapping_add(1);
                 self.pending_requests.insert(req_id, entry.contact.node_id);
                 batch.push((entry.contact.clone(), req_id));
             }
@@ -146,13 +155,26 @@ impl IterativeSearch {
         closer_nodes: Vec<EmberContact>,
         value_records: Vec<Vec<u8>>,
     ) -> bool {
-        // Mark the responding node
+        // Reject responses we didn't ask for: an attacker (or a buggy
+        // peer) sending arbitrary `(request_id, from_id)` pairs must
+        // not be able to flip a node to `Responded`, merge `closer_nodes`,
+        // or contribute to `value_records`. The caller is responsible
+        // for transport-layer auth; this is the request-correlation
+        // gate.
         let expected = self.pending_requests.remove(&request_id);
         if expected.as_ref() != Some(from_id) {
             debug!(
-                "Search {}: unexpected response from {} (expected {:?})",
-                self.id, from_id, expected
+                "Search {}: rejected response from {} (request_id {} expected {:?})",
+                self.id, from_id, request_id, expected
             );
+            // Re-insert if we removed a real pending request for a
+            // different node — we still want it to be matchable when
+            // the right response arrives. (No-op when `expected` was
+            // None.)
+            if let Some(real) = expected {
+                self.pending_requests.insert(request_id, real);
+            }
+            return false;
         }
 
         for entry in &mut self.shortlist {
@@ -280,28 +302,31 @@ impl SearchManager {
     }
 
     /// Start a new FIND_NODE search.
+    /// Returns `None` when the active-search cap is reached so the
+    /// caller can surface a "busy" state instead of unbounded growth.
     pub fn start_find_node(
         &mut self,
         target: EmberNodeId,
         routing_table: &RoutingTable,
-    ) -> u32 {
+    ) -> Option<u32> {
         let initial = routing_table.find_closest(&target, K_BUCKET_SIZE);
-        let id = self.alloc_id();
+        let id = self.alloc_id()?;
         let search = IterativeSearch::new(id, SearchType::FindNode, target, vec![], initial);
         trace!("Starting FIND_NODE search {} for target {}", id, target);
         self.searches.insert(id, search);
-        id
+        Some(id)
     }
 
     /// Start a new FIND_VALUE search with multiple keyword hashes.
+    /// Returns `None` when the active-search cap is reached.
     pub fn start_find_value(
         &mut self,
         primary_key: EmberNodeId,
         keyword_hashes: Vec<[u8; 16]>,
         routing_table: &RoutingTable,
-    ) -> u32 {
+    ) -> Option<u32> {
         let initial = routing_table.find_closest(&primary_key, K_BUCKET_SIZE);
-        let id = self.alloc_id();
+        let id = self.alloc_id()?;
         let search =
             IterativeSearch::new(id, SearchType::FindValue, primary_key, keyword_hashes, initial);
         trace!(
@@ -311,7 +336,7 @@ impl SearchManager {
             search.keyword_hashes.len()
         );
         self.searches.insert(id, search);
-        id
+        Some(id)
     }
 
     /// Get a mutable reference to an active search.
@@ -351,16 +376,26 @@ impl SearchManager {
         self.searches.len()
     }
 
-    fn alloc_id(&mut self) -> u32 {
+    fn alloc_id(&mut self) -> Option<u32> {
         if self.searches.len() >= MAX_ACTIVE_SEARCHES {
             warn!(
                 "Too many active Ember searches ({}), rejecting new search",
                 self.searches.len()
             );
+            return None;
         }
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        id
+        // Skip IDs that are already in use (defends against the
+        // pathological case where wrapping returns to a still-active
+        // ID). The cap above means at most MAX_ACTIVE_SEARCHES
+        // iterations, so this is bounded.
+        for _ in 0..=MAX_ACTIVE_SEARCHES {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            if !self.searches.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
     }
 }
 
@@ -448,7 +483,7 @@ mod tests {
         rt.add_contact(make_contact(0x20));
 
         let mut sm = SearchManager::new();
-        let search_id = sm.start_find_node(make_id(0xFF), &rt);
+        let search_id = sm.start_find_node(make_id(0xFF), &rt).expect("search slot");
 
         let search = sm.get_mut(search_id).unwrap();
         let to_query = search.next_to_query();
@@ -463,7 +498,7 @@ mod tests {
         rt.add_contact(make_contact(0x80));
 
         let mut sm = SearchManager::new();
-        let search_id = sm.start_find_node(make_id(0xFF), &rt);
+        let search_id = sm.start_find_node(make_id(0xFF), &rt).expect("search slot");
 
         let search = sm.get_mut(search_id).unwrap();
         let batch = search.next_to_query();
@@ -484,7 +519,7 @@ mod tests {
         rt.add_contact(make_contact(0x80));
 
         let mut sm = SearchManager::new();
-        let search_id = sm.start_find_value(make_id(0xFF), vec![], &rt);
+        let search_id = sm.start_find_value(make_id(0xFF), vec![], &rt).expect("search slot");
 
         let search = sm.get_mut(search_id).unwrap();
         let batch = search.next_to_query();

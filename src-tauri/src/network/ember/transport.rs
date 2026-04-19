@@ -318,7 +318,13 @@ impl EmberTransport {
         };
         resp_buf.truncate(HEADER_LEN + resp_len);
 
-        let remote_noise_pub = extract_remote_static(&responder);
+        let remote_noise_pub = match extract_remote_static(&responder) {
+            Some(k) => k,
+            None => {
+                debug!("IK responder: handshake completed without remote static key from {from}");
+                return IncomingResult::Rejected;
+            }
+        };
         let transport = match responder.into_transport_mode() {
             Ok(t) => t,
             Err(e) => {
@@ -378,7 +384,13 @@ impl EmberTransport {
             }
         };
 
-        let remote_noise_pub = extract_remote_static(&state);
+        let remote_noise_pub = match extract_remote_static(&state) {
+            Some(k) => k,
+            None => {
+                debug!("IK initiator: handshake completed without remote static key from {from}");
+                return IncomingResult::Rejected;
+            }
+        };
         let mut transport = match state.into_transport_mode() {
             Ok(t) => t,
             Err(e) => {
@@ -555,7 +567,13 @@ impl EmberTransport {
         };
         resp_buf.truncate(HEADER_LEN + resp_len);
 
-        let remote_noise_pub = extract_remote_static(&state);
+        let remote_noise_pub = match extract_remote_static(&state) {
+            Some(k) => k,
+            None => {
+                debug!("XX initiator: handshake completed without remote static key from {from}");
+                return IncomingResult::Rejected;
+            }
+        };
         let mut transport = match state.into_transport_mode() {
             Ok(t) => t,
             Err(e) => {
@@ -622,7 +640,13 @@ impl EmberTransport {
             }
         };
 
-        let remote_noise_pub = extract_remote_static(&state);
+        let remote_noise_pub = match extract_remote_static(&state) {
+            Some(k) => k,
+            None => {
+                debug!("XX msg3 responder: handshake completed without remote static key from {from}");
+                return IncomingResult::Rejected;
+            }
+        };
         let transport = match state.into_transport_mode() {
             Ok(t) => t,
             Err(e) => {
@@ -717,15 +741,23 @@ impl EmberTransport {
 }
 
 /// Extract the remote peer's static public key from a Noise handshake state.
-/// Returns zeroed bytes if not available (shouldn't happen after successful handshake).
-fn extract_remote_static(state: &snow::HandshakeState) -> [u8; 32] {
-    let mut key = [0u8; 32];
-    if let Some(rs) = state.get_remote_static() {
-        if rs.len() == 32 {
-            key.copy_from_slice(rs);
-        }
+///
+/// Returns `None` if the handshake state doesn't carry a 32-byte static
+/// public key. After a *successful* IK/XX handshake this should never
+/// happen with the snow patterns we use, but treating it as `None`
+/// (and rejecting the session at the caller) is safer than the
+/// previous fallback to an all-zero key — that fallback would have
+/// silently bound the session to the well-known zero pubkey, letting
+/// every "successful but malformed" peer collide on that identity in
+/// reputation/friend lookups.
+fn extract_remote_static(state: &snow::HandshakeState) -> Option<[u8; 32]> {
+    let rs = state.get_remote_static()?;
+    if rs.len() != 32 {
+        return None;
     }
-    key
+    let mut key = [0u8; 32];
+    key.copy_from_slice(rs);
+    Some(key)
 }
 
 #[cfg(test)]

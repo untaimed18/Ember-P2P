@@ -319,17 +319,36 @@ impl FloodProtection {
                 }
                 return false;
             }
-            if self.consume_outgoing(&(ip, req_op)) {
-                return true;
-            }
-            // For PublishRes, also check PublishSourceReq and PublishNotesReq
+            // PublishRes (0x4B) is ambiguous: it could ack any of
+            // {0x43 PublishKeyReq, 0x44 PublishSourceReq, 0x45
+            // PublishNotesReq}. The protection layer can't see the
+            // target hash inside the response payload, so it can't
+            // know which specific publish is being acked. To avoid
+            // systematically biasing 0x43 (which leaves the other
+            // counters elevated until expiry), consume the *oldest*
+            // pending publish across the three — peers typically
+            // respond in roughly send order. The actual confirmation
+            // count is tracked at the higher layer via
+            // `publish_pending` keyed by `(target_hash, addr)`, which
+            // is the source of truth for user-visible counts.
             if response_opcode == 0x4B {
-                if self.consume_outgoing(&(ip, 0x44)) {
-                    return true;
+                let mut oldest_op: Option<u8> = None;
+                let mut oldest_t: Option<Instant> = None;
+                for cand in [req_op, 0x44, 0x45] {
+                    if let Some(&t) = self.request_times.get(&(ip, cand)) {
+                        if oldest_t.map_or(true, |ot| t < ot) {
+                            oldest_t = Some(t);
+                            oldest_op = Some(cand);
+                        }
+                    }
                 }
-                if self.consume_outgoing(&(ip, 0x45)) {
-                    return true;
+                if let Some(op) = oldest_op {
+                    if self.consume_outgoing(&(ip, op)) {
+                        return true;
+                    }
                 }
+            } else if self.consume_outgoing(&(ip, req_op)) {
+                return true;
             }
             // For FirewalledRes, also check Firewalled2Req (0x53)
             if response_opcode == 0x58 && self.consume_outgoing(&(ip, 0x53)) {

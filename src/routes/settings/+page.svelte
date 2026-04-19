@@ -133,8 +133,17 @@
     if (saveTimer !== undefined) { clearTimeout(saveTimer); activeTimers.delete(saveTimer); }
     saveMessage = msg;
     saveIsWarning = isWarning;
-    saveTimer = setTimeout(() => { saveMessage = null; }, ms);
-    activeTimers.add(saveTimer);
+    // Mirror trackedTimeout: delete the id from activeTimers when the
+    // timer fires, otherwise the Set retains stale ids (clearTimeout
+    // on a fired id is a no-op but the bookkeeping drifts and on
+    // long-lived sessions activeTimers grows monotonically).
+    const id = setTimeout(() => {
+      saveMessage = null;
+      activeTimers.delete(id);
+      if (saveTimer === id) saveTimer = undefined;
+    }, ms);
+    saveTimer = id;
+    activeTimers.add(id);
   }
 
   function clampInt(v: unknown, min: number, max: number, fallback: number): number {
@@ -272,8 +281,29 @@
 
   function resetChanges() {
     if (!settings || !originalSettings) return;
-    settings = JSON.parse(originalSettings) as AppSettings;
-    showSaveMsg('Changes reverted', false, 2000);
+    try {
+      settings = JSON.parse(originalSettings) as AppSettings;
+      showSaveMsg('Changes reverted', false, 2000);
+    } catch (e) {
+      // `originalSettings` should always be valid JSON we serialized
+      // ourselves, but a storage glitch or an upstream bug elsewhere
+      // could leave it corrupt — surface the error and re-fetch from
+      // disk rather than crashing the Revert button.
+      console.error('resetChanges: originalSettings parse failed', e);
+      showSaveMsg(
+        'Could not revert in-memory snapshot; reloading from disk',
+        true,
+        3000,
+      );
+      void getSettings()
+        .then((s) => {
+          settings = s;
+          originalSettings = JSON.stringify(s);
+        })
+        .catch((err) => {
+          showSaveMsg(`Reload failed: ${err}`, true, 4000);
+        });
+    }
   }
 
   async function refreshSpamStats() {

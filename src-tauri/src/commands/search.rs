@@ -12,6 +12,21 @@ use crate::types::SearchResult;
 const SEARCH_TIMEOUT_MIN: u64 = 30;
 const SEARCH_TIMEOUT_MAX: u64 = 600;
 
+/// Maximum query length accepted from the frontend. eMule keyword
+/// searches have hard wire limits well under this; the cap is a
+/// memory/IPC bound, not a UX limit.
+pub(crate) const MAX_SEARCH_QUERY_LEN: usize = 1024;
+/// Maximum source-address strings accepted in a `mark_spam` payload.
+/// Each is at most 21 bytes ("xxx.xxx.xxx.xxx:port").
+const MAX_MARK_SPAM_SOURCES: usize = 64;
+/// Maximum filename length in a `mark_spam` payload (eD2k filenames
+/// don't exceed 255 bytes in practice; we allow a little headroom).
+const MAX_MARK_SPAM_FILENAME: usize = 1024;
+/// Maximum search-keyword count in a `mark_spam` payload.
+const MAX_MARK_SPAM_KEYWORDS: usize = 32;
+/// Maximum keyword length in a `mark_spam` payload.
+const MAX_MARK_SPAM_KEYWORD_LEN: usize = 256;
+
 fn parse_exact_file_hash(file_hash: &str) -> Result<[u8; 16], String> {
     if file_hash.len() != 32 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("Invalid file hash: expected 32 hex characters".to_string());
@@ -88,6 +103,12 @@ pub async fn search_files(
     file_extension: Option<String>,
     min_availability: Option<u32>,
 ) -> Result<Vec<SearchResult>, String> {
+    if query.len() > MAX_SEARCH_QUERY_LEN {
+        return Err(format!(
+            "Search query exceeds {MAX_SEARCH_QUERY_LEN} bytes ({}); shorten it",
+            query.len()
+        ));
+    }
     let (tx, rx) = oneshot::channel();
 
     let keywords: Vec<String> = query
@@ -318,6 +339,27 @@ pub async fn mark_spam(
 ) -> Result<(), String> {
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err("Invalid file hash".into());
+    }
+    if file_name.len() > MAX_MARK_SPAM_FILENAME {
+        return Err(format!(
+            "file_name exceeds {MAX_MARK_SPAM_FILENAME} bytes"
+        ));
+    }
+    if source_addresses.len() > MAX_MARK_SPAM_SOURCES {
+        return Err(format!(
+            "Too many source_addresses (max {MAX_MARK_SPAM_SOURCES})"
+        ));
+    }
+    if search_keywords.len() > MAX_MARK_SPAM_KEYWORDS {
+        return Err(format!(
+            "Too many search_keywords (max {MAX_MARK_SPAM_KEYWORDS})"
+        ));
+    }
+    if let Some(too_long) = search_keywords.iter().find(|k| k.len() > MAX_MARK_SPAM_KEYWORD_LEN) {
+        return Err(format!(
+            "search_keyword '{}' exceeds {MAX_MARK_SPAM_KEYWORD_LEN} bytes",
+            &too_long.chars().take(32).collect::<String>(),
+        ));
     }
     let result = SearchResult {
         file: crate::types::FileInfo {

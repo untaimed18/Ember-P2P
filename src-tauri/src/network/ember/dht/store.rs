@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use tracing::debug;
 
 use super::EmberNodeId;
@@ -44,6 +45,13 @@ impl DhtStore {
     }
 
     /// Store a record under a key. Returns true if stored, false if rejected.
+    ///
+    /// Verifies the Ed25519 signature over `data` with `publisher_key`
+    /// before insert. Without this check, callers that forgot to
+    /// verify on the wire path (or future call sites that bypass the
+    /// signing step) would let arbitrary forged records into the DHT
+    /// — a spam/poisoning vector. Verification failure logs at
+    /// `debug!` and returns false; the caller decides how loud to be.
     pub fn store(
         &mut self,
         key: [u8; 16],
@@ -51,6 +59,15 @@ impl DhtStore {
         signature: [u8; 64],
         publisher_key: [u8; 32],
     ) -> bool {
+        if !verify_record_signature(&data, &signature, &publisher_key) {
+            debug!(
+                "DHT store: signature verification failed for key {} from publisher {}",
+                hex::encode(key),
+                hex::encode(publisher_key),
+            );
+            return false;
+        }
+
         if self.entries.len() >= MAX_KEYS && !self.entries.contains_key(&key) {
             debug!("DHT store full ({MAX_KEYS} keys), rejecting new key");
             return false;
@@ -128,37 +145,91 @@ impl DhtStore {
     }
 }
 
+/// Verify an Ed25519 signature over `data` with `publisher_key`.
+/// Returns false on any failure (malformed key, malformed sig, or
+/// signature mismatch).
+fn verify_record_signature(data: &[u8], signature: &[u8; 64], publisher_key: &[u8; 32]) -> bool {
+    let Ok(vk) = VerifyingKey::from_bytes(publisher_key) else {
+        return false;
+    };
+    let sig = Signature::from_bytes(signature);
+    vk.verify(data, &sig).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+
+    /// Generate a (publisher_key, sign_fn) pair for tests so the
+    /// store's signature check accepts the inputs.
+    fn keypair() -> (SigningKey, [u8; 32]) {
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = sk.verifying_key().to_bytes();
+        (sk, pk)
+    }
+
+    fn sign(sk: &SigningKey, data: &[u8]) -> [u8; 64] {
+        sk.sign(data).to_bytes()
+    }
 
     #[test]
     fn store_and_get() {
         let mut store = DhtStore::new();
         let key = [1u8; 16];
-        assert!(store.store(key, vec![42], [0u8; 64], [0xAA; 32]));
+        let (sk, pk) = keypair();
+        let data = vec![42];
+        let sig = sign(&sk, &data);
+        assert!(store.store(key, data.clone(), sig, pk));
         assert_eq!(store.total_records(), 1);
         assert_eq!(store.key_count(), 1);
 
         let records = store.get(&key).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].data, vec![42]);
+        assert_eq!(records[0].data, data);
     }
 
     #[test]
     fn deduplicates_by_publisher() {
         let mut store = DhtStore::new();
         let key = [1u8; 16];
-        let publisher = [0xAA; 32];
+        let (sk_a, pk_a) = keypair();
+        let (sk_b, pk_b) = keypair();
 
-        store.store(key, vec![1], [0u8; 64], publisher);
-        store.store(key, vec![2], [0u8; 64], publisher); // same publisher
-        store.store(key, vec![3], [0u8; 64], [0xBB; 32]); // different publisher
+        let d1 = vec![1u8];
+        let d2 = vec![2u8];
+        let d3 = vec![3u8];
+        store.store(key, d1.clone(), sign(&sk_a, &d1), pk_a);
+        store.store(key, d2.clone(), sign(&sk_a, &d2), pk_a); // same publisher
+        store.store(key, d3.clone(), sign(&sk_b, &d3), pk_b); // different publisher
 
         assert_eq!(store.total_records(), 2);
         let records = store.get(&key).unwrap();
-        assert_eq!(records[0].data, vec![2]); // updated
-        assert_eq!(records[1].data, vec![3]);
+        assert_eq!(records[0].data, d2); // updated
+        assert_eq!(records[1].data, d3);
+    }
+
+    #[test]
+    fn rejects_bad_signature() {
+        let mut store = DhtStore::new();
+        let key = [1u8; 16];
+        let (_sk, pk) = keypair();
+        // bogus signature for `data`
+        assert!(!store.store(key, vec![42], [0u8; 64], pk));
+        assert_eq!(store.total_records(), 0);
+    }
+
+    #[test]
+    fn rejects_bad_publisher_key() {
+        let mut store = DhtStore::new();
+        let key = [1u8; 16];
+        let (sk, _pk) = keypair();
+        let data = vec![42u8];
+        let sig = sign(&sk, &data);
+        // sign with sk but claim a different publisher_key
+        assert!(!store.store(key, data, sig, [0xCC; 32]));
+        assert_eq!(store.total_records(), 0);
     }
 
     #[test]

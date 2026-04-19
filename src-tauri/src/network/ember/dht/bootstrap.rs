@@ -134,6 +134,33 @@ pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<EmberContact>> {
         });
     }
 
+    // Detect partial/truncated load. The header declared `count`
+    // contacts but the loop bailed early on the first short read,
+    // leaving us with fewer. Without this check, the next save would
+    // silently overwrite the on-disk file with the truncated list,
+    // permanently shrinking the persisted DHT bootstrap set.
+    // Mirrors `kad::bootstrap::backup_if_short_load`.
+    if contacts.len() < count {
+        warn!(
+            "Ember DHT nodes file declared {count} contacts but only {} loaded; \
+             likely a corrupted or truncated file. Backing up before next save.",
+            contacts.len(),
+        );
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let bak = path.with_extension(format!("dat.bak.{ts}"));
+        if let Err(e) = std::fs::copy(path, &bak) {
+            warn!(
+                "Failed to back up partial nodes_ember.dat to {}: {e}",
+                bak.display(),
+            );
+        } else {
+            info!("Backed up partial nodes_ember.dat to {}", bak.display());
+        }
+    }
+
     info!("Loaded {} Ember DHT contacts from {}", contacts.len(), path.display());
     Ok(contacts)
 }

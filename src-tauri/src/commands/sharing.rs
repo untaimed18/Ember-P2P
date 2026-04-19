@@ -6,6 +6,15 @@ use tauri::Emitter;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Maximum bytes for any single filesystem path accepted from the
+/// frontend. Mirrors `commands::settings::MAX_PATH_LEN` so the
+/// pre-canonicalize path length check is consistent across the
+/// "save settings" path and the explicit add/remove paths.
+const MAX_PATH_LEN: usize = 4 * 1024;
+/// Maximum file-id count in a single batch sharing operation. Bounds
+/// the IPC payload and the per-call DB transaction size.
+const MAX_BATCH_IDS: usize = 10_000;
+
 struct ScanGuard(Arc<AtomicUsize>);
 impl Drop for ScanGuard {
     fn drop(&mut self) {
@@ -127,6 +136,9 @@ pub async fn add_shared_folder(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
+    if path.len() > MAX_PATH_LEN {
+        return Err(format!("Folder path exceeds {MAX_PATH_LEN} bytes"));
+    }
     let p = std::path::Path::new(&path);
     if !p.exists() || !p.is_dir() {
         return Err("Path does not exist or is not a directory".into());
@@ -398,14 +410,26 @@ pub async fn remove_shared_folder(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
+    if path.len() > MAX_PATH_LEN {
+        return Err(format!("Folder path exceeds {MAX_PATH_LEN} bytes"));
+    }
     let canonical_path = std::path::Path::new(&path)
         .canonicalize()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| path.clone());
+    // `add_shared_folder` stores the *canonical* form in
+    // `shared_folders` and `upload_shared_folders`; the cancel-flag
+    // map is also keyed by canonical paths. Comparing against the
+    // raw `path` argument here would let an equivalent-but-not-equal
+    // representation (extended `\\?\` form, trailing separator,
+    // case difference not handled by `paths_equal_ignore_case`) leak:
+    // we'd strip the index entries (which canonicalize internally)
+    // but leave `shared_folders` populated, re-sharing on next scan.
+    // Use `canonical_path` for every comparison.
     {
         let flags = state.hash_cancel_flags.read().await;
         for (key, flag) in flags.iter() {
-            if paths_equal_ignore_case(key, &path) {
+            if paths_equal_ignore_case(key, &canonical_path) {
                 flag.store(true, Ordering::Relaxed);
             }
         }
@@ -414,7 +438,7 @@ pub async fn remove_shared_folder(
     loop {
         let still_active = state.hash_cancel_flags.read().await
             .keys()
-            .any(|key| paths_equal_ignore_case(key, &path));
+            .any(|key| paths_equal_ignore_case(key, &canonical_path));
         if !still_active || std::time::Instant::now() >= deadline {
             break;
         }
@@ -423,12 +447,12 @@ pub async fn remove_shared_folder(
 
     let save_data = {
         let mut config = state.config.write().await;
-        config.settings.shared_folders.retain(|f| !paths_equal_ignore_case(f, &path));
+        config.settings.shared_folders.retain(|f| !paths_equal_ignore_case(f, &canonical_path));
         config.prepare_save().map_err(|e| format!("Config save error: {e}"))?
     };
     {
         let mut live = state.upload_shared_folders.write().await;
-        live.retain(|f| !paths_equal_ignore_case(f, &path));
+        live.retain(|f| !paths_equal_ignore_case(f, &canonical_path));
     }
     {
         let (data, tmp, final_path) = save_data;
@@ -540,6 +564,11 @@ pub async fn batch_set_priority(
     file_paths: Vec<String>,
     priority: String,
 ) -> Result<u32, String> {
+    if file_paths.len() > MAX_BATCH_IDS {
+        return Err(format!(
+            "Too many file_paths in one batch (max {MAX_BATCH_IDS})"
+        ));
+    }
     let valid = ["verylow", "low", "normal", "high", "release", "auto"];
     if !valid.contains(&priority.as_str()) {
         return Err(format!("Invalid priority: {priority}"));
@@ -593,6 +622,11 @@ pub async fn batch_share(
     state: tauri::State<'_, AppState>,
     file_paths: Vec<String>,
 ) -> Result<u32, String> {
+    if file_paths.len() > MAX_BATCH_IDS {
+        return Err(format!(
+            "Too many file_paths in one batch (max {MAX_BATCH_IDS})"
+        ));
+    }
     let count = {
         let mut index = state.local_index.write().await;
         let mut n = 0u32;
@@ -620,6 +654,11 @@ pub async fn batch_unshare(
     state: tauri::State<'_, AppState>,
     file_paths: Vec<String>,
 ) -> Result<u32, String> {
+    if file_paths.len() > MAX_BATCH_IDS {
+        return Err(format!(
+            "Too many file_paths in one batch (max {MAX_BATCH_IDS})"
+        ));
+    }
     let count = {
         let mut index = state.local_index.write().await;
         let mut n = 0u32;
