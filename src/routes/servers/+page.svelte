@@ -36,9 +36,52 @@
   let serverMetUrl = $state('https://upd.emule-security.org/server.met');
   let serverFilter = $state('');
 
-  // Sorting
+  // Sorting — persisted to localStorage so a user who prefers
+  // "Users, descending" or "Files, descending" doesn't have to re-pick
+  // it every time they open the page or restart the app. Same approach
+  // the library and search pages use for their filter/sort prefs.
+  const SORT_PREFS_KEY = 'servers-sort-prefs';
+  // Whitelist matches the columns the table renders + sorts on (see
+  // `sortedServers` switch below). Any other persisted value is
+  // ignored on load so a stale or hand-edited localStorage entry
+  // can't break the table.
+  const VALID_SORT_COLS = new Set([
+    'name', 'ip', 'description', 'users', 'files', 'failed', 'static',
+  ]);
   let sortCol: string = $state('name');
   let sortAsc = $state(true);
+  let sortPrefsLoaded = $state(false);
+
+  function loadSortPrefs() {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      const raw = localStorage.getItem(SORT_PREFS_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        if (typeof parsed.col === 'string' && VALID_SORT_COLS.has(parsed.col)) {
+          sortCol = parsed.col;
+        }
+        if (typeof parsed.asc === 'boolean') {
+          sortAsc = parsed.asc;
+        }
+      }
+    } catch {
+      // Corrupt entry — drop it so we don't keep failing every load.
+      try { localStorage.removeItem(SORT_PREFS_KEY); } catch { /* ignore */ }
+    }
+  }
+
+  // Persist whenever either field changes. Guarded by `sortPrefsLoaded`
+  // so the initial defaults aren't written back over a saved value
+  // before `loadSortPrefs()` has a chance to apply it.
+  $effect(() => {
+    void sortCol; void sortAsc;
+    if (!sortPrefsLoaded || typeof localStorage === 'undefined') return;
+    try {
+      localStorage.setItem(SORT_PREFS_KEY, JSON.stringify({ col: sortCol, asc: sortAsc }));
+    } catch { /* quota — non-fatal */ }
+  });
 
   // Selection (multi-select support)
   let selectedServer: ServerInfo | null = $state(null);
@@ -56,6 +99,11 @@
 
   onMount(() => {
     mounted = true;
+    // Restore the user's sort choice BEFORE the first refresh paints
+    // so the initial table render is already in their preferred order
+    // rather than flashing the default "name asc" first.
+    loadSortPrefs();
+    sortPrefsLoaded = true;
     refresh();
     const interval = setInterval(refresh, 5000);
 
