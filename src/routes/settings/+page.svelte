@@ -742,6 +742,40 @@
 
           <div class="divider"></div>
 
+          <!--
+            eD2K server-list discovery. These mirror the three eMule
+            options under Options → Servers and are saved live (no
+            restart). When "Update server list when connecting" is on,
+            Ember sends OP_GETSERVERLIST shortly after login and merges
+            the response into server.met; otherwise the current server
+            list stays exactly as you curated it.
+          -->
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Update server list when connecting</span>
+              <span class="hint">Ask each eD2K server you connect to for its known peer servers and merge them into your list. (eMule: "Update server list when connecting to a server")</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.add_servers_from_server} ariaLabel="Update server list when connecting to a server" />
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Update server list from clients</span>
+              <span class="hint">Accept new servers advertised by other eD2K clients during peer connections. Off if you prefer a curated list.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.add_servers_from_clients} ariaLabel="Update server list from clients" />
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Filter servers by IP</span>
+              <span class="hint">Apply your IP filter (ipfilter.dat) to newly-discovered servers as well as peers, so blocked ranges can't sneak in via the server list.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.filter_servers_by_ip} ariaLabel="Filter servers by IP" />
+          </div>
+
+          <div class="divider"></div>
+
           <div class="field">
             <label for="nodes-dat">Bootstrap Path</label>
             <input id="nodes-dat" bind:value={settings.nodes_dat_path} placeholder="Auto-detected" />
