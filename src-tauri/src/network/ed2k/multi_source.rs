@@ -4072,67 +4072,158 @@ async fn download_parts_from_source(
                     // saturated through the part-N → part-(N+1)
                     // hand-off (no round-trip stall, no Hello/SecIdent
                     // reconnect).
-                    let pipeline_attempt = pre_pipeline_next_part_ms(
-                        &chunk_sel,
-                        &tracker,
-                        &source_available,
-                        &control,
-                        &part_queue,
-                        peer_supports_large_files,
-                        file_size,
-                    )
-                    .await;
-                    if pipeline_attempt.is_none() {
-                        info!(
-                            "DIAG: source {} ({}) cross-part pipeline trigger fired for part {} (sent_idx={}/{}) but no eligible next part found",
-                            _src_idx, addr, part_idx, sent_idx, batches.len(),
-                        );
-                    }
-                    if let Some(next) = pipeline_attempt {
-                        let first_batch = &next.batches[0];
-                        let (req_payload, req_proto, req_op) = if next.needs_i64 {
-                            (build_request_parts_i64(file_hash, first_batch), OP_EMULEPROT, OP_REQUESTPARTS_I64)
-                        } else {
-                            (build_request_parts(file_hash, first_batch), OP_EDONKEYHEADER, OP_REQUESTPARTS)
-                        };
-                        if let Err(e) = write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await {
-                            // Don't poison the rest of the loop on a
-                            // pipeline-send failure — fall through and
-                            // let the existing per-part flow handle the
-                            // next part on its own (with the round-trip
-                            // stall, but not a session drop).
+                    //
+                    // CRITICAL: pipeline the part the next iteration
+                    // will actually pick — i.e. the next entry already
+                    // in `part_queue`. Previously the pipelining asked
+                    // chunk_selector for the "best" part, which can
+                    // diverge from the queued order (especially in
+                    // retry rounds where the queue holds 5-10
+                    // pre-assigned parts). When that happened, the
+                    // resume-state filter `pipelined_next.take().filter(
+                    // |p| p.part_idx == part_idx)` discarded the
+                    // pipelined state, the peer was still processing
+                    // our pipelined OP_REQUESTPARTS for the wrong
+                    // part, AND we sent fresh requests for the
+                    // actually-next part — total in-flight requests
+                    // exceeded the peer's queue cap and they sent
+                    // OP_OUTOFPARTREQS, killing the session after
+                    // ~9.4 MiB.
+                    //
+                    // Only fall back to chunk_selector when the queue
+                    // is exhausted (initial single-part assignment
+                    // case); in that path the new part also gets
+                    // appended to `part_queue` so the resume picks it
+                    // up. Either way, the pipelined `part_idx` is
+                    // guaranteed to match the next iteration's
+                    // `part_idx`.
+                    let next_queued_part: Option<usize> =
+                        part_queue.get(queue_idx).copied();
+                    let pipeline_target: Option<usize> = match next_queued_part {
+                        Some(qp) => {
+                            // Skip if it's already complete (race with
+                            // another source); the next iteration's
+                            // `is_part_complete` check would have
+                            // skipped it anyway.
+                            let still_needed = {
+                                let t = tracker.read().await;
+                                !t.is_part_complete(qp)
+                            };
+                            if still_needed { Some(qp) } else { None }
+                        }
+                        None => {
+                            // Queue exhausted — extend it via the
+                            // chunk_selector pick, same logic as the
+                            // post-iteration dynamic-extend. The new
+                            // part is appended to part_queue so the
+                            // next iteration picks it up; the
+                            // pipelined state will then match.
+                            match pre_pipeline_next_part_ms(
+                                &chunk_sel,
+                                &tracker,
+                                &source_available,
+                                &control,
+                                &part_queue,
+                                peer_supports_large_files,
+                                file_size,
+                            )
+                            .await
+                            {
+                                Some(c) => {
+                                    if !part_queue.contains(&c.part_idx) {
+                                        part_queue.push(c.part_idx);
+                                    }
+                                    Some(c.part_idx)
+                                }
+                                None => None,
+                            }
+                        }
+                    };
+
+                    if let Some(target_part_idx) = pipeline_target {
+                        let (target_blocks, _ps, _pe) =
+                            compute_part_blocks_ms(&tracker, target_part_idx).await;
+                        if target_blocks.is_empty() {
                             info!(
-                                "DIAG: source {} ({}) cross-part pipeline send for part {} failed: {e:#} — falling back to non-pipelined hand-off",
-                                _src_idx, addr, next.part_idx,
+                                "DIAG: source {} ({}) cross-part pipeline target part {} has no remaining gaps — skipping",
+                                _src_idx, addr, target_part_idx,
                             );
                         } else {
+                            let target_batches: Vec<Vec<(u64, u64)>> = target_blocks
+                                .chunks(MAX_BLOCKS_PER_REQUEST)
+                                .map(|c| c.to_vec())
+                                .collect();
+                            let target_needs_i64 = peer_supports_large_files
+                                && target_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
+
+                            // Send only the FIRST block of the first
+                            // batch (~180 KiB), not the whole 3-block
+                            // batch. Just enough to mask the
+                            // round-trip latency for the part-N →
+                            // part-(N+1) hand-off without burning
+                            // multiple slots in the peer's request
+                            // queue. Remaining batches of the target
+                            // are sent by the next iteration's
+                            // normal max_outstanding loop.
+                            let mut first_batch = target_batches[0].clone();
+                            first_batch.truncate(1);
                             let pipelined_bytes: u64 =
                                 first_batch.iter().map(|(s, e)| e - s).sum();
-                            info!(
-                                "DIAG: source {} ({}) cross-part pipeline: pre-sent first batch of part {} ({} bytes, {} blocks) while still receiving part {}",
-                                _src_idx, addr, next.part_idx, pipelined_bytes,
-                                first_batch.len(), part_idx,
-                            );
-                            // Add to part_queue if not already present;
-                            // mark in_progress so other sources see it
-                            // and apply the eMule active-bonus heuristic.
-                            if !part_queue.contains(&next.part_idx) {
-                                part_queue.push(next.part_idx);
+                            let (req_payload, req_proto, req_op) = if target_needs_i64 {
+                                (build_request_parts_i64(file_hash, &first_batch), OP_EMULEPROT, OP_REQUESTPARTS_I64)
+                            } else {
+                                (build_request_parts(file_hash, &first_batch), OP_EDONKEYHEADER, OP_REQUESTPARTS)
+                            };
+                            if let Err(e) = write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await {
+                                info!(
+                                    "DIAG: source {} ({}) cross-part pipeline send for part {} failed: {e:#} — falling back to non-pipelined hand-off",
+                                    _src_idx, addr, target_part_idx,
+                                );
+                            } else {
+                                info!(
+                                    "DIAG: source {} ({}) cross-part pipeline: pre-sent first block of part {} ({} bytes, {} blocks) while still receiving part {} (queue_idx_next={}, queue_len={})",
+                                    _src_idx, addr, target_part_idx, pipelined_bytes,
+                                    first_batch.len(), part_idx,
+                                    queue_idx, part_queue.len(),
+                                );
+                                {
+                                    let mut t = tracker.write().await;
+                                    t.set_in_progress(target_part_idx, true);
+                                }
+                                ip_guard.mark(target_part_idx);
+                                // The pipelined state must reflect
+                                // exactly what bytes the peer will
+                                // send us next. We pipelined ONE
+                                // block; the resume path needs to
+                                // send the remainder. If batches[0]
+                                // had only 1 block, advance sent_idx
+                                // to 1; otherwise replace batches[0]
+                                // with the un-pipelined tail so the
+                                // resume "send batches[sent_idx..]"
+                                // loop covers it.
+                                let mut resume_batches = target_batches;
+                                let resume_sent_idx;
+                                if resume_batches[0].len() <= 1 {
+                                    resume_sent_idx = 1;
+                                } else {
+                                    resume_batches[0] = resume_batches[0][1..].to_vec();
+                                    resume_sent_idx = 0;
+                                }
+                                pipelined_next = Some(PipelinedNext {
+                                    part_idx: target_part_idx,
+                                    all_blocks: target_blocks,
+                                    batches: resume_batches,
+                                    sent_idx: resume_sent_idx,
+                                    needs_i64: target_needs_i64,
+                                });
                             }
-                            {
-                                let mut t = tracker.write().await;
-                                t.set_in_progress(next.part_idx, true);
-                            }
-                            ip_guard.mark(next.part_idx);
-                            let _ = pipelined_bytes;
-                            pipelined_next = Some(PipelinedNext {
-                                part_idx: next.part_idx,
-                                all_blocks: next.all_blocks,
-                                batches: next.batches,
-                                sent_idx: 1,
-                                needs_i64: next.needs_i64,
-                            });
                         }
+                    } else {
+                        info!(
+                            "DIAG: source {} ({}) cross-part pipeline trigger fired for part {} (sent_idx={}/{}) but no eligible next part found (queue_idx={}, queue_len={})",
+                            _src_idx, addr, part_idx, sent_idx, batches.len(),
+                            queue_idx, part_queue.len(),
+                        );
                     }
                 }
             }
@@ -4635,8 +4726,11 @@ async fn download_parts_from_source(
 }
 
 /// Pre-computed pipeline state for the next part this source should
-/// download, so the receive loop can ship its first OP_REQUESTPARTS
-/// without yet allocating for the rest of the batches' send budget.
+/// download. After fixing the queue-misalignment bug the caller now
+/// only consumes `part_idx` and recomputes the rest via
+/// `compute_part_blocks_ms`, but the other fields stay populated so a
+/// future caller can reuse the work without a second pass.
+#[allow(dead_code)]
 struct PipelineCandidate {
     part_idx: usize,
     all_blocks: Vec<(u64, u64)>,
