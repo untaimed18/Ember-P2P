@@ -5,6 +5,16 @@ use super::messages::EMBLOCKSIZE;
 
 const BAN_CORRUPTION_RATIO: f64 = 0.32;
 
+/// Minimum total bytes contributed by a single IP before its corruption
+/// ratio is even considered for banning. The previous code would ban an
+/// IP that contributed 1×EMBLOCKSIZE corrupt + 1×EMBLOCKSIZE clean (50% >
+/// 32%), even though that's nowhere near a statistically reliable
+/// signal. Three full eMule blocks (~540 KiB) is a small enough sample
+/// that a deliberately corrupting peer trips it quickly, but big enough
+/// to absorb a single bad block on a peer that's otherwise providing
+/// valid data.
+const MIN_BYTES_FOR_BAN_DECISION: u64 = 3 * EMBLOCKSIZE;
+
 #[derive(Debug, Clone)]
 struct RecordedBlock {
     start: u64,
@@ -139,6 +149,16 @@ impl CorruptionBlackBox {
                 continue;
             }
             let total = ip_total.get(ip).copied().unwrap_or(1);
+            // Require enough total volume from this IP for the ratio to
+            // be statistically meaningful. Without this guard, an IP
+            // that contributed exactly one EMBLOCKSIZE of corrupt data
+            // (and nothing else) hits 100% ratio and gets banned on
+            // first contact — even though the same bytes from a
+            // disk-bit-flip-prone client would be re-fetched cleanly
+            // from a different IP and cost us nothing.
+            if total < MIN_BYTES_FOR_BAN_DECISION {
+                continue;
+            }
             let ratio = *corrupt_bytes as f64 / total as f64;
             if ratio >= BAN_CORRUPTION_RATIO {
                 ban_list.push(*ip);
@@ -205,17 +225,37 @@ mod tests {
         let mut bb = CorruptionBlackBox::new();
         let h = hash(3);
 
-        // ip_bad sends EMBLOCKSIZE bytes of data that will be flagged corrupt
+        // ip_bad sends 3*EMBLOCKSIZE of corrupt data — enough to exceed
+        // MIN_BYTES_FOR_BAN_DECISION so the ratio test fires.
         let bad = ip(10, 0, 0, 1);
-        bb.record_data(h, 0, EMBLOCKSIZE, bad);
+        bb.record_data(h, 0, MIN_BYTES_FOR_BAN_DECISION, bad);
 
-        // ip_good sends a separate range
+        // ip_good sends a separate clean range
         let good = ip(10, 0, 0, 2);
-        bb.record_data(h, EMBLOCKSIZE, EMBLOCKSIZE * 2, good);
+        bb.record_data(
+            h,
+            MIN_BYTES_FOR_BAN_DECISION,
+            MIN_BYTES_FOR_BAN_DECISION * 2,
+            good,
+        );
 
-        let banned = bb.corrupted_part(&h, 0, EMBLOCKSIZE);
+        let banned = bb.corrupted_part(&h, 0, MIN_BYTES_FOR_BAN_DECISION);
         assert!(banned.contains(&bad));
         assert!(!banned.contains(&good));
+    }
+
+    #[test]
+    fn small_volume_ip_not_banned_even_at_100_percent_ratio() {
+        // Regression: previously a peer that contributed a single bad
+        // EMBLOCKSIZE (100% corrupt ratio) was banned on first contact.
+        // The MIN_BYTES_FOR_BAN_DECISION guard now requires enough
+        // sample size before the ratio test applies.
+        let mut bb = CorruptionBlackBox::new();
+        let h = hash(8);
+        let suspect = ip(10, 0, 0, 9);
+        bb.record_data(h, 0, EMBLOCKSIZE, suspect);
+        let banned = bb.corrupted_part(&h, 0, EMBLOCKSIZE);
+        assert!(banned.is_empty());
     }
 
     #[test]

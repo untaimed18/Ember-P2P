@@ -30,6 +30,19 @@ pub type SharedTrackerRegistry = Arc<std::sync::Mutex<HashMap<String, Arc<RwLock
 /// Maximum decompressed part size (PARTSIZE + margin = 10 MiB)
 const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
 
+/// Persist a `.part.met` snapshot on the blocking pool without blocking
+/// the caller. The caller MUST have already dropped any tracker
+/// `RwLock` guard before invoking this — the previous design held
+/// `tracker.read().await` across `atomic_write`, which serialized all
+/// concurrent writers behind the fsync.
+fn spawn_save_snapshot(snap: super::part_tracker::SaveSnapshot) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = snap.write_to_disk() {
+            tracing::warn!("part.met save failed: {e}");
+        }
+    });
+}
+
 /// Maximum simultaneous source connections per download.
 /// eMule typically has ~10 active connections per file.
 const MAX_CONCURRENT_SOURCES: usize = 10;
@@ -358,11 +371,14 @@ impl MultiSourceDownload {
                     "Part tracker shows progress but .part file is missing for {} — resetting",
                     self.transfer_id
                 );
-                let mut t = tracker.write().await;
-                *t = PartTracker::new_empty(self.file_size, &part_path);
-                t.set_file_hash(self.file_hash);
-                t.set_file_name(&self.file_name);
-                t.save();
+                let snap = {
+                    let mut t = tracker.write().await;
+                    *t = PartTracker::new_empty(self.file_size, &part_path);
+                    t.set_file_hash(self.file_hash);
+                    t.set_file_name(&self.file_name);
+                    t.snapshot_for_save()
+                };
+                spawn_save_snapshot(snap);
             }
         }
 
@@ -545,9 +561,14 @@ impl MultiSourceDownload {
             })
             .await;
 
-        // Progress aggregator channel: i64 signals used as a trigger (value ignored);
-        // actual progress is read from the tracker to avoid double-counting overlapping sources.
-        let (progress_tx, mut progress_rx) = mpsc::channel::<(usize, i64)>(256);
+        // Progress aggregator channel: i64 signals used as a trigger
+        // (value ignored); actual progress is read from the tracker to
+        // avoid double-counting overlapping sources. Capacity 4096 (was
+        // 256): with up to MAX_CONCURRENT_SOURCES sources each pushing a
+        // signal per ~180 KiB block, 256 was easily filled while the
+        // aggregator was waiting on `event_tx_clone.send().await`,
+        // back-pressuring every source coroutine.
+        let (progress_tx, mut progress_rx) = mpsc::channel::<(usize, i64)>(4096);
         let transfer_id = self.transfer_id.clone();
         let file_size = self.file_size;
         let event_tx_clone = event_tx.clone();
@@ -556,16 +577,88 @@ impl MultiSourceDownload {
         let agg_total = total_sources.clone();
         let agg_tracker = tracker.clone();
 
+        // Coalesce Progress / SourcesUpdate emissions to a fixed cadence
+        // (~200 ms). The previous design fired one `transfer-progress`
+        // Tauri event per received block, which saturated the webview
+        // main thread with up to thousands of events/sec on a healthy
+        // swarm. The DB persist side is already throttled, so the only
+        // consumer that benefits from sub-second granularity is the UI,
+        // and 200 ms is well below human flicker perception.
         let aggregator = tokio::spawn(async move {
+            const EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
             let mut last_active: u32 = 0;
             let mut last_queued: u32 = 0;
             let mut last_total: u32 = agg_total.load(Ordering::Relaxed);
+            let mut pending_progress = false;
+            let mut last_emitted_bytes: u64 = 0;
+            let mut interval = tokio::time::interval(EMIT_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Skip the immediate first tick so we don't emit before any
+            // data arrives.
+            interval.tick().await;
 
-            while let Some((_source_idx, _bytes)) = progress_rx.recv().await {
-                let capped = {
-                    let t = agg_tracker.read().await;
-                    t.completed_bytes().min(file_size)
-                };
+            loop {
+                tokio::select! {
+                    sig = progress_rx.recv() => {
+                        match sig {
+                            Some(_) => { pending_progress = true; }
+                            None => break,
+                        }
+                    }
+                    _ = interval.tick() => {
+                        let cur_active = agg_active.load(Ordering::Relaxed);
+                        let cur_queued = agg_queued.load(Ordering::Relaxed);
+                        let cur_total = agg_total.load(Ordering::Relaxed);
+                        let sources_changed = cur_active != last_active
+                            || cur_queued != last_queued
+                            || cur_total != last_total;
+
+                        if pending_progress || sources_changed {
+                            let capped = {
+                                let t = agg_tracker.read().await;
+                                t.completed_bytes().min(file_size)
+                            };
+                            // Skip the Progress emit when nothing actually
+                            // changed (e.g. only `pending_progress` from a
+                            // negative correction that landed at the same
+                            // total). Saves a UI round-trip when sources
+                            // are flapping but bytes are static.
+                            if pending_progress && capped != last_emitted_bytes {
+                                let _ = event_tx_clone
+                                    .send(DownloadEvent::Progress {
+                                        transfer_id: transfer_id.clone(),
+                                        downloaded: capped,
+                                        total: file_size,
+                                    })
+                                    .await;
+                                last_emitted_bytes = capped;
+                            }
+                            pending_progress = false;
+
+                            if sources_changed {
+                                last_active = cur_active;
+                                last_queued = cur_queued;
+                                last_total = cur_total;
+                                let _ = event_tx_clone
+                                    .send(DownloadEvent::SourcesUpdate {
+                                        transfer_id: transfer_id.clone(),
+                                        total: cur_total,
+                                        active: cur_active,
+                                        queued: cur_queued,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            }
+            // Final flush so the UI sees the final byte count when the
+            // last source closes.
+            let capped = {
+                let t = agg_tracker.read().await;
+                t.completed_bytes().min(file_size)
+            };
+            if capped != last_emitted_bytes {
                 let _ = event_tx_clone
                     .send(DownloadEvent::Progress {
                         transfer_id: transfer_id.clone(),
@@ -573,23 +666,6 @@ impl MultiSourceDownload {
                         total: file_size,
                     })
                     .await;
-
-                let cur_active = agg_active.load(Ordering::Relaxed);
-                let cur_queued = agg_queued.load(Ordering::Relaxed);
-                let cur_total = agg_total.load(Ordering::Relaxed);
-                if cur_active != last_active || cur_queued != last_queued || cur_total != last_total {
-                    last_active = cur_active;
-                    last_queued = cur_queued;
-                    last_total = cur_total;
-                    let _ = event_tx_clone
-                        .send(DownloadEvent::SourcesUpdate {
-                            transfer_id: transfer_id.clone(),
-                            total: cur_total,
-                            active: cur_active,
-                            queued: cur_queued,
-                        })
-                        .await;
-                }
             }
         });
 
@@ -597,16 +673,16 @@ impl MultiSourceDownload {
         // the network with dozens of simultaneous TCP handshakes to unreachable peers)
         let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SOURCES));
 
-        let shared_part_file: Arc<std::sync::Mutex<std::fs::File>> = {
-            let pp = part_path.clone();
-            Arc::new(std::sync::Mutex::new(
-                tokio::task::spawn_blocking(move || {
-                    std::fs::OpenOptions::new().write(true).read(true).open(&pp)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("spawn_blocking open: {e}"))??
-            ))
-        };
+        // Per-file writer with its own dedicated thread. Replaces the
+        // previous `Arc<Mutex<File>>` pattern that serialized all writers
+        // on a single OS-mutex and burned a `spawn_blocking` slot per
+        // 180 KiB block. See `network::ed2k::write_coordinator`.
+        let shared_part_file = super::write_coordinator::PartFileWriter::open(
+            part_path.clone(),
+            super::write_coordinator::OpenMode::OpenExisting,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("open part file: {e}"))?;
 
         // Spawn per-source download tasks
         let mut handles = Vec::new();
@@ -820,7 +896,14 @@ impl MultiSourceDownload {
                 tokio::select! {
                     result = async {
                         if pending_futs.is_empty() {
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            // Idle pacing: was 2s, now 250ms. The
+                            // `select!` already wakes immediately when a
+                            // new source is injected via `new_source_rx`,
+                            // so this only matters when *no* source
+                            // arrives — and 250ms is responsive enough
+                            // for the periodic re-check of completion /
+                            // outer state without burning CPU.
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                             None
                         } else {
                             pending_futs.next().await
@@ -1571,18 +1654,22 @@ impl MultiSourceDownload {
                 // Hash failed — re-open all parts as incomplete so retries
                 // can re-download them (we can't identify which parts are
                 // corrupt without per-part hashes).
-                let corrected_bytes = {
+                let (corrected_bytes, snap) = {
                     let mut t = tracker.write().await;
                     for i in 0..t.part_count {
                         t.mark_incomplete(i);
                     }
-                    t.save();
                     warn!(
                         "Final hash failed for {} — re-opened all {} parts for retry",
                         self.file_name, t.part_count
                     );
-                    t.completed_bytes()
+                    (t.completed_bytes(), t.snapshot_for_save())
                 };
+                // Awaited save here: this is a terminal failure path and
+                // we want the .part.met on disk to reflect the reset
+                // before signaling the failure (so a quick restart picks
+                // up the corrected gap list).
+                super::part_tracker::save_snapshot_async(snap).await;
                 let _ = event_tx
                     .send(DownloadEvent::Progress {
                         transfer_id: self.transfer_id.clone(),
@@ -1603,10 +1690,11 @@ impl MultiSourceDownload {
                 let t = tracker.read().await;
                 t.part_count - t.completed_count()
             };
-            {
+            let snap = {
                 let t = tracker.read().await;
-                t.save();
-            }
+                t.snapshot_for_save()
+            };
+            super::part_tracker::save_snapshot_async(snap).await;
             let _ = event_tx
                 .send(DownloadEvent::Failed {
                     transfer_id: self.transfer_id.clone(),
@@ -1719,7 +1807,7 @@ async fn download_parts_from_source(
     obfuscation_enabled: bool,
     server_addr: Option<SocketAddr>,
     queue_wait_secs: u64,
-    shared_output: Option<Arc<std::sync::Mutex<std::fs::File>>>,
+    shared_output: Option<super::write_coordinator::PartFileWriter>,
     ember_payload: crate::network::ember::SharedEmberPayload,
     ember_payload_generation: crate::network::ember::EmberPayloadGeneration,
     aich_pending: Option<super::transfer::SharedAichPending>,
@@ -1747,7 +1835,6 @@ async fn download_parts_from_source(
     pre_established: Option<EstablishedStream>,
 ) -> anyhow::Result<()> {
     use super::messages::*;
-    use std::io::{Read, Seek, Write};
     use tokio::net::TcpStream;
 
     let addr: SocketAddr = format!("{}:{}", source.peer_ip, source.peer_port).parse()?;
@@ -3069,14 +3156,12 @@ async fn download_parts_from_source(
     let output = if let Some(shared) = shared_output {
         shared
     } else {
-        let pp = part_path.to_path_buf();
-        Arc::new(std::sync::Mutex::new(
-            tokio::task::spawn_blocking(move || {
-                std::fs::OpenOptions::new().write(true).read(true).open(&pp)
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??
-        ))
+        super::write_coordinator::PartFileWriter::open(
+            part_path.to_path_buf(),
+            super::write_coordinator::OpenMode::OpenExisting,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("open part file: {e}"))?
     };
 
     // eMule-style adaptive pipelining: keeps 1-3 request packets outstanding
@@ -3328,33 +3413,14 @@ async fn download_parts_from_source(
                     bw.acquire_download(piece_len).await;
 
                     // D20: only commit the fill_range to the tracker if the
-                    // disk write actually succeeded. Previously fill_range
-                    // could run before the write and a spawn_blocking error
-                    // would leave the tracker thinking bytes were on disk.
-                    let write_result = {
-                        let out = output.clone();
-                        let buf = data.to_vec();
-                        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                            let mut f = out.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "file lock poisoned"))?;
-                            f.seek(std::io::SeekFrom::Start(start))?;
-                            f.write_all(&buf)?;
-                            Ok(())
-                        }).await
-                    };
-                    match write_result {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            tracing::warn!(
-                                "source {_src_idx}: disk write failed at start={start} ({piece_len} bytes): {e}"
-                            );
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "source {_src_idx}: blocking-write task failed: {e}"
-                            );
-                            continue;
-                        }
+                    // disk write actually succeeded. The PartFileWriter
+                    // serializes the writes for us — this `await` is just
+                    // an mpsc round-trip, not a global file lock acquisition.
+                    if let Err(e) = output.write(start, data.to_vec()).await {
+                        tracing::warn!(
+                            "source {_src_idx}: disk write failed at start={start} ({piece_len} bytes): {e}"
+                        );
+                        continue;
                     }
 
                     // Update byte-level gap tracker for mid-part resume.
@@ -3426,14 +3492,11 @@ async fn download_parts_from_source(
                     consecutive_bad_blocks = 0;
                     bw.acquire_download(piece_len).await;
 
-                    {
-                        let out = output.clone();
-                        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                            let mut f = out.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "file lock poisoned"))?;
-                            f.seek(std::io::SeekFrom::Start(start))?;
-                            f.write_all(&decompressed)?;
-                            Ok(())
-                        }).await.map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+                    if let Err(e) = output.write(start, decompressed).await {
+                        tracing::warn!(
+                            "source {_src_idx}: compressed disk write failed at start={start} ({piece_len} bytes): {e}"
+                        );
+                        continue;
                     }
 
                     {
@@ -3736,26 +3799,37 @@ async fn download_parts_from_source(
             }
 
             if last_periodic_save.elapsed() >= PERIODIC_SAVE_INTERVAL {
-                let t = tracker.read().await;
-                t.save();
+                // CRITICAL: take the snapshot under the lock, then drop the
+                // lock BEFORE the disk write. Previously this held
+                // `tracker.read().await` across `atomic_write+fsync` —
+                // which blocked every writer trying to call `fill_range`
+                // for the duration of the fsync.
+                let snap = {
+                    let t = tracker.read().await;
+                    t.snapshot_for_save()
+                };
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = snap.write_to_disk() {
+                        tracing::warn!("periodic part.met save failed: {e}");
+                    }
+                });
                 last_periodic_save = std::time::Instant::now();
             }
         }
 
-        // Sync writes to disk before reading back for verification
-        {
-            let out = output.clone();
-            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                let f = out.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "file lock poisoned"))?;
-                f.sync_data()?;
-                Ok(())
-            }).await.map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
-        }
+        // No pre-verification fsync: the writer thread reads from the same
+        // open file handle it wrote with, so the OS page cache is
+        // self-consistent. Skipping fsync here removes a per-part disk
+        // round-trip (tens of ms on HDDs / network shares) without
+        // affecting correctness — the final fsync still runs at completion.
 
         if peer_out_of_parts {
-            let mut t = tracker.write().await;
-            t.set_in_progress(part_idx, false);
-            t.save();
+            let snap = {
+                let mut t = tracker.write().await;
+                t.set_in_progress(part_idx, false);
+                t.snapshot_for_save()
+            };
+            spawn_save_snapshot(snap);
             ip_guard.unmark(part_idx);
             continue;
         }
@@ -3772,9 +3846,12 @@ async fn download_parts_from_source(
                     _src_idx, part_idx
                 );
                 drop(t);
-                let mut t = tracker.write().await;
-                t.set_in_progress(part_idx, false);
-                t.save();
+                let snap = {
+                    let mut t = tracker.write().await;
+                    t.set_in_progress(part_idx, false);
+                    t.snapshot_for_save()
+                };
+                spawn_save_snapshot(snap);
                 ip_guard.unmark(part_idx);
                 continue;
             }
@@ -3790,20 +3867,14 @@ async fn download_parts_from_source(
                 let part_len = (pe - ps) as usize;
                 drop(t);
 
-                let part_data = {
-                    let out = output.clone();
-                    tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
-                        let mut f = out.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "file lock poisoned"))?;
-                        f.seek(std::io::SeekFrom::Start(ps))?;
-                        let mut buf = vec![0u8; part_len];
-                        f.read_exact(&mut buf)?;
-                        Ok(buf)
-                    }).await.map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??
-                };
-
-                use digest::Digest;
-                use md4::Md4;
-                let actual_hash: [u8; 16] = Md4::digest(&part_data).into();
+                // Read + MD4 in one writer-thread round-trip: the hash
+                // never runs on an async worker, and there's no second
+                // file-lock acquisition (the writer thread serializes us
+                // anyway).
+                let (part_data, actual_hash) = output
+                    .hash_part_md4(ps, part_len)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("part hash read at {ps}: {e}"))?;
 
                 if actual_hash != expected_hash {
                     let aich_hs = super::aich::AICHRecoveryHashSet::build_from_data(&part_data);
@@ -3877,7 +3948,7 @@ async fn download_parts_from_source(
                             ) {
                                 if !corrupt.is_empty() {
                                     let mut invalidated = 0u64;
-                                    {
+                                    let snap = {
                                         let mut t = tracker.write().await;
                                         for &bi in &corrupt {
                                             let rel = bi as u64 * super::aich::AICH_BLOCK_SIZE as u64;
@@ -3887,8 +3958,9 @@ async fn download_parts_from_source(
                                             t.invalidate_range(gs, ge);
                                             invalidated += ge - gs;
                                         }
-                                        t.save();
-                                    }
+                                        t.snapshot_for_save()
+                                    };
+                                    spawn_save_snapshot(snap);
                                     let _ = progress_tx
                                         .send((_src_idx, -(invalidated as i64)))
                                         .await;
@@ -3943,21 +4015,27 @@ async fn download_parts_from_source(
 
         match part_hash_outcome {
             PartHashOutcome::AichNarrowed => {
-                let mut t = tracker.write().await;
-                t.set_in_progress(part_idx, false);
-                t.save();
+                let snap = {
+                    let mut t = tracker.write().await;
+                    t.set_in_progress(part_idx, false);
+                    t.snapshot_for_save()
+                };
+                spawn_save_snapshot(snap);
                 ip_guard.unmark(part_idx);
                 continue;
             }
             PartHashOutcome::Verified => {
-                let mut t = tracker.write().await;
-                let (ps, pe) = t.part_range(part_idx);
-                t.mark_complete(part_idx);
-                // Flip the persistent verified flag so the upload path can
-                // serve this range (see PartTracker::is_range_safe_to_serve).
-                t.set_part_verified(part_idx);
-                t.set_in_progress(part_idx, false);
-                t.save();
+                let (ps, pe, snap) = {
+                    let mut t = tracker.write().await;
+                    let (ps, pe) = t.part_range(part_idx);
+                    t.mark_complete(part_idx);
+                    // Flip the persistent verified flag so the upload path
+                    // can serve this range (see is_range_safe_to_serve).
+                    t.set_part_verified(part_idx);
+                    t.set_in_progress(part_idx, false);
+                    (ps, pe, t.snapshot_for_save())
+                };
+                spawn_save_snapshot(snap);
                 ip_guard.unmark(part_idx);
                 // D12: flush accumulated bytes to the credit ledger now
                 // that this peer's contribution went into a verified part.
@@ -3980,16 +4058,17 @@ async fn download_parts_from_source(
                 }
             }
             PartHashOutcome::Mismatch => {
-                let mut t = tracker.write().await;
-                let (ps, pe) = t.part_range(part_idx);
-                // D15: the inner verification block has already sent a
-                // progress correction for this part (using part_len);
-                // don't double-subtract here.
-                let _ = (ps, pe);
-                t.mark_incomplete(part_idx);
-                t.set_in_progress(part_idx, false);
-                t.save();
-                drop(t);
+                let (ps, pe, snap) = {
+                    let mut t = tracker.write().await;
+                    let (ps, pe) = t.part_range(part_idx);
+                    // D15: the inner verification block has already sent a
+                    // progress correction for this part (using part_len);
+                    // don't double-subtract here.
+                    t.mark_incomplete(part_idx);
+                    t.set_in_progress(part_idx, false);
+                    (ps, pe, t.snapshot_for_save())
+                };
+                spawn_save_snapshot(snap);
                 ip_guard.unmark(part_idx);
                 // D12: drop the pending credit bytes — the peer sent data
                 // that didn't verify, so no credit accrues.
@@ -4007,9 +4086,12 @@ async fn download_parts_from_source(
                 }
             }
             PartHashOutcome::Unverified => {
-                let mut t = tracker.write().await;
-                t.set_in_progress(part_idx, false);
-                t.save();
+                let snap = {
+                    let mut t = tracker.write().await;
+                    t.set_in_progress(part_idx, false);
+                    t.snapshot_for_save()
+                };
+                spawn_save_snapshot(snap);
                 ip_guard.unmark(part_idx);
             }
         }

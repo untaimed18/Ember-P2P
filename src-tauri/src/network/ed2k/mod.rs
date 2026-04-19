@@ -22,3 +22,4 @@ pub mod sources;
 pub mod tcp_obfuscation;
 pub mod transfer;
 pub mod upload;
+pub mod write_coordinator;

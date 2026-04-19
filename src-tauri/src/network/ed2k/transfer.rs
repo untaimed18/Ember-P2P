@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Read, Seek, Write};
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1685,58 +1685,43 @@ impl Ed2kDownload {
             tracker.set_part_hashes(part_hashes.clone());
         }
 
-        let output: Arc<std::sync::Mutex<std::fs::File>> = {
-            let pp = part_path.clone();
-            let fs = self.file_size;
+        // Per-file writer: dedicated thread + bounded channel replaces the
+        // previous `Arc<Mutex<File>>`-with-`spawn_blocking`-per-block pattern
+        // that serialized all writes on a single mutex. See
+        // `network::ed2k::write_coordinator` for design notes.
+        let output = {
             let completed_bytes = tracker.completed_bytes();
             let completed_parts = tracker.completed_count();
             let total_parts = tracker.part_count;
-            Arc::new(std::sync::Mutex::new(
-                tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
-                    let existing_len = if pp.exists() {
-                        std::fs::metadata(&pp)?.len()
-                    } else {
-                        0
-                    };
-                    // Never truncate a non-empty .part when .part.met reports 0 completed bytes
-                    // (e.g. corrupt/missing metadata) — that would destroy recoverable data.
-                    let resuming = completed_bytes > 0 || existing_len > 0;
-                    if resuming {
-                        if completed_bytes > 0 {
-                            info!(
-                                "Resuming download: {completed_parts}/{total_parts} parts complete"
-                            );
-                        } else {
-                            warn!(
-                                "Preserving non-empty .part ({existing_len} bytes) while resume metadata shows no completed bytes — \
-                                 .part.met may be missing or corrupt"
-                            );
-                        }
-                        let f = std::fs::OpenOptions::new()
-                            .create(true)
-                            .write(true)
-                            .read(true)
-                            .open(&pp)?;
-                        if fs > 0 && f.metadata()?.len() != fs {
-                            f.set_len(fs)?;
-                        }
-                        Ok(f)
-                    } else {
-                        let f = std::fs::OpenOptions::new()
-                            .create(true)
-                            .write(true)
-                            .read(true)
-                            .truncate(true)
-                            .open(&pp)?;
-                        if fs > 0 {
-                            f.set_len(fs)?;
-                        }
-                        Ok(f)
-                    }
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??,
-            ))
+            let existing_len = if part_path.exists() {
+                tokio::fs::metadata(&part_path).await.map(|m| m.len()).unwrap_or(0)
+            } else {
+                0
+            };
+            // Never truncate a non-empty .part when .part.met reports 0 completed bytes
+            // (e.g. corrupt/missing metadata) — that would destroy recoverable data.
+            let resuming = completed_bytes > 0 || existing_len > 0;
+            if resuming {
+                if completed_bytes > 0 {
+                    info!(
+                        "Resuming download: {completed_parts}/{total_parts} parts complete"
+                    );
+                } else {
+                    warn!(
+                        "Preserving non-empty .part ({existing_len} bytes) while resume metadata shows no completed bytes — \
+                         .part.met may be missing or corrupt"
+                    );
+                }
+            }
+            super::write_coordinator::PartFileWriter::open(
+                part_path.clone(),
+                super::write_coordinator::OpenMode::CreateOrOpen {
+                    set_len_to: if self.file_size > 0 { Some(self.file_size) } else { None },
+                    truncate_existing: !resuming,
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("open part file: {e}"))?
         };
 
         let mut downloaded: u64 = tracker.completed_bytes();
@@ -1752,6 +1737,15 @@ impl Ed2kDownload {
         let mut speed_measure_bytes: u64 = 0;
         let mut last_periodic_save = std::time::Instant::now();
         const PERIODIC_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+        // Throttle DownloadEvent::Progress emission. The DB persist side is
+        // already throttled (3s), but the Tauri UI emit and the
+        // transfer_manager.write() happen per-event, so a fast peer with
+        // ~180 KiB blocks otherwise hits the webview hundreds of times per
+        // second. ~200 ms is smooth enough for the UI without saturating it.
+        let mut last_progress_emit = std::time::Instant::now()
+            - std::time::Duration::from_millis(500);
+        const PROGRESS_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
         let mut last_epx_resend = std::time::Instant::now();
         // Use the generation we sent at handshake as the resend baseline so
         // any rebuild during file-status / queue wait gets re-sent on the
@@ -1972,16 +1966,12 @@ impl Ed2kDownload {
                             let piece_len = end - start;
                             self.acquire_download_bandwidth(piece_len).await;
 
-                            {
-                                let out = output.clone();
-                                let buf = data.to_vec();
-                                tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                                    let mut f = out.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "file lock poisoned"))?;
-                                    f.seek(std::io::SeekFrom::Start(start))?;
-                                    f.write_all(&buf)?;
-                                    Ok(())
-                                }).await.map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
-                            }
+                            // Per-file writer thread serializes the writes for
+                            // us; await is just an mpsc round-trip.
+                            output
+                                .write(start, data.to_vec())
+                                .await
+                                .map_err(|e| anyhow::anyhow!("part write at {start}: {e}"))?;
 
                             // Update byte-level gap tracker for mid-part resume
                             tracker.fill_range(start, end);
@@ -2010,13 +2000,16 @@ impl Ed2kDownload {
                             // D12: defer credit until the part verifies.
                             pending_credit_bytes = pending_credit_bytes.saturating_add(piece_len);
 
-                            let _ = event_tx
-                                .send(DownloadEvent::Progress {
-                                    transfer_id: self.transfer_id.clone(),
-                                    downloaded: downloaded.min(self.file_size),
-                                    total: self.file_size,
-                                })
-                                .await;
+                            if last_progress_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
+                                let _ = event_tx
+                                    .send(DownloadEvent::Progress {
+                                        transfer_id: self.transfer_id.clone(),
+                                        downloaded: downloaded.min(self.file_size),
+                                        total: self.file_size,
+                                    })
+                                    .await;
+                                last_progress_emit = std::time::Instant::now();
+                            }
                         }
                         (OP_EMULEPROT, OP_COMPRESSEDPART_I64)
                         | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
@@ -2055,15 +2048,10 @@ impl Ed2kDownload {
                             consecutive_bad_blocks = 0;
                             self.acquire_download_bandwidth(piece_len).await;
 
-                            {
-                                let out = output.clone();
-                                tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                                    let mut f = out.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "file lock poisoned"))?;
-                                    f.seek(std::io::SeekFrom::Start(start))?;
-                                    f.write_all(&decompressed)?;
-                                    Ok(())
-                                }).await.map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
-                            }
+                            output
+                                .write(start, decompressed)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("part write at {start}: {e}"))?;
                             tracker.fill_range(start, start + piece_len);
 
                             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
@@ -2090,13 +2078,16 @@ impl Ed2kDownload {
                             // D12: defer credit until the part verifies.
                             pending_credit_bytes = pending_credit_bytes.saturating_add(piece_len);
 
-                            let _ = event_tx
-                                .send(DownloadEvent::Progress {
-                                    transfer_id: self.transfer_id.clone(),
-                                    downloaded: downloaded.min(self.file_size),
-                                    total: self.file_size,
-                                })
-                                .await;
+                            if last_progress_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
+                                let _ = event_tx
+                                    .send(DownloadEvent::Progress {
+                                        transfer_id: self.transfer_id.clone(),
+                                        downloaded: downloaded.min(self.file_size),
+                                        total: self.file_size,
+                                    })
+                                    .await;
+                                last_progress_emit = std::time::Instant::now();
+                            }
                         }
                         (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
                             info!("Peer session limit reached (OutOfPartReqs), will re-queue");
@@ -2303,7 +2294,17 @@ impl Ed2kDownload {
                     }
 
                     if last_periodic_save.elapsed() >= PERIODIC_SAVE_INTERVAL {
-                        tracker.save();
+                        // Fire-and-forget: snapshot inline, then save on a
+                        // blocking thread without awaiting. We don't need
+                        // periodic-save to block the receive loop — the
+                        // next periodic tick (or the per-part save above)
+                        // will catch any failure.
+                        let snap = tracker.snapshot_for_save();
+                        tokio::task::spawn_blocking(move || {
+                            if let Err(e) = snap.write_to_disk() {
+                                tracing::warn!("periodic part.met save failed: {e}");
+                            }
+                        });
                         last_periodic_save = std::time::Instant::now();
                     }
                 }
@@ -2334,20 +2335,12 @@ impl Ed2kDownload {
                     let (ps, pe) = tracker.part_range(part_idx);
                     let part_len = (pe - ps) as usize;
 
-                    let part_data = {
-                        let out = output.clone();
-                        tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
-                            let mut f = out.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "file lock poisoned"))?;
-                            f.seek(std::io::SeekFrom::Start(ps))?;
-                            let mut buf = vec![0u8; part_len];
-                            f.read_exact(&mut buf)?;
-                            Ok(buf)
-                        }).await.map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??
-                    };
-
-                    use digest::Digest;
-                    use md4::Md4;
-                    let actual_hash: [u8; 16] = Md4::digest(&part_data).into();
+                    // Read + MD4 in one writer-thread round-trip — keeps the
+                    // hash off the async runtime and avoids re-locking the file.
+                    let (part_data, actual_hash) = output
+                        .hash_part_md4(ps, part_len)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("part hash read at {ps}: {e}"))?;
 
                     if actual_hash != expected_hash {
                         let aich_part = super::aich::compute_aich_part(&part_data);
@@ -2509,7 +2502,20 @@ impl Ed2kDownload {
                         { pending_credit_bytes = 0; }
                     }
                 }
-                tracker.save();
+                // Force one Progress emit at part boundary so the UI sees
+                // verified-part jumps even if the throttle just fired.
+                let _ = event_tx
+                    .send(DownloadEvent::Progress {
+                        transfer_id: self.transfer_id.clone(),
+                        downloaded: downloaded.min(self.file_size),
+                        total: self.file_size,
+                    })
+                    .await;
+                last_progress_emit = std::time::Instant::now();
+                // Save .part.met off-runtime: snapshot under no lock, then
+                // run atomic_write on a blocking task. Avoids stalling the
+                // download loop on fsync.
+                super::part_tracker::save_snapshot_async(tracker.snapshot_for_save()).await;
             }
 
             // If peer ended the session, reset flag for next retry round
@@ -2544,14 +2550,12 @@ impl Ed2kDownload {
             );
         }
 
-        {
-            let out = output.clone();
-            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                let f = out.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "file lock poisoned"))?;
-                f.sync_data()?;
-                Ok(())
-            }).await.map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
-        }
+        // One fsync at completion — the writer thread runs sync_data on the
+        // dedicated thread, so we don't block the async runtime here.
+        output
+            .sync_data()
+            .await
+            .map_err(|e| anyhow::anyhow!("part file fsync: {e}"))?;
         drop(output);
 
         let _ = event_tx

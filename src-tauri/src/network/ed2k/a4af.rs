@@ -1,8 +1,20 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-/// eMule PURGESOURCESWAPSTOP: minimum time between swaps for the same source (15 min)
+/// eMule PURGESOURCESWAPSTOP: minimum time between swaps for the same source (15 min).
+/// Applied to peers that are actively transferring — keeps us protocol-compatible
+/// with eMule's swap pacing and avoids hammering peers with re-asks.
 const PURGE_SOURCE_SWAP_STOP_SECS: i64 = 15 * 60;
+
+/// Shorter swap cooldown for sources whose currently-assigned file is
+/// **starved** (zero active sources for it). Since the peer isn't actively
+/// uploading to us anyway, the protocol-etiquette argument for the long
+/// cooldown doesn't apply — we're just deciding which queue to wait in.
+/// 2 minutes is well above any peer's queue-recalculation interval, so we
+/// don't generate spurious re-ask traffic, but it's an order of magnitude
+/// faster than the 15-minute default for when the user adds a new file
+/// and wants peers to migrate over.
+const STARVED_SWAP_STOP_SECS: i64 = 2 * 60;
 
 /// A4AF (Asked For Another File) source management.
 /// Tracks sources that are known to have files we want but are currently
@@ -121,9 +133,18 @@ impl A4AFManager {
             };
 
             for entry in entries {
-                // Suspension: don't re-swap too quickly
+                // Suspension: don't re-swap too quickly. Starved-target
+                // override: when the file we want to swap *to* has zero
+                // active sources, drop the cooldown to STARVED_SWAP_STOP_SECS
+                // so a file the user just added can pull peers in
+                // promptly. Still honours a cooldown to avoid re-ask spam.
+                let cooldown_secs = if target.active_source_count == 0 {
+                    STARVED_SWAP_STOP_SECS
+                } else {
+                    PURGE_SOURCE_SWAP_STOP_SECS
+                };
                 if entry.last_swap_time > 0
-                    && now - entry.last_swap_time < PURGE_SOURCE_SWAP_STOP_SECS
+                    && now - entry.last_swap_time < cooldown_secs
                 {
                     continue;
                 }

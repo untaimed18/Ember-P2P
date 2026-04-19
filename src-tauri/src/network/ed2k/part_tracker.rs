@@ -382,6 +382,27 @@ impl PartTracker {
         }
     }
 
+    /// Snapshot the small persistent state needed to write `.part.met`.
+    /// Cheap clone of three short vectors; the produced `SaveSnapshot` is
+    /// `Send` and can be passed to `tokio::task::spawn_blocking` so the
+    /// caller can drop any `RwLock` guard *before* fsync — fixing the
+    /// stall where reader/writer tasks blocked on the tracker lock during
+    /// the periodic `.part.met` save.
+    ///
+    /// File-format byte-for-byte identical to `save_emule_format` so eMule
+    /// resume metadata interop is preserved.
+    pub fn snapshot_for_save(&self) -> SaveSnapshot {
+        SaveSnapshot {
+            met_path: self.met_path.clone(),
+            file_size: self.file_size,
+            file_hash: self.file_hash,
+            file_name: self.file_name.clone(),
+            part_hashes: self.part_hashes.clone(),
+            gaps: self.gaps.clone(),
+            part_verified: self.part_verified.clone(),
+        }
+    }
+
     /// Save in eMule-compatible .part.met format.
     fn save_emule_format(&self) -> anyhow::Result<()> {
         let mut buf: Vec<u8> = Vec::with_capacity(512);
@@ -729,6 +750,118 @@ impl PartTracker {
 
     pub fn delete_met(&self) {
         let _ = std::fs::remove_file(&self.met_path);
+    }
+}
+
+/// Lock-free, owned snapshot of everything needed to rewrite `.part.met`.
+/// Produced by `PartTracker::snapshot_for_save()` while holding the
+/// tracker's lock; the actual disk write happens on a blocking thread
+/// AFTER the lock is dropped.
+pub struct SaveSnapshot {
+    met_path: PathBuf,
+    file_size: u64,
+    file_hash: [u8; 16],
+    file_name: String,
+    part_hashes: Vec<[u8; 16]>,
+    gaps: Vec<(u64, u64)>,
+    part_verified: Vec<bool>,
+}
+
+impl SaveSnapshot {
+    /// Synchronous fsync-anchored write. Call from `spawn_blocking`.
+    /// Output bytes are byte-identical to `PartTracker::save_emule_format`
+    /// so eMule clients can read our `.part.met` on resume.
+    pub fn write_to_disk(&self) -> anyhow::Result<()> {
+        let mut buf: Vec<u8> = Vec::with_capacity(512);
+        {
+            let mut cur = std::io::Cursor::new(&mut buf);
+
+            let use_large = self.file_size > 0xFFFF_FFFF;
+            let version = if use_large { PARTFILE_VERSION_LARGEFILE } else { PARTFILE_VERSION };
+            cur.write_u8(version)?;
+
+            let date = chrono::Utc::now().timestamp().min(u32::MAX as i64) as u32;
+            cur.write_u32::<LittleEndian>(date)?;
+
+            cur.write_all(&self.file_hash)?;
+            let part_hash_count = self.part_hashes.len();
+            if part_hash_count > u16::MAX as usize {
+                tracing::warn!(
+                    "part.met: {} part hashes exceeds u16 limit, clamping to {}",
+                    part_hash_count, u16::MAX
+                );
+            }
+            cur.write_u16::<LittleEndian>(part_hash_count.min(u16::MAX as usize) as u16)?;
+            for ph in &self.part_hashes {
+                cur.write_all(ph)?;
+            }
+
+            let tag_count_pos = 5 + 16 + 2 + self.part_hashes.len() * 16;
+            cur.write_u32::<LittleEndian>(0)?;
+
+            let mut tag_count: u32 = 0;
+
+            if !self.file_name.is_empty() {
+                write_string_tag(&mut cur, FT_FILENAME, &self.file_name)?;
+                tag_count += 1;
+            }
+
+            if use_large {
+                write_uint64_tag(&mut cur, FT_FILESIZE, self.file_size)?;
+            } else {
+                write_uint32_tag(&mut cur, FT_FILESIZE, self.file_size as u32)?;
+            }
+            tag_count += 1;
+
+            // Mirror PartTracker::completed_bytes() inline to keep this
+            // snapshot self-contained.
+            let gap_bytes: u64 = self.gaps.iter().map(|(s, e)| e - s).sum();
+            let transferred = self.file_size.saturating_sub(gap_bytes);
+            if use_large {
+                write_uint64_tag(&mut cur, FT_TRANSFERRED, transferred)?;
+            } else {
+                write_uint32_tag(&mut cur, FT_TRANSFERRED, transferred as u32)?;
+            }
+            tag_count += 1;
+
+            for (i, &(gap_start, gap_end)) in self.gaps.iter().enumerate() {
+                write_gap_tag(&mut cur, FT_GAPSTART, i, gap_start, use_large)?;
+                write_gap_tag(&mut cur, FT_GAPEND, i, gap_end.saturating_sub(1), use_large)?;
+                tag_count += 2;
+            }
+
+            if self.part_verified.iter().any(|&v| v) {
+                let byte_count = (self.part_verified.len() + 7) / 8;
+                let mut bitmap = vec![0u8; byte_count];
+                for (i, &v) in self.part_verified.iter().enumerate() {
+                    if v {
+                        bitmap[i / 8] |= 1u8 << (i % 8);
+                    }
+                }
+                write_blob_tag(&mut cur, FT_EMBER_VERIFIED_BITMAP, &bitmap)?;
+                tag_count += 1;
+            }
+
+            cur.seek(SeekFrom::Start(tag_count_pos as u64))?;
+            cur.write_u32::<LittleEndian>(tag_count)?;
+        }
+
+        crate::security::atomic_write(&self.met_path, &buf, false)?;
+        Ok(())
+    }
+}
+
+/// Convenience: take a snapshot and persist it on a blocking task. The
+/// caller MUST drop any tracker lock guard before awaiting this.
+pub async fn save_snapshot_async(snap: SaveSnapshot) {
+    if let Err(join_err) = tokio::task::spawn_blocking(move || {
+        if let Err(e) = snap.write_to_disk() {
+            tracing::warn!("Failed to save part.met (async): {e}");
+        }
+    })
+    .await
+    {
+        tracing::warn!("part.met save task panicked: {join_err}");
     }
 }
 
