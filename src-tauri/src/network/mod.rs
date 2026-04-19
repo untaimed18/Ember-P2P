@@ -6527,7 +6527,19 @@ pub async fn start_network(
             _ = udp_source_timer.tick() => {
                 if let Some((packet, addr)) = state.udp_source_queue.pop_front() {
                     let sock = server_udp.socket_handle();
-                    let _ = sock.send_to(&packet, addr).await;
+                    let pkt_len = packet.len() as u64;
+                    if sock.send_to(&packet, addr).await.is_ok() {
+                        // Outbound source-asking traffic to non-connected
+                        // servers. The queue is exclusively populated by
+                        // `build_all_getsources_packets[_multi]`, so every
+                        // byte that leaves here is `OP_GLOBGETSOURCES`
+                        // (or `OP_GLOBGETSOURCES2`) for source discovery.
+                        stats_manager.add_overhead(
+                            crate::storage::statistics::OverheadCategory::SourceExchange,
+                            crate::storage::statistics::OverheadDirection::Upload,
+                            pkt_len,
+                        );
+                    }
                 }
             }
 
@@ -7931,6 +7943,19 @@ pub async fn start_network(
                                 }
                                 ed2k::server::ServerEvent::FoundSources { file_hash, sources } => {
                                     let hash_hex_fs = hex::encode(file_hash);
+                                    // Count the inbound TCP source-list reply
+                                    // as SourceExchange overhead. The exact
+                                    // wire size isn't carried through the
+                                    // event, so we estimate from the eMule
+                                    // OP_FOUNDSOURCES layout: 6-byte frame +
+                                    // opcode + 16-byte hash + 2-byte count +
+                                    // 6 bytes per source (IP/client_id + port).
+                                    let est_bytes = (25 + sources.len() * 6) as u64;
+                                    stats_manager.add_overhead(
+                                        crate::storage::statistics::OverheadCategory::SourceExchange,
+                                        crate::storage::statistics::OverheadDirection::Download,
+                                        est_bytes,
+                                    );
                                     {
                                         let matching: Vec<String> = state.pending_downloads.iter()
                                             .filter(|(_, pd)| pd.file_hash == hash_hex_fs)
@@ -8417,11 +8442,28 @@ pub async fn start_network(
                         );
                     }
                 }
-                while let Some(resp) = server_udp.try_recv().await {
+                while let Some((recv_len, resp)) = server_udp.try_recv().await {
+                    // Attribute the actual wire bytes to the correct
+                    // category. Previously every response paid a flat
+                    // 64-byte "Server" charge AND `FoundSources`
+                    // additionally paid `sources*10` "SourceExchange",
+                    // so the same reply was double-counted under two
+                    // categories — and the `SourceExchange` estimate
+                    // missed the packet header and per-source overhead.
+                    let recv_bytes = recv_len as u64;
+                    let category = match &resp {
+                        ServerUdpResponse::FoundSources { .. } =>
+                            crate::storage::statistics::OverheadCategory::SourceExchange,
+                        // Status pings and global search results are
+                        // server-control traffic, not source-discovery.
+                        ServerUdpResponse::StatusResponse { .. }
+                        | ServerUdpResponse::SearchResult { .. } =>
+                            crate::storage::statistics::OverheadCategory::Server,
+                    };
                     stats_manager.add_overhead(
-                        crate::storage::statistics::OverheadCategory::Server,
+                        category,
                         crate::storage::statistics::OverheadDirection::Download,
-                        64,
+                        recv_bytes,
                     );
                     match resp {
                         ServerUdpResponse::StatusResponse { addr, challenge, user_count, file_count, obfuscation_port_tcp, udp_flags } => {
@@ -8461,11 +8503,9 @@ pub async fn start_network(
                             if !sources.is_empty() {
                                 let hash_hex = hex::encode(file_hash);
                                 info!("UDP server {} found {} sources for {}", addr, sources.len(), hash_hex);
-                                stats_manager.add_overhead(
-                                    crate::storage::statistics::OverheadCategory::SourceExchange,
-                                    crate::storage::statistics::OverheadDirection::Download,
-                                    (sources.len() * 10) as u64,
-                                );
+                                // Inbound bytes already counted above against
+                                // `OverheadCategory::SourceExchange` using the
+                                // actual packet length from `try_recv`.
                                 let udp_server_port = addr.port().saturating_sub(4);
                                 let udp_server_ip = match addr.ip() {
                                     std::net::IpAddr::V4(v4) => u32::from_le_bytes(v4.octets()),
@@ -8936,8 +8976,17 @@ pub async fn start_network(
                             let immediate = total.min(LOGIN_BATCH_LIMIT);
                             let mut sent = 0u32;
                             for (fh, file_size) in all_hashes.iter().take(immediate) {
-                                if conn.send_get_sources(fh, *file_size).await.is_ok() {
-                                    sent += 1;
+                                if let Ok(bytes) = conn.send_get_sources(fh, *file_size).await {
+                                    if bytes > 0 {
+                                        sent += 1;
+                                        // TCP source request to the connected
+                                        // server is source-discovery overhead.
+                                        stats_manager.add_overhead(
+                                            crate::storage::statistics::OverheadCategory::SourceExchange,
+                                            crate::storage::statistics::OverheadDirection::Upload,
+                                            bytes,
+                                        );
+                                    }
                                 }
                             }
                             let deferred = total - immediate;
@@ -9887,8 +9936,18 @@ pub async fn start_network(
                     for i in 0..batch_size {
                         let idx = (cursor + i) % total;
                         let (_, ref fh, file_size, _) = all_downloads[idx];
-                        if conn.send_get_sources(fh, file_size).await.is_ok() {
-                            sent += 1;
+                        if let Ok(bytes) = conn.send_get_sources(fh, file_size).await {
+                            if bytes > 0 { sent += 1; }
+                            // Periodic TCP source-asking sweep also counts as
+                            // SourceExchange overhead — same wire flow as the
+                            // login-time and on-demand requests below.
+                            if bytes > 0 {
+                                stats_manager.add_overhead(
+                                    crate::storage::statistics::OverheadCategory::SourceExchange,
+                                    crate::storage::statistics::OverheadDirection::Upload,
+                                    bytes,
+                                );
+                            }
                         }
                     }
                 }
@@ -13067,11 +13126,18 @@ async fn handle_command(
                     if let Some(conn) = &mut state.server_connection {
                         let mut file_hash_arr = [0u8; 16];
                         file_hash_arr.copy_from_slice(&hash_bytes);
-                        if conn.send_get_sources(&file_hash_arr, file_size).await.is_ok() {
-                            let _ = app_handle.emit("transfer:source-search", serde_json::json!({
-                                "transfer_id": &transfer_id,
-                                "kind": "server_query",
-                            }));
+                        if let Ok(bytes) = conn.send_get_sources(&file_hash_arr, file_size).await {
+                            if bytes > 0 {
+                                stats_manager.add_overhead(
+                                    crate::storage::statistics::OverheadCategory::SourceExchange,
+                                    crate::storage::statistics::OverheadDirection::Upload,
+                                    bytes,
+                                );
+                                let _ = app_handle.emit("transfer:source-search", serde_json::json!({
+                                    "transfer_id": &transfer_id,
+                                    "kind": "server_query",
+                                }));
+                            }
                         }
                     }
                 }
