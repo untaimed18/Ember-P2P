@@ -653,7 +653,27 @@ impl SearchState {
                             .closest
                             .iter()
                             .any(|c| !self.queried.contains(&c.id));
+                        // Strict completion: every contact in `closest` has
+                        // been queried (the original eMule rule).
                         if !has_unqueried {
+                            self.completed = true;
+                        // Convergence completion: with batch size 1 and
+                        // continuous discovery from KadRes responses, the
+                        // strict rule above will almost never fire before
+                        // the 60s expiry — `closest` keeps growing as long
+                        // as routing nodes hand out fresh contacts. Mirror
+                        // the logic used by Store/Find* fetch transitions:
+                        // once we've queried at least the minimum number
+                        // of nodes and seen N consecutive "stale" rounds
+                        // (no closer contact discovered), we've effectively
+                        // converged on the closest neighbourhood — the
+                        // routing table has all the useful contacts already.
+                        // Without this, every FindNode ties up a search slot
+                        // for the full 60s lifetime even though the walk
+                        // finished much earlier.
+                        } else if self.queried.len() >= LOOKUP_MIN_QUERIES
+                            && self.lookup_stale_rounds >= LOOKUP_CONVERGE_COUNT
+                        {
                             self.completed = true;
                         }
                     }
@@ -935,16 +955,34 @@ impl SearchManager {
                     SearchType::StoreKeyword => "StoreKeyword",
                     SearchType::StoreNotes => "StoreNotes",
                 };
-                info!(
-                    "Search {} ({}) expired after {}s with {} results (phase={:?}, queried={}, responded={})",
-                    sid.0,
-                    type_label,
-                    elapsed,
-                    state.results.len(),
-                    state.phase,
-                    state.queried.len(),
-                    state.responded_during_lookup.len(),
-                );
+                // FindNode / FindBuddy never populate `results` (they're
+                // routing-table walks, not fetches). The shared
+                // "with N results" phrasing made these expiries look
+                // like failures even when the walk had successfully
+                // populated the routing table — print contact-pool /
+                // verified counts instead so the line reads honestly.
+                if matches!(state.search_type, SearchType::FindNode | SearchType::FindBuddy) {
+                    info!(
+                        "Search {} ({}) lookup ended after {}s (queried={}, responded={}, closest_pool={})",
+                        sid.0,
+                        type_label,
+                        elapsed,
+                        state.queried.len(),
+                        state.responded_during_lookup.len(),
+                        state.closest.len(),
+                    );
+                } else {
+                    info!(
+                        "Search {} ({}) expired after {}s with {} results (phase={:?}, queried={}, responded={})",
+                        sid.0,
+                        type_label,
+                        elapsed,
+                        state.results.len(),
+                        state.phase,
+                        state.queried.len(),
+                        state.responded_during_lookup.len(),
+                    );
+                }
                 state.completed = true;
                 continue;
             }

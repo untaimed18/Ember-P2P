@@ -4,10 +4,20 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
+/// STUN reflectors used for NAT detection. Listed in attempt order; the
+/// probe walks the whole list so a single dead host doesn't kill the
+/// probe. We deliberately mix providers: Google sometimes throttles
+/// home IPs that hammer it (and is also occasionally rate-limited at
+/// some ISPs), so Cloudflare and Twilio cover us when Google goes
+/// quiet. This is the *primary* signal for NAT type — if every entry
+/// here fails, hole-punch falls back to the HighID-derived heuristic
+/// in `mod.rs`.
 const DEFAULT_STUN_SERVERS: &[&str] = &[
     "stun.l.google.com:19302",
     "stun1.l.google.com:19302",
     "stun2.l.google.com:19302",
+    "stun.cloudflare.com:3478",
+    "global.stun.twilio.com:3478",
 ];
 
 const STUN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -103,26 +113,71 @@ impl NatInfo {
     pub fn has_external_addr(&self) -> bool {
         self.external_addr.is_some()
     }
+
+    /// If STUN failed but we have a confirmed external IP from another
+    /// source (ed2k server HighID, KAD FirewalledRes vote, etc.) and a
+    /// confirmed-open TCP connect-back, treat ourselves as
+    /// `PortRestricted` with the local UDP port mirrored as the external
+    /// port. This is a deliberate optimistic guess — we don't know the
+    /// NAT mapping for sure, but a HighID + open TCP almost always
+    /// means a cone NAT (or no NAT) rather than symmetric. Without this
+    /// fallback the broker refuses to attempt hole-punch
+    /// (`is_punchable() == false`), so every low-to-low connect goes
+    /// straight to the relay path even on perfectly punchable links.
+    ///
+    /// `local_udp_port` is our own bound KAD UDP port; eMule uses the
+    /// same port for inbound and the actual NAT mapping is usually
+    /// 1:1 for cone NATs, so it's the best guess we can make without
+    /// a real STUN reply.
+    pub fn apply_highid_fallback(&mut self, external_ip: IpAddr, local_udp_port: u16) -> bool {
+        if self.nat_type != NatType::Unknown || self.external_addr.is_some() {
+            return false;
+        }
+        self.nat_type = NatType::PortRestricted;
+        self.external_addr = Some(SocketAddr::new(external_ip, local_udp_port));
+        self.last_probed = Instant::now();
+        true
+    }
 }
 
 /// Probe STUN servers to discover our external address and infer NAT type.
-/// Uses two STUN servers: if the external address differs, it's symmetric NAT.
+///
+/// Stops after two successful results (enough to disambiguate symmetric
+/// vs port-restricted by comparing mapped ports). Walks the entire
+/// server list before giving up so a transient outage on one provider
+/// doesn't poison the result. Per-server failures are surfaced in the
+/// final WARN message — they used to be `debug!` only, which made
+/// "all STUN servers failed" essentially undebuggable in `info`-level
+/// logs.
 pub async fn probe_nat(local_socket: &UdpSocket) -> NatInfo {
     let mut results = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
 
-    for server_str in DEFAULT_STUN_SERVERS.iter().take(2) {
+    for server_str in DEFAULT_STUN_SERVERS.iter() {
         match try_stun_server(local_socket, server_str).await {
             Ok(addr) => {
                 results.push(addr);
+                if results.len() >= 2 {
+                    break;
+                }
             }
             Err(e) => {
                 debug!("STUN server {server_str} failed: {e}");
+                failures.push(format!("{server_str}: {e}"));
             }
         }
     }
 
     if results.is_empty() {
-        warn!("NAT probe: all STUN servers failed");
+        // Surface the first two failures in the WARN so the user can
+        // tell DNS/blocked-egress/timeout apart without having to flip
+        // the whole logger to debug.
+        let detail = failures.iter().take(2).cloned().collect::<Vec<_>>().join("; ");
+        if detail.is_empty() {
+            warn!("NAT probe: all STUN servers failed");
+        } else {
+            warn!("NAT probe: all STUN servers failed ({detail})");
+        }
         return NatInfo {
             nat_type: NatType::Unknown,
             external_addr: None,
@@ -164,11 +219,17 @@ async fn try_stun_server(
     socket: &UdpSocket,
     server: &str,
 ) -> Result<SocketAddr, String> {
+    // Filter to IPv4 explicitly. The KAD UDP socket is bound IPv4-only
+    // (`socket2::Domain::IPV4` in `start_network`), and on a dual-stack
+    // resolver `lookup_host(...).next()` can return an IPv6 entry first
+    // — `send_to` would then fail with EAFNOSUPPORT and the whole
+    // attempt would silently time out. Picking the first v4 result
+    // matches what every other UDP path in this codebase expects.
     let server_addr: SocketAddr = tokio::net::lookup_host(server)
         .await
         .map_err(|e| format!("DNS resolve {server}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("No address for {server}"))?;
+        .find(|a| a.is_ipv4())
+        .ok_or_else(|| format!("No IPv4 address for {server}"))?;
 
     let txn_id: [u8; 12] = rand::random();
     let request = build_binding_request(&txn_id);

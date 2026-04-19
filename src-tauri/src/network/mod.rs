@@ -81,6 +81,24 @@ struct ActiveSourceInjectionStats {
     overflowed: usize,
 }
 
+/// Snapshot of the publish-ack diagnostic counters at a given time.
+/// Used by the `publish_health_timer` arm to print **deltas** since
+/// the last beat instead of monotonic totals — without this the
+/// numbers look identical heartbeat after heartbeat once the system
+/// has been running a while, and you can't tell whether the pipeline
+/// is currently flowing or stuck.
+#[derive(Debug, Default, Clone, Copy)]
+struct PublishHealthSnapshot {
+    confirmed: u32,
+    pending: usize,
+    plain_seen: u64,
+    obf_decoded: u64,
+    obf_total: u64,
+    wire: u64,
+    received: u64,
+    unmatched: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceInjectionResult {
     Injected,
@@ -1381,6 +1399,14 @@ struct NetworkState {
     udp_key_seed: u32,
     tcp_port: u16,
     udp_port: u16,
+    /// Actual UDP port the QUIC broker endpoint bound to. `None` until
+    /// the broker is initialised, then set to the real `local_addr()`
+    /// port — which may differ from `tcp_port` if the requested port
+    /// was already in use (e.g. when `tcp_port == udp_port` and the Kad
+    /// UDP socket got there first). Anything that advertises our QUIC
+    /// reachability (rendezvous registration / heartbeat) must read
+    /// from here, not from `settings.tcp_port`.
+    quic_port: Option<u16>,
     upnp_mapped: bool,
     /// IP filter for blocking known-bad ranges (eMule ipfilter.dat compatible)
     ip_filter: IpFilter,
@@ -2088,8 +2114,20 @@ fn kad_searches_snapshot(state: &NetworkState) -> Vec<KadSearchInfo> {
                 search.search_type,
                 SearchType::StoreFile | SearchType::StoreKeyword | SearchType::StoreNotes
             );
+            let is_routing_walk = matches!(
+                search.search_type,
+                SearchType::FindNode | SearchType::FindBuddy
+            );
+            // Store searches: contacts in the closest-pool (where the publish
+            // landed). Find* fetch searches (keyword/source/notes): actual
+            // result entries. Pure routing walks (FindNode/FindBuddy) never
+            // populate `results` — they walk the DHT to grow the routing
+            // table — so their progress is best summarised as "verified
+            // contacts found".
             let responses = if is_store {
                 search.closest.len() as u32
+            } else if is_routing_walk {
+                search.responded_during_lookup.len() as u32
             } else {
                 search.results.len() as u32
             };
@@ -2545,6 +2583,23 @@ pub async fn start_network(
     }
     info!("UDP socket bound on port {udp_port}");
 
+    // The connection broker binds a *second* UDP socket for QUIC on the
+    // configured `tcp_port`. If the user happens to set `tcp_port ==
+    // udp_port` (an easy mistake — old eMule habit, or copy-paste of
+    // the same number into both fields), QUIC will fail to bind to that
+    // port and `build_server_client_endpoint` will fall back to a
+    // neighbour. Warn loudly here so the user can either tolerate the
+    // fallback or pick distinct ports.
+    if settings.tcp_port == settings.udp_port {
+        warn!(
+            "Configured tcp_port and udp_port are identical ({}). \
+             QUIC will be unable to bind that port (Kad UDP got there first) \
+             and will fall back to a neighbouring port. Set them to distinct \
+             values in Settings to silence this warning.",
+            settings.tcp_port,
+        );
+    }
+
     let mut routing_table = RoutingTable::new(local_id, settings.block_private_ips);
     let search_manager = SearchManager::new();
     let publish_manager = PublishManager::new(local_id, user_hash, tcp_port, udp_port);
@@ -2838,6 +2893,7 @@ pub async fn start_network(
         udp_key_seed,
         tcp_port,
         udp_port,
+        quic_port: None,
         upnp_mapped: upnp_success,
         ip_filter,
         banned_ips,
@@ -3201,6 +3257,21 @@ pub async fn start_network(
     let mut bootstrap_attempts: u32 = 0;
     let mut publish_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     publish_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Publish health heartbeat: 60s is too coarse to debug the publish
+    // ack pipeline. The full `Publish cycle:` log fires *before* the
+    // cycle's publishes are dispatched (it's the first thing the timer
+    // arm does), so a single snapshot at the 60s mark always shows
+    // "0 confirmed" even when acks are flowing fine — you have to wait
+    // 120s for a useful number. This faster heartbeat fires every 10s
+    // and only logs when at least one publish-related counter has
+    // changed since the last beat, so it's quiet at idle but surfaces
+    // problems in seconds during active publishing.
+    let mut publish_health_timer = tokio::time::interval(std::time::Duration::from_secs(10));
+    publish_health_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Snapshot of the diagnostic counters as of the last health log,
+    // so we can print "since last beat" deltas instead of monotonic
+    // totals (which look like the same number cycle after cycle).
+    let mut last_publish_health: PublishHealthSnapshot = PublishHealthSnapshot::default();
     let mut search_poll_timer = tokio::time::interval(std::time::Duration::from_secs(1));
     search_poll_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // eMule UDPSEARCHSPEED = SEC2MS(3)/4 = 750ms: send one UDP search per tick
@@ -5887,12 +5958,25 @@ pub async fn start_network(
                                 sender_id: state.local_id,
                                 tags: note_tags,
                             };
+                            let now = chrono::Utc::now().timestamp();
                             let mut sent = 0;
                             for contact in search.closest.iter().take(10) {
                                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                                 if let Ok(packet) = messages::encode_packet(&msg) {
                                     state.flood_protection.track_request(addr, kad_request_opcode(&msg).unwrap_or(0));
                                     let _ = send_kad_packet(&udp_socket, &packet, addr, &state, &contact.id).await;
+                                    // Track per-peer pending entry so the
+                                    // PublishRes handler can match and bump
+                                    // `publish_confirmed`. The Source and
+                                    // Keyword paths already do this; the
+                                    // Notes path used to skip it, which made
+                                    // every notes ack show up as
+                                    // `publish_res_unmatched` in diagnostics
+                                    // even when the publish succeeded.
+                                    state.publish_pending.insert(
+                                        (file_hash, addr),
+                                        (file_hash, now, false),
+                                    );
                                     sent += 1;
                                 }
                             }
@@ -6330,31 +6414,14 @@ pub async fn start_network(
                     && state.external_ip.is_some()
                 {
                     state.friend_presence_initial_done = true;
-                    let rv_url = settings.rendezvous_url.clone();
-                    let rv_port = settings.tcp_port;
-                    let rv_hash = ember_hash;
-                    let rv_ip = state.external_ip;
-                    let app_rv = app_handle.clone();
-                    tokio::spawn(async move {
-                        match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip).await {
-                            Ok(()) => {
-                                let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
-                                    "discoverable": true,
-                                }));
-                            }
-                            Err(e) => {
-                                warn!("Initial rendezvous register failed: {e}");
-                                let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
-                                    "discoverable": false,
-                                    "reason": "rendezvous_error",
-                                }));
-                            }
-                        }
-                    });
-                    state.rendezvous_registered = true;
-                    state.rendezvous_last_register = Some(std::time::Instant::now());
 
                     // Initialize the LowID-to-LowID connection broker
+                    // **before** registering with rendezvous. Rendezvous
+                    // advertises the port other clients should QUIC-dial,
+                    // so we have to know the QUIC endpoint's actual bound
+                    // port first — `build_server_client_endpoint` may
+                    // fall back from `tcp_port` if it's already in use
+                    // (e.g. tcp_port == udp_port).
                     if state.connection_broker.is_none() {
                         let (broker_tx, broker_rx) = mpsc::channel(32);
                         let mut broker = ember::broker::ConnectionBroker::new(
@@ -6370,9 +6437,16 @@ pub async fn start_network(
                                     state.tcp_port,
                                 ) {
                                     Ok(ep) => {
+                                        let bound_port = ep
+                                            .local_addr()
+                                            .map(|a| a.port())
+                                            .unwrap_or(state.tcp_port);
+                                        state.quic_port = Some(bound_port);
                                         let ep_arc = std::sync::Arc::new(ep);
                                         broker.set_quic_endpoint(ep_arc.clone());
-                                        tracing::info!("Broker: QUIC server+client endpoint ready on UDP port {}", state.tcp_port);
+                                        tracing::info!(
+                                            "Broker: QUIC server+client endpoint ready on UDP port {bound_port}",
+                                        );
 
                                         let relay_mgr = state.relay_manager.clone();
                                         let quic_cb_tx = kad_callback_tx.clone();
@@ -6396,6 +6470,34 @@ pub async fn start_network(
                         state.connection_broker = Some(broker);
                         state.broker_event_rx = Some(broker_rx);
                     }
+
+                    // Use the *actual* QUIC port if the broker bound one,
+                    // otherwise fall back to the configured tcp_port (so
+                    // we still register even if QUIC failed entirely —
+                    // friend presence works without QUIC).
+                    let rv_url = settings.rendezvous_url.clone();
+                    let rv_port = state.quic_port.unwrap_or(settings.tcp_port);
+                    let rv_hash = ember_hash;
+                    let rv_ip = state.external_ip;
+                    let app_rv = app_handle.clone();
+                    tokio::spawn(async move {
+                        match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip).await {
+                            Ok(()) => {
+                                let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
+                                    "discoverable": true,
+                                }));
+                            }
+                            Err(e) => {
+                                warn!("Initial rendezvous register failed: {e}");
+                                let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
+                                    "discoverable": false,
+                                    "reason": "rendezvous_error",
+                                }));
+                            }
+                        }
+                    });
+                    state.rendezvous_registered = true;
+                    state.rendezvous_last_register = Some(std::time::Instant::now());
                 }
 
                 // Initial friend search burst: look up all offline friends
@@ -6471,7 +6573,11 @@ pub async fn start_network(
                     if needs_heartbeat {
                         state.rendezvous_last_register = Some(std::time::Instant::now());
                         let rv_url = settings.rendezvous_url.clone();
-                        let rv_port = settings.tcp_port;
+                        // Heartbeat must advertise the same port we
+                        // registered with — i.e. the QUIC bind port,
+                        // which can differ from `tcp_port` when QUIC
+                        // had to fall back.
+                        let rv_port = state.quic_port.unwrap_or(settings.tcp_port);
                         let rv_hash = ember_hash;
                         let rv_ip = state.external_ip;
                         let app_rv = app_handle.clone();
@@ -6490,10 +6596,14 @@ pub async fn start_network(
                     }
                 }
 
-                // Poll for incoming server-relay invitations (if registered & have external IP)
+                // Poll for incoming server-relay invitations (if registered & have external IP).
+                // Use the QUIC port we actually registered with — peers
+                // construct the relay-invite key as `(our_ip, our_quic_port)`
+                // since that's what they read from rendezvous.
                 if state.rendezvous_registered {
                     if let Some(ext_ip) = state.external_ip {
-                        let our_relay_id = format!("{:0>64}", format!("{:08x}{:04x}", u32::from(ext_ip), state.tcp_port));
+                        let advertised_port = state.quic_port.unwrap_or(state.tcp_port);
+                        let our_relay_id = format!("{:0>64}", format!("{:08x}{:04x}", u32::from(ext_ip), advertised_port));
                         let rv_url = settings.rendezvous_url.clone();
                         let relay_cb_tx = kad_callback_tx.clone();
                         tokio::spawn(async move {
@@ -6605,6 +6715,52 @@ pub async fn start_network(
                 }
 
                 } // end is_empty guard
+            }
+
+            // Publish-pipeline health heartbeat (10s). Only logs when at
+            // least one diagnostic counter has moved since the last beat,
+            // so it stays quiet at idle. Crucially this fires *between*
+            // the 60s `Publish cycle:` lines, so the user can see whether
+            // PublishRes packets are flowing seconds after publishes are
+            // sent — not 60s later.
+            _ = publish_health_timer.tick() => {
+                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                let cur = PublishHealthSnapshot {
+                    confirmed: state.publish_confirmed,
+                    pending: state.publish_pending.len(),
+                    plain_seen: state.publish_res_plain_seen,
+                    obf_decoded: state.publish_res_obf_decoded,
+                    obf_total: state.obf_decoded_total,
+                    wire: state.publish_res_wire,
+                    received: state.publish_res_received,
+                    unmatched: state.publish_res_unmatched,
+                };
+                let prev = last_publish_health;
+                let any_change = cur.confirmed != prev.confirmed
+                    || cur.pending != prev.pending
+                    || cur.plain_seen != prev.plain_seen
+                    || cur.obf_decoded != prev.obf_decoded
+                    || cur.wire != prev.wire
+                    || cur.received != prev.received
+                    || cur.unmatched != prev.unmatched;
+                if any_change {
+                    let d_confirmed = cur.confirmed.saturating_sub(prev.confirmed);
+                    let d_plain = cur.plain_seen.saturating_sub(prev.plain_seen);
+                    let d_obf_decoded = cur.obf_decoded.saturating_sub(prev.obf_decoded);
+                    let d_obf_total = cur.obf_total.saturating_sub(prev.obf_total);
+                    let d_wire = cur.wire.saturating_sub(prev.wire);
+                    let d_received = cur.received.saturating_sub(prev.received);
+                    let d_unmatched = cur.unmatched.saturating_sub(prev.unmatched);
+                    info!(
+                        "Publish health (10s): pending={} confirmed=+{} (total {}), \
+                         PublishRes plain=+{} obf_decoded=+{}/+{} wire=+{} received=+{} unmatched=+{}",
+                        cur.pending,
+                        d_confirmed, cur.confirmed,
+                        d_plain, d_obf_decoded, d_obf_total,
+                        d_wire, d_received, d_unmatched,
+                    );
+                }
+                last_publish_health = cur;
             }
 
             // Cleanup stale searches, expired DHT entries, and unconfirmed publishes
@@ -6987,6 +7143,15 @@ pub async fn start_network(
                 if state.nat_info.needs_reprobe() && state.external_ip.is_some() {
                     let nat_info = ember::nat::probe_nat(&udp_socket).await;
                     state.nat_info = nat_info;
+                    // Same HighID fallback as the initial probe: if STUN
+                    // is still down but we know our external IP, don't
+                    // regress to `Unknown` / no-punch.
+                    if let Some(ext_ip) = state.external_ip {
+                        let _ = state.nat_info.apply_highid_fallback(
+                            std::net::IpAddr::V4(ext_ip),
+                            state.udp_port,
+                        );
+                    }
                 }
 
                 // Auto-retry offline friends via rendezvous for the
@@ -9457,6 +9622,22 @@ pub async fn start_network(
                                 if was_none && state.nat_info.nat_type == ember::nat::NatType::Unknown {
                                     info!("External IP discovered via server HighID — running initial NAT probe");
                                     state.nat_info = ember::nat::probe_nat(&udp_socket).await;
+                                    // STUN can fail (firewall, DNS, blocked egress)
+                                    // even when the host is perfectly punchable.
+                                    // HighID + a successful TCP connect-back is
+                                    // strong evidence we sit behind a cone NAT (or
+                                    // none), so promote `Unknown` to
+                                    // `PortRestricted` rather than disabling
+                                    // hole-punch outright.
+                                    if state.nat_info.apply_highid_fallback(
+                                        std::net::IpAddr::V4(ext_ip),
+                                        state.udp_port,
+                                    ) {
+                                        info!(
+                                            "NAT probe failed but HighID confirmed external IP {} — assuming PortRestricted (mapped {}:{})",
+                                            ext_ip, ext_ip, state.udp_port,
+                                        );
+                                    }
                                 }
                             }
                         }
