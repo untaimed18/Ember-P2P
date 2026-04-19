@@ -1746,6 +1746,7 @@ fn is_search_source_safe(state: &NetworkState, ip: Ipv4Addr) -> bool {
 /// Acquires only a read lock on `spam_filter`, so it's safe to call
 /// from any event-loop arm. `keywords` and `server_ip` come from
 /// `ActiveSearchRequest`, populated at request start.
+#[allow(clippy::too_many_arguments)]
 async fn enrich_and_emit_search_results(
     app_handle: &tauri::AppHandle,
     spam_filter: &Arc<RwLock<crate::search::spam::SpamFilter>>,
