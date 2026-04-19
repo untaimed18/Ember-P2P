@@ -205,8 +205,17 @@ impl ServerUdpSocket {
         Ok(())
     }
 
-    /// Receive and process one UDP packet. Returns parsed result or None.
-    pub async fn try_recv(&self) -> Option<ServerUdpResponse> {
+    /// Receive and process one UDP packet. Returns the parsed result
+    /// AND the raw byte length of the packet that came off the wire,
+    /// so the caller can attribute accurate overhead bytes to the
+    /// right Statistics category (StatusResponse → Server,
+    /// FoundSources → SourceExchange, etc.). Returning the length is
+    /// what lets us avoid both double-counting (previously every
+    /// response was charged a flat 64 bytes "Server" plus an estimate
+    /// per category) and under-counting (the previous SourceExchange
+    /// estimate was `sources.len() * 10`, missing the packet header
+    /// and per-source overhead).
+    pub async fn try_recv(&self) -> Option<(usize, ServerUdpResponse)> {
         let mut buf = [0u8; 65536];
         match self.socket.try_recv_from(&mut buf) {
             Ok((len, addr)) => {
@@ -216,7 +225,7 @@ impl ServerUdpSocket {
                 if buf[0] != OP_EDONKEYPROT {
                     return None;
                 }
-                parse_server_udp_response(&buf[1..len], addr)
+                parse_server_udp_response(&buf[1..len], addr).map(|resp| (len, resp))
             }
             Err(_) => None,
         }
@@ -529,7 +538,7 @@ mod tests {
         packet.extend_from_slice(&456u32.to_le_bytes());
         send_socket.send_to(&packet, recv_addr).await.unwrap();
 
-        let response = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let (recv_len, response) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 if let Some(parsed) = server_udp.try_recv().await {
                     break parsed;
@@ -540,6 +549,7 @@ mod tests {
         .await
         .unwrap();
 
+        assert!(recv_len >= 14); // 2 header + 12 payload (challenge+users+files)
         match response {
             ServerUdpResponse::StatusResponse { challenge: parsed, user_count, file_count, obfuscation_port_tcp, .. } => {
                 assert_eq!(parsed, challenge);

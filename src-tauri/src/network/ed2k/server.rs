@@ -499,14 +499,18 @@ impl Ed2kServerConnection {
 
     /// Send a source request to the server (eMule DownloadQueue.cpp format).
     /// Uses OP_GETSOURCES_OBFU when server supports TCP obfuscation.
-    pub async fn send_get_sources(&mut self, file_hash: &[u8; 16], file_size: u64) -> anyhow::Result<()> {
+    /// Returns the number of bytes sent on the wire (header + opcode +
+    /// payload) so callers can attribute the cost to source-exchange
+    /// overhead in the Statistics panel. Returns 0 when the request was
+    /// silently skipped (e.g. the server lacks LARGEFILES support).
+    pub async fn send_get_sources(&mut self, file_hash: &[u8; 16], file_size: u64) -> anyhow::Result<u64> {
         let mut payload = Vec::with_capacity(28);
         payload.extend_from_slice(file_hash);
         let srv_flags = self.session.as_ref().map(|s| s.server_flags).unwrap_or(0);
         let supports_large = (srv_flags & SRV_TCPFLG_LARGEFILES) != 0;
         if file_size > 0xFFFF_FFFF && !supports_large {
             debug!("Skipping source query for >4 GiB file — server does not support LARGEFILES");
-            return Ok(());
+            return Ok(0);
         }
         if file_size > 0xFFFF_FFFF {
             payload.extend_from_slice(&0u32.to_le_bytes());
@@ -520,7 +524,8 @@ impl Ed2kServerConnection {
             OP_GETSOURCES
         };
         self.write_packet(opcode, &payload).await?;
-        Ok(())
+        // Wire framing: 1 protocol + 4 length + 1 opcode + payload.
+        Ok(6 + payload.len() as u64)
     }
 
     /// eMule keep-alive: send empty OP_OFFERFILES (file count = 0).
