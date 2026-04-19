@@ -4204,6 +4204,14 @@ async fn download_parts_from_source(
                         debug!("Peer comment from source {}: rating={rating}, comment='{comment}'", _src_idx);
                     }
                 }
+                // OP_REASKACK arriving mid-transfer is normal benign
+                // chatter: peers send it ~100-300 ms after we re-queue
+                // via OP_STARTUPLOADREQ (in-session re-queue path) and
+                // some clients also send periodic queue-rank pings even
+                // while we're actively downloading. Silently drop —
+                // logging it as "unexpected" misled us into thinking
+                // the in-session re-queue had a bug.
+                (OP_EDONKEYHEADER, OP_REASKACK) => {}
                 _ => {
                     info!("During data transfer, unexpected packet proto=0x{:02X} op=0x{:02X} ({} bytes) from source {} ({})",
                         proto, opcode, payload.len(), _src_idx, addr);

@@ -75,6 +75,16 @@ pub struct ServerEntry {
     /// the periodic UDP-health log say "server X last responded
     /// 12 minutes ago" rather than just "silent".
     pub last_udp_reply_at: i64,
+    /// Last time this server replied with `OP_GLOBFOUNDSOURCES`
+    /// specifically (not status pings). A server can be perfectly
+    /// status-ping-responsive yet never return source data because
+    /// it doesn't index our specific file hashes — eMule servers
+    /// stay silent rather than send empty `FoundSources` replies, so
+    /// our `udp_discovery_replies` counter would say "0 replies"
+    /// even though the servers are reachable. This field lets the
+    /// health log distinguish "server is dead" from "server is
+    /// alive but doesn't have what we want".
+    pub last_udp_source_reply_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +118,7 @@ impl ServerEntry {
             server_udp_key: 0,
             udp_consecutive_failures: 0,
             last_udp_reply_at: 0,
+            last_udp_source_reply_at: 0,
         }
     }
 }
@@ -144,6 +155,7 @@ fn apply_server_int_tag(entry: &mut ServerEntry, name_id: u8, v: u32) {
         // launch re-discovering known-dead UDP endpoints).
         0xF5 => entry.udp_consecutive_failures = v,
         0xF6 => entry.last_udp_reply_at = v as i64,
+        0xF7 => entry.last_udp_source_reply_at = v as i64,
         _ => {}
     }
 }
@@ -403,6 +415,19 @@ impl ServerList {
             }
             entry.udp_consecutive_failures = 0;
             entry.last_udp_reply_at = chrono::Utc::now().timestamp();
+        }
+    }
+
+    /// Record that this server sent us a `OP_GLOBFOUNDSOURCES` reply
+    /// specifically — meaning it actually has source data for at
+    /// least one of the file hashes we asked about. Distinct from
+    /// `record_udp_reply` (which fires on status pings too); this
+    /// one feeds the "source-responsive" column in the periodic
+    /// UDP-health log so the user can see which servers are useful
+    /// for source discovery vs which are just status-ping-alive.
+    pub fn record_udp_source_reply(&mut self, ip: &str, port: u16) {
+        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+            entry.last_udp_source_reply_at = chrono::Utc::now().timestamp();
         }
     }
 
@@ -1008,6 +1033,11 @@ impl ServerList {
             if entry.last_udp_reply_at > 0 {
                 let ts32 = entry.last_udp_reply_at.clamp(0, u32::MAX as i64) as u32;
                 write_met_uint32_tag(&mut tag_buf, 0xF6, ts32);
+                tag_count += 1;
+            }
+            if entry.last_udp_source_reply_at > 0 {
+                let ts32 = entry.last_udp_source_reply_at.clamp(0, u32::MAX as i64) as u32;
+                write_met_uint32_tag(&mut tag_buf, 0xF7, ts32);
                 tag_count += 1;
             }
 
