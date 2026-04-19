@@ -103,6 +103,13 @@ pub struct Ed2kDownload {
     pub aich_pending: Option<SharedAichPending>,
     /// GeoIP reader for country code lookups
     pub geoip: crate::geoip::GeoIpReader,
+    /// Lock-free counter that the per-source loop bumps on every
+    /// peer-to-peer Source Exchange packet (`OP_REQUESTSOURCES`,
+    /// `OP_ANSWERSOURCES`, and `OP_EMBER_SOURCEEXCHANGE`) it sends
+    /// or receives. Drained on the network loop's stats tick into
+    /// `OverheadCategory::SourceExchange` so the Statistics page
+    /// reflects real peer-SX traffic, not just server source-asking.
+    pub sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
 }
 
 /// eMule-style error classification: only protocol-level failures (FNF, hash
@@ -934,6 +941,7 @@ impl Ed2kDownload {
                     debug!("Received early AcceptUploadReq before file status");
                 }
                 (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION => {
+                    self.sx_overhead.record_download((6 + pl.len()) as u64);
                     epx_packets_received += 1;
                     info!("Received early EPX from {} during pre-control ({} bytes)", self.source_addr, pl.len());
                     match crate::network::ember::parse_exchange_payload(&pl) {
@@ -981,6 +989,7 @@ impl Ed2kDownload {
             if !epx_data.is_empty() {
                 debug!("Sending Ember Peer Exchange to {} ({} bytes, gen {})", self.source_addr, epx_data.len(), sent_gen);
                 let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await;
+                self.sx_overhead.record_upload((6 + epx_data.len()) as u64);
                 initial_epx_sent_generation = Some(sent_gen);
             }
             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
@@ -1258,6 +1267,7 @@ impl Ed2kDownload {
                     }
                 }
                 (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) => {
+                    self.sx_overhead.record_download((6 + payload.len()) as u64);
                     if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
                         debug!("Ignoring excess EPX packet from {}", self.source_addr);
                     } else {
@@ -1415,9 +1425,11 @@ impl Ed2kDownload {
                 sx2_req.extend_from_slice(&0u16.to_le_bytes());
                 sx2_req.extend_from_slice(&self.file_hash);
                 write_packet_async(&mut writer, OP_EMULEPROT, OP_REQUESTSOURCES2, &sx2_req).await?;
+                self.sx_overhead.record_upload((6 + sx2_req.len()) as u64);
             } else {
                 let sx_req = build_file_request(&self.file_hash);
                 write_packet_async(&mut writer, OP_EMULEPROT, OP_REQUESTSOURCES, &sx_req).await?;
+                self.sx_overhead.record_upload((6 + sx_req.len()) as u64);
             }
             if let Some(sm) = &self.source_manager {
                 let mut sm = sm.write().await;
@@ -1528,6 +1540,7 @@ impl Ed2kDownload {
                 }
 
                 if proto == OP_EMULEPROT && opcode == OP_ANSWERSOURCES && payload.len() >= 18 {
+                    self.sx_overhead.record_download((6 + payload.len()) as u64);
                     match parse_answer_sources(&payload, peer_source_exchange_ver) {
                         Ok((version, answer_hash, entries)) if answer_hash == self.file_hash => {
                             let mut sx_count = 0u32;
@@ -1579,6 +1592,7 @@ impl Ed2kDownload {
                 }
 
                 if proto == OP_EMULEPROT && opcode == OP_ANSWERSOURCES2 && payload.len() >= 19 {
+                    self.sx_overhead.record_download((6 + payload.len()) as u64);
                     match parse_answer_sources2(&payload) {
                         Ok((version, answer_hash, entries)) if answer_hash == self.file_hash => {
                             let mut sx_count = 0u32;
@@ -1883,6 +1897,7 @@ impl Ed2kDownload {
                             if !epx_data.is_empty() {
                                 debug!("Re-sending EPX to {} (gen {}->{}, {} bytes)", self.source_addr, last_epx_generation, current_gen, epx_data.len());
                                 let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await;
+                                self.sx_overhead.record_upload((6 + epx_data.len()) as u64);
                             }
                             last_epx_generation = current_gen;
                         }
@@ -2193,6 +2208,7 @@ impl Ed2kDownload {
                             }
                         }
                         (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) => {
+                            self.sx_overhead.record_download((6 + payload.len()) as u64);
                             if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
                                 debug!("Ignoring excess EPX packet during download from {}", self.source_addr);
                             } else {

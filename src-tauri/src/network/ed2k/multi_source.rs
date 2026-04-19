@@ -200,6 +200,11 @@ pub struct MultiSourceDownload {
     pub geoip: crate::geoip::GeoIpReader,
     /// Shared registry so the shutdown path can save our tracker
     pub tracker_registry: Option<SharedTrackerRegistry>,
+    /// Lock-free counter the per-source workers bump on every
+    /// peer-to-peer Source Exchange packet they send or receive.
+    /// Drained on the network loop's stats tick into the
+    /// `Source Exchange` overhead row.
+    pub sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
 }
 
 async fn check_control(control: &TransferControl) -> anyhow::Result<()> {
@@ -608,6 +613,7 @@ impl MultiSourceDownload {
             let sx_ext = self.external_ip;
             let geo_clone = self.geoip.clone();
             let fh_clone = self.friend_hashes.clone();
+            let sx_oh = self.sx_overhead.clone();
 
             let fail_etx = event_tx.clone();
             let fail_tid = self.transfer_id.clone();
@@ -677,6 +683,7 @@ impl MultiSourceDownload {
                     fh_clone.clone(),
                     src_ember_hash,
                     nick_for_src.clone(),
+                    sx_oh.clone(),
                 )
                 .await;
 
@@ -880,6 +887,7 @@ impl MultiSourceDownload {
                             let inj_ext = self.external_ip;
                             let inj_geo = self.geoip.clone();
                             let inj_fh = self.friend_hashes.clone();
+                            let inj_sx_oh = self.sx_overhead.clone();
                             let handle = tokio::spawn(async move {
                                 let _permit = match sem.acquire().await {
                                     Ok(p) => p,
@@ -897,6 +905,7 @@ impl MultiSourceDownload {
                                     inj_geo, inj_fh,
                                     inj_ember_hash,
                                     inj_nick,
+                                    inj_sx_oh,
                                 ).await;
                                 if !freq_avail.is_empty() {
                                     let mut csel = cs.write().await;
@@ -1105,6 +1114,7 @@ impl MultiSourceDownload {
                 let r_ext = self.external_ip;
                 let r_geo = self.geoip.clone();
                 let r_fh = self.friend_hashes.clone();
+                let r_sx_oh = self.sx_overhead.clone();
                 let r_sem = conn_semaphore.clone();
                 retry_handles.push(tokio::spawn(async move {
                     let _permit = match r_sem.acquire().await {
@@ -1123,6 +1133,7 @@ impl MultiSourceDownload {
                         r_geo, r_fh,
                         r_ember_hash,
                         r_nick,
+                        r_sx_oh,
                     )
                     .await {
                         if !super::transfer::is_queue_detached_error(&e.to_string()) {
@@ -1428,6 +1439,7 @@ async fn download_parts_from_source(
     friend_hashes: Option<Arc<RwLock<std::collections::HashSet<[u8; 16]>>>>,
     ember_hash: [u8; 16],
     our_nickname: String,
+    sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
 ) -> anyhow::Result<()> {
     use super::messages::*;
     use std::io::{Read, Seek, Write};
@@ -1885,6 +1897,7 @@ async fn download_parts_from_source(
                 debug!("Received early AcceptUploadReq from source {}", _src_idx);
             }
             (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION => {
+                sx_overhead.record_download((6 + payload.len()) as u64);
                 epx_packets_received += 1;
                 info!("Received early EPX from source {} during pre-file-control ({} bytes)", _src_idx, payload.len());
                 match crate::network::ember::parse_exchange_payload(&payload) {
@@ -1941,6 +1954,7 @@ async fn download_parts_from_source(
         if !epx_data.is_empty() {
             info!("Sending EPX to Ember source {} ({} bytes, gen {})", _src_idx, epx_data.len(), sent_gen);
             let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await;
+            sx_overhead.record_upload((6 + epx_data.len()) as u64);
             initial_epx_sent_generation = Some(sent_gen);
         } else {
             info!("EPX payload empty, skipping EPX send to source {}", _src_idx);
@@ -2225,6 +2239,7 @@ async fn download_parts_from_source(
             continue;
         }
         if proto == OP_EMULEPROT && opcode == OP_EMBER_SOURCEEXCHANGE && epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
+            sx_overhead.record_download((6 + _payload.len()) as u64);
             epx_packets_received += 1;
             info!("Received EPX from source {} during file-status-wait ({} bytes)", _src_idx, _payload.len());
             match crate::network::ember::parse_exchange_payload(&_payload) {
@@ -2563,9 +2578,11 @@ async fn download_parts_from_source(
             sx2_req.extend_from_slice(&0u16.to_le_bytes());
             sx2_req.extend_from_slice(file_hash);
             let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_REQUESTSOURCES2, &sx2_req).await;
+            sx_overhead.record_upload((6 + sx2_req.len()) as u64);
         } else {
             let sx_req = build_file_request(file_hash);
             let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_REQUESTSOURCES, &sx_req).await;
+            sx_overhead.record_upload((6 + sx_req.len()) as u64);
         }
         if let Some(sm) = &source_mgr {
             let mut sm = sm.write().await;
@@ -2834,6 +2851,7 @@ async fn download_parts_from_source(
                     if !epx_data.is_empty() {
                         debug!("Re-sending EPX to multi-source peer {} (gen {}->{}, {} bytes)", _src_idx, last_epx_generation, current_gen, epx_data.len());
                         let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await;
+                        sx_overhead.record_upload((6 + epx_data.len()) as u64);
                     }
                     last_epx_generation = current_gen;
                 }
@@ -3119,6 +3137,7 @@ async fn download_parts_from_source(
                 // notify the network loop so they can be injected into the
                 // active download immediately.
                 (OP_EMULEPROT, OP_ANSWERSOURCES) if payload.len() >= 18 => {
+                    sx_overhead.record_download((6 + payload.len()) as u64);
                     match parse_answer_sources(&payload, peer_source_exchange_ver) {
                         Ok((version, answer_hash, entries)) if answer_hash == *file_hash => {
                             let mut sx_count = 0u32;
@@ -3173,6 +3192,7 @@ async fn download_parts_from_source(
                     }
                 }
                 (OP_EMULEPROT, OP_ANSWERSOURCES2) if payload.len() >= 19 => {
+                    sx_overhead.record_download((6 + payload.len()) as u64);
                     match parse_answer_sources2(&payload) {
                         Ok((version, answer_hash, entries)) if answer_hash == *file_hash => {
                             let mut sx_count = 0u32;
@@ -3228,6 +3248,7 @@ async fn download_parts_from_source(
                     }
                 }
                 (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) => {
+                    sx_overhead.record_download((6 + payload.len()) as u64);
                     if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
                         debug!("Ignoring excess EPX packet from multi-source peer {}", _src_idx);
                     } else {
