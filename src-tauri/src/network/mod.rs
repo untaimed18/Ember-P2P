@@ -1849,6 +1849,7 @@ async fn try_start_pending_download_from_known_sources(
     geoip: &crate::geoip::GeoIpReader,
     friend_hashes: &crate::app_state::SharedFriendHashes,
     ember_hash: [u8; 16],
+    sx_overhead: &crate::storage::statistics::SharedSxOverheadCounters,
 ) -> bool {
     if let Some(pd) = state.pending_downloads.get(transfer_id) {
         if pd.control.is_paused() || pd.control.is_cancelled() {
@@ -2002,6 +2003,7 @@ async fn try_start_pending_download_from_known_sources(
         aich_pending: Some(state.aich_recovery_pending.clone()),
         geoip: geoip.clone(),
         tracker_registry: Some(state.tracker_registry.clone()),
+        sx_overhead: sx_overhead.clone(),
     };
     let dl_tid = ms_download.transfer_id.clone();
     let dl_tid2 = dl_tid.clone();
@@ -3113,6 +3115,7 @@ pub async fn start_network(
         let ul_ember_sessions = state.ember_sessions.clone();
         let ul_disconnected = state.upload_disconnected.clone();
         let ul_queue = upload_queue_handle.clone();
+        let ul_sx_overhead = stats_manager.sx_counters.clone();
         tokio::spawn(async move {
             if let Err(e) = upload_server::start_upload_server(
                 tcp_port,
@@ -3157,6 +3160,7 @@ pub async fn start_network(
                 ember_hash,
                 ul_disconnected,
                 ul_queue,
+                ul_sx_overhead,
             )
             .await
             {
@@ -5693,6 +5697,7 @@ pub async fn start_network(
                                         aich_pending: Some(state.aich_recovery_pending.clone()),
                                         geoip: geoip.clone(),
                                         tracker_registry: Some(state.tracker_registry.clone()),
+                                        sx_overhead: stats_manager.sx_counters.clone(),
                                     };
                                     let tid = ms_download.transfer_id.clone();
                                     let tid2 = tid.clone();
@@ -7707,6 +7712,7 @@ pub async fn start_network(
                             aich_pending: Some(state.aich_recovery_pending.clone()),
                             geoip: geoip.clone(),
                             tracker_registry: Some(state.tracker_registry.clone()),
+                            sx_overhead: stats_manager.sx_counters.clone(),
                         };
                         let tx = dl_event_tx.clone();
                         let dl_tid = ms_download.transfer_id.clone();
@@ -7877,6 +7883,7 @@ pub async fn start_network(
                             aich_pending: Some(state.aich_recovery_pending.clone()),
                             geoip: geoip.clone(),
                             tracker_registry: Some(state.tracker_registry.clone()),
+                            sx_overhead: stats_manager.sx_counters.clone(),
                         };
                         let dl_tid = ms_download.transfer_id.clone();
                         let dl_tid2 = dl_tid.clone();
@@ -8891,6 +8898,7 @@ pub async fn start_network(
                             &geoip,
                             &friend_hashes,
                             ember_hash,
+                            &stats_manager.sx_counters,
                         ).await;
                     }
                 }
@@ -9270,6 +9278,7 @@ pub async fn start_network(
                                         &geoip,
                                         &friend_hashes,
                                         ember_hash,
+                                        &stats_manager.sx_counters,
                                     ).await;
                                 }
                             }
@@ -9742,6 +9751,7 @@ pub async fn start_network(
                                     aich_pending: Some(state.aich_recovery_pending.clone()),
                                     geoip: geoip.clone(),
                                     tracker_registry: Some(state.tracker_registry.clone()),
+                                    sx_overhead: stats_manager.sx_counters.clone(),
                                 };
                                 let dl_tid = ms_download.transfer_id.clone();
                                 state.active_source_senders.insert(dl_tid.clone(), src_inject_tx);
@@ -9923,6 +9933,7 @@ pub async fn start_network(
                                 external_ip: state.external_ip,
                                 aich_pending: Some(state.aich_recovery_pending.clone()),
                                 geoip: geoip.clone(),
+                                sx_overhead: stats_manager.sx_counters.clone(),
                             };
                             {
                                 let mut mgr = transfer_manager.write().await;
@@ -10048,6 +10059,13 @@ pub async fn start_network(
             _ = stats_timer.tick() => {
                 stats_manager.session_down_counter.store(bandwidth_limiter.total_downloaded(), std::sync::atomic::Ordering::Relaxed);
                 stats_manager.session_up_counter.store(bandwidth_limiter.total_uploaded(), std::sync::atomic::Ordering::Relaxed);
+                // Fold peer-to-peer SX bytes (OP_REQUESTSOURCES /
+                // OP_ANSWERSOURCES + Ember EPX) accumulated by the
+                // upload / transfer / multi_source tasks into the
+                // overhead category. Without this the Source Exchange
+                // row on the Statistics page shows only server-based
+                // source-asking and reads zero on KAD/Ember-only runs.
+                stats_manager.drain_sx_counters();
                 stats_manager.record_rate();
                 state.ip_filter.collect_shared_hits(&shared_ip_filter);
                 for (transfer_id, injected, remaining) in drain_active_source_overflow(&mut state) {
@@ -13645,6 +13663,7 @@ async fn handle_command(
                     aich_pending: Some(state.aich_recovery_pending.clone()),
                     geoip: geoip.clone(),
                     tracker_registry: Some(state.tracker_registry.clone()),
+                    sx_overhead: stats_manager.sx_counters.clone(),
                 };
 
                 let tx = dl_event_tx.clone();

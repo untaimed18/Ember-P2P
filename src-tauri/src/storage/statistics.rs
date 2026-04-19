@@ -35,6 +35,35 @@ pub struct TransferStats {
     pub overhead_file_request: u64,
 }
 
+/// Lock-free counters that the ed2k upload / transfer / multi_source
+/// tasks bump on every peer-to-peer Source Exchange packet they send
+/// or receive (`OP_REQUESTSOURCES`, `OP_ANSWERSOURCES`, and Ember's
+/// `OP_EMBER_SOURCEEXCHANGE`). The network-loop's stats tick swaps
+/// them out into `StatsManager::add_overhead` so the SX bytes flow
+/// into `overhead_source_exchange` alongside the existing
+/// server-source-asking traffic. Without this the SX category was
+/// effectively zero for KAD/Ember-only sessions, even when the actual
+/// peer-to-peer source-exchange protocol was very active.
+#[derive(Debug, Default)]
+pub struct SxOverheadCounters {
+    pub upload_bytes: AtomicU64,
+    pub download_bytes: AtomicU64,
+}
+
+impl SxOverheadCounters {
+    pub fn record_upload(&self, bytes: u64) {
+        if bytes == 0 { return; }
+        self.upload_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_download(&self, bytes: u64) {
+        if bytes == 0 { return; }
+        self.download_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+pub type SharedSxOverheadCounters = Arc<SxOverheadCounters>;
+
 pub struct StatsManager {
     pub stats: TransferStats,
     down_rate_history: VecDeque<(i64, u64)>,
@@ -43,6 +72,7 @@ pub struct StatsManager {
     last_up_snapshot: u64,
     pub session_down_counter: Arc<AtomicU64>,
     pub session_up_counter: Arc<AtomicU64>,
+    pub sx_counters: SharedSxOverheadCounters,
 }
 
 impl StatsManager {
@@ -60,6 +90,23 @@ impl StatsManager {
             last_up_snapshot: 0,
             session_down_counter: Arc::new(AtomicU64::new(0)),
             session_up_counter: Arc::new(AtomicU64::new(0)),
+            sx_counters: Arc::new(SxOverheadCounters::default()),
+        }
+    }
+
+    /// Drain the lock-free peer-SX byte counters into `add_overhead` so
+    /// the bytes show up under the `Source Exchange` row on the
+    /// Statistics page. Call from the network loop's periodic stats
+    /// tick (same cadence as `refresh_rate`) so the UI sees fresh
+    /// totals without burdening every send/recv site with a Mutex.
+    pub fn drain_sx_counters(&mut self) {
+        let up = self.sx_counters.upload_bytes.swap(0, Ordering::Relaxed);
+        let down = self.sx_counters.download_bytes.swap(0, Ordering::Relaxed);
+        if up > 0 {
+            self.add_overhead(OverheadCategory::SourceExchange, OverheadDirection::Upload, up);
+        }
+        if down > 0 {
+            self.add_overhead(OverheadCategory::SourceExchange, OverheadDirection::Download, down);
         }
     }
 

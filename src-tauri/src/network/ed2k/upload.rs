@@ -424,6 +424,11 @@ struct UploadHandler {
     /// this to reject new file requests and terminate active sessions (eMule
     /// behavior: all upload activity stops on disconnect).
     network_disconnected: Arc<std::sync::atomic::AtomicBool>,
+    /// Lock-free counter the per-connection upload tasks bump on every
+    /// inbound `OP_REQUESTSOURCES` and outbound `OP_ANSWERSOURCES` /
+    /// `OP_EMBER_SOURCEEXCHANGE` packet. Drained on the network
+    /// loop's stats tick into `OverheadCategory::SourceExchange`.
+    sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
 }
 
 const MAX_AICH_CACHE_ENTRIES: usize = 50;
@@ -818,6 +823,11 @@ pub async fn start_upload_server(
     // Queue handle created by the caller so other subsystems (UDP REASKACK
     // rank, diagnostics) can read the same shared queue state.
     upload_queue: UploadQueueRef,
+    // Shared atomic counters for peer-to-peer Source Exchange overhead.
+    // Each upload-side connection bumps these on inbound REQUESTSOURCES
+    // and outbound ANSWERSOURCES / EMBER_SOURCEEXCHANGE bytes; the
+    // network-loop drains them into the SourceExchange overhead row.
+    sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     let listener = match TcpListener::bind(addr).await {
@@ -885,6 +895,7 @@ pub async fn start_upload_server(
         slot_rates,
         ember_sessions,
         network_disconnected,
+        sx_overhead,
     });
 
     let mut slot_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -1844,6 +1855,7 @@ impl UploadHandler {
             if !epx_data.is_empty() {
                 info!("Sending EPX to Ember peer {peer_addr} ({} bytes, gen {})", epx_data.len(), last_epx_generation);
                 let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await;
+                self.sx_overhead.record_upload((6 + epx_data.len()) as u64);
             } else {
                 info!("EPX payload empty, skipping EPX send to {peer_addr}");
             }
@@ -2091,6 +2103,7 @@ impl UploadHandler {
                         .is_ok()
                         {
                             last_epx_generation = current_gen;
+                            self.sx_overhead.record_upload((6 + epx_data.len()) as u64);
                         }
                     }
                 }
@@ -3841,6 +3854,7 @@ impl UploadHandler {
                                                 &resp,
                                             )
                                             .await?;
+                                            self.sx_overhead.record_upload((6 + resp.len()) as u64);
                                         }
                                         MultiPacketSubReq::RequestSources2 { version, .. } => {
                                             let exclude_ip = match peer_addr.ip() {
@@ -3858,6 +3872,7 @@ impl UploadHandler {
                                                 &resp,
                                             )
                                             .await?;
+                                            self.sx_overhead.record_upload((6 + resp.len()) as u64);
                                         }
                                         MultiPacketSubReq::AichFileHashReq => {}
                                         _ => {}
@@ -3880,6 +3895,14 @@ impl UploadHandler {
                 }
 
                 (OP_EMULEPROT, OP_REQUESTSOURCES) => {
+                    // Inbound peer-to-peer Source Exchange request: count
+                    // the wire bytes (6-byte ed2k header + payload) so the
+                    // Statistics page sees real SX activity, not just the
+                    // server-side source asking that the original SX
+                    // overhead category covered. The obfuscation layer
+                    // adds a few bytes when enabled; the unobfuscated
+                    // size is a reasonable lower bound.
+                    self.sx_overhead.record_download((6 + payload.len()) as u64);
                     // SX v1: respond with OP_ANSWERSOURCES (legacy v1 format)
                     if let Some(hash) = current_file_hash {
                         let exclude_ip = match peer_addr.ip() {
@@ -3901,10 +3924,12 @@ impl UploadHandler {
                             &resp,
                         )
                         .await?;
+                        self.sx_overhead.record_upload((6 + resp.len()) as u64);
                     }
                 }
 
                 (OP_EMULEPROT, OP_REQUESTSOURCES2) => {
+                    self.sx_overhead.record_download((6 + payload.len()) as u64);
                     // SX v2+: format is Version(1) + Options(2) + Hash(16) = 19 bytes
                     if payload.len() >= 19 {
                         let requested_version = payload[0];
@@ -3925,6 +3950,7 @@ impl UploadHandler {
                             &resp,
                         )
                         .await?;
+                        self.sx_overhead.record_upload((6 + resp.len()) as u64);
                     }
                 }
 
@@ -4061,6 +4087,7 @@ impl UploadHandler {
                 }
 
                 (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) => {
+                    self.sx_overhead.record_download((6 + payload.len()) as u64);
                     if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
                         debug!("Ignoring excess EPX packet from uploading peer {peer_addr}");
                     } else {

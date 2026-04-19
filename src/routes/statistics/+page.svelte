@@ -82,8 +82,13 @@
   }
 
   // Render overhead rows in descending size so the biggest contributor
-  // sits at the top — quicker to read at a glance than a fixed
-  // protocol-defined order.
+  // sits at the top. Zero-byte categories used to be filtered out
+  // entirely, but that hid Source Exchange from anyone running on KAD/
+  // Ember without an active eD2K server connection (the SX counter is
+  // only fed by server-based source asking, not the actual peer-to-peer
+  // traffic — see backend `OverheadCategory::SourceExchange` sites).
+  // Showing all four categories at all times tells the user which
+  // pathway is contributing to overhead and which is silent.
   type OverheadRow = { key: string; label: string; value: number; cls: string };
   let overheadRows = $derived.by<OverheadRow[]>(() => {
     if (!stats) return [];
@@ -93,7 +98,7 @@
       { key: 'srcex', label: 'Source Exchange', value: stats.overhead_source_exchange, cls: 'oh-srcex' },
       { key: 'freq', label: 'File Requests', value: stats.overhead_file_request, cls: 'oh-freq' },
     ];
-    return rows.filter((r) => r.value > 0).sort((a, b) => b.value - a.value);
+    return rows.sort((a, b) => b.value - a.value);
   });
 
   // Friendly "Apr 18, 2026" rendering for the cumulative-since label.
