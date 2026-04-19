@@ -2253,6 +2253,40 @@ pub async fn start_network(
 
     let comment_manager = Arc::new(RwLock::new(CommentManager::new()));
 
+    // Load the persisted server list from `<data_dir>/server.met` so
+    // servers discovered via OP_SERVERLIST, manually added, or merged
+    // from a downloaded server.met survive across restarts. If the
+    // file is missing (first launch) or fails to parse (corruption /
+    // older format), fall back to the hardcoded seed list so the user
+    // still has a working set of bootstrap servers. The seed is also
+    // overlaid into the loaded list below so the well-known seeds
+    // remain available even if a previous version saved a list that
+    // didn't include them.
+    let server_list = {
+        let met_path = data_dir.join("server.met");
+        let mut list = match ServerList::load_server_met(&met_path) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    info!("No persisted server.met at {:?} — seeding hardcoded list", met_path);
+                } else {
+                    warn!("Failed to load persisted server.met from {:?}: {} — seeding hardcoded list", met_path, e);
+                }
+                ServerList::hardcoded()
+            }
+        };
+        // Overlay the hardcoded seeds (idempotent: `add` skips
+        // duplicates by ip/port). Without this, a user whose
+        // server.met was saved before a seed was added would never
+        // see the new seed. The hardcoded list is only 4 entries so
+        // the clone cost is negligible.
+        let seeds = ServerList::hardcoded();
+        for seed in seeds.servers().iter().cloned() {
+            list.add(seed);
+        }
+        list
+    };
+
     let mut state = NetworkState {
         local_id,
         user_hash,
@@ -2314,10 +2348,7 @@ pub async fn start_network(
         first_publish_done: false,
         kad_initial_source_burst_done: false,
         friend_presence_initial_done: false,
-        server_list: {
-            let met_path = data_dir.join("server.met");
-            ServerList::load_server_met(&met_path).unwrap_or_else(|_| ServerList::hardcoded())
-        },
+        server_list,
         server_connected: false,
         server_connection: None,
         server_addr: None,
