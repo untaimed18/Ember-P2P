@@ -3511,14 +3511,43 @@ async fn download_parts_from_source(
         // socket and would push `total_received` past
         // `total_sent_bytes` (which only counts current-part bytes),
         // exiting before the current part actually finishes.
+        let mut bytes_received_this_part: u64 = 0;
+        let mut chunks_received_this_part: u32 = 0;
+        let mut bytes_received_for_other_parts: u64 = 0;
+        let receive_loop_started = std::time::Instant::now();
+        // DIAG: snapshot the gap state for this part at entry so we can
+        // tell whether is_part_complete tripping mid-loop is "the only
+        // remaining gap got filled" vs "something is wrong with the
+        // tracker".
+        let part_entry_gap_bytes: u64 = {
+            let t = tracker.read().await;
+            let (ps, pe) = t.part_range(part_idx);
+            t.gap_list()
+                .iter()
+                .map(|&(gs, ge)| {
+                    let s = gs.max(ps);
+                    let e = ge.min(pe);
+                    if s < e { e - s } else { 0 }
+                })
+                .sum()
+        };
+        info!(
+            "DIAG: source {} ({}) entering receive loop for part {} (resumed={}, sent_idx={}/{}, max_outstanding={}, gap_bytes_in_part={}, all_blocks_bytes={})",
+            _src_idx, addr, part_idx, resumed, sent_idx, batches.len(),
+            max_outstanding, part_entry_gap_bytes,
+            all_blocks.iter().map(|(s, e)| e - s).sum::<u64>(),
+        );
+        let exit_reason: &'static str;
         loop {
             check_control(&control).await?;
             if peer_out_of_parts {
+                exit_reason = "peer_out_of_parts";
                 break;
             }
             {
                 let t = tracker.read().await;
                 if t.is_part_complete(part_idx) {
+                    exit_reason = "is_part_complete";
                     break;
                 }
             }
@@ -3559,7 +3588,15 @@ async fn download_parts_from_source(
                     }
                     pkt
                 },
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(e)) => {
+                    info!(
+                        "DIAG: source {} ({}) read_packet_async error during part {}: {e:#} (chunks_for_part={}, bytes_for_part={}, sent_idx={}/{})",
+                        _src_idx, addr, part_idx,
+                        chunks_received_this_part, bytes_received_this_part,
+                        sent_idx, batches.len(),
+                    );
+                    return Err(e.into());
+                },
                 Err(_) => {
                     let _ = write_packet_async_ms(
                         &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
@@ -3674,6 +3711,12 @@ async fn download_parts_from_source(
                     // legitimate part N+1 credit.
                     let block_part = (start / PARTSIZE) as usize;
                     *per_part_credit.entry(block_part).or_insert(0) += piece_len;
+                    if block_part == part_idx {
+                        bytes_received_this_part += piece_len;
+                        chunks_received_this_part += 1;
+                    } else {
+                        bytes_received_for_other_parts += piece_len;
+                    }
                     let _ = progress_tx.send((_src_idx, piece_len as i64)).await;
                 }
                 (OP_EMULEPROT, OP_COMPRESSEDPART_I64) | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
@@ -3748,6 +3791,12 @@ async fn download_parts_from_source(
                     // above for rationale.
                     let block_part = (start / PARTSIZE) as usize;
                     *per_part_credit.entry(block_part).or_insert(0) += piece_len;
+                    if block_part == part_idx {
+                        bytes_received_this_part += piece_len;
+                        chunks_received_this_part += 1;
+                    } else {
+                        bytes_received_for_other_parts += piece_len;
+                    }
                     let _ = progress_tx.send((_src_idx, piece_len as i64)).await;
                 }
                 (OP_EMULEPROT, OP_AICHANSWER) if payload.len() >= 38 => {
@@ -3772,6 +3821,12 @@ async fn download_parts_from_source(
                     }
                 }
                 (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
+                    info!(
+                        "DIAG: source {} ({}) sent OP_OUTOFPARTREQS during part {} (sent_idx={}/{}, received_chunks={}, received_bytes={}, pipelined={:?}) — peer's request queue is full, ending session",
+                        _src_idx, addr, part_idx, sent_idx, batches.len(),
+                        chunks_received_this_part, bytes_received_this_part,
+                        pipelined_next.as_ref().map(|p| p.part_idx),
+                    );
                     peer_out_of_parts = true;
                     break;
                 }
@@ -4014,7 +4069,7 @@ async fn download_parts_from_source(
                     // saturated through the part-N → part-(N+1)
                     // hand-off (no round-trip stall, no Hello/SecIdent
                     // reconnect).
-                    if let Some(next) = pre_pipeline_next_part_ms(
+                    let pipeline_attempt = pre_pipeline_next_part_ms(
                         &chunk_sel,
                         &tracker,
                         &source_available,
@@ -4023,8 +4078,14 @@ async fn download_parts_from_source(
                         peer_supports_large_files,
                         file_size,
                     )
-                    .await
-                    {
+                    .await;
+                    if pipeline_attempt.is_none() {
+                        info!(
+                            "DIAG: source {} ({}) cross-part pipeline trigger fired for part {} (sent_idx={}/{}) but no eligible next part found",
+                            _src_idx, addr, part_idx, sent_idx, batches.len(),
+                        );
+                    }
+                    if let Some(next) = pipeline_attempt {
                         let first_batch = &next.batches[0];
                         let (req_payload, req_proto, req_op) = if next.needs_i64 {
                             (build_request_parts_i64(file_hash, first_batch), OP_EMULEPROT, OP_REQUESTPARTS_I64)
@@ -4037,16 +4098,17 @@ async fn download_parts_from_source(
                             // let the existing per-part flow handle the
                             // next part on its own (with the round-trip
                             // stall, but not a session drop).
-                            debug!(
-                                "Source {} ({}) cross-part pipeline send for part {} failed: {e:#} — falling back to non-pipelined hand-off",
+                            info!(
+                                "DIAG: source {} ({}) cross-part pipeline send for part {} failed: {e:#} — falling back to non-pipelined hand-off",
                                 _src_idx, addr, next.part_idx,
                             );
                         } else {
                             let pipelined_bytes: u64 =
                                 first_batch.iter().map(|(s, e)| e - s).sum();
-                            debug!(
-                                "Source {} ({}) cross-part pipeline: pre-sent first batch of part {} ({} bytes) while still receiving part {}",
-                                _src_idx, addr, next.part_idx, pipelined_bytes, part_idx,
+                            info!(
+                                "DIAG: source {} ({}) cross-part pipeline: pre-sent first batch of part {} ({} bytes, {} blocks) while still receiving part {}",
+                                _src_idx, addr, next.part_idx, pipelined_bytes,
+                                first_batch.len(), part_idx,
                             );
                             // Add to part_queue if not already present;
                             // mark in_progress so other sources see it
@@ -4105,6 +4167,34 @@ async fn download_parts_from_source(
         // self-consistent. Skipping fsync here removes a per-part disk
         // round-trip (tens of ms on HDDs / network shares) without
         // affecting correctness — the final fsync still runs at completion.
+
+        // DIAG: log every receive-loop exit with the reason and the
+        // counters so we can correlate "peer disappears after 1 chunk"
+        // with the underlying cause (gap-list says complete, peer
+        // signalled out_of_parts, etc.).
+        let part_remaining_after: u64 = {
+            let t = tracker.read().await;
+            let (ps, pe) = t.part_range(part_idx);
+            t.gap_list()
+                .iter()
+                .map(|&(gs, ge)| {
+                    let s = gs.max(ps);
+                    let e = ge.min(pe);
+                    if s < e { e - s } else { 0 }
+                })
+                .sum()
+        };
+        info!(
+            "DIAG: source {} ({}) receive-loop exit for part {}: reason={}, elapsed={:.2}s, chunks_for_part={}, bytes_for_part={}, bytes_for_other_parts={}, gap_bytes_in_part_at_entry={}, gap_bytes_in_part_after={}, sent_idx={}/{}, completed_reqs={}, peer_out={}, pipelined_now={:?}",
+            _src_idx, addr, part_idx, exit_reason,
+            receive_loop_started.elapsed().as_secs_f64(),
+            chunks_received_this_part, bytes_received_this_part,
+            bytes_received_for_other_parts,
+            part_entry_gap_bytes, part_remaining_after,
+            sent_idx, batches.len(), completed_reqs,
+            peer_out_of_parts,
+            pipelined_next.as_ref().map(|p| p.part_idx),
+        );
 
         if peer_out_of_parts {
             let snap = {
@@ -4472,13 +4562,44 @@ async fn download_parts_from_source(
                 // not-yet-complete set). Genuinely nothing left to do
                 // here — let the loop fall through to the natural
                 // `OP_END_OF_DOWNLOAD` exit.
-                debug!(
-                    "Source {} ({}): no overlap between peer's part availability and remaining incomplete parts; ending session cleanly",
-                    _src_idx, addr
+                let (cur_remaining, cur_in_progress_count, cur_avail_intersect) = {
+                    let t = tracker.read().await;
+                    let r = t.remaining_count();
+                    let ip_count = t.in_progress.iter().filter(|&&v| v).count();
+                    let intersect = if source_available.is_empty() {
+                        r
+                    } else {
+                        (0..t.part_count)
+                            .filter(|&i| {
+                                !t.is_part_complete(i)
+                                    && source_available.get(i).copied().unwrap_or(false)
+                            })
+                            .count()
+                    };
+                    (r, ip_count, intersect)
+                };
+                info!(
+                    "DIAG: source {} ({}) dynamic-extend found NO next part after part {}: remaining={}, in_progress_globally={}, peer-available-intersect-incomplete={}, source_available_len={}, queue=[{}], pipelined={:?}",
+                    _src_idx, addr, part_idx,
+                    cur_remaining, cur_in_progress_count, cur_avail_intersect,
+                    source_available.len(),
+                    part_queue.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","),
+                    pipelined_next.as_ref().map(|p| p.part_idx),
                 );
             }
         }
     }
+    // DIAG: per-part loop exited (queue exhausted or peer_out_of_parts).
+    // This used to be a silent path — the function returned Ok(()) with
+    // nothing in the log to explain why the source disconnected.
+    info!(
+        "DIAG: source {} ({}) per-part loop exit: queue_idx={}/{}, peer_out_of_parts={}, src_transferred={}, queue=[{}], pipelined={:?}",
+        _src_idx, addr,
+        queue_idx, part_queue.len(), peer_out_of_parts,
+        src_transferred,
+        part_queue.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","),
+        pipelined_next.as_ref().map(|p| p.part_idx),
+    );
 
     // Signal the uploader that we're done
     write_packet_async_ms(
@@ -4501,6 +4622,11 @@ async fn download_parts_from_source(
             cs.remove_source(avail);
         }
     }
+
+    info!(
+        "DIAG: source {} ({}) download_parts_from_source returning Ok(()): src_transferred={}, per_part_credit_remaining={:?}",
+        _src_idx, addr, src_transferred, per_part_credit,
+    );
 
     Ok(())
 }
