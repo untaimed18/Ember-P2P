@@ -954,32 +954,6 @@
 
           <div class="divider"></div>
 
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">Filter Servers by IP</span>
-              <span class="hint">Apply IP filter to eD2K servers.</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.filter_servers_by_ip} />
-          </div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">Update Server List from Server</span>
-              <span class="hint">Accept new servers from a connected server's server list.</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.add_servers_from_server} />
-          </div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">Update Server List from Clients</span>
-              <span class="hint">Accept new servers discovered from eD2K clients.</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.add_servers_from_clients} />
-          </div>
-
-          <div class="divider"></div>
-
           <!--
             eD2K server-list discovery. These mirror the three eMule
             options under Options → Servers and are saved live (no
@@ -1216,22 +1190,6 @@
           </div>
 
           <div class="divider"></div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">Require Friend Approval</span>
-              <span class="hint">Require manual approval before granting friend-slot priority to new requests.</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.friend_require_approval} />
-          </div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">Friend Online Notifications</span>
-              <span class="hint">Show a notification when a friend comes online.</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.friend_online_notifications} />
-          </div>
 
           <div class="field">
             <label for="rendezvous-url">Rendezvous Server URL</label>
