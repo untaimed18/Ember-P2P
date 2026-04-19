@@ -177,7 +177,12 @@ impl ServerUdpSocket {
     ///  - `OP_GLOBSEARCHREQ3`: server supports EXT_GETFILES + LARGEFILES
     ///  - `OP_GLOBSEARCHREQ2`: server supports EXT_GETFILES
     ///  - `OP_GLOBSEARCHREQ`:  fallback for all other servers
-    #[allow(dead_code)]
+    ///
+    /// Live caller: the search-command handler in `network/mod.rs`
+    /// fans this out to every eligible server in the list when a
+    /// keyword search runs (`run_udp` branch). Replies arrive as
+    /// `ServerUdpResponse::SearchResult` and merge into the same UI
+    /// search-results stream as TCP and KAD results.
     pub fn build_global_search_packet(server: &ServerEntry, search_expr: &[u8]) -> Option<(Vec<u8>, SocketAddr)> {
         let udp_port = server.port.checked_add(4)?;
         let addr: SocketAddr = format!("{}:{}", server.ip, udp_port).parse().ok()?;

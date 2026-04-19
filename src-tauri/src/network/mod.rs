@@ -1323,6 +1323,18 @@ struct ActiveSearchRequest {
     kad_pending: bool,
     udp_pending: bool,
     file_type_filter: Option<String>,
+    /// Keywords extracted from the original query, used by the spam-filter
+    /// scorer when streamed results arrive from the network event loop.
+    /// Empty for queries where extraction yielded nothing (no spam scoring
+    /// applied — those queries shouldn't reach the streaming paths anyway,
+    /// since we early-return when `keywords.is_empty()` at request start).
+    keywords: Vec<String>,
+    /// Source IP of the connected eD2k server at request-start time, used
+    /// as an extra signal by the spam filter (`spam_server_ips` set). Only
+    /// meaningful for the TCP-server streaming path; the UDP-server and
+    /// KAD paths pass `None` because results from those origins don't
+    /// uniquely belong to one server / origin IP.
+    server_ip: Option<String>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -1694,6 +1706,79 @@ fn emit_search_results(
         "search-results",
         SearchResultsEvent { request_id, results },
     );
+}
+
+/// Return true if `ip` is safe to surface as a candidate download source
+/// in a streamed search result. Mirrors the gate used at
+/// `inject_source_into_active_transfers` so the search UI never lists IPs
+/// that we'd refuse to dial: special-use ranges, multicast, the user's
+/// IP filter, and the live runtime banlist.
+///
+/// Uses the readonly form of `IpFilter::is_blocked` because we only have
+/// `&NetworkState` at the call sites; the per-IP cache miss cost is
+/// negligible compared to the per-result string formatting we're already
+/// doing on the same path.
+fn is_search_source_safe(state: &NetworkState, ip: Ipv4Addr) -> bool {
+    if crate::security::is_special_use_v4(ip) || ip.is_multicast() {
+        return false;
+    }
+    if state.ip_filter.is_blocked_readonly(ip) {
+        return false;
+    }
+    if state.banned_ips.contains(&ip) {
+        return false;
+    }
+    true
+}
+
+/// Apply spam scoring + filename cleanup + comment URL stripping to a
+/// batch of streamed search results, then forward them to the existing
+/// `emit_search_results` pipeline. This is the streaming counterpart to
+/// `commands::search::enrich_results` (used by the synchronous local
+/// search path).
+///
+/// Without this, network-discovered results — which is where spam
+/// actually lives — would reach the UI with `spam_rating: 0` /
+/// `is_spam: false` regardless of the user's spam-filter settings,
+/// because the construction sites stub those fields and the frontend
+/// trusts them.
+///
+/// Acquires only a read lock on `spam_filter`, so it's safe to call
+/// from any event-loop arm. `keywords` and `server_ip` come from
+/// `ActiveSearchRequest`, populated at request start.
+async fn enrich_and_emit_search_results(
+    app_handle: &tauri::AppHandle,
+    spam_filter: &Arc<RwLock<crate::search::spam::SpamFilter>>,
+    settings: &AppSettings,
+    request_id: u64,
+    mut results: Vec<SearchResult>,
+    file_type_filter: &Option<String>,
+    keywords: &[String],
+    server_ip: Option<&str>,
+) {
+    if results.is_empty() {
+        return;
+    }
+    let spam_enabled = settings.spam_filter_enabled;
+    let spam_profile = crate::search::spam::SpamFilterProfile::from_setting(
+        &settings.spam_filter_profile,
+    );
+    let cleanup_strings =
+        crate::search::cleanup::parse_cleanup_strings(&settings.filename_cleanups);
+
+    let spam = spam_filter.read().await;
+    crate::commands::search::apply_search_enrichment(
+        &mut results,
+        &spam,
+        keywords,
+        server_ip,
+        spam_enabled,
+        spam_profile,
+        &cleanup_strings,
+    );
+    drop(spam);
+
+    emit_search_results(app_handle, request_id, results, file_type_filter);
 }
 
 fn maybe_finish_active_search(
@@ -5283,15 +5368,31 @@ pub async fn start_network(
                         if new_results > pending.last_streamed_count + stream_threshold {
                             let new_entries = &search.results[pending.last_streamed_count..];
                             let mut batch = convert_search_results(new_entries);
-                            if pending.keywords.len() > 1 {
-                                let kws = &pending.keywords;
+                            // Pull the per-pending data out by value so we
+                            // don't hold an immutable borrow of
+                            // `state.pending_keyword_searches` across the
+                            // `await` below — the next statement re-borrows
+                            // it mutably (`get_mut`).
+                            let pending_request_id = pending.request_id;
+                            let pending_file_type_filter = pending.file_type_filter.clone();
+                            let pending_keywords = pending.keywords.clone();
+                            if pending_keywords.len() > 1 {
                                 batch.retain(|r| {
                                     let name_lower = r.file.name.to_lowercase();
-                                    kws.iter().all(|kw| name_lower.contains(kw))
+                                    pending_keywords.iter().all(|kw| name_lower.contains(kw))
                                 });
                             }
                             if !batch.is_empty() {
-                                emit_search_results(&app_handle, pending.request_id, batch, &pending.file_type_filter);
+                                enrich_and_emit_search_results(
+                                    &app_handle,
+                                    &spam_filter,
+                                    &settings,
+                                    pending_request_id,
+                                    batch,
+                                    &pending_file_type_filter,
+                                    &pending_keywords,
+                                    None,
+                                ).await;
                             }
                             if let Some(p) = state.pending_keyword_searches.get_mut(&sid) {
                                 p.last_streamed_count = new_results;
@@ -8829,7 +8930,12 @@ pub async fn start_network(
                                             .map(|(_, ext)| ext.to_string())
                                             .unwrap_or_default();
                                         let source_addresses = if sr.client_id >= ed2k::server::LOWID_THRESHOLD {
-                                            vec![format!("{}:{}", Ipv4Addr::from(sr.client_id.to_le_bytes()), sr.client_port)]
+                                            let ip = Ipv4Addr::from(sr.client_id.to_le_bytes());
+                                            if is_search_source_safe(&state, ip) {
+                                                vec![format!("{}:{}", ip, sr.client_port)]
+                                            } else {
+                                                Vec::new()
+                                            }
                                         } else {
                                             Vec::new()
                                         };
@@ -8893,8 +8999,21 @@ pub async fn start_network(
                                                 finished_search_requests.push(request_id);
                                             }
                                         } else {
-                                            let ft_filter = state.active_search_request.as_ref().and_then(|a| a.file_type_filter.clone());
-                                            emit_search_results(&app_handle, request_id, search_results, &ft_filter);
+                                            let (ft_filter, kws, srv_ip) = state
+                                                .active_search_request
+                                                .as_ref()
+                                                .map(|a| (a.file_type_filter.clone(), a.keywords.clone(), a.server_ip.clone()))
+                                                .unwrap_or((None, Vec::new(), None));
+                                            enrich_and_emit_search_results(
+                                                &app_handle,
+                                                &spam_filter,
+                                                &settings,
+                                                request_id,
+                                                search_results,
+                                                &ft_filter,
+                                                &kws,
+                                                srv_ip.as_deref(),
+                                            ).await;
                                             if count >= 200 {
                                                 state.server_search_more_needed = true;
                                                 state.pending_server_search = Some(PendingServerSearch {
@@ -9760,7 +9879,12 @@ pub async fn start_network(
                                         .map(|(_, ext)| ext.to_string())
                                         .unwrap_or_default();
                                     let source_addresses = if sr.client_id >= ed2k::server::LOWID_THRESHOLD {
-                                        vec![format!("{}:{}", Ipv4Addr::from(sr.client_id.to_le_bytes()), sr.client_port)]
+                                        let ip = Ipv4Addr::from(sr.client_id.to_le_bytes());
+                                        if is_search_source_safe(&state, ip) {
+                                            vec![format!("{}:{}", ip, sr.client_port)]
+                                        } else {
+                                            Vec::new()
+                                        }
                                     } else {
                                         Vec::new()
                                     };
@@ -9800,9 +9924,21 @@ pub async fn start_network(
                                         result_origin: crate::search::merge::ORIGIN_SERVER_UDP.to_string(),
                                     }
                                 }).collect();
-                                if let Some(ref active) = state.active_search_request {
+                                if let Some(active) = state.active_search_request.as_ref() {
                                     state.server_udp_search_age = 0;
-                                    emit_search_results(&app_handle, active.request_id, search_results, &active.file_type_filter);
+                                    let request_id = active.request_id;
+                                    let ft_filter = active.file_type_filter.clone();
+                                    let kws = active.keywords.clone();
+                                    enrich_and_emit_search_results(
+                                        &app_handle,
+                                        &spam_filter,
+                                        &settings,
+                                        request_id,
+                                        search_results,
+                                        &ft_filter,
+                                        &kws,
+                                        None,
+                                    ).await;
                                 }
                             }
                         }
@@ -14062,6 +14198,8 @@ async fn handle_command(
                 kad_pending: false,
                 udp_pending: false,
                 file_type_filter: file_type_filter.clone(),
+                keywords: Vec::new(),
+                server_ip: state.server_addr.map(|a| a.ip().to_string()),
             };
 
             let keywords = kad::publish::extract_keywords(&query);
@@ -14075,6 +14213,7 @@ async fn handle_command(
                 );
                 return;
             }
+            active_request.keywords = keywords.clone();
 
             // Build the search expression once, reuse for TCP + UDP.
             // Single keyword → string leaf; multiple → AND tree; file-type

@@ -22,6 +22,34 @@ fn parse_exact_file_hash(file_hash: &str) -> Result<[u8; 16], String> {
     Ok(hash)
 }
 
+/// Apply spam scoring + filename cleanup + comment URL stripping to a
+/// batch of results, given pre-resolved configuration. Pure enrichment
+/// — no I/O, no locking. Used by both the synchronous `search_files`
+/// command path and the streaming network event loop.
+pub fn apply_search_enrichment(
+    results: &mut [SearchResult],
+    spam: &SpamFilter,
+    search_keywords: &[String],
+    server_ip: Option<&str>,
+    spam_enabled: bool,
+    spam_profile: SpamFilterProfile,
+    cleanup_strings: &[String],
+) {
+    for result in results.iter_mut() {
+        if spam_enabled {
+            result.spam_rating = spam.rate_result(result, search_keywords, server_ip, spam_profile);
+            result.is_spam = SpamFilter::is_spam(result.spam_rating, spam_profile);
+        }
+        result.clean_name = cleanup_filename(&result.file.name, cleanup_strings);
+        if let Some(ref comment) = result.comment {
+            let cleaned = strip_comment_urls(comment);
+            if cleaned != *comment {
+                result.comment = Some(cleaned);
+            }
+        }
+    }
+}
+
 pub async fn enrich_results(
     results: &mut [SearchResult],
     state: &AppState,
@@ -37,19 +65,15 @@ pub async fn enrich_results(
     let cleanup_strings = parse_cleanup_strings(&config.settings.filename_cleanups);
     drop(config);
 
-    for result in results.iter_mut() {
-        if spam_enabled {
-            result.spam_rating = spam.rate_result(result, search_keywords, server_ip, spam_profile);
-            result.is_spam = SpamFilter::is_spam(result.spam_rating, spam_profile);
-        }
-        result.clean_name = cleanup_filename(&result.file.name, &cleanup_strings);
-        if let Some(ref comment) = result.comment {
-            let cleaned = strip_comment_urls(comment);
-            if cleaned != *comment {
-                result.comment = Some(cleaned);
-            }
-        }
-    }
+    apply_search_enrichment(
+        results,
+        &spam,
+        search_keywords,
+        server_ip,
+        spam_enabled,
+        spam_profile,
+        &cleanup_strings,
+    );
 }
 
 #[tauri::command]
