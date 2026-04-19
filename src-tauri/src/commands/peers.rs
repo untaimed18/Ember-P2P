@@ -3,6 +3,11 @@ use crate::network::{NetworkCommand, PeerReputationInfo, ReputationStatsInfo};
 use crate::storage::identity::NodeIdentity;
 use crate::types::*;
 
+/// Maximum stored friend nickname size. Same cap is enforced in
+/// `update_friend_nickname`; centralizing it here keeps the two
+/// command paths in sync.
+const MAX_FRIEND_NICKNAME_LEN: usize = 256;
+
 fn parse_user_hash(hex_str: &str) -> Result<[u8; 16], String> {
     if hex_str.len() != 32 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("User hash must be 32 hex characters (16 bytes)".into());
@@ -40,6 +45,11 @@ pub async fn add_friend(
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
     let nick = nickname.unwrap_or_default();
+    if nick.len() > MAX_FRIEND_NICKNAME_LEN {
+        return Err(format!(
+            "Nickname too long (max {MAX_FRIEND_NICKNAME_LEN} bytes)"
+        ));
+    }
 
     let our_ember_hash = {
         let data_dir = directories::ProjectDirs::from("com", "ember", "p2p")
@@ -127,8 +137,10 @@ pub async fn update_friend_nickname(
     user_hash_hex: String,
     nickname: String,
 ) -> Result<(), String> {
-    if nickname.len() > 256 {
-        return Err("Nickname too long (max 256 bytes)".into());
+    if nickname.len() > MAX_FRIEND_NICKNAME_LEN {
+        return Err(format!(
+            "Nickname too long (max {MAX_FRIEND_NICKNAME_LEN} bytes)"
+        ));
     }
     let canonical = user_hash_hex.to_lowercase();
     parse_user_hash(&canonical)?;

@@ -339,6 +339,19 @@ impl PerFileSourceList {
             .collect()
     }
 
+    /// Bump `last_asked` on the matching source so the next
+    /// `needs_udp_reask()` call returns false until another full
+    /// `FILEREASKTIME_SECS - 120` window elapses. Without this, the
+    /// source stays "due" forever and the 5s reask timer in the
+    /// network event loop emits a fresh `OP_REASKFILEPING` on every
+    /// tick — peers throttle/ban the IP and we self-DoS our own
+    /// upstream.
+    pub fn mark_udp_reask_sent(&mut self, ip: Ipv4Addr, tcp_port: u16) {
+        if let Some(s) = self.find_mut(ip, tcp_port) {
+            s.last_asked = std::time::Instant::now();
+        }
+    }
+
     /// Count sources in OnQueue or Downloading state (eMule: m_nCompleteSourcesCount).
     pub fn complete_source_count(&self) -> u16 {
         self.sources.iter()

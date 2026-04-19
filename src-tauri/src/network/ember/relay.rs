@@ -343,12 +343,33 @@ pub async fn connect_to_peer_relay(
         .await
         .map_err(|e| format!("relay write request: {e}"))?;
 
-    let mut resp_buf = [0u8; 7];
-    recv.read_exact(&mut resp_buf)
+    // Read header first (always 7 bytes: msg_type | session_id | payload_len),
+    // then drain the payload by length so we don't desynchronize the
+    // stream if a future protocol revision (or non-conforming relay)
+    // ever sends a non-empty accept/reject body. Cap payload to 64 KiB
+    // to avoid reading an attacker-chosen huge `payload_len` into
+    // memory.
+    let mut resp_header = [0u8; 7];
+    recv.read_exact(&mut resp_header)
         .await
         .map_err(|e| format!("relay read response: {e}"))?;
+    let payload_len = u16::from_le_bytes([resp_header[5], resp_header[6]]) as usize;
+    if payload_len > 64 * 1024 {
+        return Err(format!(
+            "relay response payload_len {payload_len} exceeds 64 KiB cap"
+        ));
+    }
+    let mut payload_buf = vec![0u8; payload_len];
+    if payload_len > 0 {
+        recv.read_exact(&mut payload_buf)
+            .await
+            .map_err(|e| format!("relay read response payload: {e}"))?;
+    }
+    let mut full = Vec::with_capacity(7 + payload_len);
+    full.extend_from_slice(&resp_header);
+    full.extend_from_slice(&payload_buf);
 
-    let (msg_type, returned_sid, _payload) = decode_relay_message(&resp_buf)
+    let (msg_type, returned_sid, _payload) = decode_relay_message(&full)
         .ok_or_else(|| "invalid relay response".to_string())?;
 
     if msg_type == MSG_RELAY_REJECT {
@@ -486,6 +507,22 @@ impl AsyncWrite for WsStream {
 /// Timeout for the relay node to connect to the target peer.
 const RELAY_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Maximum number of in-flight QUIC accept tasks. The semaphore is
+/// taken **before** spawning to bound pre-auth work — without this,
+/// a peer flooding QUIC connections could exhaust scheduler/memory
+/// regardless of `RelayManager::MAX_CONCURRENT_RELAY_SESSIONS`
+/// (which only kicks in *after* the spawned task has read and
+/// parsed the first message).
+///
+/// The permit is held for the **lifetime of the accept task**, which
+/// for relay sessions runs for the duration of the relayed transfer
+/// (potentially minutes), so the cap also bounds concurrent relay
+/// sessions plus hole-punched direct connections plus in-progress
+/// handshakes. Sized at 64 to leave room for normal traffic spikes
+/// while still being orders of magnitude below a real
+/// scheduler/memory exhaustion threshold.
+const QUIC_ACCEPT_INFLIGHT_CAP: usize = 64;
+
 /// Run the QUIC accept loop. Handles three kinds of inbound QUIC connections:
 ///   1. **RELAY_REQUEST** — peer wants us to relay a LowID transfer (existing relay logic)
 ///   2. **RELAY_CONNECT** — a relay node is forwarding a client to us (relay target)
@@ -496,6 +533,7 @@ pub async fn run_quic_accept_loop(
     kad_callback_tx: tokio::sync::mpsc::Sender<crate::network::ed2k::upload::KadCallbackParts>,
 ) {
     info!("QUIC accept loop started on {:?}", endpoint.local_addr());
+    let accept_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(QUIC_ACCEPT_INFLIGHT_CAP));
     loop {
         let incoming = match endpoint.accept().await {
             Some(inc) => inc,
@@ -505,10 +543,31 @@ pub async fn run_quic_accept_loop(
             }
         };
 
+        // Pre-spawn admission gate. `try_acquire_owned` is non-blocking
+        // and lets us drop excess inbound connections fast (refusing
+        // the QUIC handshake) instead of queueing work that would
+        // accumulate during a flood.
+        let permit = match accept_sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                debug!(
+                    "QUIC accept: at concurrency cap ({}), refusing inbound from {:?}",
+                    QUIC_ACCEPT_INFLIGHT_CAP,
+                    incoming.remote_address(),
+                );
+                incoming.refuse();
+                continue;
+            }
+        };
+
         let mgr = relay_manager.clone();
         let ep = endpoint.clone();
         let cb_tx = kad_callback_tx.clone();
         tokio::spawn(async move {
+            // Hold the permit for the lifetime of the accept task so
+            // long-running relay sessions count against the cap; they
+            // already have their own per-session timeouts.
+            let _permit = permit;
             let conn = match incoming.await {
                 Ok(c) => c,
                 Err(e) => {

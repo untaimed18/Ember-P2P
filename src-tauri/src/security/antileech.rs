@@ -224,11 +224,25 @@ impl AntiLeechFilter {
                 }
             }
         };
+        // Fail closed: if the user expected the filter to be active
+        // (`enabled = true`) but the RegexSet failed to build, force
+        // `enabled = false`. The previous behavior left `enabled =
+        // true` with `set = None` so `check()` returned `None` (=
+        // allow) for every peer — i.e. the filter silently
+        // disappeared while the UI still claimed it was on.
+        let effective_enabled = enabled && set.is_some();
+        if enabled && !effective_enabled {
+            warn!(
+                "AntiLeech: disabling filter at runtime because RegexSet build failed; \
+                 user-facing setting still reads enabled=true and the next save/reload \
+                 will retry the build with the current pattern list",
+            );
+        }
         (
             Self {
                 set,
                 raw_patterns: accepted,
-                enabled,
+                enabled: effective_enabled,
             },
             errors,
         )

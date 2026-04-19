@@ -54,11 +54,18 @@ fn build_server_config(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<Server
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)?,
     ));
-    let transport = Arc::get_mut(&mut server_config.transport).unwrap();
+    // Build a fresh `TransportConfig`, populate it, then store via
+    // `Arc::new` so we don't depend on `server_config.transport`
+    // having a unique strong count at this exact point. The previous
+    // `Arc::get_mut(...).unwrap()` would panic if a future quinn
+    // upgrade ever shared the default transport Arc inside
+    // `with_crypto`.
+    let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(64u32.into());
     transport.max_concurrent_uni_streams(64u32.into());
     transport.max_idle_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS).try_into()?));
     transport.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_SECS)));
+    server_config.transport = Arc::new(transport);
 
     Ok(server_config)
 }

@@ -9,5 +9,8 @@
   // `replaceState` keeps the bad URL out of history.
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
-  onMount(() => { goto('/', { replaceState: true }); });
+  // `goto` returns a Promise; without `.catch` a navigation failure
+  // (e.g. user-cancelled or a transient SvelteKit error) surfaces as
+  // an unhandled rejection. The void cast keeps the caller sync.
+  onMount(() => { void goto('/', { replaceState: true }).catch(() => {}); });
 </script>

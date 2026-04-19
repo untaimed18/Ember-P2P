@@ -8406,6 +8406,16 @@ pub async fn start_network(
 
                         let total_udp = sm.get_udp_sources(&fh).len();
                         let udp_sources = sm.get_udp_sources_due_for_reask(&fh, reask_interval);
+                        // Track which (ip, tcp_port) pairs we sent to in this
+                        // tick so the persistent-list pass below doesn't
+                        // double-fire to the same peer (the SM cooldown is
+                        // already active from the `mark_asked` call below,
+                        // but `can_request_sources_for` returning false is
+                        // *exactly* the gate the persistent loop currently
+                        // proceeds past — so without an explicit set we'd
+                        // emit two identical OP_REASKFILEPING in one tick).
+                        let mut sent_this_tick: HashSet<(Ipv4Addr, u16)> =
+                            HashSet::with_capacity(udp_sources.len());
                         let mut sent = 0usize;
                         for (ip, tcp_port, udp_port) in &udp_sources {
                             if state.dead_sources.is_dead_source_for_file(&fh, u32::from(*ip), *tcp_port) {
@@ -8419,6 +8429,7 @@ pub async fn start_network(
                             pkt.extend_from_slice(&reask_payload);
                             let _ = udp_socket.send_to(&pkt, addr).await;
                             sm.mark_asked(&fh, *ip, *tcp_port);
+                            sent_this_tick.insert((*ip, *tcp_port));
                             sent += 1;
                         }
                         if sent > 0 {
@@ -8428,11 +8439,15 @@ pub async fn start_network(
                             );
                         }
 
-                        // Also check persistent per-file source list for UDP reask candidates
-                        if let Some(pfs) = state.per_file_sources.get(tid) {
+                        // Also check persistent per-file source list for UDP reask candidates.
+                        if let Some(pfs) = state.per_file_sources.get_mut(tid) {
                             let udp_due = pfs.sources_needing_udp_reask();
                             let mut pfs_sent = 0usize;
                             for (ip, tcp_port, udp_port) in &udp_due {
+                                if sent_this_tick.contains(&(*ip, *tcp_port)) {
+                                    // Already pinged via SourceManager this tick.
+                                    continue;
+                                }
                                 if state.dead_sources.is_dead_source_for_file(&pfs.file_hash, u32::from(*ip), *tcp_port) {
                                     continue;
                                 }
@@ -8442,8 +8457,15 @@ pub async fn start_network(
                                 let addr = SocketAddr::new((*ip).into(), *udp_port);
                                 let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                                 pkt.extend_from_slice(&reask_payload);
-                                let _ = udp_socket.send_to(&pkt, addr).await;
-                                pfs_sent += 1;
+                                if udp_socket.send_to(&pkt, addr).await.is_ok() {
+                                    // Bump last_asked so this entry isn't
+                                    // "due" again until the next full
+                                    // FILEREASKTIME window — without this
+                                    // the 5s timer pings the same peer
+                                    // every tick forever.
+                                    pfs.mark_udp_reask_sent(*ip, *tcp_port);
+                                    pfs_sent += 1;
+                                }
                             }
                             if pfs_sent > 0 {
                                 debug!("Sent UDP reask to {} persistent sources for {}", pfs_sent, tid);

@@ -200,6 +200,11 @@ pub struct PublishOperation {
     pub pending_requests: HashMap<u32, EmberNodeId>,
     pub started_at: Instant,
     pub complete: bool,
+    /// Monotonic per-publish request-id counter; see the matching
+    /// field on `IterativeSearch` for the rationale (avoids the
+    /// `rand::random` collision that silently overwrites a pending
+    /// node mapping).
+    next_request_id: u32,
 }
 
 impl PublishOperation {
@@ -215,6 +220,7 @@ impl PublishOperation {
             pending_requests: HashMap::new(),
             started_at: Instant::now(),
             complete: false,
+            next_request_id: 1,
         }
     }
 
@@ -228,7 +234,8 @@ impl PublishOperation {
             {
                 continue;
             }
-            let req_id = rand::random::<u32>();
+            let req_id = self.next_request_id;
+            self.next_request_id = self.next_request_id.wrapping_add(1);
             self.pending_requests.insert(req_id, target.node_id);
             batch.push((target.clone(), req_id));
         }
@@ -282,16 +289,19 @@ impl PublishManager {
 
     /// Start publishing a signed record. First finds the closest nodes to the key,
     /// then stores on them.
+    /// Returns `None` when the active-publish cap is reached so the
+    /// caller can surface a "busy" state instead of unbounded growth.
     pub fn start_publish(
         &mut self,
         record: SignedRecord,
         routing_table: &RoutingTable,
-    ) -> u32 {
+    ) -> Option<u32> {
         if self.operations.len() >= MAX_ACTIVE_PUBLISHES {
             warn!(
-                "Too many active publishes ({}), oldest will be overwritten",
+                "Too many active publishes ({}), rejecting new publish",
                 self.operations.len()
             );
+            return None;
         }
 
         let dht_key = EmberNodeId(record.keyword_hash);
@@ -304,7 +314,7 @@ impl PublishManager {
             );
         }
 
-        let id = self.alloc_id();
+        let id = self.alloc_id()?;
         let op = PublishOperation::new(id, record, targets);
         trace!(
             "Starting publish {} on {} nodes for key {}",
@@ -313,7 +323,7 @@ impl PublishManager {
             op.dht_key
         );
         self.operations.insert(id, op);
-        id
+        Some(id)
     }
 
     pub fn get_mut(&mut self, publish_id: u32) -> Option<&mut PublishOperation> {
@@ -342,10 +352,15 @@ impl PublishManager {
         self.operations.len()
     }
 
-    fn alloc_id(&mut self) -> u32 {
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        id
+    fn alloc_id(&mut self) -> Option<u32> {
+        for _ in 0..=MAX_ACTIVE_PUBLISHES {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1);
+            if !self.operations.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        None
     }
 }
 
@@ -436,7 +451,7 @@ mod tests {
         let record = SignedRecord::keyword("test", [0xAA; 16], [0xBB; 32], 1000, "file.txt", &sk);
 
         let mut pm = PublishManager::new();
-        let pub_id = pm.start_publish(record, &rt);
+        let pub_id = pm.start_publish(record, &rt).expect("publish slot");
 
         let op = pm.get_mut(pub_id).unwrap();
         let to_store = op.next_to_store();

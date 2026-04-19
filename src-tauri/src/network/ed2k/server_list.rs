@@ -521,22 +521,40 @@ impl ServerList {
             // sizes are type-specific and we'd desync the cursor by
             // continuing — the previous bug parsed every following
             // record from the wrong offset.
+            // `unknown_tag` is also set on any short read — a
+            // truncated or hostile fragment otherwise leaves the
+            // cursor at an arbitrary position and subsequent reads
+            // interpret unrelated bytes as structure (silent
+            // corruption of merged entries). Mirrors the strict
+            // behavior of `load_server_met`.
             let mut unknown_tag = false;
             for _ in 0..tag_count {
                 let tag_type = match cursor.read_u8() {
                     Ok(v) => v,
                     Err(_) => { unknown_tag = true; break; }
                 };
-                let name_len = cursor.read_u16::<LittleEndian>().unwrap_or(0) as usize;
+                let name_len = match cursor.read_u16::<LittleEndian>() {
+                    Ok(v) => v as usize,
+                    Err(_) => { unknown_tag = true; break; }
+                };
                 let mut name = vec![0u8; name_len];
-                let _ = cursor.read_exact(&mut name);
+                if cursor.read_exact(&mut name).is_err() {
+                    unknown_tag = true;
+                    break;
+                }
                 let name_id = if name_len == 1 { name[0] } else { 0 };
 
                 match tag_type {
                     0x02 => {
-                        let slen = cursor.read_u16::<LittleEndian>().unwrap_or(0) as usize;
+                        let slen = match cursor.read_u16::<LittleEndian>() {
+                            Ok(v) => v as usize,
+                            Err(_) => { unknown_tag = true; break; }
+                        };
                         let mut sbuf = vec![0u8; slen];
-                        let _ = cursor.read_exact(&mut sbuf);
+                        if cursor.read_exact(&mut sbuf).is_err() {
+                            unknown_tag = true;
+                            break;
+                        }
                         match name_id {
                             0x01 => entry.name = String::from_utf8_lossy(&sbuf).to_string(),
                             0x0B => entry.description = String::from_utf8_lossy(&sbuf).to_string(),
@@ -544,11 +562,24 @@ impl ServerList {
                         }
                     }
                     0x03 => {
-                        let v = cursor.read_u32::<LittleEndian>().unwrap_or(0);
+                        let v = match cursor.read_u32::<LittleEndian>() {
+                            Ok(v) => v,
+                            Err(_) => { unknown_tag = true; break; }
+                        };
                         apply_server_int_tag(&mut entry, name_id, v);
                     }
-                    0x08 => { let _ = cursor.read_u16::<LittleEndian>(); }
-                    0x09 => { let _ = cursor.read_u8(); }
+                    0x08 => {
+                        if cursor.read_u16::<LittleEndian>().is_err() {
+                            unknown_tag = true;
+                            break;
+                        }
+                    }
+                    0x09 => {
+                        if cursor.read_u8().is_err() {
+                            unknown_tag = true;
+                            break;
+                        }
+                    }
                     other => {
                         debug!(
                             "server.met merge: unknown tag type 0x{other:02X} in entry {ip}:{port}; aborting merge to avoid cursor desync",

@@ -100,29 +100,78 @@ pub struct SpamStats {
     pub spam_source_ips: usize,
 }
 
+/// Drop excess entries from a `HashSet` (iteration order is
+/// unspecified, but for cap-enforcement on a corrupted load file
+/// we just need *some* deterministic upper bound — we keep an
+/// arbitrary subset rather than fail the whole load).
+fn truncate_set(set: &mut HashSet<String>, cap: usize) {
+    if set.len() > cap {
+        let to_drop: Vec<String> = set.iter().skip(cap).cloned().collect();
+        for k in to_drop {
+            set.remove(&k);
+        }
+    }
+}
+
+/// Mirrors the per-set caps enforced at write time
+/// (`mark_spam` / `mark_spam_server_ip` etc.). The load path is
+/// otherwise free to ingest anything that was on disk — including
+/// a hand-crafted JSON aimed at memory exhaustion at startup.
+const LOAD_MAX_SPAM_HASHES: usize = 2_000;
+const LOAD_MAX_NOT_SPAM_HASHES: usize = 10_000;
+const LOAD_MAX_SPAM_FILENAMES: usize = 500;
+const LOAD_MAX_SPAM_SERVER_IPS: usize = 1_000;
+const LOAD_MAX_SPAM_SOURCE_IPS: usize = 5_000;
+
+/// Maximum decoded JSON file size (bytes) we'll attempt to parse.
+/// At >50 MB of `search_spam.json` something is broken or malicious.
+const LOAD_MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+
 impl SpamFilter {
     pub fn load(data_dir: &Path) -> Self {
         let data_path = data_dir.join("search_spam.json");
         let db = if data_path.exists() {
-            match std::fs::read_to_string(&data_path) {
-                Ok(data) => match serde_json::from_str::<SpamDatabase>(&data) {
-                    Ok(db) => {
-                        info!(
-                            "Loaded spam filter: {} hashes, {} filenames",
-                            db.spam_hashes.len(),
-                            db.spam_filenames.len()
-                        );
-                        db
-                    }
+            // Pre-flight size check so a large file doesn't OOM us at startup.
+            match std::fs::metadata(&data_path) {
+                Ok(meta) if meta.len() > LOAD_MAX_FILE_BYTES => {
+                    warn!(
+                        "search_spam.json is {} bytes (> {} cap); refusing to load",
+                        meta.len(),
+                        LOAD_MAX_FILE_BYTES
+                    );
+                    SpamDatabase::default()
+                }
+                _ => match std::fs::read_to_string(&data_path) {
+                    Ok(data) => match serde_json::from_str::<SpamDatabase>(&data) {
+                        Ok(mut db) => {
+                            // Truncate to per-set caps so a corrupted or
+                            // hand-edited file can't produce a runtime
+                            // db larger than `mark_spam` would ever
+                            // produce on its own.
+                            truncate_set(&mut db.spam_hashes, LOAD_MAX_SPAM_HASHES);
+                            truncate_set(&mut db.not_spam_hashes, LOAD_MAX_NOT_SPAM_HASHES);
+                            if db.spam_filenames.len() > LOAD_MAX_SPAM_FILENAMES {
+                                db.spam_filenames.truncate(LOAD_MAX_SPAM_FILENAMES);
+                            }
+                            truncate_set(&mut db.spam_server_ips, LOAD_MAX_SPAM_SERVER_IPS);
+                            truncate_set(&mut db.spam_source_ips, LOAD_MAX_SPAM_SOURCE_IPS);
+                            info!(
+                                "Loaded spam filter: {} hashes, {} filenames",
+                                db.spam_hashes.len(),
+                                db.spam_filenames.len()
+                            );
+                            db
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse search_spam.json, starting fresh: {e}");
+                            SpamDatabase::default()
+                        }
+                    },
                     Err(e) => {
-                        warn!("Failed to parse search_spam.json, starting fresh: {e}");
+                        warn!("Failed to read search_spam.json: {e}");
                         SpamDatabase::default()
                     }
                 },
-                Err(e) => {
-                    warn!("Failed to read search_spam.json: {e}");
-                    SpamDatabase::default()
-                }
             }
         } else {
             SpamDatabase::default()
