@@ -2345,6 +2345,21 @@ impl UploadHandler {
                         // stuck in IS_IDNEEDED / IS_IDFAILED and renders
                         // "Identification: Invalid".
                         if let Some((challenge, state)) = pending_peer_challenge.take() {
+                            // Pass our actual public IPv4 (from
+                            // `external_ip_shared`) so the signed
+                            // response selects CRYPT_CIP_LOCALCLIENT
+                            // consistently with our HighID Hello
+                            // advertisement. Hardcoding 0 here was a
+                            // leftover from when this handler didn't
+                            // know our external IP and forced every
+                            // signed response into REMOTECLIENT mode —
+                            // which verifies fine but advertises us as
+                            // LowID for SecIdent purposes, blocking
+                            // peers from caching our credit record
+                            // under our public IP.
+                            let our_client_id = self
+                                .external_ip_shared
+                                .load(std::sync::atomic::Ordering::Relaxed);
                             super::transfer::respond_to_secident_challenge(
                                 &mut writer,
                                 Some(&self.credit_manager),
@@ -2353,7 +2368,7 @@ impl UploadHandler {
                                 peer_addr,
                                 peer_user_hash,
                                 peer_secure_ident_level,
-                                0u32,
+                                our_client_id,
                             ).await?;
                             debug!("Replayed deferred SecIdent challenge response to {peer_addr}");
                         }
@@ -2409,6 +2424,13 @@ impl UploadHandler {
                             "Deferred SecIdent challenge from {peer_addr} — awaiting their public key"
                         );
                     } else {
+                        // See the OP_PUBLICKEY handler above — pass our
+                        // public IP so the signed response uses
+                        // CRYPT_CIP_LOCALCLIENT when we're HighID
+                        // instead of always REMOTECLIENT.
+                        let our_client_id = self
+                            .external_ip_shared
+                            .load(std::sync::atomic::Ordering::Relaxed);
                         super::transfer::respond_to_secident_challenge(
                             &mut writer,
                             Some(&self.credit_manager),
@@ -2417,49 +2439,37 @@ impl UploadHandler {
                             peer_addr,
                             peer_user_hash,
                             peer_secure_ident_level,
-                            0u32,
+                            our_client_id,
                         ).await?;
                         debug!("Responded to SecIdent challenge from {peer_addr}");
                     }
                 }
 
                 (OP_EMULEPROT, OP_SIGNATURE) if payload.len() >= 2 => {
-                    let sig_len = payload[0] as usize;
-                    if sig_len > 0 && payload.len() >= 1 + sig_len {
-                        if let Some(challenge) = pending_secident_challenge.take() {
-                            let sig_bytes = &payload[1..1 + sig_len];
-                            let peer_ip_u32 = match peer_addr.ip() {
-                                std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-                                std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| u32::from_be_bytes(v4.octets())).unwrap_or(0),
-                            };
-                            let mode = if payload.len() == 1 + sig_len {
-                                None
-                            } else if payload.len() == 2 + sig_len {
-                                Some(payload[1 + sig_len])
-                            } else {
-                                continue;
-                            };
-                            let cm = self.credit_manager.read().await;
-                            let verified = cm.verify_signature(
-                                &peer_user_hash,
-                                challenge,
-                                mode,
-                                peer_ip_u32,
-                                0,
-                                sig_bytes,
-                            );
-                            drop(cm);
-                            let mut cm = self.credit_manager.write().await;
-                            if verified {
-                                cm.set_ident_state(peer_user_hash, super::credits::IdentState::Verified);
-                                cm.check_identity_ip(peer_user_hash, peer_ip_u32);
-                                debug!("SecIdent verified for {peer_addr}");
-                            } else {
-                                cm.set_ident_state(peer_user_hash, super::credits::IdentState::Failed);
-                                debug!("SecIdent verification failed for {peer_addr}");
-                            }
-                        }
-                    }
+                    // Reuse the shared verification helper instead of an
+                    // inline copy. The previous inline path passed `0`
+                    // as `local_ip_for_remoteclient`, which silently
+                    // broke verification for any LowID peer that signed
+                    // in CRYPT_CIP_REMOTECLIENT mode (their signature
+                    // includes our public IP). Failed verification
+                    // flips them to `IdentState::Failed`, which then
+                    // blocks upload-credit accrual for the rest of the
+                    // session even though the peer's signature was
+                    // actually valid. The helper computes `local_ip`
+                    // from `our_client_id` the same way transfer.rs
+                    // does for downloads.
+                    let our_client_id = self
+                        .external_ip_shared
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    super::transfer::handle_secident_signature(
+                        Some(&self.credit_manager),
+                        peer_user_hash,
+                        &mut pending_secident_challenge,
+                        peer_addr,
+                        peer_secure_ident_level,
+                        &payload,
+                        our_client_id,
+                    ).await;
                 }
 
                 (OP_EDONKEYHEADER, OP_SETREQFILEID) => {

@@ -473,6 +473,24 @@ pub async fn get_shared_folders(
     Ok(config.settings.shared_folders.clone())
 }
 
+/// Encode a UI priority label into the u8 stored in
+/// `KnownFileRecord::upload_priority` (and shipped over the wire as the
+/// `FT_ULPRIORITY` known-file tag). Order matches eMule's priority
+/// enum: 0=verylow, 1=low, 2=normal, 3=high, 4=release, 5=auto.
+/// Unknown labels fall back to `normal` so a malformed UI value never
+/// promotes a file to the highest tier silently.
+fn priority_str_to_u8(priority: &str) -> u8 {
+    match priority {
+        "verylow" => 0,
+        "low" => 1,
+        "normal" => 2,
+        "high" => 3,
+        "release" => 4,
+        "auto" => 5,
+        _ => 2,
+    }
+}
+
 #[tauri::command]
 pub async fn set_file_priority(
     state: tauri::State<'_, AppState>,
@@ -483,13 +501,31 @@ pub async fn set_file_priority(
     if !valid.contains(&priority.as_str()) {
         return Err(format!("Invalid priority: {priority}"));
     }
-    {
+    let file_hash = {
         let mut index = state.local_index.write().await;
         if !index.set_file_priority_by_path(&file_path, &priority) {
             return Err("File not found".to_string());
         }
-    }
+        index.get_by_path(&file_path).map(|f| f.hash.clone())
+    };
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+    // Push the new priority into `known.met` via the network task so
+    // the value persists across restarts. `try_send` is fine here —
+    // if the channel is briefly full the value still survives in the
+    // search index (saved separately) and a future SharedFilesChanged
+    // will reconcile it.
+    if let Some(hash) = file_hash.filter(|h| !h.is_empty()) {
+        if state
+            .network_tx
+            .try_send(NetworkCommand::SetUploadPriority {
+                file_hash_hex: hash,
+                priority: priority_str_to_u8(&priority),
+            })
+            .is_err()
+        {
+            warn!("Network channel full; upload_priority change not yet flushed to known.met");
+        }
+    }
     info!("Set priority for {} to {}", file_path, priority);
     Ok(())
 }
@@ -508,18 +544,42 @@ pub async fn batch_set_priority(
     if !valid.contains(&priority.as_str()) {
         return Err(format!("Invalid priority: {priority}"));
     }
-    let count = {
+    let (count, hashes) = {
         let mut index = state.local_index.write().await;
         let mut n = 0u32;
+        let mut hashes = Vec::new();
         for path in &file_paths {
             if index.set_file_priority_by_path(path, &priority) {
                 n += 1;
+                if let Some(f) = index.get_by_path(path) {
+                    if !f.hash.is_empty() {
+                        hashes.push(f.hash.clone());
+                    }
+                }
             }
         }
-        n
+        (n, hashes)
     };
     if count > 0 {
         refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+        // Mirror each priority change into `known.met`. Use `try_send`
+        // so the bulk action doesn't block when the network channel is
+        // briefly saturated; the search index is still authoritative
+        // for live priority and a future SharedFilesChanged reconciles.
+        let prio_u8 = priority_str_to_u8(&priority);
+        for hash in hashes {
+            if state
+                .network_tx
+                .try_send(NetworkCommand::SetUploadPriority {
+                    file_hash_hex: hash,
+                    priority: prio_u8,
+                })
+                .is_err()
+            {
+                warn!("Network channel full during batch priority push");
+                break;
+            }
+        }
         info!("Batch set priority to {priority} for {count}/{} files", file_paths.len());
     }
     Ok(count)

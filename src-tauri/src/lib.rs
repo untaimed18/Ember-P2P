@@ -59,6 +59,16 @@ pub fn run() {
         .setup(|app| {
             let app_handle = app.handle().clone();
 
+            // Show the running version in the main window title so users
+            // can confirm which build they're on at a glance (matches the
+            // wix product version we ship and the value reported by the
+            // About / Update dialog). `package_info().version` reads the
+            // `version` field of `tauri.conf.json` at build time.
+            if let Some(window) = app.get_webview_window("main") {
+                let version = &app.package_info().version;
+                let _ = window.set_title(&format!("Ember v{version}"));
+            }
+
             let db = Arc::new(
                 Database::new(&app_handle).map_err(|e| {
                     tracing::error!("Failed to initialize database: {e}");
