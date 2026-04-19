@@ -40,6 +40,41 @@ pub const STAT_REASK_INTERVAL_SECS: i64 = 16200;
 
 const MAX_TRACKED_SERVERS: usize = 500;
 
+/// Wrap a plain server UDP packet in eMule's UDP-obfuscation envelope
+/// when the destination server has both advertised the capability AND
+/// a non-zero `BaseKey`. Returns the bytes that should actually go on
+/// the wire and the address they should be sent to (which switches
+/// from the standard UDP port to the server's `obfuscation_port_udp`
+/// when set).
+///
+/// This is the single choke point for "do I obfuscate this packet" so
+/// that `build_get_sources_packet`, `build_multi_get_sources_packet`,
+/// `build_global_search_packet`, and `send_status_ping` all behave
+/// consistently. Callers that hold a `(packet, addr)` queue entry
+/// don't need to know anything about obfuscation — they just push the
+/// returned tuple.
+fn maybe_obfuscate_packet(
+    packet: Vec<u8>,
+    plain_addr: SocketAddr,
+    server: &ServerEntry,
+) -> (Vec<u8>, SocketAddr) {
+    if server.server_udp_key == 0 {
+        return (packet, plain_addr);
+    }
+    if server.udp_flags & SRV_UDPFLG_UDPOBFUSCATION == 0 {
+        return (packet, plain_addr);
+    }
+    let encrypted = super::server_obfuscation::encrypt_send_server(
+        &packet,
+        server.server_udp_key,
+    );
+    let mut wire_addr = plain_addr;
+    if server.obfuscation_port_udp != 0 {
+        wire_addr.set_port(server.obfuscation_port_udp);
+    }
+    (encrypted, wire_addr)
+}
+
 pub struct ServerUdpSocket {
     socket: Arc<UdpSocket>,
     last_ping_times: std::collections::HashMap<SocketAddr, i64>,
@@ -126,7 +161,15 @@ impl ServerUdpSocket {
         if count == 0 {
             return None;
         }
-        Some((packet, addr))
+        // Apply UDP obfuscation if this server supports it AND we
+        // have a BaseKey. Without this, V2 silently sends plaintext
+        // GETSOURCES to obfuscation-only servers and they ignore us.
+        // The same gate runs in `send_status_ping` and matches eMule
+        // `UDPSocket.cpp`. Returns (final_wire_bytes, final_dest_addr)
+        // so the caller's queue + send loop are unchanged — they just
+        // see different bytes for obfuscated servers.
+        let (wire_packet, wire_addr) = maybe_obfuscate_packet(packet, addr, server);
+        Some((wire_packet, wire_addr))
     }
 
     /// Build a global search packet, selecting the best opcode based on server
@@ -142,7 +185,7 @@ impl ServerUdpSocket {
         let ext_getfiles = (server.udp_flags & SRV_UDPFLG_EXT_GETFILES) != 0;
         let large_files = (server.udp_flags & SRV_UDPFLG_LARGEFILES) != 0;
 
-        if ext_getfiles && large_files {
+        let plain = if ext_getfiles && large_files {
             // OP_GLOBSEARCHREQ3: prepend a tag set with SRVCAP_UDP_NEWTAGS_LARGEFILES
             const CT_SERVER_UDPSEARCH_FLAGS: u8 = 0x0E;
             const SRVCAP_UDP_NEWTAGS_LARGEFILES: u8 = 0x01;
@@ -154,32 +197,60 @@ impl ServerUdpSocket {
             packet.push(CT_SERVER_UDPSEARCH_FLAGS);
             packet.push(SRVCAP_UDP_NEWTAGS_LARGEFILES);
             packet.extend_from_slice(search_expr);
-            Some((packet, addr))
+            packet
         } else if ext_getfiles {
             // OP_GLOBSEARCHREQ2: same as basic but tells server to use new-style tags
             let mut packet = Vec::with_capacity(2 + search_expr.len());
             packet.push(OP_EDONKEYPROT);
             packet.push(OP_GLOBSEARCHREQ2);
             packet.extend_from_slice(search_expr);
-            Some((packet, addr))
+            packet
         } else {
             let mut packet = Vec::with_capacity(2 + search_expr.len());
             packet.push(OP_EDONKEYPROT);
             packet.push(OP_GLOBSEARCHREQ);
             packet.extend_from_slice(search_expr);
-            Some((packet, addr))
-        }
+            packet
+        };
+        let (wire_packet, wire_addr) = maybe_obfuscate_packet(plain, addr, server);
+        Some((wire_packet, wire_addr))
     }
 
     pub async fn send_status_ping(&mut self, server: &ServerEntry) -> anyhow::Result<()> {
         let udp_port = server.port.checked_add(4)
             .ok_or_else(|| anyhow::anyhow!("Server port {} too high for UDP offset", server.port))?;
-        let addr: SocketAddr = format!("{}:{}", server.ip, udp_port)
+        // `plain_addr` is the **canonical** server addr (TCP port + 4).
+        // We use it as the cooldown / challenge tracking key so the
+        // recv path — which canonicalises obfuscated source addrs to
+        // this same value — finds the matching challenge regardless
+        // of whether the reply came from `obfuscation_port_udp` or
+        // the standard UDP port. Without this, an obfuscated reply
+        // arrived as `(ip, obf_port)`, was canonicalised to
+        // `(ip, TCP+4)`, but the challenge map was keyed by
+        // `(ip, obf_port)` → `take_challenge` returned `None` and we
+        // dropped every obfuscated status reply.
+        let plain_addr: SocketAddr = format!("{}:{}", server.ip, udp_port)
             .parse()
             .map_err(|e| anyhow::anyhow!("Invalid server address: {e}"))?;
 
+        // Apply UDP obfuscation if this server has advertised both the
+        // capability AND a BaseKey we've previously learned. eMule's
+        // `UDPSocket.cpp` uses the same gate
+        // (`pServer->GetServerKeyUDP() != 0 && pServer->SupportsObfuscationUDP()`).
+        // First ping always goes plain (key not yet known); subsequent
+        // pings obfuscate.
+        let use_obf = server.server_udp_key != 0
+            && server.udp_flags & SRV_UDPFLG_UDPOBFUSCATION != 0;
+        let mut wire_addr = plain_addr;
+        if use_obf && server.obfuscation_port_udp != 0 {
+            wire_addr.set_port(server.obfuscation_port_udp);
+        }
+
         let now = chrono::Utc::now().timestamp();
-        if let Some(&last) = self.last_ping_times.get(&addr) {
+        // Dedup keyed by the canonical (plain) addr — so toggling
+        // obfuscation on/off for a server doesn't bypass the
+        // cooldown by switching to a "different" key.
+        if let Some(&last) = self.last_ping_times.get(&plain_addr) {
             if now - last < MIN_PING_INTERVAL_SECS {
                 return Ok(());
             }
@@ -192,9 +263,16 @@ impl ServerUdpSocket {
         packet.push(OP_GLOBSERVSTATREQ);
         packet.extend_from_slice(&challenge.to_le_bytes());
 
-        self.socket.send_to(&packet, addr).await?;
-        self.last_ping_times.insert(addr, now);
-        self.pending_challenges.insert(addr, challenge);
+        let wire_packet = if use_obf {
+            super::server_obfuscation::encrypt_send_server(&packet, server.server_udp_key)
+        } else {
+            packet
+        };
+
+        self.socket.send_to(&wire_packet, wire_addr).await?;
+        // Tracking keyed by canonical addr — see comment above.
+        self.last_ping_times.insert(plain_addr, now);
+        self.pending_challenges.insert(plain_addr, challenge);
 
         if self.last_ping_times.len() > MAX_TRACKED_SERVERS {
             let cutoff = now - STAT_REASK_INTERVAL_SECS;
@@ -215,17 +293,141 @@ impl ServerUdpSocket {
     /// per category) and under-counting (the previous SourceExchange
     /// estimate was `sources.len() * 10`, missing the packet header
     /// and per-source overhead).
+    /// Backwards-compatible plain-only receive. Used by tests; live
+    /// recv goes through `try_recv_with` so we can attempt UDP
+    /// obfuscation decryption when the first byte ≠ `0xE3`.
+    #[allow(dead_code)]
     pub async fn try_recv(&self) -> Option<(usize, ServerUdpResponse)> {
+        self.try_recv_with(|_ip, _port| None).await
+    }
+
+    // `recv_packet` / `process_received` were drafted as building
+    // blocks for an event-driven recv arm but the actual integration
+    // shortened the existing ping timer's interval instead (cleaner
+    // diff against the giant inline dispatch block). Kept as
+    // `#[cfg(test)]`-only helpers below so the API surface is still
+    // tested even though prod uses `try_recv_with` from the timer.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub async fn recv_packet(&self) -> std::io::Result<(Vec<u8>, SocketAddr)> {
+        let mut buf = [0u8; 65536];
+        let (len, addr) = self.socket.recv_from(&mut buf).await?;
+        Ok((buf[..len].to_vec(), addr))
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn process_received<F>(
+        data: &[u8],
+        addr: SocketAddr,
+        key_lookup: F,
+    ) -> Option<(usize, ServerUdpResponse)>
+    where
+        F: Fn(Ipv4Addr, u16) -> Option<(u32, u16)>,
+    {
+        let len = data.len();
+        if len < 2 {
+            return None;
+        }
+        if data[0] == OP_EDONKEYPROT {
+            return parse_server_udp_response(&data[1..], addr).map(|resp| (len, resp));
+        }
+        let src_ip = match addr.ip() {
+            std::net::IpAddr::V4(v4) => v4,
+            _ => return None,
+        };
+        let (base_key, tcp_port) = key_lookup(src_ip, addr.port())?;
+        if base_key == 0 {
+            return None;
+        }
+        use super::server_obfuscation::{decrypt_received_server, DecryptOutcome};
+        match decrypt_received_server(data, base_key) {
+            DecryptOutcome::Decrypted(plain) => {
+                if plain.len() < 2 || plain[0] != OP_EDONKEYPROT {
+                    return None;
+                }
+                let canonical_addr = SocketAddr::new(addr.ip(), tcp_port.saturating_add(4));
+                parse_server_udp_response(&plain[1..], canonical_addr).map(|resp| (len, resp))
+            }
+            _ => None,
+        }
+    }
+
+    /// Same as `try_recv`, plus an opportunity to attempt UDP-server
+    /// obfuscation decryption when the first byte is not `OP_EDONKEYPROT`
+    /// (`0xE3`). The closure is asked "what server does this inbound
+    /// `(src_ip, src_port)` belong to, and what's its BaseKey?" —
+    /// return `Some((base_key, tcp_port))` to attempt decryption,
+    /// `None` to drop the packet (matches the historical behaviour
+    /// for every non-`0xE3` datagram).
+    ///
+    /// `tcp_port` is used to **canonicalise** the source address on a
+    /// successful decrypt: the response is emitted with
+    /// `addr.port() == tcp_port + 4` so downstream handlers (which
+    /// derive the server's TCP identity as `addr.port() - 4`) keep
+    /// working unchanged. Without this, replies from a server's
+    /// `obfuscation_port_udp` would silently fail every list lookup
+    /// (`update_server_stats`, `update_udp_flags`, `update_udp_obfuscation`,
+    /// `register_lowid_source`, the L-2 callback flush, …).
+    ///
+    /// Decryption failures (bad magic, bad padding) silently drop the
+    /// packet so random noise from non-server sources doesn't corrupt
+    /// anything.
+    ///
+    /// Wire reference: `CEncryptedDatagramSocket::DecryptReceivedServer`
+    /// in eMule's `EncryptedDatagramSocket.cpp`.
+    pub async fn try_recv_with<F>(&self, key_lookup: F) -> Option<(usize, ServerUdpResponse)>
+    where
+        F: Fn(Ipv4Addr, u16) -> Option<(u32, u16)>,
+    {
         let mut buf = [0u8; 65536];
         match self.socket.try_recv_from(&mut buf) {
             Ok((len, addr)) => {
                 if len < 2 {
                     return None;
                 }
-                if buf[0] != OP_EDONKEYPROT {
+                if buf[0] == OP_EDONKEYPROT {
+                    // Plain packet — historical fast path. addr is
+                    // already canonical: a plain reply only comes
+                    // from the standard UDP port = TCP+4.
+                    return parse_server_udp_response(&buf[1..len], addr).map(|resp| (len, resp));
+                }
+                // Obfuscation candidate: only servers we know the
+                // BaseKey for can have sent us an encrypted packet.
+                let src_ip = match addr.ip() {
+                    std::net::IpAddr::V4(v4) => v4,
+                    _ => return None,
+                };
+                let (base_key, tcp_port) = key_lookup(src_ip, addr.port())?;
+                if base_key == 0 {
+                    // We know the server but haven't learned its key
+                    // yet — can't decrypt. The original status
+                    // exchange must have been plain (which it is,
+                    // for the first ping).
                     return None;
                 }
-                parse_server_udp_response(&buf[1..len], addr).map(|resp| (len, resp))
+                use super::server_obfuscation::{decrypt_received_server, DecryptOutcome};
+                match decrypt_received_server(&buf[..len], base_key) {
+                    DecryptOutcome::Decrypted(plain) => {
+                        if plain.len() < 2 || plain[0] != OP_EDONKEYPROT {
+                            return None;
+                        }
+                        // Canonicalise: emit the response with the
+                        // standard UDP port so handlers' `addr.port()
+                        // - 4` math gives the right TCP port. We
+                        // report the *wire* length (`len`) for stats
+                        // — that's the actual on-the-wire cost.
+                        let canonical_port = tcp_port.saturating_add(4);
+                        let canonical_addr = SocketAddr::new(addr.ip(), canonical_port);
+                        parse_server_udp_response(&plain[1..], canonical_addr)
+                            .map(|resp| (len, resp))
+                    }
+                    // Plain (shouldn't happen — first byte ≠ 0xE3
+                    // here), or magic mismatch / too short / no key /
+                    // invalid padding: drop quietly. Random noise on
+                    // a UDP socket is normal; logging would be spam.
+                    _ => None,
+                }
             }
             Err(_) => None,
         }
@@ -240,7 +442,17 @@ pub enum ServerUdpResponse {
         user_count: u32,
         file_count: u32,
         obfuscation_port_tcp: u16,
+        /// Alternate UDP port the server uses for **obfuscated** UDP
+        /// traffic (extended status, offset 32, u16 LE). `0` if the
+        /// server didn't advertise it; senders fall back to the
+        /// regular UDP port.
+        obfuscation_port_udp: u16,
         udp_flags: u32,
+        /// Per-server BaseKey for client⇄server UDP obfuscation
+        /// (extended status, offset 36, u32 LE). `0` if the server
+        /// didn't advertise it; obfuscation cannot be used until a
+        /// future status reply lands one.
+        server_udp_key: u32,
     },
     FoundSources {
         addr: SocketAddr,
@@ -305,11 +517,21 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
             );
 
             let mut tcp_obf_port: u16 = 0;
+            let mut udp_obf_port: u16 = 0;
+            let mut server_udp_key: u32 = 0;
             if payload.len() >= 40 {
                 // skip low_id_users (offset 28)
                 let _ = cursor.read_u32::<LittleEndian>();
-                let _udp_obf = cursor.read_u16::<LittleEndian>().unwrap_or(0); // offset 32
+                udp_obf_port = cursor.read_u16::<LittleEndian>().unwrap_or(0); // offset 32
                 tcp_obf_port = cursor.read_u16::<LittleEndian>().unwrap_or(0); // offset 34
+                // dwServerUDPKey (offset 36, u32 LE) — eMule's
+                // `pServer->SetServerKeyUDP(dwServerUDPKey)` source.
+                // Required as the BaseKey for `EncryptSendServer` /
+                // `DecryptReceivedServer` (see `server_obfuscation.rs`).
+                // Previously this field was skipped, which silently
+                // disabled all UDP obfuscation against this server even
+                // when `SRV_UDPFLG_UDPOBFUSCATION` was set.
+                server_udp_key = cursor.read_u32::<LittleEndian>().unwrap_or(0); // offset 36
             }
             // eMule default: if flag says TCP obfuscation but no port, use the main TCP port
             if tcp_obf_port == 0 && (udp_flags & SRV_UDPFLG_TCPOBFUSCATION) != 0 {
@@ -322,7 +544,9 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
                 user_count,
                 file_count,
                 obfuscation_port_tcp: tcp_obf_port,
+                obfuscation_port_udp: udp_obf_port,
                 udp_flags,
+                server_udp_key,
             })
         }
         OP_GLOBFOUNDSOURCES => {

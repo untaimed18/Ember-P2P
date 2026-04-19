@@ -38,8 +38,22 @@ pub struct ServerEntry {
     /// Timestamp of last failed connection attempt (for cooldown)
     pub last_failed_at: i64,
     pub obfuscation_port_tcp: u16,
+    /// Alternate UDP port the server listens on for **obfuscated** UDP
+    /// packets, learned from the extended `OP_GLOBSERVSTATRES` payload.
+    /// `0` means "not advertised, fall back to TCP+4". When obfuscation
+    /// is active and this is non-zero, sends go here instead of the
+    /// standard UDP port (matches eMule's
+    /// `pServer->GetObfuscationPortUDP()` choice in `UDPSocket.cpp`).
+    pub obfuscation_port_udp: u16,
     /// Server UDP capability flags (SRV_UDPFLG_*), learned from status pings.
     pub udp_flags: u32,
+    /// Per-server **BaseKey** for UDP obfuscation, learned from the
+    /// extended `OP_GLOBSERVSTATRES` payload (`dwServerUDPKey`, offset
+    /// 36). `0` means we haven't received it yet — caller must send
+    /// plaintext until a non-zero value lands. Required for both
+    /// directions (send key uses CLIENTSERVER magic, recv key uses
+    /// SERVERCLIENT magic; see `server_obfuscation.rs`).
+    pub server_udp_key: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +82,9 @@ impl ServerEntry {
             last_ping: 0,
             last_failed_at: 0,
             obfuscation_port_tcp: 0,
+            obfuscation_port_udp: 0,
             udp_flags: 0,
+            server_udp_key: 0,
         }
     }
 }
@@ -91,6 +107,13 @@ fn apply_server_int_tag(entry: &mut ServerEntry, name_id: u8, v: u32) {
         0x89 => entry.hard_files = v,
         0x8A => entry.is_static = v != 0,
         0x97 | 0xF1 => entry.obfuscation_port_tcp = v as u16,
+        // Ember-private tags persisted by `save_server_met` for UDP
+        // obfuscation state. Fresh server.met files from eMule won't
+        // carry these (so the fields stay 0 until the first status
+        // ping); our own saves preserve them across restarts.
+        0xF2 => entry.obfuscation_port_udp = v as u16,
+        0xF3 => entry.server_udp_key = v,
+        0xF4 => entry.udp_flags = v,
         _ => {}
     }
 }
@@ -564,6 +587,21 @@ impl ServerList {
                 if entry.obfuscation_port_tcp > 0 {
                     existing.obfuscation_port_tcp = entry.obfuscation_port_tcp;
                 }
+                // Merge UDP-obfuscation state too: a fresh import (from
+                // another saved server.met or our own) can carry
+                // updated material we'd otherwise lose by ignoring
+                // these fields. We never overwrite a non-zero key with
+                // 0 (so importing an old eMule-format file doesn't
+                // wipe what we already learned).
+                if entry.obfuscation_port_udp > 0 {
+                    existing.obfuscation_port_udp = entry.obfuscation_port_udp;
+                }
+                if entry.server_udp_key != 0 {
+                    existing.server_udp_key = entry.server_udp_key;
+                }
+                if entry.udp_flags != 0 {
+                    existing.udp_flags = entry.udp_flags;
+                }
                 if entry.priority != ServerPriority::Normal {
                     existing.priority = entry.priority;
                 }
@@ -612,6 +650,108 @@ impl ServerList {
                 entry.obfuscation_port_tcp = obfuscation_port_tcp;
             }
         }
+    }
+
+    /// Store per-server UDP obfuscation material from extended status
+    /// ping responses. Both fields are optional (servers that don't
+    /// support UDP obfuscation send 0 / 0); we only overwrite a stored
+    /// non-zero value if the new one is also non-zero, so that a
+    /// missing-extended-fields response doesn't clear what we already
+    /// learned earlier in the session.
+    pub fn update_udp_obfuscation(
+        &mut self,
+        ip: &str,
+        port: u16,
+        obfuscation_port_udp: u16,
+        server_udp_key: u32,
+    ) {
+        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+            if obfuscation_port_udp != 0 {
+                entry.obfuscation_port_udp = obfuscation_port_udp;
+            }
+            if server_udp_key != 0 && entry.server_udp_key != server_udp_key {
+                tracing::info!(
+                    "Learned UDP obfuscation key for server {ip}:{port} (key={server_udp_key:#x}, obf_port={obfuscation_port_udp})",
+                );
+                entry.server_udp_key = server_udp_key;
+            }
+        }
+    }
+
+    /// Look up the UDP obfuscation material for a server by `(ip, tcp_port)`.
+    /// Returns `Some((base_key, obf_udp_port))` only when the server has
+    /// advertised a non-zero key AND has the `SRV_UDPFLG_UDPOBFUSCATION`
+    /// flag set. The caller is expected to fall back to plaintext + the
+    /// regular UDP port (`tcp_port + 4`) when this returns `None`.
+    pub fn get_udp_obfuscation(&self, ip: std::net::Ipv4Addr, tcp_port: u16) -> Option<(u32, u16)> {
+        let ip_str = ip.to_string();
+        let entry = self
+            .servers
+            .iter()
+            .find(|s| s.ip == ip_str && s.port == tcp_port)?;
+        if entry.server_udp_key == 0 {
+            return None;
+        }
+        if entry.udp_flags & super::server_udp::SRV_UDPFLG_UDPOBFUSCATION == 0 {
+            return None;
+        }
+        let port = if entry.obfuscation_port_udp != 0 {
+            entry.obfuscation_port_udp
+        } else {
+            // Fall back to the standard UDP port — eMule's
+            // `UDPSocket.cpp` does the same when `nUDPObfuscationPort`
+            // is 0 (`if (!nPort) nPort = pServer->GetObfuscationPortUDP();`,
+            // which then resolves to the standard port).
+            tcp_port.saturating_add(4)
+        };
+        Some((entry.server_udp_key, port))
+    }
+
+    /// Inverse lookup: given an inbound UDP `(src_ip, src_port)`, find
+    /// which server it belongs to and return:
+    ///   * `base_key`  — server's `dwServerUDPKey` for obfuscation,
+    ///                   or 0 if obfuscation isn't applicable here
+    ///                   (still returned for the canonicalisation path)
+    ///   * `tcp_port`  — server's canonical TCP port, used to
+    ///                   normalise the recv source addr so downstream
+    ///                   handlers' `addr.port() - 4` arithmetic
+    ///                   continues to give the right value even when
+    ///                   the reply arrived from a non-standard
+    ///                   `obfuscation_port_udp`.
+    ///
+    /// Returns `None` only when no server in the list matches the
+    /// given source `(ip, port)` pair via either the standard UDP
+    /// port (TCP+4) or the advertised obfuscation UDP port.
+    pub fn lookup_for_udp_addr(
+        &self,
+        ip: std::net::Ipv4Addr,
+        src_port: u16,
+    ) -> Option<(u32, u16)> {
+        let ip_str = ip.to_string();
+        for entry in &self.servers {
+            if entry.ip != ip_str {
+                continue;
+            }
+            let tcp_port = entry.port;
+            let std_udp = tcp_port.saturating_add(4);
+            let obf_udp = entry.obfuscation_port_udp;
+            if src_port == std_udp || (obf_udp != 0 && src_port == obf_udp) {
+                return Some((entry.server_udp_key, tcp_port));
+            }
+        }
+        None
+    }
+
+    /// Backwards-compatible wrapper that returns just the BaseKey when
+    /// the caller doesn't need the canonical TCP port. Internally
+    /// dispatches to [`lookup_for_udp_addr`]. Returns `None` when no
+    /// server matches OR when the matching server has no key yet.
+    pub fn server_udp_key_for_addr(&self, ip: std::net::Ipv4Addr, src_port: u16) -> Option<u32> {
+        let (key, _) = self.lookup_for_udp_addr(ip, src_port)?;
+        if key == 0 {
+            return None;
+        }
+        Some(key)
     }
 
     /// Store per-server UDP capability flags from status ping responses.
@@ -729,6 +869,37 @@ impl ServerList {
             // Obfuscation TCP port (0xF1)
             if entry.obfuscation_port_tcp > 0 {
                 write_met_uint32_tag(&mut tag_buf, 0xF1, entry.obfuscation_port_tcp as u32);
+                tag_count += 1;
+            }
+
+            // UDP obfuscation port (Ember-private tag 0xF2). Persisted
+            // alongside `server_udp_key` so we don't have to wait for
+            // the next status ping after a restart before we can talk
+            // obfuscated UDP. eMule's stock server.met format doesn't
+            // include this — we use a private tag id in the eMule
+            // private range (0xF0+); other clients ignore it.
+            if entry.obfuscation_port_udp > 0 {
+                write_met_uint32_tag(&mut tag_buf, 0xF2, entry.obfuscation_port_udp as u32);
+                tag_count += 1;
+            }
+
+            // Per-server UDP obfuscation BaseKey (Ember-private 0xF3).
+            // Stored as a u32 tag. Like the port above, persisting
+            // means a fresh-start client can immediately use UDP
+            // obfuscation against servers it has previously talked
+            // to. Without this, every restart silently sends
+            // plaintext for the first 30 seconds (until the next
+            // status ping).
+            if entry.server_udp_key != 0 {
+                write_met_uint32_tag(&mut tag_buf, 0xF3, entry.server_udp_key);
+                tag_count += 1;
+            }
+
+            // UDP capability flags (Ember-private 0xF4). Same
+            // rationale: avoid losing learned capability bits across
+            // restarts.
+            if entry.udp_flags != 0 {
+                write_met_uint32_tag(&mut tag_buf, 0xF4, entry.udp_flags);
                 tag_count += 1;
             }
 

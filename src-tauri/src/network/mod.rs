@@ -99,6 +99,19 @@ struct PublishHealthSnapshot {
     unmatched: u64,
 }
 
+/// Snapshot of the UDP source-discovery diagnostic counters at a given
+/// time. Same delta-style logging pattern as `PublishHealthSnapshot`:
+/// the heartbeat arm only fires the log line when at least one counter
+/// moved since the last beat. Lets the user verify "is UDP source
+/// discovery happening at all" without flipping to debug logging.
+#[derive(Debug, Default, Clone, Copy)]
+struct UdpDiscoveryHealthSnapshot {
+    sent: u64,
+    send_errs: u64,
+    replies: u64,
+    sources_found: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceInjectionResult {
     Injected,
@@ -545,7 +558,32 @@ fn inject_source_into_active_transfers(
     };
     let parsed_ip = source.peer_ip.parse::<Ipv4Addr>().ok();
 
-    // Skip reputation-banned sources
+    // Source-level filtering. The Ember EPX path applies the same
+    // checks before calling its own injection helper; doing them here
+    // too means the UDP server (`OP_GLOBFOUNDSOURCES`) and KAD source
+    // paths inherit them automatically without each site having to
+    // duplicate the gate. Order: cheap rejections first.
+    //
+    // 1. Special-use IPv4 (RFC 5735: loopback, link-local, multicast,
+    //    documentation, etc.). These are never reachable peers.
+    // 2. IP filter (`ipfilter.dat`). Drops emule-security-blocked
+    //    ranges, optionally private IPs, etc.
+    // 3. Banned IPs (live runtime banlist).
+    // 4. Reputation-banned user hashes (existing check).
+    if let Some(v4) = parsed_ip {
+        if crate::security::is_special_use_v4(v4) || v4.is_multicast() {
+            stats.dropped_full += transfer_ids.len();
+            return stats;
+        }
+        if state.ip_filter.is_blocked(v4) {
+            stats.dropped_full += transfer_ids.len();
+            return stats;
+        }
+        if state.banned_ips.contains(&v4) {
+            stats.dropped_full += transfer_ids.len();
+            return stats;
+        }
+    }
     if let Some(ref uh) = source.peer_user_hash {
         if state.reputation.is_banned(uh) {
             stats.dropped_full += transfer_ids.len();
@@ -1485,6 +1523,17 @@ struct NetworkState {
     active_kad_search_state: HashMap<String, (i64, u32)>,
     /// Senders for injecting new sources into active multi-source downloads
     active_source_senders: HashMap<String, mpsc::Sender<DownloadSource>>,
+    /// UDP source-discovery diagnostic counters. Surfaced in the
+    /// periodic discovery health log so the user can verify UDP
+    /// source-asking is actually flowing (vs silently broken by
+    /// firewall, missing obfuscation, dead servers, etc.). All four
+    /// are monotonic since process start; the health log prints
+    /// deltas. Saturating arithmetic so a long-running session can't
+    /// overflow `u64`.
+    udp_discovery_sent: u64,
+    udp_discovery_send_errs: u64,
+    udp_discovery_replies: u64,
+    udp_discovery_sources_found: u64,
     /// Senders for injecting *pre-handshaked* peer streams into active
     /// multi-source downloads. Distinct from `active_source_senders`
     /// because the payload (`EstablishedSource`) carries an
@@ -2949,6 +2998,10 @@ pub async fn start_network(
         aich_recovery_pending: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
         per_file_sources: HashMap::new(),
         active_kad_search_state: HashMap::new(),
+        udp_discovery_sent: 0,
+        udp_discovery_send_errs: 0,
+        udp_discovery_replies: 0,
+        udp_discovery_sources_found: 0,
         active_source_senders: HashMap::new(),
         active_established_senders: HashMap::new(),
         active_source_overflow: HashMap::new(),
@@ -3301,6 +3354,13 @@ pub async fn start_network(
     // so we can print "since last beat" deltas instead of monotonic
     // totals (which look like the same number cycle after cycle).
     let mut last_publish_health: PublishHealthSnapshot = PublishHealthSnapshot::default();
+    // UDP source-discovery heartbeat: same 30s cadence, only logs
+    // when at least one counter has moved since the last beat. Lets
+    // the user verify UDP source-asking is actually flowing instead
+    // of having to enable debug logging.
+    let mut udp_discovery_health_timer = tokio::time::interval(std::time::Duration::from_secs(30));
+    udp_discovery_health_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_udp_discovery_health: UdpDiscoveryHealthSnapshot = UdpDiscoveryHealthSnapshot::default();
     let mut search_poll_timer = tokio::time::interval(std::time::Duration::from_secs(1));
     search_poll_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // eMule UDPSEARCHSPEED = SEC2MS(3)/4 = 750ms: send one UDP search per tick
@@ -3339,8 +3399,22 @@ pub async fn start_network(
     a4af_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut server_timer = tokio::time::interval(std::time::Duration::from_secs(2));
     server_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let initial_ping_interval = 5u64.min(ed2k::server_udp::STAT_REASK_INTERVAL_SECS as u64);
-    let mut server_udp_ping_timer = tokio::time::interval(std::time::Duration::from_secs(initial_ping_interval));
+    // Was: 5s. Now 200ms. The same arm both (a) sends a status
+    // ping to the next server in round-robin order and (b) drains
+    // any queued UDP replies via `try_recv_with`. At 5s, replies to
+    // a `OP_GLOBGETSOURCES` could sit in the kernel buffer for up
+    // to 5 seconds before we noticed — bad latency for source
+    // discovery. Pings remain rate-limited *per server* by
+    // `MIN_PING_INTERVAL_SECS` (= 5s) inside `send_status_ping`,
+    // so the higher tick rate doesn't increase ping traffic — it
+    // just makes the recv drain feel like a real event-driven arm.
+    // CPU cost per idle tick is one `try_recv_from` syscall (which
+    // returns `WouldBlock` instantly when nothing's queued) plus a
+    // hashmap lookup for the cooldown — negligible.
+    let initial_ping_interval_ms = 200u64;
+    let mut server_udp_ping_timer = tokio::time::interval(
+        std::time::Duration::from_millis(initial_ping_interval_ms),
+    );
     server_udp_ping_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut stats_timer = tokio::time::interval(std::time::Duration::from_secs(1));
     stats_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -6804,6 +6878,50 @@ pub async fn start_network(
                 last_publish_health = cur;
             }
 
+            // UDP source-discovery health heartbeat (30s). Like the
+            // publish heartbeat above, only emits a log line when at
+            // least one counter has changed since the last beat. Lets
+            // the user verify that UDP source-asking is actually
+            // flowing in real time without enabling debug logging:
+            // a steady "sent=+N replies=+M sources=+K" stream means
+            // healthy discovery; "sent=+N replies=+0 sources=+0" for
+            // many beats means servers aren't replying (firewall,
+            // missing UDP obfuscation, dead servers).
+            _ = udp_discovery_health_timer.tick() => {
+                if state.stats.status == NetworkStatus::Disconnected { continue; }
+                let cur = UdpDiscoveryHealthSnapshot {
+                    sent: state.udp_discovery_sent,
+                    send_errs: state.udp_discovery_send_errs,
+                    replies: state.udp_discovery_replies,
+                    sources_found: state.udp_discovery_sources_found,
+                };
+                let prev = last_udp_discovery_health;
+                let any_change = cur.sent != prev.sent
+                    || cur.send_errs != prev.send_errs
+                    || cur.replies != prev.replies
+                    || cur.sources_found != prev.sources_found;
+                if any_change {
+                    let d_sent = cur.sent.saturating_sub(prev.sent);
+                    let d_errs = cur.send_errs.saturating_sub(prev.send_errs);
+                    let d_replies = cur.replies.saturating_sub(prev.replies);
+                    let d_sources = cur.sources_found.saturating_sub(prev.sources_found);
+                    // `ok` and `fail` are disjoint counts of the
+                    // **attempted** sends since the last beat (each
+                    // `send_to` call bumps exactly one). The totals
+                    // are cumulative since process start (each kind
+                    // separately). Earlier wording put them in the
+                    // same paren which read as "errs are a subset
+                    // of sent" — they aren't.
+                    info!(
+                        "UDP source-discovery health (30s): sends ok=+{d_sent} fail=+{d_errs} (totals ok={} fail={}), replies=+{d_replies} (total {}), sources_found=+{d_sources} (total {})",
+                        cur.sent, cur.send_errs,
+                        cur.replies,
+                        cur.sources_found,
+                    );
+                }
+                last_udp_discovery_health = cur;
+            }
+
             // Cleanup stale searches, expired DHT entries, and unconfirmed publishes
             _ = cleanup_timer.tick() => {
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
@@ -7337,8 +7455,14 @@ pub async fn start_network(
             _ = udp_search_timer.tick() => {
                 if let Some((packet, addr)) = state.udp_search_queue.pop_front() {
                     let sock = server_udp.socket_handle();
-                    let _ = sock.send_to(&packet, addr).await;
-                    if state.udp_search_queue.is_empty() {
+                    if let Err(e) = sock.send_to(&packet, addr).await {
+                        // Most common failures are transient ICMP-unreachable
+                        // (Windows: WSAECONNRESET = "An existing connection
+                        // was forcibly closed") from a previous packet to a
+                        // dead server. Log at debug to avoid spam; aggregate
+                        // visibility is in the periodic discovery health log.
+                        debug!("UDP global search send_to {addr} failed: {e}");
+                    } else if state.udp_search_queue.is_empty() {
                         debug!("UDP global search: all servers queried");
                     }
                 }
@@ -7349,17 +7473,32 @@ pub async fn start_network(
                 if let Some((packet, addr)) = state.udp_source_queue.pop_front() {
                     let sock = server_udp.socket_handle();
                     let pkt_len = packet.len() as u64;
-                    if sock.send_to(&packet, addr).await.is_ok() {
-                        // Outbound source-asking traffic to non-connected
-                        // servers. The queue is exclusively populated by
-                        // `build_all_getsources_packets[_multi]`, so every
-                        // byte that leaves here is `OP_GLOBGETSOURCES`
-                        // (or `OP_GLOBGETSOURCES2`) for source discovery.
-                        stats_manager.add_overhead(
-                            crate::storage::statistics::OverheadCategory::SourceExchange,
-                            crate::storage::statistics::OverheadDirection::Upload,
-                            pkt_len,
-                        );
+                    match sock.send_to(&packet, addr).await {
+                        Ok(_) => {
+                            // Outbound source-asking traffic to non-connected
+                            // servers. The queue is exclusively populated by
+                            // `build_all_getsources_packets[_multi]`, so every
+                            // byte that leaves here is `OP_GLOBGETSOURCES`
+                            // (or `OP_GLOBGETSOURCES2`) for source discovery.
+                            stats_manager.add_overhead(
+                                crate::storage::statistics::OverheadCategory::SourceExchange,
+                                crate::storage::statistics::OverheadDirection::Upload,
+                                pkt_len,
+                            );
+                            state.udp_discovery_sent = state.udp_discovery_sent.saturating_add(1);
+                        }
+                        Err(e) => {
+                            // Don't double-count failed sends in stats.
+                            // Failed sends to dead/unreachable servers are
+                            // expected (each cycle queues to *every*
+                            // eligible server in `server.met`, many of
+                            // which are stale). Per-server failure is
+                            // tracked via `state.udp_discovery_send_errs`
+                            // for the periodic health log; debug here
+                            // gives detail when needed without spamming.
+                            debug!("UDP source send_to {addr} failed: {e}");
+                            state.udp_discovery_send_errs = state.udp_discovery_send_errs.saturating_add(1);
+                        }
                     }
                 }
             }
@@ -9276,7 +9415,24 @@ pub async fn start_network(
                         );
                     }
                 }
-                while let Some((recv_len, resp)) = server_udp.try_recv().await {
+                while let Some((recv_len, resp)) = {
+                    // Snapshot the server list reference so the
+                    // closure (called possibly multiple times by
+                    // `try_recv_with`) can do per-server lookups
+                    // without borrowing `state` mutably across the
+                    // await. Returns `(base_key, tcp_port)`: the
+                    // first lets us decrypt obfuscated replies, the
+                    // second lets `try_recv_with` canonicalise the
+                    // emitted `addr` so downstream handlers'
+                    // `addr.port() - 4 == tcp_port` math works
+                    // regardless of whether the reply came from the
+                    // standard UDP port or the server's
+                    // `obfuscation_port_udp`.
+                    let server_list = &state.server_list;
+                    server_udp.try_recv_with(move |ip, port| {
+                        server_list.lookup_for_udp_addr(ip, port)
+                    }).await
+                } {
                     // Attribute the actual wire bytes to the correct
                     // category. Previously every response paid a flat
                     // 64-byte "Server" charge AND `FoundSources`
@@ -9300,7 +9456,7 @@ pub async fn start_network(
                         recv_bytes,
                     );
                     match resp {
-                        ServerUdpResponse::StatusResponse { addr, challenge, user_count, file_count, obfuscation_port_tcp, udp_flags } => {
+                        ServerUdpResponse::StatusResponse { addr, challenge, user_count, file_count, obfuscation_port_tcp, obfuscation_port_udp, udp_flags, server_udp_key } => {
                             // eMule: verify challenge to prevent spoofed status responses
                             let expected = server_udp.take_challenge(&addr);
                             if expected != Some(challenge) {
@@ -9314,9 +9470,29 @@ pub async fn start_network(
                                 state.server_list.update_udp_flags(
                                     &addr.ip().to_string(), tcp_port, udp_flags,
                                 );
+                                // Persist UDP obfuscation crypto material so
+                                // subsequent send / recv paths can wrap and
+                                // unwrap packets for this server. Both fields
+                                // come from the extended status payload —
+                                // without storing them, V2 silently sends
+                                // plaintext to obfuscation-only servers and
+                                // they ignore us.
+                                state.server_list.update_udp_obfuscation(
+                                    &addr.ip().to_string(), tcp_port,
+                                    obfuscation_port_udp, server_udp_key,
+                                );
                             }
                         }
                         ServerUdpResponse::FoundSources { addr, file_hash, sources } => {
+                            // Bump diagnostics first so the periodic
+                            // health log catches even empty replies
+                            // (which still mean "the server answered
+                            // us at all" — useful signal vs total
+                            // silence).
+                            state.udp_discovery_replies = state.udp_discovery_replies.saturating_add(1);
+                            state.udp_discovery_sources_found = state
+                                .udp_discovery_sources_found
+                                .saturating_add(sources.len() as u64);
                             {
                                 let hash_hex_udp = hex::encode(file_hash);
                                 let matching: Vec<String> = state.pending_downloads.iter()
@@ -9349,6 +9525,15 @@ pub async fn start_network(
                                     let mut sm = source_manager.write().await;
                                     for (ip, port, client_id) in &sources {
                                         if *client_id > 0 {
+                                            // LowID source — no peer
+                                            // IP yet (only known once
+                                            // the callback connects
+                                            // back). No IP-level filter
+                                            // we can apply here, so
+                                            // register and let the
+                                            // upload listener filter
+                                            // when the callback
+                                            // actually arrives.
                                             sm.register_lowid_source(
                                                 file_hash,
                                                 *client_id,
@@ -9359,6 +9544,26 @@ pub async fn start_network(
                                                 0,
                                             );
                                         } else {
+                                            // HighID source — apply
+                                            // the same IP filter /
+                                            // banned / special-use
+                                            // gate as
+                                            // `inject_source_into_active_transfers`
+                                            // BEFORE registering, so
+                                            // banned IPs don't end up
+                                            // in the source manager
+                                            // (where they would
+                                            // pollute SX out and
+                                            // future retries).
+                                            if crate::security::is_special_use_v4(*ip) || ip.is_multicast() {
+                                                continue;
+                                            }
+                                            if state.ip_filter.is_blocked(*ip) {
+                                                continue;
+                                            }
+                                            if state.banned_ips.contains(ip) {
+                                                continue;
+                                            }
                                             sm.register_source_full_server(
                                                 file_hash, *ip, *port, 0,
                                                 udp_server_ip, udp_server_port,
@@ -9866,6 +10071,73 @@ pub async fn start_network(
                         state.server_connection = Some(conn);
                         state.stats.server_status = "connected".to_string();
                         let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "connected" }));
+
+                        // L-2: flush LowID callback requests for any
+                        // sources we previously learned about via UDP
+                        // from this server. Without this, UDP-discovered
+                        // LowID sources from a server we *weren't* TCP-
+                        // connected to at discovery time would sit in
+                        // source manager unreachable forever — eMule
+                        // protocol requires the callback to go through
+                        // the source's originating server.
+                        if !is_low {
+                            let server_ip_u32 = match addr.ip() {
+                                std::net::IpAddr::V4(v4) => u32::from_le_bytes(v4.octets()),
+                                _ => 0,
+                            };
+                            let server_port_u16 = addr.port();
+                            if server_ip_u32 != 0 {
+                                let pending: Vec<([u8; 16], u32)> = {
+                                    let sm = source_manager.read().await;
+                                    sm.get_lowid_sources_for_server(
+                                        server_ip_u32,
+                                        server_port_u16,
+                                        ed2k::dead_sources::FILEREASKTIME_SECS,
+                                    )
+                                };
+                                if !pending.is_empty() {
+                                    if let Some(conn) = &mut state.server_connection {
+                                        // Send callbacks WITHOUT
+                                        // holding the source_manager
+                                        // write lock — each
+                                        // `request_callback` is an
+                                        // async TCP write (potentially
+                                        // tens of ms when slow), and
+                                        // holding `source_manager`
+                                        // exclusively blocks every
+                                        // other task that needs to
+                                        // register / look up a source
+                                        // (KAD source-search results,
+                                        // EPX source-receive, server
+                                        // OP_FOUNDSOURCES handler,
+                                        // upload listener IP-banlist
+                                        // queries). Collect successes,
+                                        // then re-acquire the lock
+                                        // briefly to batch-mark.
+                                        let mut succeeded: Vec<([u8; 16], u32)> =
+                                            Vec::with_capacity(pending.len());
+                                        for (file_hash, client_id) in &pending {
+                                            if conn.request_callback(*client_id).await.is_ok() {
+                                                succeeded.push((*file_hash, *client_id));
+                                            }
+                                        }
+                                        let sent = succeeded.len();
+                                        if sent > 0 {
+                                            let mut sm = source_manager.write().await;
+                                            for (file_hash, client_id) in &succeeded {
+                                                sm.mark_callback_sent(file_hash, *client_id);
+                                            }
+                                        }
+                                        if sent > 0 {
+                                            info!(
+                                                "L-2 flush: requested {sent}/{} LowID callbacks via newly-connected server {}:{}",
+                                                pending.len(), addr.ip(), server_port_u16,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     Ok(ServerConnectResult { ip, port, result: Err(e), .. }) => {
                         warn!("Failed to connect to server {ip}:{port}: {e}");
