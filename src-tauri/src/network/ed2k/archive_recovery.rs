@@ -46,7 +46,16 @@ pub fn recover_archive(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| file_name.to_string());
 
-    let output_name = format!("{stem}-rec.{ext}");
+    // Run the same sanitizer the download path uses on the recovered
+    // archive's outer name, so a peer-supplied `file_name` like
+    // `..\..\evil.zip` or one with NUL/reserved Windows names can't
+    // produce a surprising path next to the `.part` file. The inner
+    // archive entries are sanitized separately by
+    // `sanitize_zip_entry_name` (zip path) and
+    // `sanitize_archive_name_in_place` (RAR/ACE paths).
+    let safe_stem_full = crate::security::sanitize_filename(&stem);
+    let safe_ext = crate::security::sanitize_filename(&ext);
+    let output_name = format!("{safe_stem_full}-rec.{safe_ext}");
     let output_path = part_path
         .parent()
         .unwrap_or(Path::new("."))
@@ -329,6 +338,41 @@ fn recover_zip(
     Ok(entries.len())
 }
 
+/// Neutralize path-traversal bytes inside an RAR/ACE filename **in
+/// place** — we can't change the byte length without rewriting the
+/// surrounding header (size fields, offsets), so we keep the same
+/// length and just replace dangerous bytes with `_`.
+///
+/// After this call:
+///   * No path separators remain (`/`, `\`, `:`), so any extractor
+///     interprets the name as a single filename, not a path.
+///   * NUL bytes are removed (they truncate the displayed name on
+///     some extractors — defensive only).
+///   * Pure-`.` / pure-`..` names are turned into `_` / `__` so the
+///     extractor doesn't try to write to the destination's parent
+///     directory or refuse the entry.
+///
+/// This is the same defense the ZIP path applies via
+/// `sanitize_zip_entry_name`, ported to formats where we can't rebuild
+/// the header.
+fn sanitize_archive_name_in_place(name: &mut [u8]) {
+    for byte in name.iter_mut() {
+        match *byte {
+            b'/' | b'\\' | b':' | 0 => *byte = b'_',
+            _ => {}
+        }
+    }
+    // Reject pure-`.` / `..` references after separator stripping so
+    // the extractor can't interpret the name as a parent-directory
+    // reference. Only matches the *whole* name; embedded dots are fine
+    // (e.g. `..foo` becomes itself, which is a valid filename).
+    if name == b"." || name == b".." {
+        for byte in name.iter_mut() {
+            *byte = b'_';
+        }
+    }
+}
+
 /// D17: rewrite an inner ZIP entry name so it cannot zip-slip when a
 /// downstream extractor writes it out. We:
 ///   * strip any leading `/` or drive-letter prefix,
@@ -504,6 +548,19 @@ fn recover_rar(
             // Directory check: eMule uses HEAD_FLAGS bits 5-7 (0xE0)
             let is_dir = (head_flags & 0xE0) == 0xE0;
 
+            // Sanitize the inner filename in place before writing the
+            // header. The filename sits at byte 32 in the file header
+            // with `name_size` bytes; we already validated the bounds
+            // above. Without this, a peer-supplied name like `..\..\x`
+            // would be carried verbatim into the recovered archive,
+            // leaving a zip-slip-class write for a downstream
+            // extractor (e.g. WinRAR, 7-Zip).
+            let name_start = 32usize;
+            let name_end = name_start + name_size;
+            if name_end <= header_data.len() {
+                sanitize_archive_name_in_place(&mut header_data[name_start..name_end]);
+            }
+
             // Write header + data to output
             output.write_all(&header_data)?;
             if total_pack > 0 {
@@ -618,6 +675,21 @@ fn recover_ace(
             if pack_size > 0 && !is_filled(data_start, data_end, filled) {
                 pos = data_end;
                 continue;
+            }
+
+            // Sanitize the embedded filename before writing. ACE FILE32
+            // headers carry `FNAME_SIZE` at bytes 29..31 of the body
+            // (the 1-byte HEAD_TYPE prefix shifts the spec offsets by
+            // one) followed by the filename. As with RAR above, we
+            // mutate in place to keep all surrounding offsets valid.
+            if header_body.len() >= 31 {
+                let fname_size =
+                    u16::from_le_bytes([header_body[29], header_body[30]]) as usize;
+                let fname_start = 31usize;
+                let fname_end = fname_start.saturating_add(fname_size);
+                if fname_size > 0 && fname_end <= header_body.len() {
+                    sanitize_archive_name_in_place(&mut header_body[fname_start..fname_end]);
+                }
             }
 
             // Write header + data

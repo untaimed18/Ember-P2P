@@ -677,6 +677,20 @@ impl Database {
     }
 
     pub fn save_file_comment(&self, file_hash: &str, rating: u8, comment: &str) -> anyhow::Result<()> {
+        // Defense-in-depth cap matching the IPC layer
+        // (`commands/comments.rs::set_file_comment`). The IPC entry point
+        // already rejects > 4096-byte comments, but enforcing it again
+        // here protects against future internal callers that might skip
+        // the validation step. 4096 matches eMule's on-wire limit so we
+        // don't write something the protocol couldn't carry.
+        const MAX_COMMENT_BYTES: usize = 4096;
+        if comment.len() > MAX_COMMENT_BYTES {
+            return Err(anyhow::anyhow!(
+                "comment too long ({} bytes > {} max)",
+                comment.len(),
+                MAX_COMMENT_BYTES
+            ));
+        }
         let conn = self.conn.lock();
         conn.execute(
             "INSERT OR REPLACE INTO file_comments (file_hash, rating, comment) VALUES (?1, ?2, ?3)",

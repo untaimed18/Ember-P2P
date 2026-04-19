@@ -255,7 +255,7 @@
           </svg>
         </div>
         <span class="chat-name" id={titleId}>
-          <span class="sr-only">Chat with </span>{friendName || friendHash.slice(0, 8) + '\u2026'}
+          <span class="sr-only">Chat with </span><bdi>{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi>
         </span>
       </div>
       <button class="chat-close" onclick={onclose} title="Close chat" aria-label="Close chat">
@@ -278,7 +278,15 @@
       {:else}
         {#each messages as msg (msg.id)}
           <div class="chat-bubble" class:sent={msg.direction === 'sent'} class:received={msg.direction === 'received'}>
-            <div class="bubble-text">{msg.message}</div>
+            <!--
+              `<bdi>` isolates the message body from the surrounding
+              UI's text direction so a peer-supplied RTL/LTR override
+              character can't reorder neighbouring elements (a known
+              "Trojan Source"-style spoofing class). The text is still
+              rendered exactly as written; only its bidi influence is
+              scoped to this element.
+            -->
+            <div class="bubble-text"><bdi>{msg.message}</bdi></div>
             <div class="bubble-time">{formatTime(msg.timestamp)}</div>
           </div>
         {/each}

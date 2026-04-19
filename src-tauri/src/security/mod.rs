@@ -295,14 +295,35 @@ fn normalize_match_path(path: &str) -> String {
 
 /// Returns true when `path` is the same as `dir` or is nested beneath it,
 /// using path-segment boundaries instead of raw string prefix matching.
+///
+/// Refuses match when `dir` resolves to a filesystem root (POSIX `/` →
+/// empty string; Windows `C:\` → bare drive letter like `"c:"`).  A
+/// bare-drive-letter prefix would otherwise match every path on the
+/// volume — for example `unshare_folder("C:\\")` would flip
+/// `shared = false` on every indexed file. Callers should pass concrete
+/// folder paths; matching against a root is almost certainly a bug or a
+/// malicious request and is rejected here as defense in depth.
 pub fn path_matches_dir(path: &str, dir: &str) -> bool {
     let normalized_path = normalize_match_path(path);
     let normalized_dir = normalize_match_path(dir);
     if normalized_dir.is_empty() {
         return false;
     }
+    if is_bare_drive_letter(&normalized_dir) {
+        return false;
+    }
     normalized_path == normalized_dir
         || normalized_path.starts_with(&(normalized_dir.clone() + "/"))
+}
+
+/// `true` when the normalized path is a single segment ending in `:`
+/// (e.g. `"c:"`), i.e. a Windows drive root with no path components.
+fn is_bare_drive_letter(normalized: &str) -> bool {
+    if normalized.contains('/') {
+        return false;
+    }
+    let bytes = normalized.as_bytes();
+    bytes.len() == 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
 }
 
 /// Restrict file permissions to the current user only (platform-specific).

@@ -15154,7 +15154,10 @@ async fn handle_command(
                             let db3 = db.clone();
                             let msg = message.clone();
                             let ul_tx2 = ul_event_tx.clone();
-                            info!("Auto-connecting to friend {} for chat at {}", hex::encode(friend_eh), addr);
+                            // debug! (not info!) because the Ember hash + address pair
+                            // is identity-correlatable PII; we keep it for troubleshooting
+                            // but don't surface it in the default log stream.
+                            debug!("Auto-connecting to friend {} for chat at {}", hex::encode(friend_eh), addr);
                             tokio::spawn(async move {
                                 match ed2k::friend_connect::open_and_run_friend_session(
                                     addr, our_user_hash, our_ember_hash, nickname,
@@ -15189,7 +15192,7 @@ async fn handle_command(
                                         }
                                     }
                                     Err(e) => {
-                                        info!("Auto-connect for chat to {} failed: {e}", hex::encode(friend_eh));
+                                        debug!("Auto-connect for chat to {} failed: {e}", hex::encode(friend_eh));
                                         let _ = tx.send(Err(format!("Auto-connect failed: {e}")));
                                         let _ = ul_tx2.send(upload_server::UploadEvent {
                                             transfer_id: String::new(),
@@ -15218,7 +15221,7 @@ async fn handle_command(
                         let msg = message.clone();
                         let ultx2 = ul_event_tx.clone();
                         state.outbound_session_tasks.insert(friend_eh, std::time::Instant::now());
-                        info!("No stored address for {}, trying rendezvous for chat", hex::encode(friend_eh));
+                        debug!("No stored address for {}, trying rendezvous for chat", hex::encode(friend_eh));
                         tokio::spawn(async move {
                             match crate::network::rendezvous::lookup(&rv_url, &friend_eh).await {
                                 Ok(Some((ip, port))) => {

@@ -316,6 +316,11 @@ pub async fn reject_friend_request(
     state: tauri::State<'_, AppState>,
     sender_hash: String,
 ) -> Result<(), String> {
+    // Validate identically to `accept_friend_request` so a malformed
+    // hash is rejected before it reaches the database. The DB path
+    // uses bound parameters and is safe today, but consistency makes
+    // the contract obvious and protects against future refactors.
+    parse_user_hash(&sender_hash)?;
     let canonical = sender_hash.to_lowercase();
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.remove_friend_request(&canonical))

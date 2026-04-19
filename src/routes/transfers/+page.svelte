@@ -1116,8 +1116,13 @@
         }
         case 'paste_link': {
           const text = await navigator.clipboard.readText();
-          if (text.trim().toLowerCase().startsWith('ed2k://')) {
-            const info = await parseEd2kLink(text);
+          const trimmed = text.trim();
+          if (trimmed.length > MAX_PASTE_LEN) {
+            transferError = `Clipboard text is too long (${trimmed.length} chars, max ${MAX_PASTE_LEN}) — eD2K links are typically under 1 KiB`;
+            break;
+          }
+          if (trimmed.toLowerCase().startsWith('ed2k://')) {
+            const info = await parseEd2kLink(trimmed);
             const res = await startDownload(info.hash, info.name, info.size, '', 0);
             showInfo(res.already_queued
               ? `Already in download list: ${info.name}`
@@ -1157,12 +1162,22 @@
   // have to right-click an existing transfer (which is the only place
   // the action is otherwise discoverable). Reads ed2k:// from the
   // clipboard and queues a download.
+  //
+  // Length cap is generous (real ed2k:// links are well under 1 KiB
+  // even with an AICH root and source list) but bounded so a paste of
+  // megabytes doesn't reach the parser at all. Backend validation is
+  // still the real boundary; this is just defense-in-depth + UX.
+  const MAX_PASTE_LEN = 4096;
   let pasteLinkBusy = $state(false);
   async function handlePasteLinkFromHeader() {
     if (pasteLinkBusy) return;
     pasteLinkBusy = true;
     try {
       const text = (await navigator.clipboard.readText()).trim();
+      if (text.length > MAX_PASTE_LEN) {
+        transferError = `Clipboard text is too long (${text.length} chars, max ${MAX_PASTE_LEN}) — eD2K links are typically under 1 KiB`;
+        return;
+      }
       if (!text.toLowerCase().startsWith('ed2k://')) {
         transferError = 'Clipboard does not contain an ed2k:// link';
         return;
