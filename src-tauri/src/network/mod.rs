@@ -8959,6 +8959,23 @@ pub async fn start_network(
                                         for src in &sources {
                                             if src.client_id == 0 {
                                                 if let Ok(v4) = src.ip.parse::<Ipv4Addr>() {
+                                                    // Mirror the gate the UDP source path applies
+                                                    // (see `OP_FOUNDSOURCES` handler). Without
+                                                    // this, banned/special-use IPs reported by
+                                                    // the TCP-connected server would pollute
+                                                    // `source_manager` (and from there our
+                                                    // outbound Source Exchange) — the eventual
+                                                    // download attempt is gated by
+                                                    // `inject_source_into_active_transfers` so
+                                                    // we don't actually connect, but we'd still
+                                                    // forward the bad IP to other peers.
+                                                    if crate::security::is_special_use_v4(v4)
+                                                        || v4.is_multicast()
+                                                        || state.ip_filter.is_blocked(v4)
+                                                        || state.banned_ips.contains(&v4)
+                                                    {
+                                                        continue;
+                                                    }
                                                     sm.register_source_full_server(
                                                         file_hash,
                                                         v4,
@@ -9099,6 +9116,25 @@ pub async fn start_network(
                                 ed2k::server::ServerEvent::CallbackRequested { ip, port, crypt_options, user_hash } => {
                                     info!("Server callback requested: peer at {ip}:{port}");
                                     if let Ok(peer_ip) = ip.parse::<std::net::Ipv4Addr>() {
+                                        // Same IP-filter gate as the
+                                        // UDP `OP_FOUNDSOURCES` path:
+                                        // refuse to register a callback
+                                        // peer whose announced IP is in
+                                        // a special-use range, in our
+                                        // ipfilter.dat blocklist, or
+                                        // banned at runtime. A
+                                        // misbehaving server could
+                                        // otherwise sneak banned IPs
+                                        // into source_manager and out
+                                        // via Source Exchange.
+                                        if crate::security::is_special_use_v4(peer_ip)
+                                            || peer_ip.is_multicast()
+                                            || state.ip_filter.is_blocked(peer_ip)
+                                            || state.banned_ips.contains(&peer_ip)
+                                        {
+                                            debug!("Ignoring server callback for {peer_ip}:{port}: blocked by IP filter / banned / special-use");
+                                            continue;
+                                        }
                                         let matching_hashes = if let Some(addr) = state.server_addr {
                                             if let std::net::IpAddr::V4(v4) = addr.ip() {
                                                 let sm = source_manager.read().await;

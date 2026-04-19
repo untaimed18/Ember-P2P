@@ -743,9 +743,13 @@ impl ServerList {
     }
 
     /// Backwards-compatible wrapper that returns just the BaseKey when
-    /// the caller doesn't need the canonical TCP port. Internally
-    /// dispatches to [`lookup_for_udp_addr`]. Returns `None` when no
-    /// server matches OR when the matching server has no key yet.
+    /// the caller doesn't need the canonical TCP port. The canonical-
+    /// port consumer ([`try_recv_with`]) uses [`lookup_for_udp_addr`]
+    /// directly; this thinner wrapper is kept around for any future
+    /// caller that just wants "do we have a key for this address?".
+    /// Returns `None` when no server matches OR when the matching
+    /// server has no key yet.
+    #[allow(dead_code)]
     pub fn server_udp_key_for_addr(&self, ip: std::net::Ipv4Addr, src_port: u16) -> Option<u32> {
         let (key, _) = self.lookup_for_udp_addr(ip, src_port)?;
         if key == 0 {
