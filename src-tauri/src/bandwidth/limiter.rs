@@ -86,8 +86,16 @@ impl BandwidthLimiter {
         while remaining > 0 {
             let current = tokens.load(Ordering::Acquire);
             if current == 0 {
+                // 25 ms wake granularity (was 100 ms). The refill task
+                // calls `notify_waiters()` on every refill — which is the
+                // primary wakeup — but the timeout is the safety net for
+                // the (rare) case where a refill happened between our
+                // load and our `notified()` registration. Tightening it
+                // to 25 ms keeps worst-case extra latency near the
+                // refill cadence (REFILL_INTERVAL_MS = 100 ms / 4 ticks)
+                // instead of an order of magnitude slower.
                 tokio::time::timeout(
-                    Duration::from_millis(100),
+                    Duration::from_millis(25),
                     self.refill_notify.notified(),
                 ).await.ok();
                 if !warned_slow && start.elapsed() > Duration::from_secs(60) {

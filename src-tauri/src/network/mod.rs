@@ -3226,11 +3226,19 @@ pub async fn start_network(
         info!("KAD auto-connect disabled, skipping bootstrap (use Connect to start KAD)");
     }
 
-    // Download event channel
-    let (dl_event_tx, mut dl_event_rx) = mpsc::channel::<DownloadEvent>(128);
+    // Download / upload event channels.
+    //
+    // Capacity bumped from 128 → 4096. Per-block events
+    // (DownloadEvent::Progress and DataReceived) flow through this single
+    // queue from every active source on every active transfer; with N
+    // concurrent transfers and ~10 sources each, 128 was easily filled
+    // while the consumer was awaiting `transfer_manager.write()` or the
+    // Tauri webview emit, back-pressuring every download coroutine on
+    // `dl_event_tx.send().await`. 4096 keeps the queue absorbent without
+    // hiding a stuck consumer.
+    let (dl_event_tx, mut dl_event_rx) = mpsc::channel::<DownloadEvent>(4096);
 
-    // Upload event channel
-    let (ul_event_tx, mut ul_event_rx) = mpsc::channel::<UploadEvent>(128);
+    let (ul_event_tx, mut ul_event_rx) = mpsc::channel::<UploadEvent>(4096);
 
     // Buddy connection channel (upload listener sends recognized buddy connections here)
     let (buddy_conn_tx, mut buddy_conn_rx) = mpsc::channel::<upload_server::BuddyConnectionParts>(4);

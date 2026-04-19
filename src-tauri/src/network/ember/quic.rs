@@ -2,9 +2,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Endpoint, EndpointConfig, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Maximum concurrent QUIC connections.
 #[allow(dead_code)]
@@ -15,6 +15,28 @@ const IDLE_TIMEOUT_SECS: u64 = 120;
 
 /// Keep-alive interval.
 const KEEP_ALIVE_SECS: u64 = 15;
+
+/// Concurrent stream limits. Ember uses one bidi stream per "request"; 64
+/// is plenty for normal RPC and leaves headroom for DHT/relay bursts.
+const MAX_CONCURRENT_BIDI_STREAMS: u32 = 128;
+const MAX_CONCURRENT_UNI_STREAMS: u32 = 128;
+
+/// Per-stream and per-connection receive windows. Quinn defaults are
+/// conservative (a few MiB) which caps single-stream throughput on
+/// high-BDP links. 8 MiB / 64 MiB roughly matches Linux's auto-tuned
+/// TCP receive window for a 100 ms RTT 100+ Mbps link.
+const STREAM_RECEIVE_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+const RECEIVE_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
+const SEND_WINDOW_BYTES: u64 = 8 * 1024 * 1024;
+
+/// UDP socket buffer sizes. The default OS buffer (often 208 KiB on Linux,
+/// 64 KiB on Windows) starves QUIC of recv buffer at high throughput,
+/// causing spurious packet drops that look like loss to the congestion
+/// controller. 8 MiB recv / 2 MiB send is well-supported on all major OSes
+/// (Windows clamps but tolerates), and matches what high-perf QUIC stacks
+/// (mvfst, msquic) recommend.
+const UDP_RECV_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const UDP_SEND_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 /// Configuration for the Ember QUIC transport.
 #[allow(dead_code)]
@@ -39,6 +61,26 @@ pub fn generate_self_signed_cert(
     Ok((cert_der, key_der))
 }
 
+/// Build the shared `TransportConfig` used by both server- and
+/// client-side endpoints. Centralising this means the client side
+/// inherits the same window sizes / timeouts / stream limits as the
+/// server, instead of running on Quinn defaults.
+fn build_transport_config() -> Arc<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_bidi_streams(MAX_CONCURRENT_BIDI_STREAMS.into());
+    transport.max_concurrent_uni_streams(MAX_CONCURRENT_UNI_STREAMS.into());
+    transport.max_idle_timeout(Some(
+        Duration::from_secs(IDLE_TIMEOUT_SECS)
+            .try_into()
+            .expect("IDLE_TIMEOUT fits VarInt"),
+    ));
+    transport.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_SECS)));
+    transport.stream_receive_window(STREAM_RECEIVE_WINDOW_BYTES.try_into().unwrap_or(quinn::VarInt::MAX));
+    transport.receive_window(RECEIVE_WINDOW_BYTES.try_into().unwrap_or(quinn::VarInt::MAX));
+    transport.send_window(SEND_WINDOW_BYTES);
+    Arc::new(transport)
+}
+
 /// Create the server-side QUIC endpoint configuration.
 fn build_server_config(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<ServerConfig> {
     let cert = CertificateDer::from(cert_der.to_vec());
@@ -54,18 +96,12 @@ fn build_server_config(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<Server
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)?,
     ));
-    // Build a fresh `TransportConfig`, populate it, then store via
-    // `Arc::new` so we don't depend on `server_config.transport`
-    // having a unique strong count at this exact point. The previous
-    // `Arc::get_mut(...).unwrap()` would panic if a future quinn
-    // upgrade ever shared the default transport Arc inside
-    // `with_crypto`.
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(64u32.into());
-    transport.max_concurrent_uni_streams(64u32.into());
-    transport.max_idle_timeout(Some(Duration::from_secs(IDLE_TIMEOUT_SECS).try_into()?));
-    transport.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_SECS)));
-    server_config.transport = Arc::new(transport);
+    // Build a fresh `TransportConfig` and store via `Arc::new` so we
+    // don't depend on `server_config.transport` having a unique strong
+    // count at this exact point (the previous `Arc::get_mut(...).unwrap()`
+    // would panic if a future quinn upgrade ever shared the default
+    // transport Arc inside `with_crypto`).
+    server_config.transport = build_transport_config();
 
     Ok(server_config)
 }
@@ -83,9 +119,33 @@ pub fn build_client_config(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<Cl
         .with_client_auth_cert(vec![cert], key)?;
     tls_config.alpn_protocols = vec![b"ember/1".to_vec()];
 
-    Ok(ClientConfig::new(Arc::new(
+    let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,
-    )))
+    ));
+    // Mirror the server-side TransportConfig so outgoing connections
+    // (download peers, hole-punch attempts, relay clients) get the same
+    // generous windows and stream caps as inbound ones, instead of
+    // running on whatever Quinn picked as a "safe" default.
+    client_config.transport_config(build_transport_config());
+
+    Ok(client_config)
+}
+
+/// Bind a UDP socket with explicit kernel buffer sizes. Returns the bound
+/// `std::net::UdpSocket` ready to be handed to `Endpoint::new`. On
+/// platforms where the requested buffer exceeds the system maximum, the
+/// kernel silently clamps; we log a warning and continue rather than
+/// failing the bind.
+fn bind_tuned_udp(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let socket = std::net::UdpSocket::bind(addr)?;
+    let s = socket2::SockRef::from(&socket);
+    if let Err(e) = s.set_recv_buffer_size(UDP_RECV_BUFFER_BYTES) {
+        warn!("UDP set_recv_buffer_size({UDP_RECV_BUFFER_BYTES}) failed: {e} (using OS default)");
+    }
+    if let Err(e) = s.set_send_buffer_size(UDP_SEND_BUFFER_BYTES) {
+        warn!("UDP set_send_buffer_size({UDP_SEND_BUFFER_BYTES}) failed: {e} (using OS default)");
+    }
+    Ok(socket)
 }
 
 /// Certificate verifier that accepts any server certificate (P2P trust model).
@@ -146,12 +206,18 @@ pub struct EmberQuicEndpoint {
 
 #[allow(dead_code)]
 impl EmberQuicEndpoint {
-    /// Create and bind a new QUIC endpoint.
+    /// Create and bind a new QUIC endpoint with tuned UDP buffer sizes.
     pub fn new(bind_addr: SocketAddr, config: &QuicConfig) -> anyhow::Result<Self> {
         let server_config = build_server_config(&config.cert_der, &config.key_der)?;
         let client_config = build_client_config(&config.cert_der, &config.key_der)?;
 
-        let endpoint = Endpoint::server(server_config, bind_addr)?;
+        let socket = bind_tuned_udp(bind_addr)?;
+        let endpoint = Endpoint::new(
+            EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )?;
         let local_addr = endpoint.local_addr()?;
         info!("Ember QUIC endpoint bound on {local_addr}");
 
@@ -196,7 +262,13 @@ impl EmberQuicEndpoint {
 #[allow(dead_code)]
 pub fn build_client_endpoint(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<Endpoint> {
     let client_config = build_client_config(cert_der, key_der)?;
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse::<SocketAddr>()?)?;
+    let socket = bind_tuned_udp("0.0.0.0:0".parse::<SocketAddr>()?)?;
+    let mut endpoint = Endpoint::new(
+        EndpointConfig::default(),
+        None,
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
 }
@@ -237,7 +309,19 @@ pub fn build_server_client_endpoint(
     let mut last_err: Option<anyhow::Error> = None;
     for &candidate in &candidates {
         let bind_addr: SocketAddr = format!("0.0.0.0:{candidate}").parse()?;
-        match Endpoint::server(server_config.clone(), bind_addr) {
+        let socket = match bind_tuned_udp(bind_addr) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(anyhow::Error::new(e).context(format!("bind {candidate}")));
+                continue;
+            }
+        };
+        match Endpoint::new(
+            EndpointConfig::default(),
+            Some(server_config.clone()),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        ) {
             Ok(mut endpoint) => {
                 endpoint.set_default_client_config(client_config.clone());
                 let local = endpoint.local_addr()?;
