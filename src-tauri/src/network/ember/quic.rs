@@ -196,7 +196,14 @@ pub fn build_client_endpoint(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<
 
 /// Create a QUIC endpoint that can both accept incoming connections (relay server)
 /// and make outgoing ones (hole-punch/relay client). Binds to `0.0.0.0:{bind_port}`
-/// on UDP — this coexists with any TCP listener on the same port number.
+/// on UDP — this coexists with any TCP listener on the same port number, but
+/// **does not** share a UDP socket with the eMule/Kad UDP listener. If the
+/// caller has configured `tcp_port == udp_port`, the requested QUIC port will
+/// already be in use; this function then walks a small range of fallback ports
+/// (`bind_port+1..=+4`) before giving up. Use [`Endpoint::local_addr`] on the
+/// returned endpoint to learn the *actual* bound port — callers that advertise
+/// the QUIC port (e.g. rendezvous registration) must use that value, not the
+/// originally-requested one.
 pub fn build_server_client_endpoint(
     cert_der: &[u8],
     key_der: &[u8],
@@ -204,11 +211,49 @@ pub fn build_server_client_endpoint(
 ) -> anyhow::Result<Endpoint> {
     let server_config = build_server_config(cert_der, key_der)?;
     let client_config = build_client_config(cert_der, key_der)?;
-    let bind_addr: SocketAddr = format!("0.0.0.0:{bind_port}").parse()?;
-    let mut endpoint = Endpoint::server(server_config, bind_addr)?;
-    endpoint.set_default_client_config(client_config);
-    info!("QUIC server+client endpoint bound on {}", endpoint.local_addr()?);
-    Ok(endpoint)
+
+    // Ordered: requested port first, then a few neighbours, then OS-assigned.
+    // Don't include port 0 in the visible range to avoid hiding a typo'd
+    // config behind silent OS-assignment — but still fall back to it if
+    // every nearby port is busy, because losing QUIC entirely is worse
+    // than running on an unpredictable port.
+    let mut candidates: Vec<u16> = Vec::with_capacity(6);
+    candidates.push(bind_port);
+    for offset in 1..=4u16 {
+        let p = bind_port.saturating_add(offset);
+        if p != bind_port && p != 0 {
+            candidates.push(p);
+        }
+    }
+    candidates.push(0);
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for &candidate in &candidates {
+        let bind_addr: SocketAddr = format!("0.0.0.0:{candidate}").parse()?;
+        match Endpoint::server(server_config.clone(), bind_addr) {
+            Ok(mut endpoint) => {
+                endpoint.set_default_client_config(client_config.clone());
+                let local = endpoint.local_addr()?;
+                if candidate == bind_port {
+                    info!("QUIC server+client endpoint bound on {local}");
+                } else {
+                    // Notable: the requested port collided (commonly because
+                    // tcp_port == udp_port and the Kad UDP socket got there
+                    // first). We're still up — but the advertised port has
+                    // changed, so anything that exposes our QUIC reachability
+                    // (rendezvous, friend presence, …) needs to read it back.
+                    info!(
+                        "QUIC requested port {bind_port} unavailable; bound on {local} instead",
+                    );
+                }
+                return Ok(endpoint);
+            }
+            Err(e) => {
+                last_err = Some(anyhow::Error::new(e).context(format!("bind {candidate}")));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no QUIC bind candidates exhausted")))
 }
 
 #[cfg(test)]
