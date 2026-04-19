@@ -11565,9 +11565,17 @@ fn spawn_udp_firewall_probe_request(
         )
         .await
         {
-            Ok(()) => info!("UDP firewall probe sent to {}:{} (asking for reply on ports {}/{})",
+            Ok(()) => debug!("UDP firewall probe sent to {}:{} (asking for reply on ports {}/{})",
                 contact_ip, contact_tcp, udp_port, external_udp_port),
-            Err(e) => info!("UDP firewall probe to {}:{} failed: {e}", contact_ip, contact_tcp),
+            // Probe failures are routine — Windows surfaces remote
+            // ICMP-unreachable as `os error 10054`, which just means the
+            // peer's UDP port is closed (very common for stale routing
+            // contacts). Each cycle dispatches several probes and we
+            // only need *one* successful peer to confirm not-firewalled,
+            // so per-probe failures are debug-only. The aggregate
+            // outcome is logged separately as "UDP firewall test
+            // passed/failed".
+            Err(e) => debug!("UDP firewall probe to {}:{} failed: {e}", contact_ip, contact_tcp),
         }
     });
 }
@@ -13177,7 +13185,23 @@ async fn handle_udp_packet(
                 return;
             }
             let external_ip = Ipv4Addr::from(ip.to_be_bytes());
-            info!("FirewalledRes from {}: reports our IP as {}", sender_ip, external_ip);
+            // Each firewall check dispatches probes to several peers and
+            // we routinely get 4-6 confirming responses in a tight burst.
+            // Per-vote info logs were just N copies of the same line at
+            // INFO. Detail stays at debug; mismatches and confirmations
+            // are surfaced separately below (the "External IP changed"
+            // log fires once per actual change, and a disagreement
+            // between this report and our already-confirmed IP
+            // promotes back to info because that *is* worth knowing).
+            if state.external_ip == Some(external_ip) {
+                debug!("FirewalledRes from {sender_ip}: confirms our IP {external_ip}");
+            } else if let Some(known) = state.external_ip {
+                info!(
+                    "FirewalledRes from {sender_ip}: reports our IP as {external_ip} (differs from confirmed {known})",
+                );
+            } else {
+                debug!("FirewalledRes from {sender_ip}: reports our IP as {external_ip} (no confirmed IP yet)");
+            }
             // K7: pass the reporter IP so the firewall checker can count
             // distinct /24 networks instead of raw vote counts.
             state.firewall_checker.handle_firewalled_response(external_ip, sender_ip);
@@ -13334,6 +13358,13 @@ async fn handle_udp_packet(
                 return;
             }
             if error_code == 0 {
+                // Multiple peers may answer the same UDP firewall probe
+                // (we dispatch ~4 per cycle and need only one to declare
+                // the port reachable). Capture the prior verified state
+                // so we only emit the "passed" log on the *first*
+                // confirming response — subsequent confirmations from
+                // other peers are redundant for the user.
+                let was_already_verified = state.udp_fw_verified;
                 state.firewall_checker.handle_udp_firewall_result(true);
                 state.udp_firewalled = false;
                 state.udp_fw_verified = true;
@@ -13349,7 +13380,11 @@ async fn handle_udp_packet(
                     "tcp_status": state.stats.tcp_status,
                     "udp_status": state.stats.udp_status,
                 }));
-                info!("UDP firewall test passed - UDP port {udp_port} is reachable, not UDP-firewalled");
+                if !was_already_verified {
+                    info!("UDP firewall test passed - UDP port {udp_port} is reachable, not UDP-firewalled");
+                } else {
+                    debug!("UDP firewall test: additional confirmation on port {udp_port} from {from}");
+                }
             } else {
                 state.firewall_checker.handle_udp_firewall_result(false);
                 info!("UDP firewall test returned remote error from {from} on port {udp_port} (error={error_code})");

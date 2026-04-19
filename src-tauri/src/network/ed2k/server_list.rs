@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Debug, Clone, Default)]
 pub struct ServerMergeStats {
@@ -203,7 +203,13 @@ impl ServerList {
             return AddServerOutcome::Duplicate;
         }
         if filter_by_ip && Self::is_ip_filtered(&entry.ip, ip_filter) {
-            info!("Server {}:{} blocked by IP filter", entry.ip, entry.port);
+            // Per-entry filter blocks are noisy: a single push from a
+            // connected server can carry 25+ entries, almost all of
+            // which get filtered when a strict ipfilter.dat (e.g.
+            // emule-security) is in use. The aggregate count is
+            // surfaced by the caller (see `add_from_server_list_packet`),
+            // so per-entry detail is debug-only.
+            debug!("Server {}:{} blocked by IP filter", entry.ip, entry.port);
             return AddServerOutcome::Filtered;
         }
         self.servers.push(entry);
@@ -232,6 +238,8 @@ impl ServerList {
             return 0;
         }
         let mut added = 0;
+        let mut filtered = 0;
+        let mut duplicate = 0;
         for _ in 0..count {
             let ip_raw = match cursor.read_u32::<LittleEndian>() {
                 Ok(v) => v,
@@ -248,12 +256,19 @@ impl ServerList {
             let mut entry = ServerEntry::new(ip.to_string(), port);
             entry.name = ip.to_string();
             entry.priority = ServerPriority::Low;
-            if matches!(self.add_filtered(entry, filter_by_ip, ip_filter), AddServerOutcome::Added) {
-                added += 1;
+            match self.add_filtered(entry, filter_by_ip, ip_filter) {
+                AddServerOutcome::Added => added += 1,
+                AddServerOutcome::Filtered => filtered += 1,
+                AddServerOutcome::Duplicate => duplicate += 1,
             }
         }
-        if added > 0 {
-            info!("Added {added} new servers from connected server's server list");
+        // Always summarise the push if it carried anything actionable —
+        // before, a list of 27 entries that were all IP-filtered would
+        // produce 27 INFO lines and no aggregate. Now: one line.
+        if added > 0 || filtered > 0 {
+            info!(
+                "Server list push: {added} added, {filtered} blocked by IP filter, {duplicate} duplicate (out of {count})",
+            );
         }
         added
     }
