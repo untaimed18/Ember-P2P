@@ -1361,9 +1361,49 @@ impl MultiSourceDownload {
             })
             .await;
 
-        // Retry incomplete parts (from failed sources or hash mismatches)
+        // Retry incomplete parts (from failed sources or hash mismatches).
+        //
+        // Two backoff knobs prevent the previously-observed retry storm
+        // where a single dead source (failing instantly at hello_wait)
+        // would burn through all 3 retry rounds in ~1.3 seconds and get
+        // us soft-banned by the remote eMule client for re-asking faster
+        // than `FILEREASKTIME`:
+        //   * `RETRY_ROUND_MIN_INTERVAL_SECS`: minimum wall-clock gap
+        //     between consecutive retry rounds. If a round drains in
+        //     less than this (because every source rejected us
+        //     immediately), we sleep the remainder before the next round.
+        //   * `SOURCE_RETRY_COOLDOWN_SECS`: minimum gap between two
+        //     dial attempts to the same `(ip, port)`. Skips a source
+        //     that we (or the initial spawn loop) just tried, regardless
+        //     of which round we're in.
+        // Rounds where every candidate source is on cooldown DO NOT
+        // consume the retry budget — we sleep until the soonest cooldown
+        // expires and re-evaluate. This keeps the retry budget available
+        // for genuinely fresh attempts.
+        const RETRY_ROUND_MIN_INTERVAL_SECS: u64 = 30;
+        const SOURCE_RETRY_COOLDOWN_SECS: u64 = 60;
+        let retry_round_min_interval =
+            std::time::Duration::from_secs(RETRY_ROUND_MIN_INTERVAL_SECS);
+        let source_retry_cooldown =
+            std::time::Duration::from_secs(SOURCE_RETRY_COOLDOWN_SECS);
+
         let max_retry_rounds = self.ed2k_limits.multisource_retry_rounds;
-        for retry_round in 1..=max_retry_rounds {
+        // Initial source attempts have just completed (or just failed);
+        // seed the cooldown table with `now()` so round 1 doesn't
+        // immediately re-dial the same peers we tried in the initial
+        // pass. Same-peer retries from this round onward will require
+        // SOURCE_RETRY_COOLDOWN_SECS to elapse first.
+        let mut source_dial_history: HashMap<(String, u16), std::time::Instant> =
+            HashMap::new();
+        {
+            let now = std::time::Instant::now();
+            for s in self.sources.iter().chain(injected_sources.iter()) {
+                source_dial_history.insert((s.peer_ip.clone(), s.peer_port), now);
+            }
+        }
+        let mut last_round_end: Option<std::time::Instant> = None;
+        let mut retry_round: u32 = 0;
+        while retry_round < max_retry_rounds {
             check_control(&self.control).await?;
 
             let incomplete: Vec<usize> = {
@@ -1376,17 +1416,41 @@ impl MultiSourceDownload {
                 break;
             }
 
-            warn!(
-                "Retry round {}/{}: {} incomplete parts",
-                retry_round,
-                max_retry_rounds,
-                incomplete.len()
-            );
+            // Inter-round backoff: never start a retry round less than
+            // `retry_round_min_interval` after the previous one ended.
+            // Without this, a peer that fails at hello in 200 ms gets
+            // re-dialled three times in under a second.
+            if let Some(end) = last_round_end {
+                let elapsed = end.elapsed();
+                if elapsed < retry_round_min_interval {
+                    let wait = retry_round_min_interval - elapsed;
+                    info!(
+                        "Retry round {}/{}: previous round ended {:.1}s ago, sleeping {:.1}s before next attempt",
+                        retry_round + 1,
+                        max_retry_rounds,
+                        elapsed.as_secs_f64(),
+                        wait.as_secs_f64(),
+                    );
+                    tokio::time::sleep(wait).await;
+                    check_control(&self.control).await?;
+                }
+            }
 
             let all_sources: Vec<DownloadSource> = self.sources.iter()
                 .chain(injected_sources.iter())
                 .cloned()
                 .collect();
+            // Build the cooldown-eligible candidate list once; re-used
+            // by every part assignment below.
+            let now = std::time::Instant::now();
+            let eligible: Vec<bool> = all_sources
+                .iter()
+                .map(|s| match source_dial_history.get(&(s.peer_ip.clone(), s.peer_port)) {
+                    Some(t) => now.duration_since(*t) >= source_retry_cooldown,
+                    None => true,
+                })
+                .collect();
+
             let mut retry_assignments: Vec<Vec<usize>> = vec![Vec::new(); all_sources.len()];
             let mut next_source_cursor = 0usize;
             // Sort by ascending rarity so the rarest parts get assigned first
@@ -1400,6 +1464,9 @@ impl MultiSourceDownload {
             for &part_idx in &sorted_incomplete {
                 let mut candidates = Vec::new();
                 for (src_idx, source) in all_sources.iter().enumerate() {
+                    if !eligible[src_idx] {
+                        continue;
+                    }
                     if source.available_parts.is_empty()
                         || source.available_parts.get(part_idx).copied().unwrap_or(false)
                     {
@@ -1412,6 +1479,88 @@ impl MultiSourceDownload {
                 let chosen = candidates[next_source_cursor % candidates.len()];
                 next_source_cursor = next_source_cursor.wrapping_add(1);
                 retry_assignments[chosen].push(part_idx);
+            }
+
+            // If the cooldown filter left us with nothing to dial, sleep
+            // until the soonest cooldown expires and re-evaluate WITHOUT
+            // consuming a retry round. (The retry budget exists to bound
+            // genuine retry attempts, not to be spent waiting on
+            // cooldowns.)
+            let assigned_count: usize =
+                retry_assignments.iter().map(|v| v.len()).sum();
+            if assigned_count == 0 {
+                // Find the soonest cooldown expiry among sources that
+                // actually have at least one needed part.
+                let mut next_eligible: Option<std::time::Duration> = None;
+                for (src_idx, source) in all_sources.iter().enumerate() {
+                    let has_useful_part = sorted_incomplete.iter().any(|&p| {
+                        source.available_parts.is_empty()
+                            || source.available_parts.get(p).copied().unwrap_or(false)
+                    });
+                    if !has_useful_part {
+                        continue;
+                    }
+                    let key = (source.peer_ip.clone(), source.peer_port);
+                    let remaining = match source_dial_history.get(&key) {
+                        Some(t) => source_retry_cooldown
+                            .checked_sub(now.duration_since(*t))
+                            .unwrap_or_default(),
+                        None => std::time::Duration::ZERO,
+                    };
+                    next_eligible = Some(match next_eligible {
+                        Some(cur) => cur.min(remaining),
+                        None => remaining,
+                    });
+                    let _ = src_idx;
+                }
+                match next_eligible {
+                    None => {
+                        // No source has any of the parts we still need —
+                        // retry rounds can't help. Fall out of the loop
+                        // and let the outer logic re-queue the transfer.
+                        info!("Retry round budget unused: no source advertises any of the {} remaining parts", sorted_incomplete.len());
+                        break;
+                    }
+                    Some(d) if d.is_zero() => {
+                        // Shouldn't happen given assigned_count == 0,
+                        // but defend against an infinite tight loop.
+                        warn!("Retry assignment empty despite eligible sources — bailing to avoid loop");
+                        break;
+                    }
+                    Some(wait) => {
+                        info!(
+                            "Retry round {}/{}: all candidate sources on cooldown, sleeping {:.1}s before re-evaluating",
+                            retry_round + 1,
+                            max_retry_rounds,
+                            wait.as_secs_f64(),
+                        );
+                        tokio::time::sleep(wait).await;
+                        // Loop back without incrementing retry_round so
+                        // a cooldown-only round doesn't burn the budget.
+                        continue;
+                    }
+                }
+            }
+
+            retry_round += 1;
+            warn!(
+                "Retry round {}/{}: {} incomplete parts, dialing {} source(s)",
+                retry_round,
+                max_retry_rounds,
+                incomplete.len(),
+                retry_assignments.iter().filter(|v| !v.is_empty()).count(),
+            );
+
+            // Record dial timestamps for every source we're about to
+            // retry, so subsequent rounds (or a new round triggered by
+            // the cooldown sleep above) skip them until the cooldown
+            // window expires.
+            for (src_idx, parts) in retry_assignments.iter().enumerate() {
+                if parts.is_empty() {
+                    continue;
+                }
+                let s = &all_sources[src_idx];
+                source_dial_history.insert((s.peer_ip.clone(), s.peer_port), now);
             }
 
             let (retry_tx, mut retry_rx) = mpsc::channel::<(usize, i64)>(256);
@@ -1548,6 +1697,9 @@ impl MultiSourceDownload {
                 }
             }
             retry_agg.await?;
+            // Stamp the round-end so the inter-round backoff at the
+            // top of the next iteration can decide whether to sleep.
+            last_round_end = Some(std::time::Instant::now());
         }
 
         // eMule-style: remaining incomplete parts are handled through normal
