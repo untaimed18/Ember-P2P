@@ -30,6 +30,11 @@ pub type SharedTrackerRegistry = Arc<std::sync::Mutex<HashMap<String, Arc<RwLock
 /// Maximum decompressed part size (PARTSIZE + margin = 10 MiB)
 const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
 
+/// eMule-style adaptive pipelining: keeps 1-3 request packets outstanding.
+/// Module-level so the cross-part pipelining helpers below the per-source
+/// download function can refer to it without re-declaring.
+const MAX_BLOCKS_PER_REQUEST: usize = 3;
+
 /// Persist a `.part.met` snapshot on the blocking pool without blocking
 /// the caller. The caller MUST have already dropped any tracker
 /// `RwLock` guard before invoking this — the previous design held
@@ -3323,8 +3328,6 @@ async fn download_parts_from_source(
         .map_err(|e| anyhow::anyhow!("open part file: {e}"))?
     };
 
-    // eMule-style adaptive pipelining: keeps 1-3 request packets outstanding
-    const MAX_BLOCKS_PER_REQUEST: usize = 3;
     let mut peer_out_of_parts = false;
     let mut measured_speed: u64 = 0;
     let mut speed_start = std::time::Instant::now();
@@ -3365,7 +3368,6 @@ async fn download_parts_from_source(
         all_blocks: Vec<(u64, u64)>,
         batches: Vec<Vec<(u64, u64)>>,
         sent_idx: usize,
-        total_sent_bytes: u64,
         needs_i64: bool,
     }
     let mut pipelined_next: Option<PipelinedNext> = None;
@@ -3402,9 +3404,9 @@ async fn download_parts_from_source(
             .take()
             .filter(|p| p.part_idx == part_idx);
         let resumed = pipelined_for_this.is_some();
-        let (all_blocks, batches, mut sent_idx, mut total_sent_bytes, needs_i64) =
+        let (all_blocks, batches, mut sent_idx, needs_i64) =
             if let Some(p) = pipelined_for_this {
-                (p.all_blocks, p.batches, p.sent_idx, p.total_sent_bytes, p.needs_i64)
+                (p.all_blocks, p.batches, p.sent_idx, p.needs_i64)
             } else {
                 let (all_blocks, _ps, _pe) = compute_part_blocks_ms(&tracker, part_idx).await;
                 let batches: Vec<Vec<(u64, u64)>> = all_blocks
@@ -3413,7 +3415,7 @@ async fn download_parts_from_source(
                     .collect();
                 let needs_i64 = peer_supports_large_files
                     && all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
-                (all_blocks, batches, 0, 0u64, needs_i64)
+                (all_blocks, batches, 0, needs_i64)
             };
 
         // Mark in_progress (idempotent — pipelined state already did this,
@@ -3431,7 +3433,6 @@ async fn download_parts_from_source(
         };
         let max_outstanding =
             outstanding_requests_for_speed_ms(measured_speed, remaining, gap_rem);
-        let mut total_received: u64 = 0;
 
         if all_blocks.is_empty() {
             debug!("Source {} part {} has no gaps — skipping", _src_idx, part_idx);
@@ -3470,7 +3471,6 @@ async fn download_parts_from_source(
                     _src_idx, addr, req_proto, req_op, req_payload.len(), hex::encode(&req_payload));
             }
             write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await?;
-            total_sent_bytes += batch.iter().map(|(s, e)| e - s).sum::<u64>();
             sent_idx += 1;
         }
 
@@ -3663,7 +3663,6 @@ async fn download_parts_from_source(
                         info!("Source {} ({}) first data received for part {} ({} bytes)", _src_idx, addr, part_idx, piece_len);
                         got_any_data = true;
                     }
-                    total_received += piece_len;
                     src_transferred += piece_len;
                     blocks_received_in_current_req += 1;
                     speed_bytes += piece_len;
@@ -3742,7 +3741,6 @@ async fn download_parts_from_source(
                         info!("Source {} ({}) first compressed data received for part {} ({} bytes)", _src_idx, addr, part_idx, piece_len);
                         got_any_data = true;
                     }
-                    total_received += piece_len;
                     src_transferred += piece_len;
                     blocks_received_in_current_req += 1;
                     speed_bytes += piece_len;
@@ -4007,7 +4005,6 @@ async fn download_parts_from_source(
                         (build_request_parts(file_hash, batch), OP_EDONKEYHEADER, OP_REQUESTPARTS)
                     };
                     write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await?;
-                    total_sent_bytes += batch.iter().map(|(s, e)| e - s).sum::<u64>();
                     sent_idx += 1;
                 } else if pipelined_next.is_none() && !batches.is_empty() {
                     // CROSS-PART PIPELINE: every batch for the current
@@ -4062,12 +4059,12 @@ async fn download_parts_from_source(
                                 t.set_in_progress(next.part_idx, true);
                             }
                             ip_guard.mark(next.part_idx);
+                            let _ = pipelined_bytes;
                             pipelined_next = Some(PipelinedNext {
                                 part_idx: next.part_idx,
                                 all_blocks: next.all_blocks,
                                 batches: next.batches,
                                 sent_idx: 1,
-                                total_sent_bytes: pipelined_bytes,
                                 needs_i64: next.needs_i64,
                             });
                         }
@@ -4629,6 +4626,7 @@ async fn compute_part_blocks_ms(
     tracker: &Arc<RwLock<PartTracker>>,
     part_idx: usize,
 ) -> (Vec<(u64, u64)>, u64, u64) {
+    use super::messages::EMBLOCKSIZE;
     let t = tracker.read().await;
     let (part_start, part_end) = t.part_range(part_idx);
     let all_blocks: Vec<(u64, u64)> = t
