@@ -3428,7 +3428,9 @@ pub async fn start_network(
                         transfer.status = TransferStatus::Completed;
                         transfer.progress = 100.0;
                         transfer.speed = 0;
-                        let _ = db.save_transfer(&transfer);
+                        if let Err(e) = db.save_transfer(&transfer) {
+                            warn!("DB save_transfer failed for completed transfer {}: {e}", transfer.id);
+                        }
                         let mut mgr = transfer_manager.write().await;
                         mgr.completed.push(transfer);
                         continue;
@@ -3454,7 +3456,9 @@ pub async fn start_network(
 
                             transfer.status = TransferStatus::Verifying;
                             transfer.speed = 0;
-                            let _ = db.save_transfer(&transfer);
+                            if let Err(e) = db.save_transfer(&transfer) {
+                                warn!("DB save_transfer failed for verifying transfer {}: {e}", transfer.id);
+                            }
                             {
                                 let mut mgr = transfer_manager.write().await;
                                 mgr.active.insert(tid.clone(), transfer);
@@ -4672,7 +4676,9 @@ pub async fn start_network(
                             last_search_at: 0,
                             priority: priority_str_to_u32(&prio),
                         });
-                        let _ = db.update_transfer_status(&rid, "searching");
+                        if let Err(e) = db.update_transfer_status(&rid, "searching") {
+                            warn!("DB update_transfer_status('searching') failed for {rid}: {e}");
+                        }
                         let _ = app_handle.emit(
                             "transfer-status",
                             serde_json::json!({ "id": rid, "status": "searching" }),
@@ -7683,7 +7689,9 @@ pub async fn start_network(
                                 Some("transient".to_string()),
                                 Some("cancelled".to_string()),
                             );
-                            let _ = db.update_transfer_status(tid, "failed");
+                            if let Err(e) = db.update_transfer_status(tid, "failed") {
+                                warn!("DB update_transfer_status('failed') failed for {tid}: {e}");
+                            }
                             let _ = app_handle.emit("transfer-status", serde_json::json!({
                                 "id": tid,
                                 "status": "failed",
@@ -10226,6 +10234,30 @@ pub async fn start_network(
                         let cb_file_hash = parts.file_hash;
                         let cb_emule_info_done = parts.emule_info_done;
 
+                        // Apply the same reputation gate that
+                        // `inject_source_into_active_transfers` uses
+                        // for metadata-only injection. Without this,
+                        // a peer banned by user-hash reputation could
+                        // bypass the ban via a LowID callback — the
+                        // metadata path checked, the
+                        // established-stream fast path didn't.
+                        // All-zero hash means "unknown identity" and
+                        // is exempt from reputation checks (treated
+                        // as "no identity to ban yet"); only verified
+                        // hashes carry reputation entries.
+                        // `continue` here returns to the outer event
+                        // loop; the moved-but-not-yet-consumed
+                        // `parts.reader` / `parts.writer` go out of
+                        // scope and the TCP socket is dropped.
+                        if cb_peer_user_hash != [0u8; 16]
+                            && state.reputation.is_banned(&cb_peer_user_hash)
+                        {
+                            debug!(
+                                "Dropping LowID callback from {cb_peer_ip}:{cb_peer_port} for {hash_hex}: peer is reputation-banned",
+                            );
+                            continue;
+                        }
+
                         let server_info = state.server_addr.and_then(|sa| {
                             if let std::net::IpAddr::V4(v4) = sa.ip() {
                                 Some((u32::from_le_bytes(v4.octets()), sa.port()))
@@ -10333,8 +10365,15 @@ pub async fn start_network(
                         }
                         // Reap any closed senders we encountered above
                         // so we don't keep retrying them.
+                        // Reap any closed senders we encountered. A
+                        // `Closed` on the established channel means the
+                        // multi-source worker is gone, so the paired
+                        // metadata sender is also dead — keep both maps
+                        // in lockstep (see field doc on
+                        // `active_established_senders`).
                         for tid in &closed_senders {
                             state.active_established_senders.remove(tid);
+                            state.active_source_senders.remove(tid);
                         }
                         // If nothing took the stream it's dropped here
                         // (`pending_stream` goes out of scope).
@@ -11327,6 +11366,9 @@ pub async fn start_network(
         }
     }
     state.active_source_senders.clear();
+    // Lockstep — every download is dead at shutdown, both sender
+    // maps must be cleared together (see field doc).
+    state.active_established_senders.clear();
     state.active_source_overflow.clear();
     state.active_kad_search_state.clear();
 
@@ -12178,7 +12220,16 @@ async fn handle_udp_packet(
         KadMessage::KadRes { .. } => Some(0x29),
         KadMessage::SearchRes { .. } => Some(0x3B),
         KadMessage::PublishRes { .. } => Some(0x4B),
-        KadMessage::PublishResAck => Some(0x4C),
+        // PublishResAck (0x4C) is intentionally NOT validated: we
+        // emit PublishRes (0x4B) ourselves as a *response* to the
+        // peer's PublishKeyReq, so we never have a tracked outgoing
+        // 0x4B for the validator to consume — every PublishResAck
+        // would otherwise be rejected as "unsolicited" and the
+        // `stores_acknowledged` stat would stay at 0 forever. The
+        // handler is a stat counter only (no state mutation, no
+        // amplification surface), so skipping validation here is
+        // safe.
+        KadMessage::PublishResAck => None,
         KadMessage::FindBuddyRes { .. } => Some(0x5A),
         KadMessage::Pong { .. } => Some(0x61),
         KadMessage::FirewalledRes { .. } => Some(0x58),
@@ -13854,6 +13905,12 @@ async fn handle_command(
             }
 
             state.active_source_senders.remove(&transfer_id);
+            // Lockstep with the metadata sender (see field doc on
+            // `active_established_senders`). Without this, a cancelled
+            // download leaves a dead `EstablishedSource` channel
+            // registered; future LowID callbacks for the same hash
+            // would hit `Closed` on dispatch and waste a round.
+            state.active_established_senders.remove(&transfer_id);
             state.active_source_overflow.remove(&transfer_id);
             state.active_kad_search_state.remove(&transfer_id);
             state.per_file_sources.remove(&transfer_id);
@@ -13923,6 +13980,10 @@ async fn handle_command(
                 handle.abort();
             }
             state.active_source_senders.remove(&transfer_id);
+            // Pause = worker is gone; keep both sender maps in lockstep
+            // so a callback that arrives mid-pause doesn't try to
+            // dispatch to a dead established channel.
+            state.active_established_senders.remove(&transfer_id);
             state.active_source_overflow.remove(&transfer_id);
             state.active_kad_search_state.remove(&transfer_id);
             if let Some(pfs) = state.per_file_sources.get_mut(&transfer_id) {
@@ -14724,6 +14785,12 @@ async fn handle_command(
                 reg.clear();
             }
             state.active_source_senders.clear();
+            // Lockstep cleanup — KAD disconnect tears down all
+            // workers, so the established-source channel map must be
+            // cleared too. Without this, on reconnect new downloads
+            // would create new entries while stale closed senders
+            // remain forever.
+            state.active_established_senders.clear();
             state.active_source_overflow.clear();
             state.active_kad_search_state.clear();
 
@@ -14799,12 +14866,22 @@ async fn handle_command(
 
         NetworkCommand::KadBootstrapIp { ip, port, tx } => {
             info!("KAD bootstrap from IP {ip}:{port}");
-            let outcome: Result<String, String> = if let Ok(addr_ip) = ip.parse::<Ipv4Addr>() {
+            let outcome: Result<String, String> = if !(11..=65535).contains(&port) {
+                // eMule's convention is "tcp_port = udp_port - 10".
+                // For any UDP port < 11, that produces 0 (or wraps with
+                // saturating_sub) — a silently broken contact whose
+                // TCP port is unusable. Reject up front with a clear
+                // error rather than insert a poison record into the
+                // routing table.
+                Err(format!(
+                    "Invalid UDP port {port} for manual bootstrap (must be ≥ 11 so the implied TCP port = UDP-10 is non-zero)",
+                ))
+            } else if let Ok(addr_ip) = ip.parse::<Ipv4Addr>() {
                 let contact = KadContact {
                     id: KadId::zero(),
                     ip: addr_ip,
                     udp_port: port,
-                    tcp_port: port.saturating_sub(10),
+                    tcp_port: port - 10,
                     version: KADEMLIA_VERSION,
                     last_seen: chrono::Utc::now().timestamp(),
                     verified: false,
@@ -16169,7 +16246,9 @@ async fn handle_download_event(
                 Some(last) => last.elapsed() >= db_progress_persist_interval,
             };
             if should_persist_db {
-                let _ = db.update_transfer_progress(&transfer_id, capped_downloaded, progress, speed);
+                if let Err(e) = db.update_transfer_progress(&transfer_id, capped_downloaded, progress, speed) {
+                    warn!("DB update_transfer_progress failed for {transfer_id}: {e}");
+                }
                 db_progress_last_persist.insert(transfer_id.clone(), std::time::Instant::now());
             }
             let _ = app_handle.emit(
@@ -16191,7 +16270,9 @@ async fn handle_download_event(
                 let mut mgr = transfer_manager.write().await;
                 mgr.update_status(&transfer_id, crate::types::TransferStatus::Verifying);
             }
-            let _ = db.update_transfer_status(&transfer_id, "verifying");
+            if let Err(e) = db.update_transfer_status(&transfer_id, "verifying") {
+                warn!("DB update_transfer_status('verifying') failed for {transfer_id}: {e}");
+            }
             let _ = app_handle.emit(
                 "transfer-status",
                 serde_json::json!({
@@ -16305,7 +16386,9 @@ async fn handle_download_event(
                     .map(|t| (t.transferred, t.progress, t.speed))
             };
             if let Some((transferred, progress, speed)) = final_progress {
-                let _ = db.update_transfer_progress(&transfer_id, transferred, progress, speed);
+                if let Err(e) = db.update_transfer_progress(&transfer_id, transferred, progress, speed) {
+                    warn!("DB update_transfer_progress (final) failed for {transfer_id}: {e}");
+                }
             }
             db_progress_last_persist.remove(&transfer_id);
             if let Some(promoted) = {
@@ -16319,7 +16402,9 @@ async fn handle_download_event(
             } else {
                 warn!("Completed event for transfer {transfer_id} not found in active set");
             }
-            let _ = db.update_transfer_status(&transfer_id, "completed");
+            if let Err(e) = db.update_transfer_status(&transfer_id, "completed") {
+                warn!("DB update_transfer_status('completed') failed for {transfer_id}: {e}");
+            }
 
             {
                 let mgr = transfer_manager.read().await;
@@ -16377,7 +16462,9 @@ async fn handle_download_event(
                     .map(|t| (t.transferred, t.progress, t.speed))
             };
             if let Some((transferred, progress, speed)) = final_progress {
-                let _ = db.update_transfer_progress(&transfer_id, transferred, progress, speed);
+                if let Err(e) = db.update_transfer_progress(&transfer_id, transferred, progress, speed) {
+                    warn!("DB update_transfer_progress (final) failed for {transfer_id}: {e}");
+                }
             }
             db_progress_last_persist.remove(&transfer_id);
             if let Some(promoted) = {
@@ -16396,7 +16483,9 @@ async fn handle_download_event(
             } else {
                 warn!("Failed event for transfer {transfer_id} not found in active set");
             }
-            let _ = db.update_transfer_status(&transfer_id, "failed");
+            if let Err(e) = db.update_transfer_status(&transfer_id, "failed") {
+                warn!("DB update_transfer_status('failed') failed for {transfer_id}: {e}");
+            }
             let _ = app_handle.emit(
                 "transfer-failed",
                 serde_json::json!({

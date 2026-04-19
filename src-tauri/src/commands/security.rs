@@ -232,9 +232,20 @@ pub async fn download_and_load_ipfilter(
         .map_err(|e| format!("Failed to create data dir: {e}"))?;
 
     let filter_path = data_dir.join("ipfilter.dat");
-    tokio::fs::write(&filter_path, &extracted)
+    // Use atomic_write so a crash mid-save can't leave a partial
+    // ipfilter.dat that would silently disable filtering on next
+    // start. Mirrors `commands/settings.rs::download_ipfilter` which
+    // already does this.
+    {
+        let path = filter_path.clone();
+        let payload = extracted.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::security::atomic_write(&path, &payload, false)
+        })
         .await
+        .map_err(|e| format!("Save task failed: {e}"))?
         .map_err(|e| format!("Failed to write ipfilter.dat: {e}"))?;
+    }
 
     let byte_count = extracted.len();
     let line_count = extracted.iter().filter(|&&b| b == b'\n').count();
@@ -332,9 +343,17 @@ pub async fn update_ipfilter_from_url(
         .map_err(|e| format!("Failed to create data dir: {e}"))?;
 
     let filter_path = data_dir.join("ipfilter.dat");
-    tokio::fs::write(&filter_path, &filter_bytes)
+    // Atomic write: crash safety as above.
+    {
+        let path = filter_path.clone();
+        let payload = filter_bytes.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::security::atomic_write(&path, &payload, false)
+        })
         .await
+        .map_err(|e| format!("Save task failed: {e}"))?
         .map_err(|e| format!("Failed to write ipfilter.dat: {e}"))?;
+    }
 
     let byte_count = filter_bytes.len();
     let line_count = filter_bytes.iter().filter(|&&b| b == b'\n').count();
@@ -449,7 +468,10 @@ pub async fn import_ipfilter_file(
             } else {
                 extract_ipfilter_from_zip(&raw)?
             };
-            std::fs::write(&dest, &decompressed)
+            // Atomic write: prevents partial-file corruption on crash
+            // mid-decompression-write. Already inside spawn_blocking,
+            // so calling the sync helper directly is fine.
+            crate::security::atomic_write(&dest, &decompressed, false)
                 .map_err(|e| format!("Failed to write ipfilter.dat: {e}"))?;
             Ok::<std::path::PathBuf, String>(dest)
         })

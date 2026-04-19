@@ -832,31 +832,18 @@ impl MultiSourceDownload {
                     new_src = new_source_rx.recv() => {
                         if let Some(source) = new_src {
                             injection_deadline = None;
-                            let src_idx = next_src_idx;
-                            next_src_idx += 1;
 
-                            let new_total = total_sources.fetch_add(1, Ordering::Relaxed) + 1;
-                            let _ = event_tx
-                                .send(DownloadEvent::SourcesUpdate {
-                                    transfer_id: self.transfer_id.clone(),
-                                    total: new_total,
-                                    active: active_count.load(Ordering::Relaxed),
-                                    queued: queued_count.load(Ordering::Relaxed),
-                                })
-                                .await;
-
-                            // Update ChunkSelector frequencies with the new source's availability
-                            if !source.available_parts.is_empty() {
-                                let mut cs = chunk_selector.write().await;
-                                for (i, &has) in source.available_parts.iter().enumerate() {
-                                    if i < cs.part_frequency.len() && has {
-                                        cs.part_frequency[i] = cs.part_frequency[i].saturating_add(1);
-                                    }
-                                }
-                                cs.total_sources = cs.total_sources.saturating_add(1);
-                            }
-
-                            // Assign parts to the new source using ChunkSelector
+                            // Compute parts FIRST, before incrementing
+                            // counters / emitting `SourcesUpdate` /
+                            // touching `chunk_selector.total_sources`.
+                            // Previously we bumped `total_sources` and
+                            // emitted the event before the `parts.is_empty()`
+                            // check below — when no part could be assigned
+                            // (chunk selector returns None: every part
+                            // already in_progress / done), the `continue`
+                            // left the counter and UI total inflated for
+                            // the lifetime of the download. Compute first,
+                            // commit only on success.
                             let parts = {
                                 let cs = chunk_selector.read().await;
                                 let t = tracker.read().await;
@@ -888,7 +875,38 @@ impl MultiSourceDownload {
                                 }
                             };
                             if parts.is_empty() {
+                                // Source not usable right now (e.g. all
+                                // parts already in progress); drop it
+                                // silently so we don't pollute counters
+                                // or UI totals. The peer can be
+                                // re-injected via KAD/server SX if it
+                                // becomes useful later.
                                 continue;
+                            }
+
+                            // Commit: assign an idx, bump counters, emit
+                            // `SourcesUpdate`, and update the chunk
+                            // selector — only now that we know the
+                            // source will actually start a worker task.
+                            let src_idx = next_src_idx;
+                            next_src_idx += 1;
+                            let new_total = total_sources.fetch_add(1, Ordering::Relaxed) + 1;
+                            let _ = event_tx
+                                .send(DownloadEvent::SourcesUpdate {
+                                    transfer_id: self.transfer_id.clone(),
+                                    total: new_total,
+                                    active: active_count.load(Ordering::Relaxed),
+                                    queued: queued_count.load(Ordering::Relaxed),
+                                })
+                                .await;
+                            if !source.available_parts.is_empty() {
+                                let mut cs = chunk_selector.write().await;
+                                for (i, &has) in source.available_parts.iter().enumerate() {
+                                    if i < cs.part_frequency.len() && has {
+                                        cs.part_frequency[i] = cs.part_frequency[i].saturating_add(1);
+                                    }
+                                }
+                                cs.total_sources = cs.total_sources.saturating_add(1);
                             }
                             info!("Injecting new source {}:{} (idx {src_idx}) into active download", source.peer_ip, source.peer_port);
                             injected_sources.push(source.clone());
@@ -1021,32 +1039,21 @@ impl MultiSourceDownload {
                     } => {
                         if let Some(es) = new_est {
                             injection_deadline = None;
-                            let src_idx = next_src_idx;
-                            next_src_idx += 1;
-
-                            let new_total = total_sources.fetch_add(1, Ordering::Relaxed) + 1;
-                            let _ = event_tx
-                                .send(DownloadEvent::SourcesUpdate {
-                                    transfer_id: self.transfer_id.clone(),
-                                    total: new_total,
-                                    active: active_count.load(Ordering::Relaxed),
-                                    queued: queued_count.load(Ordering::Relaxed),
-                                })
-                                .await;
 
                             let source = es.source;
                             let stream = es.stream;
-                            // Update ChunkSelector frequencies with the new source's availability
-                            if !source.available_parts.is_empty() {
-                                let mut cs = chunk_selector.write().await;
-                                for (i, &has) in source.available_parts.iter().enumerate() {
-                                    if i < cs.part_frequency.len() && has {
-                                        cs.part_frequency[i] = cs.part_frequency[i].saturating_add(1);
-                                    }
-                                }
-                                cs.total_sources = cs.total_sources.saturating_add(1);
-                            }
 
+                            // Compute parts BEFORE bumping counters /
+                            // emitting events / mutating the chunk
+                            // selector — same reasoning as the
+                            // metadata-injection arm above. If no
+                            // part can be assigned, the live stream
+                            // is dropped (nothing else to do with it
+                            // — only one task can read each TCP
+                            // socket) but we don't pollute counters /
+                            // UI totals. Without this ordering, an
+                            // unusable callback inflates `total_sources`
+                            // and the UI's source count permanently.
                             let parts = {
                                 let cs = chunk_selector.read().await;
                                 let t = tracker.read().await;
@@ -1078,7 +1085,36 @@ impl MultiSourceDownload {
                                 }
                             };
                             if parts.is_empty() {
+                                debug!(
+                                    "Pre-established source {}:{} has no assignable parts; dropping stream",
+                                    source.peer_ip, source.peer_port,
+                                );
+                                drop(stream);
                                 continue;
+                            }
+
+                            // Commit phase: only now that we know the
+                            // worker will actually run, bump counters
+                            // and update the chunk selector.
+                            let src_idx = next_src_idx;
+                            next_src_idx += 1;
+                            let new_total = total_sources.fetch_add(1, Ordering::Relaxed) + 1;
+                            let _ = event_tx
+                                .send(DownloadEvent::SourcesUpdate {
+                                    transfer_id: self.transfer_id.clone(),
+                                    total: new_total,
+                                    active: active_count.load(Ordering::Relaxed),
+                                    queued: queued_count.load(Ordering::Relaxed),
+                                })
+                                .await;
+                            if !source.available_parts.is_empty() {
+                                let mut cs = chunk_selector.write().await;
+                                for (i, &has) in source.available_parts.iter().enumerate() {
+                                    if i < cs.part_frequency.len() && has {
+                                        cs.part_frequency[i] = cs.part_frequency[i].saturating_add(1);
+                                    }
+                                }
+                                cs.total_sources = cs.total_sources.saturating_add(1);
                             }
                             info!(
                                 "Injecting pre-established source {}:{} (idx {src_idx}) into active download",

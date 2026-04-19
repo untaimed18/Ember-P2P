@@ -24,9 +24,18 @@
 
   $effect(() => {
     if (open && friendHash) {
+      // Capture the generation BEFORE awaiting so we can detect a
+      // close/re-open race: if the user closes the dialog (or
+      // switches friend) while `setupListener` is still awaiting,
+      // the cleanup destructor bumps `listenerGen` and we abort
+      // before issuing a stale `requestBrowse()`. Without this, a
+      // closed dialog could still fire IPC and corrupt the next
+      // session's state.
+      const gen = ++listenerGen;
       (async () => {
-        await setupListener();
-        requestBrowse();
+        const ok = await setupListener(gen);
+        if (!ok || gen !== listenerGen || !open) return;
+        await requestBrowse();
       })();
     }
     return () => {
@@ -39,8 +48,14 @@
 
   let unlistenError: UnlistenFn | null = null;
 
-  async function setupListener() {
-    const gen = listenerGen;
+  /// Returns true on success, false if either listener registration
+  /// failed (caller should NOT proceed to requestBrowse — without
+  /// the listeners we'd never see results / errors and the user
+  /// would just stare at a spinner). The previous implementation
+  /// `return`ed on failure but the caller still called
+  /// `requestBrowse()` afterward — which then ran `error = null`
+  /// and wiped the actionable error message before the user saw it.
+  async function setupListener(gen: number): Promise<boolean> {
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenError) { unlistenError(); unlistenError = null; }
     let fn: UnlistenFn;
@@ -58,9 +73,9 @@
       console.warn('BrowseFriendDialog: failed to register browse-result listener', e);
       error = 'Could not listen for browse results. Try re-opening the dialog.';
       loading = false;
-      return;
+      return false;
     }
-    if (gen !== listenerGen) { fn(); return; }
+    if (gen !== listenerGen) { fn(); return false; }
     unlisten = fn;
 
     let errFn: UnlistenFn;
@@ -74,10 +89,18 @@
       });
     } catch (e) {
       console.warn('BrowseFriendDialog: failed to register browse-error listener', e);
-      return;
+      // result-listener succeeded but error-listener failed: still
+      // usable for the happy path, but we won't surface backend
+      // browse failures. Set a soft warning rather than block.
+      error = 'Browse error notifications unavailable; results may still arrive.';
+      // Returning true: the result listener is live and the caller
+      // can still request browse. We just won't see backend errors
+      // until the next dialog open.
+      return true;
     }
-    if (gen !== listenerGen) { errFn(); return; }
+    if (gen !== listenerGen) { errFn(); return false; }
     unlistenError = errFn;
+    return true;
   }
 
   async function requestBrowse() {

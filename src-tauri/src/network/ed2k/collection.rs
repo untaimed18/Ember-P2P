@@ -239,9 +239,11 @@ impl Collection {
             buf.write_all(&file_buf)?;
         }
 
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &buf)?;
-        std::fs::rename(&tmp, path)?;
+        // Use atomic_write so a crash mid-save can't truncate the
+        // collection file. Previously we did write+rename without
+        // fsync — on Windows the rename can land before the data
+        // pages flush, leaving a zero-length file at the final path.
+        crate::security::atomic_write(path, &buf, false)?;
         info!("Saved collection '{}' with {} files", self.name, self.files.len());
         Ok(())
     }
@@ -252,9 +254,8 @@ impl Collection {
             content.push_str(&super::hash::format_ed2k_link(&file.name, file.size, &file.hash));
             content.push('\n');
         }
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &content)?;
-        std::fs::rename(&tmp, path)?;
+        // Same crash-safety reasoning as `save` above.
+        crate::security::atomic_write(path, content.as_bytes(), false)?;
         Ok(())
     }
 }

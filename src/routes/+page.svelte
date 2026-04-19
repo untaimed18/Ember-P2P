@@ -46,6 +46,13 @@
   let pageVisible = $state(true);
 
   let refreshTimer: ReturnType<typeof setInterval> | undefined = $state();
+  // Last `Date.now()` we fired the "empty contacts → refresh again
+  // sooner than the 5s timer" branch. Throttles that branch to once
+  // per 2s so a stuck-empty contact list can't trigger an
+  // effect-reentrancy refresh storm. Plain `let`, not `$state`,
+  // because it's read inside the same effect that writes it — a
+  // reactive cell would loop the effect.
+  let lastEmptyRefresh = 0;
   let upnpEnabled = $state(true);
   let rechecking = $state(false);
   let recheckTimer: ReturnType<typeof setTimeout> | undefined;
@@ -109,7 +116,19 @@
       // have nothing to show — fire one refresh so the initial paint
       // isn't blocked by the full 5s interval. Covers the mount path
       // above (which no longer calls refresh() directly).
-      void refresh();
+      //
+      // Throttle: this branch is reactive on `contacts.length`, and
+      // `refresh()` itself reassigns `contacts`. If a refresh
+      // resolves with another empty array (brand-new node, network
+      // partition), the effect re-runs immediately and we'd hammer
+      // the backend in a tight loop until contacts arrive. Only fire
+      // one refresh per 2s here — the regular 5s timer handles the
+      // steady state.
+      const now = Date.now();
+      if (now - lastEmptyRefresh > 2000) {
+        lastEmptyRefresh = now;
+        void refresh();
+      }
     } else if (!connected && refreshTimer) {
       clearInterval(refreshTimer);
       refreshTimer = undefined;

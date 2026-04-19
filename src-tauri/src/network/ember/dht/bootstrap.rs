@@ -20,35 +20,39 @@ const MAX_BOOTSTRAP_NODES: usize = 200;
 ///     node_id(16) + addr_type(1) + ip(4 or 16) + port(2 BE) +
 ///     noise_pub(32) + ed25519_pub(32) + last_seen(i64 LE)
 pub fn save_nodes(path: &Path, contacts: &[EmberContact]) -> anyhow::Result<()> {
-    let tmp = path.with_extension("dat.tmp");
-    let mut file = std::fs::File::create(&tmp)?;
-
-    file.write_u32::<LittleEndian>(NODES_EMBER_MAGIC)?;
-    file.write_u8(NODES_EMBER_VERSION)?;
+    // Build the full file in memory first, then commit via
+    // `atomic_write`. The previous implementation did
+    // `File::create -> write -> drop -> rename` without `sync_all`,
+    // which on a Windows or pre-fsync Linux crash can leave the
+    // renamed file with zero / partial bytes. `atomic_write` does
+    // tmp + write + sync + rename + dir-sync (Unix), matching what
+    // `nodes.dat` and `known.met` use elsewhere.
+    let mut buf: Vec<u8> = Vec::with_capacity(8 + contacts.len() * 100);
+    buf.write_u32::<LittleEndian>(NODES_EMBER_MAGIC)?;
+    buf.write_u8(NODES_EMBER_VERSION)?;
     let count = contacts.len().min(u16::MAX as usize);
-    file.write_u16::<LittleEndian>(count as u16)?;
+    buf.write_u16::<LittleEndian>(count as u16)?;
 
     for contact in contacts.iter().take(count) {
-        file.write_all(&contact.node_id.0)?;
+        buf.write_all(&contact.node_id.0)?;
 
         match contact.addr.ip() {
             std::net::IpAddr::V4(ip) => {
-                file.write_u8(4)?;
-                file.write_all(&ip.octets())?;
+                buf.write_u8(4)?;
+                buf.write_all(&ip.octets())?;
             }
             std::net::IpAddr::V6(ip) => {
-                file.write_u8(6)?;
-                file.write_all(&ip.octets())?;
+                buf.write_u8(6)?;
+                buf.write_all(&ip.octets())?;
             }
         }
-        file.write_u16::<byteorder::BigEndian>(contact.addr.port())?;
-        file.write_all(&contact.noise_pub)?;
-        file.write_all(&contact.ed25519_pub)?;
-        file.write_i64::<LittleEndian>(contact.last_seen)?;
+        buf.write_u16::<byteorder::BigEndian>(contact.addr.port())?;
+        buf.write_all(&contact.noise_pub)?;
+        buf.write_all(&contact.ed25519_pub)?;
+        buf.write_i64::<LittleEndian>(contact.last_seen)?;
     }
 
-    drop(file);
-    std::fs::rename(&tmp, path)?;
+    crate::security::atomic_write(path, &buf, false)?;
     info!("Saved {} Ember DHT contacts to {}", count, path.display());
     Ok(())
 }
