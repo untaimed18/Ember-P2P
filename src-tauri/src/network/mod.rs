@@ -483,8 +483,23 @@ const MAX_SOURCES_FOR_UDP: usize = 50;
 
 const MAX_FAIL_COUNT_FOR_UDP: u32 = 3;
 
+/// Maximum number of UDP source-discovery queries we'll send to a
+/// single server with no inbound UDP reply before treating it as
+/// dead-for-UDP and skipping it. Distinct from [`MAX_FAIL_COUNT_FOR_UDP`]
+/// (which counts TCP connect failures); a server can be perfectly
+/// healthy on TCP and still completely silent on UDP because its
+/// admin firewalled the UDP port, it doesn't index our specific file
+/// hashes, or it requires UDP obfuscation we never negotiated.
+///
+/// Re-eligible the moment any inbound UDP reply arrives — the recv
+/// path resets the per-server counter via `record_udp_reply`.
+const MAX_UDP_CONSECUTIVE_FAILURES: u32 = 5;
+
 fn is_eligible_udp_server(server: &ed2k::server_list::ServerEntry, connected_addr: Option<SocketAddr>) -> bool {
     if server.fail_count >= MAX_FAIL_COUNT_FOR_UDP {
+        return false;
+    }
+    if server.udp_consecutive_failures >= MAX_UDP_CONSECUTIVE_FAILURES {
         return false;
     }
     if let Some(conn_addr) = connected_addr {
@@ -7028,6 +7043,44 @@ pub async fn start_network(
                         cur.replies,
                         cur.sources_found,
                     );
+
+                    // Per-server breakdown so the user can see which
+                    // entries in their server.met are actually
+                    // responding to UDP. Only logs when the
+                    // discovery counters changed (gated above), so
+                    // it doesn't spam during long quiet periods.
+                    let now_ts = chrono::Utc::now().timestamp();
+                    let mut alive: Vec<String> = Vec::new();
+                    let mut silent: Vec<String> = Vec::new();
+                    let mut pruned: Vec<String> = Vec::new();
+                    for s in state.server_list.servers().iter() {
+                        let label = if s.name.is_empty() {
+                            format!("{}:{}", s.ip, s.port)
+                        } else {
+                            format!("{} ({}:{})", s.name, s.ip, s.port)
+                        };
+                        if s.udp_consecutive_failures >= MAX_UDP_CONSECUTIVE_FAILURES {
+                            pruned.push(label);
+                        } else if s.last_udp_reply_at > 0 {
+                            let ago = (now_ts - s.last_udp_reply_at).max(0);
+                            alive.push(format!("{label} (last reply {ago}s ago)"));
+                        } else {
+                            silent.push(format!("{label} (fails={})", s.udp_consecutive_failures));
+                        }
+                    }
+                    info!(
+                        "UDP server health: {} alive, {} silent (no UDP reply yet), {} pruned (>= {MAX_UDP_CONSECUTIVE_FAILURES} unanswered queries)",
+                        alive.len(), silent.len(), pruned.len(),
+                    );
+                    if !alive.is_empty() {
+                        info!("UDP alive servers: {}", alive.join("; "));
+                    }
+                    if !silent.is_empty() {
+                        info!("UDP silent servers: {}", silent.join("; "));
+                    }
+                    if !pruned.is_empty() {
+                        info!("UDP pruned servers (re-eligible on any inbound UDP): {}", pruned.join("; "));
+                    }
                 }
                 last_udp_discovery_health = cur;
             }
@@ -7583,6 +7636,21 @@ pub async fn start_network(
                 if let Some((packet, addr)) = state.udp_source_queue.pop_front() {
                     let sock = server_udp.socket_handle();
                     let pkt_len = packet.len() as u64;
+                    // Compute the canonical (TCP_port) lookup key from the
+                    // wire dest port (TCP+4 for plain, obfuscation_port_udp
+                    // for obfuscated). The recv path canonicalises to the
+                    // TCP+4 port; we mirror that so per-server pruning
+                    // tracks the right entry.
+                    let server_tcp_port = state
+                        .server_list
+                        .lookup_for_udp_addr(
+                            match addr.ip() {
+                                std::net::IpAddr::V4(v4) => v4,
+                                _ => std::net::Ipv4Addr::UNSPECIFIED,
+                            },
+                            addr.port(),
+                        )
+                        .map(|(_key, tcp_port)| tcp_port);
                     match sock.send_to(&packet, addr).await {
                         Ok(_) => {
                             // Outbound source-asking traffic to non-connected
@@ -7596,6 +7664,18 @@ pub async fn start_network(
                                 pkt_len,
                             );
                             state.udp_discovery_sent = state.udp_discovery_sent.saturating_add(1);
+                            // Per-server pruning: bump
+                            // udp_consecutive_failures. The recv path
+                            // resets it on any inbound UDP reply, so a
+                            // genuinely responsive server ratchets back
+                            // to zero immediately. Servers that never
+                            // reply hit MAX_UDP_CONSECUTIVE_FAILURES
+                            // and get excluded from future UDP queries
+                            // by `is_eligible_udp_server`.
+                            if let Some(tcp_port) = server_tcp_port {
+                                let ip_str = addr.ip().to_string();
+                                state.server_list.record_udp_query_sent(&ip_str, tcp_port);
+                            }
                         }
                         Err(e) => {
                             // Don't double-count failed sends in stats.
@@ -9641,6 +9721,24 @@ pub async fn start_network(
                         crate::storage::statistics::OverheadDirection::Download,
                         recv_bytes,
                     );
+                    // Reset the per-server UDP-failure counter on
+                    // any inbound reply (status, sources, or search).
+                    // The address is already canonicalised to the
+                    // standard TCP+4 port by `try_recv_with`, so the
+                    // server-list lookup uses `addr.port() - 4` for
+                    // the matching TCP port.
+                    {
+                        let resp_addr = match &resp {
+                            ServerUdpResponse::StatusResponse { addr, .. }
+                            | ServerUdpResponse::FoundSources { addr, .. } => Some(*addr),
+                            ServerUdpResponse::SearchResult { .. } => None,
+                        };
+                        if let Some(a) = resp_addr {
+                            let ip_str = a.ip().to_string();
+                            let tcp_port = a.port().saturating_sub(4);
+                            state.server_list.record_udp_reply(&ip_str, tcp_port);
+                        }
+                    }
                     match resp {
                         ServerUdpResponse::StatusResponse { addr, challenge, user_count, file_count, obfuscation_port_tcp, obfuscation_port_udp, udp_flags, server_udp_key } => {
                             // eMule: verify challenge to prevent spoofed status responses

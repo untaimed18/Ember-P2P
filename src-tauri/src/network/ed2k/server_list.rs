@@ -54,6 +54,27 @@ pub struct ServerEntry {
     /// directions (send key uses CLIENTSERVER magic, recv key uses
     /// SERVERCLIENT magic; see `server_obfuscation.rs`).
     pub server_udp_key: u32,
+    /// Number of UDP source-discovery queries (`OP_GLOBGETSOURCES` /
+    /// `OP_GLOBGETSOURCES2`) we've sent to this server since the last
+    /// time it sent us *any* UDP reply. Reset to 0 on any inbound UDP
+    /// packet from this server (status response or found-sources).
+    /// Used by `is_eligible_udp_server` to stop wasting bandwidth on
+    /// servers that no longer respond to UDP — distinct from
+    /// `fail_count` which only tracks **TCP** connect failures.
+    ///
+    /// Background: a non-trivial portion of the public ed2k server
+    /// population is TCP-reachable but UDP-dead (e.g. sysadmin
+    /// firewalled the UDP port, server doesn't index every file
+    /// hash, server requires UDP obfuscation we never negotiated).
+    /// Without per-server UDP-failure tracking we'd keep blasting
+    /// these servers for the lifetime of the process.
+    pub udp_consecutive_failures: u32,
+    /// Last time (Unix timestamp, seconds) this server replied to
+    /// *any* of our UDP requests — status pings or source queries.
+    /// Diagnostic; combined with `udp_consecutive_failures` this lets
+    /// the periodic UDP-health log say "server X last responded
+    /// 12 minutes ago" rather than just "silent".
+    pub last_udp_reply_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +106,8 @@ impl ServerEntry {
             obfuscation_port_udp: 0,
             udp_flags: 0,
             server_udp_key: 0,
+            udp_consecutive_failures: 0,
+            last_udp_reply_at: 0,
         }
     }
 }
@@ -114,6 +137,13 @@ fn apply_server_int_tag(entry: &mut ServerEntry, name_id: u8, v: u32) {
         0xF2 => entry.obfuscation_port_udp = v as u16,
         0xF3 => entry.server_udp_key = v,
         0xF4 => entry.udp_flags = v,
+        // Ember-private: per-server UDP-responsiveness counters,
+        // persisted so a server's "dead for UDP" status survives a
+        // process restart (otherwise we'd waste a full
+        // MAX_UDP_CONSECUTIVE_FAILURES round of queries on every
+        // launch re-discovering known-dead UDP endpoints).
+        0xF5 => entry.udp_consecutive_failures = v,
+        0xF6 => entry.last_udp_reply_at = v as i64,
         _ => {}
     }
 }
@@ -349,6 +379,31 @@ impl ServerList {
             }
             true
         });
+    }
+
+    /// Record that we sent a UDP source-discovery query
+    /// (`OP_GLOBGETSOURCES` / `OP_GLOBGETSOURCES2`) to this server.
+    /// Bumps `udp_consecutive_failures`; the next inbound UDP packet
+    /// from the same server will reset it via `record_udp_reply`.
+    /// Saturating arithmetic so a long-running session against a
+    /// dead server can't overflow.
+    pub fn record_udp_query_sent(&mut self, ip: &str, port: u16) {
+        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+            entry.udp_consecutive_failures = entry.udp_consecutive_failures.saturating_add(1);
+        }
+    }
+
+    /// Record that this server sent us *any* UDP reply (status response
+    /// or found-sources). Resets the failure counter and timestamps the
+    /// reply for the periodic UDP-health log.
+    pub fn record_udp_reply(&mut self, ip: &str, port: u16) {
+        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+            if entry.udp_consecutive_failures != 0 {
+                self.needs_sort = true;
+            }
+            entry.udp_consecutive_failures = 0;
+            entry.last_udp_reply_at = chrono::Utc::now().timestamp();
+        }
     }
 
     pub fn record_success(&mut self, ip: &str, port: u16) {
@@ -935,6 +990,24 @@ impl ServerList {
             // restarts.
             if entry.udp_flags != 0 {
                 write_met_uint32_tag(&mut tag_buf, 0xF4, entry.udp_flags);
+                tag_count += 1;
+            }
+
+            // Per-server UDP-responsiveness counters (Ember-private
+            // 0xF5/0xF6). Persisting `udp_consecutive_failures`
+            // means a server that's been confirmed dead-for-UDP in
+            // a previous session stays excluded across restarts; it
+            // gets re-tried the moment any inbound UDP arrives (the
+            // recv path resets the counter). Without persistence,
+            // every launch wastes a full pruning round on
+            // already-known-dead endpoints.
+            if entry.udp_consecutive_failures > 0 {
+                write_met_uint32_tag(&mut tag_buf, 0xF5, entry.udp_consecutive_failures);
+                tag_count += 1;
+            }
+            if entry.last_udp_reply_at > 0 {
+                let ts32 = entry.last_udp_reply_at.clamp(0, u32::MAX as i64) as u32;
+                write_met_uint32_tag(&mut tag_buf, 0xF6, ts32);
                 tag_count += 1;
             }
 

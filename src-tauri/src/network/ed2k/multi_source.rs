@@ -278,6 +278,162 @@ async fn check_control(control: &TransferControl) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Outcome of an in-session re-queue attempt after `OP_OUTOFPARTREQS`.
+/// `Promoted` means the peer accepted us back into an active upload
+/// slot on the same TCP connection — caller should reset per-session
+/// state and re-enter the per-part loop. Any other variant means the
+/// session is dead and the caller should fall through to clean exit
+/// (`OP_END_OF_DOWNLOAD` + TCP close).
+enum InSessionRequeueResult {
+    /// Peer sent `OP_ACCEPTUPLOADREQ` — we have a fresh slot.
+    Promoted,
+    /// Peer responded with `OP_QUEUEFULL` (no room in their queue) or
+    /// the timeout elapsed without promotion.
+    Timeout(String),
+    /// TCP read failed mid-wait — connection is gone.
+    Disconnected(String),
+}
+
+/// Try to re-acquire an upload slot from the peer on the SAME TCP
+/// connection that just signalled `OP_OUTOFPARTREQS`. Sends a fresh
+/// `OP_STARTUPLOADREQ` (the eMule "I want this file" packet) and waits
+/// up to `timeout_secs` for the peer to either:
+///   * promote us with `OP_ACCEPTUPLOADREQ` → `Promoted`
+///   * reject us with `OP_QUEUEFULL` → `Timeout`
+///   * stay silent past the deadline → `Timeout`
+///   * close the TCP socket → `Disconnected`
+///
+/// Saves a Hello/SecIdent/obfuscation reconnect (1–3 s) on every
+/// peer-rotation cycle. eMule's per-session upload cap (SESSIONMAXTRANS,
+/// ~9.30 MiB) means well-behaved peers fire `OP_OUTOFPARTREQS` after
+/// every ~1 part of upload to us — without re-queue we'd pay the full
+/// reconnect tax for each subsequent part from the same peer.
+///
+/// Wire-protocol-compatible: `OP_STARTUPLOADREQ` mid-session is the
+/// same packet the initial handshake uses, and our own upload code
+/// (`upload.rs:2613`) already handles duplicate `OP_STARTUPLOADREQ`
+/// from a peer whose previous session was just rotated out.
+async fn try_in_session_requeue<R, W>(
+    writer: &mut W,
+    reader: &mut R,
+    file_hash: &[u8; 16],
+    timeout_secs: u64,
+    control: &TransferControl,
+) -> InSessionRequeueResult
+where
+    R: AsyncReadExt + Unpin + ?Sized,
+    W: AsyncWriteExt + Unpin + ?Sized,
+{
+    use super::messages::*;
+
+    let upload_req = build_file_request(file_hash);
+    if let Err(e) = write_packet_async_ms(writer, OP_EDONKEYHEADER, OP_STARTUPLOADREQ, &upload_req).await {
+        return InSessionRequeueResult::Disconnected(format!("send OP_STARTUPLOADREQ: {e:#}"));
+    }
+
+    let queue_start = std::time::Instant::now();
+    loop {
+        if let Err(e) = check_control(control).await {
+            return InSessionRequeueResult::Disconnected(format!("cancelled: {e:#}"));
+        }
+        let elapsed = queue_start.elapsed().as_secs();
+        if elapsed >= timeout_secs {
+            return InSessionRequeueResult::Timeout(format!("no OP_ACCEPTUPLOADREQ within {timeout_secs}s"));
+        }
+        let remaining = timeout_secs.saturating_sub(elapsed).max(5);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(remaining),
+            read_packet_async_ms(reader),
+        )
+        .await;
+        let (proto, opcode, _payload) = match result {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                return InSessionRequeueResult::Disconnected(format!("read failed during re-queue: {e:#}"));
+            }
+            Err(_) => {
+                return InSessionRequeueResult::Timeout(format!("read timeout during re-queue"));
+            }
+        };
+        if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
+            return InSessionRequeueResult::Promoted;
+        }
+        if proto == OP_EMULEPROT && opcode == OP_QUEUEFULL {
+            return InSessionRequeueResult::Timeout("peer queue is full".to_string());
+        }
+        // Anything else (queue-rank updates, comment packets, EPX
+        // re-sends, etc.) is just noise during the re-queue wait —
+        // ignore and keep waiting for OP_ACCEPTUPLOADREQ.
+    }
+}
+
+/// Recompute a fresh `part_queue` for an in-session re-queue, picking
+/// one part as a seed (cross-part pipelining + post-iteration extend
+/// will grow it from there). Mirrors the same two-stage selection
+/// (strict, then relaxed fallback) used by the initial assignment and
+/// `pre_pipeline_next_part_ms`.
+async fn seed_fresh_part_queue_after_requeue(
+    chunk_sel: &Option<Arc<RwLock<ChunkSelector>>>,
+    tracker: &Arc<RwLock<PartTracker>>,
+    source_available: &[bool],
+    control: &Arc<TransferControl>,
+) -> Vec<usize> {
+    let Some(cs) = chunk_sel.as_ref() else {
+        return Vec::new();
+    };
+    let cs = cs.read().await;
+
+    let (completed, in_prog, remaining, part_count, gap_bytes) = {
+        let t = tracker.read().await;
+        (
+            t.completed_parts().to_vec(),
+            t.in_progress.clone(),
+            t.remaining_count(),
+            t.part_count,
+            t.part_gap_bytes_vec(),
+        )
+    };
+    if remaining == 0 {
+        return Vec::new();
+    }
+    let avail = if source_available.is_empty() {
+        vec![true; part_count]
+    } else {
+        source_available.to_vec()
+    };
+    let pp = control.is_preview_priority();
+    let prefer_higher = remaining <= 3 && part_count > 1;
+    let active: Vec<usize> = in_prog
+        .iter()
+        .enumerate()
+        .filter(|(_, &ip)| ip)
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut next_part = cs.select_part(
+        &completed,
+        &in_prog,
+        &avail,
+        &active,
+        &gap_bytes,
+        pp,
+        prefer_higher,
+    );
+    if next_part.is_none() {
+        let no_in_progress = vec![false; part_count];
+        next_part = cs.select_part(
+            &completed,
+            &no_in_progress,
+            &avail,
+            &active,
+            &gap_bytes,
+            pp,
+            prefer_higher,
+        );
+    }
+    next_part.map(|p| vec![p]).unwrap_or_default()
+}
+
 impl MultiSourceDownload {
     /// Run the multi-source download.
     pub async fn run(mut self, event_tx: mpsc::Sender<DownloadEvent>) -> anyhow::Result<()> {
@@ -3372,6 +3528,14 @@ async fn download_parts_from_source(
     }
     let mut pipelined_next: Option<PipelinedNext> = None;
 
+    // Outer "session" loop wraps the per-part loop so we can re-enter
+    // it after the peer rotates us out via `OP_OUTOFPARTREQS` (their
+    // SESSIONMAXTRANS = ~9.30 MiB cap). On a successful in-session
+    // re-queue we recompute `part_queue` from the current tracker
+    // state and `continue 'session_loop` — saving the
+    // Hello/SecIdent/obfuscation reconnect cost on every part-rotation
+    // cycle from the same peer.
+    'session_loop: loop {
     while queue_idx < part_queue.len() {
         check_control(&control).await?;
         let part_idx = part_queue[queue_idx];
@@ -4694,6 +4858,142 @@ async fn download_parts_from_source(
         part_queue.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","),
         pipelined_next.as_ref().map(|p| p.part_idx),
     );
+
+    // In-session re-queue: only attempt when the per-part loop exited
+    // because the peer hit their SESSIONMAXTRANS cap (sent
+    // OP_OUTOFPARTREQS). For any other exit reason the queue is
+    // genuinely exhausted (no more parts this peer can serve) and
+    // re-queueing would just stall.
+    if !peer_out_of_parts {
+        break 'session_loop;
+    }
+    // Verify there's still work for this peer to do before we burn
+    // ~90s of TCP+IO waiting in their queue. If every remaining part
+    // is either complete or unavailable on this peer, exit cleanly.
+    let work_remaining = {
+        let t = tracker.read().await;
+        if t.all_complete() {
+            false
+        } else if source_available.is_empty() {
+            t.remaining_count() > 0
+        } else {
+            (0..t.part_count).any(|i| {
+                !t.is_part_complete(i)
+                    && source_available.get(i).copied().unwrap_or(false)
+            })
+        }
+    };
+    if !work_remaining {
+        info!(
+            "DIAG: source {} ({}) OUTOFPARTREQS but no remaining parts available from this peer — closing cleanly",
+            _src_idx, addr,
+        );
+        break 'session_loop;
+    }
+    // Cap re-queue wait at the configured slot wait but never less
+    // than 60s (eMule's queue rotation interval is typically 30-120s
+    // depending on peer load and our queue position).
+    let requeue_timeout_secs = queue_wait_secs.max(60).min(180);
+    info!(
+        "DIAG: source {} ({}) attempting in-session re-queue after OUTOFPARTREQS (timeout={}s, src_transferred={})",
+        _src_idx, addr, requeue_timeout_secs, src_transferred,
+    );
+    // Briefly transition to "queued" status while we wait. The
+    // active/queued counts mirror the UI state; without this the
+    // user would see the source as "active" while it sits idle in
+    // the peer's queue.
+    if _active_guard.armed {
+        _active_guard.armed = false;
+        active_count.fetch_sub(1, Ordering::Relaxed);
+    }
+    queued_count.fetch_add(1, Ordering::Relaxed);
+    queued_guard.armed = true;
+    emit_source!("queued", None, measured_speed);
+
+    let requeue_outcome = try_in_session_requeue(
+        &mut *writer,
+        &mut *reader,
+        file_hash,
+        requeue_timeout_secs,
+        &control,
+    )
+    .await;
+
+    match requeue_outcome {
+        InSessionRequeueResult::Promoted => {
+            // Peer gave us a fresh slot on the same TCP connection.
+            // Reset per-session state and re-enter the per-part
+            // loop.  pipelined_next / per_part_credit stay because
+            // any in-flight bytes still belong to this peer's
+            // credit ledger; queue_idx and pipelined_next are reset
+            // so we don't try to consume stale state from the
+            // previous session.
+            queued_guard.armed = false;
+            queued_count.fetch_sub(1, Ordering::Relaxed);
+            active_count.fetch_add(1, Ordering::Relaxed);
+            _active_guard.armed = true;
+            emit_source!("transferring", None, measured_speed);
+            info!(
+                "DIAG: source {} ({}) re-promoted in-session after OUTOFPARTREQS — saved Hello/SecIdent reconnect, resuming downloads",
+                _src_idx, addr,
+            );
+            peer_out_of_parts = false;
+            queue_idx = 0;
+            pipelined_next = None;
+            // Reset the speed-measurement window so the post-rotation
+            // throughput emits a fresh `transferring` rate instead of
+            // averaging in the dead time we spent waiting for the
+            // queue.
+            speed_start = std::time::Instant::now();
+            speed_bytes = 0;
+            // Recompute a fresh seed for part_queue. The cross-part
+            // pipeline + post-iteration dynamic-extend will grow it
+            // from there.
+            part_queue = seed_fresh_part_queue_after_requeue(
+                &chunk_sel,
+                &tracker,
+                &source_available,
+                &control,
+            )
+            .await;
+            if part_queue.is_empty() {
+                info!(
+                    "DIAG: source {} ({}) re-promoted but no part this peer can serve remains — closing cleanly",
+                    _src_idx, addr,
+                );
+                break 'session_loop;
+            }
+            info!(
+                "DIAG: source {} ({}) re-promoted; seeded fresh queue=[{}] (cross-part pipeline + dynamic extend will grow it)",
+                _src_idx, addr,
+                part_queue.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","),
+            );
+            continue 'session_loop;
+        }
+        InSessionRequeueResult::Timeout(reason) => {
+            info!(
+                "DIAG: source {} ({}) in-session re-queue timed out: {} — closing TCP",
+                _src_idx, addr, reason,
+            );
+            break 'session_loop;
+        }
+        InSessionRequeueResult::Disconnected(reason) => {
+            info!(
+                "DIAG: source {} ({}) in-session re-queue lost TCP: {} — exiting",
+                _src_idx, addr, reason,
+            );
+            // No point in OP_END_OF_DOWNLOAD — the socket is gone.
+            // Decrement queued counter (active was already reset).
+            if queued_guard.armed {
+                queued_guard.armed = false;
+                queued_count.fetch_sub(1, Ordering::Relaxed);
+            }
+            // Bail with an error so the spawn handler logs and emits
+            // a SourceDetail "failed" event.
+            anyhow::bail!("in-session re-queue lost connection: {reason}");
+        }
+    }
+    } // end 'session_loop
 
     // Signal the uploader that we're done
     write_packet_async_ms(
