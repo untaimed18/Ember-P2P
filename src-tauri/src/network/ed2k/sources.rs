@@ -834,6 +834,47 @@ impl SourceManager {
             .unwrap_or_default()
     }
 
+    /// L-2 helper: return every (file_hash, client_id) pair eligible
+    /// for a callback request through `(server_ip, server_port)` —
+    /// across **all** files we know sources for. Called when we
+    /// successfully (re)connect TCP to a server, so we can request
+    /// callbacks for LowID sources that were learned earlier via UDP
+    /// from that same server but couldn't be reached because we
+    /// weren't TCP-connected to it at the time.
+    ///
+    /// Without this, UDP-discovered LowID sources from a non-current
+    /// server were stored but never reachable — the original audit
+    /// flagged this as an effectively-dead source population.
+    pub fn get_lowid_sources_for_server(
+        &self,
+        server_ip: u32,
+        server_port: u16,
+        min_interval_secs: i64,
+    ) -> Vec<([u8; 16], u32)> {
+        let now = chrono::Utc::now().timestamp();
+        let mut out = Vec::new();
+        for (file_hash, entries) in &self.sources {
+            for e in entries {
+                if e.client_id == 0 {
+                    continue;
+                }
+                if e.server_ip != server_ip || e.server_port != server_port {
+                    continue;
+                }
+                if now.saturating_sub(e.last_seen) >= SOURCE_EXPIRY_SECS {
+                    continue;
+                }
+                if e.last_callback_at != 0
+                    && now.saturating_sub(e.last_callback_at) < min_interval_secs
+                {
+                    continue;
+                }
+                out.push((*file_hash, e.client_id));
+            }
+        }
+        out
+    }
+
     /// D11: return LowID sources for a file that are eligible for a
     /// callback, grouped by the server they were announced through. Lets
     /// the caller switch eMule servers on the fly (or talk to multiple
