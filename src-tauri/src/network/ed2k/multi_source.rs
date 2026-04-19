@@ -4248,7 +4248,28 @@ async fn download_parts_from_source(
             }
         }
 
-        // Dynamically select the next part if we have a shared chunk selector
+        // Dynamically select the next part if we have a shared chunk selector.
+        //
+        // CRITICAL: keep the TCP session alive across multiple parts. If
+        // we can't find a fresh part this loop iteration the source
+        // disconnects and we have to redo the full Hello/SecIdent
+        // handshake (and the peer's `FILEREASKTIME` may force us to
+        // wait minutes before they accept us again — visibly: "DONE,
+        // speed → 0, reconnect, next part").
+        //
+        // Two-stage selection:
+        //   1. Strict: pick a part that NO source is currently
+        //      downloading (rarest-first, anti-herding). This is the
+        //      preferred outcome.
+        //   2. Fallback: if every remaining incomplete part is already
+        //      in_progress on some other source, pile onto one of them.
+        //      This is `MAX_SOURCES_PER_PART`-style behaviour matching
+        //      the initial-assignment phase (which already allows up to
+        //      5 sources per part). The byte-level gap tracker stops
+        //      duplicate writes — source B will request only the still-
+        //      empty ranges of part X via `tracker.gap_list()`, so the
+        //      wasted-bandwidth cost is bounded to the blocks in flight
+        //      at the exact moment of the request.
         if let Some(cs) = &chunk_sel {
             let cs = cs.read().await;
             let t = tracker.read().await;
@@ -4270,15 +4291,52 @@ async fn download_parts_from_source(
             let prefer_higher = remaining <= 3 && part_count > 1;
             let active: Vec<usize> = in_prog.iter().enumerate()
                 .filter(|(_, &ip)| ip).map(|(i, _)| i).collect();
-            if let Some(next) =
-                cs.select_part(&completed, &in_prog, &avail, &active, &gap_bytes, pp, prefer_higher)
-            {
+            let next_part = cs
+                .select_part(&completed, &in_prog, &avail, &active, &gap_bytes, pp, prefer_higher)
+                .or_else(|| {
+                    // Fallback: relaxed selection. Treat no part as
+                    // in-progress so we can piggy-back on one another
+                    // source is already pulling. `active_parts` is
+                    // still the real active list, so the
+                    // active-chunk-bonus (lower score) inside
+                    // select_part will prefer joining a part already
+                    // in motion over starting a fresh in-progress
+                    // one — that's also what the eMule endgame mode
+                    // does naturally.
+                    let no_in_progress = vec![false; part_count];
+                    cs.select_part(
+                        &completed,
+                        &no_in_progress,
+                        &avail,
+                        &active,
+                        &gap_bytes,
+                        pp,
+                        prefer_higher,
+                    )
+                });
+            if let Some(next) = next_part {
                 if !part_queue.contains(&next) {
                     part_queue.push(next);
+                    // Mark in_progress (idempotent — may already be
+                    // set by another source). `ip_guard.mark` records
+                    // that THIS source contributed to this part so
+                    // teardown unmarks correctly even when another
+                    // source also claimed it.
                     let mut t = tracker.write().await;
                     t.set_in_progress(next, true);
+                    drop(t);
                     ip_guard.mark(next);
                 }
+            } else {
+                // No remaining part is reachable from this source
+                // (the peer's `available_parts` doesn't intersect the
+                // not-yet-complete set). Genuinely nothing left to do
+                // here — let the loop fall through to the natural
+                // `OP_END_OF_DOWNLOAD` exit.
+                debug!(
+                    "Source {} ({}): no overlap between peer's part availability and remaining incomplete parts; ending session cleanly",
+                    _src_idx, addr
+                );
             }
         }
     }
