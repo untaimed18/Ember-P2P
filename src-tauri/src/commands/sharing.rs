@@ -494,6 +494,92 @@ pub async fn set_file_priority(
     Ok(())
 }
 
+/// Bulk-set upload priority for many files in a single Tauri call. Returns
+/// the number of files actually updated (paths that did not match a known
+/// shared file are silently skipped). Cuts N invoke round-trips down to 1
+/// for the library multi-select action.
+#[tauri::command]
+pub async fn batch_set_priority(
+    state: tauri::State<'_, AppState>,
+    file_paths: Vec<String>,
+    priority: String,
+) -> Result<u32, String> {
+    let valid = ["verylow", "low", "normal", "high", "release", "auto"];
+    if !valid.contains(&priority.as_str()) {
+        return Err(format!("Invalid priority: {priority}"));
+    }
+    let count = {
+        let mut index = state.local_index.write().await;
+        let mut n = 0u32;
+        for path in &file_paths {
+            if index.set_file_priority_by_path(path, &priority) {
+                n += 1;
+            }
+        }
+        n
+    };
+    if count > 0 {
+        refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+        info!("Batch set priority to {priority} for {count}/{} files", file_paths.len());
+    }
+    Ok(count)
+}
+
+/// Bulk-share many files in a single Tauri call. Returns the count of
+/// files actually flipped to shared (already-shared paths and unknown
+/// paths contribute 0).
+#[tauri::command]
+pub async fn batch_share(
+    state: tauri::State<'_, AppState>,
+    file_paths: Vec<String>,
+) -> Result<u32, String> {
+    let count = {
+        let mut index = state.local_index.write().await;
+        let mut n = 0u32;
+        for path in &file_paths {
+            if index.set_file_shared_by_path(path, true) {
+                n += 1;
+            }
+        }
+        n
+    };
+    if count > 0 {
+        refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+        if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+            warn!("Failed to queue SharedFilesChanged after batch share: {e}");
+        }
+        info!("Batch shared {count}/{} files", file_paths.len());
+    }
+    Ok(count)
+}
+
+/// Bulk-unshare many files in a single Tauri call. Returns the count of
+/// files actually flipped to unshared.
+#[tauri::command]
+pub async fn batch_unshare(
+    state: tauri::State<'_, AppState>,
+    file_paths: Vec<String>,
+) -> Result<u32, String> {
+    let count = {
+        let mut index = state.local_index.write().await;
+        let mut n = 0u32;
+        for path in &file_paths {
+            if index.set_file_shared_by_path(path, false) {
+                n += 1;
+            }
+        }
+        n
+    };
+    if count > 0 {
+        refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+        if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
+            warn!("Failed to queue SharedFilesChanged after batch unshare: {e}");
+        }
+        info!("Batch unshared {count}/{} files", file_paths.len());
+    }
+    Ok(count)
+}
+
 #[tauri::command]
 pub async fn reload_shared_files(
     app: tauri::AppHandle,
