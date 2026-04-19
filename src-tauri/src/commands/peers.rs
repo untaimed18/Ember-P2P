@@ -75,9 +75,19 @@ pub async fn add_friend(
         return Err(format!("Failed to save friend: {e}"));
     }
 
-    state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
+    // Friend is already persisted to the DB above; the network task
+    // only needs the hash to start the auto-connect search. If the
+    // command channel is briefly saturated we'd rather log a warning
+    // than fail the whole add — the friend IS added either way and
+    // the next periodic friend-search cycle (or restart) will pick
+    // them up. Returning Err here used to make the UI flag
+    // "add friend failed" even though the DB row was successfully
+    // written.
+    if let Err(e) = state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
         ember_hash: hash,
-    }).map_err(|e| format!("Network busy: {e}"))?;
+    }) {
+        tracing::warn!("Friend added to DB, but auto-connect search was not enqueued (channel full): {e}");
+    }
 
     Ok(())
 }
@@ -100,8 +110,14 @@ pub async fn remove_friend(
     let mut friends = state.friend_hashes.write().await;
     friends.remove(&hash);
     drop(friends);
-    state.network_tx.try_send(NetworkCommand::FriendRemoved { ember_hash: hash })
-        .map_err(|e| format!("Network busy: {e}"))?;
+    // Removal is already committed to the DB and the in-memory friend
+    // set above. The network notification only matters for tearing
+    // down a live session — if the channel is full a stale session may
+    // linger until next restart, which is preferable to surfacing a
+    // "remove friend failed" error after the row is already gone.
+    if let Err(e) = state.network_tx.try_send(NetworkCommand::FriendRemoved { ember_hash: hash }) {
+        tracing::warn!("Friend removed from DB, but live-session teardown was not enqueued (channel full): {e}");
+    }
     Ok(())
 }
 
@@ -304,9 +320,16 @@ pub async fn accept_friend_request(
         return Err(format!("Failed to accept friend request: {e}"));
     }
 
-    state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
+    // Same rationale as `add_friend`: the friend row is already
+    // committed to the DB, so a full network channel just means
+    // auto-connect waits for the next friend-search cycle. Don't
+    // surface that as an "accept failed" error to the UI when the
+    // accept itself succeeded.
+    if let Err(e) = state.network_tx.try_send(NetworkCommand::FindFriendAndConnect {
         ember_hash: hash,
-    }).map_err(|e| format!("Network busy: {e}"))?;
+    }) {
+        tracing::warn!("Friend request accepted in DB, but auto-connect search was not enqueued (channel full): {e}");
+    }
 
     Ok(())
 }
@@ -442,9 +465,15 @@ pub async fn ban_peer(
         .map_err(|e| format!("Task error: {e}"))?
         .map_err(|e| format!("Failed to ban peer: {e}"))?;
 
-    state.network_tx.try_send(NetworkCommand::BanPeer {
+    // Ban is already persisted to the DB above; the network task only
+    // needs the peer ID to drop any active connections. If the channel
+    // is full a current connection may linger briefly, but the ban
+    // itself takes effect on next reconnect via the persistent banlist.
+    if let Err(e) = state.network_tx.try_send(NetworkCommand::BanPeer {
         peer_id_hex: peer_id,
-    }).map_err(|e| format!("Network busy: {e}"))?;
+    }) {
+        tracing::warn!("Peer banned in DB, but live-connection drop was not enqueued (channel full): {e}");
+    }
 
     Ok(())
 }
@@ -465,9 +494,15 @@ pub async fn unban_peer(
         .map_err(|e| format!("Task error: {e}"))?
         .map_err(|e| format!("Failed to unban peer: {e}"))?;
 
-    state.network_tx.try_send(NetworkCommand::UnbanPeer {
+    // Unban is already persisted to the DB above; the network task
+    // notification only refreshes the in-memory banned-IPs cache. If
+    // the channel is full the cache catches up on next refresh cycle
+    // — the user shouldn't see "unban failed" when the row is gone.
+    if let Err(e) = state.network_tx.try_send(NetworkCommand::UnbanPeer {
         peer_id_hex: peer_id,
-    }).map_err(|e| format!("Network busy: {e}"))?;
+    }) {
+        tracing::warn!("Peer unbanned in DB, but cache refresh was not enqueued (channel full): {e}");
+    }
 
     Ok(())
 }

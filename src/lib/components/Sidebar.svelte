@@ -19,8 +19,20 @@
   // the badge clears the moment the request is accepted/rejected.
   let pendingFriendRequestCount = $derived($friendRequests.length);
 
-  const navItems = [
-    { href: '/', label: 'KAD Network', id: 'kad' },
+  type NavItem = {
+    href: string;
+    label: string;
+    id: string;
+    /** Legacy URLs that should highlight this item (and short-circuit
+     *  re-navigation) until the route-level redirect fires. The KAD
+     *  view used to live at `/kad-network`; we keep the alias so the
+     *  sidebar doesn't flicker between "no item active" and "KAD
+     *  active" on the brief detour through the redirect stub. */
+    aliases?: string[];
+  };
+
+  const navItems: NavItem[] = [
+    { href: '/', label: 'KAD Network', id: 'kad', aliases: ['/kad-network'] },
     { href: '/servers', label: 'Servers', id: 'servers' },
     { href: '/search', label: 'Search', id: 'search' },
     { href: '/transfers', label: 'Transfers', id: 'transfers' },
@@ -31,13 +43,18 @@
     { href: '/settings', label: 'Settings', id: 'settings' },
   ];
 
-  function isActive(item: typeof navItems[0], pathname: string): boolean {
-    return pathname === item.href;
+  function isActive(item: NavItem, pathname: string): boolean {
+    return pathname === item.href || (item.aliases?.includes(pathname) ?? false);
   }
 
   function navigateTo(href: string) {
     const current = $page.url.pathname;
     if (current === href) return;
+    // If we're already on a legacy alias of the target, don't re-issue
+    // the navigation — the route redirect will land us on `href`
+    // momentarily and a parallel goto would race with it.
+    const item = navItems.find((i) => i.href === href);
+    if (item?.aliases?.includes(current)) return;
     goto(href).catch(() => {
       window.location.href = href;
     });

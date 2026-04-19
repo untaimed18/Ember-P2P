@@ -209,9 +209,18 @@ pub async fn update_settings(
         *live = settings.shared_folders.clone();
     }
 
-    state.network_tx.try_send(NetworkCommand::UpdateSettings {
+    // Settings are already persisted to disk above; the network task
+    // only needs the new values to apply them at runtime. If the
+    // command channel is briefly saturated we'd rather log a warning
+    // than fail the whole save — the user's choices are already on
+    // disk and the network will pick them up at the next restart (or
+    // the next `UpdateSettings` push). Returning `Err` here used to
+    // make the UI show "save failed" even though the save succeeded.
+    if let Err(e) = state.network_tx.try_send(NetworkCommand::UpdateSettings {
         settings: settings.clone(),
-    }).map_err(|e| format!("Network busy: {e}"))?;
+    }) {
+        tracing::warn!("Settings saved to disk, but live network update was dropped (channel full): {e}");
+    }
 
     if port_changed {
         Ok("Settings saved. Port changes require an application restart to take effect.".into())
