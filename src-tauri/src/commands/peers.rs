@@ -600,6 +600,26 @@ pub async fn get_kad_searches(
     rx.await.map_err(|_| "Failed to get KAD searches".to_string())
 }
 
+/// User-initiated cancellation for an active KAD search. Accepts the
+/// id as a string so the JS side can safely pass a u64 without the
+/// 2^53-bit precision problem. Returns `()` on success; a missing/
+/// invalid id or a completed search that has already been pruned both
+/// surface as `Ok(())` so the UI can refresh idempotently.
+#[tauri::command]
+pub async fn kad_cancel_search(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let parsed: u64 = id
+        .parse()
+        .map_err(|_| "Invalid search id".to_string())?;
+    state
+        .network_tx
+        .try_send(NetworkCommand::CancelKadSearch { id: parsed })
+        .map_err(|e| format!("Network busy: {e}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_peer_reputation(
     state: tauri::State<'_, AppState>,
