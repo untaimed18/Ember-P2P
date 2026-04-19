@@ -48,22 +48,47 @@
   let historyFetchedHashes = new Set<string>();
   let historyPendingHashes = new Set<string>();
   let historyFetchTimer: ReturnType<typeof setTimeout> | null = null;
+  // Per-hash "last applied generation". `getDownloadHistory` IPC
+  // round-trips can resolve out of order (cold DB vs warm cache),
+  // and the previous merge happily let an older batch overwrite a
+  // fresher per-hash status. Tracking the dispatch generation per
+  // hash lets us skip the merge for any hash whose newer entry has
+  // already landed — without throwing away unrelated hashes the
+  // older batch fetched (which would happen with a single global
+  // "latest" counter when batches query disjoint hash sets).
+  let historyFetchGen = 0;
+  const historyHashGen = new Map<string, number>();
 
   async function flushHistoryFetch() {
     historyFetchTimer = null;
     if (historyPendingHashes.size === 0) return;
     const batch = [...historyPendingHashes];
     historyPendingHashes.clear();
+    const myGen = ++historyFetchGen;
+    for (const h of batch) historyHashGen.set(h, myGen);
     try {
       const result = await getDownloadHistory(batch);
       if (destroyed) return;
-      if (Object.keys(result).length > 0) {
-        downloadHistoryMap = { ...downloadHistoryMap, ...result };
+      // Per-hash freshness check: only apply keys for which our gen
+      // is still the most recent dispatch.
+      const fresh: Record<string, string> = {};
+      for (const [h, status] of Object.entries(result)) {
+        if (historyHashGen.get(h) === myGen) {
+          fresh[h] = status;
+        }
+      }
+      if (Object.keys(fresh).length > 0) {
+        downloadHistoryMap = { ...downloadHistoryMap, ...fresh };
       }
     } catch (e) {
       console.error('Failed to fetch download history:', e);
       // Failed batch — forget the "already fetched" mark so they retry next cycle.
-      for (const h of batch) historyFetchedHashes.delete(h);
+      for (const h of batch) {
+        historyFetchedHashes.delete(h);
+        // Clear our gen claim too so a future batch can re-attempt
+        // without the stale-gen filter rejecting its results.
+        if (historyHashGen.get(h) === myGen) historyHashGen.delete(h);
+      }
     }
   }
 

@@ -366,17 +366,42 @@ impl ServerList {
             ));
         }
         let count = cursor.read_u32::<LittleEndian>()? as usize;
+        // Cap raised from 500 → 5000. The previous 500 cap silently
+        // truncated large server lists; the next save would then
+        // overwrite the file with the truncated subset, permanently
+        // dropping every server beyond the cap. 5000 is generous
+        // enough for any realistic eMule server.met (the current
+        // public list is ~30 servers) while still bounding worst-
+        // case memory and parse time. If the count exceeds the cap
+        // we fail-closed so a malformed/huge file can't OOM us.
+        const MAX_SERVERS: usize = 5_000;
+        if count > MAX_SERVERS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "server.met declares {count} servers, exceeding cap of {MAX_SERVERS}; refusing to load to avoid silent truncation",
+                ),
+            ));
+        }
         let mut list = Self::new();
 
-        for _ in 0..count.min(500) {
+        for _ in 0..count {
             let ip_raw = cursor.read_u32::<LittleEndian>()?;
             let ip = std::net::Ipv4Addr::from(ip_raw.to_le_bytes());
             let port = cursor.read_u16::<LittleEndian>()?;
             let tag_count = cursor.read_u32::<LittleEndian>()? as usize;
+            if tag_count > 50 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "server.met entry for {ip}:{port} declares {tag_count} tags, exceeding cap of 50",
+                    ),
+                ));
+            }
 
             let mut entry = ServerEntry::new(ip.to_string(), port);
 
-            for _ in 0..tag_count.min(50) {
+            for _ in 0..tag_count {
                 let tag_type = cursor.read_u8()?;
                 let name_len = cursor.read_u16::<LittleEndian>()? as usize;
                 let mut name = vec![0u8; name_len];
@@ -400,7 +425,21 @@ impl ServerList {
                     }
                     0x08 => { let _ = cursor.read_u16::<LittleEndian>(); }
                     0x09 => { let _ = cursor.read_u8(); }
-                    _ => break,
+                    // Unknown tag type: bail the whole load. The
+                    // tag's payload size depends on its type so we
+                    // can't safely skip past it — `break`-ing would
+                    // desync the cursor and parse the rest of the
+                    // file as nonsense entries (the previous bug).
+                    // Failing here keeps the on-disk file intact;
+                    // the caller falls back to the seed list.
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "server.met entry for {ip}:{port} has unknown tag type 0x{other:02X}; refusing to continue (would desync parser)",
+                            ),
+                        ));
+                    }
                 }
             }
 
@@ -445,13 +484,25 @@ impl ServerList {
                 Ok(v) => v as usize,
                 Err(_) => break,
             };
+            if tag_count > 50 {
+                debug!(
+                    "server.met merge: entry {ip}:{port} declares {tag_count} tags (>50); aborting merge to avoid wasting memory or running into a hostile file",
+                );
+                break;
+            }
 
             let mut entry = ServerEntry::new(ip.to_string(), port);
 
-            for _ in 0..tag_count.min(50) {
+            // `unknown_tag` flag: when set, we abort the merge of the
+            // *whole* file (not just this entry) because tag payload
+            // sizes are type-specific and we'd desync the cursor by
+            // continuing — the previous bug parsed every following
+            // record from the wrong offset.
+            let mut unknown_tag = false;
+            for _ in 0..tag_count {
                 let tag_type = match cursor.read_u8() {
                     Ok(v) => v,
-                    Err(_) => break,
+                    Err(_) => { unknown_tag = true; break; }
                 };
                 let name_len = cursor.read_u16::<LittleEndian>().unwrap_or(0) as usize;
                 let mut name = vec![0u8; name_len];
@@ -475,8 +526,17 @@ impl ServerList {
                     }
                     0x08 => { let _ = cursor.read_u16::<LittleEndian>(); }
                     0x09 => { let _ = cursor.read_u8(); }
-                    _ => break,
+                    other => {
+                        debug!(
+                            "server.met merge: unknown tag type 0x{other:02X} in entry {ip}:{port}; aborting merge to avoid cursor desync",
+                        );
+                        unknown_tag = true;
+                        break;
+                    }
                 }
+            }
+            if unknown_tag {
+                break;
             }
 
             if let Some(existing) = self.servers.iter_mut().find(|s| s.ip == entry.ip && s.port == entry.port) {
@@ -676,8 +736,10 @@ impl ServerList {
             buf.write_all(&tag_buf)?;
         }
 
-        std::fs::write(path, &buf)?;
-        Ok(())
+        // Use atomic_write so a crash mid-save can't truncate or
+        // zero-out server.met. Without this, the next start could
+        // load 0 servers and silently lose the persisted list.
+        crate::security::atomic_write(path, &buf, false)
     }
 }
 

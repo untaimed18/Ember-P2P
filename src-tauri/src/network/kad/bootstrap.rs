@@ -1,4 +1,4 @@
-use std::io::Cursor;
+﻿use std::io::Cursor;
 use std::net::Ipv4Addr;
 use std::path::Path;
 
@@ -58,7 +58,7 @@ pub fn default_bootstrap_contacts() -> Vec<KadContact> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodesDatFormat {
     /// Pre-verified-bit format: v0 contacts, v1 whole file, or
-    /// v3-bootstrap_edition — no `verified` field on the wire.
+    /// v3-bootstrap_edition â€” no `verified` field on the wire.
     LegacyNoVerified,
     /// Modern format where each contact carries its own `verified` byte.
     WithVerifiedBit,
@@ -78,6 +78,21 @@ pub fn load_nodes_dat_with_format(
     let mut cursor = Cursor::new(data_slice);
     let mut contacts = Vec::new();
     let mut format = NodesDatFormat::LegacyNoVerified;
+    // Track the count the file *claims* so we can detect short loads
+    // below. If the parser stops early (truncation or a bad record)
+    // we'd silently return a partial list â€” and the next
+    // `save_nodes_dat` would overwrite the original file with the
+    // shorter list, permanently losing every contact we couldn't
+    // parse. The end-of-function guard backs the file up before
+    // that can happen. Use `0` as the sentinel for "header didn't
+    // declare a count" (e.g. file has only header bytes); the guard
+    // skips backup when expected == loaded.
+    //
+    // Each version branch below assigns this from its own count
+    // field, so the initial 0 is dead — silence the warning rather
+    // than pull the variable into every branch.
+    #[allow(unused_assignments)]
+    let mut expected_count: usize = 0;
 
     // Check for v2/v3 header: first 4 bytes == 0
     let first_u32 = cursor.read_u32::<LittleEndian>()?;
@@ -89,6 +104,7 @@ pub fn load_nodes_dat_with_format(
             if bootstrap_edition == 1 {
                 // Bootstrap-only nodes.dat: contacts are v1-format (no UDP key/verified)
                 let count = (cursor.read_u32::<LittleEndian>()? as usize).min(50_000);
+                expected_count = count;
                 info!("Loading {count} contacts from bootstrap nodes.dat v3");
                 for _ in 0..count {
                     match read_contact_v0(&mut cursor) {
@@ -104,11 +120,13 @@ pub fn load_nodes_dat_with_format(
                     }
                 }
                 info!("Loaded {} valid contacts from bootstrap nodes.dat", contacts.len());
+                backup_if_short_load(path, contacts.len(), expected_count);
                 return Ok((contacts, NodesDatFormat::LegacyNoVerified));
             }
             // v3 with bootstrap_edition != 1: separate count follows (eMule RoutingZone format)
             format = NodesDatFormat::WithVerifiedBit;
             let count = (cursor.read_u32::<LittleEndian>()? as usize).min(50_000);
+            expected_count = count;
             info!("Loading {count} contacts from nodes.dat v3");
             for _ in 0..count {
                 match read_contact_v2(&mut cursor) {
@@ -122,6 +140,7 @@ pub fn load_nodes_dat_with_format(
         } else if version == 2 || version == 1 {
             if version == 2 { format = NodesDatFormat::WithVerifiedBit; }
             let count = (cursor.read_u32::<LittleEndian>()? as usize).min(50_000);
+            expected_count = count;
             info!("Loading {count} contacts from nodes.dat v{version}");
             for _ in 0..count {
                 if version >= 2 {
@@ -146,6 +165,7 @@ pub fn load_nodes_dat_with_format(
             warn!("Unknown nodes.dat version: {version}, trying as v2");
             format = NodesDatFormat::WithVerifiedBit;
             let count = (cursor.read_u32::<LittleEndian>()? as usize).min(50_000);
+            expected_count = count;
             info!("Loading {count} contacts from nodes.dat v{version}");
             for _ in 0..count {
                 match read_contact_v2(&mut cursor) {
@@ -160,6 +180,7 @@ pub fn load_nodes_dat_with_format(
     } else {
         // Version 0/1 format: first_u32 is the contact count
         let count = (first_u32 as usize).min(50_000);
+        expected_count = count;
         info!("Loading {count} contacts from nodes.dat v0");
 
         for _ in 0..count {
@@ -174,7 +195,36 @@ pub fn load_nodes_dat_with_format(
     }
 
     info!("Loaded {} valid contacts from nodes.dat", contacts.len());
+    backup_if_short_load(path, contacts.len(), expected_count);
     Ok((contacts, format))
+}
+
+/// If the load was short (file claimed N contacts, parser only got
+/// M < N), copy the original file aside as `nodes.dat.bak.<unix_ts>`
+/// before any subsequent save can overwrite it. Without this, a
+/// single corrupt or truncated record causes permanent loss of every
+/// later contact on the very next `save_nodes_dat`. The backup is
+/// best-effort: if we can't write it (disk full, perms), we still
+/// return â€” the user just loses recovery rather than getting a worse
+/// outcome than today.
+fn backup_if_short_load(path: &Path, loaded: usize, expected: usize) {
+    // expected == 0 means the header didn't declare a count (or
+    // declared zero), so a "short" load is not meaningful here.
+    if expected == 0 || loaded >= expected {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let bak = path.with_extension(format!("dat.bak.{now}"));
+    match std::fs::copy(path, &bak) {
+        Ok(bytes) => warn!(
+            "nodes.dat parse stopped at {loaded}/{expected} contacts â€” backup written to {} ({bytes} bytes); the next save will overwrite the live file with {loaded} contacts",
+            bak.display(),
+        ),
+        Err(e) => warn!(
+            "nodes.dat parse stopped at {loaded}/{expected} contacts and backup to {} failed: {e}; subsequent save will overwrite the live file with {loaded} contacts",
+            bak.display(),
+        ),
+    }
 }
 
 /// Backward-compatible thin wrapper that drops the format tag. Prefer
@@ -288,7 +338,7 @@ pub fn save_nodes_dat(path: &Path, contacts: &[KadContact]) -> anyhow::Result<()
     // `.bak` copy so an unclean shutdown during the atomic write (or a
     // corrupted buffer that still parses enough to pass header checks)
     // doesn't wipe out our only working contact list. The `.bak` is
-    // intentionally silent on failure — we'd rather save the new file
+    // intentionally silent on failure â€” we'd rather save the new file
     // than refuse because a backup couldn't be made.
     if path.exists() {
         let bak = path.with_extension("dat.bak");
@@ -301,3 +351,4 @@ pub fn save_nodes_dat(path: &Path, contacts: &[KadContact]) -> anyhow::Result<()
     info!("Saved {} contacts to nodes.dat", contacts.len());
     Ok(())
 }
+
