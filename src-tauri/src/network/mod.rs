@@ -1080,6 +1080,16 @@ pub enum NetworkCommand {
         tx: oneshot::Sender<Vec<KadSearchInfo>>,
     },
     SharedFilesChanged,
+    /// UI changed a file's upload priority. Pushes the new value into
+    /// the in-memory `KnownFileList` so the upload server's per-request
+    /// priority lookup sees it without waiting for a reload. Without
+    /// this, priority changes only took effect after the next restart
+    /// because `set_file_priority` only updated the live index, not the
+    /// on-disk known-file record the upload handler reads.
+    SetUploadPriority {
+        file_hash_hex: String,
+        priority: u8,
+    },
     ConnectToServer {
         ip: String,
         port: u16,
@@ -14812,6 +14822,29 @@ async fn handle_command(
 
         NetworkCommand::GetConnectedServerSnapshot { tx } => {
             let _ = tx.send(connected_server_info(state));
+        }
+
+        NetworkCommand::SetUploadPriority { file_hash_hex, priority } => {
+            // Push a priority change from the UI directly into the
+            // in-memory `KnownFileList` so the upload server's
+            // per-request priority lookup sees it without waiting for
+            // a reload. Without this hook the new priority sat in the
+            // search index but the upload handler — which reads
+            // `KnownFileRecord::upload_priority` — kept using the
+            // stale value until the next process restart.
+            if let Ok(hash_bytes) = hex::decode(&file_hash_hex) {
+                if hash_bytes.len() == 16 {
+                    let mut fh = [0u8; 16];
+                    fh.copy_from_slice(&hash_bytes);
+                    if let Some(record) = known_files.find_by_hash_mut(&fh) {
+                        record.upload_priority = priority;
+                        known_files.mark_dirty();
+                        debug!(
+                            "Updated upload_priority={priority} for {file_hash_hex} in known.met"
+                        );
+                    }
+                }
+            }
         }
 
         NetworkCommand::SharedFilesChanged => {
