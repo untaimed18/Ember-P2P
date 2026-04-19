@@ -35,6 +35,35 @@ const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
 const MAX_CONCURRENT_SOURCES: usize = 10;
 const SOURCE_INJECTION_WAIT_SECS: u64 = 10;
 
+/// A TCP stream + identity that has already been established by another
+/// part of the system (typically the upload listener after recognising
+/// an inbound KAD/server callback). Used to avoid the wasted-redial bug
+/// where a LowID peer connects back to us via callback, we recognise
+/// it, then throw away the inbound socket and try a fresh outbound to
+/// a firewalled IP — which always fails with `stage:hello_wait:
+/// forcibly closed`. By the time this struct is built the peer has
+/// already exchanged Hello with us in `upload.rs`, so we know
+/// `peer_user_hash`; `emule_info_done` records whether the EmuleInfo
+/// round-trip was also completed (true for obfuscated callbacks,
+/// where the obfuscation handshake also negotiates the eMule
+/// extensions).
+pub struct EstablishedStream {
+    pub reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    pub writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    pub peer_user_hash: [u8; 16],
+    pub emule_info_done: bool,
+}
+
+/// Pairing of an established peer stream with the synthesised
+/// `DownloadSource` metadata the rest of the multi-source machinery
+/// expects. Sent into a running `MultiSourceDownload` via
+/// `new_established_rx` instead of `new_source_rx` so the worker takes
+/// the "use this stream" path instead of the "dial this address" path.
+pub struct EstablishedSource {
+    pub source: DownloadSource,
+    pub stream: EstablishedStream,
+}
+
 /// Target kernel TCP receive buffer for outbound peer sockets.
 ///
 /// Windows' TCP auto-tuning ramps the receive window in stages and starts
@@ -179,6 +208,17 @@ pub struct MultiSourceDownload {
     pub server_addr: Option<SocketAddr>,
     /// Channel for receiving new sources discovered during the download
     pub new_source_rx: Option<mpsc::Receiver<DownloadSource>>,
+    /// Parallel injection channel for sources that arrive *with an
+    /// already-handshaked TCP stream* — typically a LowID peer that
+    /// reached us via KAD or server callback. Routed to the
+    /// "skip connect+Hello, use this stream" code path in
+    /// `download_parts_from_source`. Separate from `new_source_rx`
+    /// because the payload type (carries a `Box<dyn AsyncRead/Write>`)
+    /// is fundamentally different from the lightweight metadata
+    /// `DownloadSource` and we don't want to perturb the dozens of
+    /// existing send sites that operate on the metadata channel.
+    /// Stays `None` for downloads that never receive a callback.
+    pub new_established_rx: Option<mpsc::Receiver<EstablishedSource>>,
     pub ed2k_limits: Ed2kDownloadLimits,
     /// Our Ember identity hash, sent in EmuleInfo for friend identification
     pub ember_hash: [u8; 16],
@@ -684,6 +724,9 @@ impl MultiSourceDownload {
                     src_ember_hash,
                     nick_for_src.clone(),
                     sx_oh.clone(),
+                    // No pre-established stream — this is the initial-
+                    // sources path; we always dial these peers fresh.
+                    None,
                 )
                 .await;
 
@@ -722,6 +765,14 @@ impl MultiSourceDownload {
         let mut injected_sources: Vec<DownloadSource> = Vec::new();
 
         if let Some(mut new_source_rx) = self.new_source_rx.take() {
+            // Established-stream injection channel — populated by the
+            // KAD/server callback path in `network/mod.rs` when a
+            // LowID peer connects back to our upload listener for a
+            // file we're already downloading. Stays None (no-op) when
+            // no callback ever arrives for this transfer; the
+            // `std::future::pending()` sentinel below makes the
+            // select! arm uncostly when the channel doesn't exist.
+            let mut new_established_rx = self.new_established_rx.take();
             let abort_handles: Vec<tokio::task::AbortHandle> = handles.iter().map(|h| h.abort_handle()).collect();
             let mut pending_futs: FuturesUnordered<tokio::task::JoinHandle<(usize, Vec<usize>, anyhow::Result<()>)>> = handles.into_iter().collect();
             let mut injected_abort_handles: Vec<tokio::task::AbortHandle> = Vec::new();
@@ -906,6 +957,11 @@ impl MultiSourceDownload {
                                     inj_ember_hash,
                                     inj_nick,
                                     inj_sx_oh,
+                                    // Metadata-only injection (peer
+                                    // discovered via KAD/server source
+                                    // exchange); no pre-handshaked
+                                    // stream available.
+                                    None,
                                 ).await;
                                 if !freq_avail.is_empty() {
                                     let mut csel = cs.write().await;
@@ -941,6 +997,200 @@ impl MultiSourceDownload {
                                 info!("Source injection channel closed with no active source tasks left; proceeding to retry rounds");
                                 break;
                             }
+                        }
+                    }
+                    // Accept a pre-handshaked stream from the
+                    // established-source channel. Same wiring as the
+                    // metadata path above except we pass the supplied
+                    // reader/writer/peer_user_hash through as
+                    // `pre_established` so `download_parts_from_source`
+                    // skips its own connect+Hello+EmuleInfo dance.
+                    // Without this branch, when a LowID peer reaches
+                    // us via KAD callback for a file we're already
+                    // downloading, network/mod.rs would otherwise just
+                    // metadata-inject the peer into `new_source_rx`,
+                    // which then triggers a fresh outbound connect that
+                    // can't reach a LowID peer behind NAT — every such
+                    // injection failed with `stage:hello_wait: forcibly
+                    // closed` before this fix.
+                    new_est = async {
+                        match &mut new_established_rx {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if let Some(es) = new_est {
+                            injection_deadline = None;
+                            let src_idx = next_src_idx;
+                            next_src_idx += 1;
+
+                            let new_total = total_sources.fetch_add(1, Ordering::Relaxed) + 1;
+                            let _ = event_tx
+                                .send(DownloadEvent::SourcesUpdate {
+                                    transfer_id: self.transfer_id.clone(),
+                                    total: new_total,
+                                    active: active_count.load(Ordering::Relaxed),
+                                    queued: queued_count.load(Ordering::Relaxed),
+                                })
+                                .await;
+
+                            let source = es.source;
+                            let stream = es.stream;
+                            // Update ChunkSelector frequencies with the new source's availability
+                            if !source.available_parts.is_empty() {
+                                let mut cs = chunk_selector.write().await;
+                                for (i, &has) in source.available_parts.iter().enumerate() {
+                                    if i < cs.part_frequency.len() && has {
+                                        cs.part_frequency[i] = cs.part_frequency[i].saturating_add(1);
+                                    }
+                                }
+                                cs.total_sources = cs.total_sources.saturating_add(1);
+                            }
+
+                            let parts = {
+                                let cs = chunk_selector.read().await;
+                                let t = tracker.read().await;
+                                let completed = t.completed_parts().to_vec();
+                                let in_prog = t.in_progress.clone();
+                                let endgame_prefer =
+                                    t.remaining_count() <= 3 && t.part_count > 1;
+                                let gap_bytes = t.part_gap_bytes_vec();
+                                let avail = if source.available_parts.is_empty() {
+                                    vec![true; t.part_count]
+                                } else {
+                                    source.available_parts.clone()
+                                };
+                                let pp = self.control.is_preview_priority();
+                                let active: Vec<usize> = in_prog.iter().enumerate()
+                                    .filter(|(_, &ip)| ip).map(|(i, _)| i).collect();
+                                if let Some(p) = cs.select_part(
+                                    &completed,
+                                    &in_prog,
+                                    &avail,
+                                    &active,
+                                    &gap_bytes,
+                                    pp,
+                                    endgame_prefer,
+                                ) {
+                                    vec![p]
+                                } else {
+                                    Vec::new()
+                                }
+                            };
+                            if parts.is_empty() {
+                                continue;
+                            }
+                            info!(
+                                "Injecting pre-established source {}:{} (idx {src_idx}) into active download",
+                                source.peer_ip, source.peer_port,
+                            );
+                            injected_sources.push(source.clone());
+                            let src = source.clone();
+                            let trk = tracker.clone();
+                            let pp = part_path.clone();
+                            let fh = self.file_hash;
+                            let fs = self.file_size;
+                            let uh = self.user_hash;
+                            let nn = self.nickname.clone();
+                            let tp = self.tcp_port;
+                            let up = self.udp_port;
+                            let bw = self.bandwidth_limiter.clone();
+                            let _ptx = event_tx.clone();
+                            let ph = part_hashes.clone();
+                            let aich_m = shared_aich_master.clone();
+                            let sa = active_count.clone();
+                            let sq = queued_count.clone();
+                            let sm = self.source_manager.clone();
+                            let cm = self.credit_manager.clone();
+                            let cmt = self.comment_manager.clone();
+                            let cs = chunk_selector.clone();
+                            let avail = source.available_parts.clone();
+                            let etx = event_tx.clone();
+                            let tid = self.transfer_id.clone();
+                            let bi = self.shared_buddy_info.clone();
+                            let ctrl = self.control.clone();
+                            let sem = conn_semaphore.clone();
+
+                            let fail_etx = event_tx.clone();
+                            let fail_tid = self.transfer_id.clone();
+                            let fail_ip = source.peer_ip.clone();
+                            let fail_port = source.peer_port;
+
+                            let inj_progress_tx = progress_tx.clone();
+                            let obf_enabled = self.obfuscation_enabled;
+                            let hello_server = self.server_addr;
+                            let inj_ember_hash = self.ember_hash;
+                            let inj_nick = self.nickname.clone();
+                            let inj_qw = queue_wait_secs;
+                            let inj_shared_out = shared_part_file.clone();
+                            let inj_epx = self.ember_payload.clone();
+                            let inj_epx_gen = self.ember_payload_generation.clone();
+                            let inj_aich_p = self.aich_pending.clone();
+                            let inj_ipf = self.ip_filter.clone();
+                            let inj_ban = self.banned_ips.clone();
+                            let inj_ext = self.external_ip;
+                            let inj_geo = self.geoip.clone();
+                            let inj_fh = self.friend_hashes.clone();
+                            let inj_sx_oh = self.sx_overhead.clone();
+                            let handle = tokio::spawn(async move {
+                                let _permit = match sem.acquire().await {
+                                    Ok(p) => p,
+                                    Err(_) => return (src_idx, Vec::new(), Err(anyhow::anyhow!("download cancelled"))),
+                                };
+                                let freq_avail = avail.clone();
+                                let result = download_parts_from_source(
+                                    src_idx, &src, &parts, trk, &pp, &fh, fs, &uh, &nn,
+                                    tp, up, bw, inj_progress_tx, ph, aich_m, sa, sq, sm, cm,
+                                    cmt, Some(cs.clone()), avail, Some(etx), tid, bi, ctrl,
+                                    obf_enabled, hello_server, inj_qw,
+                                    Some(inj_shared_out), inj_epx, inj_epx_gen,
+                                    inj_aich_p,
+                                    inj_ipf, inj_ban, inj_ext,
+                                    inj_geo, inj_fh,
+                                    inj_ember_hash,
+                                    inj_nick,
+                                    inj_sx_oh,
+                                    // The crucial bit: hand the
+                                    // already-handshaked stream to
+                                    // download_parts_from_source so it
+                                    // takes the adoption branch instead
+                                    // of dialing the LowID peer back.
+                                    Some(stream),
+                                ).await;
+                                if !freq_avail.is_empty() {
+                                    let mut csel = cs.write().await;
+                                    csel.remove_source(&freq_avail);
+                                }
+                                if let Err(e) = &result {
+                                    if !super::transfer::is_queue_detached_error(&e.to_string()) {
+                                        warn!("Pre-established source {} ({}) failed: {e:#}", src_idx, fail_ip);
+                                        let _ = fail_etx.send(DownloadEvent::SourceDetail {
+                                            transfer_id: fail_tid,
+                                            ip: fail_ip,
+                                            port: fail_port,
+                                            status: "failed".to_string(),
+                                            queue_rank: None,
+                                            speed: 0,
+                                            transferred: 0,
+                                            client_software: String::new(),
+                                            peer_name: String::new(),
+                                            failure_kind: Some(super::transfer::classify_error(&e.to_string())),
+                                            available_parts: None,
+                                            total_parts: None,
+                                            country_code: None,
+                                        }).await;
+                                    }
+                                }
+                                (src_idx, parts, result)
+                            });
+                            injected_abort_handles.push(handle.abort_handle());
+                            pending_futs.push(handle);
+                        } else {
+                            // Established channel closed — drop our
+                            // handle to it so future select iterations
+                            // skip the recv branch entirely (via the
+                            // `std::future::pending` sentinel).
+                            new_established_rx = None;
                         }
                     }
                 }
@@ -1134,6 +1384,11 @@ impl MultiSourceDownload {
                         r_ember_hash,
                         r_nick,
                         r_sx_oh,
+                        // Retry round always re-dials; the original
+                        // pre-established stream (if any) was consumed
+                        // by the initial attempt and is no longer
+                        // alive by the time we retry.
+                        None,
                     )
                     .await {
                         if !super::transfer::is_queue_detached_error(&e.to_string()) {
@@ -1440,6 +1695,20 @@ async fn download_parts_from_source(
     ember_hash: [u8; 16],
     our_nickname: String,
     sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
+    // `pre_established`: if `Some`, skip TCP connect + obfuscation +
+    // Hello + EmuleInfo because the upload listener already did all
+    // of that for an inbound KAD/server callback. We adopt the
+    // supplied stream and peer user-hash, default
+    // `peer_secure_ident_level` to 3 (every client that reaches us
+    // via callback is a modern eMule that advertises SecIdent v3 in
+    // MISCOPTIONS1), and jump straight into the proactive SecIdent
+    // kick-off + pre-file-control loop. This is the fix for the
+    // wasted-callback bug where we were re-dialling LowID peers
+    // that, by definition, can't accept inbound TCP — the new
+    // outbound always failed at hello_wait. `None` preserves the
+    // historical connect+handshake path used by all non-callback
+    // sources (initial sources, KAD/server-discovered sources, etc.).
+    pre_established: Option<EstablishedStream>,
 ) -> anyhow::Result<()> {
     use super::messages::*;
     use std::io::{Read, Seek, Write};
@@ -1528,201 +1797,274 @@ async fn download_parts_from_source(
     emit_source!("connecting", None, 0u64);
     check_control(&control).await?;
 
-    let stream = match tokio::time::timeout(
-        std::time::Duration::from_secs(40),
-        TcpStream::connect(addr),
-    )
-    .await
-    {
-        Ok(Ok(s)) => { tune_peer_stream(&s); s },
-        Ok(Err(e)) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout {e}")),
-        Err(_) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout timeout")),
-    };
-
-    // Register this source with the source manager
-    if let Some(sm) = &source_mgr {
-        if let std::net::IpAddr::V4(v4) = addr.ip() {
-            let mut sm = sm.write().await;
-            sm.register_source(*file_hash, v4, addr.port());
-        }
-    }
-
     type DynRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
     type DynWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
 
-    // eMule BaseClient.cpp: only enable encryption when peer requests (bit 1)
-    // or requires (bit 2) it. Merely supporting (bit 0) is not enough unless
-    // we have a "prefer crypt" setting. Matching eMule's conservative default
-    // avoids unnecessary obfuscation attempts that add latency and may fail.
-    let peer_opts = source.peer_connect_options.unwrap_or(0);
-    let should_try_obf = source.peer_user_hash.is_some()
-        && (peer_opts & 0x06) != 0;
-    let mut connection_is_obfuscated = false;
-    let (mut reader, mut writer): (DynRead, DynWrite) = if let Some(peer_hash) = source.peer_user_hash.filter(|_| should_try_obf) {
-        debug!("Source {} has known peer hash metadata", _src_idx);
-        let (raw_r, raw_w) = stream.into_split();
-        let mut buf_r = tokio::io::BufReader::new(raw_r);
-        let mut buf_w = tokio::io::BufWriter::new(raw_w);
-        match tcp_obfuscation::negotiate_outgoing(&mut buf_r, &mut buf_w, &peer_hash).await {
-            Ok((recv_key, send_key)) => {
-                connection_is_obfuscated = true;
-                (
-                    Box::new(tokio::io::BufReader::new(Rc4Reader::new(buf_r, recv_key))),
-                    Box::new(tokio::io::BufWriter::new(Rc4Writer::new(buf_w, send_key))),
-                )
-            }
-            Err(e) => {
-                if peer_opts & 0x04 != 0 {
-                    return Err(anyhow::anyhow!(
-                        "stage:tcp_obfuscation peer requires crypt and obfuscation failed: {e}"
-                    ));
-                }
-                debug!("Outgoing obfuscation failed for source {}: {e}; reconnecting plain", _src_idx);
-                let plain_stream = match tokio::time::timeout(
-                    std::time::Duration::from_secs(40),
-                    TcpStream::connect(addr),
-                )
-                .await
-                {
-                    Ok(Ok(s)) => { tune_peer_stream(&s); s },
-                    Ok(Err(err)) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout {err}")),
-                    Err(_) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout timeout")),
-                };
-                let (r, w) = plain_stream.into_split();
-                (
-                    Box::new(tokio::io::BufReader::new(r)),
-                    Box::new(tokio::io::BufWriter::new(w)),
-                )
-            }
-        }
-    } else {
-        let (raw_r, raw_w) = stream.into_split();
-        (
-            Box::new(tokio::io::BufReader::new(raw_r)),
-            Box::new(tokio::io::BufWriter::new(raw_w)),
-        )
-    };
-
-    // Hello handshake (include buddy tags if we have a buddy)
-    let buddy = match &buddy_info {
-        Some(bi) => bi.read().await.clone(),
-        None => None,
-    };
-    let server_ip = server_addr.and_then(|addr| match addr.ip() {
-        std::net::IpAddr::V4(v4) => Some(u32::from_le_bytes(v4.octets())),
-        _ => None,
-    }).unwrap_or(0);
-    let server_port = server_addr.map(|addr| addr.port()).unwrap_or(0);
-    let hello_options = HelloOptions {
-        udp_port,
-        kad_port: udp_port,
-        supports_crypt_layer: obfuscation_enabled,
-        requests_crypt_layer: obfuscation_enabled,
-        requires_crypt_layer: false,
-        supports_direct_udp_callback: false,
-        supports_captcha: false,
-        server_ip,
-        server_port,
-        kad_version: 0x09,
-    };
     let our_client_id = sx_external_ip
         .map(|ip| u32::from_le_bytes(ip.octets()))
         .unwrap_or(0);
-    let hello_payload = build_hello_with_buddy_opts(
-        user_hash,
-        our_client_id,
-        tcp_port,
-        nickname,
-        buddy,
-        &hello_options,
-    );
-    write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_HELLO, &hello_payload).await?;
 
-    let (h_proto, h_opcode, hello_ans_data) = read_packet_timeout_ms(&mut *reader)
-        .await
-        .context("stage:hello_wait")?;
-    if h_proto != OP_EDONKEYHEADER || h_opcode != OP_HELLOANSWER {
-        anyhow::bail!("source {}: expected HelloAnswer, got proto=0x{h_proto:02X} op=0x{h_opcode:02X}", _src_idx);
-    }
-    let (peer_user_hash, mut hello_caps) = parse_hello_answer(&hello_ans_data)
-        .map_err(|e| {
-            tracing::warn!("Source {}: failed to parse HelloAnswer: {e}", _src_idx);
-            e
-        })
-        .unwrap_or_else(|_| {
-            let mut peer_user_hash = [0u8; 16];
-            if hello_ans_data.len() >= 16 {
-                peer_user_hash.copy_from_slice(&hello_ans_data[..16]);
-            }
-            (peer_user_hash, PeerCapabilities::default())
-        });
-    src_client_software = client_software_from_caps(&hello_caps);
-    src_peer_name = hello_caps.peer_name.clone();
-    let mut peer_supports_large_files = hello_caps.supports_large_files;
-    let mut peer_supports_multipacket = hello_caps.supports_multi_packet;
-    let mut peer_supports_ext_multipacket = hello_caps.ext_multi_packet;
-    let mut peer_supports_file_ident = hello_caps.supports_file_ident;
-    let mut peer_extended_requests_ver = hello_caps.extended_requests_ver;
-    let mut peer_supports_source_ex2 = hello_caps.supports_source_ex2;
-    let mut peer_source_exchange_ver = hello_caps.source_exchange_ver;
-    let mut peer_secure_ident_level = hello_caps.secure_ident_level;
-    let mut peer_supports_aich = hello_caps.supports_aich;
-    let mut peer_ember_hash: Option<[u8; 16]> = hello_caps.ember_hash;
-
-    let emule_payload = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
-    write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
-
+    // Variables produced by either the connect+handshake path below
+    // or the pre-established adoption path. Single-assignment from
+    // each branch; the rest of the function uses these uniformly.
+    // Pre-declaring them here (instead of inside the connect path)
+    // is what lets the new "use this stream" shortcut populate the
+    // same variables without duplicating every downstream `let`.
+    let connection_is_obfuscated: bool;
+    let mut reader: DynRead;
+    let mut writer: DynWrite;
+    let peer_user_hash: [u8; 16];
+    let mut hello_caps: PeerCapabilities;
+    let mut peer_supports_large_files: bool;
+    let mut peer_supports_multipacket: bool;
+    let mut peer_supports_ext_multipacket: bool;
+    let mut peer_supports_file_ident: bool;
+    let mut peer_extended_requests_ver: u8;
+    let mut peer_supports_source_ex2: bool;
+    let mut peer_source_exchange_ver: u8;
+    let mut peer_secure_ident_level: u8;
+    let mut peer_supports_aich: bool;
+    let mut peer_ember_hash: Option<[u8; 16]>;
     let mut deferred_packet: Option<(u8, u8, Vec<u8>)> = None;
-    match read_packet_timeout_ms(&mut *reader)
-        .await
-        .context("stage:emule_info_wait")
-    {
-        Ok((proto, opcode, payload)) => {
-            if proto == OP_EMULEPROT && (opcode == OP_EMULEINFOANSWER || opcode == OP_EMULEINFO) {
-                merge_caps(&mut hello_caps, parse_emule_info(&payload));
-                let peer_udp = hello_caps.udp_port;
-                peer_supports_multipacket = hello_caps.supports_multi_packet;
-                peer_supports_ext_multipacket = hello_caps.ext_multi_packet;
-                peer_supports_file_ident = hello_caps.supports_file_ident;
-                peer_extended_requests_ver = hello_caps.extended_requests_ver;
-                peer_supports_source_ex2 = hello_caps.supports_source_ex2;
-                peer_source_exchange_ver = hello_caps.source_exchange_ver;
-                peer_secure_ident_level = hello_caps.secure_ident_level;
-                peer_supports_large_files = hello_caps.supports_large_files;
-                peer_supports_aich = hello_caps.supports_aich;
-                peer_ember_hash = hello_caps.ember_hash;
-                src_client_software = client_software_from_caps(&hello_caps);
-                if !hello_caps.peer_name.is_empty() {
-                    src_peer_name = hello_caps.peer_name.clone();
-                }
-                if peer_udp > 0 {
-                    if let Some(sm) = &source_mgr {
-                        let mut sm = sm.write().await;
-                        if let std::net::IpAddr::V4(v4) = addr.ip() {
-                            sm.register_source_full(*file_hash, v4, addr.port(), peer_udp, peer_user_hash);
-                        }
-                    }
-                }
-                if opcode == OP_EMULEINFO {
-                    let emule_answer = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
-                    let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_answer).await;
-                    debug!("Received peer OP_EMULEINFO from source {}, replied", _src_idx);
-                } else {
-                    debug!("Got EmuleInfoAnswer from source {}", _src_idx);
-                }
-                pending_secident_challenge = super::transfer::maybe_send_secident_challenge(
-                    &mut *writer,
-                    credit_mgr.as_ref(),
-                    peer_user_hash,
-                    addr,
-                    peer_secure_ident_level,
-                ).await?;
-            } else {
-                deferred_packet = Some((proto, opcode, payload));
+
+    if let Some(es) = pre_established {
+        // Pre-established (KAD/server callback) path: the upload-side
+        // listener already did TCP + (maybe obfuscation) + Hello +
+        // (maybe EmuleInfo) for this peer, so we adopt the supplied
+        // stream and identity directly. Default capabilities to a
+        // modest-but-correct set (SecIdent v3 because every modern
+        // eMule advertises that in MISCOPTIONS1; everything else
+        // conservatively false). Any EmuleInfo that arrives mid-flow
+        // will overwrite these via the existing match arms below in
+        // the file-status-wait phase. This is the bug fix for the
+        // wasted callback: previously, a LowID peer that connected
+        // back to us via callback would just have its metadata
+        // injected into `new_source_rx`, triggering a fresh outbound
+        // connect that always failed because LowID peers can't accept
+        // inbound TCP.
+        info!(
+            "Source {} ({}) adopting pre-established callback stream (obf={})",
+            _src_idx, addr, es.emule_info_done,
+        );
+        if let Some(sm) = &source_mgr {
+            if let std::net::IpAddr::V4(v4) = addr.ip() {
+                let mut sm = sm.write().await;
+                sm.register_source(*file_hash, v4, addr.port());
             }
         }
-        Err(e) => {
-            debug!("EmuleInfo exchange failed for source {}: {e}", _src_idx);
+        connection_is_obfuscated = es.emule_info_done;
+        reader = es.reader;
+        writer = es.writer;
+        peer_user_hash = es.peer_user_hash;
+        let mut caps = PeerCapabilities::default();
+        caps.secure_ident_level = 3;
+        caps.supports_secure_ident = true;
+        hello_caps = caps;
+        peer_supports_large_files = false;
+        peer_supports_multipacket = false;
+        peer_supports_ext_multipacket = false;
+        peer_supports_file_ident = false;
+        peer_extended_requests_ver = 0;
+        peer_supports_source_ex2 = false;
+        peer_source_exchange_ver = 1;
+        peer_secure_ident_level = 3;
+        peer_supports_aich = false;
+        peer_ember_hash = None;
+    } else {
+        let stream = match tokio::time::timeout(
+            std::time::Duration::from_secs(40),
+            TcpStream::connect(addr),
+        )
+        .await
+        {
+            Ok(Ok(s)) => { tune_peer_stream(&s); s },
+            Ok(Err(e)) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout {e}")),
+            Err(_) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout timeout")),
+        };
+
+        // Register this source with the source manager
+        if let Some(sm) = &source_mgr {
+            if let std::net::IpAddr::V4(v4) = addr.ip() {
+                let mut sm = sm.write().await;
+                sm.register_source(*file_hash, v4, addr.port());
+            }
+        }
+
+        // eMule BaseClient.cpp: only enable encryption when peer requests (bit 1)
+        // or requires (bit 2) it. Merely supporting (bit 0) is not enough unless
+        // we have a "prefer crypt" setting. Matching eMule's conservative default
+        // avoids unnecessary obfuscation attempts that add latency and may fail.
+        let peer_opts = source.peer_connect_options.unwrap_or(0);
+        let should_try_obf = source.peer_user_hash.is_some()
+            && (peer_opts & 0x06) != 0;
+        let mut conn_is_obf = false;
+        let (r0, w0): (DynRead, DynWrite) = if let Some(peer_hash) = source.peer_user_hash.filter(|_| should_try_obf) {
+            debug!("Source {} has known peer hash metadata", _src_idx);
+            let (raw_r, raw_w) = stream.into_split();
+            let mut buf_r = tokio::io::BufReader::new(raw_r);
+            let mut buf_w = tokio::io::BufWriter::new(raw_w);
+            match tcp_obfuscation::negotiate_outgoing(&mut buf_r, &mut buf_w, &peer_hash).await {
+                Ok((recv_key, send_key)) => {
+                    conn_is_obf = true;
+                    (
+                        Box::new(tokio::io::BufReader::new(Rc4Reader::new(buf_r, recv_key))),
+                        Box::new(tokio::io::BufWriter::new(Rc4Writer::new(buf_w, send_key))),
+                    )
+                }
+                Err(e) => {
+                    if peer_opts & 0x04 != 0 {
+                        return Err(anyhow::anyhow!(
+                            "stage:tcp_obfuscation peer requires crypt and obfuscation failed: {e}"
+                        ));
+                    }
+                    debug!("Outgoing obfuscation failed for source {}: {e}; reconnecting plain", _src_idx);
+                    let plain_stream = match tokio::time::timeout(
+                        std::time::Duration::from_secs(40),
+                        TcpStream::connect(addr),
+                    )
+                    .await
+                    {
+                        Ok(Ok(s)) => { tune_peer_stream(&s); s },
+                        Ok(Err(err)) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout {err}")),
+                        Err(_) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout timeout")),
+                    };
+                    let (r, w) = plain_stream.into_split();
+                    (
+                        Box::new(tokio::io::BufReader::new(r)),
+                        Box::new(tokio::io::BufWriter::new(w)),
+                    )
+                }
+            }
+        } else {
+            let (raw_r, raw_w) = stream.into_split();
+            (
+                Box::new(tokio::io::BufReader::new(raw_r)),
+                Box::new(tokio::io::BufWriter::new(raw_w)),
+            )
+        };
+        connection_is_obfuscated = conn_is_obf;
+        reader = r0;
+        writer = w0;
+
+        // Hello handshake (include buddy tags if we have a buddy)
+        let buddy = match &buddy_info {
+            Some(bi) => bi.read().await.clone(),
+            None => None,
+        };
+        let server_ip = server_addr.and_then(|addr| match addr.ip() {
+            std::net::IpAddr::V4(v4) => Some(u32::from_le_bytes(v4.octets())),
+            _ => None,
+        }).unwrap_or(0);
+        let server_port = server_addr.map(|addr| addr.port()).unwrap_or(0);
+        let hello_options = HelloOptions {
+            udp_port,
+            kad_port: udp_port,
+            supports_crypt_layer: obfuscation_enabled,
+            requests_crypt_layer: obfuscation_enabled,
+            requires_crypt_layer: false,
+            supports_direct_udp_callback: false,
+            supports_captcha: false,
+            server_ip,
+            server_port,
+            kad_version: 0x09,
+        };
+        let hello_payload = build_hello_with_buddy_opts(
+            user_hash,
+            our_client_id,
+            tcp_port,
+            nickname,
+            buddy,
+            &hello_options,
+        );
+        write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_HELLO, &hello_payload).await?;
+
+        let (h_proto, h_opcode, hello_ans_data) = read_packet_timeout_ms(&mut *reader)
+            .await
+            .context("stage:hello_wait")?;
+        if h_proto != OP_EDONKEYHEADER || h_opcode != OP_HELLOANSWER {
+            anyhow::bail!("source {}: expected HelloAnswer, got proto=0x{h_proto:02X} op=0x{h_opcode:02X}", _src_idx);
+        }
+        let (puh, hcaps) = parse_hello_answer(&hello_ans_data)
+            .map_err(|e| {
+                tracing::warn!("Source {}: failed to parse HelloAnswer: {e}", _src_idx);
+                e
+            })
+            .unwrap_or_else(|_| {
+                let mut peer_user_hash = [0u8; 16];
+                if hello_ans_data.len() >= 16 {
+                    peer_user_hash.copy_from_slice(&hello_ans_data[..16]);
+                }
+                (peer_user_hash, PeerCapabilities::default())
+            });
+        peer_user_hash = puh;
+        hello_caps = hcaps;
+        src_client_software = client_software_from_caps(&hello_caps);
+        src_peer_name = hello_caps.peer_name.clone();
+        peer_supports_large_files = hello_caps.supports_large_files;
+        peer_supports_multipacket = hello_caps.supports_multi_packet;
+        peer_supports_ext_multipacket = hello_caps.ext_multi_packet;
+        peer_supports_file_ident = hello_caps.supports_file_ident;
+        peer_extended_requests_ver = hello_caps.extended_requests_ver;
+        peer_supports_source_ex2 = hello_caps.supports_source_ex2;
+        peer_source_exchange_ver = hello_caps.source_exchange_ver;
+        peer_secure_ident_level = hello_caps.secure_ident_level;
+        peer_supports_aich = hello_caps.supports_aich;
+        peer_ember_hash = hello_caps.ember_hash;
+
+        let emule_payload = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
+        write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
+
+        match read_packet_timeout_ms(&mut *reader)
+            .await
+            .context("stage:emule_info_wait")
+        {
+            Ok((proto, opcode, payload)) => {
+                if proto == OP_EMULEPROT && (opcode == OP_EMULEINFOANSWER || opcode == OP_EMULEINFO) {
+                    merge_caps(&mut hello_caps, parse_emule_info(&payload));
+                    let peer_udp = hello_caps.udp_port;
+                    peer_supports_multipacket = hello_caps.supports_multi_packet;
+                    peer_supports_ext_multipacket = hello_caps.ext_multi_packet;
+                    peer_supports_file_ident = hello_caps.supports_file_ident;
+                    peer_extended_requests_ver = hello_caps.extended_requests_ver;
+                    peer_supports_source_ex2 = hello_caps.supports_source_ex2;
+                    peer_source_exchange_ver = hello_caps.source_exchange_ver;
+                    peer_secure_ident_level = hello_caps.secure_ident_level;
+                    peer_supports_large_files = hello_caps.supports_large_files;
+                    peer_supports_aich = hello_caps.supports_aich;
+                    peer_ember_hash = hello_caps.ember_hash;
+                    src_client_software = client_software_from_caps(&hello_caps);
+                    if !hello_caps.peer_name.is_empty() {
+                        src_peer_name = hello_caps.peer_name.clone();
+                    }
+                    if peer_udp > 0 {
+                        if let Some(sm) = &source_mgr {
+                            let mut sm = sm.write().await;
+                            if let std::net::IpAddr::V4(v4) = addr.ip() {
+                                sm.register_source_full(*file_hash, v4, addr.port(), peer_udp, peer_user_hash);
+                            }
+                        }
+                    }
+                    if opcode == OP_EMULEINFO {
+                        let emule_answer = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
+                        let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_answer).await;
+                        debug!("Received peer OP_EMULEINFO from source {}, replied", _src_idx);
+                    } else {
+                        debug!("Got EmuleInfoAnswer from source {}", _src_idx);
+                    }
+                    pending_secident_challenge = super::transfer::maybe_send_secident_challenge(
+                        &mut *writer,
+                        credit_mgr.as_ref(),
+                        peer_user_hash,
+                        addr,
+                        peer_secure_ident_level,
+                    ).await?;
+                } else {
+                    deferred_packet = Some((proto, opcode, payload));
+                }
+            }
+            Err(e) => {
+                debug!("EmuleInfo exchange failed for source {}: {e}", _src_idx);
+            }
         }
     }
 

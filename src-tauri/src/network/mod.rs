@@ -414,6 +414,11 @@ fn drain_active_source_overflow(
 
         if closed {
             state.active_source_senders.remove(&transfer_id);
+            // Drop the established-source sender in lockstep so the
+            // upload listener doesn't keep handing us inbound LowID
+            // callback streams for a download that's no longer
+            // listening (the receive task is gone with the worker).
+            state.active_established_senders.remove(&transfer_id);
             state.active_source_overflow.remove(&transfer_id);
             state.active_kad_search_state.remove(&transfer_id);
             state.download_source_searches.retain(|_, (tid, _)| tid != &transfer_id);
@@ -597,6 +602,9 @@ fn inject_source_into_active_transfers(
 
     for transfer_id in &stale_transfer_ids {
         state.active_source_senders.remove(transfer_id);
+        // Mirror the metadata sender's removal — see lockstep
+        // rationale on `active_established_senders`.
+        state.active_established_senders.remove(transfer_id);
         state.active_source_overflow.remove(transfer_id);
         state.active_kad_search_state.remove(transfer_id);
         state.download_source_searches.retain(|_, (tid, _)| tid != transfer_id);
@@ -1477,6 +1485,18 @@ struct NetworkState {
     active_kad_search_state: HashMap<String, (i64, u32)>,
     /// Senders for injecting new sources into active multi-source downloads
     active_source_senders: HashMap<String, mpsc::Sender<DownloadSource>>,
+    /// Senders for injecting *pre-handshaked* peer streams into active
+    /// multi-source downloads. Distinct from `active_source_senders`
+    /// because the payload (`EstablishedSource`) carries an
+    /// already-adopted reader/writer pair — used by the LowID-callback
+    /// fast path to avoid the wasted-redial bug where we'd otherwise
+    /// metadata-inject the peer and then try a fresh outbound connect
+    /// to a NAT'd address. Mirrors `active_source_senders` in
+    /// lifecycle: created at MultiSourceDownload construction, removed
+    /// when the download completes / fails / is cancelled. Always
+    /// registered/removed in lockstep with `active_source_senders` so
+    /// neither leaks past the other.
+    active_established_senders: HashMap<String, mpsc::Sender<ed2k::multi_source::EstablishedSource>>,
     /// Overflow queue for sources discovered faster than the active download can accept them
     active_source_overflow: HashMap<String, VecDeque<DownloadSource>>,
     /// JoinHandles for spawned download tasks, keyed by transfer_id
@@ -2008,6 +2028,12 @@ async fn try_start_pending_download_from_known_sources(
         out
     };
     let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
+    // Parallel channel for pre-handshaked peer streams. Sized small —
+    // it only sees inbound LowID callbacks for files we're actively
+    // downloading, which is naturally rate-limited by NAT-traversal
+    // round-trips.
+    let (est_inject_tx, est_inject_rx) =
+        mpsc::channel::<ed2k::multi_source::EstablishedSource>(8);
     let ms_download = MultiSourceDownload {
         transfer_id: pending.transfer_id,
         file_hash: hash_bytes,
@@ -2028,6 +2054,7 @@ async fn try_start_pending_download_from_known_sources(
         obfuscation_enabled: state.obfuscation_enabled,
         server_addr: state.server_addr,
         new_source_rx: Some(src_inject_rx),
+        new_established_rx: Some(est_inject_rx),
                         ed2k_limits: settings.ed2k_download_limits(),
                         ember_hash,
                         friend_hashes: Some(friend_hashes.clone()),
@@ -2048,6 +2075,7 @@ async fn try_start_pending_download_from_known_sources(
         dl_tid, hex::encode(hash_bytes), live_sources.len()
     );
     state.active_source_senders.insert(dl_tid.clone(), src_inject_tx);
+    state.active_established_senders.insert(dl_tid.clone(), est_inject_tx);
     let tx = dl_event_tx.clone();
     let tx2 = tx.clone();
     if let Some(old_handle) = state.download_handles.remove(&dl_tid2) {
@@ -2922,6 +2950,7 @@ pub async fn start_network(
         per_file_sources: HashMap::new(),
         active_kad_search_state: HashMap::new(),
         active_source_senders: HashMap::new(),
+        active_established_senders: HashMap::new(),
         active_source_overflow: HashMap::new(),
         download_handles: HashMap::new(),
         comment_manager: comment_manager.clone(),
@@ -3790,6 +3819,7 @@ pub async fn start_network(
                         }
                     }
                     state.active_source_senders.remove(transfer_id);
+                    state.active_established_senders.remove(transfer_id);
                     state.active_source_overflow.remove(transfer_id);
                     state.active_kad_search_state.remove(transfer_id);
                     state.per_file_sources.remove(transfer_id);
@@ -3977,6 +4007,7 @@ pub async fn start_network(
                 }
                 if let DownloadEvent::Failed { ref transfer_id, ref error, ref failure_kind } = event {
                     state.active_source_senders.remove(transfer_id);
+                    state.active_established_senders.remove(transfer_id);
                     state.active_source_overflow.remove(transfer_id);
                     state.active_kad_search_state.remove(transfer_id);
                     state.download_handles.remove(transfer_id);
@@ -5747,6 +5778,8 @@ pub async fn start_network(
                                         out
                                     };
                                     let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
+                                    let (est_inject_tx, est_inject_rx) =
+                                        mpsc::channel::<ed2k::multi_source::EstablishedSource>(8);
                                     let ms_download = MultiSourceDownload {
                                         transfer_id: pending.transfer_id,
                                         file_hash: hash_bytes,
@@ -5767,6 +5800,7 @@ pub async fn start_network(
                                         obfuscation_enabled: state.obfuscation_enabled,
                                         server_addr: state.server_addr,
                                         new_source_rx: Some(src_inject_rx),
+                                        new_established_rx: Some(est_inject_rx),
                         ed2k_limits: settings.ed2k_download_limits(),
                         ember_hash,
                         friend_hashes: Some(friend_hashes.clone()),
@@ -5783,6 +5817,7 @@ pub async fn start_network(
                                     let tid = ms_download.transfer_id.clone();
                                     let tid2 = tid.clone();
                                     state.active_source_senders.insert(tid.clone(), src_inject_tx);
+                                    state.active_established_senders.insert(tid.clone(), est_inject_tx);
                                     let tx = dl_event_tx.clone();
                                     let tx2 = tx.clone();
                                     if let Some(old_handle) = state.download_handles.remove(&tid2) {
@@ -7855,7 +7890,10 @@ pub async fn start_network(
                                 .collect()
                         };
                         let (new_source_tx, new_source_rx) = mpsc::channel::<DownloadSource>(64);
+                        let (new_established_tx, new_established_rx) =
+                            mpsc::channel::<ed2k::multi_source::EstablishedSource>(8);
                         state.active_source_senders.insert(tid.clone(), new_source_tx);
+                        state.active_established_senders.insert(tid.clone(), new_established_tx);
                         let ms_download = MultiSourceDownload {
                             transfer_id: pending.transfer_id,
                             file_hash: hash_bytes,
@@ -7876,6 +7914,7 @@ pub async fn start_network(
                             obfuscation_enabled: state.obfuscation_enabled,
                             server_addr: state.server_addr,
                             new_source_rx: Some(new_source_rx),
+                            new_established_rx: Some(new_established_rx),
                         ed2k_limits: settings.ed2k_download_limits(),
                         ember_hash,
                         friend_hashes: Some(friend_hashes.clone()),
@@ -8027,6 +8066,8 @@ pub async fn start_network(
                                 .collect()
                         };
                         let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
+                        let (est_inject_tx, est_inject_rx) =
+                            mpsc::channel::<ed2k::multi_source::EstablishedSource>(8);
                         let ms_download = MultiSourceDownload {
                             transfer_id: pending.transfer_id,
                             file_hash: hash_bytes,
@@ -8047,6 +8088,7 @@ pub async fn start_network(
                             obfuscation_enabled: state.obfuscation_enabled,
                             server_addr: state.server_addr,
                             new_source_rx: Some(src_inject_rx),
+                            new_established_rx: Some(est_inject_rx),
                         ed2k_limits: settings.ed2k_download_limits(),
                         ember_hash,
                         friend_hashes: Some(friend_hashes.clone()),
@@ -8063,6 +8105,7 @@ pub async fn start_network(
                         let dl_tid = ms_download.transfer_id.clone();
                         let dl_tid2 = dl_tid.clone();
                         state.active_source_senders.insert(dl_tid.clone(), src_inject_tx);
+                        state.active_established_senders.insert(dl_tid.clone(), est_inject_tx);
                         let tx = dl_event_tx.clone();
                         let tx2 = tx.clone();
                         if let Some(old_handle) = state.download_handles.remove(&dl_tid2) {
@@ -9911,6 +9954,8 @@ pub async fn start_network(
                                 }];
 
                                 let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
+                                let (est_inject_tx, est_inject_rx) =
+                                    mpsc::channel::<ed2k::multi_source::EstablishedSource>(8);
                                 let ms_download = MultiSourceDownload {
                                     transfer_id: pd.transfer_id.clone(),
                                     file_hash,
@@ -9931,6 +9976,7 @@ pub async fn start_network(
                                     obfuscation_enabled: state.obfuscation_enabled,
                                     server_addr: state.server_addr,
                                     new_source_rx: Some(src_inject_rx),
+                                    new_established_rx: Some(est_inject_rx),
                         ed2k_limits: settings.ed2k_download_limits(),
                         ember_hash,
                         friend_hashes: Some(friend_hashes.clone()),
@@ -9946,6 +9992,7 @@ pub async fn start_network(
                                 };
                                 let dl_tid = ms_download.transfer_id.clone();
                                 state.active_source_senders.insert(dl_tid.clone(), src_inject_tx);
+                                state.active_established_senders.insert(dl_tid.clone(), est_inject_tx);
                                 let tx = dl_event_tx.clone();
                                 let tx2 = tx.clone();
                                 if let Some(old_handle) = state.download_handles.remove(&dl_tid) {
@@ -10155,11 +10202,30 @@ pub async fn start_network(
                             state.download_handles.insert(tid3, handle);
                         }
                     } else {
-                        // Download already active — promote LowID source to
-                        // HighID with the callback peer's real IP and inject
-                        // into the active multi-source download. The peer's
-                        // NAT mapping may still be open from this callback, so
-                        // the multi-source download can attempt a direct connect.
+                        // Download already active — the LowID peer
+                        // connected *back* to us (server-relay or KAD
+                        // callback). Hand the live, post-handshake
+                        // stream to the running multi-source worker
+                        // so it adopts the connection rather than
+                        // dialing the LowID peer's NAT'd address —
+                        // which can't accept inbound TCP and would
+                        // always fail at `stage:hello_wait: forcibly
+                        // closed`. Falls back to the legacy metadata
+                        // injection only if the established channel
+                        // can't accept the stream (no matching active
+                        // download, channel full, channel closed),
+                        // mirroring the pre-fix behaviour as a
+                        // last resort.
+
+                        // Extract Copy / clonable fields up front so
+                        // we can keep them after the stream itself is
+                        // moved into the EstablishedSource.
+                        let cb_peer_ip = parts.peer_ip;
+                        let cb_peer_port = parts.peer_port;
+                        let cb_peer_user_hash = parts.peer_user_hash;
+                        let cb_file_hash = parts.file_hash;
+                        let cb_emule_info_done = parts.emule_info_done;
+
                         let server_info = state.server_addr.and_then(|sa| {
                             if let std::net::IpAddr::V4(v4) = sa.ip() {
                                 Some((u32::from_le_bytes(v4.octets()), sa.port()))
@@ -10172,17 +10238,17 @@ pub async fn start_network(
                             if let Some((srv_ip, srv_port)) = server_info {
                                 sm.promote_lowid_source(
                                     srv_ip, srv_port,
-                                    parts.peer_port,
-                                    parts.peer_ip,
-                                    parts.peer_user_hash,
+                                    cb_peer_port,
+                                    cb_peer_ip,
+                                    cb_peer_user_hash,
                                 );
                             }
                             sm.register_source_full_opts(
-                                parts.file_hash,
-                                parts.peer_ip,
-                                parts.peer_port,
+                                cb_file_hash,
+                                cb_peer_ip,
+                                cb_peer_port,
                                 0,
-                                parts.peer_user_hash,
+                                cb_peer_user_hash,
                                 0,
                             );
                         }
@@ -10190,28 +10256,112 @@ pub async fn start_network(
                             let mgr = transfer_manager.read().await;
                             matching_active_transfer_ids_for_hash(&state, &mgr, &hash_hex)
                         };
-                        let uh = if parts.peer_user_hash != [0u8; 16] { Some(parts.peer_user_hash) } else { None };
+                        let uh = if cb_peer_user_hash != [0u8; 16] { Some(cb_peer_user_hash) } else { None };
                         let download_source = DownloadSource {
-                            peer_ip: parts.peer_ip.to_string(),
-                            peer_port: parts.peer_port,
+                            peer_ip: cb_peer_ip.to_string(),
+                            peer_port: cb_peer_port,
                             available_parts: Vec::new(),
                             peer_user_hash: uh,
                             peer_connect_options: None,
                         };
-                        let stats = inject_source_into_active_transfers(
-                            &mut state,
-                            parts.file_hash,
-                            &matching_tids,
-                            &download_source,
-                            0,
-                        );
-                        if stats.injected > 0 {
-                            info!(
-                                "Injected LowID callback peer {}:{} into {} active download(s) for {}",
-                                parts.peer_ip, parts.peer_port, stats.injected, hash_hex,
+
+                        // Try to hand off the live stream to the first
+                        // matching active download. A single inbound
+                        // TCP connection can only be adopted by one
+                        // downloader, so we pick the first matching
+                        // active transfer; if no established sender
+                        // takes it, the stream is dropped and we fall
+                        // back to the legacy metadata path so the
+                        // peer at least appears as a known source for
+                        // retry rounds.
+                        let mut stream_dispatched = false;
+                        let mut pending_stream = Some(ed2k::multi_source::EstablishedStream {
+                            reader: parts.reader,
+                            writer: parts.writer,
+                            peer_user_hash: cb_peer_user_hash,
+                            emule_info_done: cb_emule_info_done,
+                        });
+                        let mut closed_senders: Vec<String> = Vec::new();
+                        for tid in &matching_tids {
+                            let stream = match pending_stream.take() {
+                                Some(s) => s,
+                                None => break,
+                            };
+                            let est_source = ed2k::multi_source::EstablishedSource {
+                                source: download_source.clone(),
+                                stream,
+                            };
+                            match state.active_established_senders.get(tid) {
+                                Some(tx) => match tx.try_send(est_source) {
+                                    Ok(()) => {
+                                        info!(
+                                            "Adopted LowID callback stream from {cb_peer_ip}:{cb_peer_port} into active download {tid} for {hash_hex}",
+                                        );
+                                        stream_dispatched = true;
+                                        break;
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_es)) => {
+                                        warn!(
+                                            "Established-stream channel full for {tid}; dropping callback stream from {cb_peer_ip}:{cb_peer_port}",
+                                        );
+                                        // Stream value consumed by
+                                        // try_send and dropped here.
+                                        // Don't try other matching
+                                        // downloads — only one of
+                                        // them needed the stream and
+                                        // we already lost it.
+                                        break;
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(es)) => {
+                                        debug!(
+                                            "Established-stream channel closed for {tid}; trying next match",
+                                        );
+                                        // Sender is stale; mark for
+                                        // cleanup and try the next
+                                        // matching download.
+                                        closed_senders.push(tid.clone());
+                                        pending_stream = Some(es.stream);
+                                    }
+                                },
+                                None => {
+                                    debug!(
+                                        "No established-stream channel for {tid}; trying next match",
+                                    );
+                                    pending_stream = Some(est_source.stream);
+                                }
+                            }
+                        }
+                        // Reap any closed senders we encountered above
+                        // so we don't keep retrying them.
+                        for tid in &closed_senders {
+                            state.active_established_senders.remove(tid);
+                        }
+                        // If nothing took the stream it's dropped here
+                        // (`pending_stream` goes out of scope).
+                        drop(pending_stream);
+
+                        if !stream_dispatched {
+                            // Last-resort: legacy metadata injection.
+                            // The live stream is gone, so the dial-
+                            // back will likely fail for true LowID
+                            // peers — but the call mirrors the
+                            // pre-fix behaviour and at least registers
+                            // the peer for SX / future retry rounds.
+                            let stats = inject_source_into_active_transfers(
+                                &mut state,
+                                cb_file_hash,
+                                &matching_tids,
+                                &download_source,
+                                0,
                             );
-                        } else {
-                            debug!("No active download accepts callback peer for {hash_hex}");
+                            if stats.injected > 0 {
+                                info!(
+                                    "Injected LowID callback peer {}:{} (metadata-only fallback) into {} active download(s) for {}",
+                                    download_source.peer_ip, download_source.peer_port, stats.injected, hash_hex,
+                                );
+                            } else {
+                                debug!("No active download accepts callback peer for {hash_hex}");
+                            }
                         }
                     }
                 }
@@ -13858,6 +14008,8 @@ async fn handle_command(
                     }]
                 };
                 let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
+                let (est_inject_tx, est_inject_rx) =
+                    mpsc::channel::<ed2k::multi_source::EstablishedSource>(8);
                 let ms_download = MultiSourceDownload {
                     transfer_id,
                     file_hash: hash_bytes,
@@ -13878,6 +14030,7 @@ async fn handle_command(
                     obfuscation_enabled: state.obfuscation_enabled,
                     server_addr: state.server_addr,
                     new_source_rx: Some(src_inject_rx),
+                    new_established_rx: Some(est_inject_rx),
                         ed2k_limits: settings.ed2k_download_limits(),
                         ember_hash,
                         friend_hashes: Some(friend_hashes.clone()),
@@ -13896,6 +14049,7 @@ async fn handle_command(
                 let tid = ms_download.transfer_id.clone();
                 let tid2 = tid.clone();
                 state.active_source_senders.insert(tid.clone(), src_inject_tx);
+                state.active_established_senders.insert(tid.clone(), est_inject_tx);
                 state.active_kad_search_state.insert(tid.clone(), (chrono::Utc::now().timestamp(), 0));
                 let tx2 = tx.clone();
                 if let Some(old_handle) = state.download_handles.remove(&tid2) {
