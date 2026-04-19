@@ -3537,7 +3537,10 @@ async fn download_parts_from_source(
             max_outstanding, part_entry_gap_bytes,
             all_blocks.iter().map(|(s, e)| e - s).sum::<u64>(),
         );
-        let exit_reason: &'static str;
+        // Initialised here so the post-loop diagnostic always has a
+        // value even on the (rare) paths where the loop exits via `?`
+        // before any explicit `break` runs.
+        let mut exit_reason: &'static str = "loop_returned_err";
         loop {
             check_control(&control).await?;
             if peer_out_of_parts {
