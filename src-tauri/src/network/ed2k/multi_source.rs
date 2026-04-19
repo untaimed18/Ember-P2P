@@ -2000,7 +2000,14 @@ async fn download_parts_from_source(
     // gets no credit for corrupt data. Legit bytes contributed to a
     // multi-source part completion will be counted when any one peer's
     // task observes the Verified outcome.
-    let mut pending_credit_bytes: u64 = 0;
+    // Credit accrual is **per-part**. Without pipelining a single
+    // counter sufficed (a session only has one part outstanding at a
+    // time), but cross-part request pipelining can leave bytes for
+    // part N+1 in flight while part N is being verified. If we lump
+    // them, a part-N hash failure would also drop part-N+1's
+    // legitimate bytes from the credit ledger. Keyed by part_idx;
+    // entries are taken on `Verified` and dropped on `Mismatch`.
+    let mut per_part_credit: HashMap<usize, u64> = HashMap::new();
     let mut early_upload_accept = false;
     let mut pending_secident_challenge: Option<u32> = None;
     // Parks an incoming OP_SECIDENTSTATE when the peer's RSA public key
@@ -3337,6 +3344,32 @@ async fn download_parts_from_source(
         Unverified,
     }
 
+    // Cross-part request pipelining.
+    //
+    // When the LAST OP_REQUESTPARTS batch of part N has been sent,
+    // we eagerly pre-pick part N+1 and ship its FIRST batch on the
+    // same TCP session. The peer's send queue then never drains
+    // while we verify part N — which removes the round-trip stall
+    // that otherwise shows up as a "speed → 0" gap and a wasted
+    // Hello/SecIdent reconnect handshake.
+    //
+    // Wire-protocol compatibility: OP_REQUESTPARTS payloads are just
+    // byte ranges of the file (the peer has no notion of "parts").
+    // Block placement on receipt is purely offset-driven
+    // (`output.write(start, …)` and `tracker.fill_range(start, end)`),
+    // so cross-part interleave is harmless. The peer also doesn't
+    // distinguish between requests for different parts — it just
+    // services them in order.
+    struct PipelinedNext {
+        part_idx: usize,
+        all_blocks: Vec<(u64, u64)>,
+        batches: Vec<Vec<(u64, u64)>>,
+        sent_idx: usize,
+        total_sent_bytes: u64,
+        needs_i64: bool,
+    }
+    let mut pipelined_next: Option<PipelinedNext> = None;
+
     while queue_idx < part_queue.len() {
         check_control(&control).await?;
         let part_idx = part_queue[queue_idx];
@@ -3344,46 +3377,53 @@ async fn download_parts_from_source(
         if peer_out_of_parts {
             break;
         }
+
+        // Race-check: another source may have completed this part
+        // while we were on the previous one. Cheap read-lock check.
         {
-            let mut t = tracker.write().await;
+            let t = tracker.read().await;
             if t.is_part_complete(part_idx) {
+                // Drop any stale pipelined state for this part (we'd
+                // pipelined it but no longer need to) and move on.
+                if pipelined_next.as_ref().map(|p| p.part_idx) == Some(part_idx) {
+                    pipelined_next = None;
+                }
                 continue;
             }
+        }
+
+        let mut aich_recovery_data: Option<([u8; 20], Vec<u8>)> = None;
+        let mut pending_compressed: HashMap<u64, PendingCompressedBlock> = HashMap::new();
+
+        // Either resume from a pre-pipelined state (the previous
+        // iteration's send-ahead already shipped the first batch
+        // for this part) or compute fresh.
+        let pipelined_for_this = pipelined_next
+            .take()
+            .filter(|p| p.part_idx == part_idx);
+        let resumed = pipelined_for_this.is_some();
+        let (all_blocks, batches, mut sent_idx, mut total_sent_bytes, needs_i64) =
+            if let Some(p) = pipelined_for_this {
+                (p.all_blocks, p.batches, p.sent_idx, p.total_sent_bytes, p.needs_i64)
+            } else {
+                let (all_blocks, _ps, _pe) = compute_part_blocks_ms(&tracker, part_idx).await;
+                let batches: Vec<Vec<(u64, u64)>> = all_blocks
+                    .chunks(MAX_BLOCKS_PER_REQUEST)
+                    .map(|c| c.to_vec())
+                    .collect();
+                let needs_i64 = peer_supports_large_files
+                    && all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
+                (all_blocks, batches, 0, 0u64, needs_i64)
+            };
+
+        // Mark in_progress (idempotent — pipelined state already did this,
+        // and the same flag may be set by another source piling on for
+        // MAX_SOURCES_PER_PART-style behaviour).
+        {
+            let mut t = tracker.write().await;
             t.set_in_progress(part_idx, true);
         }
         ip_guard.mark(part_idx);
-
-        let mut aich_recovery_data: Option<([u8; 20], Vec<u8>)> = None;
-
-        let (_part_start, _part_end, all_blocks) = {
-            let t = tracker.read().await;
-            let (part_start, part_end) = t.part_range(part_idx);
-            let all_blocks: Vec<(u64, u64)> = t
-                .gap_list()
-                .iter()
-                .filter_map(|&(gs, ge)| {
-                    let start = gs.max(part_start);
-                    let end = ge.min(part_end);
-                    (start < end).then_some((start, end))
-                })
-                .flat_map(|(start, end)| {
-                    let mut blocks = Vec::new();
-                    let mut cursor = start;
-                    while cursor < end {
-                        let chunk_end = (cursor + EMBLOCKSIZE).min(end);
-                        blocks.push((cursor, chunk_end));
-                        cursor = chunk_end;
-                    }
-                    blocks
-                })
-                .collect();
-            (part_start, part_end, all_blocks)
-        };
-
-        let batches: Vec<Vec<(u64, u64)>> = all_blocks
-            .chunks(MAX_BLOCKS_PER_REQUEST)
-            .map(|c| c.to_vec())
-            .collect();
 
         let (remaining, gap_rem) = {
             let t = tracker.read().await;
@@ -3391,29 +3431,33 @@ async fn download_parts_from_source(
         };
         let max_outstanding =
             outstanding_requests_for_speed_ms(measured_speed, remaining, gap_rem);
-        let mut sent_idx: usize = 0;
-        let mut total_sent_bytes: u64 = 0;
         let mut total_received: u64 = 0;
-        let mut pending_compressed: HashMap<u64, PendingCompressedBlock> = HashMap::new();
 
         if all_blocks.is_empty() {
             debug!("Source {} part {} has no gaps — skipping", _src_idx, part_idx);
+        } else if resumed {
+            info!(
+                "Source {} ({}) resuming pipelined part {}: {} batches sent ahead, {} more queued",
+                _src_idx, addr, part_idx, sent_idx, batches.len() - sent_idx,
+            );
         } else {
-            let needs_i64_check = peer_supports_large_files
-                && all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
             info!("Source {} ({}) requesting part {}: {} blocks, {} batches, {} bytes (i64={})",
-                _src_idx, addr, part_idx, all_blocks.len(), batches.len(), 
+                _src_idx, addr, part_idx, all_blocks.len(), batches.len(),
                 all_blocks.iter().map(|(s, e)| e - s).sum::<u64>(),
-                needs_i64_check);
+                needs_i64);
         }
 
-        // Send initial batch of requests.
-        // Match eMule behaviour: only use OP_REQUESTPARTS_I64 when an offset
-        // actually exceeds 32-bit range.  Many peers on the network (eMule mods)
-        // do not implement the I64 handler and silently drop the request,
-        // causing "accepted but no data" timeouts.
-        let needs_i64 = peer_supports_large_files
-            && all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
+        // Send initial batches up to max_outstanding. When `resumed=true`
+        // some batches have already been sent via the previous
+        // iteration's pipeline; `sent_idx` reflects that, so we pick up
+        // exactly where the pipeline left off without re-sending or
+        // missing any batch.
+        //
+        // Match eMule behaviour: only use OP_REQUESTPARTS_I64 when an
+        // offset actually exceeds 32-bit range.  Many peers on the
+        // network (eMule mods) do not implement the I64 handler and
+        // silently drop the request, causing "accepted but no data"
+        // timeouts.
         while sent_idx < batches.len() && sent_idx < max_outstanding {
             let batch = &batches[sent_idx];
             let (req_payload, req_proto, req_op) = if needs_i64 {
@@ -3421,7 +3465,7 @@ async fn download_parts_from_source(
             } else {
                 (build_request_parts(file_hash, batch), OP_EDONKEYHEADER, OP_REQUESTPARTS)
             };
-            if sent_idx == 0 {
+            if sent_idx == 0 && !resumed {
                 info!("Source {} ({}) sending OP_REQUESTPARTS: proto=0x{:02X} op=0x{:02X} len={} payload_hex={}",
                     _src_idx, addr, req_proto, req_op, req_payload.len(), hex::encode(&req_payload));
             }
@@ -3452,10 +3496,31 @@ async fn download_parts_from_source(
             .unwrap_or_else(|| ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed));
         const EPX_RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
-        while total_received < total_sent_bytes {
+        // Receive loop. Exits when:
+        //   * `peer_out_of_parts` was signalled by the remote, OR
+        //   * the byte-level gap tracker reports `part_idx` complete
+        //     (which is the authoritative signal for "we have every
+        //     byte of this part on disk", regardless of whether the
+        //     bytes came from this source's blocks for `part_idx` or
+        //     from another source piling on for the same part, or
+        //     from this source's pipelined blocks for part N+1
+        //     overlapping nothing in part N).
+        //
+        // Was: `while total_received < total_sent_bytes` — broken under
+        // pipelining because pipelined N+1 bytes also arrive on this
+        // socket and would push `total_received` past
+        // `total_sent_bytes` (which only counts current-part bytes),
+        // exiting before the current part actually finishes.
+        loop {
             check_control(&control).await?;
             if peer_out_of_parts {
                 break;
+            }
+            {
+                let t = tracker.read().await;
+                if t.is_part_complete(part_idx) {
+                    break;
+                }
             }
 
             // Periodic EPX re-send: if payload has been rebuilt and 5min elapsed
@@ -3603,8 +3668,13 @@ async fn download_parts_from_source(
                     blocks_received_in_current_req += 1;
                     speed_bytes += piece_len;
                     // D12: defer credit accrual until the covered part
-                    // verifies; see `pending_credit_bytes` declaration.
-                    pending_credit_bytes = pending_credit_bytes.saturating_add(piece_len);
+                    // verifies. With cross-part pipelining a block can
+                    // belong to either the current part or the
+                    // pre-pipelined next part — bucket by absolute
+                    // offset so a Mismatch on part N doesn't wipe
+                    // legitimate part N+1 credit.
+                    let block_part = (start / PARTSIZE) as usize;
+                    *per_part_credit.entry(block_part).or_insert(0) += piece_len;
                     let _ = progress_tx.send((_src_idx, piece_len as i64)).await;
                 }
                 (OP_EMULEPROT, OP_COMPRESSEDPART_I64) | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
@@ -3676,9 +3746,10 @@ async fn download_parts_from_source(
                     src_transferred += piece_len;
                     blocks_received_in_current_req += 1;
                     speed_bytes += piece_len;
-                    // D12: accrue credit only after the covered part
-                    // verifies.
-                    pending_credit_bytes = pending_credit_bytes.saturating_add(piece_len);
+                    // Per-part credit bucket; see uncompressed branch
+                    // above for rationale.
+                    let block_part = (start / PARTSIZE) as usize;
+                    *per_part_credit.entry(block_part).or_insert(0) += piece_len;
                     let _ = progress_tx.send((_src_idx, piece_len as i64)).await;
                 }
                 (OP_EMULEPROT, OP_AICHANSWER) if payload.len() >= 38 => {
@@ -3930,14 +4001,77 @@ async fn download_parts_from_source(
                 completed_reqs += 1;
                 if sent_idx < batches.len() {
                     let batch = &batches[sent_idx];
-                        let (req_payload, req_proto, req_op) = if needs_i64 {
-                            (build_request_parts_i64(file_hash, batch), OP_EMULEPROT, OP_REQUESTPARTS_I64)
-                        } else {
-                            (build_request_parts(file_hash, batch), OP_EDONKEYHEADER, OP_REQUESTPARTS)
-                        };
-                        write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await?;
+                    let (req_payload, req_proto, req_op) = if needs_i64 {
+                        (build_request_parts_i64(file_hash, batch), OP_EMULEPROT, OP_REQUESTPARTS_I64)
+                    } else {
+                        (build_request_parts(file_hash, batch), OP_EDONKEYHEADER, OP_REQUESTPARTS)
+                    };
+                    write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await?;
                     total_sent_bytes += batch.iter().map(|(s, e)| e - s).sum::<u64>();
                     sent_idx += 1;
+                } else if pipelined_next.is_none() && !batches.is_empty() {
+                    // CROSS-PART PIPELINE: every batch for the current
+                    // part has been sent, but we're still receiving
+                    // bytes. Pre-pick the next part and ship its first
+                    // OP_REQUESTPARTS so the peer's send queue stays
+                    // saturated through the part-N → part-(N+1)
+                    // hand-off (no round-trip stall, no Hello/SecIdent
+                    // reconnect).
+                    if let Some(next) = pre_pipeline_next_part_ms(
+                        &chunk_sel,
+                        &tracker,
+                        &source_available,
+                        &control,
+                        &part_queue,
+                        peer_supports_large_files,
+                        file_size,
+                    )
+                    .await
+                    {
+                        let first_batch = &next.batches[0];
+                        let (req_payload, req_proto, req_op) = if next.needs_i64 {
+                            (build_request_parts_i64(file_hash, first_batch), OP_EMULEPROT, OP_REQUESTPARTS_I64)
+                        } else {
+                            (build_request_parts(file_hash, first_batch), OP_EDONKEYHEADER, OP_REQUESTPARTS)
+                        };
+                        if let Err(e) = write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await {
+                            // Don't poison the rest of the loop on a
+                            // pipeline-send failure — fall through and
+                            // let the existing per-part flow handle the
+                            // next part on its own (with the round-trip
+                            // stall, but not a session drop).
+                            debug!(
+                                "Source {} ({}) cross-part pipeline send for part {} failed: {e:#} — falling back to non-pipelined hand-off",
+                                _src_idx, addr, next.part_idx,
+                            );
+                        } else {
+                            let pipelined_bytes: u64 =
+                                first_batch.iter().map(|(s, e)| e - s).sum();
+                            debug!(
+                                "Source {} ({}) cross-part pipeline: pre-sent first batch of part {} ({} bytes) while still receiving part {}",
+                                _src_idx, addr, next.part_idx, pipelined_bytes, part_idx,
+                            );
+                            // Add to part_queue if not already present;
+                            // mark in_progress so other sources see it
+                            // and apply the eMule active-bonus heuristic.
+                            if !part_queue.contains(&next.part_idx) {
+                                part_queue.push(next.part_idx);
+                            }
+                            {
+                                let mut t = tracker.write().await;
+                                t.set_in_progress(next.part_idx, true);
+                            }
+                            ip_guard.mark(next.part_idx);
+                            pipelined_next = Some(PipelinedNext {
+                                part_idx: next.part_idx,
+                                all_blocks: next.all_blocks,
+                                batches: next.batches,
+                                sent_idx: 1,
+                                total_sent_bytes: pipelined_bytes,
+                                needs_i64: next.needs_i64,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -4191,12 +4325,17 @@ async fn download_parts_from_source(
                 ip_guard.unmark(part_idx);
                 // D12: flush accumulated bytes to the credit ledger now
                 // that this peer's contribution went into a verified part.
-                if pending_credit_bytes > 0 {
-                    if let Some(cm) = &credit_mgr {
-                        let mut cm = cm.write().await;
-                        cm.add_downloaded(peer_user_hash, pending_credit_bytes);
+                // Per-part bucket: only credit bytes that landed in
+                // THIS verified part. With cross-part pipelining the
+                // pending map may also hold bytes for part N+1 that
+                // are still in flight; those stay until N+1 verifies.
+                if let Some(verified_bytes) = per_part_credit.remove(&part_idx) {
+                    if verified_bytes > 0 {
+                        if let Some(cm) = &credit_mgr {
+                            let mut cm = cm.write().await;
+                            cm.add_downloaded(peer_user_hash, verified_bytes);
+                        }
                     }
-                    pending_credit_bytes = 0;
                 }
                 if let Some(ref etx) = event_tx {
                     let _ = etx
@@ -4222,9 +4361,12 @@ async fn download_parts_from_source(
                 };
                 spawn_save_snapshot(snap);
                 ip_guard.unmark(part_idx);
-                // D12: drop the pending credit bytes — the peer sent data
-                // that didn't verify, so no credit accrues.
-                pending_credit_bytes = 0;
+                // D12: drop the per-part credit bucket for THIS part —
+                // the peer sent data that didn't verify, so no credit
+                // accrues for this part. With cross-part pipelining
+                // we leave other parts' buckets intact (they verify
+                // independently).
+                per_part_credit.remove(&part_idx);
                 let _ = progress_tx.send((_src_idx, 0i64)).await;
                 if let Some(ref etx) = event_tx {
                     let _ = etx
@@ -4364,6 +4506,151 @@ async fn download_parts_from_source(
     }
 
     Ok(())
+}
+
+/// Pre-computed pipeline state for the next part this source should
+/// download, so the receive loop can ship its first OP_REQUESTPARTS
+/// without yet allocating for the rest of the batches' send budget.
+struct PipelineCandidate {
+    part_idx: usize,
+    all_blocks: Vec<(u64, u64)>,
+    batches: Vec<Vec<(u64, u64)>>,
+    needs_i64: bool,
+}
+
+/// Pick the next part to pre-pipeline for this source, applying the
+/// same two-stage selection (strict, then relaxed) as the post-part
+/// dynamic-extend path. Returns `None` when there's nothing useful to
+/// pipeline (every remaining part either falls outside the peer's
+/// availability map, is already pipelined / queued for this source,
+/// or has no gaps left).
+async fn pre_pipeline_next_part_ms(
+    chunk_sel: &Option<Arc<RwLock<ChunkSelector>>>,
+    tracker: &Arc<RwLock<PartTracker>>,
+    source_available: &[bool],
+    control: &Arc<TransferControl>,
+    part_queue: &[usize],
+    peer_supports_large_files: bool,
+    file_size: u64,
+) -> Option<PipelineCandidate> {
+    let cs = chunk_sel.as_ref()?.read().await;
+
+    let (completed, in_prog, remaining, part_count, gap_bytes) = {
+        let t = tracker.read().await;
+        (
+            t.completed_parts().to_vec(),
+            t.in_progress.clone(),
+            t.remaining_count(),
+            t.part_count,
+            t.part_gap_bytes_vec(),
+        )
+    };
+    if remaining == 0 {
+        return None;
+    }
+    let avail = if source_available.is_empty() {
+        vec![true; part_count]
+    } else {
+        source_available.to_vec()
+    };
+    let pp = control.is_preview_priority();
+    let prefer_higher = remaining <= 3 && part_count > 1;
+    let active: Vec<usize> = in_prog
+        .iter()
+        .enumerate()
+        .filter(|(_, &ip)| ip)
+        .map(|(i, _)| i)
+        .collect();
+
+    // Strict: pick a part nobody is currently downloading.
+    let mut next_part = cs.select_part(
+        &completed,
+        &in_prog,
+        &avail,
+        &active,
+        &gap_bytes,
+        pp,
+        prefer_higher,
+    );
+    // Relaxed fallback (matches the post-verify dynamic-extend logic):
+    // every remaining incomplete part is already in_progress on some
+    // source — pile on, with the active-bonus naturally preferring
+    // already-active parts.
+    if next_part.is_none() {
+        let no_in_progress = vec![false; part_count];
+        next_part = cs.select_part(
+            &completed,
+            &no_in_progress,
+            &avail,
+            &active,
+            &gap_bytes,
+            pp,
+            prefer_higher,
+        );
+    }
+    let next_part = next_part?;
+
+    // Don't double-pipeline a part already in this source's queue.
+    if part_queue.contains(&next_part) {
+        return None;
+    }
+
+    let (all_blocks, _ps, _pe) = compute_part_blocks_ms(tracker, next_part).await;
+    if all_blocks.is_empty() {
+        // Race: another source filled the part between select_part and
+        // now. Caller can re-try on the next iteration.
+        return None;
+    }
+    let batches: Vec<Vec<(u64, u64)>> = all_blocks
+        .chunks(MAX_BLOCKS_PER_REQUEST)
+        .map(|c| c.to_vec())
+        .collect();
+    if batches.is_empty() {
+        return None;
+    }
+    let needs_i64 =
+        peer_supports_large_files && all_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
+    let _ = file_size;
+
+    Some(PipelineCandidate {
+        part_idx: next_part,
+        all_blocks,
+        batches,
+        needs_i64,
+    })
+}
+
+/// Compute the gap-aware OP_REQUESTPARTS block list for `part_idx`.
+/// Returns (`all_blocks`, `part_start`, `part_end`). Splits each
+/// in-part gap into EMBLOCKSIZE chunks (eMule's request granularity).
+/// Used by both the cold path at the top of the per-part loop and the
+/// pipeline send-ahead.
+async fn compute_part_blocks_ms(
+    tracker: &Arc<RwLock<PartTracker>>,
+    part_idx: usize,
+) -> (Vec<(u64, u64)>, u64, u64) {
+    let t = tracker.read().await;
+    let (part_start, part_end) = t.part_range(part_idx);
+    let all_blocks: Vec<(u64, u64)> = t
+        .gap_list()
+        .iter()
+        .filter_map(|&(gs, ge)| {
+            let start = gs.max(part_start);
+            let end = ge.min(part_end);
+            (start < end).then_some((start, end))
+        })
+        .flat_map(|(start, end)| {
+            let mut blocks = Vec::new();
+            let mut cursor = start;
+            while cursor < end {
+                let chunk_end = (cursor + EMBLOCKSIZE).min(end);
+                blocks.push((cursor, chunk_end));
+                cursor = chunk_end;
+            }
+            blocks
+        })
+        .collect();
+    (all_blocks, part_start, part_end)
 }
 
 fn outstanding_requests_for_speed_ms(
