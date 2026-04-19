@@ -26,8 +26,14 @@
   let newPort = $state('4661');
   let newName = $state('');
 
-  // Update server.met form
-  let serverMetUrl = $state('http://www.gruk.org/server.met');
+  // Update server.met form. The default points at eMule Security's
+  // curated "safe server list" — the same operator Ember already trusts
+  // for ipfilter.zip (`commands/security.rs`) and nodes.dat
+  // (`commands/settings.rs`). It's served over HTTPS (no MITM risk),
+  // updated daily, and explicitly vetted against fake/spam servers.
+  // Previously this was `http://www.gruk.org/server.met` — plain HTTP
+  // and increasingly unreliable in 2026.
+  let serverMetUrl = $state('https://upd.emule-security.org/server.met');
   let serverFilter = $state('');
 
   // Sorting
@@ -698,7 +704,7 @@
               id="met-url"
               type="text"
               bind:value={serverMetUrl}
-              placeholder="http://www.gruk.org/server.met"
+              placeholder="https://upd.emule-security.org/server.met"
               onkeydown={handleKeydownMet}
             />
           </div>
