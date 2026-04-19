@@ -21,6 +21,7 @@ fn client() -> reqwest::Client {
     match reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .no_proxy()
+        .https_only(true)
         .build()
     {
         Ok(c) => c,
@@ -28,6 +29,27 @@ fn client() -> reqwest::Client {
             warn!("Failed to build rendezvous HTTP client with configured options: {e}, using default");
             reqwest::Client::new()
         }
+    }
+}
+
+/// Reject non-HTTPS rendezvous URLs before we send any traffic. The
+/// rendezvous flow gives a peer the IP/port we'll connect to for a
+/// friend session — over plaintext HTTP, a network-position attacker
+/// could rewrite the response and steer the connection to an
+/// attacker-controlled host. The HTTP client is also built with
+/// `https_only(true)` (above), which catches redirects to `http://`,
+/// but checking up-front gives a clearer error message.
+fn require_https(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    if trimmed.starts_with("https://") {
+        Ok(())
+    } else {
+        Err(format!(
+            "rendezvous URL must use https:// (got: {})",
+            // Show the scheme part only; don't echo the whole URL into
+            // the user-visible error since it can be long.
+            trimmed.split("://").next().unwrap_or("<empty>")
+        ))
     }
 }
 
@@ -59,6 +81,7 @@ async fn read_bounded_bytes(resp: reqwest::Response, limit: usize) -> Result<Vec
 /// If `external_ip` is provided, it is sent so the server stores our true
 /// IPv4 address instead of the (possibly IPv6) connection address.
 pub async fn register(base_url: &str, ember_hash: &[u8; 16], port: u16, external_ip: Option<Ipv4Addr>) -> Result<(), String> {
+    require_https(base_url)?;
     let url = format!("{}/register", base_url.trim_end_matches('/'));
     let id = hashed_id(ember_hash);
     let mut body = serde_json::json!({ "id": id, "port": port });
@@ -91,6 +114,7 @@ pub async fn register(base_url: &str, ember_hash: &[u8; 16], port: u16, external
 /// Look up a friend on the rendezvous server.
 /// Returns `Some((ip, port))` if the friend is currently registered, `None` if not found.
 pub async fn lookup(base_url: &str, friend_hash: &[u8; 16]) -> Result<Option<(Ipv4Addr, u16)>, String> {
+    require_https(base_url)?;
     let id = hashed_id(friend_hash);
     let url = format!("{}/lookup/{}", base_url.trim_end_matches('/'), id);
     let resp = client()
@@ -136,6 +160,7 @@ pub async fn lookup(base_url: &str, friend_hash: &[u8; 16]) -> Result<Option<(Ip
 
 /// Unregister our presence from the rendezvous server (graceful shutdown).
 pub async fn unregister(base_url: &str, ember_hash: &[u8; 16]) -> Result<(), String> {
+    require_https(base_url)?;
     let url = format!("{}/unregister", base_url.trim_end_matches('/'));
     let id = hashed_id(ember_hash);
     let resp = client()

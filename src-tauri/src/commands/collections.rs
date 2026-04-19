@@ -56,6 +56,19 @@ pub async fn create_collection(
     output_path: String,
     binary: bool,
 ) -> Result<String, String> {
+    // Mirror the cap on the binary loader (100k entries) and the
+    // download-batch cap (200 entries) — the IPC create path was
+    // unbounded, so a frontend bug or malicious bundle could push a
+    // multi-million-entry vector. 100k is generous; the on-disk binary
+    // loader will enforce the same cap on read-back.
+    const MAX_COLLECTION_FILES: usize = 100_000;
+    if files.len() > MAX_COLLECTION_FILES {
+        return Err(format!(
+            "Collection too large ({} files > {} max)",
+            files.len(),
+            MAX_COLLECTION_FILES
+        ));
+    }
     let collection = Collection {
         name: name.clone(),
         author,

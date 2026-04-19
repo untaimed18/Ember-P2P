@@ -17,7 +17,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{debug, info};
 
 const ENTRY_TTL: Duration = Duration::from_secs(300);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
@@ -192,7 +192,12 @@ async fn register(
         return StatusCode::SERVICE_UNAVAILABLE;
     }
     store.insert(key, entry);
-    info!("registered {} ip={} (conn={})", &body.id[..8], presence_ip, client_ip);
+    // debug!, not info!: per-request lines include the client IP and a
+    // partial id, which together can be correlated to deanonymize a
+    // user across log aggregations. Drop into debug so operators can
+    // still get this with `RUST_LOG=ember_rendezvous=debug` when
+    // troubleshooting, but the default log stream stays free of PII.
+    debug!("registered {} ip={} (conn={})", &body.id[..8], presence_ip, client_ip);
     StatusCode::OK
 }
 
@@ -214,14 +219,16 @@ async fn lookup(
     let store = state.store.read().await;
     match store.get(&id.to_lowercase()) {
         Some(entry) if entry.expires_at > Instant::now() => {
-            info!("lookup hit {} from {}", &id[..8], client_ip);
+            // See `register` above: per-request lines stay at debug to
+            // avoid PII in the default log stream.
+            debug!("lookup hit {} from {}", &id[..8], client_ip);
             Ok(Json(LookupResponse {
                 ip: entry.ip.to_string(),
                 port: entry.port,
             }))
         }
         _ => {
-            info!("lookup miss {} from {}", &id[..8], client_ip);
+            debug!("lookup miss {} from {}", &id[..8], client_ip);
             Err(StatusCode::NOT_FOUND)
         }
     }
@@ -246,7 +253,8 @@ async fn unregister(
     if let Some(entry) = store.get(&body.id.to_lowercase()) {
         if entry.conn_ip == client_ip || entry.ip == client_ip {
             store.remove(&body.id.to_lowercase());
-            info!("unregistered {} from {}", &body.id[..8], client_ip);
+            // See `register` above: per-request lines stay at debug.
+            debug!("unregistered {} from {}", &body.id[..8], client_ip);
             return StatusCode::OK;
         }
         return StatusCode::FORBIDDEN;

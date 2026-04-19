@@ -2015,14 +2015,19 @@
                   <div class="comment-label">Peer comments:</div>
                   {#each commentInfo.peer_comments as pc, i (i)}
                     <div class="comment-peer-item">
-                      <span class="comment-peer-name">{pc.user_name}</span>
+                      <!-- Both `user_name` and `comment` are
+                           peer-supplied; wrap each in `<bdi>` so an
+                           embedded RTL/LTR override character can't
+                           spoof neighbouring fields like the star
+                           rating or the visible name. -->
+                      <span class="comment-peer-name"><bdi>{pc.user_name}</bdi></span>
                       <span class="comment-peer-stars">
                         {#each [1,2,3,4,5] as s}
                           <span class="star-display">{s <= pc.rating ? '\u2605' : '\u2606'}</span>
                         {/each}
                       </span>
                       {#if pc.comment}
-                        <span class="comment-peer-text">{pc.comment}</span>
+                        <span class="comment-peer-text"><bdi>{pc.comment}</bdi></span>
                       {/if}
                     </div>
                   {/each}

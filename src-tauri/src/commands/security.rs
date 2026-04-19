@@ -428,11 +428,23 @@ pub async fn import_ipfilter_file(
             let raw = std::fs::read(&src)
                 .map_err(|e| format!("Failed to read file: {e}"))?;
             let decompressed = if ext == "gz" {
+                // Bound the decompressed output to MAX_RESPONSE_BYTES to
+                // prevent a "zip bomb" — a small .gz that expands into
+                // many GB. Without this cap a crafted file could exhaust
+                // memory. We `take(MAX + 1)` and check against the cap so
+                // we can distinguish "exactly the limit" from "overflowed".
                 use flate2::read::GzDecoder;
-                let mut decoder = GzDecoder::new(std::io::Cursor::new(&raw));
+                let decoder = GzDecoder::new(std::io::Cursor::new(&raw));
+                let mut limited = decoder.take(MAX_RESPONSE_BYTES as u64 + 1);
                 let mut out = Vec::new();
-                decoder.read_to_end(&mut out)
+                limited.read_to_end(&mut out)
                     .map_err(|e| format!("Failed to decompress .gz file: {e}"))?;
+                if out.len() > MAX_RESPONSE_BYTES {
+                    return Err(format!(
+                        "Decompressed .gz file is too large (over {} MiB) — refusing to load",
+                        MAX_RESPONSE_BYTES / (1024 * 1024)
+                    ));
+                }
                 out
             } else {
                 extract_ipfilter_from_zip(&raw)?

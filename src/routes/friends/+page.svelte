@@ -687,7 +687,13 @@
               />
             {:else}
               <button class="nick-btn" onclick={() => startEdit(f)} title="Click to edit nickname">
-                {f.nickname || '(no nickname)'}
+                <!-- `<bdi>` isolates the peer-supplied nickname from
+                     the surrounding UI text direction so an embedded
+                     RTL/LTR override character can't reorder
+                     neighbouring elements (Trojan-Source-style
+                     spoofing). Falls back to a non-peer string when
+                     the nickname is empty. -->
+                {#if f.nickname}<bdi>{f.nickname}</bdi>{:else}(no nickname){/if}
               </button>
             {/if}
             <span class="card-status-label">

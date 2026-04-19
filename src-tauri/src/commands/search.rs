@@ -479,6 +479,18 @@ pub async fn get_download_history(
     state: tauri::State<'_, AppState>,
     hashes: Vec<String>,
 ) -> Result<std::collections::HashMap<String, String>, String> {
+    // Cap the batch size so the IPC frame and the SQL `IN (?,?,…)`
+    // query stay bounded. The frontend already chunks search results
+    // (5k visible at most); this guards against a buggy/hostile
+    // caller pushing a million-element vector.
+    const MAX_HISTORY_BATCH: usize = 5_000;
+    if hashes.len() > MAX_HISTORY_BATCH {
+        return Err(format!(
+            "Too many hashes in one batch ({} > {} max) — chunk the request",
+            hashes.len(),
+            MAX_HISTORY_BATCH
+        ));
+    }
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.get_download_history_batch(&hashes))
         .await

@@ -40,6 +40,25 @@ use tracing::{info, warn};
 /// Default file name written into and read from the user data directory.
 pub const DEFAULT_FILE_NAME: &str = "antileech.dat";
 
+/// Hard cap on the number of patterns we'll compile at once. The
+/// upload hot path runs `RegexSet::is_match` on every incoming
+/// connection; a runaway pattern list (intentional or accidental)
+/// would slow handshakes for every peer. 500 is comfortably above any
+/// realistic curated AntiLeech.dat (the public ones top out around 60).
+pub const MAX_PATTERNS: usize = 500;
+
+/// Hard cap on a single pattern's source length. Real patterns are
+/// short brand-name regexes (the longest default is ~12 chars). 256
+/// is generous and bounds the worst-case compile time.
+pub const MAX_PATTERN_LEN: usize = 256;
+
+/// Memory budget passed to the `regex` crate when compiling a pattern.
+/// 1 MiB is the crate's default, named here so it's auditable in one
+/// place. Patterns whose compiled DFA exceeds this are rejected
+/// (returned in the per-pattern error list) rather than allowed to
+/// blow the memory budget on the hot path.
+const REGEX_SIZE_LIMIT: usize = 1 << 20;
+
 /// Built-in patterns — the well-known leech mods + a few that target
 /// clients that explicitly identify as broken. Kept conservative on
 /// purpose; a too-aggressive default would create silent connectivity
@@ -109,27 +128,57 @@ impl AntiLeechFilter {
         patterns: impl IntoIterator<Item = String>,
         enabled: bool,
     ) -> (Self, Vec<(String, regex::Error)>) {
+        // Pre-trim and de-noise once. `take(MAX_PATTERNS + 1)` so we
+        // can detect overflow without iterating an unbounded source.
         let raw: Vec<String> = patterns
             .into_iter()
+            .take(MAX_PATTERNS + 1)
             .map(|p| p.trim().to_string())
             .filter(|p| !p.is_empty() && !p.starts_with('#'))
             .collect();
         let mut errors: Vec<(String, regex::Error)> = Vec::new();
-        let mut accepted: Vec<String> = Vec::with_capacity(raw.len());
+        let mut accepted: Vec<String> = Vec::with_capacity(raw.len().min(MAX_PATTERNS));
         for pat in &raw {
+            // Hard cap on count. Anything past MAX_PATTERNS is dropped
+            // with a synthetic error so the user sees it in the UI's
+            // "Patterns rejected" list rather than silently losing
+            // patterns. We synthesise the error by compiling an
+            // intentionally bad pattern (regex doesn't expose a public
+            // constructor for `regex::Error`).
+            if accepted.len() >= MAX_PATTERNS {
+                if let Err(e) = Regex::new("(?P<>") {
+                    errors.push((
+                        pat.clone(),
+                        e,
+                    ));
+                }
+                continue;
+            }
+            // Hard cap on per-pattern length. A 4 KiB regex isn't a
+            // brand name, it's a denial-of-service waiting to happen.
+            if pat.len() > MAX_PATTERN_LEN {
+                if let Err(e) = Regex::new("(?P<>") {
+                    errors.push((pat.clone(), e));
+                }
+                continue;
+            }
             // Force case-insensitive matching unless the pattern already
             // has its own `(?i)` / inline flag. Most user patterns are
             // brand names ("VeryCD", "MagicMule") and the user shouldn't
             // have to remember to add the flag. We compile each pattern
-            // standalone (and discard the `Regex`) purely to surface
-            // per-pattern compile errors back to the caller — the
-            // RegexSet built below is what actually runs at match time.
+            // standalone with an explicit `size_limit` so a pathological
+            // regex that would compile to a multi-MB DFA is rejected
+            // here instead of slowing the upload hot path.
             let normalised = if pat.starts_with("(?") {
                 pat.clone()
             } else {
                 format!("(?i){pat}")
             };
-            match Regex::new(&normalised) {
+            let compile_result = regex::RegexBuilder::new(&normalised)
+                .size_limit(REGEX_SIZE_LIMIT)
+                .dfa_size_limit(REGEX_SIZE_LIMIT)
+                .build();
+            match compile_result {
                 Ok(_) => accepted.push(pat.clone()),
                 Err(e) => errors.push((pat.clone(), e)),
             }
@@ -151,7 +200,15 @@ impl AntiLeechFilter {
                     }
                 })
                 .collect();
-            match RegexSetBuilder::new(&prefixed).build() {
+            // Same size cap on the combined RegexSet. If the overall
+            // automaton would be huge despite each individual pattern
+            // fitting, we'd rather warn and run with no filter than
+            // burn a peer-facing CPU budget.
+            let build_result = RegexSetBuilder::new(&prefixed)
+                .size_limit(REGEX_SIZE_LIMIT)
+                .dfa_size_limit(REGEX_SIZE_LIMIT)
+                .build();
+            match build_result {
                 Ok(s) => Some(s),
                 Err(e) => {
                     warn!("AntiLeech: RegexSet build failed unexpectedly: {e}");

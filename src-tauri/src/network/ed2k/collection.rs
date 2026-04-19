@@ -142,13 +142,38 @@ impl Collection {
     }
 
     fn load_text(path: &Path) -> anyhow::Result<Self> {
+        // Cap how much of a "text collection" we'll ingest. The binary
+        // path enforces a hard 100,000-entry limit (above); the text
+        // path historically had no caps, so a multi-GB .txt under an
+        // allowed folder could OOM the process. The same 100,000 entry
+        // cap mirrors the binary cap; the 32 MiB byte cap is generous
+        // for any realistic curated link list.
+        const MAX_TEXT_BYTES: u64 = 32 * 1024 * 1024;
+        const MAX_TEXT_LINES: usize = 100_000;
+
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() > MAX_TEXT_BYTES {
+            return Err(anyhow::anyhow!(
+                "Text collection is too large ({} bytes > {} MiB cap)",
+                metadata.len(),
+                MAX_TEXT_BYTES / (1024 * 1024)
+            ));
+        }
         let content = std::fs::read_to_string(path)?;
         let mut files = Vec::new();
         let name = path.file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        let mut line_count = 0usize;
         for line in content.lines() {
+            line_count += 1;
+            if line_count > MAX_TEXT_LINES {
+                return Err(anyhow::anyhow!(
+                    "Text collection has too many lines (> {} max)",
+                    MAX_TEXT_LINES
+                ));
+            }
             let line = line.trim();
             if line.starts_with("ed2k://|file|") {
                 if let Some(cf) = parse_ed2k_link(line) {
