@@ -8844,6 +8844,11 @@ pub async fn start_network(
 
                         // eMule: "Update server list when connecting" —
                         // process OP_SERVERLIST payload received during login handshake.
+                        // Some servers push it unsolicited (handled here); most modern
+                        // servers wait for an explicit OP_GETSERVERLIST request from
+                        // the client (sent below). Either way the response opcode is
+                        // the same OP_SERVERLIST and arrives via the regular
+                        // `ServerEvent::ServerList` branch in the read loop.
                         if settings.add_servers_from_server {
                             if let Some(ref list_data) = session.server_list_data {
                                 let added = state.server_list.add_from_server_list_packet(
@@ -8858,6 +8863,15 @@ pub async fn start_network(
                                         warn!("Failed to save server.met after login server list: {e}");
                                     }
                                 }
+                            }
+                            // Explicitly request the server list. eMule's "Update
+                            // server list when connecting" sends OP_GETSERVERLIST
+                            // shortly after login because most public ed2k servers
+                            // don't push the list unsolicited — they wait for the
+                            // client to ask. Without this our `add_servers_from_server`
+                            // setting was effectively dead for the common case.
+                            if let Err(e) = conn.request_server_list().await {
+                                warn!("Failed to send OP_GETSERVERLIST: {e}");
                             }
                         }
 

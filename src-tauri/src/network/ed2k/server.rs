@@ -534,7 +534,10 @@ impl Ed2kServerConnection {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    /// Send eMule's `OP_GETSERVERLIST` to ask the server for its known
+    /// peer servers. The response arrives later as `OP_SERVERLIST` and
+    /// is parsed by `ServerList::add_from_server_list_packet`. Called
+    /// after login when `add_servers_from_server` is enabled.
     pub async fn request_server_list(&mut self) -> anyhow::Result<()> {
         self.write_packet(OP_GETSERVERLIST, &[]).await?;
         debug!("Sent OP_GETSERVERLIST request to server");
