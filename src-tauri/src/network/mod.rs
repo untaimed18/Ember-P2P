@@ -9419,7 +9419,8 @@ pub async fn start_network(
                             let ext_ip = Ipv4Addr::from(ip_bytes);
                             info!("Server HighID reports our IP as {}", ext_ip);
                             if !ext_ip.is_unspecified() && !ext_ip.is_loopback() {
-                                if state.external_ip.is_none() {
+                                let was_none = state.external_ip.is_none();
+                                if was_none {
                                     set_external_ip(&mut state, Some(ext_ip));
                                     state.stats.external_ip = ext_ip.to_string();
                                     info!("External IP set from server HighID: {}", ext_ip);
