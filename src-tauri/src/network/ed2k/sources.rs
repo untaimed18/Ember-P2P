@@ -93,7 +93,19 @@ impl DownloadSourceEntry {
             DownloadSourceState::Failed | DownloadSourceState::TooManyConns => FILEREASKTIME_SECS as u64,
             DownloadSourceState::OnQueue { .. } => FILEREASKTIME_SECS as u64,
             DownloadSourceState::WaitCallback | DownloadSourceState::WaitCallbackKad => FILEREASKTIME_SECS as u64,
-            DownloadSourceState::Connecting | DownloadSourceState::Downloading => return u64::MAX,
+            DownloadSourceState::Connecting | DownloadSourceState::Downloading => {
+                // Watchdog: if a source has been `Connecting` /
+                // `Downloading` far longer than any legitimate handshake
+                // or transfer gap, treat it as stuck and allow a fresh
+                // reask. Without this, a panicked or killed driver task
+                // leaves the source permanently "active" and the
+                // scheduler can't pick it up again until the next full
+                // list reset.
+                if self.state_changed.elapsed().as_secs() >= Self::CONNECTING_WATCHDOG_SECS {
+                    return 0;
+                }
+                return u64::MAX;
+            }
             DownloadSourceState::LowToLowIp | DownloadSourceState::EmberRelay | DownloadSourceState::Banned => return u64::MAX,
         };
         let elapsed = self.last_asked.elapsed().as_secs();

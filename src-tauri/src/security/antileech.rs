@@ -34,7 +34,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use regex::{Regex, RegexSetBuilder};
+use regex::RegexSetBuilder;
 use tracing::{info, warn};
 
 /// Default file name written into and read from the user data directory.
@@ -142,24 +142,32 @@ impl AntiLeechFilter {
             // Hard cap on count. Anything past MAX_PATTERNS is dropped
             // with a synthetic error so the user sees it in the UI's
             // "Patterns rejected" list rather than silently losing
-            // patterns. We synthesise the error by compiling an
-            // intentionally bad pattern (regex doesn't expose a public
-            // constructor for `regex::Error`).
+            // patterns. `regex::Error` is `#[non_exhaustive]` but its
+            // public `Syntax(String)` variant is constructible from
+            // outside the crate, so we use it as a typed carrier for
+            // a human-readable rejection reason instead of compiling
+            // an intentionally invalid pattern (which clippy correctly
+            // flags as `invalid_regex` and would surface a confusing
+            // "empty capture group name" message in the UI).
             if accepted.len() >= MAX_PATTERNS {
-                if let Err(e) = Regex::new("(?P<>") {
-                    errors.push((
-                        pat.clone(),
-                        e,
-                    ));
-                }
+                errors.push((
+                    pat.clone(),
+                    regex::Error::Syntax(format!(
+                        "Too many patterns (limit {MAX_PATTERNS}); pattern dropped",
+                    )),
+                ));
                 continue;
             }
             // Hard cap on per-pattern length. A 4 KiB regex isn't a
             // brand name, it's a denial-of-service waiting to happen.
             if pat.len() > MAX_PATTERN_LEN {
-                if let Err(e) = Regex::new("(?P<>") {
-                    errors.push((pat.clone(), e));
-                }
+                errors.push((
+                    pat.clone(),
+                    regex::Error::Syntax(format!(
+                        "Pattern exceeds {MAX_PATTERN_LEN}-byte limit ({} bytes)",
+                        pat.len(),
+                    )),
+                ));
                 continue;
             }
             // Force case-insensitive matching unless the pattern already
