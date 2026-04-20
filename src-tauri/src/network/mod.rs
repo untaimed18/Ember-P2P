@@ -3547,6 +3547,19 @@ pub async fn start_network(
     reputation_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut watchdog_timer = tokio::time::interval(std::time::Duration::from_secs(30));
     watchdog_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Broker tick + event drain. Runs at 200 ms so:
+    //   * `BrokerEvent::StartPunch` / `StartRelay` posted by
+    //     `attempt_low_to_low()` are dispatched into spawned tasks
+    //     within a single tick, instead of waiting for the 5-minute
+    //     `cleanup_timer` arm where this code used to live (which
+    //     was longer than `PUNCH_TIMEOUT` / `RELAY_TIMEOUT`, making
+    //     hole-punch and LowID-to-LowID effectively dead).
+    //   * `broker.tick()` reaps expired in-flight attempts close to
+    //     their nominal 20 s / 30 s timeouts.
+    // Idle cost per tick is one `try_recv()` (returns `Empty` instantly)
+    // plus a hashmap walk over at most `MAX_ACTIVE_ATTEMPTS` entries.
+    let mut broker_timer = tokio::time::interval(std::time::Duration::from_millis(200));
+    broker_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // UDP source sweep for active downloads (eMule UDPSERVERREASKTIME = 30 min)
     let mut server_udp_source_timer = tokio::time::interval(std::time::Duration::from_secs(30 * 60));
     server_udp_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -7207,10 +7220,10 @@ pub async fn start_network(
                     state.outbound_session_tasks.retain(|_, started| now.duration_since(*started).as_secs() < 600);
                 }
 
-                // Tick the connection broker (clean up expired attempts)
-                if let Some(ref mut broker) = state.connection_broker {
-                    broker.tick().await;
-                }
+                // (broker.tick() and broker event drain are now handled
+                // by their own 200 ms `broker_timer` arm — the 5-minute
+                // cadence here was longer than PUNCH_TIMEOUT/RELAY_TIMEOUT
+                // and effectively disabled hole-punch + LowID-to-LowID.)
 
                 // Clean up expired relay sessions
                 {
@@ -7221,7 +7234,147 @@ pub async fn start_network(
                     }
                 }
 
-                // Drain broker events (punch/relay coordination)
+                // (broker event drain moved to its own 200ms `broker_timer`
+                // arm — see below. Leaving it on cleanup_timer's 5-min
+                // cadence made every queued punch/relay event obsolete
+                // before it was ever processed.)
+
+                // Periodic NAT reprobe (every 5 minutes)
+                if state.nat_info.needs_reprobe() && state.external_ip.is_some() {
+                    let nat_info = ember::nat::probe_nat(&udp_socket).await;
+                    state.nat_info = nat_info;
+                    // Same HighID fallback as the initial probe: if STUN
+                    // is still down but we know our external IP, don't
+                    // regress to `Unknown` / no-punch.
+                    if let Some(ext_ip) = state.external_ip {
+                        let _ = state.nat_info.apply_highid_fallback(
+                            std::net::IpAddr::V4(ext_ip),
+                            state.udp_port,
+                        );
+                    }
+                }
+
+                // Auto-retry offline friends via rendezvous for the
+                // entire session. First 30 min: every tick (5 min).
+                // After that: every other tick (10 min) to reduce load.
+                if let Some(started) = state.friend_search_started_at {
+                    let elapsed = std::time::Instant::now().duration_since(started).as_secs();
+                    let should_retry = if elapsed <= 1800 {
+                        true
+                    } else {
+                        (elapsed / 300) % 2 == 0
+                    };
+                    if should_retry {
+                        let all_friends: Vec<[u8; 16]> = friend_hashes.read().await.iter().copied().collect();
+                        let sessions = state.ember_sessions.read().await;
+
+                        let mut retry_targets: Vec<[u8; 16]> = Vec::new();
+                        for fh in &all_friends {
+                            if state.online_friends.contains_key(fh) { continue; }
+                            if sessions.contains_key(fh) { continue; }
+                            if state.outbound_session_tasks.contains_key(fh) { continue; }
+                            retry_targets.push(*fh);
+                        }
+                        drop(sessions);
+
+                        if !retry_targets.is_empty() {
+                            info!("Friend auto-retry ({:.0}s since connect): looking up {} offline friend(s) via rendezvous",
+                                elapsed as f64, retry_targets.len());
+                        }
+                        for target_hash in retry_targets.iter().take(10) {
+                            state.outbound_session_tasks.insert(*target_hash, std::time::Instant::now());
+                            let _ = app_handle.emit("ember:friend-searching", serde_json::json!({
+                                "user_hash": hex::encode(target_hash),
+                            }));
+                            spawn_rendezvous_friend_lookup(
+                                &settings, &state, ember_hash, *target_hash,
+                                &db, &app_handle, &friend_hashes, &ul_event_tx,
+                                ed25519_pubkey, ed25519_secret_key,
+                            );
+                        }
+                    }
+                }
+
+                // Prune callback buddy attempts for files no longer pending or active
+                {
+                    let mut live_hashes: HashSet<[u8; 16]> = state.pending_downloads.values()
+                        .filter_map(|pd| hex::decode(&pd.file_hash).ok())
+                        .filter(|b| b.len() == 16)
+                        .map(|b| { let mut a = [0u8; 16]; a.copy_from_slice(&b); a })
+                        .collect();
+                    for pfs in state.per_file_sources.values() {
+                        live_hashes.insert(pfs.file_hash);
+                    }
+                    state.callback_buddy_attempts.retain(|&(_, fh), _| live_hashes.contains(&fh));
+                }
+
+                // Prune expired sources (older than 1 hour)
+                {
+                    let mut sm = source_manager.write().await;
+                    sm.cleanup_expired();
+                }
+
+                // Prune stale credit records (older than 90 days)
+                {
+                    let mut cm = credit_manager.write().await;
+                    cm.cleanup_stale(90);
+                }
+
+                // Remove contacts not seen in 2 hours
+                let stale_removed = state.routing_table.remove_stale(7200);
+                if stale_removed > 0 {
+                    debug!("Removed {stale_removed} stale contacts from routing table");
+                    state.stats.connected_peers = state.routing_table.len() as u32;
+                }
+
+                let now = chrono::Utc::now().timestamp();
+                // Collect stale per-(target, peer) entries, then dedupe by
+                // file_hash so we reset publish_manager at most once per
+                // file regardless of how many peers we had outstanding.
+                let stale_keys: Vec<((KadId, SocketAddr), KadId, bool)> = state.publish_pending
+                    .iter()
+                    .filter(|(_, (_, sent_at, _))| now - sent_at > 120)
+                    .map(|(k, (file_hash, _, is_source))| (*k, *file_hash, *is_source))
+                    .collect();
+                let mut retried_files: std::collections::HashSet<(KadId, bool)> = std::collections::HashSet::new();
+                for (key, file_hash, is_source) in &stale_keys {
+                    state.publish_pending.remove(key);
+                    // Skip stale-retry bookkeeping if any peer for this file
+                    // has already succeeded (file_hash still in
+                    // publish_pending under a different key → recently acked).
+                    // The dedupe set covers the common "all peers timed out"
+                    // path.
+                    if retried_files.insert((*file_hash, *is_source)) {
+                        if *is_source {
+                            state.publish_manager.reset_source_publish(file_hash);
+                        } else {
+                            state.publish_manager.reset_keyword_publish(file_hash);
+                        }
+                        debug!("Retrying unconfirmed publish for target {} (peer {})", key.0, key.1);
+                    }
+                }
+            }
+
+            // Broker tick + event drain. Used to live inside the
+            // `cleanup_timer` arm (5-minute cadence), which made every
+            // `BrokerEvent::StartPunch` / `StartRelay` posted by
+            // `attempt_low_to_low()` sit in the channel for minutes —
+            // long past the per-attempt PUNCH_TIMEOUT (20s) and
+            // RELAY_TIMEOUT (30s), and `broker.tick()` would then GC
+            // the matching attempt before the event was even dispatched.
+            // Net effect: hole-punch and LowID-to-LowID never fired in
+            // any session shorter than 5 minutes. 200 ms cadence is
+            // small enough that punch/relay scheduling is effectively
+            // event-driven and large enough that an idle tick costs
+            // one `try_recv()` (returns `Empty` instantly) plus a
+            // hashmap walk over at most `MAX_ACTIVE_ATTEMPTS` entries.
+            _ = broker_timer.tick() => {
+                if state.stats.status == NetworkStatus::Disconnected { continue; }
+
+                if let Some(ref mut broker) = state.connection_broker {
+                    broker.tick().await;
+                }
+
                 if let Some(ref mut rx) = state.broker_event_rx {
                     while let Ok(event) = rx.try_recv() {
                         match event {
@@ -7443,7 +7596,6 @@ pub async fn start_network(
                             }
                             ember::broker::BrokerEvent::ConnectionReady(conn) => {
                                 tracing::info!("Broker: connection ready for transfer {} from {}:{} via {:?}", conn.transfer_id, conn.source_ip, conn.source_port, conn.method);
-                                // Feed into the callback download pipeline
                                 let parts = upload_server::KadCallbackParts {
                                     peer_ip: conn.source_ip,
                                     peer_port: conn.source_port,
@@ -7481,121 +7633,6 @@ pub async fn start_network(
                                 }
                             }
                         }
-                    }
-                }
-
-                // Periodic NAT reprobe (every 5 minutes)
-                if state.nat_info.needs_reprobe() && state.external_ip.is_some() {
-                    let nat_info = ember::nat::probe_nat(&udp_socket).await;
-                    state.nat_info = nat_info;
-                    // Same HighID fallback as the initial probe: if STUN
-                    // is still down but we know our external IP, don't
-                    // regress to `Unknown` / no-punch.
-                    if let Some(ext_ip) = state.external_ip {
-                        let _ = state.nat_info.apply_highid_fallback(
-                            std::net::IpAddr::V4(ext_ip),
-                            state.udp_port,
-                        );
-                    }
-                }
-
-                // Auto-retry offline friends via rendezvous for the
-                // entire session. First 30 min: every tick (5 min).
-                // After that: every other tick (10 min) to reduce load.
-                if let Some(started) = state.friend_search_started_at {
-                    let elapsed = std::time::Instant::now().duration_since(started).as_secs();
-                    let should_retry = if elapsed <= 1800 {
-                        true
-                    } else {
-                        (elapsed / 300) % 2 == 0
-                    };
-                    if should_retry {
-                        let all_friends: Vec<[u8; 16]> = friend_hashes.read().await.iter().copied().collect();
-                        let sessions = state.ember_sessions.read().await;
-
-                        let mut retry_targets: Vec<[u8; 16]> = Vec::new();
-                        for fh in &all_friends {
-                            if state.online_friends.contains_key(fh) { continue; }
-                            if sessions.contains_key(fh) { continue; }
-                            if state.outbound_session_tasks.contains_key(fh) { continue; }
-                            retry_targets.push(*fh);
-                        }
-                        drop(sessions);
-
-                        if !retry_targets.is_empty() {
-                            info!("Friend auto-retry ({:.0}s since connect): looking up {} offline friend(s) via rendezvous",
-                                elapsed as f64, retry_targets.len());
-                        }
-                        for target_hash in retry_targets.iter().take(10) {
-                            state.outbound_session_tasks.insert(*target_hash, std::time::Instant::now());
-                            let _ = app_handle.emit("ember:friend-searching", serde_json::json!({
-                                "user_hash": hex::encode(target_hash),
-                            }));
-                            spawn_rendezvous_friend_lookup(
-                                &settings, &state, ember_hash, *target_hash,
-                                &db, &app_handle, &friend_hashes, &ul_event_tx,
-                                ed25519_pubkey, ed25519_secret_key,
-                            );
-                        }
-                    }
-                }
-
-                // Prune callback buddy attempts for files no longer pending or active
-                {
-                    let mut live_hashes: HashSet<[u8; 16]> = state.pending_downloads.values()
-                        .filter_map(|pd| hex::decode(&pd.file_hash).ok())
-                        .filter(|b| b.len() == 16)
-                        .map(|b| { let mut a = [0u8; 16]; a.copy_from_slice(&b); a })
-                        .collect();
-                    for pfs in state.per_file_sources.values() {
-                        live_hashes.insert(pfs.file_hash);
-                    }
-                    state.callback_buddy_attempts.retain(|&(_, fh), _| live_hashes.contains(&fh));
-                }
-
-                // Prune expired sources (older than 1 hour)
-                {
-                    let mut sm = source_manager.write().await;
-                    sm.cleanup_expired();
-                }
-
-                // Prune stale credit records (older than 90 days)
-                {
-                    let mut cm = credit_manager.write().await;
-                    cm.cleanup_stale(90);
-                }
-
-                // Remove contacts not seen in 2 hours
-                let stale_removed = state.routing_table.remove_stale(7200);
-                if stale_removed > 0 {
-                    debug!("Removed {stale_removed} stale contacts from routing table");
-                    state.stats.connected_peers = state.routing_table.len() as u32;
-                }
-
-                let now = chrono::Utc::now().timestamp();
-                // Collect stale per-(target, peer) entries, then dedupe by
-                // file_hash so we reset publish_manager at most once per
-                // file regardless of how many peers we had outstanding.
-                let stale_keys: Vec<((KadId, SocketAddr), KadId, bool)> = state.publish_pending
-                    .iter()
-                    .filter(|(_, (_, sent_at, _))| now - sent_at > 120)
-                    .map(|(k, (file_hash, _, is_source))| (*k, *file_hash, *is_source))
-                    .collect();
-                let mut retried_files: std::collections::HashSet<(KadId, bool)> = std::collections::HashSet::new();
-                for (key, file_hash, is_source) in &stale_keys {
-                    state.publish_pending.remove(key);
-                    // Skip stale-retry bookkeeping if any peer for this file
-                    // has already succeeded (file_hash still in
-                    // publish_pending under a different key → recently acked).
-                    // The dedupe set covers the common "all peers timed out"
-                    // path.
-                    if retried_files.insert((*file_hash, *is_source)) {
-                        if *is_source {
-                            state.publish_manager.reset_source_publish(file_hash);
-                        } else {
-                            state.publish_manager.reset_keyword_publish(file_hash);
-                        }
-                        debug!("Retrying unconfirmed publish for target {} (peer {})", key.0, key.1);
                     }
                 }
             }

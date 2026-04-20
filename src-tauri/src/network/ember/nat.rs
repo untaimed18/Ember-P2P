@@ -129,12 +129,24 @@ impl NatInfo {
     /// same port for inbound and the actual NAT mapping is usually
     /// 1:1 for cone NATs, so it's the best guess we can make without
     /// a real STUN reply.
+    ///
+    /// We *do not* gate on `external_addr.is_some()`: a previous STUN
+    /// probe may have written an external mapping but failed to
+    /// classify the NAT (e.g. only one server responded, before the
+    /// `probe_nat` optimistic-PortRestricted patch landed, or any
+    /// future regression). In that situation we still need to upgrade
+    /// `nat_type` away from `Unknown` so the broker is willing to
+    /// attempt a hole-punch. We preserve the existing `external_addr`
+    /// when it's present so we don't clobber the real mapped port
+    /// returned by STUN.
     pub fn apply_highid_fallback(&mut self, external_ip: IpAddr, local_udp_port: u16) -> bool {
-        if self.nat_type != NatType::Unknown || self.external_addr.is_some() {
+        if self.nat_type != NatType::Unknown {
             return false;
         }
         self.nat_type = NatType::PortRestricted;
-        self.external_addr = Some(SocketAddr::new(external_ip, local_udp_port));
+        if self.external_addr.is_none() {
+            self.external_addr = Some(SocketAddr::new(external_ip, local_udp_port));
+        }
         self.last_probed = Instant::now();
         true
     }
@@ -200,7 +212,20 @@ pub async fn probe_nat(local_socket: &UdpSocket) -> NatInfo {
             info!("NAT probe: port-restricted or better NAT (consistent port {})", external_addr.port());
             NatType::PortRestricted
         } else {
-            NatType::Unknown
+            // Only one STUN reply made it back — usually the other servers
+            // are blocked, slow, or timing out. We can't disambiguate
+            // symmetric vs cone with a single mapped port, but leaving
+            // `nat_type = Unknown` is worse: `is_punchable()` returns
+            // false and the broker will skip every hole-punch attempt
+            // even on a perfectly punchable link. Optimistically assume
+            // PortRestricted (the common case for residential NATs); if
+            // we're actually behind a symmetric NAT the punch will fail
+            // and the broker falls back to relay anyway.
+            info!(
+                "NAT probe: only 1 STUN reply (mapped {}), optimistically assuming PortRestricted",
+                external_addr,
+            );
+            NatType::PortRestricted
         }
     } else {
         NatType::Unknown
@@ -406,6 +431,52 @@ mod tests {
         for t in [NatType::Open, NatType::FullCone, NatType::RestrictedCone, NatType::PortRestricted, NatType::Symmetric, NatType::Unknown] {
             assert_eq!(NatType::from_u8(t.as_u8()), t);
         }
+    }
+
+    #[test]
+    fn highid_fallback_upgrades_unknown_with_no_addr() {
+        let mut info = NatInfo::unknown();
+        let applied = info.apply_highid_fallback(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)), 4242);
+        assert!(applied);
+        assert_eq!(info.nat_type, NatType::PortRestricted);
+        assert_eq!(
+            info.external_addr,
+            Some("8.8.8.8:4242".parse().unwrap()),
+        );
+    }
+
+    #[test]
+    fn highid_fallback_upgrades_unknown_but_preserves_existing_addr() {
+        // Pre-existing external_addr (e.g. STUN got one reply but
+        // couldn't classify) must NOT be clobbered by the fallback —
+        // we still want to upgrade `nat_type` so the broker is willing
+        // to attempt a hole-punch, while keeping the real mapped port.
+        let mut info = NatInfo {
+            nat_type: NatType::Unknown,
+            external_addr: Some("1.2.3.4:9999".parse().unwrap()),
+            last_probed: Instant::now(),
+        };
+        let applied = info.apply_highid_fallback(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)), 4242);
+        assert!(applied);
+        assert_eq!(info.nat_type, NatType::PortRestricted);
+        assert_eq!(
+            info.external_addr,
+            Some("1.2.3.4:9999".parse().unwrap()),
+            "fallback must not overwrite an addr STUN already discovered",
+        );
+    }
+
+    #[test]
+    fn highid_fallback_skips_when_already_classified() {
+        let mut info = NatInfo {
+            nat_type: NatType::FullCone,
+            external_addr: None,
+            last_probed: Instant::now(),
+        };
+        let applied = info.apply_highid_fallback(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)), 4242);
+        assert!(!applied);
+        assert_eq!(info.nat_type, NatType::FullCone);
+        assert_eq!(info.external_addr, None);
     }
 
     #[test]
