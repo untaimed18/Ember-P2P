@@ -3640,6 +3640,30 @@ async fn download_parts_from_source(
 
         let mut blocks_received_in_current_req: usize = 0;
         let mut completed_reqs: usize = 0;
+        // Sticky "no next part to pipeline" flag for the current part.
+        //
+        // The cross-part pipeline trigger below fires every time a
+        // request-batch's worth of blocks arrives AND `sent_idx` has
+        // reached `batches.len()` (all batches for this part are in
+        // flight) AND nothing is pipelined yet. On the *last* queued
+        // part (or whenever `pre_pipeline_next_part_ms` returns None
+        // because every other part is in-progress on another source
+        // / already complete), the trigger has no work to do — but it
+        // re-fires every ~50-200 ms for the entire tail of the part
+        // (10+ s near end-of-download), spamming `info!` and
+        // re-acquiring the tracker / chunk-selector / control locks
+        // for nothing. See terminals/31.txt: ~600 lines/s of
+        // "no eligible next part found" diag during the final part.
+        //
+        // Once we determine "no next part is available right now",
+        // there's no event inside this per-part loop that would make
+        // a new part appear (peers don't push new queue entries; the
+        // queue is owned by the outer caller). Setting this flag the
+        // first time the search comes back empty turns the trigger
+        // into a no-op for the remainder of this part. The flag is
+        // declared in the same scope as `completed_reqs` so it
+        // resets to `false` for every new part the source picks up.
+        let mut pipeline_giveup_for_part: bool = false;
         let mut consecutive_bad_blocks: u32 = 0;
         const MAX_CONSECUTIVE_BAD_BLOCKS: u32 = 5;
         let data_loop_start = std::time::Instant::now();
@@ -4236,7 +4260,7 @@ async fn download_parts_from_source(
                     };
                     write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await?;
                     sent_idx += 1;
-                } else if pipelined_next.is_none() && !batches.is_empty() {
+                } else if pipelined_next.is_none() && !batches.is_empty() && !pipeline_giveup_for_part {
                     // CROSS-PART PIPELINE: every batch for the current
                     // part has been sent, but we're still receiving
                     // bytes. Pre-pick the next part and ship its first
@@ -4244,6 +4268,15 @@ async fn download_parts_from_source(
                     // saturated through the part-N → part-(N+1)
                     // hand-off (no round-trip stall, no Hello/SecIdent
                     // reconnect).
+                    //
+                    // Gated on `!pipeline_giveup_for_part`: once we've
+                    // already discovered there's no next part to
+                    // pipeline (tail of the last queued part, all
+                    // other parts in-progress on other sources, or
+                    // download nearly complete), don't keep retrying
+                    // on every batch completion. See declaration of
+                    // `pipeline_giveup_for_part` for the full
+                    // rationale.
                     //
                     // CRITICAL: pipeline the part the next iteration
                     // will actually pick — i.e. the next entry already
@@ -4391,11 +4424,23 @@ async fn download_parts_from_source(
                             }
                         }
                     } else {
-                        info!(
-                            "DIAG: source {} ({}) cross-part pipeline trigger fired for part {} (sent_idx={}/{}) but no eligible next part found (queue_idx={}, queue_len={})",
+                        // Downgraded from info! to debug! and gated
+                        // by the giveup flag below: in the prior
+                        // build this fired ~30-50 Hz per source for
+                        // the entire 10+ s tail of the last part of
+                        // a download (terminals/31.txt). Useful as
+                        // a once-per-part breadcrumb but never as
+                        // a steady-state log line.
+                        debug!(
+                            "DIAG: source {} ({}) cross-part pipeline trigger fired for part {} (sent_idx={}/{}) but no eligible next part found (queue_idx={}, queue_len={}); marking pipeline as given up for this part",
                             _src_idx, addr, part_idx, sent_idx, batches.len(),
                             queue_idx, part_queue.len(),
                         );
+                        // Suppress further trigger work for the rest
+                        // of this part — there's no event in this
+                        // per-part loop that would make a new part
+                        // appear in `part_queue`.
+                        pipeline_giveup_for_part = true;
                     }
                 }
             }
