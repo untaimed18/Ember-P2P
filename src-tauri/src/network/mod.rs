@@ -5735,7 +5735,56 @@ pub async fn start_network(
                                         debug!("Skipping callback source: buddy IP {} is private/unroutable", buddy_ip);
                                         continue;
                                     }
-                                    let buddy_tcp_port = cb_src.buddy_port.unwrap_or(0);
+                                    // Per eMule `Search.cpp:668-669`,
+                                    // `TAG_SERVERIP` / `TAG_SERVERPORT`
+                                    // carry the **buddy's UDP-listen
+                                    // address**, not its TCP port. So
+                                    // `cb_src.buddy_port` is ALREADY the
+                                    // UDP port we need — no `+3` TCP→UDP
+                                    // adjustment. The previous code
+                                    // misnamed this `buddy_tcp_port` and
+                                    // then fabricated a "UDP" port by
+                                    // adding 3, sending every
+                                    // `KADEMLIA_CALLBACK_REQ` to an
+                                    // arbitrary wrong port — no buddy
+                                    // ever received them, which is why
+                                    // zero LowID callback connections
+                                    // ever materialised for KAD-discovered
+                                    // sources (see the "Sent KAD
+                                    // CallbackReq …" log lines with no
+                                    // matching inbound "Adopted LowID
+                                    // callback stream" in session 3).
+                                    let buddy_udp_port = cb_src.buddy_port.unwrap_or(0);
+                                    if buddy_udp_port == 0 {
+                                        debug!("Skipping callback source: no buddy UDP port in TAG_SERVERPORT");
+                                        continue;
+                                    }
+                                    // `cb_src.buddy_hash` is the
+                                    // `TAG_BUDDYHASH` value published by
+                                    // the LowID peer, which eMule
+                                    // `Search.cpp:665-670` computes as
+                                    // `NOT(LowID_peer_kad_id)` — a
+                                    // verification token, NOT the
+                                    // buddy's actual KAD ID. The LowID
+                                    // peer's `OP_CALLBACK` handler
+                                    // (`ListenSocket.cpp:1337-1358`)
+                                    // accepts the callback iff
+                                    // `received_token XOR all_ones ==
+                                    // my_kad_id`. We forward this
+                                    // token unmodified as the first
+                                    // 128-bit field of
+                                    // `KADEMLIA_CALLBACK_REQ` so the
+                                    // buddy relays it to its LowID
+                                    // client via `OP_CALLBACK` with
+                                    // `uCheck` intact.
+                                    //
+                                    // Looking this hash up in our
+                                    // routing table to resolve the
+                                    // buddy's UDP port was always
+                                    // wrong — there's no contact with
+                                    // ID = NOT(LowID_peer_kad_id) in
+                                    // the routing table except by
+                                    // astronomical coincidence.
                                     let buddy_hash = match &cb_src.buddy_hash {
                                         Some(h) => *h,
                                         None => {
@@ -5763,11 +5812,6 @@ pub async fn start_network(
                                         );
                                         continue;
                                     }
-
-                                    // Resolve buddy's KAD UDP port: routing table first, then TCP+3 fallback
-                                    let buddy_udp_port = state.routing_table.get_contact(&buddy_hash)
-                                        .map(|c| c.udp_port)
-                                        .unwrap_or_else(|| buddy_tcp_port.saturating_add(3));
 
                                     let buddy_addr = SocketAddr::new(buddy_ip.into(), buddy_udp_port);
                                     let file_id = KadId(fh);
