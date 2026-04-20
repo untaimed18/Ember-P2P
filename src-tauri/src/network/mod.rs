@@ -6008,11 +6008,25 @@ pub async fn start_network(
                                 {
                                     let mut mgr = transfer_manager.write().await;
                                     mgr.update_sources(&transfer_id, indirect_count as u32, 0, 0);
+                                    // Skip rows when the peer IP is already
+                                    // represented — either by an existing
+                                    // placeholder from a prior search cycle
+                                    // or by the real `(ip, ephemeral_port)`
+                                    // row the callback arrived on. Without
+                                    // the guard each ~45s search refresh
+                                    // stomps the placeholder back to
+                                    // `Connecting`, producing duplicate
+                                    // rows for peers that are already
+                                    // queued or transferring.
                                     for cb_src in &callback_sources {
+                                        let ip_s = cb_src.ip.to_string();
+                                        if mgr.has_source_detail_for_ip(&transfer_id, &ip_s) {
+                                            continue;
+                                        }
                                         mgr.update_source_detail(
                                             &transfer_id,
                                             crate::types::SourceInfo {
-                                                ip: cb_src.ip.to_string(),
+                                                ip: ip_s,
                                                 port: cb_src.tcp_port,
                                                 status: crate::types::SourceStatus::Connecting,
                                                 queue_rank: None,
@@ -6028,10 +6042,14 @@ pub async fn start_network(
                                         );
                                     }
                                     for dc_src in &direct_callback_sources {
+                                        let ip_s = dc_src.ip.to_string();
+                                        if mgr.has_source_detail_for_ip(&transfer_id, &ip_s) {
+                                            continue;
+                                        }
                                         mgr.update_source_detail(
                                             &transfer_id,
                                             crate::types::SourceInfo {
-                                                ip: dc_src.ip.to_string(),
+                                                ip: ip_s,
                                                 port: dc_src.tcp_port,
                                                 status: crate::types::SourceStatus::Connecting,
                                                 queue_rank: None,
@@ -6049,6 +6067,9 @@ pub async fn start_network(
                                     for ls in &lowid_sources {
                                         if state.server_connected {
                                             let ip_str = Ipv4Addr::from(ls.ed2k_server_ip).to_string();
+                                            if mgr.has_source_detail_for_ip(&transfer_id, &ip_str) {
+                                                continue;
+                                            }
                                             mgr.update_source_detail(
                                                 &transfer_id,
                                                 crate::types::SourceInfo {
@@ -6165,14 +6186,28 @@ pub async fn start_network(
                                     // peer connects back to us; the
                                     // type-6 branch transitions on the
                                     // UDP punch-response.
+                                    // Skip callback/type-6 placeholders when
+                                    // the peer IP is already represented.
+                                    // See the parallel block in the
+                                    // "only indirect sources" branch for
+                                    // the full rationale — essentially
+                                    // the real callback connection lands
+                                    // on an ephemeral port that doesn't
+                                    // match the listed listening port,
+                                    // so a refreshed placeholder would
+                                    // duplicate-row the same peer.
                                     for cb_src in &callback_sources {
+                                        let ip_s = cb_src.ip.to_string();
+                                        if mgr.has_source_detail_for_ip(&transfer_id, &ip_s) {
+                                            continue;
+                                        }
                                         let cc = crate::geoip::lookup_country(
                                             &geoip, std::net::IpAddr::V4(cb_src.ip),
                                         );
                                         mgr.update_source_detail(
                                             &transfer_id,
                                             crate::types::SourceInfo {
-                                                ip: cb_src.ip.to_string(),
+                                                ip: ip_s,
                                                 port: cb_src.tcp_port,
                                                 status: crate::types::SourceStatus::Connecting,
                                                 queue_rank: None,
@@ -6188,13 +6223,17 @@ pub async fn start_network(
                                         );
                                     }
                                     for dc_src in &direct_callback_sources {
+                                        let ip_s = dc_src.ip.to_string();
+                                        if mgr.has_source_detail_for_ip(&transfer_id, &ip_s) {
+                                            continue;
+                                        }
                                         let cc = crate::geoip::lookup_country(
                                             &geoip, std::net::IpAddr::V4(dc_src.ip),
                                         );
                                         mgr.update_source_detail(
                                             &transfer_id,
                                             crate::types::SourceInfo {
-                                                ip: dc_src.ip.to_string(),
+                                                ip: ip_s,
                                                 port: dc_src.tcp_port,
                                                 status: crate::types::SourceStatus::Connecting,
                                                 queue_rank: None,
@@ -6427,14 +6466,23 @@ pub async fn start_network(
                                     // the ~4-6 direct sources and
                                     // thinks Ember is finding half what
                                     // eMule finds for the same file.
+                                    // Skip placeholders when the peer IP is
+                                    // already represented (duplicate-row
+                                    // prevention — see parallel blocks
+                                    // in the pending / pending→active
+                                    // branches above).
                                     for cb_src in &callback_sources {
+                                        let ip_s = cb_src.ip.to_string();
+                                        if mgr.has_source_detail_for_ip(&transfer_id, &ip_s) {
+                                            continue;
+                                        }
                                         let cc = crate::geoip::lookup_country(
                                             &geoip, std::net::IpAddr::V4(cb_src.ip),
                                         );
                                         mgr.update_source_detail(
                                             &transfer_id,
                                             crate::types::SourceInfo {
-                                                ip: cb_src.ip.to_string(),
+                                                ip: ip_s,
                                                 port: cb_src.tcp_port,
                                                 status: crate::types::SourceStatus::Connecting,
                                                 queue_rank: None,
@@ -6450,13 +6498,17 @@ pub async fn start_network(
                                         );
                                     }
                                     for dc_src in &direct_callback_sources {
+                                        let ip_s = dc_src.ip.to_string();
+                                        if mgr.has_source_detail_for_ip(&transfer_id, &ip_s) {
+                                            continue;
+                                        }
                                         let cc = crate::geoip::lookup_country(
                                             &geoip, std::net::IpAddr::V4(dc_src.ip),
                                         );
                                         mgr.update_source_detail(
                                             &transfer_id,
                                             crate::types::SourceInfo {
-                                                ip: dc_src.ip.to_string(),
+                                                ip: ip_s,
                                                 port: dc_src.tcp_port,
                                                 status: crate::types::SourceStatus::Connecting,
                                                 queue_rank: None,
@@ -11332,7 +11384,50 @@ pub async fn start_network(
                                     let _ = tx2.send(DownloadEvent::Failed { transfer_id: tid2, error: e.to_string(), failure_kind: kind }).await;
                                 }
                             });
-                            state.download_handles.insert(tid3, handle);
+                            state.download_handles.insert(tid3.clone(), handle);
+                            // The LowID peer successfully called back. The
+                            // real source-detail row will materialise
+                            // under `(peer_ip, ephemeral_port)` as the
+                            // download progresses; drop the
+                            // `(peer_ip, listed_port)` placeholder we
+                            // seeded earlier from the KAD source
+                            // response so the UI doesn't show two rows
+                            // (one forever-Connecting, one actually
+                            // transferring) for the same peer.
+                            //
+                            // We emit `transfer-source-detail` with
+                            // `status=failed` to match the frontend's
+                            // existing remove-on-terminal-status
+                            // protocol (see `transfers/+page.svelte`'s
+                            // `transfer-source-detail` handler — rows
+                            // with `status='failed'` are filtered out
+                            // of the expanded list rather than kept as
+                            // failed entries, so this does NOT inflate
+                            // the "N failed sources hidden" counter).
+                            let peer_ip_str = parts.peer_ip.to_string();
+                            let removed = {
+                                let mut mgr = transfer_manager.write().await;
+                                mgr.remove_callback_placeholders_for_ip(&tid3, &peer_ip_str)
+                            };
+                            for (ip, port) in removed {
+                                let _ = app_handle.emit(
+                                    "transfer-source-detail",
+                                    serde_json::json!({
+                                        "transfer_id": &tid3,
+                                        "ip": ip,
+                                        "port": port,
+                                        "status": "failed",
+                                        "queue_rank": null,
+                                        "speed": 0,
+                                        "transferred": 0,
+                                        "client_software": "",
+                                        "peer_name": "",
+                                        "available_parts": null,
+                                        "total_parts": null,
+                                        "country_code": null,
+                                    }),
+                                );
+                            }
                         }
                     } else {
                         // Download already active — the LowID peer
@@ -11455,6 +11550,43 @@ pub async fn start_network(
                                             "Adopted LowID callback stream from {cb_peer_ip}:{cb_peer_port} into active download {tid} for {hash_hex}",
                                         );
                                         stream_dispatched = true;
+                                        // Clean up the placeholder row for
+                                        // this peer on this transfer. See
+                                        // the mirrored cleanup in the
+                                        // first-time-callback branch
+                                        // above for the detailed
+                                        // rationale — in short, the
+                                        // placeholder was keyed by the
+                                        // listed listening port while
+                                        // the real stream lands on the
+                                        // peer's ephemeral outgoing
+                                        // port; removing the placeholder
+                                        // keeps a single row per peer
+                                        // in the UI.
+                                        let peer_ip_str = cb_peer_ip.to_string();
+                                        let removed = {
+                                            let mut mgr = transfer_manager.write().await;
+                                            mgr.remove_callback_placeholders_for_ip(tid, &peer_ip_str)
+                                        };
+                                        for (ip, port) in removed {
+                                            let _ = app_handle.emit(
+                                                "transfer-source-detail",
+                                                serde_json::json!({
+                                                    "transfer_id": tid,
+                                                    "ip": ip,
+                                                    "port": port,
+                                                    "status": "failed",
+                                                    "queue_rank": null,
+                                                    "speed": 0,
+                                                    "transferred": 0,
+                                                    "client_software": "",
+                                                    "peer_name": "",
+                                                    "available_parts": null,
+                                                    "total_parts": null,
+                                                    "country_code": null,
+                                                }),
+                                            );
+                                        }
                                         break;
                                     }
                                     Err(tokio::sync::mpsc::error::TrySendError::Full(_es)) => {
