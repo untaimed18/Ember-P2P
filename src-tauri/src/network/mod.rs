@@ -7399,9 +7399,16 @@ pub async fn start_network(
                             ember::broker::BrokerEvent::StartPunch { ref attempt_key, source_ip, source_port, our_external_addr, our_nat_type, .. } => {
                                 tracing::info!("Broker: initiating hole-punch for {} -> {}:{} (ext={})", attempt_key, source_ip, source_port, our_external_addr);
                                 let rv_url = settings.rendezvous_url.clone();
-                                let our_id = hex::encode(ember_hash);
-                                let target_id = format!("{:08x}{:04x}", u32::from(source_ip), source_port);
-                                let target_id = format!("{:0>64}", target_id);
+                                // Both `from_id` and `target_id` MUST be 64 chars or
+                                // the rendezvous server returns `400 Bad Request`
+                                // (`punch_register` checks `len() != 64` for both).
+                                // `ember_hash` is 16 bytes = 32 hex chars, so we
+                                // need to left-pad it to 64. Previously this was
+                                // sent unpadded, which made every single punch
+                                // attempt fail at the register step before any
+                                // hole-punch logic could run.
+                                let our_id = format!("{:0>64}", hex::encode(ember_hash));
+                                let target_id = format!("{:0>64}", format!("{:08x}{:04x}", u32::from(source_ip), source_port));
                                 let port = our_external_addr.port();
                                 let nat_type_val = our_nat_type.as_u8();
                                 let attempt_key_owned = attempt_key.clone();
@@ -7573,10 +7580,19 @@ pub async fn start_network(
                                     // gives each LowID peer its own room. The peer side
                                     // gets the matching session_id via the relay-invite
                                     // we POST below, so it will dial the right room.
+                                    //
+                                    // Use the *trailing* portion of target_id, not
+                                    // the leading slice — `target_id` is `{:0>64}`
+                                    // formatted (52 leading zeros + 12 chars of
+                                    // ip:port hex). Slicing `[..16]` would give us
+                                    // 16 zeros for every peer, which is exactly the
+                                    // bug we just hit (every session_id ended in
+                                    // `-0000000000000000-` and collided again).
+                                    let peer_tag = &target_id[target_id.len().saturating_sub(12)..];
                                     let session_id = format!(
                                         "{}-{}-{}",
                                         hex::encode(ember_hash),
-                                        &target_id[..16],
+                                        peer_tag,
                                         hex::encode(file_hash),
                                     );
                                     let transfer_id = attempt_transfer_id;
