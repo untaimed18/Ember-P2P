@@ -512,6 +512,65 @@ impl TransferManager {
         self.source_details.get(transfer_id).cloned().unwrap_or_default()
     }
 
+    /// True if `transfer_id` has any source-detail row for `peer_ip`,
+    /// regardless of port or status. Used by the KAD-search-completion
+    /// path to skip re-adding a "KAD Callback" placeholder when the
+    /// peer has *any* representation — placeholder from an earlier
+    /// cycle, or the real `(ip, ephemeral_port)` row that the
+    /// successful callback installed. Without this guard, every
+    /// ~45s search cycle would reinstall the placeholder alongside
+    /// the already-connected real row, producing duplicate UI
+    /// entries for the same peer.
+    pub fn has_source_detail_for_ip(&self, transfer_id: &str, peer_ip: &str) -> bool {
+        self.source_details
+            .get(transfer_id)
+            .map(|rows| rows.iter().any(|s| s.ip == peer_ip))
+            .unwrap_or(false)
+    }
+
+    /// Remove any KAD-callback / direct-callback / server-relay
+    /// placeholder rows for `transfer_id` whose IP matches `peer_ip`.
+    /// Called when the real LowID peer connects back to us — the
+    /// live connection carries the peer's *ephemeral* outgoing port
+    /// (not the listed listening port we stored in the placeholder),
+    /// so the real source-detail row appears under a different
+    /// `(ip, port)` key than the placeholder. Removing the stale
+    /// placeholder prevents the UI from showing two rows for the
+    /// same peer — one permanently "Connecting" next to another
+    /// that's "Transferring" or "Queued".
+    ///
+    /// We only remove rows still in the `Connecting` state so we
+    /// never discard a row that has already transitioned to a
+    /// real transfer state (defensive: shouldn't happen for
+    /// placeholders, but cheap to check).
+    ///
+    /// Returns the `(ip, port)` pairs that were removed so the
+    /// caller can emit matching frontend events signalling the
+    /// row has gone away.
+    pub fn remove_callback_placeholders_for_ip(
+        &mut self,
+        transfer_id: &str,
+        peer_ip: &str,
+    ) -> Vec<(String, u16)> {
+        let mut removed = Vec::new();
+        if let Some(rows) = self.source_details.get_mut(transfer_id) {
+            rows.retain(|s| {
+                let is_placeholder = s.ip == peer_ip
+                    && s.status == crate::types::SourceStatus::Connecting
+                    && (s.client_software == "KAD Callback"
+                        || s.client_software == "KAD Direct Callback"
+                        || s.client_software == "Low ID (Server Relay)");
+                if is_placeholder {
+                    removed.push((s.ip.clone(), s.port));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        removed
+    }
+
     pub fn pause(&mut self, id: &str) {
         if let Some(transfer) = self.active.get_mut(id) {
             transfer.status = TransferStatus::Paused;
