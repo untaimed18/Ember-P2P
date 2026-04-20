@@ -27,14 +27,40 @@ const MAX_STORE_ENTRIES: usize = 100_000;
 const MAX_RATE_ENTRIES: usize = 200_000;
 
 const PUNCH_TTL: Duration = Duration::from_secs(30);
-const MAX_PUNCH_PER_MINUTE: u64 = 10;
+/// Per-IP punch register rate limit. Was `10/min`, but a single
+/// LowID Ember client may legitimately fire 5–10 punch attempts per
+/// active download in a sub-second burst (one per discovered LowID
+/// peer), then retry every 15 s. At `10/min` the second retry round
+/// for two concurrent downloads exhausts the budget and the server
+/// returns `429 Too Many Requests` for the rest, leaving them stuck
+/// on the relay fallback for no good reason. `60/min` covers the
+/// realistic worst case (2 downloads × 8 peers × 2 retries within a
+/// minute = 32) with comfortable headroom.
+const MAX_PUNCH_PER_MINUTE: u64 = 60;
 /// Cap on simultaneous pending punch entries per `target_id`. Bounds
 /// the impact of `punch_register` spam against a victim once the
 /// per-IP rate limit is exhausted (the attacker would have to source
 /// from many IPs to fill more slots, which is also bounded by
 /// `MAX_GLOBAL_RELAY_SESSIONS` upstream).
 const MAX_PUNCH_PER_TARGET: usize = 8;
-const MAX_RELAY_SESSIONS_PER_IP: usize = 2;
+/// Per-IP relay session cap. Was `2`, which was the cause of every
+/// `WebSocket protocol error: Sending after closing is not allowed`
+/// failure the Ember client saw on adoption: the server accepts the
+/// WS handshake (so `connect_async` returns Ok), THEN this check
+/// runs, finds the IP already has 2 sessions, and immediately sends
+/// `Close(None)` and returns. From the client's POV the connection
+/// is "open", multi_source adopts the stream, the first write fails
+/// with the close-after-send error.
+///
+/// One Ember client legitimately wants N concurrent relay sessions:
+/// each (file × LowID peer) pair gets its own room (since each
+/// peer dials its own session_id from the relay-invite). With ~5–10
+/// LowID peers per active download and 2–3 active downloads, the
+/// realistic working set is 16–32 simultaneous sessions per client
+/// IP. `32` covers that with a small buffer; the global cap
+/// (`MAX_GLOBAL_RELAY_SESSIONS = 200`) still bounds total resource
+/// consumption to ~6 maxed-out clients before backpressure kicks in.
+const MAX_RELAY_SESSIONS_PER_IP: usize = 32;
 const MAX_GLOBAL_RELAY_SESSIONS: usize = 200;
 const RELAY_BANDWIDTH_CAP_BYTES: usize = 256 * 1024;
 const RELAY_SESSION_TIMEOUT: Duration = Duration::from_secs(120);
