@@ -978,6 +978,74 @@ mod tests {
         assert_eq!(results[0].comment.as_deref(), Some("Looks good"));
         assert_eq!(results[0].rating, Some(5));
     }
+
+    /// `extract_kad_sources` must read the `"ember"` capability tag we
+    /// emit in `kad/publish.rs::build_source_publish` and surface it as
+    /// `is_ember_capable`. This is the linchpin of the broker dispatch
+    /// gate — if parsing breaks, every Ember peer silently regresses
+    /// to "skip broker" and LowID-to-LowID becomes unreachable.
+    #[test]
+    fn extract_kad_sources_reads_ember_capability_tag() {
+        use crate::network::kad::publish::EMBER_CAP_RELAY_PUNCH_V1;
+        use crate::network::kad::types::{
+            TAG_ENCRYPTION, TAG_FILESIZE, TAG_SOURCEIP, TAG_SOURCEPORT, TAG_SOURCETYPE,
+        };
+
+        // Ember-capable HighID source.
+        let ember_entry = SearchResultEntry {
+            id: KadId([0x33; 16]),
+            tags: vec![
+                KadTag {
+                    name: TagName::Id(TAG_SOURCEIP),
+                    // 1.2.3.4 in network byte order -> u32(0x01020304)
+                    value: TagValue::Uint32(u32::from_be_bytes([1, 2, 3, 4])),
+                },
+                KadTag { name: TagName::Id(TAG_SOURCEPORT), value: TagValue::Uint16(4662) },
+                KadTag { name: TagName::Id(TAG_SOURCETYPE), value: TagValue::Uint8(1) },
+                KadTag { name: TagName::Id(TAG_FILESIZE), value: TagValue::Uint64(123) },
+                KadTag { name: TagName::Id(TAG_ENCRYPTION), value: TagValue::Uint8(0) },
+                KadTag {
+                    name: TagName::Str("ember".to_string()),
+                    value: TagValue::Uint8(EMBER_CAP_RELAY_PUNCH_V1),
+                },
+            ],
+        };
+
+        // Vanilla eMule source — no `"ember"` tag.
+        let emule_entry = SearchResultEntry {
+            id: KadId([0x44; 16]),
+            tags: vec![
+                KadTag {
+                    name: TagName::Id(TAG_SOURCEIP),
+                    value: TagValue::Uint32(u32::from_be_bytes([5, 6, 7, 8])),
+                },
+                KadTag { name: TagName::Id(TAG_SOURCEPORT), value: TagValue::Uint16(4663) },
+                KadTag { name: TagName::Id(TAG_SOURCETYPE), value: TagValue::Uint8(1) },
+            ],
+        };
+
+        let sources = extract_kad_sources(&[ember_entry, emule_entry]);
+        assert_eq!(sources.len(), 2);
+
+        let ember_src = sources
+            .iter()
+            .find(|s| s.tcp_port == 4662)
+            .expect("ember source should be present");
+        assert!(
+            ember_src.is_ember_capable,
+            "source carrying `ember` tag must be marked ember-capable",
+        );
+
+        let emule_src = sources
+            .iter()
+            .find(|s| s.tcp_port == 4663)
+            .expect("emule source should be present");
+        assert!(
+            !emule_src.is_ember_capable,
+            "source without `ember` tag must default to NOT ember-capable — \
+             this is what guards the broker against wasting cycles on vanilla eMule",
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -1687,6 +1755,19 @@ struct NetworkState {
     relay_manager: Arc<tokio::sync::Mutex<ember::relay::RelayManager>>,
     /// Peer reputation tracking (score, ban, decay)
     reputation: ember::reputation::ReputationManager,
+    /// Set of peers `(ip, tcp_port)` we have observed advertising the
+    /// `"ember"` capability tag (`EMBER_CAP_RELAY_PUNCH_V1`) in a KAD
+    /// source publish. Both broker call sites gate on this — peers
+    /// that haven't advertised the tag get marked `low_to_low` and
+    /// skipped, instead of burning ~46 s of broker time per attempt
+    /// trying to talk Ember relay protocol to a vanilla eMule client
+    /// that doesn't understand it.
+    ///
+    /// Lazily populated by `extract_kad_sources` callers; cleared on
+    /// process shutdown. KAD source publishes have a 5-hour TTL and
+    /// our routing table is repopulated at startup, so the cache
+    /// rebuilds quickly on each session.
+    ember_capable_peers: HashSet<(Ipv4Addr, u16)>,
 }
 
 /// Filter search results by file type, matching eMule's AddToList behavior:
@@ -3151,6 +3232,7 @@ pub async fn start_network(
         broker_event_rx: None,
         relay_manager: Arc::new(tokio::sync::Mutex::new(ember::relay::RelayManager::new())),
         reputation: ember::reputation::ReputationManager::load(&data_dir.join("reputation.json")),
+        ember_capable_peers: HashSet::new(),
     };
 
     // Load known files for hash cache
@@ -4597,7 +4679,26 @@ pub async fn start_network(
                                 "too_many_conns" => pfs.set_too_many_conns(v4, port),
                                 "low_to_low" => {
                                     let file_hash = pfs.file_hash();
-                                    let broker_started = if let Some(ref mut broker) = state.connection_broker {
+                                    // Gate the broker on prior Ember-capability evidence.
+                                    // Vanilla eMule peers don't speak our relay protocol on
+                                    // the other end, so attempting hole-punch + relay
+                                    // burns ~16 s + 30 s with no possibility of success.
+                                    // The `ember_capable_peers` set is populated by
+                                    // `extract_kad_sources` whenever a peer publishes the
+                                    // `"ember"` source tag (see `kad/publish.rs`). Peers
+                                    // we've never seen a tag from get marked as plain
+                                    // `low_to_low` and skipped — same outcome as before
+                                    // these features existed, no time wasted.
+                                    let ember_capable =
+                                        state.ember_capable_peers.contains(&(v4, port));
+                                    let broker_started = if !ember_capable {
+                                        debug!(
+                                            "Skipping LowID-to-LowID broker for {}:{} — \
+                                             peer has not advertised Ember capability via KAD",
+                                            v4, port,
+                                        );
+                                        false
+                                    } else if let Some(ref mut broker) = state.connection_broker {
                                         let ext = state.nat_info.external_addr;
                                         broker.attempt_low_to_low(
                                             transfer_id, file_hash, v4, port,
@@ -5476,6 +5577,16 @@ pub async fn start_network(
                     } else if let Some(tx) = state.pending_source_searches.remove(&sid) {
                         let sources = if let Some(search) = state.search_manager.get(&sid) {
                             let all = extract_kad_sources(&search.results);
+                            // Remember any peer that advertised Ember capability so
+                            // future broker attempts for them are unlocked. We update
+                            // the cache *before* filtering self-sources because we want
+                            // to learn about peers from every search response, not just
+                            // ones we end up handing back to the caller.
+                            for s in &all {
+                                if s.is_ember_capable && !s.ip.is_unspecified() && s.tcp_port != 0 {
+                                    state.ember_capable_peers.insert((s.ip, s.tcp_port));
+                                }
+                            }
                             let before = all.len();
                             let filtered: Vec<(String, u16)> = all
                                 .into_iter()
@@ -5532,6 +5643,17 @@ pub async fn start_network(
                     } else if let Some((transfer_id, search_file_hash)) = state.download_source_searches.remove(&sid) {
                         let kad_sources = if let Some(search) = state.search_manager.get(&sid) {
                             let all = extract_kad_sources(&search.results);
+                            // Same cache update as the pending_source_searches branch:
+                            // record every peer that advertised Ember capability so the
+                            // broker dispatch sites can unblock them. Doing this in both
+                            // branches (rather than once inside `extract_kad_sources`)
+                            // keeps that helper a pure function with no `state`
+                            // dependency.
+                            for s in &all {
+                                if s.is_ember_capable && !s.ip.is_unspecified() && s.tcp_port != 0 {
+                                    state.ember_capable_peers.insert((s.ip, s.tcp_port));
+                                }
+                            }
                             let before = all.len();
                             let filtered: Vec<KadSource> = all
                                 .into_iter()
@@ -5675,8 +5797,20 @@ pub async fn start_network(
                                             state.ember_payload_dirty = true;
                                         }
                                         if state.firewalled || state.low_id {
-                                            // Instead of giving up, try broker for LowID-to-LowID
-                                            let broker_started = if let Some(ref mut broker) = state.connection_broker {
+                                            // Try broker only for peers that have advertised
+                                            // Ember capability. `cb_src.is_ember_capable` was
+                                            // set by `extract_kad_sources` when this entry
+                                            // came back from the KAD search — see the parse
+                                            // site in this file and the publish site in
+                                            // `kad/publish.rs::build_source_publish`.
+                                            let broker_started = if !cb_src.is_ember_capable {
+                                                debug!(
+                                                    "Skipping LowID-to-LowID broker for {}:{} — \
+                                                     no Ember capability advertised in KAD record",
+                                                    cb_src.ip, cb_src.tcp_port,
+                                                );
+                                                false
+                                            } else if let Some(ref mut broker) = state.connection_broker {
                                                 let ext = state.nat_info.external_addr;
                                                 broker.attempt_low_to_low(
                                                     &transfer_id, fh, cb_src.ip, cb_src.tcp_port,
@@ -17813,6 +17947,14 @@ struct KadSource {
     ed2k_server_ip: u32,
     /// Type-2: eD2K server TCP port.
     ed2k_server_port: u16,
+    /// `true` if this peer advertised `EMBER_CAP_RELAY_PUNCH_V1` in the
+    /// KAD source publish (string tag `"ember"`). Other Ember peers gate
+    /// LowID-to-LowID broker attempts on this — see the broker call
+    /// sites in this file. Defaults to `false` for any source we
+    /// haven't seen the tag from (vanilla eMule peers, type-2 LowID
+    /// sources from the ed2k server, or older Ember peers from before
+    /// this tag existed).
+    is_ember_capable: bool,
 }
 
 /// Returns true if this `KadSource` actually describes us — either by
@@ -17856,6 +17998,7 @@ fn extract_kad_sources(
         let mut server_ip = 0u32;
         let mut server_port = 0u16;
         let mut buddy_hash: Option<[u8; 16]> = None;
+        let mut is_ember_capable = false;
         for tag in &entry.tags {
             match &tag.name {
                 TagName::Id(TAG_SOURCEIP) => {
@@ -17892,6 +18035,18 @@ fn extract_kad_sources(
                         }
                     }
                 }
+                // Ember capability advertisement — see the corresponding
+                // emit site in `kad/publish.rs::build_source_publish` and
+                // `EMBER_CAP_RELAY_PUNCH_V1`. Bit 0 means "speaks Ember
+                // v1 LowID-to-LowID protocol". Higher bits are reserved.
+                // Vanilla eMule peers won't carry this tag so the field
+                // stays `false`, which is exactly what gates the broker.
+                TagName::Str(s) if s == "ember" => {
+                    if let Some(v) = tag.uint8_value() {
+                        is_ember_capable =
+                            (v & kad::publish::EMBER_CAP_RELAY_PUNCH_V1) != 0;
+                    }
+                }
                 _ => {}
             }
         }
@@ -17920,6 +18075,7 @@ fn extract_kad_sources(
                             lowid: 0,
                             ed2k_server_ip: 0,
                             ed2k_server_port: 0,
+                            is_ember_capable,
                         });
                     }
                 }
@@ -17940,6 +18096,7 @@ fn extract_kad_sources(
                             lowid: ip,
                             ed2k_server_ip: server_ip,
                             ed2k_server_port: server_port,
+                            is_ember_capable,
                         });
                     }
                 } else if ip != 0 && port != 0 {
@@ -17958,6 +18115,7 @@ fn extract_kad_sources(
                             lowid: 0,
                             ed2k_server_ip: 0,
                             ed2k_server_port: 0,
+                            is_ember_capable,
                         });
                     }
                 }
@@ -17983,6 +18141,7 @@ fn extract_kad_sources(
                             lowid: 0,
                             ed2k_server_ip: 0,
                             ed2k_server_port: 0,
+                            is_ember_capable,
                         });
                     }
                 } else if ip != 0 && port != 0 {
@@ -18002,6 +18161,7 @@ fn extract_kad_sources(
                             lowid: 0,
                             ed2k_server_ip: 0,
                             ed2k_server_port: 0,
+                            is_ember_capable,
                         });
                     }
                 }
@@ -18024,6 +18184,7 @@ fn extract_kad_sources(
                             lowid: 0,
                             ed2k_server_ip: 0,
                             ed2k_server_port: 0,
+                            is_ember_capable,
                         });
                     }
                 }
@@ -18045,6 +18206,7 @@ fn extract_kad_sources(
                             lowid: 0,
                             ed2k_server_ip: 0,
                             ed2k_server_port: 0,
+                            is_ember_capable,
                         });
                     }
                 }
