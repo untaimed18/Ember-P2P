@@ -461,9 +461,12 @@ pub enum ServerUdpResponse {
     },
     FoundSources {
         addr: SocketAddr,
-        file_hash: [u8; 16],
-        /// (ip, port, client_id) — client_id > 0 means LowID source
-        sources: Vec<(Ipv4Addr, u16, u32)>,
+        /// One entry per file the server returned sources for. eMule's UDP
+        /// servers can pack multiple file responses into a single
+        /// `OP_GLOBFOUNDSOURCES` datagram (see `parse_server_udp_response`
+        /// for the wire format) — the receive handler iterates and emits
+        /// one event per file.
+        files: Vec<([u8; 16], Vec<(Ipv4Addr, u16, u32)>)>,
     },
     SearchResult {
         results: Vec<ServerSearchResult>,
@@ -555,26 +558,88 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
             })
         }
         OP_GLOBFOUNDSOURCES => {
+            // eMule's UDP servers PACK MULTIPLE file responses into a single
+            // OP_GLOBFOUNDSOURCES datagram, separated by a re-emission of the
+            // `<OP_EDONKEYPROT><OP_GLOBFOUNDSOURCES>` header (see
+            // `UDPSocket.cpp:268-313`). The previous parser only read the
+            // first file's response and dropped every subsequent one in the
+            // same packet — silently halving (or worse) the source pool any
+            // time we batched multiple file hashes into one OP_GLOBGETSOURCES2
+            // request, which is the default for any session with >1 active
+            // download. We now drain every entry the packet contains and emit
+            // them all in one `FoundSources` so the recv handler injects all
+            // file hits at once.
+            //
+            // Per-entry layout: <file_hash[16]><source_count u8><sources(6 each)>.
+            // Per-source layout: <id u32 LE><port u16 LE>. id < LOWID_THRESHOLD
+            // means this entry is a LowID peer — store with the client_id slot
+            // populated, IP unspecified (same convention as before).
             if payload.len() < 17 {
                 return None;
             }
+            let mut all_files: Vec<([u8; 16], Vec<(Ipv4Addr, u16, u32)>)> = Vec::new();
             let mut cursor = Cursor::new(payload);
-            let mut file_hash = [0u8; 16];
-            std::io::Read::read_exact(&mut cursor, &mut file_hash).ok()?;
-            let source_count = cursor.read_u8().ok()? as usize;
-            let mut sources = Vec::with_capacity(source_count);
-            for _ in 0..source_count {
-                let id = cursor.read_u32::<LittleEndian>().ok()?;
-                let port = cursor.read_u16::<LittleEndian>().ok()?;
-                if id < super::server::LOWID_THRESHOLD {
-                    // LowID: store with client_id, IP is unspecified
-                    sources.push((Ipv4Addr::UNSPECIFIED, port, id));
-                } else {
-                    let ip = Ipv4Addr::from(id.to_le_bytes());
-                    sources.push((ip, port, 0));
+            loop {
+                let mut file_hash = [0u8; 16];
+                if std::io::Read::read_exact(&mut cursor, &mut file_hash).is_err() {
+                    break;
                 }
+                let source_count = match cursor.read_u8() {
+                    Ok(c) => c as usize,
+                    Err(_) => break,
+                };
+                let mut sources = Vec::with_capacity(source_count);
+                let mut entry_ok = true;
+                for _ in 0..source_count {
+                    let id = match cursor.read_u32::<LittleEndian>() {
+                        Ok(v) => v,
+                        Err(_) => { entry_ok = false; break; }
+                    };
+                    let port = match cursor.read_u16::<LittleEndian>() {
+                        Ok(v) => v,
+                        Err(_) => { entry_ok = false; break; }
+                    };
+                    if id < super::server::LOWID_THRESHOLD {
+                        sources.push((Ipv4Addr::UNSPECIFIED, port, id));
+                    } else {
+                        let ip = Ipv4Addr::from(id.to_le_bytes());
+                        sources.push((ip, port, 0));
+                    }
+                }
+                if !entry_ok {
+                    // Truncated source list — drop this entry but keep what
+                    // we successfully parsed so far. Matches eMule's
+                    // "swallow leftover bytes silently" tolerance.
+                    break;
+                }
+                all_files.push((file_hash, sources));
+
+                // Look for `<OP_EDONKEYPROT><OP_GLOBFOUNDSOURCES>` separator
+                // introducing the next file's entry. Anything else (or end
+                // of buffer) terminates the loop.
+                let saved_pos = cursor.position();
+                let p_byte = match cursor.read_u8() {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                if p_byte != OP_EDONKEYPROT {
+                    cursor.set_position(saved_pos);
+                    break;
+                }
+                let o_byte = match cursor.read_u8() {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                if o_byte != OP_GLOBFOUNDSOURCES {
+                    cursor.set_position(saved_pos);
+                    break;
+                }
+                // Header consumed — loop reads the next file's entry.
             }
-            Some(ServerUdpResponse::FoundSources { addr, file_hash, sources })
+            if all_files.is_empty() {
+                return None;
+            }
+            Some(ServerUdpResponse::FoundSources { addr, files: all_files })
         }
         OP_GLOBSEARCHRES => {
             parse_search_results(payload)
@@ -744,10 +809,52 @@ mod tests {
 
         let parsed = parse_server_udp_response(&packet, addr).unwrap();
         match parsed {
-            ServerUdpResponse::FoundSources { file_hash: parsed_hash, sources, .. } => {
-                assert_eq!(parsed_hash, file_hash);
+            ServerUdpResponse::FoundSources { files, .. } => {
+                assert_eq!(files.len(), 1, "single-file response should produce exactly one entry");
+                let (parsed_hash, sources) = &files[0];
+                assert_eq!(*parsed_hash, file_hash);
                 assert_eq!(sources[0], (Ipv4Addr::new(1, 2, 3, 4), 4662, 0));
                 assert_eq!(sources[1], (Ipv4Addr::UNSPECIFIED, 4672, low_id));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// eMule's UDP servers can pack multiple OP_GLOBFOUNDSOURCES file
+    /// responses in a single datagram (UDPSocket.cpp:268-313). Verify the
+    /// parser walks every entry and recognises the
+    /// `<OP_EDONKEYPROT><OP_GLOBFOUNDSOURCES>` separator between them.
+    #[test]
+    fn parse_multi_file_globfoundsources_packet_drains_all_entries() {
+        let addr: SocketAddr = "10.0.0.1:4665".parse().unwrap();
+        let hash_a = [0x11u8; 16];
+        let hash_b = [0x22u8; 16];
+        let high_a = u32::from_le_bytes([1, 2, 3, 4]);
+        let high_b = u32::from_le_bytes([5, 6, 7, 8]);
+
+        let mut packet = vec![OP_GLOBFOUNDSOURCES];
+        // First file: 1 source
+        packet.extend_from_slice(&hash_a);
+        packet.push(1);
+        packet.extend_from_slice(&high_a.to_le_bytes());
+        packet.extend_from_slice(&4662u16.to_le_bytes());
+        // Inter-file separator
+        packet.push(OP_EDONKEYPROT);
+        packet.push(OP_GLOBFOUNDSOURCES);
+        // Second file: 1 source
+        packet.extend_from_slice(&hash_b);
+        packet.push(1);
+        packet.extend_from_slice(&high_b.to_le_bytes());
+        packet.extend_from_slice(&4663u16.to_le_bytes());
+
+        let parsed = parse_server_udp_response(&packet, addr).unwrap();
+        match parsed {
+            ServerUdpResponse::FoundSources { files, .. } => {
+                assert_eq!(files.len(), 2, "must drain BOTH file entries");
+                assert_eq!(files[0].0, hash_a);
+                assert_eq!(files[0].1[0], (Ipv4Addr::new(1, 2, 3, 4), 4662, 0));
+                assert_eq!(files[1].0, hash_b);
+                assert_eq!(files[1].1[0], (Ipv4Addr::new(5, 6, 7, 8), 4663, 0));
             }
             other => panic!("unexpected response: {other:?}"),
         }

@@ -10042,16 +10042,20 @@ pub async fn start_network(
                                 );
                             }
                         }
-                        ServerUdpResponse::FoundSources { addr, file_hash, sources } => {
-                            // Bump diagnostics first so the periodic
-                            // health log catches even empty replies
-                            // (which still mean "the server answered
-                            // us at all" — useful signal vs total
-                            // silence).
+                        ServerUdpResponse::FoundSources { addr, files } => {
+                            // Bump per-reply diagnostic ONCE per packet, not
+                            // per file — `udp_discovery_replies` measures
+                            // "server answered our UDP query at all", and
+                            // a multi-file reply is still one packet on the
+                            // wire. `udp_discovery_sources_found` aggregates
+                            // sources across every file in the packet.
                             state.udp_discovery_replies = state.udp_discovery_replies.saturating_add(1);
+                            let total_sources_in_packet: u64 = files.iter()
+                                .map(|(_, srcs)| srcs.len() as u64)
+                                .sum();
                             state.udp_discovery_sources_found = state
                                 .udp_discovery_sources_found
-                                .saturating_add(sources.len() as u64);
+                                .saturating_add(total_sources_in_packet);
                             // Distinct from `record_udp_reply` (which
                             // fires above for ANY UDP reply): this
                             // marks the server as actually USEFUL for
@@ -10064,6 +10068,16 @@ pub async fn start_network(
                                 let tcp_port = addr.port().saturating_sub(4);
                                 state.server_list.record_udp_source_reply(&ip_str, tcp_port);
                             }
+                            // Now process each file's source list. eMule's
+                            // UDP servers can pack multiple file responses
+                            // in one OP_GLOBFOUNDSOURCES datagram, so iterate
+                            // every entry the parser returned (the previous
+                            // single-entry parser silently dropped every
+                            // entry past the first, which dramatically
+                            // reduced the source pool whenever we batched
+                            // multiple file hashes into one OP_GLOBGETSOURCES2
+                            // request — i.e. any session with >1 download).
+                          for (file_hash, sources) in files {
                             {
                                 let hash_hex_udp = hex::encode(file_hash);
                                 let matching: Vec<String> = state.pending_downloads.iter()
@@ -10284,6 +10298,7 @@ pub async fn start_network(
                                     ).await;
                                 }
                             }
+                          } // end `for (file_hash, sources) in files`
                         }
                         ServerUdpResponse::SearchResult { results } => {
                             if !results.is_empty() {
