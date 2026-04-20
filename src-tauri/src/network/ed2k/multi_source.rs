@@ -2536,6 +2536,12 @@ async fn download_parts_from_source(
         ).await?;
     }
 
+    // Tracks whether we've already shipped our `OP_EMBER_HELLO` /
+    // `OP_EMBER_HELLOANSWER` to this peer so the post-loop kick-off below
+    // and the in-loop "peer beat us to it" branch don't double-send. See
+    // the longer comment at the kick-off site for the full rationale.
+    let mut sent_ember_hello = false;
+
     // Handle pre-file-control packets which may arrive before file requests.
     for _ in 0..3 {
         let (proto, opcode, payload) = if let Some(pkt) = deferred_packet.take() {
@@ -2714,10 +2720,71 @@ async fn download_parts_from_source(
                     }).await;
                 }
             }
+            // Authoritative Ember peer detection. Replaces the old in-band
+            // signals (MISCOPTIONS2 bit 20 + ET_MOD_VERSION starting with
+            // "Ember") that we removed to keep our public handshake
+            // byte-identical to vanilla eMule. A peer that emits a parseable
+            // `OP_EMBER_HELLO`/`OP_EMBER_HELLOANSWER` payload is, by
+            // construction, an Ember client — vanilla eMule never sends
+            // either opcode (the constants are in our private 0xF8/0xF9
+            // range). When we see `OP_EMBER_HELLO` (peer beat us to it) we
+            // also send our `OP_EMBER_HELLOANSWER` back so the peer learns
+            // our identity in the same round trip.
+            (OP_EMULEPROT, OP_EMBER_HELLO) | (OP_EMULEPROT, OP_EMBER_HELLOANSWER) => {
+                if let Some(ident) = parse_ember_hello(&payload) {
+                    hello_caps.is_ember = true;
+                    if !ident.mod_version.is_empty() {
+                        hello_caps.mod_version = ident.mod_version.clone();
+                    }
+                    if !ident.nickname.is_empty() {
+                        hello_caps.peer_name = ident.nickname.clone();
+                        src_peer_name = ident.nickname.clone();
+                    }
+                    if ident.ember_hash != [0u8; 16] {
+                        hello_caps.ember_hash = Some(ident.ember_hash);
+                        peer_ember_hash = Some(ident.ember_hash);
+                    }
+                    if let Some(pk) = ident.ed25519_pubkey {
+                        hello_caps.ember_pubkey = Some(pk);
+                    }
+                    src_client_software = client_software_from_caps(&hello_caps);
+                    debug!("Source {} identified as Ember via OP_EMBER_HELLO (mod='{}', nick='{}')",
+                        _src_idx, ident.mod_version, ident.nickname);
+                    if opcode == OP_EMBER_HELLO && !sent_ember_hello {
+                        let payload = build_ember_hello(&ember_hash, &our_nickname, None);
+                        let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &payload).await;
+                        sent_ember_hello = true;
+                    }
+                }
+            }
             _ => {
                 deferred_packet = Some((proto, opcode, payload));
                 break;
             }
+        }
+    }
+
+    // Send `OP_EMBER_HELLO` so genuine Ember peers can identify each other
+    // out-of-band from the public Hello / EmuleInfo. Vanilla eMule peers
+    // ignore unknown OP_EMULEPROT opcodes (`ListenSocket.cpp` ProcessExtPacket
+    // default branch just logs "Unknown extended emule protocol opcode" and
+    // returns), so this is invisible to non-Ember clients and doesn't
+    // pollute the public handshake — which we deliberately keep
+    // byte-identical to vanilla eMule to avoid anti-leecher queue bans.
+    //
+    // Skipped if the peer already sent us their Ember-Hello during the
+    // pre-file-control loop above (we replied with HELLOANSWER there and
+    // set `sent_ember_hello = true`). Otherwise this fires a fresh HELLO
+    // which the peer answers later with HELLOANSWER (handled in both the
+    // pre-file-control loop above and the file_status_wait loop below).
+    // When we receive a reply we set `hello_caps.is_ember = true` and
+    // learn the peer's mod_version, ember_hash, and (optionally)
+    // ember_pubkey authoritatively — none of which we can extract from
+    // the public handshake anymore.
+    if !sent_ember_hello {
+        let payload = build_ember_hello(&ember_hash, &our_nickname, None);
+        if write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload).await.is_ok() {
+            sent_ember_hello = true;
         }
     }
 
@@ -3055,6 +3122,40 @@ async fn download_parts_from_source(
                     peer_ip: addr.ip().to_string(),
                     peer_port: addr.port(),
                 }).await;
+            }
+            continue;
+        }
+        // Ember peer identification (post-handshake). Mirror of the same
+        // arm in the pre-file-control loop above — a peer might delay
+        // their `OP_EMBER_HELLOANSWER` past the 3-iteration pre-loop, in
+        // which case it lands here. Either way we set is_ember + cache
+        // identity so the EPX / friend-system / broker code paths that
+        // gate on `hello_caps.is_ember` start working immediately.
+        if proto == OP_EMULEPROT && (opcode == OP_EMBER_HELLO || opcode == OP_EMBER_HELLOANSWER) {
+            if let Some(ident) = parse_ember_hello(&_payload) {
+                hello_caps.is_ember = true;
+                if !ident.mod_version.is_empty() {
+                    hello_caps.mod_version = ident.mod_version.clone();
+                }
+                if !ident.nickname.is_empty() {
+                    hello_caps.peer_name = ident.nickname.clone();
+                    src_peer_name = ident.nickname.clone();
+                }
+                if ident.ember_hash != [0u8; 16] {
+                    hello_caps.ember_hash = Some(ident.ember_hash);
+                    peer_ember_hash = Some(ident.ember_hash);
+                }
+                if let Some(pk) = ident.ed25519_pubkey {
+                    hello_caps.ember_pubkey = Some(pk);
+                }
+                src_client_software = client_software_from_caps(&hello_caps);
+                debug!("Source {} identified as Ember via OP_EMBER_HELLO during file-status-wait (mod='{}', nick='{}')",
+                    _src_idx, ident.mod_version, ident.nickname);
+                if opcode == OP_EMBER_HELLO && !sent_ember_hello {
+                    let payload = build_ember_hello(&ember_hash, &our_nickname, None);
+                    let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &payload).await;
+                    sent_ember_hello = true;
+                }
             }
             continue;
         }

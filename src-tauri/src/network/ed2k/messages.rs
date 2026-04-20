@@ -112,6 +112,14 @@ pub const OP_EMBER_FRIEND_REQ: u8 = 0xF4;
 pub const OP_EMBER_KEEPALIVE: u8 = 0xF5;
 pub const OP_EMBER_AUTH_CHALLENGE: u8 = 0xF6;
 pub const OP_EMBER_AUTH_RESPONSE: u8 = 0xF7;
+/// Ember-private handshake. Vanilla eMule peers ignore unknown OP_EMULEPROT
+/// opcodes (`ListenSocket.cpp` ProcessExtPacket default branch), so this is
+/// invisible to non-Ember clients and keeps our public Hello / EmuleInfo
+/// byte-identical to vanilla eMule. Carries `ember_hash`, `mod_version`,
+/// nickname, and optionally the Ed25519 pubkey. Sent right after the
+/// standard EmuleInfo exchange completes; replied with `OP_EMBER_HELLOANSWER`.
+pub const OP_EMBER_HELLO: u8 = 0xF8;
+pub const OP_EMBER_HELLOANSWER: u8 = 0xF9;
 
 // Constants
 pub const EMBLOCKSIZE: u64 = 184_320;
@@ -337,14 +345,19 @@ pub fn build_hello_answer_with_buddy_opts(
     build_hello_inner(user_hash, client_id, tcp_port, nickname, false, buddy, options)
 }
 
-/// ET_COMPATIBLECLIENT byte advertised by Ember. eMule maps a small set of
-/// values to named clients (0=eMule, 1=cDonkey, 2=xMule, 3=aMule, 4/40=Shareaza,
-/// 10=MLdonkey, 20=lphant — see ClientStateDefs.h `EClientSoftware`); any
-/// other non-zero value falls through to the `"eMule Compat"` label in
-/// BaseClient.cpp InitClientSoftwareVersion, which is exactly what we want:
-/// we're an eMule-compatible client, not eMule itself. 0xC5 is outside all
-/// the well-known IDs and survives eMule's uint8 truncation cleanly.
-pub(crate) const COMPAT_CLIENT_EMBER: u8 = 0xC5;
+// NOTE: Ember used to advertise a `COMPAT_CLIENT_EMBER = 0xC5` byte in the
+// high byte of `CT_EMULE_VERSION` (Hello) and as `ET_COMPATIBLECLIENT`
+// (EmuleInfo). Both have been REMOVED. Vanilla eMule explicitly comments
+// out the compat byte in its Hello (`BaseClient.cpp` SendHelloTypePacket,
+// the line `//(uCompatibleClientID << 24) |`) and never emits
+// ET_COMPATIBLECLIENT in EmuleInfo. Anti-leecher mods in widespread use
+// (NeoMule, MorphXT, Xtreme, ScarAngel, Magic Angel) flag any incoming
+// Hello with a non-zero CT_EMULE_VERSION high byte as a third-party
+// spoofing client and either silently ban us or refuse to add us to the
+// upload queue (peer answers OP_REQFILENAMEANSWER politely then closes
+// the socket — exactly the symptom we hit in the wild). Ember identity
+// now travels in a separate `OP_EMBER_HELLO` opcode that vanilla peers
+// ignore, so we look byte-identical to eMule on the public handshake.
 
 /// Compute CT_EMULE_MISCOPTIONS1 matching eMule BaseClient.cpp SendHelloTypePacket.
 pub fn build_misc_options1() -> u32 {
@@ -419,16 +432,17 @@ fn build_hello_inner(
     write_ed2k_tag(&mut buf, 0xFE, &Ed2kTagValue::Uint32(build_misc_options2(options)));
     // Tag 6: CT_EMULE_VERSION (0xFB).
     // Layout from BaseClient.cpp: (compat << 24) | (major << 17) | (minor << 10) | (update << 7).
-    // Use minor=50, update=1 (a real, recent eMule protocol level so anti-leecher
-    // heuristics that look for impossible version numbers don't flag us) and set
-    // the top "compatible client" byte to COMPAT_CLIENT_EMBER so eMule renders
-    // the peer Software as "eMule Compat" instead of "eMule" — we're not an
-    // eMule build, we just speak its wire protocol. ET_COMPATIBLECLIENT in the
-    // EmuleInfo below carries the same value (and, being processed later, is
-    // what eMule actually displays); this Hello-side byte is the fallback for
-    // peers that drop the EmuleInfo tag.
-    let emule_version: u32 =
-        ((COMPAT_CLIENT_EMBER as u32) << 24) | (50u32 << 10) | (1u32 << 7);
+    // Match eMule exactly — `BaseClient.cpp` SendHelloTypePacket explicitly
+    // comments out `(uCompatibleClientID << 24)` and ALWAYS leaves the
+    // high byte zero in Hello. Anti-leecher mods specifically check this
+    // byte: any non-zero value is treated as a third-party / spoofing
+    // client and triggers a silent queue-ban (the peer accepts the
+    // connection, answers OP_REQFILENAMEANSWER, then closes the socket
+    // before sending OP_FILESTATUS). We claim eMule 0.50.1 (the last
+    // known-good vanilla build) so anti-leecher version-range heuristics
+    // accept us. Ember-specific identity is exchanged later via
+    // `OP_EMBER_HELLO`, which vanilla peers ignore.
+    let emule_version: u32 = (50u32 << 10) | (1u32 << 7);
     write_ed2k_tag(&mut buf, 0xFB, &Ed2kTagValue::Uint32(emule_version));
 
     // Optional buddy tags
@@ -476,22 +490,28 @@ fn write_ed2k_tag(buf: &mut Vec<u8>, name_id: u8, value: &Ed2kTagValue) {
     }
 }
 
-/// Build an EmuleInfo packet payload matching eMule BaseClient.cpp SendMuleInfoPacket.
-/// Format: version(1) + EMULE_PROTOCOL(1) + tag_count(4) + 8 ET_ tags.
-pub fn build_emule_info(udp_port: u16, obfuscation_enabled: bool, ember_hash: Option<&[u8; 16]>, ed25519_pubkey: Option<&[u8; 32]>) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(140);
+/// Build an EmuleInfo packet payload matching eMule `BaseClient.cpp`
+/// `SendMuleInfoPacket` byte-for-byte: version(1) + EMULE_PROTOCOL(1) +
+/// tag_count(4) + 7 ET_ tags. **No** `ET_COMPATIBLECLIENT`, **no**
+/// `ET_MOD_VERSION`, **no** Ember-specific tags — vanilla eMule emits none
+/// of these and any extras tip off anti-leecher mods that we're a
+/// third-party client and lead to queue bans.
+///
+/// The `ember_hash` and `ed25519_pubkey` parameters are accepted for
+/// API stability but are intentionally ignored here — Ember identity is
+/// exchanged in a separate `OP_EMBER_HELLO` opcode that vanilla peers
+/// silently ignore. Callers that need Ember peer identification should
+/// also send `build_ember_hello(...)` after their EmuleInfoAnswer.
+pub fn build_emule_info(udp_port: u16, obfuscation_enabled: bool, _ember_hash: Option<&[u8; 16]>, _ed25519_pubkey: Option<&[u8; 32]>) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
 
+    // m_uCurVersionShort (eMule writes its short version byte here; 0x32 = 50)
     buf.write_u8(0x32).unwrap();
+    // EMULE_PROTOCOL marker
     buf.write_u8(0x01).unwrap();
 
-    // Base tag count: 8 standard ET_ tags + ET_COMPATIBLECLIENT (always)
-    // + ET_EMBER_HASH when present + ET_EMBER_PUBKEY when present. The
-    // ET_COMPATIBLECLIENT tag makes eMule label our Software as
-    // "eMule Compat" instead of "eMule" in the client details dialog —
-    // see BaseClient.cpp InitClientSoftwareVersion.
-    let tag_count: u32 = 9
-        + ember_hash.is_some() as u32
-        + ed25519_pubkey.is_some() as u32;
+    // eMule sends 7 tags exactly. See BaseClient.cpp:705-726.
+    let tag_count: u32 = 7;
     buf.write_u32::<LittleEndian>(tag_count).unwrap();
 
     // ET_COMPRESSION (0x20) = 1
@@ -506,11 +526,6 @@ pub fn build_emule_info(udp_port: u16, obfuscation_enabled: bool, ember_hash: Op
     write_ed2k_tag(&mut buf, 0x24, &Ed2kTagValue::Uint8(1));
     // ET_EXTENDEDREQUEST (0x25) = 2
     write_ed2k_tag(&mut buf, 0x25, &Ed2kTagValue::Uint8(2));
-    // ET_COMPATIBLECLIENT (0x26) — top byte that drives eMule's Software label.
-    // Sent as a full u32 (eMule reads it as an int) so it overwrites the
-    // high byte of CT_EMULE_VERSION parsed from Hello (EmuleInfo is processed
-    // after Hello in BaseClient.cpp, so this tag wins).
-    write_ed2k_tag(&mut buf, 0x26, &Ed2kTagValue::Uint32(COMPAT_CLIENT_EMBER as u32));
     // ET_FEATURES (0x27): bits 0-1 = SecureIdent level, bit 2 = preview,
     // bit 3 = SupportsCryptLayer, bit 4 = RequestsCryptLayer, bit 5 = RequiresCryptLayer
     let features: u8 = 3        // SecIdent level 3
@@ -519,25 +534,99 @@ pub fn build_emule_info(udp_port: u16, obfuscation_enabled: bool, ember_hash: Op
         | ((obfuscation_enabled as u8) << 4)  // RequestsCryptLayer — must match Hello MISCOPTIONS2
         | (0 << 5);             // no RequiresCryptLayer
     write_ed2k_tag(&mut buf, 0x27, &Ed2kTagValue::Uint8(features));
-    // ET_MOD_VERSION (0x55) — identifies this client as Ember
-    write_ed2k_tag(&mut buf, 0x55, &Ed2kTagValue::String(format!("Ember {}", env!("CARGO_PKG_VERSION"))));
-    // ET_EMBER_HASH (0x56) — Ember-specific identity for the friend system
-    if let Some(hash) = ember_hash {
-        buf.write_u8(0x01).unwrap(); // tag type HASH (16 bytes)
-        buf.write_u16::<LittleEndian>(1).unwrap(); // name length = 1
-        buf.write_u8(0x56).unwrap(); // name_id
-        buf.write_all(hash).unwrap();
-    }
-    // ET_EMBER_PUBKEY (0x57) — Ed25519 public key for Ember auth (BLOB: u32 len + 32 bytes)
-    if let Some(pk) = ed25519_pubkey {
-        buf.write_u8(0x07).unwrap(); // tag type BSob (blob with length prefix)
-        buf.write_u16::<LittleEndian>(1).unwrap(); // name length = 1
-        buf.write_u8(0x57).unwrap(); // name_id
-        buf.write_u32::<LittleEndian>(32).unwrap(); // data length
-        buf.write_all(pk).unwrap();
-    }
 
     buf
+}
+
+/// Build the Ember-private handshake packet sent right after a successful
+/// standard EmuleInfo exchange. Vanilla eMule peers silently ignore unknown
+/// `OP_EMULEPROT` opcodes (see `ListenSocket.cpp` ProcessExtPacket default
+/// branch) so this is invisible to non-Ember clients. Ember peers reply
+/// with their own `OP_EMBER_HELLOANSWER` carrying the same fields, which
+/// is how we authoritatively detect peer Ember-ness, mod_version, and
+/// ember_hash / ember_pubkey now that we no longer leak any of that in
+/// the public Hello / EmuleInfo.
+///
+/// Wire format (little-endian):
+/// - version(1) = 0x01
+/// - flags(1) = bit 0 set when ed25519_pubkey is present
+/// - ember_hash(16)
+/// - mod_version_len(u16) + mod_version_utf8(...)
+/// - nickname_len(u16) + nickname_utf8(...)
+/// - if flags & 0x01: ed25519_pubkey(32)
+pub fn build_ember_hello(ember_hash: &[u8; 16], nickname: &str, ed25519_pubkey: Option<&[u8; 32]>) -> Vec<u8> {
+    let mod_version = format!("Ember {}", env!("CARGO_PKG_VERSION"));
+    let mod_bytes = mod_version.as_bytes();
+    let nick_bytes = nickname.as_bytes();
+    let mut buf = Vec::with_capacity(2 + 16 + 2 + mod_bytes.len() + 2 + nick_bytes.len() + 32);
+
+    buf.write_u8(0x01).unwrap(); // version
+    buf.write_u8(if ed25519_pubkey.is_some() { 0x01 } else { 0x00 }).unwrap();
+    buf.write_all(ember_hash).unwrap();
+    buf.write_u16::<LittleEndian>(mod_bytes.len().min(u16::MAX as usize) as u16).unwrap();
+    buf.write_all(&mod_bytes[..mod_bytes.len().min(u16::MAX as usize)]).unwrap();
+    buf.write_u16::<LittleEndian>(nick_bytes.len().min(u16::MAX as usize) as u16).unwrap();
+    buf.write_all(&nick_bytes[..nick_bytes.len().min(u16::MAX as usize)]).unwrap();
+    if let Some(pk) = ed25519_pubkey {
+        buf.write_all(pk).unwrap();
+    }
+    buf
+}
+
+/// Parsed contents of an `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER` payload.
+#[derive(Debug, Clone, Default)]
+pub struct EmberIdentity {
+    pub ember_hash: [u8; 16],
+    pub mod_version: String,
+    pub nickname: String,
+    pub ed25519_pubkey: Option<[u8; 32]>,
+}
+
+/// Parse the Ember-private handshake packet built by [`build_ember_hello`].
+/// Returns `None` for any malformed payload — Ember-ness is just not detected
+/// in that case (no error is propagated; the standard handshake always wins).
+pub fn parse_ember_hello(payload: &[u8]) -> Option<EmberIdentity> {
+    if payload.len() < 2 + 16 + 2 + 2 {
+        return None;
+    }
+    let mut cursor = Cursor::new(payload);
+    let _version = cursor.read_u8().ok()?;
+    let flags = cursor.read_u8().ok()?;
+    let mut ember_hash = [0u8; 16];
+    cursor.read_exact(&mut ember_hash).ok()?;
+    let mod_len = cursor.read_u16::<LittleEndian>().ok()? as usize;
+    if mod_len > 256 {
+        return None;
+    }
+    let p = cursor.position() as usize;
+    if p + mod_len > payload.len() {
+        return None;
+    }
+    let mod_version = String::from_utf8_lossy(&payload[p..p + mod_len]).to_string();
+    cursor.set_position((p + mod_len) as u64);
+    let nick_len = cursor.read_u16::<LittleEndian>().ok()? as usize;
+    if nick_len > 256 {
+        return None;
+    }
+    let p = cursor.position() as usize;
+    if p + nick_len > payload.len() {
+        return None;
+    }
+    let nickname = String::from_utf8_lossy(&payload[p..p + nick_len]).to_string();
+    cursor.set_position((p + nick_len) as u64);
+    let ed25519_pubkey = if (flags & 0x01) != 0 {
+        let p = cursor.position() as usize;
+        if p + 32 > payload.len() {
+            None
+        } else {
+            let mut pk = [0u8; 32];
+            pk.copy_from_slice(&payload[p..p + 32]);
+            Some(pk)
+        }
+    } else {
+        None
+    };
+    Some(EmberIdentity { ember_hash, mod_version, nickname, ed25519_pubkey })
 }
 
 /// Parse an EmuleInfo or EmuleInfoAnswer payload into peer capabilities.
@@ -583,29 +672,33 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
             0x09 => cursor.read_u8().unwrap_or(0) as u32,
             0x0B => { cursor.read_u64::<LittleEndian>().unwrap_or(0); continue; } // UINT64 — skip
             0x02 => {
+                // String tag. We used to harvest `ET_MOD_VERSION (0x55)` here
+                // and treat any value starting with "Ember" as authoritative
+                // proof that the peer was Ember — but vanilla eMule's
+                // `SendMuleInfoPacket` doesn't even *include* `ET_MOD_VERSION`,
+                // and our own `build_emule_info` no longer does either. Ember
+                // peer identification migrated to `OP_EMBER_HELLO` (0xF8)
+                // which vanilla peers silently ignore. We still skip past
+                // any string tag a third-party client might send so the
+                // tag-loop stays in sync.
                 let slen = cursor.read_u16::<LittleEndian>().unwrap_or(0) as usize;
                 let p = cursor.position() as usize;
                 if p + slen > payload.len() { break; }
-                if name_id == 0x55 { // ET_MOD_VERSION
+                if name_id == 0x55 {
+                    // Record mod_version for diagnostics only; never use it
+                    // to drive `is_ember` (see `OP_EMBER_HELLO` for that).
                     let bytes = &payload[p..p + slen];
                     caps.mod_version = String::from_utf8_lossy(bytes).to_string();
-                    if caps.mod_version.starts_with("Ember") {
-                        caps.is_ember = true;
-                    }
                 }
                 cursor.set_position((p + slen) as u64);
                 continue;
             }
-            0x01 => { // HASH — 16 bytes
+            0x01 => { // HASH — 16 bytes; eMule never emits hash-typed tags
+                // here so we just advance the cursor. The old `ET_EMBER_HASH
+                // (0x56)` harvest is gone — `ember_hash` is now learned via
+                // `OP_EMBER_HELLO` exclusively.
                 let p = cursor.position() as usize;
                 if p + 16 > payload.len() { break; }
-                if name_id == 0x56 { // ET_EMBER_HASH
-                    let mut h = [0u8; 16];
-                    h.copy_from_slice(&payload[p..p + 16]);
-                    if h != [0u8; 16] {
-                        caps.ember_hash = Some(h);
-                    }
-                }
                 cursor.set_position((p + 16) as u64);
                 continue;
             }
@@ -619,15 +712,15 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
                 cursor.set_position((p + byte_count) as u64);
                 continue;
             }
-            0x07 => { // BLOB (BSob with u32 length prefix)
+            0x07 => { // BLOB (BSob with u32 length prefix). Same migration as
+                // the hash and string tag arms: vanilla eMule never emits
+                // a blob in EmuleInfo, and the old `ET_EMBER_PUBKEY (0x57)`
+                // harvest moved to `OP_EMBER_HELLO`. Just skip the bytes
+                // so a third-party client that does send a blob doesn't
+                // desync our tag loop.
                 let blen = cursor.read_u32::<LittleEndian>().unwrap_or(0) as usize;
                 let p = cursor.position() as usize;
                 if blen > payload.len() || p > payload.len() - blen { break; }
-                if name_id == 0x57 && blen == 32 { // ET_EMBER_PUBKEY
-                    let mut pk = [0u8; 32];
-                    pk.copy_from_slice(&payload[p..p + 32]);
-                    caps.ember_pubkey = Some(pk);
-                }
                 cursor.set_position((p + blen) as u64);
                 continue;
             }
@@ -773,8 +866,15 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
                 caps.supports_preview = (int_val & 0x01) != 0;
             }
             0xFE => {
-                caps.is_ember = ((int_val >> 20) & 0x01) != 0;
-                caps.epx_version = ((int_val >> 21) & 0x07) as u8;
+                // `is_ember` and `epx_version` used to be harvested from
+                // bits 20 and 21-23 of MISCOPTIONS2 — a legacy in-band
+                // signal. We removed both: vanilla eMule never sets these
+                // bits and our `build_misc_options2` doesn't either,
+                // so the only peers that would set them are old Ember
+                // builds. Modern Ember peer detection uses
+                // `OP_EMBER_HELLO` (see `parse_ember_hello`) which gives
+                // us not just is_ember but also nickname, mod_version,
+                // and pubkey in one round-trip.
                 caps.supports_file_ident = ((int_val >> 13) & 0x01) != 0;
                 caps.supports_direct_udp_callback = ((int_val >> 12) & 0x01) != 0;
                 caps.supports_captcha = ((int_val >> 11) & 0x01) != 0;
@@ -1070,32 +1170,13 @@ pub fn merge_caps(base: &mut PeerCapabilities, update: PeerCapabilities) {
     if update.ember_hash.is_some() { base.ember_hash = update.ember_hash; }
     if update.ember_pubkey.is_some() { base.ember_pubkey = update.ember_pubkey; }
 
-    // Defense: require `ET_MOD_VERSION` to corroborate `is_ember`.
-    //
-    // `is_ember` can be raised by two independent signals:
-    //   1. `parse_hello_*` reads MISCOPTIONS2 bit 20 (legacy Ember
-    //      capability bit). `build_misc_options2` deliberately does NOT
-    //      set this bit anymore — Ember identification migrated to
-    //      `ET_MOD_VERSION` (0x55) in `EmuleInfo` to avoid tripping
-    //      anti-leecher mods that ban on unknown reserved-bit values.
-    //      Today nothing in vanilla eMule writes bit 20 either, so
-    //      reading it is harmless. But if a future eMule release ever
-    //      assigns bit 20 to a new feature, we'd misclassify those
-    //      peers as Ember without this guard — handing them the
-    //      LowID-to-LowID broker (which would fail), serving them via
-    //      the Ember-friend path (which would silently no-op), etc.
-    //   2. `parse_emule_info` sets `is_ember = true` when
-    //      `ET_MOD_VERSION` starts with "Ember". This is the canonical
-    //      path — every real Ember client emits it (see
-    //      `build_emule_info`), and no eMule mod uses that prefix.
-    //
-    // We trust signal #2 unconditionally. Signal #1 is only respected
-    // when corroborated by signal #2 (mod_version starting with
-    // "Ember"). For peers that haven't sent EmuleInfo yet,
-    // `mod_version` is empty and the bit-20 evidence is suppressed
-    // until the next merge with EmuleInfo data — which is exactly the
-    // moment we have enough information to act on it.
-    base.is_ember &= base.mod_version.starts_with("Ember");
+    // No `is_ember` corroboration check needed anymore — `parse_hello_*`
+    // and `parse_emule_info` no longer set `is_ember` from bit-20 or
+    // ET_MOD_VERSION (vanilla eMule never sets either, and we no longer
+    // emit them ourselves). The only path that sets `update.is_ember = true`
+    // is the `OP_EMBER_HELLO` handler in `multi_source.rs` / `upload.rs`,
+    // which is by definition authoritative — only an Ember peer can
+    // produce a parseable Ember-Hello payload.
 }
 
 /// Build a human-readable client software string from peer capabilities.
@@ -1810,59 +1891,91 @@ mod tests {
         assert!(caps.source_exchange_ver > 0);
     }
 
-    /// Defense-in-depth: a peer that sets MISCOPTIONS2 bit 20 (the
-    /// legacy Ember capability bit) but doesn't actually identify as
-    /// Ember in `ET_MOD_VERSION` MUST be reclassified as non-Ember
-    /// after `merge_caps`. Otherwise a future eMule release that
-    /// repurposes bit 20 would be served the Ember-only paths
-    /// (LowID-to-LowID broker, friend-system features) and waste
-    /// resources / silently misbehave.
+    /// `parse_emule_info` MUST NOT raise `is_ember` from `ET_MOD_VERSION`
+    /// any more (vanilla eMule never emits the tag, and a peer that does
+    /// is just a third-party mod identifying itself, not necessarily an
+    /// Ember client). The single source of truth for is_ember is now
+    /// `OP_EMBER_HELLO`.
     #[test]
-    fn merge_caps_drops_is_ember_without_mod_version_corroboration() {
-        let mut base = PeerCapabilities::default();
-        base.is_ember = true; // simulate bit-20 read in parse_hello_*
-        // mod_version is empty — no `ET_MOD_VERSION` corroboration yet.
-        let update = PeerCapabilities::default();
-        merge_caps(&mut base, update);
-        assert!(
-            !base.is_ember,
-            "is_ember must be cleared when ET_MOD_VERSION doesn't start with \"Ember\"",
+    fn parse_emule_info_does_not_set_is_ember_from_mod_version() {
+        // Hand-craft an EmuleInfo payload that includes a fake
+        // ET_MOD_VERSION = "Ember 9.9.9" string tag — exactly what an old
+        // Ember build (or a malicious client trying to impersonate one)
+        // would send. parse_emule_info should record it in `mod_version`
+        // for diagnostics but leave `is_ember = false`.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.write_u8(0x32).unwrap();
+        buf.write_u8(0x01).unwrap();
+        buf.write_u32::<LittleEndian>(1).unwrap(); // 1 tag
+        // tag: type=0x02 (string), name_len=1, name_id=0x55 (ET_MOD_VERSION)
+        buf.write_u8(0x02).unwrap();
+        buf.write_u16::<LittleEndian>(1).unwrap();
+        buf.write_u8(0x55).unwrap();
+        let s = b"Ember 9.9.9";
+        buf.write_u16::<LittleEndian>(s.len() as u16).unwrap();
+        buf.write_all(s).unwrap();
+
+        let caps = parse_emule_info(&buf);
+        assert_eq!(caps.mod_version, "Ember 9.9.9", "mod_version is recorded for diagnostics");
+        assert!(!caps.is_ember, "is_ember must come from OP_EMBER_HELLO, not ET_MOD_VERSION");
+    }
+
+    /// `OP_EMBER_HELLO` round-trip: the builder + parser must agree on the
+    /// wire format including the optional ed25519 pubkey. This is the
+    /// authoritative Ember peer-detection path now.
+    #[test]
+    fn ember_hello_roundtrip() {
+        let hash = [0x42u8; 16];
+        let pk = [0xAAu8; 32];
+        let payload = build_ember_hello(&hash, "alice", Some(&pk));
+        let parsed = parse_ember_hello(&payload).expect("must parse");
+        assert_eq!(parsed.ember_hash, hash);
+        assert_eq!(parsed.nickname, "alice");
+        assert!(parsed.mod_version.starts_with("Ember "), "mod_version='{}'", parsed.mod_version);
+        assert_eq!(parsed.ed25519_pubkey, Some(pk));
+
+        let payload_nopk = build_ember_hello(&hash, "bob", None);
+        let parsed_nopk = parse_ember_hello(&payload_nopk).expect("must parse");
+        assert_eq!(parsed_nopk.ember_hash, hash);
+        assert_eq!(parsed_nopk.nickname, "bob");
+        assert_eq!(parsed_nopk.ed25519_pubkey, None);
+    }
+
+    /// Anti-leecher contract: the public Hello our `build_hello_with_buddy_opts`
+    /// produces MUST have a zero high byte in CT_EMULE_VERSION. Mods like
+    /// NeoMule/MorphXT/Xtreme/ScarAngel treat any non-zero high byte as a
+    /// third-party spoofing client and silently queue-ban us — exactly the
+    /// failure mode we observed in the wild before this fix.
+    #[test]
+    fn hello_ct_emule_version_high_byte_is_zero() {
+        let user_hash = [0x33; 16];
+        let opts = HelloOptions {
+            udp_port: 4672, kad_port: 4672,
+            supports_crypt_layer: true, requests_crypt_layer: true,
+            requires_crypt_layer: false, supports_direct_udp_callback: false,
+            supports_captcha: false, server_ip: 0, server_port: 0,
+            kad_version: 0x09,
+        };
+        let payload = build_hello_with_buddy_opts(&user_hash, 0x1234_5678, 4662, "ember", None, &opts);
+        let (_hash, caps) = parse_hello_packet(&payload).unwrap();
+        assert_eq!(
+            caps.compatible_client, 0,
+            "CT_EMULE_VERSION high byte (compatible_client) MUST be 0 in Hello to match vanilla eMule and avoid anti-leecher queue bans",
         );
     }
 
-    /// Inverse: a peer that signals bit 20 *and* identifies as Ember
-    /// in `ET_MOD_VERSION` is preserved as `is_ember=true`. This is
-    /// the realistic path for any actual Ember client (we always emit
-    /// `ET_MOD_VERSION = "Ember <ver>"` in build_emule_info).
+    /// Tag-count contract: vanilla eMule's `SendMuleInfoPacket` writes
+    /// exactly 7 ET_ tags. We must do the same — adding extra tags
+    /// (`ET_COMPATIBLECLIENT`, `ET_MOD_VERSION`, custom Ember tags) makes
+    /// us look like a third-party client to anti-leecher mods.
     #[test]
-    fn merge_caps_preserves_is_ember_with_mod_version_corroboration() {
-        let mut base = PeerCapabilities::default();
-        base.is_ember = true; // bit-20 read in parse_hello_*
-        let mut update = PeerCapabilities::default();
-        update.mod_version = "Ember 2.0.0".to_string(); // EmuleInfo arrives
-        update.is_ember = true; // parse_emule_info sees "Ember" prefix
-        merge_caps(&mut base, update);
-        assert!(
-            base.is_ember,
-            "is_ember must remain true when corroborated by ET_MOD_VERSION starting with \"Ember\"",
-        );
-        assert_eq!(base.mod_version, "Ember 2.0.0");
-    }
-
-    /// Belt-and-suspenders: if a non-Ember peer somehow ends up with
-    /// `is_ember=true` and a mod_version like "MorphXT" (eMule mod),
-    /// the merge must clear the flag.
-    #[test]
-    fn merge_caps_clears_is_ember_for_non_ember_mod_version() {
-        let mut base = PeerCapabilities::default();
-        base.is_ember = true;
-        base.mod_version = "MorphXT 1.2.3".to_string();
-        let update = PeerCapabilities::default();
-        merge_caps(&mut base, update);
-        assert!(
-            !base.is_ember,
-            "is_ember must be cleared when mod_version is set but doesn't start with \"Ember\"",
-        );
+    fn emule_info_has_exactly_seven_tags() {
+        let payload = build_emule_info(4672, true, None, None);
+        // Layout: version(1) + protocol(1) + tag_count(u32) + tags
+        assert_eq!(payload[0], 0x32, "version byte");
+        assert_eq!(payload[1], 0x01, "protocol marker");
+        let tag_count = u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
+        assert_eq!(tag_count, 7, "must match eMule SendMuleInfoPacket exactly");
     }
 
     #[test]
