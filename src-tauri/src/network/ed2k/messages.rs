@@ -1069,6 +1069,33 @@ pub fn merge_caps(base: &mut PeerCapabilities, update: PeerCapabilities) {
     base.epx_version = base.epx_version.max(update.epx_version);
     if update.ember_hash.is_some() { base.ember_hash = update.ember_hash; }
     if update.ember_pubkey.is_some() { base.ember_pubkey = update.ember_pubkey; }
+
+    // Defense: require `ET_MOD_VERSION` to corroborate `is_ember`.
+    //
+    // `is_ember` can be raised by two independent signals:
+    //   1. `parse_hello_*` reads MISCOPTIONS2 bit 20 (legacy Ember
+    //      capability bit). `build_misc_options2` deliberately does NOT
+    //      set this bit anymore — Ember identification migrated to
+    //      `ET_MOD_VERSION` (0x55) in `EmuleInfo` to avoid tripping
+    //      anti-leecher mods that ban on unknown reserved-bit values.
+    //      Today nothing in vanilla eMule writes bit 20 either, so
+    //      reading it is harmless. But if a future eMule release ever
+    //      assigns bit 20 to a new feature, we'd misclassify those
+    //      peers as Ember without this guard — handing them the
+    //      LowID-to-LowID broker (which would fail), serving them via
+    //      the Ember-friend path (which would silently no-op), etc.
+    //   2. `parse_emule_info` sets `is_ember = true` when
+    //      `ET_MOD_VERSION` starts with "Ember". This is the canonical
+    //      path — every real Ember client emits it (see
+    //      `build_emule_info`), and no eMule mod uses that prefix.
+    //
+    // We trust signal #2 unconditionally. Signal #1 is only respected
+    // when corroborated by signal #2 (mod_version starting with
+    // "Ember"). For peers that haven't sent EmuleInfo yet,
+    // `mod_version` is empty and the bit-20 evidence is suppressed
+    // until the next merge with EmuleInfo data — which is exactly the
+    // moment we have enough information to act on it.
+    base.is_ember &= base.mod_version.starts_with("Ember");
 }
 
 /// Build a human-readable client software string from peer capabilities.
@@ -1781,6 +1808,61 @@ mod tests {
         assert_eq!(caps.compression_ver, 1);
         assert_eq!(caps.extended_requests_ver, 2);
         assert!(caps.source_exchange_ver > 0);
+    }
+
+    /// Defense-in-depth: a peer that sets MISCOPTIONS2 bit 20 (the
+    /// legacy Ember capability bit) but doesn't actually identify as
+    /// Ember in `ET_MOD_VERSION` MUST be reclassified as non-Ember
+    /// after `merge_caps`. Otherwise a future eMule release that
+    /// repurposes bit 20 would be served the Ember-only paths
+    /// (LowID-to-LowID broker, friend-system features) and waste
+    /// resources / silently misbehave.
+    #[test]
+    fn merge_caps_drops_is_ember_without_mod_version_corroboration() {
+        let mut base = PeerCapabilities::default();
+        base.is_ember = true; // simulate bit-20 read in parse_hello_*
+        // mod_version is empty — no `ET_MOD_VERSION` corroboration yet.
+        let update = PeerCapabilities::default();
+        merge_caps(&mut base, update);
+        assert!(
+            !base.is_ember,
+            "is_ember must be cleared when ET_MOD_VERSION doesn't start with \"Ember\"",
+        );
+    }
+
+    /// Inverse: a peer that signals bit 20 *and* identifies as Ember
+    /// in `ET_MOD_VERSION` is preserved as `is_ember=true`. This is
+    /// the realistic path for any actual Ember client (we always emit
+    /// `ET_MOD_VERSION = "Ember <ver>"` in build_emule_info).
+    #[test]
+    fn merge_caps_preserves_is_ember_with_mod_version_corroboration() {
+        let mut base = PeerCapabilities::default();
+        base.is_ember = true; // bit-20 read in parse_hello_*
+        let mut update = PeerCapabilities::default();
+        update.mod_version = "Ember 2.0.0".to_string(); // EmuleInfo arrives
+        update.is_ember = true; // parse_emule_info sees "Ember" prefix
+        merge_caps(&mut base, update);
+        assert!(
+            base.is_ember,
+            "is_ember must remain true when corroborated by ET_MOD_VERSION starting with \"Ember\"",
+        );
+        assert_eq!(base.mod_version, "Ember 2.0.0");
+    }
+
+    /// Belt-and-suspenders: if a non-Ember peer somehow ends up with
+    /// `is_ember=true` and a mod_version like "MorphXT" (eMule mod),
+    /// the merge must clear the flag.
+    #[test]
+    fn merge_caps_clears_is_ember_for_non_ember_mod_version() {
+        let mut base = PeerCapabilities::default();
+        base.is_ember = true;
+        base.mod_version = "MorphXT 1.2.3".to_string();
+        let update = PeerCapabilities::default();
+        merge_caps(&mut base, update);
+        assert!(
+            !base.is_ember,
+            "is_ember must be cleared when mod_version is set but doesn't start with \"Ember\"",
+        );
     }
 
     #[test]
