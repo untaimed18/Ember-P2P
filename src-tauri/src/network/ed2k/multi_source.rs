@@ -834,6 +834,38 @@ impl MultiSourceDownload {
         // the network with dozens of simultaneous TCP handshakes to unreachable peers)
         let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SOURCES));
 
+        // Tracks "what stage did this peer reach?" per peer, so we
+        // can cool peers that queued us for eMule's 29 min
+        // (`FILEREASKTIME`, `DownloadClient.cpp:1889` DS_ONQUEUE) vs.
+        // peers that only failed at hello for 60 s. Matching eMule's
+        // per-state cooldown is what lets the retry loop keep a
+        // download alive for hours while peers climb their queue by
+        // user_hash recognition, without hammering peers that refused
+        // our TCP connect.
+        //
+        // `CooldownKind::Queued` is set when a source task ends with
+        // a queue-state error (peer dropped our TCP while queued,
+        // queue_full, queue_timeout, OutOfPartReqs) — i.e. the peer
+        // accepted our file request and put us in their upload queue
+        // at some point. `CooldownKind::Unknown` is the seed state
+        // for every source and the state after a hello/file_status-
+        // phase failure; those peers will likely succeed soon if the
+        // network glitch recovers (matches eMule's short reask for
+        // unknown states).
+        //
+        // Declared out here (not inside the retry-round loop) so the
+        // initial source tasks at line 849+ can populate it the same
+        // way the retry tasks do — otherwise the first-attempt peers
+        // wouldn't get their cooldown promoted after the initial
+        // round and would be hammered at 60 s intervals by round 1.
+        #[derive(Clone, Copy, PartialEq)]
+        enum CooldownKind {
+            Unknown,
+            Queued,
+        }
+        let peers_that_queued: Arc<std::sync::Mutex<HashSet<(String, u16)>>> =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
+
         // Per-file writer with its own dedicated thread. Replaces the
         // previous `Arc<Mutex<File>>` pattern that serialized all writers
         // on a single OS-mutex and burned a `spawn_blocking` slot per
@@ -896,6 +928,9 @@ impl MultiSourceDownload {
             let fail_tid = self.transfer_id.clone();
             let fail_ip = source.peer_ip.clone();
             let fail_port = source.peer_port;
+            let init_queued = peers_that_queued.clone();
+            let init_src_ip = source.peer_ip.clone();
+            let init_src_port = source.peer_port;
             let handle = tokio::spawn(async move {
                 if sem_clone.available_permits() == 0 {
                     let _ = fail_etx.send(DownloadEvent::SourceDetail {
@@ -973,7 +1008,37 @@ impl MultiSourceDownload {
                 }
 
                 if let Err(e) = &result {
-                    if !super::transfer::is_queue_detached_error(&e.to_string()) {
+                    let err_str = e.to_string();
+                    // Promote the peer's cooldown to `Queued` (29 min,
+                    // matching eMule's FILEREASKTIME) when the task
+                    // ended in a queue-state error — TCP dropped while
+                    // queued, queue_full, queue_timeout, or
+                    // OutOfPartReqs. The outer retry loop reads this
+                    // shared set at round boundaries and applies the
+                    // longer cooldown for next dial. See
+                    // `SOURCE_RETRY_COOLDOWN_SECS` for the full
+                    // rationale.
+                    let is_queue_related =
+                        super::transfer::is_queue_detached_error(&err_str)
+                        || err_str.contains("peer queue is full")
+                        || err_str.contains("timed out waiting for upload slot")
+                        || err_str.contains("OutOfPartReqs");
+                    if is_queue_related {
+                        if let Ok(mut q) = init_queued.lock() {
+                            q.insert((init_src_ip.clone(), init_src_port));
+                        }
+                    }
+                    // Un-suppress the queue_detached case at info
+                    // level. It used to exit silently; now we log
+                    // that the peer is cooling down instead of
+                    // leaving the user wondering why a queued source
+                    // disappeared. Other failures stay at warn.
+                    if super::transfer::is_queue_detached_error(&err_str) {
+                        info!(
+                            "Source {} ({}): TCP dropped while queued — cooling down before re-dial",
+                            src_idx, fail_ip,
+                        );
+                    } else {
                         warn!("Source {} ({}) failed: {e:#}", src_idx, fail_ip);
                         let _ = fail_etx.send(DownloadEvent::SourceDetail {
                             transfer_id: fail_tid,
@@ -985,7 +1050,7 @@ impl MultiSourceDownload {
                             transferred: 0,
                             client_software: String::new(),
                             peer_name: String::new(),
-                            failure_kind: Some(super::transfer::classify_error(&e.to_string())),
+                            failure_kind: Some(super::transfer::classify_error(&err_str)),
                             available_parts: None,
                             total_parts: None,
                             country_code: None,
@@ -1542,26 +1607,53 @@ impl MultiSourceDownload {
         // expires and re-evaluate. This keeps the retry budget available
         // for genuinely fresh attempts.
         const RETRY_ROUND_MIN_INTERVAL_SECS: u64 = 30;
-        const SOURCE_RETRY_COOLDOWN_SECS: u64 = 60;
+        // Per-source redial cooldown. Raised from the historical 60 s to
+        // match eMule's `FILEREASKTIME` (29 min, `DownloadClient.cpp:1889`
+        // case DS_ONQUEUE). The 60 s value caused Ember to churn any
+        // peer that kicked us from its queue — reconnecting at 60 s
+        // intervals looks like bot behaviour and makes modern eMule
+        // peers ignore us (some anti-leecher mods even ban on reconnect
+        // rate). With `FILEREASKTIME` we redial at the same cadence
+        // eMule does, giving the peer a chance to retain our queue slot
+        // by user_hash across the reconnect — same mechanism that lets
+        // eMule climb to queue rank 1 over hours/days rather than
+        // restarting at the bottom every 60 s like we did.
+        //
+        // Fast-failing paths that never reached queue state (TCP connect
+        // failure, hello timeout) keep a shorter cooldown via
+        // `HELLO_FAIL_COOLDOWN_SECS` — see the cooldown-lookup logic
+        // below. We only want the 29 min patience for peers that
+        // actually queued us.
+        const SOURCE_RETRY_COOLDOWN_SECS: u64 =
+            super::dead_sources::FILEREASKTIME_SECS as u64;
+        const HELLO_FAIL_COOLDOWN_SECS: u64 = 60;
         let retry_round_min_interval =
             std::time::Duration::from_secs(RETRY_ROUND_MIN_INTERVAL_SECS);
         let source_retry_cooldown =
             std::time::Duration::from_secs(SOURCE_RETRY_COOLDOWN_SECS);
+        let hello_fail_cooldown =
+            std::time::Duration::from_secs(HELLO_FAIL_COOLDOWN_SECS);
 
         let max_retry_rounds = self.ed2k_limits.multisource_retry_rounds;
-        // Initial source attempts have just completed (or just failed);
-        // seed the cooldown table with `now()` so round 1 doesn't
-        // immediately re-dial the same peers we tried in the initial
-        // pass. Same-peer retries from this round onward will require
-        // SOURCE_RETRY_COOLDOWN_SECS to elapse first.
-        let mut source_dial_history: HashMap<(String, u16), std::time::Instant> =
+        let mut source_dial_history: HashMap<(String, u16), (std::time::Instant, CooldownKind)> =
             HashMap::new();
         {
             let now = std::time::Instant::now();
             for s in self.sources.iter().chain(injected_sources.iter()) {
-                source_dial_history.insert((s.peer_ip.clone(), s.peer_port), now);
+                source_dial_history.insert(
+                    (s.peer_ip.clone(), s.peer_port),
+                    (now, CooldownKind::Unknown),
+                );
             }
         }
+        // Per-peer cooldown duration lookup — see `SOURCE_RETRY_COOLDOWN_SECS`
+        // comment above for the full rationale.
+        let cooldown_for = |kind: CooldownKind| -> std::time::Duration {
+            match kind {
+                CooldownKind::Queued => source_retry_cooldown,
+                CooldownKind::Unknown => hello_fail_cooldown,
+            }
+        };
         let mut last_round_end: Option<std::time::Instant> = None;
         let mut retry_round: u32 = 0;
         while retry_round < max_retry_rounds {
@@ -1601,13 +1693,31 @@ impl MultiSourceDownload {
                 .chain(injected_sources.iter())
                 .cloned()
                 .collect();
+
+            // Promote any peers that reached queue state during the
+            // previous round (populated by `download_parts_from_source`
+            // when it receives `OP_QUEUERANKING`). Doing this at
+            // round boundary avoids holding the mutex while we work.
+            {
+                let mut queued = peers_that_queued.lock().unwrap();
+                for key in queued.drain() {
+                    if let Some(entry) = source_dial_history.get_mut(&key) {
+                        entry.1 = CooldownKind::Queued;
+                    }
+                }
+            }
+
             // Build the cooldown-eligible candidate list once; re-used
-            // by every part assignment below.
+            // by every part assignment below. `source_dial_history`
+            // now carries the cooldown kind (queued vs. unknown/failed),
+            // so a peer that kicked us from its queue gets the long
+            // 29 min cooldown and a peer that simply refused a TCP
+            // connection gets the fast 60 s cooldown.
             let now = std::time::Instant::now();
             let eligible: Vec<bool> = all_sources
                 .iter()
                 .map(|s| match source_dial_history.get(&(s.peer_ip.clone(), s.peer_port)) {
-                    Some(t) => now.duration_since(*t) >= source_retry_cooldown,
+                    Some((t, kind)) => now.duration_since(*t) >= cooldown_for(*kind),
                     None => true,
                 })
                 .collect();
@@ -1663,7 +1773,7 @@ impl MultiSourceDownload {
                     }
                     let key = (source.peer_ip.clone(), source.peer_port);
                     let remaining = match source_dial_history.get(&key) {
-                        Some(t) => source_retry_cooldown
+                        Some((t, kind)) => cooldown_for(*kind)
                             .checked_sub(now.duration_since(*t))
                             .unwrap_or_default(),
                         None => std::time::Duration::ZERO,
@@ -1715,13 +1825,24 @@ impl MultiSourceDownload {
             // Record dial timestamps for every source we're about to
             // retry, so subsequent rounds (or a new round triggered by
             // the cooldown sleep above) skip them until the cooldown
-            // window expires.
+            // window expires. Preserve the existing `CooldownKind` for
+            // peers we've seen before — a peer that queued us once and
+            // dropped will get re-dialed NOW, but if it queues again
+            // then drops again we still want the long 29 min cooldown
+            // next round. `CooldownKind::Queued` flips on via the
+            // `peers_that_queued` drain at the top of the round loop
+            // whenever a retry task calls `emit_source!("queued", …)`.
             for (src_idx, parts) in retry_assignments.iter().enumerate() {
                 if parts.is_empty() {
                     continue;
                 }
                 let s = &all_sources[src_idx];
-                source_dial_history.insert((s.peer_ip.clone(), s.peer_port), now);
+                let key = (s.peer_ip.clone(), s.peer_port);
+                let prior_kind = source_dial_history
+                    .get(&key)
+                    .map(|e| e.1)
+                    .unwrap_or(CooldownKind::Unknown);
+                source_dial_history.insert(key, (now, prior_kind));
             }
 
             let (retry_tx, mut retry_rx) = mpsc::channel::<(usize, i64)>(256);
@@ -1795,6 +1916,16 @@ impl MultiSourceDownload {
                 let r_fh = self.friend_hashes.clone();
                 let r_sx_oh = self.sx_overhead.clone();
                 let r_sem = conn_semaphore.clone();
+                // Clone the shared "peers that queued" set so this
+                // retry task can flag its peer when the task ends in
+                // a queue-related error. The outer loop drains the
+                // set at the top of the next round and promotes the
+                // peer's cooldown from 60 s (Unknown / hello-fail) to
+                // 29 min (Queued / eMule FILEREASKTIME) — see
+                // `CooldownKind` and `SOURCE_RETRY_COOLDOWN_SECS`.
+                let r_queued = peers_that_queued.clone();
+                let r_src_ip = source.peer_ip.clone();
+                let r_src_port = source.peer_port;
                 retry_handles.push(tokio::spawn(async move {
                     let _permit = match r_sem.acquire().await {
                         Ok(p) => p,
@@ -1820,7 +1951,45 @@ impl MultiSourceDownload {
                         None,
                     )
                     .await {
-                        if !super::transfer::is_queue_detached_error(&e.to_string()) {
+                        let err_str = e.to_string();
+                        // Queue-phase errors (peer kicked us from its
+                        // upload queue, TCP dropped while queued, queue
+                        // full, queue timeout, no-needed-parts): tag
+                        // the peer as `Queued` so next round's cooldown
+                        // is 29 min instead of 60 s. Without this the
+                        // retry loop hammered the peer every 60 s after
+                        // every queue-state failure, which (a) looked
+                        // like bot behaviour to anti-leecher mods and
+                        // (b) used up the small `max_retry_rounds`
+                        // budget in under 5 minutes, causing downloads
+                        // to abandon queued peers the user would have
+                        // eventually climbed to rank 1 with.
+                        let is_queue_related =
+                            super::transfer::is_queue_detached_error(&err_str)
+                            || err_str.contains("peer queue is full")
+                            || err_str.contains("timed out waiting for upload slot")
+                            || err_str.contains("OutOfPartReqs");
+                        if is_queue_related {
+                            if let Ok(mut q) = r_queued.lock() {
+                                q.insert((r_src_ip.clone(), r_src_port));
+                            }
+                        }
+                        // Un-suppress queue_detached logs at info
+                        // level — historically suppressed to avoid log
+                        // spam, but the resulting silent task exit
+                        // made these connections invisible in the
+                        // diagnostics and masked that we were losing
+                        // queue position every time. Other queue-state
+                        // errors (full / timeout / NNP) were already
+                        // warn-logged above but with `warn!`, which
+                        // overstates them — they're normal protocol
+                        // states, not failures.
+                        if super::transfer::is_queue_detached_error(&err_str) {
+                            info!(
+                                "Retry source {} ({}): TCP dropped while queued — will re-dial after {}s cooldown",
+                                src_idx, r_src_ip, SOURCE_RETRY_COOLDOWN_SECS,
+                            );
+                        } else {
                             let _ = rfail_etx.send(DownloadEvent::SourceDetail {
                                 transfer_id: rfail_tid,
                                 ip: rfail_ip,
@@ -1831,7 +2000,7 @@ impl MultiSourceDownload {
                                 transferred: 0,
                                 client_software: String::new(),
                                 peer_name: String::new(),
-                                failure_kind: Some(super::transfer::classify_error(&e.to_string())),
+                                failure_kind: Some(super::transfer::classify_error(&err_str)),
                                 available_parts: None,
                                 total_parts: None,
                                 country_code: None,
