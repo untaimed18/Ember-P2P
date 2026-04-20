@@ -29,6 +29,25 @@ use storage::database::Database;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Install the process-wide rustls CryptoProvider before *anything*
+    // can do TLS. Multiple crates in this app speak rustls 0.23
+    // (`quinn`, `tokio-tungstenite`, `reqwest`) and 0.23 deliberately
+    // refuses to pick a default automatically — any code path that
+    // doesn't pass an explicit provider will panic with:
+    //   "Could not automatically determine the process-level
+    //    CryptoProvider from Rustls crate features."
+    // QUIC is fine because `quic.rs::build_{server,client}_config`
+    // pass `builder_with_provider(...)` explicitly, but the WS client
+    // used by `connect_server_relay` (every LowID-to-LowID relay
+    // fallback) goes through `tokio_tungstenite::connect_async`,
+    // which uses the global default — no install, every relay
+    // attempt panicked the spawned task.
+    //
+    // Idempotent: returns Err if a provider is already installed
+    // (e.g. a future `cargo test` linking us in alongside another
+    // initializer). We don't care about that case, hence `let _ =`.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let log_dir = directories::ProjectDirs::from("com", "ember", "p2p")
         .map(|d| d.data_dir().to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
