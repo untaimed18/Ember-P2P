@@ -3161,6 +3161,23 @@ async fn download_parts_from_source(
         }
         if proto == OP_EDONKEYHEADER && opcode == OP_REQFILENAMEANSWER {
             got_filename = true;
+            // For single-part files, `got_status` is initialised to `true`
+            // because the eMule protocol does NOT send `OP_FILESTATUS` for
+            // sub-PARTSIZE files: we deliberately omit `OP_SETREQFILEID`
+            // from our multipacket request (line ~2876), and eMule's
+            // ProcessMultiPacket / standalone OP_SETREQFILEID handlers
+            // both treat `GetPartCount() <= 1` as a no-op (see
+            // `ListenSocket.cpp:374-376`). Without this early break the
+            // wait loop kept reading after receiving the only packet the
+            // peer was ever going to send for the file-control phase,
+            // never reaching the `OP_STARTUPLOADREQ` send below; eMule
+            // eventually closed the idle session and we surfaced as
+            // `stage:file_status_wait (round 1, got_filename=true)
+            // unexpected end of file` — exactly the symptom the user hit
+            // on every single-part download in the latest session.
+            if got_status {
+                break;
+            }
             continue;
         }
         if proto == OP_EDONKEYHEADER && opcode == OP_FILESTATUS {
@@ -3219,6 +3236,20 @@ async fn download_parts_from_source(
                     };
                     peer_file_status = Some(parts_vec);
                     got_status = true;
+                    break;
+                }
+                // Single-part-file path: the multipacket answer carries
+                // OP_REQFILENAMEANSWER but no OP_FILESTATUS, because we
+                // never asked for one (`OP_SETREQFILEID` is omitted from
+                // our request when `single_part == true`). `got_status`
+                // was already initialised to `single_part`, so once we
+                // also have `got_filename` the wait phase is complete —
+                // break instead of looping back to read a packet that
+                // will never come (peer is now waiting for our
+                // `OP_STARTUPLOADREQ` and will close the idle session
+                // 30-90 s later, surfacing as the spurious
+                // `unexpected end of file` we saw in the wild).
+                if got_status && got_filename {
                     break;
                 }
             }
