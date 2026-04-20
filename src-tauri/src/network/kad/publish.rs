@@ -9,6 +9,11 @@ use super::types::*;
 const REPUBLISH_KEYWORD_SECS: i64 = 24 * 3600;
 const REPUBLISH_SOURCE_SECS: i64 = 5 * 3600;
 
+/// Bit set in the `"ember"` source-publish tag when this client speaks
+/// the v1 LowID-to-LowID protocol (rendezvous hole-punch + WebSocket
+/// relay fallback). See `build_source_publish` for the full rationale.
+pub const EMBER_CAP_RELAY_PUNCH_V1: u8 = 0x01;
+
 #[derive(Debug, Clone)]
 pub struct PublishableFile {
     pub file_hash: KadId,
@@ -243,6 +248,27 @@ impl PublishManager {
             value: TagValue::Uint8(self.connect_options),
         });
 
+        // Ember capability advertisement: tells other Ember clients that we
+        // speak the LowID-to-LowID hole-punch / WebSocket-relay protocol
+        // (broker.rs + relay.rs + the rendezvous-server). Other Ember peers
+        // gate their broker attempts on the presence of this tag, so vanilla
+        // eMule peers (which don't speak our relay protocol on the other
+        // end) don't get ~46 s of wasted punch+relay before failing.
+        //
+        // Wire details:
+        // - String-named (not a numeric ID) so it lives in eMule's free
+        //   string-tag namespace and can never collide with a future
+        //   `0xF0..0xFF` source-tag assignment from the upstream protocol.
+        // - eMule clients see an unknown string tag and silently drop it.
+        // - Value is a Uint8 capability bitfield. Bit 0 means "Ember v1
+        //   relay+punch capable". Higher bits are reserved for future
+        //   protocol features (e.g. peer-relay support, alt transport)
+        //   so we can extend without a breaking change.
+        tags.push(KadTag {
+            name: TagName::Str("ember".to_string()),
+            value: TagValue::Uint8(EMBER_CAP_RELAY_PUNCH_V1),
+        });
+
         // eMule Search.cpp STOREFILE uses client hash (user hash), not KadID:
         // CUInt128 uID(CKademlia::GetPrefs()->GetClientHash())
         // user_hash is raw ed2k bytes; wrap in CUInt128 wire format for KAD.
@@ -395,4 +421,84 @@ pub fn extract_keywords(filename: &str) -> Vec<String> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_file() -> PublishableFile {
+        PublishableFile {
+            file_hash: KadId([0x42; 16]),
+            file_name: "ember-test.bin".to_string(),
+            file_size: 1024,
+            file_type: "Pro".to_string(),
+            complete_sources: 0,
+        }
+    }
+
+    fn make_publisher(firewalled: bool) -> PublishManager {
+        let mut p = PublishManager::new(KadId([0xAA; 16]), [0xBB; 16], 4662, 4672);
+        p.firewalled = firewalled;
+        // Fake direct UDP callback so the firewalled branch is allowed to
+        // emit a publish (otherwise `build_source_publish` returns None
+        // for firewalled clients with no buddy info, which would skip
+        // emission of every other tag too).
+        p.direct_udp_callback = true;
+        p
+    }
+
+    /// HighID Ember client must emit the `"ember"` capability tag in
+    /// every source publish so the recipient's `extract_kad_sources`
+    /// (and via it the broker dispatch gate) can know we're reachable
+    /// over the Ember relay/punch protocol.
+    #[test]
+    fn build_source_publish_includes_ember_capability_tag() {
+        let publisher = make_publisher(false);
+        let file = sample_file();
+        let msg = publisher
+            .build_source_publish(&file)
+            .expect("HighID publish should not be skipped");
+        let tags = match msg {
+            KadMessage::PublishSourceReq { tags, .. } => tags,
+            _ => panic!("unexpected message type from build_source_publish"),
+        };
+
+        let ember_tag = tags
+            .iter()
+            .find(|t| matches!(&t.name, TagName::Str(s) if s == "ember"))
+            .expect("ember capability tag must be present in source publish");
+        let value = match ember_tag.value {
+            TagValue::Uint8(v) => v,
+            _ => panic!("ember tag must be Uint8 (capability bitfield)"),
+        };
+        assert!(
+            value & EMBER_CAP_RELAY_PUNCH_V1 != 0,
+            "v1 relay+punch capability bit must be set, got {:#04x}",
+            value,
+        );
+    }
+
+    /// Same emission required when the publisher is firewalled (LowID /
+    /// behind NAT) — that's actually the most important case because
+    /// those publishes are the only ones the broker dispatch gate
+    /// consults to decide "can I reach this peer via Ember".
+    #[test]
+    fn build_source_publish_firewalled_includes_ember_capability_tag() {
+        let publisher = make_publisher(true);
+        let file = sample_file();
+        let msg = publisher
+            .build_source_publish(&file)
+            .expect("firewalled-with-direct-udp publish should not be skipped");
+        let tags = match msg {
+            KadMessage::PublishSourceReq { tags, .. } => tags,
+            _ => panic!("unexpected message type from build_source_publish"),
+        };
+        assert!(
+            tags.iter()
+                .any(|t| matches!(&t.name, TagName::Str(s) if s == "ember")),
+            "firewalled publish must still advertise ember capability — \
+             the broker uses this to decide whether to attempt LowID-to-LowID",
+        );
+    }
 }
