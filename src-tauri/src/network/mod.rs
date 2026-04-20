@@ -5735,30 +5735,55 @@ pub async fn start_network(
                                         debug!("Skipping callback source: buddy IP {} is private/unroutable", buddy_ip);
                                         continue;
                                     }
-                                    // Per eMule `Search.cpp:668-669`,
-                                    // `TAG_SERVERIP` / `TAG_SERVERPORT`
-                                    // carry the **buddy's UDP-listen
-                                    // address**, not its TCP port. So
-                                    // `cb_src.buddy_port` is ALREADY the
-                                    // UDP port we need — no `+3` TCP→UDP
-                                    // adjustment. The previous code
-                                    // misnamed this `buddy_tcp_port` and
-                                    // then fabricated a "UDP" port by
-                                    // adding 3, sending every
-                                    // `KADEMLIA_CALLBACK_REQ` to an
-                                    // arbitrary wrong port — no buddy
-                                    // ever received them, which is why
-                                    // zero LowID callback connections
-                                    // ever materialised for KAD-discovered
-                                    // sources (see the "Sent KAD
-                                    // CallbackReq …" log lines with no
-                                    // matching inbound "Adopted LowID
-                                    // callback stream" in session 3).
-                                    let buddy_udp_port = cb_src.buddy_port.unwrap_or(0);
-                                    if buddy_udp_port == 0 {
+                                    // Per eMule `Search.cpp:669`,
+                                    // `TAG_SERVERPORT` is declared as
+                                    // `theApp.clientlist->GetBuddy()->GetUDPPort()` —
+                                    // i.e. the buddy's eMule UDP listen
+                                    // port. In practice the field gets
+                                    // published inconsistently in the
+                                    // wild: some clients (modern eMule
+                                    // on a classic setup) publish the
+                                    // UDP port (e.g. 4675), others
+                                    // (aMule, several eMule mods, and
+                                    // clients whose buddy record came
+                                    // from KAD `IncomingBuddy` which
+                                    // only calls `SetKadPort` and
+                                    // leaves `m_nUDPPort == 0` until a
+                                    // subsequent Hello fills it) end up
+                                    // publishing a value that's really
+                                    // the buddy's TCP port (e.g. 4672),
+                                    // expecting callers to apply the
+                                    // `UDP = TCP + 3` convention.
+                                    //
+                                    // We can't tell which flavour a
+                                    // given source record uses without
+                                    // probing. The packet is ~40 bytes;
+                                    // rather than guess wrong half the
+                                    // time and send every
+                                    // `KADEMLIA_CALLBACK_REQ` to the
+                                    // void (the pre-fix bug shipped
+                                    // `port + 3` unconditionally; the
+                                    // post-fix bug shipped `port`
+                                    // unconditionally — both failed ~100%
+                                    // of the time against the
+                                    // opposite-flavour publishers),
+                                    // fire the callback at **both**
+                                    // `TAG_SERVERPORT` and
+                                    // `TAG_SERVERPORT + 3`. Exactly one
+                                    // of the two lands on the buddy's
+                                    // actual UDP listener; the other is
+                                    // dropped by the OS as "no such
+                                    // socket" with zero protocol
+                                    // impact. Tracking the attempt as a
+                                    // single logical attempt (not two)
+                                    // is correct — the peer only sees
+                                    // one.
+                                    let buddy_port_raw = cb_src.buddy_port.unwrap_or(0);
+                                    if buddy_port_raw == 0 {
                                         debug!("Skipping callback source: no buddy UDP port in TAG_SERVERPORT");
                                         continue;
                                     }
+                                    let buddy_port_alt = buddy_port_raw.saturating_add(3);
                                     // `cb_src.buddy_hash` is the
                                     // `TAG_BUDDYHASH` value published by
                                     // the LowID peer, which eMule
@@ -5813,7 +5838,8 @@ pub async fn start_network(
                                         continue;
                                     }
 
-                                    let buddy_addr = SocketAddr::new(buddy_ip.into(), buddy_udp_port);
+                                    let buddy_addr_raw = SocketAddr::new(buddy_ip.into(), buddy_port_raw);
+                                    let buddy_addr_alt = SocketAddr::new(buddy_ip.into(), buddy_port_alt);
                                     let file_id = KadId(fh);
                                     let callback_req = KadMessage::CallbackReq {
                                         buddy_id: buddy_hash,
@@ -5821,14 +5847,23 @@ pub async fn start_network(
                                         tcp_port: state.tcp_port,
                                     };
                                     if let Ok(packet) = kad::messages::encode_packet(&callback_req) {
+                                        // Fire both ports (see `buddy_port_raw`
+                                        // comment above for rationale). The
+                                        // second send is typically to a port
+                                        // with no listener and silently fails
+                                        // at the OS layer — zero protocol
+                                        // impact but costs nothing to try.
                                         let _ = send_kad_packet(
-                                            &udp_socket, &packet, buddy_addr, &state, &buddy_hash,
+                                            &udp_socket, &packet, buddy_addr_raw, &state, &buddy_hash,
+                                        ).await;
+                                        let _ = send_kad_packet(
+                                            &udp_socket, &packet, buddy_addr_alt, &state, &buddy_hash,
                                         ).await;
                                         let entry = state.callback_buddy_attempts.entry(cb_key).or_insert((0, now_ts));
                                         entry.0 += 1;
                                         info!(
-                                            "Sent KAD CallbackReq to buddy {} at {} for file {} (attempt {})",
-                                            buddy_hash, buddy_addr, hex::encode(fh), attempts + 1
+                                            "Sent KAD CallbackReq to buddy {} at {}/{} for file {} (attempt {})",
+                                            buddy_hash, buddy_addr_raw, buddy_port_alt, hex::encode(fh), attempts + 1
                                         );
                                     }
 
