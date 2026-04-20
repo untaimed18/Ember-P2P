@@ -6095,7 +6095,23 @@ pub async fn start_network(
                                     let sm = source_manager.read().await;
                                     sm.source_count(&hash_bytes) as u32
                                 };
-                                let source_count = (total_found as u32).max(sm_known);
+                                // Include type-6 (direct-callback) in the
+                                // visible-sources count. `total_found`
+                                // is derived from
+                                // `sources.len() + callback_sources.len()
+                                //  + effective_lowid`, which deliberately
+                                // omits type-6 because direct-callback is
+                                // handled via a separate code path. But
+                                // from the user's perspective a type-6
+                                // source is "a source for this file that
+                                // we're trying to reach" and must show
+                                // up in the transfer's source count —
+                                // otherwise sessions with several type-6
+                                // peers display a source count
+                                // significantly lower than eMule's for
+                                // the same file.
+                                let visible_total = (total_found as u32).saturating_add(type6_count as u32);
+                                let source_count = visible_total.max(sm_known);
                                 {
                                     let mut mgr = transfer_manager.write().await;
                                     mgr.update_status(&transfer_id, TransferStatus::Active);
@@ -6113,6 +6129,78 @@ pub async fn start_network(
                                                 speed: 0,
                                                 transferred: 0,
                                                 client_software: String::new(),
+                                                peer_name: String::new(),
+                                                available_parts: None,
+                                                total_parts: None,
+                                                country_code: cc,
+                                                source_origin: Some("kad".into()),
+                                            },
+                                        );
+                                    }
+                                    // Also populate the per-source detail
+                                    // rows for callback and type-6
+                                    // (direct-callback) sources. These
+                                    // are REAL sources we're actively
+                                    // trying to reach — the CallbackReq
+                                    // has already been sent to each
+                                    // buddy (see `callback_sources` loop
+                                    // earlier in this function) and
+                                    // DIRECTCALLBACKREQ to each type-6
+                                    // peer — so they belong in the
+                                    // transfer's source table just as
+                                    // much as HighID direct sources.
+                                    // The previously-existing code only
+                                    // registered these rows in the
+                                    // "indirect-only" branch (when
+                                    // `sources.is_empty()`); the same
+                                    // sources being ALSO present as
+                                    // direct candidates caused the
+                                    // branch above to be taken, which
+                                    // silently dropped the callback /
+                                    // type-6 rows from the UI. Status
+                                    // starts as `Connecting` for both
+                                    // — the callback branch transitions
+                                    // to `Queued` / `Transferring` once
+                                    // the buddy relays and the LowID
+                                    // peer connects back to us; the
+                                    // type-6 branch transitions on the
+                                    // UDP punch-response.
+                                    for cb_src in &callback_sources {
+                                        let cc = crate::geoip::lookup_country(
+                                            &geoip, std::net::IpAddr::V4(cb_src.ip),
+                                        );
+                                        mgr.update_source_detail(
+                                            &transfer_id,
+                                            crate::types::SourceInfo {
+                                                ip: cb_src.ip.to_string(),
+                                                port: cb_src.tcp_port,
+                                                status: crate::types::SourceStatus::Connecting,
+                                                queue_rank: None,
+                                                speed: 0,
+                                                transferred: 0,
+                                                client_software: "KAD Callback".to_string(),
+                                                peer_name: String::new(),
+                                                available_parts: None,
+                                                total_parts: None,
+                                                country_code: cc,
+                                                source_origin: Some("kad".into()),
+                                            },
+                                        );
+                                    }
+                                    for dc_src in &direct_callback_sources {
+                                        let cc = crate::geoip::lookup_country(
+                                            &geoip, std::net::IpAddr::V4(dc_src.ip),
+                                        );
+                                        mgr.update_source_detail(
+                                            &transfer_id,
+                                            crate::types::SourceInfo {
+                                                ip: dc_src.ip.to_string(),
+                                                port: dc_src.tcp_port,
+                                                status: crate::types::SourceStatus::Connecting,
+                                                queue_rank: None,
+                                                speed: 0,
+                                                transferred: 0,
+                                                client_software: "KAD Direct Callback".to_string(),
                                                 peer_name: String::new(),
                                                 available_parts: None,
                                                 total_parts: None,
@@ -6297,9 +6385,71 @@ pub async fn start_network(
                                         let sm2 = source_manager.read().await;
                                         sm2.source_count(&fh) as u32
                                     };
-                                    let source_count = (total_found as u32).max(sm_known);
+                                    // Include type-6 in the visible total
+                                    // — see the parallel fix at the
+                                    // `sources.is_empty() == false` branch
+                                    // above for the full rationale.
+                                    let visible_total = (total_found as u32).saturating_add(type6_count as u32);
+                                    let source_count = visible_total.max(sm_known);
                                     let mut mgr = transfer_manager.write().await;
                                     mgr.update_sources(&transfer_id, source_count, 0, 0);
+                                    // Populate UI source-detail rows for
+                                    // callback and type-6 sources so the
+                                    // transfer's Sources tab reflects
+                                    // what's actually being pursued. The
+                                    // CallbackReq / DIRECTCALLBACKREQ
+                                    // was already dispatched earlier in
+                                    // this function; these rows tell
+                                    // the user "we're waiting on these
+                                    // peers to connect back to us".
+                                    // Without them the user only sees
+                                    // the ~4-6 direct sources and
+                                    // thinks Ember is finding half what
+                                    // eMule finds for the same file.
+                                    for cb_src in &callback_sources {
+                                        let cc = crate::geoip::lookup_country(
+                                            &geoip, std::net::IpAddr::V4(cb_src.ip),
+                                        );
+                                        mgr.update_source_detail(
+                                            &transfer_id,
+                                            crate::types::SourceInfo {
+                                                ip: cb_src.ip.to_string(),
+                                                port: cb_src.tcp_port,
+                                                status: crate::types::SourceStatus::Connecting,
+                                                queue_rank: None,
+                                                speed: 0,
+                                                transferred: 0,
+                                                client_software: "KAD Callback".to_string(),
+                                                peer_name: String::new(),
+                                                available_parts: None,
+                                                total_parts: None,
+                                                country_code: cc,
+                                                source_origin: Some("kad".into()),
+                                            },
+                                        );
+                                    }
+                                    for dc_src in &direct_callback_sources {
+                                        let cc = crate::geoip::lookup_country(
+                                            &geoip, std::net::IpAddr::V4(dc_src.ip),
+                                        );
+                                        mgr.update_source_detail(
+                                            &transfer_id,
+                                            crate::types::SourceInfo {
+                                                ip: dc_src.ip.to_string(),
+                                                port: dc_src.tcp_port,
+                                                status: crate::types::SourceStatus::Connecting,
+                                                queue_rank: None,
+                                                speed: 0,
+                                                transferred: 0,
+                                                client_software: "KAD Direct Callback".to_string(),
+                                                peer_name: String::new(),
+                                                available_parts: None,
+                                                total_parts: None,
+                                                country_code: cc,
+                                                source_origin: Some("kad".into()),
+                                            },
+                                        );
+                                    }
                                 }
                             }
                         }
