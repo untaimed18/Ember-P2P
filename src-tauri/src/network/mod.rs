@@ -6393,6 +6393,27 @@ pub async fn start_network(
                                     let source_count = visible_total.max(sm_known);
                                     let mut mgr = transfer_manager.write().await;
                                     mgr.update_sources(&transfer_id, source_count, 0, 0);
+                                    // Push the new count to the UI.
+                                    // `mgr.update_sources` alone only
+                                    // mutates backend state — without an
+                                    // explicit `transfer-sources` emit the
+                                    // frontend's Sources column stays on
+                                    // whatever value was last broadcast
+                                    // (typically the initial direct-only
+                                    // server count, e.g. 3-4) even after
+                                    // we've discovered 7+ callback peers
+                                    // and a type-6. That mismatch is the
+                                    // "column says 4 but detail list shows
+                                    // 8" UI bug.
+                                    let _ = app_handle.emit(
+                                        "transfer-sources",
+                                        &crate::types::TransferSourcesPayload {
+                                            id: &transfer_id,
+                                            sources: source_count,
+                                            active_sources: 0,
+                                            queued_sources: 0,
+                                        },
+                                    );
                                     // Populate UI source-detail rows for
                                     // callback and type-6 sources so the
                                     // transfer's Sources tab reflects
