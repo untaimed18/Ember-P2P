@@ -1773,6 +1773,24 @@ impl UploadHandler {
             deferred_packet = Some((proto2, opcode2, payload2));
         }
 
+        // Send `OP_EMBER_HELLO` so other Ember peers can detect us out-of-
+        // band from the public Hello / EmuleInfo (which we deliberately
+        // keep byte-identical to vanilla eMule to avoid anti-leecher queue
+        // bans). Vanilla eMule peers ignore unknown OP_EMULEPROT opcodes
+        // (`ListenSocket.cpp` ProcessExtPacket default branch), so sending
+        // it unconditionally is safe — it's invisible to non-Ember peers.
+        // The peer's reply (`OP_EMBER_HELLOANSWER`) is handled in the
+        // main packet-processing loop further down, where we'll also
+        // recognise it as authoritative proof of Ember-ness and learn the
+        // peer's mod_version / ember_hash / ember_pubkey.
+        let mut ul_sent_ember_hello = false;
+        {
+            let payload = build_ember_hello(&self.ember_hash, &self.nickname, None);
+            if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload).await.is_ok() {
+                ul_sent_ember_hello = true;
+            }
+        }
+
         // Anti-leech client-software filter. eMule's `AntiLeech.dat`
         // equivalent — match the rendered software label against the
         // user's pattern list and close the connection at handshake
@@ -4094,6 +4112,47 @@ impl UploadHandler {
 
                 (OP_EMULEPROT, OP_BUDDYPONG) => {
                     debug!("Received OP_BUDDYPONG from {peer_addr}");
+                }
+
+                // Authoritative Ember peer detection from the uploader side.
+                // Mirrors the downloader path in `multi_source.rs` — a
+                // peer that sends a parseable `OP_EMBER_HELLO` /
+                // `OP_EMBER_HELLOANSWER` is, by construction, an Ember
+                // client (vanilla eMule never emits these opcodes; they
+                // sit in our private 0xF8/0xF9 range). We learn their
+                // mod_version, ember_hash, and (optionally) ember_pubkey
+                // here — all the fields we used to harvest from the
+                // public Hello / EmuleInfo before the anti-leecher fix.
+                // If the peer beat us to it, also send our HELLOANSWER
+                // back so they learn our identity in the same round trip.
+                (OP_EMULEPROT, OP_EMBER_HELLO) | (OP_EMULEPROT, OP_EMBER_HELLOANSWER) => {
+                    if let Some(ident) = parse_ember_hello(&payload) {
+                        hello_caps.is_ember = true;
+                        if !ident.mod_version.is_empty() {
+                            hello_caps.mod_version = ident.mod_version.clone();
+                        }
+                        if !ident.nickname.is_empty() {
+                            hello_caps.peer_name = ident.nickname.clone();
+                            ul_peer_name = ident.nickname.clone();
+                        }
+                        if ident.ember_hash != [0u8; 16] {
+                            hello_caps.ember_hash = Some(ident.ember_hash);
+                            peer_ember_hash = Some(ident.ember_hash);
+                        }
+                        if let Some(pk) = ident.ed25519_pubkey {
+                            hello_caps.ember_pubkey = Some(pk);
+                        }
+                        ul_client_software = client_software_from_caps(&hello_caps);
+                        info!(
+                            "Peer {peer_addr} identified as Ember via OP_EMBER_HELLO (mod='{}', nick='{}')",
+                            ident.mod_version, ident.nickname,
+                        );
+                        if opcode == OP_EMBER_HELLO && !ul_sent_ember_hello {
+                            let payload = build_ember_hello(&self.ember_hash, &self.nickname, None);
+                            let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &payload).await;
+                            ul_sent_ember_hello = true;
+                        }
+                    }
                 }
 
                 (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) => {
