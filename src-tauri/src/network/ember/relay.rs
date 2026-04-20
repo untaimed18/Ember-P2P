@@ -268,10 +268,21 @@ pub async fn register_punch(
         .await
         .map_err(|e| format!("punch register: {e}"))?;
 
-    if resp.status().is_success() {
+    let status = resp.status();
+    if status.is_success() {
         Ok(())
+    } else if status == reqwest::StatusCode::NOT_FOUND {
+        // The deployed rendezvous server is older than this client and
+        // doesn't have the `/punch` route registered. Calling it out
+        // explicitly so a `WARN` line is enough to diagnose without
+        // having to grep through the source — the same 404 is
+        // otherwise indistinguishable from a network blip.
+        Err(format!(
+            "punch register: status 404 Not Found ({} — deployed rendezvous is missing the /punch route; redeploy the server)",
+            url,
+        ))
     } else {
-        Err(format!("punch register: status {}", resp.status()))
+        Err(format!("punch register: status {status}"))
     }
 }
 
@@ -864,7 +875,22 @@ pub async fn connect_server_relay(
 
     let (ws_stream, _response) = tokio_tungstenite::connect_async(&ws_url)
         .await
-        .map_err(|e| format!("WS relay connect failed: {e}"))?;
+        .map_err(|e| {
+            // tokio-tungstenite surfaces an HTTP 404 from the upgrade
+            // handshake as `Http(Response { status: 404, ... })`. The
+            // raw `Display` is noisy but does contain "404", so we
+            // pattern-match on the rendered string. Same intent as the
+            // explicit branch in `register_punch`: make a missing
+            // route on the deployed rendezvous obvious.
+            let rendered = format!("{e}");
+            if rendered.contains("404") {
+                format!(
+                    "WS relay connect failed: 404 Not Found ({ws_url} — deployed rendezvous is missing the /relay route; redeploy the server)"
+                )
+            } else {
+                format!("WS relay connect failed: {rendered}")
+            }
+        })?;
 
     info!("Relay: server relay connected for session {session_id}");
     Ok(WsStream::new(ws_stream))

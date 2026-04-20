@@ -7556,9 +7556,26 @@ pub async fn start_network(
                                     });
 
                                     tokio::spawn(async move {
+                                        use futures::FutureExt;
                                         let Some(broker_tx) = broker_tx else { return; };
-                                        match ember::relay::connect_server_relay(&rv_url, &session_id).await {
-                                            Ok(ws_stream) => {
+                                        // Wrap in `catch_unwind`. `tokio_tungstenite::connect_async`
+                                        // dispatches into rustls, which `panic!`s on the worker
+                                        // thread if the process-wide CryptoProvider isn't
+                                        // installed. We DO install it in `lib.rs::run()` now,
+                                        // but if any future code path (test binary, alternate
+                                        // entry point, third-party plugin) ever lands without
+                                        // doing so, an uncaught panic would kill this spawned
+                                        // task, no `RelayFailed` event would ever be sent, and
+                                        // the broker entry would sit stuck at `RelayConnect`
+                                        // until `RELAY_TIMEOUT` (30 s) reaped it via
+                                        // `broker.tick()`. Catching the panic here keeps the
+                                        // broker state machine driven by explicit events
+                                        // regardless.
+                                        let result = std::panic::AssertUnwindSafe(
+                                            ember::relay::connect_server_relay(&rv_url, &session_id),
+                                        ).catch_unwind().await;
+                                        match result {
+                                            Ok(Ok(ws_stream)) => {
                                                 tracing::info!("Broker: server relay connected for {attempt_key_owned}");
                                                 let (reader, writer) = tokio::io::split(ws_stream);
                                                 let _ = broker_tx.send(ember::broker::BrokerEvent::ConnectionReady(
@@ -7574,11 +7591,25 @@ pub async fn start_network(
                                                     },
                                                 )).await;
                                             }
-                                            Err(e) => {
+                                            Ok(Err(e)) => {
                                                 tracing::warn!("Broker: server relay failed: {e}");
                                                 let _ = broker_tx.send(ember::broker::BrokerEvent::RelayFailed {
                                                     attempt_key: attempt_key_owned,
                                                     reason: e,
+                                                }).await;
+                                            }
+                                            Err(panic) => {
+                                                let msg = if let Some(s) = panic.downcast_ref::<&'static str>() {
+                                                    (*s).to_string()
+                                                } else if let Some(s) = panic.downcast_ref::<String>() {
+                                                    s.clone()
+                                                } else {
+                                                    "non-string panic payload".to_string()
+                                                };
+                                                tracing::error!("Broker: server relay panicked: {msg}");
+                                                let _ = broker_tx.send(ember::broker::BrokerEvent::RelayFailed {
+                                                    attempt_key: attempt_key_owned,
+                                                    reason: format!("panic: {msg}"),
                                                 }).await;
                                             }
                                         }
