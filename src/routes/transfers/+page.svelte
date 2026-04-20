@@ -1835,6 +1835,27 @@
     }
   });
 
+  // When the currently-expanded transfer is paused or stopped, the
+  // backend has torn down every peer connection for it — the
+  // accumulated `expandedSources` list no longer reflects live state
+  // (the rows that show Queued / Transferring would falsely imply
+  // live peers on a paused download). Clear the panel so it matches
+  // backend reality; on resume it will repopulate naturally from
+  // the next `transfer-source-detail` push events.
+  $effect(() => {
+    if (!expandedTransferId) return;
+    const t = activeDownloads.find((x) => x.id === expandedTransferId);
+    if (!t) return;
+    if (t.status === 'paused' || t.status === 'stopped') {
+      expandedSources = [];
+      // Invalidate any in-flight getTransferSources request so its
+      // late-arriving response doesn't repopulate the list after
+      // we've intentionally cleared it.
+      sourceDetailRequestId += 1;
+      loadingSources = false;
+    }
+  });
+
   $effect.pre(() => {
     const visible = visibleActiveDownloadIds;
     const next = selectedDownloadIds.filter((id) => visible.has(id));

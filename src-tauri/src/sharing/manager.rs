@@ -583,6 +583,14 @@ impl TransferManager {
         if let Some(control) = self.controls.get(id) {
             control.pause();
         }
+        // Pause tears down all peer connections for this transfer, so
+        // the per-source detail rows (status=Connecting / Queued /
+        // Transferring) no longer reflect live state — keeping them
+        // would show the user "31 sources, 6 transferring" for a
+        // transfer that has zero live peers. Clear the backend list
+        // so the next pull (or resume) rebuilds it from reality. This
+        // matches what `stop()` and `cancel()` already do below.
+        self.source_details.remove(id);
     }
 
     /// Pause a transfer and, if this frees an active download slot, promote
