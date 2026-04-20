@@ -4186,16 +4186,44 @@ async fn download_parts_from_source(
                                 if entry.tcp_port == 0 {
                                     continue;
                                 }
+                                let uh = entry.user_hash.unwrap_or([0u8; 16]);
+                                let co = entry.crypt_options.unwrap_or(0);
+                                // LowID SX source — `entry.source_id` is the
+                                // peer's server-assigned client ID (< 0x01_000_000).
+                                // We can't dial it directly, but we can ask
+                                // the named server (`entry.server_ip:server_port`)
+                                // to send a callback request — same path the
+                                // server-discovered LowID source flow uses.
+                                // eMule does NOT drop these (see
+                                // `PartFile.cpp::AddClientSources`); dropping
+                                // them in V1/V2 silently halved our source pool
+                                // for any well-seeded file in a LowID-heavy
+                                // network. Register them in the source manager
+                                // so the periodic source-asking sweep can
+                                // dispatch the callback when we're connected
+                                // to the matching server.
                                 if entry.source_id < 16_777_216 {
-                                    debug!("SX1: skipping Low-ID source {} (server {:08X}:{})", entry.source_id, entry.server_ip, entry.server_port);
+                                    if entry.server_ip == 0 || entry.server_port == 0 {
+                                        // Without a server reference we have
+                                        // no way to reach this peer — drop
+                                        // it (matches eMule's `CanAddSource`
+                                        // gate when the server addr is bogus).
+                                        continue;
+                                    }
+                                    if let Some(sm) = &source_mgr {
+                                        let mut sm = sm.write().await;
+                                        sm.register_lowid_source(
+                                            *file_hash, entry.source_id, entry.tcp_port,
+                                            entry.server_ip, entry.server_port, uh, co,
+                                        );
+                                    }
+                                    sx_count += 1;
                                     continue;
                                 }
                                 let ip = source_exchange_id_to_ipv4(version, entry.source_id);
                                 if is_filtered_source_ip(&ip) || is_sx_rejected(&ip, entry.tcp_port) {
                                     continue;
                                 }
-                                let uh = entry.user_hash.unwrap_or([0u8; 16]);
-                                let co = entry.crypt_options.unwrap_or(0);
                                 if let Some(sm) = &source_mgr {
                                     let mut sm = sm.write().await;
                                     sm.register_source_full_server(
@@ -4241,8 +4269,25 @@ async fn download_parts_from_source(
                                 if entry.tcp_port == 0 {
                                     continue;
                                 }
+                                let uh = entry.user_hash.unwrap_or([0u8; 16]);
+                                let co = entry.crypt_options.unwrap_or(0);
+                                // Same LowID handling as the SX1 arm above —
+                                // register with the named server so we can
+                                // request a callback later instead of
+                                // silently dropping every LowID peer the
+                                // upstream client knew about.
                                 if entry.source_id < 16_777_216 {
-                                    debug!("SX2: skipping Low-ID source {} (server {:08X}:{})", entry.source_id, entry.server_ip, entry.server_port);
+                                    if entry.server_ip == 0 || entry.server_port == 0 {
+                                        continue;
+                                    }
+                                    if let Some(sm) = &source_mgr {
+                                        let mut sm = sm.write().await;
+                                        sm.register_lowid_source(
+                                            *file_hash, entry.source_id, entry.tcp_port,
+                                            entry.server_ip, entry.server_port, uh, co,
+                                        );
+                                    }
+                                    sx_count += 1;
                                     continue;
                                 }
                                 let ip = source_exchange_id_to_ipv4(version, entry.source_id);
@@ -4252,8 +4297,6 @@ async fn download_parts_from_source(
                                 if entry.server_ip != 0 {
                                     debug!("SX2 source {} advertises server {:08X}:{}", ip, entry.server_ip, entry.server_port);
                                 }
-                                let uh = entry.user_hash.unwrap_or([0u8; 16]);
-                                let co = entry.crypt_options.unwrap_or(0);
                                 if let Some(sm) = &source_mgr {
                                     let mut sm = sm.write().await;
                                     sm.register_source_full_server(

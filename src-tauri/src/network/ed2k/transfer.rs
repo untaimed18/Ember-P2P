@@ -1549,16 +1549,32 @@ impl Ed2kDownload {
                                 if entry.tcp_port == 0 {
                                     continue;
                                 }
+                                let uh = entry.user_hash.unwrap_or([0u8; 16]);
+                                let co = entry.crypt_options.unwrap_or(0);
+                                // LowID source — see the matching block in
+                                // `multi_source.rs` for the full rationale.
+                                // eMule registers these via the named server
+                                // and uses the callback path; dropping them
+                                // silently halved our source pool on
+                                // LowID-heavy networks.
                                 if entry.source_id < 16_777_216 {
-                                    debug!("SX1: skipping Low-ID source {} (server {:08X}:{})", entry.source_id, entry.server_ip, entry.server_port);
+                                    if entry.server_ip == 0 || entry.server_port == 0 {
+                                        continue;
+                                    }
+                                    if let Some(sm) = &self.source_manager {
+                                        let mut sm = sm.write().await;
+                                        sm.register_lowid_source(
+                                            self.file_hash, entry.source_id, entry.tcp_port,
+                                            entry.server_ip, entry.server_port, uh, co,
+                                        );
+                                    }
+                                    sx_count += 1;
                                     continue;
                                 }
                                 let ip = source_exchange_id_to_ipv4(version, entry.source_id);
                                 if is_filtered_source_ip(&ip) || self.is_sx_source_rejected(&ip, entry.tcp_port) {
                                     continue;
                                 }
-                                let uh = entry.user_hash.unwrap_or([0u8; 16]);
-                                let co = entry.crypt_options.unwrap_or(0);
                                 if let Some(sm) = &self.source_manager {
                                     let mut sm = sm.write().await;
                                     sm.register_source_full_server(
@@ -1601,8 +1617,24 @@ impl Ed2kDownload {
                                 if entry.tcp_port == 0 {
                                     continue;
                                 }
+                                let uh = entry.user_hash.unwrap_or([0u8; 16]);
+                                let co = entry.crypt_options.unwrap_or(0);
+                                // Same LowID handling as the SX1 arm above —
+                                // register with the named server so the
+                                // callback path can reach this peer instead
+                                // of dropping it outright.
                                 if entry.source_id < 16_777_216 {
-                                    debug!("SX2: skipping Low-ID source {} (server {:08X}:{})", entry.source_id, entry.server_ip, entry.server_port);
+                                    if entry.server_ip == 0 || entry.server_port == 0 {
+                                        continue;
+                                    }
+                                    if let Some(sm) = &self.source_manager {
+                                        let mut sm = sm.write().await;
+                                        sm.register_lowid_source(
+                                            self.file_hash, entry.source_id, entry.tcp_port,
+                                            entry.server_ip, entry.server_port, uh, co,
+                                        );
+                                    }
+                                    sx_count += 1;
                                     continue;
                                 }
                                 let ip = source_exchange_id_to_ipv4(version, entry.source_id);
@@ -1612,8 +1644,6 @@ impl Ed2kDownload {
                                 if entry.server_ip != 0 {
                                     debug!("SX2 source {} advertises server {:08X}:{}", ip, entry.server_ip, entry.server_port);
                                 }
-                                let uh = entry.user_hash.unwrap_or([0u8; 16]);
-                                let co = entry.crypt_options.unwrap_or(0);
                                 if let Some(sm) = &self.source_manager {
                                     let mut sm = sm.write().await;
                                     sm.register_source_full_server(
