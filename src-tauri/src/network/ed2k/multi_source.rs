@@ -863,8 +863,8 @@ impl MultiSourceDownload {
             Unknown,
             Queued,
         }
-        let peers_that_queued: Arc<std::sync::Mutex<HashSet<(String, u16)>>> =
-            Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let peers_that_queued: Arc<std::sync::Mutex<std::collections::HashSet<(String, u16)>>> =
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
         // Per-file writer with its own dedicated thread. Replaces the
         // previous `Arc<Mutex<File>>` pattern that serialized all writers
