@@ -6473,6 +6473,24 @@ pub async fn start_network(
                     if !had_ip && state.external_ip.is_some() && state.nat_info.nat_type == ember::nat::NatType::Unknown {
                         info!("External IP discovered via firewall check — running initial NAT probe");
                         state.nat_info = ember::nat::probe_nat(&udp_socket).await;
+                        // Same HighID fallback as the KAD-discovery and
+                        // server-HighID paths: STUN can fail wholesale
+                        // even when we know our external IP. Without
+                        // this, `nat_info.nat_type` stays `Unknown`,
+                        // `is_punchable()` returns false, and every
+                        // LowID-to-LowID attempt is forced into the
+                        // relay path instead of trying hole-punch first.
+                        if let Some(ext_ip) = state.external_ip {
+                            if state.nat_info.apply_highid_fallback(
+                                std::net::IpAddr::V4(ext_ip),
+                                state.udp_port,
+                            ) {
+                                info!(
+                                    "NAT probe failed but firewall check confirmed external IP {} — assuming PortRestricted (mapped {}:{})",
+                                    ext_ip, ext_ip, state.udp_port,
+                                );
+                            }
+                        }
                     }
                     let status_changed = was_udp_fw != state.udp_firewalled
                         || was_tcp_fw != state.firewalled
@@ -7540,13 +7558,29 @@ pub async fn start_network(
                                         }
                                     });
                                 } else if !rv_url.is_empty() {
+                                    let target_id = format!("{:0>64}", format!("{:08x}{:04x}", u32::from(source_ip), source_port));
+                                    // Session id MUST be unique per (us, file, peer)
+                                    // triple. Previously we used `{user}-{file}` which
+                                    // collided whenever multiple LowID peers wanted the
+                                    // same file: the rendezvous server pairs WebSockets
+                                    // two at a time per session_id, so the second
+                                    // connection would tear down the first peer's
+                                    // socket via the `sessions.remove(&session_id)` →
+                                    // bridge_relay path. Our adopted callback streams
+                                    // would then immediately fail on the next send
+                                    // with `WebSocket protocol error: Sending after
+                                    // closing is not allowed`. Including `target_id`
+                                    // gives each LowID peer its own room. The peer side
+                                    // gets the matching session_id via the relay-invite
+                                    // we POST below, so it will dial the right room.
                                     let session_id = format!(
-                                        "{}-{}", hex::encode(ember_hash),
+                                        "{}-{}-{}",
+                                        hex::encode(ember_hash),
+                                        &target_id[..16],
                                         hex::encode(file_hash),
                                     );
                                     let transfer_id = attempt_transfer_id;
 
-                                    let target_id = format!("{:0>64}", format!("{:08x}{:04x}", u32::from(source_ip), source_port));
                                     let invite_rv_url = rv_url.clone();
                                     let invite_sid = session_id.clone();
                                     tokio::spawn(async move {
@@ -14108,6 +14142,25 @@ async fn handle_udp_packet(
             if prev_ip.is_none() && state.external_ip.is_some() && state.nat_info.nat_type == ember::nat::NatType::Unknown {
                 info!("External IP discovered via KAD — running initial NAT probe");
                 state.nat_info = ember::nat::probe_nat(socket).await;
+                // STUN can fail wholesale (firewall, DNS, blocked egress).
+                // We still know our external IP from KAD votes, so fall
+                // back to `PortRestricted` rather than leaving `Unknown`,
+                // which would force every subsequent LowID-to-LowID
+                // attempt straight into the relay path (see
+                // `attempt_low_to_low()` — `is_punchable()` is false for
+                // `Unknown`). Mirrors the same fallback already in the
+                // server-HighID branch above.
+                if let Some(ext_ip) = state.external_ip {
+                    if state.nat_info.apply_highid_fallback(
+                        std::net::IpAddr::V4(ext_ip),
+                        state.udp_port,
+                    ) {
+                        info!(
+                            "NAT probe failed but KAD confirmed external IP {} — assuming PortRestricted (mapped {}:{})",
+                            ext_ip, ext_ip, state.udp_port,
+                        );
+                    }
+                }
             }
 
             if state.external_ip.is_some() {
