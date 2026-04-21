@@ -74,24 +74,53 @@
           stopTransferPoll = startTransferPoll();
           initialized = true;
 
-          try {
-            const s = await getSettings();
-            if (!s.setup_complete) {
-              wizardSettings = s;
+          // Fetch settings with bounded exponential-backoff retries.
+          //
+          // Previously a single retry-and-skip landed users in the
+          // main app whenever `getSettings()` lost two IPC races in a
+          // row: `setup_complete` stayed false on disk, yet no wizard
+          // ever rendered and nothing surfaced the failure — the user
+          // saw a fully default app (empty nickname, no shared
+          // folders, no download folder) with no indication that
+          // setup was supposed to run, and the same dice-roll could
+          // repeat on every launch.
+          //
+          // Policy now: retry up to 5 times with short backoff. If
+          // we still can't load settings, treat it as a fatal init
+          // error (the existing .init-error branch below already
+          // renders a blocking Retry button that reloads the window).
+          // Never drop into `children()` with `setup_complete === false`
+          // and no wizard shown.
+          const retryDelaysMs = [150, 300, 600, 1200];
+          let settings: AppSettings | null = null;
+          let settingsError: unknown = null;
+          for (let attempt = 0; attempt <= retryDelaysMs.length; attempt++) {
+            if (!mounted) return;
+            try {
+              settings = await getSettings();
+              break;
+            } catch (e) {
+              settingsError = e;
+              if (attempt === retryDelaysMs.length) break;
+              console.warn(
+                `Settings fetch attempt ${attempt + 1} failed, retrying in ${retryDelaysMs[attempt]}ms...`,
+                e,
+              );
+              await new Promise((r) => setTimeout(r, retryDelaysMs[attempt]));
+            }
+          }
+          if (!mounted) return;
+
+          if (settings) {
+            if (!settings.setup_complete) {
+              wizardSettings = settings;
               showWizard = true;
             }
-          } catch (e) {
-            console.warn('Failed to fetch settings for setup wizard, retrying once...', e);
-            try {
-              await new Promise(r => setTimeout(r, 1000));
-              const s = await getSettings();
-              if (!s.setup_complete) {
-                wizardSettings = s;
-                showWizard = true;
-              }
-            } catch {
-              console.error('Settings fetch retry failed, wizard skipped');
-            }
+          } else {
+            console.error('Persistent settings fetch failure; blocking main app entry', settingsError);
+            initError = settingsError instanceof Error
+              ? `Could not load app settings: ${settingsError.message}. Please restart the app.`
+              : 'Could not load app settings. Please restart the app.';
           }
 
           releaseSplashWhenReady();
