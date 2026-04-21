@@ -5888,6 +5888,58 @@ pub async fn start_network(
                                         file_id,
                                         tcp_port: state.tcp_port,
                                     };
+                                    // Pick an encryption identity per destination port. eMule
+                                    // `Search.cpp` (FINDSOURCE branch) obfuscates the
+                                    // `KADEMLIA_CALLBACK_REQ` it sends to the buddy using
+                                    // `pFromContact->GetClientID()` + `pFromContact->GetUDPKey()` —
+                                    // i.e. the buddy's real routing-table identity, NOT the
+                                    // `buddy_hash` token that rides inside the packet body (that
+                                    // token is `NOT(LowID_peer_kad_id)` and is only meaningful to
+                                    // the LowID peer downstream). `send_kad_packet`'s obfuscation
+                                    // path keys off `routing_table.get_contact(target_id)`, so
+                                    // passing `buddy_hash` there always misses (by design —
+                                    // there's no contact with `id = NOT(LowID_peer_kad_id)` in
+                                    // the routing table) and every CallbackReq Ember has ever
+                                    // sent has gone out plain. That works against tolerant
+                                    // buddies but gets silently dropped by strict-obfuscation
+                                    // eMule mods.
+                                    //
+                                    // Resolve the raw/alt target IDs in a single O(N) pass over
+                                    // the routing table so we only walk it once per callback
+                                    // source. If the table has no contact at the (ip, port)
+                                    // we want, we fall back to `buddy_hash`, which keeps the
+                                    // old plain-packet behaviour for that port. The receive
+                                    // side of every eMule-family buddy accepts both plain and
+                                    // obfuscated (`Process_KADEMLIA_CALLBACK_REQ` discards
+                                    // `senderUDPKey`), so worst case: we send exactly the same
+                                    // two plain packets we did before.
+                                    let (enc_target_raw, enc_target_alt) = {
+                                        let mut t_raw: KadId = buddy_hash;
+                                        let mut t_alt: KadId = buddy_hash;
+                                        for c in state.routing_table.all_contacts() {
+                                            if c.ip != buddy_ip { continue; }
+                                            if !c.supports_obfuscation() { continue; }
+                                            match c.udp_key {
+                                                Some(k) if k.is_valid() => {}
+                                                // Without a valid UDP key we'd encrypt with a
+                                                // zero receiver-key that the buddy can't
+                                                // reconstruct, so the packet would decrypt to
+                                                // garbage and get dropped. Stay on the plain
+                                                // path for this port instead.
+                                                _ => continue,
+                                            }
+                                            if c.udp_port == buddy_port_raw && t_raw == buddy_hash {
+                                                t_raw = c.id;
+                                            } else if c.udp_port == buddy_port_alt && t_alt == buddy_hash {
+                                                t_alt = c.id;
+                                            }
+                                            if t_raw != buddy_hash && t_alt != buddy_hash {
+                                                break;
+                                            }
+                                        }
+                                        (t_raw, t_alt)
+                                    };
+
                                     if let Ok(packet) = kad::messages::encode_packet(&callback_req) {
                                         // Fire both ports (see `buddy_port_raw`
                                         // comment above for rationale). The
@@ -5895,17 +5947,28 @@ pub async fn start_network(
                                         // with no listener and silently fails
                                         // at the OS layer — zero protocol
                                         // impact but costs nothing to try.
+                                        //
+                                        // Per-port `enc_target_*` picks obfuscation when the
+                                        // routing table has a version-capable contact with a
+                                        // valid UDP key for that exact port, and falls back to
+                                        // `buddy_hash` (= plain send) otherwise. The two ports
+                                        // are looked up independently so the port that actually
+                                        // houses the buddy's KAD listener can go obfuscated
+                                        // while the decoy port stays on the plain OS-drop path.
                                         let _ = send_kad_packet(
-                                            &udp_socket, &packet, buddy_addr_raw, &state, &buddy_hash,
+                                            &udp_socket, &packet, buddy_addr_raw, &state, &enc_target_raw,
                                         ).await;
                                         let _ = send_kad_packet(
-                                            &udp_socket, &packet, buddy_addr_alt, &state, &buddy_hash,
+                                            &udp_socket, &packet, buddy_addr_alt, &state, &enc_target_alt,
                                         ).await;
                                         let entry = state.callback_buddy_attempts.entry(cb_key).or_insert((0, now_ts));
                                         entry.0 += 1;
+                                        let obf_raw = enc_target_raw != buddy_hash;
+                                        let obf_alt = enc_target_alt != buddy_hash;
                                         info!(
-                                            "Sent KAD CallbackReq to buddy {} at {}/{} for file {} (attempt {})",
-                                            buddy_hash, buddy_addr_raw, buddy_port_alt, hex::encode(fh), attempts + 1
+                                            "Sent KAD CallbackReq to buddy {} at {}/{} for file {} (attempt {}, obf raw={} alt={})",
+                                            buddy_hash, buddy_addr_raw, buddy_port_alt, hex::encode(fh), attempts + 1,
+                                            obf_raw, obf_alt,
                                         );
                                     }
 
