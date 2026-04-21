@@ -1074,12 +1074,22 @@ impl RoutingTable {
             return verified;
         }
 
+        // The verified pool didn't reach `count`; fall back to still-live
+        // unverified contacts to fill up the search-seed slot. Explicitly
+        // filter out `is_dead()` rows: `get_contacts_to_probe` and
+        // `remove_dead_contacts` prune dead+expired contacts, but there's
+        // a window between a contact's final `checking_type` failure
+        // (type=DEAD, expires_at set ~2 min out) and the next cleanup
+        // pass where a dead-but-not-yet-expired row still sits in the
+        // bin. Without this filter, a nearly-empty verified pool would
+        // seed a fresh search with contacts that are known to be
+        // unresponsive, guaranteeing one wasted round of probes.
         let remaining = count - verified.len();
         let verified_ids: HashSet<KadId> = verified.iter().map(|c| c.id).collect();
         let all_contacts = self.all_contacts_vec();
         let mut unverified: Vec<(KadId, &KadContact)> = all_contacts
             .iter()
-            .filter(|c| !c.verified && !verified_ids.contains(&c.id))
+            .filter(|c| !c.verified && !c.is_dead() && !verified_ids.contains(&c.id))
             .map(|c| (target.xor_distance(&c.id), *c))
             .collect();
         unverified.sort_by(|a, b| {
