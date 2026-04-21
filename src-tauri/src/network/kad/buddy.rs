@@ -483,6 +483,65 @@ impl BuddyManager {
         }
     }
 
+    /// Forward a buddy-relayed UDP reask callback to our own TCP buddy.
+    ///
+    /// This is the Low-ID-recipient half of the eMule buddy-relay-reask
+    /// flow (matches `CClientUDPSocket::ProcessPacket` case
+    /// `OP_REASKCALLBACKUDP` in the reference eMule client): another
+    /// peer's buddy just sent us an `OP_REASKCALLBACKUDP` over UDP
+    /// targeting our `buddy_id`, and we need to turn around and relay
+    /// it to our buddy as `OP_REASKCALLBACKTCP` so our buddy can send
+    /// the actual UDP reask to the original requester's destination.
+    ///
+    /// `sender_ip` / `sender_port` identify the upstream relay buddy
+    /// (i.e. the other Low-ID peer's buddy) and are placed at the
+    /// head of the forwarded payload so the receiving (our own) buddy
+    /// knows where to direct its outbound UDP reask. `trailing` is
+    /// the tail of the original `OP_REASKCALLBACKUDP` payload after
+    /// the 16-byte `buddy_id` header (typically a 16-byte file hash;
+    /// any extended tail is forwarded as-is).
+    ///
+    /// Returns `false` (and drops the buddy connection) on write
+    /// failure / timeout, matching the semantics of the sibling
+    /// ping / callback relay helpers. No-ops if we don't currently
+    /// have an outbound buddy TCP writer open.
+    pub async fn forward_reask_callback(
+        &mut self,
+        sender_ip: Ipv4Addr,
+        sender_port: u16,
+        trailing: &[u8],
+    ) -> bool {
+        let Some(ref mut w) = self.buddy_writer else {
+            return false;
+        };
+        let mut payload = Vec::with_capacity(6 + trailing.len());
+        payload.extend_from_slice(&u32::from(sender_ip).to_le_bytes());
+        payload.extend_from_slice(&sender_port.to_le_bytes());
+        payload.extend_from_slice(trailing);
+        let pkt = build_emule_packet(OP_REASKCALLBACKTCP, &payload);
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async {
+                w.write_all(&pkt).await?;
+                w.flush().await
+            },
+        )
+        .await
+        {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                warn!("Failed to forward OP_REASKCALLBACKUDP to buddy over TCP: {e}");
+                self.disconnect_buddy();
+                false
+            }
+            Err(_) => {
+                warn!("OP_REASKCALLBACKUDP forward to buddy TCP timed out");
+                self.disconnect_buddy();
+                false
+            }
+        }
+    }
+
     pub fn disconnect_buddy(&mut self) {
         if let Some(h) = self.buddy_reader_handle.take() {
             h.abort();

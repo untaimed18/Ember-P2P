@@ -13570,11 +13570,111 @@ async fn handle_udp_packet(
                 return;
             }
 
-            // eMule UDP callback reask: Low-ID peer asks us to relay a reask
-            if header == OP_EMULEPROT && opcode == ed2k::messages::OP_REASKCALLBACKUDP && payload.len() >= 16 {
-                let mut file_hash = [0u8; 16];
-                file_hash.copy_from_slice(&payload[..16]);
-                debug!("Received OP_REASKCALLBACKUDP from {from} for file {}", hex::encode(file_hash));
+            // eMule OP_REASKCALLBACKUDP (0x94): we are a Low-ID client
+            // and some other peer's buddy has sent us a UDP packet
+            // addressed to our buddy_id, asking us to relay a reask
+            // through our own buddy over TCP. This is the UDP half of
+            // the buddy-relay-reask flow; its TCP sibling
+            // OP_REASKCALLBACKTCP is handled in
+            // `kad::buddy::run_buddy_reader`, which sends a direct UDP
+            // reask to the destination once we (acting as a buddy)
+            // receive it.
+            //
+            // Wire format (matches eMule's CClientUDPSocket::ProcessPacket
+            // case OP_REASKCALLBACKUDP):
+            //   [our_buddy_id:16][trailing payload (>= 1 byte; the
+            //    canonical shape is a 16-byte file_hash)]
+            //
+            // Outbound TCP payload we emit as OP_REASKCALLBACKTCP to
+            // our buddy:
+            //   [sender_ip:4][sender_port:2][trailing]
+            //
+            // Previously this path was a silent no-op: Low-ID peers
+            // whose reasks were relayed through *their* buddy to us
+            // got no answer at all and silently dropped off our
+            // buddy-accessible queues.
+            //
+            // Security layering (defense in depth; the `buddy_id`
+            // match is the primary gate):
+            //   1. We only act on this opcode when we have an active
+            //      buddy of our own — otherwise there is no TCP path
+            //      to forward to, and accepting the packet would
+            //      accomplish nothing except burn CPU.
+            //   2. The first 16 bytes must match our buddy's KadID.
+            //      Matching the 128-bit ID effectively requires the
+            //      sender to either be our legitimate buddy-pair
+            //      participant or to have observed our Kad traffic —
+            //      it's not brute-forceable and rejects random
+            //      scanning traffic.
+            //   3. Special-use / private / loopback sources are
+            //      refused (matches the `is_special_use_v4` policy
+            //      used elsewhere in this file).
+            //   4. Per-source rate limiting via `flood_protection`
+            //      caps how fast a single IP can fan UDP→TCP
+            //      amplification through our buddy connection — a
+            //      single stray flooder cannot saturate the buddy
+            //      writer.
+            if header == OP_EMULEPROT && opcode == ed2k::messages::OP_REASKCALLBACKUDP {
+                if payload.len() < 17 {
+                    debug!(
+                        "OP_REASKCALLBACKUDP from {from} too short ({} bytes, need >= 17)",
+                        payload.len()
+                    );
+                    return;
+                }
+                if state.buddy_manager.state() != BuddyState::Connected {
+                    debug!("OP_REASKCALLBACKUDP from {from} ignored: we have no active buddy to forward through");
+                    return;
+                }
+                let our_buddy_id = match state.buddy_manager.buddy_id() {
+                    Some(id) => *id,
+                    None => {
+                        debug!("OP_REASKCALLBACKUDP from {from} ignored: buddy connected but buddy_id unknown");
+                        return;
+                    }
+                };
+                if payload[..16] != our_buddy_id.0 {
+                    debug!("OP_REASKCALLBACKUDP from {from} rejected: buddy_id mismatch");
+                    return;
+                }
+                if crate::security::is_special_use_v4(from_ipv4) {
+                    debug!("OP_REASKCALLBACKUDP from {from} rejected: special-use source IP");
+                    return;
+                }
+                // Use the shared per-IP rate limiter. Layer 1 (per-IP
+                // per-opcode) is skipped automatically because 0x94
+                // isn't in `is_request_opcode`'s Kad set, but Layer 2
+                // (per-IP packet-rate cap) still applies — which is
+                // exactly the amplification gate we want here.
+                if state.flood_protection.check_rate_limit_with_opcode(
+                    from.ip(),
+                    false,
+                    ed2k::messages::OP_REASKCALLBACKUDP,
+                ) {
+                    debug!("OP_REASKCALLBACKUDP from {from} rate-limited");
+                    return;
+                }
+                let trailing = &payload[16..];
+                let forwarded = state
+                    .buddy_manager
+                    .forward_reask_callback(from_ipv4, from.port(), trailing)
+                    .await;
+                if forwarded {
+                    // On successful forward the buddy TCP connection has
+                    // taken responsibility for relaying; drop the local
+                    // buddy-info snapshot only if the forward failed and
+                    // `forward_reask_callback` already torn down.
+                    debug!(
+                        "Forwarded OP_REASKCALLBACKUDP from {from} to buddy as OP_REASKCALLBACKTCP ({} trailing bytes)",
+                        trailing.len()
+                    );
+                } else {
+                    // `forward_reask_callback` already disconnected on
+                    // write/timeout; clear shared state so the rest of
+                    // the network task observes the disconnection.
+                    state.buddy_event_rx = None;
+                    *state.shared_buddy_info.write().await = None;
+                }
                 return;
             }
         }
