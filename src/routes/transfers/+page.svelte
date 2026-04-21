@@ -3594,6 +3594,23 @@
   .dl-row {
     cursor: default;
   }
+  /* Suppress text selection on interactive transfer rows. Double-click
+     toggles the source-detail panel, and single-click toggles selection
+     — both gestures kept triggering native text-range highlighting on
+     the file-name / peer-name cells, which flashed a jarring blue
+     selection and prevented subsequent double-clicks in some browsers
+     from registering cleanly. `user-select: none` on the rows (and on
+     the source detail rows / upload / client rows that share the
+     same double-click-to-expand UX) makes the rows behave like
+     first-class controls. If a cell needs to be copyable (a future
+     text-copy cell), override this locally with `user-select: text`. */
+  .dl-row,
+  .ul-row,
+  .source-child-row,
+  .client-row {
+    user-select: none;
+    -webkit-user-select: none;
+  }
   .source-child-row td {
     padding: 3px 6px 3px 0 !important;
     border-bottom: 1px solid color-mix(in srgb, var(--border) 35%, transparent);
