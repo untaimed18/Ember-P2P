@@ -135,9 +135,14 @@
   <SetupWizard settings={wizardSettings} oncomplete={onWizardComplete} />
 {/if}
 <div class="app-shell">
-  <nav aria-label="Main navigation">
-    <Sidebar />
-  </nav>
+  <!--
+    Sidebar renders its own <nav aria-label="Primary"> landmark. An
+    extra outer <nav> here used to double-announce the navigation
+    region to screen readers ("Main navigation" then "Primary") and
+    required `nav { display: contents }` to avoid breaking the flex
+    layout. Mounting Sidebar directly is simpler and a11y-correct.
+  -->
+  <Sidebar />
   <div class="main-area">
     <main id="main-content" class="page-container">
       {#if !initialized}
@@ -184,10 +189,6 @@
     height: 100vh;
     width: 100vw;
     overflow: hidden;
-  }
-
-  nav {
-    display: contents;
   }
 
   .main-area {
