@@ -6324,6 +6324,51 @@ pub async fn start_network(
                                             now_ts,
                                         );
                                     }
+                                    // Parity with the indirect-only branch:
+                                    // populate Server-Relay ("Low ID") placeholder
+                                    // rows so mixed KAD results (direct HighID
+                                    // + Type-2 LowID via connected server) show
+                                    // ALL the peers we're pursuing, not just
+                                    // the direct ones. Without this the user
+                                    // sees e.g. "7 sources found" in the
+                                    // summary but a shorter list in the detail
+                                    // panel whenever a download has both
+                                    // reachable-direct and Low-ID candidates —
+                                    // same visual inconsistency that motivated
+                                    // the callback placeholder rows in the
+                                    // first place.
+                                    for ls in &lowid_sources {
+                                        if !state.server_connected {
+                                            continue;
+                                        }
+                                        let ip_str = Ipv4Addr::from(ls.ed2k_server_ip).to_string();
+                                        if mgr.has_source_detail_for_ip(&transfer_id, &ip_str) {
+                                            continue;
+                                        }
+                                        mgr.update_source_detail(
+                                            &transfer_id,
+                                            crate::types::SourceInfo {
+                                                ip: ip_str.clone(),
+                                                port: ls.ed2k_server_port,
+                                                status: crate::types::SourceStatus::Connecting,
+                                                queue_rank: None,
+                                                speed: 0,
+                                                transferred: 0,
+                                                client_software: "Low ID (Server Relay)".to_string(),
+                                                peer_name: String::new(),
+                                                available_parts: None,
+                                                total_parts: None,
+                                                country_code: crate::geoip::lookup_country(
+                                                    &geoip, std::net::IpAddr::V4(ls.ip),
+                                                ),
+                                                source_origin: Some("kad".into()),
+                                            },
+                                        );
+                                        state.callback_row_pending_since.insert(
+                                            (transfer_id.clone(), ip_str, ls.ed2k_server_port),
+                                            now_ts,
+                                        );
+                                    }
                                 }
                                 let peer_desc = sources.iter()
                                     .map(|(ip, port)| format!("{ip}:{port}"))
@@ -6373,6 +6418,32 @@ pub async fn start_network(
                                         .collect();
                                     if live_sources.is_empty() {
                                         debug!("All {} sources are dead for {transfer_id}, re-queuing", sources.len());
+                                        // Revert the just-emitted Active transition:
+                                        // we set status=Active + emitted the
+                                        // `transfer-status` event up above in the
+                                        // optimistic path, but now we've discovered
+                                        // every candidate is on the dead-source
+                                        // cooldown list so no worker is actually
+                                        // going to start. Flip back to Searching
+                                        // and re-emit so the UI lifecycle phase
+                                        // (and the priority badge, health color,
+                                        // context menu entries, etc.) reflects
+                                        // reality instead of sitting at Active
+                                        // with 0 peers until the next retry tick.
+                                        {
+                                            let mut mgr = transfer_manager.write().await;
+                                            mgr.update_status(
+                                                &transfer_id,
+                                                TransferStatus::Searching,
+                                            );
+                                        }
+                                        let _ = app_handle.emit(
+                                            "transfer-status",
+                                            serde_json::json!({
+                                                "id": &transfer_id,
+                                                "status": "searching",
+                                            }),
+                                        );
                                         state.pending_downloads.insert(transfer_id, pending);
                                         continue;
                                     }
@@ -15403,6 +15474,19 @@ async fn handle_command(
                 }
             }
 
+            // Drop any KAD-callback placeholder timestamps for this
+            // transfer so they don't linger until the 180s timeout
+            // sweep catches them. The periodic sweep tolerates stale
+            // keys (it returns no-op when the row is gone), but
+            // clearing here keeps the map tight and avoids a race
+            // where a restart-download for the same transfer_id
+            // within the sweep window would inherit pre-cancel
+            // timestamps. See the parallel cleanup in
+            // `PauseDownload` below.
+            state
+                .callback_row_pending_since
+                .retain(|(tid, _, _), _| tid != &transfer_id);
+
             if removed_pending.is_some() || !search_ids.is_empty() {
                 info!(
                     "CancelDownload {}: removed pending_download={}, stopped {} KAD source search(es)",
@@ -15426,6 +15510,18 @@ async fn handle_command(
                 }
                 handle.abort();
             }
+            // Drop KAD-callback placeholder timestamps: the manager
+            // clears `source_details` for this transfer on pause
+            // (see `TransferManager::pause`), so any pending_since
+            // entries would be orphaned until the sweep. Resuming
+            // the download within the 180s sweep window would let
+            // the freshly-added placeholders inherit stale
+            // timestamps via `.insert(...)` overwrite, which works,
+            // but proactively clearing here keeps the invariant
+            // "pending_since only tracks rows that exist".
+            state
+                .callback_row_pending_since
+                .retain(|(tid, _, _), _| tid != &transfer_id);
             state.active_source_senders.remove(&transfer_id);
             // Pause = worker is gone; keep both sender maps in lockstep
             // so a callback that arrives mid-pause doesn't try to
