@@ -342,13 +342,46 @@
     expandedTransferId = t.id;
     loadingSources = true;
     sourceLoadError = null;
+    // Snapshot any push-arrived rows present at fetch start. Keep the
+    // reference so we can tell, after the await resolves, whether
+    // push events mutated `expandedSources` during the fetch. Svelte
+    // 5 reassigns the bound `$state` array on every mutating update
+    // from the `transfer-source-detail` handler, so identity
+    // inequality is a reliable "pushed during await" signal.
+    const preFetchSources = expandedSources;
     try {
       const sources = await getTransferSources(t.id);
       if (expandedTransferId !== t.id || requestId !== sourceDetailRequestId) return;
-      expandedSources = sources;
+      if (expandedSources === preFetchSources) {
+        // No push events hit during the fetch — safe to replace.
+        expandedSources = sources;
+      } else {
+        // Push events landed while the snapshot was in flight.
+        // Merging prevents the snapshot from clobbering live row
+        // updates (e.g. a peer that transitioned to `transferring`
+        // during the 50-200ms round-trip would otherwise snap back
+        // to the snapshot's "connecting" status). Push events are
+        // more current than the snapshot, so push rows win on
+        // collision and any snapshot row the push hasn't touched
+        // is appended.
+        const liveByKey = new Map<string, SourceInfo>();
+        for (const s of expandedSources) {
+          liveByKey.set(`${s.ip}:${s.port}`, s);
+        }
+        const merged: SourceInfo[] = [...expandedSources];
+        for (const s of sources) {
+          const key = `${s.ip}:${s.port}`;
+          if (!liveByKey.has(key)) merged.push(s);
+        }
+        expandedSources = merged;
+      }
     } catch (e) {
       if (expandedTransferId === t.id && requestId === sourceDetailRequestId) {
-        expandedSources = [];
+        // Only wipe on error if no push events have populated the
+        // list in the meantime; otherwise keep what we have.
+        if (expandedSources === preFetchSources) {
+          expandedSources = [];
+        }
         sourceLoadError = 'Failed to load sources';
       }
     }
