@@ -653,12 +653,41 @@
       const ax = (a ?? '').toLowerCase();
       const bx = (b ?? '').toLowerCase();
       if (ax === bx) return 0;
-      // Empty values sort last regardless of direction.
+      // Empty values return +1 here so that after the outer `raw * dir`
+      // multiplication they land at the end on ascending sort and at
+      // the start on descending sort — matching the derivation-level
+      // comment above. Don't change to "last regardless of direction"
+      // without also dropping the outer * dir flip on empties.
       if (!ax) return 1;
       if (!bx) return -1;
       return ax < bx ? -1 : 1;
     };
     const cmpNum = (a: number, b: number) => a === b ? 0 : (a < b ? -1 : 1);
+    // Numeric IPv4 comparator for the Last IP column. `cmpStr` would
+    // treat dotted-quad addresses as plain strings, which makes
+    // "10.0.0.1" sort before "2.3.4.5" because '1' < '2' lexicographically.
+    // Backend-produced IPs are always IPv4 (built from a u32 via
+    // `Ipv4Addr::from(octets).to_string()`), so octet-wise compare is
+    // both correct and sufficient — no IPv6 path to worry about. Falls
+    // back to `cmpStr` on malformed input so a rogue value can't make
+    // the whole column unorderable.
+    const cmpIp = (a: string | null | undefined, b: string | null | undefined) => {
+      const ax = a ?? '';
+      const bx = b ?? '';
+      if (ax === bx) return 0;
+      if (!ax) return 1;
+      if (!bx) return -1;
+      const pa = ax.split('.');
+      const pb = bx.split('.');
+      if (pa.length !== 4 || pb.length !== 4) return cmpStr(ax, bx);
+      for (let i = 0; i < 4; i++) {
+        const na = Number(pa[i]);
+        const nb = Number(pb[i]);
+        if (!Number.isFinite(na) || !Number.isFinite(nb)) return cmpStr(ax, bx);
+        if (na !== nb) return na < nb ? -1 : 1;
+      }
+      return 0;
+    };
     sorted.sort((a, b) => {
       let raw: number;
       switch (knSortField) {
@@ -666,7 +695,7 @@
           raw = cmpStr(a.user_hash, b.user_hash);
           break;
         case 'last_known_ip':
-          raw = cmpStr(a.last_known_ip, b.last_known_ip);
+          raw = cmpIp(a.last_known_ip, b.last_known_ip);
           break;
         case 'uploaded':
           raw = cmpNum(a.uploaded, b.uploaded);
