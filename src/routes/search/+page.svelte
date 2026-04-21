@@ -579,47 +579,40 @@
   );
 
   let filteredResults: SearchResult[] = $derived.by(() => {
-    let results = [...searchResultsList];
+    // Single-pass filter: the previous implementation chained up to 8
+    // `.filter()` calls, each allocating a fresh array. On a busy search
+    // the store ships new `searchResultsList` snapshots dozens of times
+    // a second, so a result set of several thousand rows meant we
+    // allocated tens of thousands of short-lived intermediate entries
+    // per second just to get to the sort. Collapsing the predicates and
+    // pre-parsing the filter inputs once keeps the hot path allocation-
+    // light and cuts the re-derive cost roughly proportionally to the
+    // number of active filters.
+    const ext = filterExtension.trim().toLowerCase().replace(/^\./, '');
+    const hasExt = ext.length > 0;
+    const minParsed = filterMinSize !== '' ? parseFloat(filterMinSize) * filterMinUnit : NaN;
+    const minBytes = Number.isFinite(minParsed) && minParsed > 0 ? minParsed : 0;
+    const maxParsed = filterMaxSize !== '' ? parseFloat(filterMaxSize) * filterMaxUnit : NaN;
+    const maxBytes = Number.isFinite(maxParsed) && maxParsed > 0 ? maxParsed : 0;
+    const minSrcParsed = filterMinSources !== '' ? parseInt(filterMinSources, 10) : NaN;
+    const minSrc = Number.isFinite(minSrcParsed) && minSrcParsed > 0 ? minSrcParsed : 0;
+    const hasType = !!filterType;
+    const spamHidden = hideSpam;
 
-    if (hideSpam) {
-      results = results.filter(r => !r.is_spam);
+    const out: SearchResult[] = [];
+    for (const r of searchResultsList) {
+      if (spamHidden && r.is_spam) continue;
+      if (isLocalOnlySearchResult(r)) continue;
+      if (hasType && resultType(r) !== filterType) continue;
+      if (hasExt && r.file.extension.toLowerCase() !== ext) continue;
+      if (minBytes > 0 && r.file.size < minBytes) continue;
+      if (maxBytes > 0 && r.file.size > maxBytes) continue;
+      if (minSrc > 0 && r.availability < minSrc) continue;
+      if (isFilteredByText(r)) continue;
+      out.push(r);
     }
 
-    results = results.filter((r) => !isLocalOnlySearchResult(r));
-
-    if (filterType) {
-      results = results.filter(r => resultType(r) === filterType);
-    }
-
-    if (filterExtension.trim()) {
-      const ext = filterExtension.trim().toLowerCase().replace(/^\./, '');
-      results = results.filter(r => r.file.extension.toLowerCase() === ext);
-    }
-
-    if (filterMinSize !== '') {
-      const minBytes = parseFloat(filterMinSize) * filterMinUnit;
-      if (!isNaN(minBytes) && minBytes > 0) {
-        results = results.filter(r => r.file.size >= minBytes);
-      }
-    }
-
-    if (filterMaxSize !== '') {
-      const maxBytes = parseFloat(filterMaxSize) * filterMaxUnit;
-      if (!isNaN(maxBytes) && maxBytes > 0) {
-        results = results.filter(r => r.file.size <= maxBytes);
-      }
-    }
-
-    if (filterMinSources !== '') {
-      const minSrc = parseInt(filterMinSources, 10);
-      if (!isNaN(minSrc) && minSrc > 0) {
-        results = results.filter(r => r.availability >= minSrc);
-      }
-    }
-
-    results = results.filter(r => !isFilteredByText(r));
-
-    results.sort((a, b) => {
+    out.sort((a, b) => {
       let cmp = 0;
       switch (sortField) {
         case 'name':
@@ -641,7 +634,7 @@
       return sortDir === 'asc' ? cmp : -cmp;
     });
 
-    return results;
+    return out;
   });
 
   let allFilteredChecked = $derived(

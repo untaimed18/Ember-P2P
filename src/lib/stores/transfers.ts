@@ -505,6 +505,7 @@ export function cleanupTransferStore() {
   if (pollInterval !== null) {
     clearInterval(pollInterval);
     pollInterval = null;
+    detachPollVisibilityListener();
   }
   pollConsumers = 0;
   pendingProgress.clear();
@@ -512,6 +513,25 @@ export function cleanupTransferStore() {
   progressFlushScheduled = false;
   initialized = false;
   transfers.set([]);
+}
+
+let pollPumpOnNextVisible = false;
+let pollVisibilityListenerAttached = false;
+function onPollVisibilityChange() {
+  if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+    pollPumpOnNextVisible = true;
+  }
+}
+function attachPollVisibilityListener() {
+  if (pollVisibilityListenerAttached || typeof document === 'undefined') return;
+  document.addEventListener('visibilitychange', onPollVisibilityChange);
+  pollVisibilityListenerAttached = true;
+}
+function detachPollVisibilityListener() {
+  if (!pollVisibilityListenerAttached || typeof document === 'undefined') return;
+  document.removeEventListener('visibilitychange', onPollVisibilityChange);
+  pollVisibilityListenerAttached = false;
+  pollPumpOnNextVisible = false;
 }
 
 let lastEventUpdate = 0;
@@ -528,15 +548,30 @@ export function startTransferPoll() {
       if (pollConsumers === 0 && pollInterval !== null) {
         clearInterval(pollInterval);
         pollInterval = null;
+        detachPollVisibilityListener();
       }
     };
   }
+
+  attachPollVisibilityListener();
 
   let busy = false;
 
   const poll = async () => {
     if (busy) return;
-    if (Date.now() - lastEventUpdate < 2000) return;
+    // Skip the IPC entirely when the window is hidden. Every tick here
+    // costs a Rust-side `list_transfers()` + the full merge-and-broadcast
+    // below; while the tab is in the background there's no subscriber
+    // worth the wake-up, and the event-driven path keeps the store warm
+    // enough that the first poll after we regain visibility catches up.
+    // `pollPumpOnNextVisible` is flipped by the visibilitychange handler
+    // so the first tick after we regain focus always reconciles, even if
+    // the event-freshness gate below would normally skip.
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+      return;
+    }
+    if (!pollPumpOnNextVisible && Date.now() - lastEventUpdate < 2000) return;
+    pollPumpOnNextVisible = false;
     busy = true;
     try {
       const all = await Promise.race([
@@ -599,6 +634,7 @@ export function startTransferPoll() {
     if (pollConsumers === 0 && pollInterval !== null) {
       clearInterval(pollInterval);
       pollInterval = null;
+      detachPollVisibilityListener();
     }
   };
 }

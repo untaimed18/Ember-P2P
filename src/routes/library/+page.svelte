@@ -433,23 +433,28 @@
   }
 
   // --- Filtering ---
+  // Combine all five predicates into a single pass. The previous chain
+  // allocated a new intermediate array for each active filter (so up to 5
+  // mid-sized copies on every keystroke-triggered re-derive with ~50k
+  // files in the library). Collapsing to one `.filter` also lets the JIT
+  // fuse the hot path and cuts one dependency read per skipped row.
   let filteredFiles = $derived.by(() => {
-    let result = files;
-    if (filterFolder) result = result.filter(f => isPathInFolder(f.path, filterFolder!));
-    if (searchQuery.trim()) {
-      const q = searchQuery.trim().toLowerCase();
-      result = result.filter(f => f.name.toLowerCase().includes(q));
-    }
-    if (typeFilter !== 'All') {
-      result = result.filter(f => fileType(f.extension) === typeFilter);
-    }
-    if (showDuplicatesOnly) {
-      result = result.filter(f => !!f.hash && duplicateHashes.has(f.hash));
-    }
-    if (showMissingOnly) {
-      result = result.filter(f => missingPathSet.has(f.path));
-    }
-    return result;
+    const q = searchQuery.trim().toLowerCase();
+    const hasFolder = !!filterFolder;
+    const folder = filterFolder;
+    const hasQuery = q.length > 0;
+    const hasType = typeFilter !== 'All';
+    const dupOnly = showDuplicatesOnly;
+    const missOnly = showMissingOnly;
+    if (!hasFolder && !hasQuery && !hasType && !dupOnly && !missOnly) return files;
+    return files.filter((f) => {
+      if (hasFolder && !isPathInFolder(f.path, folder!)) return false;
+      if (hasQuery && !f.name.toLowerCase().includes(q)) return false;
+      if (hasType && fileType(f.extension) !== typeFilter) return false;
+      if (dupOnly && (!f.hash || !duplicateHashes.has(f.hash))) return false;
+      if (missOnly && !missingPathSet.has(f.path)) return false;
+      return true;
+    });
   });
 
   let hasActiveLibraryFilters = $derived(!!filterFolder || !!searchQuery.trim() || typeFilter !== 'All' || showDuplicatesOnly || showMissingOnly);

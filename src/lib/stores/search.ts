@@ -209,22 +209,75 @@ export async function initSearchStore() {
   initialized = true;
   const registered: UnlistenFn[] = [];
   try {
+    // Coalesce `search-results` events per request id across one animation
+    // frame. A global-phase KAD/server search commonly streams dozens of
+    // small result batches back-to-back; handling each synchronously meant
+    // rebuilding the tab's full results list (via `mergeSearchResults`,
+    // which spins up a Map over all existing rows) once per event — O(N·B)
+    // work where N is the tab's accumulated results and B is the burst
+    // size. Buffering incoming payloads and flushing once per frame folds
+    // that into a single merge per tab per frame, which is especially
+    // noticeable on large result sets (thousands of rows).
+    const pendingByRequest = new Map<number, SearchResult[]>();
+    let flushScheduled = false;
+    const flushSearchResults = () => {
+      flushScheduled = false;
+      if (pendingByRequest.size === 0) return;
+      const batch = pendingByRequest;
+      searchTabs.update((tabs) => {
+        let next = tabs;
+        for (const [requestId, incoming] of batch) {
+          next = updateTabByRequestId(next, requestId, (t) => ({
+            ...t,
+            results: mergeSearchResults(t.results, incoming),
+          }));
+        }
+        return next;
+      });
+      batch.clear();
+    };
+    const scheduleFlush = () => {
+      if (flushScheduled) return;
+      flushScheduled = true;
+      if (typeof requestAnimationFrame === 'function' && typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        requestAnimationFrame(flushSearchResults);
+      } else {
+        // Hidden tab or non-DOM host (SSR / tests): fall back to a macrotask
+        // so we still coalesce but don't hang the burst waiting for a
+        // visibilitychange that might never come.
+        setTimeout(flushSearchResults, 32);
+      }
+    };
+
     registered.push(await listen<{ request_id: number; results: SearchResult[] }>('search-results', (event) => {
       const requestId = event.payload.request_id;
       const incoming = event.payload.results;
-      const origins = new Set(incoming.map((r) => r.result_origin).filter(Boolean));
-      if (dev && origins.size > 0) {
-        console.debug(`[search-results] req=${requestId} count=${incoming.length} origins=${[...origins].join(', ')}`);
+      if (dev) {
+        const origins = new Set(incoming.map((r) => r.result_origin).filter(Boolean));
+        if (origins.size > 0) {
+          console.debug(`[search-results] req=${requestId} count=${incoming.length} origins=${[...origins].join(', ')}`);
+        }
       }
-      searchTabs.update((tabs) =>
-        updateTabByRequestId(tabs, requestId, (t) => ({
-          ...t,
-          results: mergeSearchResults(t.results, incoming),
-        })),
-      );
+      const existing = pendingByRequest.get(requestId);
+      if (existing) {
+        // In-place concat beats recreating the array — the buffer is
+        // internal, and we clear it at flush time.
+        for (const r of incoming) existing.push(r);
+      } else {
+        pendingByRequest.set(requestId, incoming.slice());
+      }
+      scheduleFlush();
     }));
     registered.push(await listen<{ request_id: number }>('search-complete', (event) => {
       const requestId = event.payload.request_id;
+      // Flush any buffered `search-results` for this request synchronously
+      // before flipping `isSearching` off — otherwise the spinner could
+      // disappear while the last batch of results is still queued for the
+      // next animation frame, and the UI would briefly show "done with
+      // N results" where N is missing the final chunk.
+      if (pendingByRequest.has(requestId)) {
+        flushSearchResults();
+      }
       searchTabs.update((tabs) =>
         updateTabByRequestId(tabs, requestId, (t) => {
           const isRetry = t.retryRequestId === requestId;
