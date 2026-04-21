@@ -89,8 +89,19 @@
 {/if}
 <div class="speed-input" class:unlimited={isUnlimited}>
   {#if isUnlimited}
-    <div class="unlimited-display" role="button" tabindex="0"
-         onclick={toggleUnlimited} onkeydown={(e) => e.key === 'Enter' && toggleUnlimited()}>
+    <div
+      class="unlimited-display"
+      role="button"
+      tabindex="0"
+      aria-label="Unlimited — activate to set a limit"
+      onclick={toggleUnlimited}
+      onkeydown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggleUnlimited();
+        }
+      }}
+    >
       <span class="unlimited-text">Unlimited</span>
       <span class="unlimited-hint">Click to set a limit</span>
     </div>
