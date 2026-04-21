@@ -27,6 +27,73 @@ use super::transfer::{is_filtered_source_ip, DownloadEvent};
 /// persist `.part.met` files even when download tasks are aborted.
 pub type SharedTrackerRegistry = Arc<std::sync::Mutex<HashMap<String, Arc<RwLock<PartTracker>>>>>;
 
+/// Shared per-peer "known missing parts" hints. Populated by source
+/// workers when a peer accepts our upload request and then drops the
+/// TCP connection with zero bytes transferred — a strong signal that
+/// the peer doesn't actually hold the byte range we asked for,
+/// regardless of what its `OP_FILESTATUS` claimed. Consulted by the
+/// retry coordinator and the post-handshake filter so we stop
+/// re-assigning the same part to a peer that has just demonstrated it
+/// can't serve it.
+///
+/// Key: `(peer_ip_string, peer_port)`.
+/// Value: a `Vec<bool>` of length `part_count`; `vec[i] == true` means
+/// the peer is confirmed not to hold part `i`. Entries are only ever
+/// added to — we never upgrade a `false` back to "might have it"
+/// within a transfer because the failure was already observed.
+pub(crate) type SharedPeerMissingParts =
+    Arc<std::sync::Mutex<HashMap<(String, u16), Vec<bool>>>>;
+
+/// Test whether `peers_missing_parts` is known to say peer `(ip, port)`
+/// does NOT have part `part_idx`. Returns `false` for unknown peers
+/// (no entry) and for parts inside a peer's recorded vector that are
+/// still `false` (i.e. we haven't observed a failure on that part yet).
+pub(crate) fn peer_confirmed_missing_part(
+    map: &SharedPeerMissingParts,
+    peer_ip: &str,
+    peer_port: u16,
+    part_idx: usize,
+) -> bool {
+    if let Ok(guard) = map.lock() {
+        if let Some(v) = guard.get(&(peer_ip.to_string(), peer_port)) {
+            return v.get(part_idx).copied().unwrap_or(false);
+        }
+    }
+    false
+}
+
+/// Record that peer `(ip, port)` dropped the TCP connection immediately
+/// after accepting our upload request, with zero bytes of part data
+/// received. Marks `part_idx` (and optionally a list of any other
+/// parts that were queued behind it on the same session) as confirmed
+/// missing for that peer. Creates the peer's vector lazily sized to
+/// `part_count`.
+pub(crate) fn record_peer_missing_parts(
+    map: &SharedPeerMissingParts,
+    peer_ip: &str,
+    peer_port: u16,
+    part_count: usize,
+    primary_part_idx: usize,
+    also_suspect: &[usize],
+) {
+    if let Ok(mut guard) = map.lock() {
+        let entry = guard
+            .entry((peer_ip.to_string(), peer_port))
+            .or_insert_with(|| vec![false; part_count]);
+        if entry.len() < part_count {
+            entry.resize(part_count, false);
+        }
+        if primary_part_idx < entry.len() {
+            entry[primary_part_idx] = true;
+        }
+        for &p in also_suspect {
+            if p < entry.len() {
+                entry[p] = true;
+            }
+        }
+    }
+}
+
 /// Maximum decompressed part size (PARTSIZE + margin = 10 MiB)
 const MAX_DECOMPRESSED_PART: usize = 10 * 1024 * 1024;
 
@@ -637,24 +704,47 @@ impl MultiSourceDownload {
                 (t.remaining_count() <= 3 && part_count > 1, t.part_gap_bytes_vec(), t.in_progress.clone())
             };
 
-            // First pass: unique part per source where possible (rarest-first)
+            // First pass: unique part per source where possible (rarest-first).
+            //
+            // Fix A: peers whose availability we don't yet know (the
+            // server-discovery path doesn't populate `available_parts`)
+            // used to be fed through the rarity-based selector with a
+            // fabricated `vec![true; part_count]`. For small files in
+            // the endgame branch that selector would gamble on the
+            // rare tail part — and when the peer turned out to not
+            // hold it, it would `OP_ACCEPTUPLOADREQ` us and then FIN
+            // the TCP connection right after our `OP_REQUESTPARTS`,
+            // wasting the whole handshake and the retry cooldown
+            // window. Since part 0 is universally held by any peer
+            // that has any of the file (it's the first part everyone
+            // downloads / shares), deterministically assign the
+            // lowest still-needed part to unknown-availability peers
+            // so their first handshake reliably produces bytes. The
+            // real rarity balancing takes over on the second round,
+            // once we've learned the peer's actual bitmap via
+            // `OP_FILESTATUS`.
             for src_idx in 0..self.sources.len() {
                 let src = &self.sources[src_idx];
-                let src_available: Vec<bool> = if src.available_parts.is_empty() {
-                    vec![true; part_count]
+                let src_is_unknown = src.available_parts.is_empty();
+
+                let chosen_part = if src_is_unknown {
+                    (0..part_count).find(|&p| {
+                        !assigned[p]
+                            && !tracker_in_progress.get(p).copied().unwrap_or(false)
+                    })
                 } else {
-                    src.available_parts.clone()
+                    cs.select_part(
+                        &assigned,
+                        &tracker_in_progress,
+                        &src.available_parts,
+                        &active,
+                        &gap_bytes,
+                        preview_prio,
+                        endgame_prefer_avail,
+                    )
                 };
 
-                if let Some(p) = cs.select_part(
-                    &assigned,
-                    &tracker_in_progress,
-                    &src_available,
-                    &active,
-                    &gap_bytes,
-                    preview_prio,
-                    endgame_prefer_avail,
-                ) {
+                if let Some(p) = chosen_part {
                     source_parts[src_idx].push(p);
                     part_source_count[p] += 1;
                     assigned[p] = true;
@@ -666,16 +756,17 @@ impl MultiSourceDownload {
             // (allows multiple sources to try the same part for small files).
             // Uses rarest-first selection with the MAX_SOURCES_PER_PART cap
             // enforced by marking over-subscribed parts as completed.
+            //
+            // Fix A: same unknown-availability treatment as the first
+            // pass — pick the lowest non-excluded part rather than
+            // letting the rarity selector re-randomise ties onto a
+            // rare tail we don't yet know the peer can serve.
             for src_idx in 0..self.sources.len() {
                 if !source_parts[src_idx].is_empty() {
                     continue;
                 }
                 let src = &self.sources[src_idx];
-                let src_available: Vec<bool> = if src.available_parts.is_empty() {
-                    vec![true; part_count]
-                } else {
-                    src.available_parts.clone()
-                };
+                let src_is_unknown = src.available_parts.is_empty();
 
                 let completed_parts = {
                     let t = tracker.read().await;
@@ -687,16 +778,23 @@ impl MultiSourceDownload {
                         excluded[p] = true;
                     }
                 }
-                let no_in_progress = vec![false; part_count];
-                if let Some(p) = cs.select_part(
-                    &excluded,
-                    &no_in_progress,
-                    &src_available,
-                    &active,
-                    &gap_bytes,
-                    preview_prio,
-                    endgame_prefer_avail,
-                ) {
+
+                let chosen_part = if src_is_unknown {
+                    (0..part_count).find(|&p| !excluded[p])
+                } else {
+                    let no_in_progress = vec![false; part_count];
+                    cs.select_part(
+                        &excluded,
+                        &no_in_progress,
+                        &src.available_parts,
+                        &active,
+                        &gap_bytes,
+                        preview_prio,
+                        endgame_prefer_avail,
+                    )
+                };
+
+                if let Some(p) = chosen_part {
                     source_parts[src_idx].push(p);
                     part_source_count[p] += 1;
                 }
@@ -866,6 +964,19 @@ impl MultiSourceDownload {
         let peers_that_queued: Arc<std::sync::Mutex<std::collections::HashSet<(String, u16)>>> =
             Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
+        // Shared "peer confirmed missing parts" registry — populated
+        // from inside `download_parts_from_source` when a peer accepts
+        // our upload request and then FINs the connection with zero
+        // bytes of part data received. Read back here at every retry
+        // round boundary (and by the post-handshake filter inside the
+        // task) to avoid re-assigning the same part to a peer that's
+        // already demonstrated it can't serve it, which used to show
+        // up as the same source failing with `early eof` on every
+        // retry round until we ran out of budget. See
+        // `SharedPeerMissingParts` for the exact semantics.
+        let peers_missing_parts: SharedPeerMissingParts =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
         // Per-file writer with its own dedicated thread. Replaces the
         // previous `Arc<Mutex<File>>` pattern that serialized all writers
         // on a single OS-mutex and burned a `spawn_blocking` slot per
@@ -929,6 +1040,7 @@ impl MultiSourceDownload {
             let fail_ip = source.peer_ip.clone();
             let fail_port = source.peer_port;
             let init_queued = peers_that_queued.clone();
+            let init_missing_parts = peers_missing_parts.clone();
             let init_src_ip = source.peer_ip.clone();
             let init_src_port = source.peer_port;
             let handle = tokio::spawn(async move {
@@ -999,6 +1111,7 @@ impl MultiSourceDownload {
                     // No pre-established stream — this is the initial-
                     // sources path; we always dial these peers fresh.
                     None,
+                    init_missing_parts,
                 )
                 .await;
 
@@ -1266,6 +1379,7 @@ impl MultiSourceDownload {
                             let inj_geo = self.geoip.clone();
                             let inj_fh = self.friend_hashes.clone();
                             let inj_sx_oh = self.sx_overhead.clone();
+                            let inj_missing_parts = peers_missing_parts.clone();
                             let handle = tokio::spawn(async move {
                                 let _permit = match sem.acquire().await {
                                     Ok(p) => p,
@@ -1289,6 +1403,7 @@ impl MultiSourceDownload {
                                     // exchange); no pre-handshaked
                                     // stream available.
                                     None,
+                                    inj_missing_parts,
                                 ).await;
                                 if !freq_avail.is_empty() {
                                     let mut csel = cs.write().await;
@@ -1477,6 +1592,7 @@ impl MultiSourceDownload {
                             let inj_geo = self.geoip.clone();
                             let inj_fh = self.friend_hashes.clone();
                             let inj_sx_oh = self.sx_overhead.clone();
+                            let inj_missing_parts = peers_missing_parts.clone();
                             let handle = tokio::spawn(async move {
                                 let _permit = match sem.acquire().await {
                                     Ok(p) => p,
@@ -1501,6 +1617,7 @@ impl MultiSourceDownload {
                                     // takes the adoption branch instead
                                     // of dialing the LowID peer back.
                                     Some(stream),
+                                    inj_missing_parts,
                                 ).await;
                                 if !freq_avail.is_empty() {
                                     let mut csel = cs.write().await;
@@ -1733,17 +1850,48 @@ impl MultiSourceDownload {
                 });
             }
             for &part_idx in &sorted_incomplete {
-                let mut candidates = Vec::new();
+                // Split candidates into three priority tiers:
+                //   1. `known_has`: peer's OP_FILESTATUS explicitly
+                //      confirmed they hold `part_idx`.
+                //   2. `unknown`: peer's bitmap is empty (we haven't
+                //      done a handshake yet); they might have it.
+                //   3. (implicit) skipped: peer has a bitmap that
+                //      marks `part_idx` as missing, OR the shared
+                //      `peers_missing_parts` registry recorded a
+                //      prior drop-after-accept on this part.
+                //
+                // Fix A / Fix B: prefer `known_has` over `unknown`,
+                // and never include a peer we've observed dropping on
+                // this exact part. The old code collapsed `known_has`
+                // and `unknown` into one list, which meant a peer
+                // that had just FINed us mid-session would be
+                // re-picked on the next retry round for the same
+                // doomed part.
+                let mut known_has = Vec::new();
+                let mut unknown = Vec::new();
                 for (src_idx, source) in all_sources.iter().enumerate() {
                     if !eligible[src_idx] {
                         continue;
                     }
-                    if source.available_parts.is_empty()
-                        || source.available_parts.get(part_idx).copied().unwrap_or(false)
-                    {
-                        candidates.push(src_idx);
+                    if peer_confirmed_missing_part(
+                        &peers_missing_parts,
+                        &source.peer_ip,
+                        source.peer_port,
+                        part_idx,
+                    ) {
+                        continue;
+                    }
+                    if source.available_parts.is_empty() {
+                        unknown.push(src_idx);
+                    } else if source.available_parts.get(part_idx).copied().unwrap_or(false) {
+                        known_has.push(src_idx);
                     }
                 }
+                let candidates = if !known_has.is_empty() {
+                    known_has
+                } else {
+                    unknown
+                };
                 if candidates.is_empty() {
                     continue;
                 }
@@ -1761,10 +1909,22 @@ impl MultiSourceDownload {
                 retry_assignments.iter().map(|v| v.len()).sum();
             if assigned_count == 0 {
                 // Find the soonest cooldown expiry among sources that
-                // actually have at least one needed part.
+                // actually have at least one needed part AND haven't
+                // already demonstrated they can't serve any of them.
+                // Fix B: a peer that FINed us on every remaining part
+                // is effectively dead for this transfer — don't block
+                // the retry budget waiting on its cooldown to expire.
                 let mut next_eligible: Option<std::time::Duration> = None;
                 for (src_idx, source) in all_sources.iter().enumerate() {
                     let has_useful_part = sorted_incomplete.iter().any(|&p| {
+                        if peer_confirmed_missing_part(
+                            &peers_missing_parts,
+                            &source.peer_ip,
+                            source.peer_port,
+                            p,
+                        ) {
+                            return false;
+                        }
                         source.available_parts.is_empty()
                             || source.available_parts.get(p).copied().unwrap_or(false)
                     });
@@ -1924,6 +2084,7 @@ impl MultiSourceDownload {
                 // 29 min (Queued / eMule FILEREASKTIME) — see
                 // `CooldownKind` and `SOURCE_RETRY_COOLDOWN_SECS`.
                 let r_queued = peers_that_queued.clone();
+                let r_missing_parts = peers_missing_parts.clone();
                 let r_src_ip = source.peer_ip.clone();
                 let r_src_port = source.peer_port;
                 retry_handles.push(tokio::spawn(async move {
@@ -1949,6 +2110,7 @@ impl MultiSourceDownload {
                         // by the initial attempt and is no longer
                         // alive by the time we retry.
                         None,
+                        r_missing_parts,
                     )
                     .await {
                         let err_str = e.to_string();
@@ -2315,6 +2477,12 @@ async fn download_parts_from_source(
     // historical connect+handshake path used by all non-callback
     // sources (initial sources, KAD/server-discovered sources, etc.).
     pre_established: Option<EstablishedStream>,
+    // `peers_missing_parts`: transfer-scoped shared registry of parts
+    // we've already observed a given peer drop us on. Consulted by
+    // the post-handshake filter (to replace a pre-assigned part that
+    // the peer has already failed on) and by the receive-loop error
+    // path (to record a fresh failure). See `SharedPeerMissingParts`.
+    peers_missing_parts: SharedPeerMissingParts,
 ) -> anyhow::Result<()> {
     use super::messages::*;
     use tokio::net::TcpStream;
@@ -3355,18 +3523,46 @@ async fn download_parts_from_source(
                     debug!("Source {} OP_FILESTATUS hash mismatch, ignoring", _src_idx);
                     continue;
                 }
-                let parts_vec = if parts_vec.is_empty() {
-                    debug!("Source {} file status: part_count=0 → peer has complete file ({} parts)", _src_idx, part_count);
-                    vec![true; part_count]
+                if parts_vec.is_empty() {
+                    // eMule's OP_FILESTATUS protocol: `part_count == 0`
+                    // (empty bitmap) is the "I have the complete file"
+                    // sentinel. We trust it for single-part files,
+                    // where it's the only reasonable thing to send.
+                    //
+                    // Fix D: for multi-part files, peers that send
+                    // `part_count == 0` have proven unreliable in the
+                    // wild — some aMule builds send it for a partial
+                    // cache of the same ed2k hash and then drop us
+                    // when we ask for byte ranges beyond what they
+                    // actually hold. Don't populate `peer_file_status`
+                    // in that case; leaving availability as `None`
+                    // falls through to the existing
+                    // "filename-only handshake fallback" path, and
+                    // combined with Fix A (initial part-0 assignment
+                    // for unknown peers) and Fix B (skip peers that
+                    // drop us on a specific part) the worst case is
+                    // one wasted handshake per bad peer instead of
+                    // the retry-loop churn we were seeing before.
+                    if part_count <= 1 {
+                        debug!(
+                            "Source {} file status: part_count=0 → peer has complete single-part file",
+                            _src_idx
+                        );
+                        peer_file_status = Some(vec![true; part_count]);
+                    } else {
+                        debug!(
+                            "Source {} file status: part_count=0 for multi-part file ({} parts) — treating as unverified (leaving availability unknown)",
+                            _src_idx, part_count
+                        );
+                    }
                 } else {
                     debug!("Source {} file status: {}/{} parts available", _src_idx, parts_vec.iter().filter(|&&p| p).count(), parts_vec.len());
                     let mut padded = parts_vec;
                     if padded.len() < part_count {
                         padded.resize(part_count, false);
                     }
-                    padded
-                };
-                peer_file_status = Some(parts_vec);
+                    peer_file_status = Some(padded);
+                }
             }
             got_status = true;
             break;
@@ -3392,18 +3588,33 @@ async fn download_parts_from_source(
                     got_filename = true;
                 }
                 if let Some(parts_vec) = mp.file_status {
-                    let parts_vec = if parts_vec.is_empty() {
-                        debug!("Source {} multipacket file status: part_count=0 → peer has complete file ({} parts)", _src_idx, part_count);
-                        vec![true; part_count]
+                    if parts_vec.is_empty() {
+                        // Fix D: mirror the `OP_FILESTATUS` handling
+                        // above — `part_count == 0` inside a
+                        // multipacket answer means "complete file"
+                        // and we only trust it for single-part files.
+                        // See the standalone `OP_FILESTATUS` branch
+                        // for the full rationale.
+                        if part_count <= 1 {
+                            debug!(
+                                "Source {} multipacket file status: part_count=0 → peer has complete single-part file",
+                                _src_idx
+                            );
+                            peer_file_status = Some(vec![true; part_count]);
+                        } else {
+                            debug!(
+                                "Source {} multipacket file status: part_count=0 for multi-part file ({} parts) — treating as unverified",
+                                _src_idx, part_count
+                            );
+                        }
                     } else {
                         debug!("Source {} multipacket file status: {}/{} parts available", _src_idx, parts_vec.iter().filter(|&&p| p).count(), parts_vec.len());
                         let mut padded = parts_vec;
                         if padded.len() < part_count {
                             padded.resize(part_count, false);
                         }
-                        padded
-                    };
-                    peer_file_status = Some(parts_vec);
+                        peer_file_status = Some(padded);
+                    }
                     got_status = true;
                     break;
                 }
@@ -3460,10 +3671,32 @@ async fn download_parts_from_source(
         _src_idx, addr, src_available_parts, src_total_parts
     );
 
-    // Filter pre-assigned parts to only those the peer actually has
-    let mut filtered_parts: Vec<usize> = parts.iter().copied().filter(|&p| {
-        source_available.is_empty() || source_available.get(p).copied().unwrap_or(false)
-    }).collect();
+    // Filter pre-assigned parts to only those the peer actually has.
+    //
+    // Fix B: also drop any part that the transfer-scoped
+    // `peers_missing_parts` registry says this peer has already FINed
+    // us on. Without that check we would happily re-send
+    // `OP_REQUESTPARTS` for the same part that got the peer to drop
+    // the session last time, and watch the same `early eof` roll in
+    // again 600 ms later — burning a retry-round slot and the
+    // handshake cost for nothing.
+    let peer_known_missing = |p: usize| -> bool {
+        peer_confirmed_missing_part(
+            &peers_missing_parts,
+            &source.peer_ip,
+            source.peer_port,
+            p,
+        )
+    };
+    let mut filtered_parts: Vec<usize> = parts
+        .iter()
+        .copied()
+        .filter(|&p| {
+            !peer_known_missing(p)
+                && (source_available.is_empty()
+                    || source_available.get(p).copied().unwrap_or(false))
+        })
+        .collect();
 
     if filtered_parts.is_empty() {
         if let Some(cs) = &chunk_sel {
@@ -3476,11 +3709,19 @@ async fn download_parts_from_source(
             let gap_bytes = t.part_gap_bytes_vec();
             drop(t);
             if remaining > 0 {
-                let avail = if source_available.is_empty() {
+                // Fix B: mask out any part the peer has already FINed
+                // us on so the dynamic selector doesn't hand it the
+                // same broken assignment it just lost on.
+                let mut avail = if source_available.is_empty() {
                     vec![true; pc]
                 } else {
                     source_available.clone()
                 };
+                for p in 0..avail.len() {
+                    if peer_known_missing(p) {
+                        avail[p] = false;
+                    }
+                }
                 let pp = control.is_preview_priority();
                 let prefer_higher = remaining <= 3 && pc > 1;
                 let active: Vec<usize> = in_prog.iter().enumerate()
@@ -4156,12 +4397,64 @@ async fn download_parts_from_source(
                     pkt
                 },
                 Ok(Err(e)) => {
+                    // Fix C: classify the FIN so the log (and, below,
+                    // the shared `peers_missing_parts` registry) can
+                    // tell the difference between:
+                    //   * peer granted our upload slot, then dropped
+                    //     the TCP connection with zero bytes of part
+                    //     data ever received — a strong signal it
+                    //     doesn't actually hold the byte range we
+                    //     asked for (Pattern A in the triage), and
+                    //   * peer was mid-stream and then dropped — a
+                    //     weaker signal that's often just a transient
+                    //     TCP/NAT problem.
+                    // Both used to bubble up as an indistinguishable
+                    // `early eof` / `unexpected end of file`.
+                    let classification = if !got_any_data
+                        && chunks_received_this_part == 0
+                        && bytes_received_this_part == 0
+                    {
+                        "peer_dropped_after_accept"
+                    } else if got_any_data {
+                        "peer_truncated_transfer"
+                    } else {
+                        "read_error"
+                    };
                     info!(
-                        "DIAG: source {} ({}) read_packet_async error during part {}: {e:#} (chunks_for_part={}, bytes_for_part={}, sent_idx={}/{})",
-                        _src_idx, addr, part_idx,
+                        "DIAG: source {} ({}) read_packet_async error during part {}: {e:#} (kind={}, chunks_for_part={}, bytes_for_part={}, sent_idx={}/{})",
+                        _src_idx, addr, part_idx, classification,
                         chunks_received_this_part, bytes_received_this_part,
                         sent_idx, batches.len(),
                     );
+                    if classification == "peer_dropped_after_accept" {
+                        // Fix B: record this peer as confirmed-missing
+                        // for the part we were just requesting so
+                        // subsequent retry rounds (and the
+                        // post-handshake filter on the next dial) skip
+                        // the part for this peer. The part_queue tail
+                        // past `queue_idx` was NOT requested over the
+                        // wire yet — we only queued it locally — so
+                        // don't mark those as missing; only the part
+                        // the peer actively dropped on is known bad.
+                        record_peer_missing_parts(
+                            &peers_missing_parts,
+                            &source.peer_ip,
+                            source.peer_port,
+                            part_count,
+                            part_idx,
+                            &[],
+                        );
+                        warn!(
+                            "Source {} ({}) accepted upload for part {} then FINed with zero bytes — marking this peer as missing part {} for this transfer",
+                            _src_idx, addr, part_idx, part_idx,
+                        );
+                        // Tag the error so `classify_error` can surface
+                        // it distinctly in the UI and so the log grep
+                        // is easy.
+                        return Err(anyhow::Error::from(e).context(
+                            "stage:peer_dropped_after_accept peer FINed after OP_REQUESTPARTS with 0 bytes received",
+                        ));
+                    }
                     return Err(e.into());
                 },
                 Err(()) => {
