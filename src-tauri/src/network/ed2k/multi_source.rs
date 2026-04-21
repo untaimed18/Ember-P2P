@@ -4113,7 +4113,12 @@ async fn download_parts_from_source(
                 loop {
                     tokio::select! {
                         biased;
-                        res = &mut read_fut => break Ok(res),
+                        // `read_packet_async_ms` returns `Result<_, io::Error>`;
+                        // hoist into `anyhow::Error` here so the outer
+                        // match arms stay aligned with the error-kind
+                        // classification that the rest of the receive
+                        // loop uses.
+                        res = &mut read_fut => break Ok(res.map_err(anyhow::Error::from)),
                         _ = &mut timeout_fut => break Err(()),
                         _ = stall_check.tick() => {
                             // Emit a fresh `transferring` update
