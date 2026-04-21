@@ -155,6 +155,7 @@ export function cleanupNetworkStore() {
   if (statsPollInterval !== null) {
     clearInterval(statsPollInterval);
     statsPollInterval = null;
+    detachStatsVisibilityListener();
   }
   statsPollConsumers = 0;
   serverStatus.set('disconnected');
@@ -173,6 +174,30 @@ export function cleanupNetworkStore() {
 let statsPollInterval: ReturnType<typeof setInterval> | null = null;
 let statsPollConsumers = 0;
 
+// Module-scope so both the consumer-ref teardown and `cleanupNetworkStore`
+// can reliably detach it without keeping a dangling DOM listener. Set
+// true by `visibilitychange` when the tab becomes visible; the next poll
+// tick consumes it to pump one reconcile even if the event-freshness
+// gate below would normally skip.
+let statsPumpOnNextVisible = false;
+let statsVisibilityListenerAttached = false;
+function onStatsVisibilityChange() {
+  if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+    statsPumpOnNextVisible = true;
+  }
+}
+function attachStatsVisibilityListener() {
+  if (statsVisibilityListenerAttached || typeof document === 'undefined') return;
+  document.addEventListener('visibilitychange', onStatsVisibilityChange);
+  statsVisibilityListenerAttached = true;
+}
+function detachStatsVisibilityListener() {
+  if (!statsVisibilityListenerAttached || typeof document === 'undefined') return;
+  document.removeEventListener('visibilitychange', onStatsVisibilityChange);
+  statsVisibilityListenerAttached = false;
+  statsPumpOnNextVisible = false;
+}
+
 export function startStatsPoll() {
   statsPollConsumers += 1;
   if (statsPollInterval !== null) {
@@ -181,12 +206,26 @@ export function startStatsPoll() {
       if (statsPollConsumers === 0 && statsPollInterval !== null) {
         clearInterval(statsPollInterval);
         statsPollInterval = null;
+        detachStatsVisibilityListener();
       }
     };
   }
 
+  attachStatsVisibilityListener();
+
   statsPollInterval = setInterval(async () => {
-    if (Date.now() - lastEventUpdate < 5500) return;
+    // Skip the IPC entirely when the window is hidden. The backend keeps
+    // firing `network-status` / `firewall-status` events and those land in
+    // the store regardless; the poll is only a reconciliation fallback for
+    // when events are silent, and a hidden tab has no one watching the
+    // sidebar dot or the status bar. Without this gate we did a full
+    // `getNetworkStats()` round-trip + reactive re-broadcast every 3 s
+    // while backgrounded, for no observable benefit.
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+      return;
+    }
+    if (!statsPumpOnNextVisible && Date.now() - lastEventUpdate < 5500) return;
+    statsPumpOnNextVisible = false;
     try {
       const stats = await Promise.race([
         getNetworkStats(),
@@ -224,6 +263,7 @@ export function startStatsPoll() {
     if (statsPollConsumers === 0 && statsPollInterval !== null) {
       clearInterval(statsPollInterval);
       statsPollInterval = null;
+      detachStatsVisibilityListener();
     }
   };
 }

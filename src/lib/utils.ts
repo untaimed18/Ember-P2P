@@ -38,11 +38,31 @@ export function formatEta(totalSize: number, transferred: number, speed: number)
   return `${mins}m`;
 }
 
+/*
+ * `Intl.DateTimeFormat` construction is surprisingly expensive — each call
+ * to `toLocaleDateString(undefined, options)` allocates a fresh formatter
+ * internally, which shows up in the flame graph for tables rendering
+ * hundreds of rows (transfers, library, known clients). Module-scope these
+ * once; the intl cache respects the user's current system locale at first
+ * use and that's what we want anyway (the app doesn't switch locales at
+ * runtime).
+ */
+const SHORT_DT_FORMATTER = new Intl.DateTimeFormat(undefined, {
+  month: 'short',
+  day: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+});
+const LEDGER_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, {
+  year: 'numeric',
+  month: 'short',
+  day: 'numeric',
+});
+
 /** Format a unix timestamp as a short date string. */
 export function formatDate(ts: number): string {
   if (!ts || ts <= 0) return '\u2014';
-  const d = new Date(ts * 1000);
-  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  return SHORT_DT_FORMATTER.format(new Date(ts * 1000));
 }
 
 /** Format a unix timestamp for long-lived ledger views (e.g. the Known
@@ -54,8 +74,7 @@ export function formatDate(ts: number): string {
  *  just push the column wider for no real signal. */
 export function formatDateWithYear(ts: number): string {
   if (!ts || ts <= 0) return '\u2014';
-  const d = new Date(ts * 1000);
-  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  return LEDGER_DATE_FORMATTER.format(new Date(ts * 1000));
 }
 
 /**

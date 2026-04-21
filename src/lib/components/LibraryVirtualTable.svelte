@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { FileInfo } from '$lib/types';
   import { passiveScroll } from '$lib/actions/passiveScroll';
-  import { formatSize } from '$lib/utils';
+  import { formatSize, formatDateWithYear as formatDate } from '$lib/utils';
   import { onMount, onDestroy, untrack } from 'svelte';
 
   type SortField =
@@ -45,11 +45,6 @@
   const STORAGE_WIDTHS = 'library-col-widths';
   const STORAGE_HIDDEN = 'library-col-hidden';
   const STORAGE_ORDER = 'library-col-order';
-
-  function formatDate(ts: number): string {
-    if (!ts) return '\u2014';
-    return new Date(ts * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
-  }
 
   let {
     sortedFiles,
