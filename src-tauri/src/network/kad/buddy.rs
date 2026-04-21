@@ -574,13 +574,14 @@ impl BuddyManager {
 
 async fn send_pong<W: AsyncWriteExt + Unpin + ?Sized>(w: &mut W) -> bool {
     let pkt = build_emule_packet(OP_BUDDYPONG, &[]);
-    match tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        w.write_all(&pkt).await?;
-        w.flush().await
-    }).await {
-        Ok(Ok(())) => true,
-        _ => false,
-    }
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            w.write_all(&pkt).await?;
+            w.flush().await
+        })
+        .await,
+        Ok(Ok(()))
+    )
 }
 
 /// Outgoing buddy handshake: we send Hello, read HelloAnswer, then exchange EmuleInfo.
