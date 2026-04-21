@@ -449,6 +449,16 @@ fn drain_active_source_overflow(
     drained
 }
 
+/// How long a "KAD Callback" / "KAD Direct Callback" / "Low ID (Server Relay)"
+/// placeholder row is allowed to sit in `Connecting` state before the
+/// `source_retry_timer` sweep removes it. KAD source searches re-run every
+/// ~30-60s for active downloads, so 180s gives each peer roughly 3-6 chances
+/// to call back before we consider their buddy unreachable and clear the
+/// stale row. If the peer is still in subsequent KAD search results, a fresh
+/// placeholder is re-inserted immediately — producing a visible
+/// "still trying" rhythm rather than a row that sits forever in `Connecting`.
+const KAD_CALLBACK_PLACEHOLDER_TIMEOUT_SECS: i64 = 180;
+
 fn pending_download_retry_interval(search_count: u32) -> i64 {
     match search_count {
         0 => 0,
@@ -1711,6 +1721,19 @@ struct NetworkState {
     /// repeatedly contacting non-responsive buddies.
     /// Value is (attempt_count, first_attempt_timestamp) — resets after 10 minutes.
     callback_buddy_attempts: HashMap<([u8; 16], [u8; 16]), (u32, i64)>,
+    /// When each "KAD Callback" / "KAD Direct Callback" / "Low ID (Server Relay)"
+    /// placeholder row was inserted into a transfer's source-detail list.
+    /// Key: `(transfer_id, peer_ip, peer_port)`. Value: insertion epoch (seconds).
+    ///
+    /// Placeholders are seeded optimistically when KAD source searches return
+    /// type-4 / type-5 / type-6 sources. Many of those callbacks never arrive
+    /// because the listed buddy no longer has the LowID peer connected, so the
+    /// row would otherwise sit in `Connecting` state forever. The
+    /// `source_retry_timer` tick sweeps this map and removes rows older than
+    /// `KAD_CALLBACK_PLACEHOLDER_TIMEOUT_SECS`; the next KAD search cycle
+    /// re-inserts them if the peer still appears in results, producing a
+    /// visible "we're retrying" rhythm rather than a stuck list.
+    callback_row_pending_since: HashMap<(String, String, u16), i64>,
     /// Semaphore limiting concurrent outgoing TCP connections for firewall checks
     firewall_connect_semaphore: Arc<tokio::sync::Semaphore>,
     /// K18: per-IP cooldown timestamps for incoming FirewalledReq. An
@@ -3215,6 +3238,7 @@ pub async fn start_network(
         antileech: shared_antileech.clone(),
         aich_root_map: HashMap::new(),
         callback_buddy_attempts: HashMap::new(),
+        callback_row_pending_since: HashMap::new(),
         firewall_connect_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
         firewall_req_cooldown: HashMap::new(),
         online_friends: HashMap::new(),
@@ -4888,7 +4912,7 @@ pub async fn start_network(
                 };
                 let was_completed = completed_file_hash.is_some();
                 let mut promoted = Vec::new();
-                handle_download_event(event, &app_handle, &transfer_manager, &db, &mut promoted, &mut stats_manager, settings.remove_finished_downloads, &a4af_shared, &settings.download_folder, &mut db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL).await;
+                handle_download_event(event, &app_handle, &transfer_manager, &db, &mut promoted, &mut stats_manager, settings.remove_finished_downloads, &a4af_shared, &settings.download_folder, &mut db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL, &mut state.callback_row_pending_since).await;
 
                 if let Some(ref file_hash) = completed_file_hash {
                     let mut sf = spam_filter.write().await;
@@ -6018,6 +6042,7 @@ pub async fn start_network(
                                     // `Connecting`, producing duplicate
                                     // rows for peers that are already
                                     // queued or transferring.
+                                    let now_ts = chrono::Utc::now().timestamp();
                                     for cb_src in &callback_sources {
                                         let ip_s = cb_src.ip.to_string();
                                         if mgr.has_source_detail_for_ip(&transfer_id, &ip_s) {
@@ -6026,7 +6051,7 @@ pub async fn start_network(
                                         mgr.update_source_detail(
                                             &transfer_id,
                                             crate::types::SourceInfo {
-                                                ip: ip_s,
+                                                ip: ip_s.clone(),
                                                 port: cb_src.tcp_port,
                                                 status: crate::types::SourceStatus::Connecting,
                                                 queue_rank: None,
@@ -6040,6 +6065,16 @@ pub async fn start_network(
                                                 source_origin: Some("kad".into()),
                                             },
                                         );
+                                        // Fresh row → fresh timestamp, always.
+                                        // Overwrites any stale entry left over
+                                        // from a prior pause/resume cycle
+                                        // where `source_details` was cleared
+                                        // but we hadn't swept the timestamp
+                                        // map yet.
+                                        state.callback_row_pending_since.insert(
+                                            (transfer_id.clone(), ip_s, cb_src.tcp_port),
+                                            now_ts,
+                                        );
                                     }
                                     for dc_src in &direct_callback_sources {
                                         let ip_s = dc_src.ip.to_string();
@@ -6049,7 +6084,7 @@ pub async fn start_network(
                                         mgr.update_source_detail(
                                             &transfer_id,
                                             crate::types::SourceInfo {
-                                                ip: ip_s,
+                                                ip: ip_s.clone(),
                                                 port: dc_src.tcp_port,
                                                 status: crate::types::SourceStatus::Connecting,
                                                 queue_rank: None,
@@ -6063,6 +6098,10 @@ pub async fn start_network(
                                                 source_origin: Some("kad".into()),
                                             },
                                         );
+                                        state.callback_row_pending_since.insert(
+                                            (transfer_id.clone(), ip_s, dc_src.tcp_port),
+                                            now_ts,
+                                        );
                                     }
                                     for ls in &lowid_sources {
                                         if state.server_connected {
@@ -6073,7 +6112,7 @@ pub async fn start_network(
                                             mgr.update_source_detail(
                                                 &transfer_id,
                                                 crate::types::SourceInfo {
-                                                    ip: ip_str,
+                                                    ip: ip_str.clone(),
                                                     port: ls.ed2k_server_port,
                                                     status: crate::types::SourceStatus::Connecting,
                                                     queue_rank: None,
@@ -6086,6 +6125,10 @@ pub async fn start_network(
                                                     country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(ls.ip)),
                                                     source_origin: Some("kad".into()),
                                                 },
+                                            );
+                                            state.callback_row_pending_since.insert(
+                                                (transfer_id.clone(), ip_str, ls.ed2k_server_port),
+                                                now_ts,
                                             );
                                         }
                                     }
@@ -6196,6 +6239,7 @@ pub async fn start_network(
                                     // match the listed listening port,
                                     // so a refreshed placeholder would
                                     // duplicate-row the same peer.
+                                    let now_ts = chrono::Utc::now().timestamp();
                                     for cb_src in &callback_sources {
                                         let ip_s = cb_src.ip.to_string();
                                         if mgr.has_source_detail_for_ip(&transfer_id, &ip_s) {
@@ -6207,7 +6251,7 @@ pub async fn start_network(
                                         mgr.update_source_detail(
                                             &transfer_id,
                                             crate::types::SourceInfo {
-                                                ip: ip_s,
+                                                ip: ip_s.clone(),
                                                 port: cb_src.tcp_port,
                                                 status: crate::types::SourceStatus::Connecting,
                                                 queue_rank: None,
@@ -6221,6 +6265,16 @@ pub async fn start_network(
                                                 source_origin: Some("kad".into()),
                                             },
                                         );
+                                        // Fresh row → fresh timestamp, always.
+                                        // Overwrites any stale entry left over
+                                        // from a prior pause/resume cycle
+                                        // where `source_details` was cleared
+                                        // but we hadn't swept the timestamp
+                                        // map yet.
+                                        state.callback_row_pending_since.insert(
+                                            (transfer_id.clone(), ip_s, cb_src.tcp_port),
+                                            now_ts,
+                                        );
                                     }
                                     for dc_src in &direct_callback_sources {
                                         let ip_s = dc_src.ip.to_string();
@@ -6233,7 +6287,7 @@ pub async fn start_network(
                                         mgr.update_source_detail(
                                             &transfer_id,
                                             crate::types::SourceInfo {
-                                                ip: ip_s,
+                                                ip: ip_s.clone(),
                                                 port: dc_src.tcp_port,
                                                 status: crate::types::SourceStatus::Connecting,
                                                 queue_rank: None,
@@ -6246,6 +6300,10 @@ pub async fn start_network(
                                                 country_code: cc,
                                                 source_origin: Some("kad".into()),
                                             },
+                                        );
+                                        state.callback_row_pending_since.insert(
+                                            (transfer_id.clone(), ip_s, dc_src.tcp_port),
+                                            now_ts,
                                         );
                                     }
                                 }
@@ -6471,6 +6529,7 @@ pub async fn start_network(
                                     // prevention — see parallel blocks
                                     // in the pending / pending→active
                                     // branches above).
+                                    let now_ts = chrono::Utc::now().timestamp();
                                     for cb_src in &callback_sources {
                                         let ip_s = cb_src.ip.to_string();
                                         if mgr.has_source_detail_for_ip(&transfer_id, &ip_s) {
@@ -6482,7 +6541,7 @@ pub async fn start_network(
                                         mgr.update_source_detail(
                                             &transfer_id,
                                             crate::types::SourceInfo {
-                                                ip: ip_s,
+                                                ip: ip_s.clone(),
                                                 port: cb_src.tcp_port,
                                                 status: crate::types::SourceStatus::Connecting,
                                                 queue_rank: None,
@@ -6496,6 +6555,16 @@ pub async fn start_network(
                                                 source_origin: Some("kad".into()),
                                             },
                                         );
+                                        // Fresh row → fresh timestamp, always.
+                                        // Overwrites any stale entry left over
+                                        // from a prior pause/resume cycle
+                                        // where `source_details` was cleared
+                                        // but we hadn't swept the timestamp
+                                        // map yet.
+                                        state.callback_row_pending_since.insert(
+                                            (transfer_id.clone(), ip_s, cb_src.tcp_port),
+                                            now_ts,
+                                        );
                                     }
                                     for dc_src in &direct_callback_sources {
                                         let ip_s = dc_src.ip.to_string();
@@ -6508,7 +6577,7 @@ pub async fn start_network(
                                         mgr.update_source_detail(
                                             &transfer_id,
                                             crate::types::SourceInfo {
-                                                ip: ip_s,
+                                                ip: ip_s.clone(),
                                                 port: dc_src.tcp_port,
                                                 status: crate::types::SourceStatus::Connecting,
                                                 queue_rank: None,
@@ -6521,6 +6590,10 @@ pub async fn start_network(
                                                 country_code: cc,
                                                 source_origin: Some("kad".into()),
                                             },
+                                        );
+                                        state.callback_row_pending_since.insert(
+                                            (transfer_id.clone(), ip_s, dc_src.tcp_port),
+                                            now_ts,
                                         );
                                     }
                                 }
@@ -8567,6 +8640,69 @@ pub async fn start_network(
                 let now = chrono::Utc::now().timestamp();
                 let kad_available = state.stats.status != NetworkStatus::Disconnected;
                 let server_connected = state.server_connected;
+
+                // Expire stale KAD-callback placeholder rows. A placeholder
+                // sits in `Connecting` state until either (a) the LowID
+                // peer calls back and the `SourceDetail` handler removes
+                // it, or (b) this timeout fires because the peer's buddy
+                // never relayed our CallbackReq (most common outcome —
+                // buddies only relay callbacks for peers currently
+                // connected to them, which is a small fraction).
+                // Without this sweep the UI accumulates "forever-
+                // Connecting" rows and the user rightly wonders why
+                // nothing ever transitions. The next KAD source search
+                // for this transfer (~30-60s cadence) will re-insert the
+                // row if the peer is still in results, producing a
+                // visible "still trying" rhythm instead of stale rows.
+                {
+                    let expired_keys: Vec<(String, String, u16)> = state
+                        .callback_row_pending_since
+                        .iter()
+                        .filter(|(_, &since)| now - since >= KAD_CALLBACK_PLACEHOLDER_TIMEOUT_SECS)
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    if !expired_keys.is_empty() {
+                        let removed_rows: Vec<(String, String, u16)> = {
+                            let mut mgr = transfer_manager.write().await;
+                            let mut out = Vec::new();
+                            for (tid, ip, port) in &expired_keys {
+                                if mgr.remove_placeholder_row(tid, ip, *port) {
+                                    out.push((tid.clone(), ip.clone(), *port));
+                                }
+                            }
+                            out
+                        };
+                        for (tid, ip, port) in &removed_rows {
+                            let _ = app_handle.emit(
+                                "transfer-source-detail",
+                                serde_json::json!({
+                                    "transfer_id": tid,
+                                    "ip": ip,
+                                    "port": port,
+                                    "status": "failed",
+                                    "queue_rank": null,
+                                    "speed": 0,
+                                    "transferred": 0,
+                                    "client_software": "",
+                                    "peer_name": "",
+                                    "available_parts": null,
+                                    "total_parts": null,
+                                    "country_code": null,
+                                }),
+                            );
+                        }
+                        // Drop timestamp entries for all expired keys —
+                        // whether we actually removed a row (placeholder
+                        // was still there) or the row had already
+                        // transitioned to a real peer state in the
+                        // interval between our snapshot and the write
+                        // lock. In both cases the timestamp no longer
+                        // tracks a live placeholder.
+                        for key in &expired_keys {
+                            state.callback_row_pending_since.remove(key);
+                        }
+                    }
+                }
 
                 // Always process cancellations even when offline.
                 {
@@ -11410,6 +11546,8 @@ pub async fn start_network(
                                 mgr.remove_callback_placeholders_for_ip(&tid3, &peer_ip_str)
                             };
                             for (ip, port) in removed {
+                                state.callback_row_pending_since
+                                    .remove(&(tid3.clone(), ip.clone(), port));
                                 let _ = app_handle.emit(
                                     "transfer-source-detail",
                                     serde_json::json!({
@@ -11569,6 +11707,8 @@ pub async fn start_network(
                                             mgr.remove_callback_placeholders_for_ip(tid, &peer_ip_str)
                                         };
                                         for (ip, port) in removed {
+                                            state.callback_row_pending_since
+                                                .remove(&(tid.clone(), ip.clone(), port));
                                             let _ = app_handle.emit(
                                                 "transfer-source-detail",
                                                 serde_json::json!({
@@ -17491,6 +17631,12 @@ async fn handle_download_event(
     download_folder: &str,
     db_progress_last_persist: &mut HashMap<String, std::time::Instant>,
     db_progress_persist_interval: std::time::Duration,
+    // Pending-since tracking for KAD callback placeholder rows. When
+    // the `SourceDetail` handler removes stale placeholders, we also
+    // drop their timestamp entries so the periodic timeout sweep in
+    // `source_retry_timer` doesn't keep checking keys that no longer
+    // refer to live rows.
+    callback_row_pending_since: &mut HashMap<(String, String, u16), i64>,
 ) {
     match event {
         DownloadEvent::Progress {
@@ -17655,6 +17801,8 @@ async fn handle_download_event(
                 removed
             };
             for (rem_ip, rem_port) in placeholder_removed {
+                callback_row_pending_since
+                    .remove(&(transfer_id.clone(), rem_ip.clone(), rem_port));
                 let _ = app_handle.emit(
                     "transfer-source-detail",
                     serde_json::json!({

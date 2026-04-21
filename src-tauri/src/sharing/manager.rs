@@ -566,6 +566,40 @@ impl TransferManager {
     /// "remove all placeholder rows for this IP", matching the
     /// behaviour of the `kad_callback_rx` callers that know for a
     /// fact the live row landed on a different port.
+    /// Remove one specific placeholder row at `(transfer_id, peer_ip, peer_port)`
+    /// if it is still in the placeholder shape (status=Connecting AND
+    /// one of the three placeholder client labels). Returns `true` if
+    /// the row was removed, `false` if no matching row exists or the
+    /// row has already transitioned out of placeholder shape (e.g. a
+    /// late callback just turned it into a real Queued row — we must
+    /// NOT drop that). Called by the periodic stale-placeholder
+    /// sweep in `source_retry_timer`.
+    pub fn remove_placeholder_row(
+        &mut self,
+        transfer_id: &str,
+        peer_ip: &str,
+        peer_port: u16,
+    ) -> bool {
+        let mut removed = false;
+        if let Some(rows) = self.source_details.get_mut(transfer_id) {
+            rows.retain(|s| {
+                let is_expired_placeholder = s.ip == peer_ip
+                    && s.port == peer_port
+                    && s.status == crate::types::SourceStatus::Connecting
+                    && (s.client_software == "KAD Callback"
+                        || s.client_software == "KAD Direct Callback"
+                        || s.client_software == "Low ID (Server Relay)");
+                if is_expired_placeholder {
+                    removed = true;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        removed
+    }
+
     pub fn remove_callback_placeholders_for_ip_except(
         &mut self,
         transfer_id: &str,
