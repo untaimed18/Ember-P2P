@@ -224,6 +224,18 @@
     loadStoredColumnWidths();
     loadStoredColumnSetup(savedAdvancedCols === '0');
     syncAdvancedDlState();
+
+    // One-shot fetch of the upload-queue and known-clients snapshots so
+    // the bottom-tab labels show their counts immediately on page load,
+    // not just after the user has clicked each tab. The per-tab
+    // `$effect`s below still own the ongoing polling while a tab is
+    // visible — this only primes the counts for tabs the user hasn't
+    // opened yet. Without it, "Queued (N)" / "Known Clients (N)"
+    // rendered as bare "Queued" / "Known Clients" until first click,
+    // and the numbers vanished again every time the user navigated
+    // away from /transfers and back.
+    refreshUploadQueue();
+    refreshKnownClients();
     listen<{
       transfer_id: string; ip: string; port: number; status: string;
       queue_rank?: number; speed: number; transferred: number; client_software: string; peer_name: string;
