@@ -4069,10 +4069,80 @@ async fn download_parts_from_source(
                 budget.saturating_sub(elapsed).max(std::time::Duration::from_secs(1))
             };
 
-            let (proto, opcode, payload) = match tokio::time::timeout(
-                read_timeout,
-                read_packet_async_ms(&mut *reader),
-            ).await {
+            // Wait for the next packet with two distinct deadlines:
+            //   - a short **stall-check tick** (every 2s) that emits a
+            //     fresh `transferring` `SourceDetail` event carrying
+            //     the current (likely falling-to-zero) measured
+            //     speed, so the UI reflects a silent peer in seconds
+            //     rather than 100s;
+            //   - the existing **hard deadline** (`read_timeout`) that
+            //     bails on a truly dead peer.
+            //
+            // The read future is pinned so stall-check ticks don't
+            // drop it — any bytes already consumed by an in-flight
+            // `read_exact` remain accumulated. Only the hard timeout
+            // or the branch consuming the read's `Ready` result
+            // drops the future, matching the previous
+            // `tokio::time::timeout` semantics for those paths.
+            //
+            // Previously the worker was blocked in a single 100s
+            // `tokio::time::timeout` with no intermediate UI
+            // updates, so a source that stopped sending mid-transfer
+            // kept displaying its last measured speed (e.g.
+            // 172.3 KB/s) in the detail panel until the full
+            // timeout fired — leaving the user staring at a row
+            // that looked healthy while the transfer-level health
+            // indicator had already flipped red at the 60s
+            // ACTIVE_STALLED threshold.
+            let hard_deadline = tokio::time::Instant::now() + read_timeout;
+            let read_result: Result<anyhow::Result<(u8, u8, Vec<u8>)>, ()> = {
+                let mut read_fut = std::pin::pin!(read_packet_async_ms(&mut *reader));
+                let timeout_fut = tokio::time::sleep_until(hard_deadline);
+                tokio::pin!(timeout_fut);
+                let mut stall_check =
+                    tokio::time::interval(std::time::Duration::from_secs(2));
+                stall_check.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Skip,
+                );
+                // Consume the immediate first tick so the first real
+                // stall-check fires 2s after we start waiting, not
+                // instantly (which would spam an emit on every
+                // packet).
+                stall_check.tick().await;
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        res = &mut read_fut => break Ok(res),
+                        _ = &mut timeout_fut => break Err(()),
+                        _ = stall_check.tick() => {
+                            // Emit a fresh `transferring` update
+                            // with recalculated speed (which will
+                            // trend toward 0 as the byte window
+                            // ages out). The same logic that runs
+                            // after packet processing below — just
+                            // triggered on a timer so the UI gets
+                            // updates during silence.
+                            let elapsed = speed_start.elapsed();
+                            if elapsed.as_millis() >= 2000 {
+                                measured_speed =
+                                    (speed_bytes as u128 * 1000
+                                        / elapsed.as_millis().max(1))
+                                        as u64;
+                                speed_bytes = 0;
+                                speed_start = std::time::Instant::now();
+                                emit_source!(
+                                    "transferring",
+                                    None,
+                                    measured_speed
+                                );
+                            }
+                        }
+                    }
+                }
+            };
+
+            let (proto, opcode, payload) = match read_result {
                 Ok(Ok(pkt)) => {
                     if !got_any_data {
                         debug!("Source {} ({}) data loop received packet BEFORE first data: proto=0x{:02X} op=0x{:02X} ({} bytes)",
@@ -4089,7 +4159,7 @@ async fn download_parts_from_source(
                     );
                     return Err(e.into());
                 },
-                Err(_) => {
+                Err(()) => {
                     let _ = write_packet_async_ms(
                         &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
                     ).await;
