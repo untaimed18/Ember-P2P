@@ -552,6 +552,26 @@ impl TransferManager {
         transfer_id: &str,
         peer_ip: &str,
     ) -> Vec<(String, u16)> {
+        self.remove_callback_placeholders_for_ip_except(transfer_id, peer_ip, None)
+    }
+
+    /// Same as [`remove_callback_placeholders_for_ip`], but skips the row
+    /// whose port equals `except_port`. Called from the central
+    /// `SourceDetail` handler when a live peer row arrives — we want
+    /// to drop stale placeholders that share the IP but we must NOT
+    /// drop the very row the caller is about to insert/update at
+    /// `(peer_ip, except_port)` when it happens to match a placeholder
+    /// port (e.g. the peer's ephemeral outbound port randomly coincided
+    /// with its advertised listening port). Passing `None` means
+    /// "remove all placeholder rows for this IP", matching the
+    /// behaviour of the `kad_callback_rx` callers that know for a
+    /// fact the live row landed on a different port.
+    pub fn remove_callback_placeholders_for_ip_except(
+        &mut self,
+        transfer_id: &str,
+        peer_ip: &str,
+        except_port: Option<u16>,
+    ) -> Vec<(String, u16)> {
         let mut removed = Vec::new();
         if let Some(rows) = self.source_details.get_mut(transfer_id) {
             rows.retain(|s| {
@@ -559,7 +579,8 @@ impl TransferManager {
                     && s.status == crate::types::SourceStatus::Connecting
                     && (s.client_software == "KAD Callback"
                         || s.client_software == "KAD Direct Callback"
-                        || s.client_software == "Low ID (Server Relay)");
+                        || s.client_software == "Low ID (Server Relay)")
+                    && Some(s.port) != except_port;
                 if is_placeholder {
                     removed.push((s.ip.clone(), s.port));
                     false
