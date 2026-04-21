@@ -17604,8 +17604,37 @@ async fn handle_download_event(
                 "completed" => crate::types::SourceStatus::Completed,
                 _ => crate::types::SourceStatus::Failed,
             };
-            {
+            // Events arriving at this handler come from real
+            // download workers (multi_source / transfer) for live
+            // peer connections — placeholder rows we seed from KAD
+            // search results bypass `DownloadEvent` and write
+            // directly to the transfer manager, so they never
+            // reach here. That means any event here is the signal
+            // "this peer is connected (or actively being dialled)
+            // on (ip, port)". Strip any stale placeholder rows
+            // for the same IP that we seeded earlier from KAD —
+            // they keyed by the peer's *listed* listening port,
+            // while the live connection almost always lands on a
+            // different ephemeral port, so without this cleanup
+            // the UI ends up with two rows per peer (one
+            // forever-"Connecting" placeholder next to the real
+            // transferring/queued row). The `except_port` guard
+            // preserves the one placeholder row that happens to
+            // share the live row's port — `update_source_detail`
+            // below updates it in place, no duplicate to clean up.
+            //
+            // This is defence-in-depth alongside the dedicated
+            // cleanup in the `kad_callback_rx` path: if a callback
+            // arrives via a path that path doesn't cover
+            // (e.g. future protocol additions, or the fallback-
+            // to-metadata-injection branch), the placeholder still
+            // goes away as soon as the worker reports any live
+            // state for the peer.
+            let placeholder_removed = {
                 let mut mgr = transfer_manager.write().await;
+                let removed = mgr.remove_callback_placeholders_for_ip_except(
+                    &transfer_id, &ip, Some(port),
+                );
                 mgr.update_source_detail(
                     &transfer_id,
                     crate::types::SourceInfo {
@@ -17622,6 +17651,26 @@ async fn handle_download_event(
                         country_code: country_code.clone(),
                         source_origin: None,
                     },
+                );
+                removed
+            };
+            for (rem_ip, rem_port) in placeholder_removed {
+                let _ = app_handle.emit(
+                    "transfer-source-detail",
+                    serde_json::json!({
+                        "transfer_id": &transfer_id,
+                        "ip": rem_ip,
+                        "port": rem_port,
+                        "status": "failed",
+                        "queue_rank": null,
+                        "speed": 0,
+                        "transferred": 0,
+                        "client_software": "",
+                        "peer_name": "",
+                        "available_parts": null,
+                        "total_parts": null,
+                        "country_code": null,
+                    }),
                 );
             }
             if status == "queued" || status == "transferring" {

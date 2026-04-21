@@ -370,6 +370,47 @@
     }
   }
 
+  // Source-list ordering: transferring rises to the top (most useful
+  // info: who's actively sending us bytes), queued comes next (the
+  // ones we're waiting on, ordered by closest-to-top-of-queue), then
+  // everything else (connecting / queue_full / no_needed_parts /
+  // completed) in stable insertion order. Within the transferring
+  // tier, sort by speed descending so the fastest sources are easy
+  // to find. Within the queued tier, sort by queue_rank ascending
+  // (smaller rank = closer to a slot).
+  //
+  // Returns a new sorted array; the caller's input is not mutated.
+  function sortSourcesByPriority(sources: SourceInfo[]): SourceInfo[] {
+    const tier = (s: SourceInfo): number => {
+      if (s.status === 'transferring') return 0;
+      if (s.status === 'queued') return 1;
+      return 2;
+    };
+    return sources
+      .map((s, i) => ({ s, i }))
+      .sort((a, b) => {
+        const ta = tier(a.s);
+        const tb = tier(b.s);
+        if (ta !== tb) return ta - tb;
+        if (ta === 0) {
+          // Transferring: faster on top.
+          return (b.s.speed ?? 0) - (a.s.speed ?? 0);
+        }
+        if (ta === 1) {
+          // Queued: smaller queue_rank on top. Treat null/0 (queue
+          // position unknown) as worst so known ranks float up.
+          const ar = a.s.queue_rank != null && a.s.queue_rank > 0
+            ? a.s.queue_rank : Number.MAX_SAFE_INTEGER;
+          const br = b.s.queue_rank != null && b.s.queue_rank > 0
+            ? b.s.queue_rank : Number.MAX_SAFE_INTEGER;
+          if (ar !== br) return ar - br;
+        }
+        // Stable within tier: preserve original insertion order.
+        return a.i - b.i;
+      })
+      .map((x) => x.s);
+  }
+
   function toErrorMsg(e: unknown): string {
     return e instanceof Error ? e.message : typeof e === 'string' ? e : 'Operation failed';
   }
@@ -2131,7 +2172,7 @@
                   </td>
                 </tr>
               {:else}
-                {@const visibleSources = expandedSources.filter(s => s.status !== 'failed')}
+                {@const visibleSources = sortSourcesByPriority(expandedSources.filter(s => s.status !== 'failed'))}
                 {@const failedCount = expandedSources.length - visibleSources.length}
                 {@const xferCount = visibleSources.filter(s => s.status === 'transferring').length}
                 {@const queuedCount = visibleSources.filter(s => s.status === 'queued').length}
@@ -2729,7 +2770,7 @@
           </thead>
           <tbody>
             {#if expandedSources.length > 0 && expandedTransferId}
-              {@const clientSources = expandedSources.filter(s => s.status !== 'failed')}
+              {@const clientSources = sortSourcesByPriority(expandedSources.filter(s => s.status !== 'failed'))}
               {#each clientSources as src (src.ip + ':' + src.port)}
                 <tr class="client-row">
                   {#each visibleClientColumns as column (column.key)}
