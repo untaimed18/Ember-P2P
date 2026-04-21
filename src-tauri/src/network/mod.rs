@@ -3581,9 +3581,27 @@ pub async fn start_network(
     // eMule UDPSEARCHSPEED = SEC2MS(3)/4 = 750ms: send one UDP search per tick
     let mut udp_search_timer = tokio::time::interval(std::time::Duration::from_millis(750));
     udp_search_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Pacing for UDP source requests: eMule sends ~1 per second during its global sweep
-    let mut udp_source_timer = tokio::time::interval(std::time::Duration::from_millis(1000));
+    // UDP source-query drain cadence. The previous 1000ms-per-single-packet
+    // pace was far stricter than eMule's: eMule's `CDownloadQueue::Process()`
+    // ticks every ~1s and sends a BURST of OP_GLOBGETSOURCES(2) packets
+    // within each tick — one per eligible server — so a freshly-added
+    // download sees UDP replies from all servers within the first second.
+    // Our old implementation pop'd one packet per 1s tick, meaning a 7-server
+    // queue took 7 seconds to fully dispatch even though the server-side
+    // responses arrive in <500ms. That made new-download source discovery
+    // feel sluggish next to eMule for no protocol reason.
+    //
+    // 200ms tick + up to 3 packets per tick = peak 15 pkts/sec, well below
+    // any per-client anti-flood heuristics (typical thresholds are in the
+    // hundreds of pkts/sec), and drains a 7-server burst in ~0.4s —
+    // matching the eMule UX the user pointed out.
+    let mut udp_source_timer = tokio::time::interval(std::time::Duration::from_millis(200));
     udp_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Max UDP source-query packets to dispatch per `udp_source_timer`
+    // tick. Combined with the 200ms tick above this yields a peak rate
+    // of 15 packets/sec during bursts (e.g. just after a download is
+    // added) while remaining idle when the queue is empty.
+    const UDP_SOURCE_BURST_PER_TICK: usize = 3;
     let mut cleanup_timer = tokio::time::interval(std::time::Duration::from_secs(300));
     cleanup_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut small_timer = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -8281,9 +8299,19 @@ pub async fn start_network(
                 }
             }
 
-            // Throttled UDP source requests: send one packet per ~1s tick (eMule pacing)
+            // Paced UDP source-request drain: up to UDP_SOURCE_BURST_PER_TICK
+            // packets per ~200ms tick. Bursting a small batch per tick
+            // (rather than 1 packet per tick) matches eMule's
+            // `CDownloadQueue::Process` behaviour — when a download is
+            // added eMule sends a flurry of OP_GLOBGETSOURCES(2) to all
+            // eligible servers in quick succession, so their replies land
+            // within the first second. See the timer-definition comment
+            // for the rate rationale.
             _ = udp_source_timer.tick() => {
-                if let Some((packet, addr)) = state.udp_source_queue.pop_front() {
+                for _ in 0..UDP_SOURCE_BURST_PER_TICK {
+                    let Some((packet, addr)) = state.udp_source_queue.pop_front() else {
+                        break;
+                    };
                     let sock = server_udp.socket_handle();
                     let pkt_len = packet.len() as u64;
                     // Compute the canonical (TCP_port) lookup key from the
