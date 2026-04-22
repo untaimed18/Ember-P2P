@@ -4183,6 +4183,17 @@ async fn download_parts_from_source(
     // Build dynamic part queue: start with pre-assigned parts, add more dynamically
     let mut part_queue: Vec<usize> = parts.to_vec();
     let mut queue_idx = 0;
+    // Count of consecutive `is_part_complete → continue` skips that
+    // extended the queue from the chunk selector. Bounded so a peer
+    // whose parts all happen to race to completion with other sources
+    // can't get us stuck looping between "skip complete" and "extend"
+    // — after this many skip-then-extend cycles without actually
+    // transferring anything, we conclude the source has nothing useful
+    // to do and exit the per-part loop cleanly. 8 is comfortably more
+    // than any realistic race but well under anything that would burn
+    // noticeable CPU.
+    const MAX_CONSECUTIVE_STALE_SKIPS: usize = 8;
+    let mut consecutive_stale_skips: usize = 0;
     let mut last_periodic_save = std::time::Instant::now();
     const PERIODIC_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -4237,6 +4248,17 @@ async fn download_parts_from_source(
 
         // Race-check: another source may have completed this part
         // while we were on the previous one. Cheap read-lock check.
+        //
+        // Note that this branch is also hit when an *injected* source
+        // (late-arriving from KAD/server source discovery) connects
+        // after the only part originally assigned to it has already
+        // been completed by an earlier-dialing peer. Without the
+        // dynamic-extend below, the source would exit the per-part
+        // loop immediately with `src_transferred=0`, wasting the
+        // whole TCP + Hello + EmuleInfo + SecIdent + obfuscation
+        // handshake round-trip. The extend pulls a fresh in-progress
+        // part from the chunk selector so the source gets real work
+        // to do on the session we already paid to open.
         {
             let t = tracker.read().await;
             if t.is_part_complete(part_idx) {
@@ -4245,9 +4267,79 @@ async fn download_parts_from_source(
                 if pipelined_next.as_ref().map(|p| p.part_idx) == Some(part_idx) {
                     pipelined_next = None;
                 }
+                drop(t);
+
+                // Dynamic-extend attempt. Mirrors the end-of-iteration
+                // block further down, but fires when the current part
+                // was already complete before we could start work on
+                // it — without it, sources with a stale initial queue
+                // (typical for KAD-injected late arrivals) never reach
+                // the end-of-iteration extend point. Capped by
+                // `MAX_CONSECUTIVE_STALE_SKIPS` to prevent a live-lock
+                // if `select_part` keeps handing us parts that race
+                // to completion before we can claim them.
+                if queue_idx >= part_queue.len()
+                    && consecutive_stale_skips < MAX_CONSECUTIVE_STALE_SKIPS
+                {
+                    if let Some(cs) = &chunk_sel {
+                        let cs = cs.read().await;
+                        let t = tracker.read().await;
+                        let completed = t.completed_parts().to_vec();
+                        let in_prog = t.in_progress.clone();
+                        let remaining = t.remaining_count();
+                        let part_count = t.part_count;
+                        let gap_bytes = t.part_gap_bytes_vec();
+                        drop(t);
+                        if remaining > 0 {
+                            let avail = if source_available.is_empty() {
+                                vec![true; part_count]
+                            } else {
+                                source_available.clone()
+                            };
+                            let pp = control.is_preview_priority();
+                            let prefer_higher = remaining <= 3 && part_count > 1;
+                            let active: Vec<usize> = in_prog.iter().enumerate()
+                                .filter(|(_, &ip)| ip).map(|(i, _)| i).collect();
+                            let next_part = cs
+                                .select_part(&completed, &in_prog, &avail, &active, &gap_bytes, pp, prefer_higher)
+                                .or_else(|| {
+                                    let no_in_progress = vec![false; part_count];
+                                    cs.select_part(
+                                        &completed,
+                                        &no_in_progress,
+                                        &avail,
+                                        &active,
+                                        &gap_bytes,
+                                        pp,
+                                        prefer_higher,
+                                    )
+                                });
+                            if let Some(next) = next_part {
+                                if !part_queue.contains(&next) {
+                                    part_queue.push(next);
+                                    let mut t = tracker.write().await;
+                                    t.set_in_progress(next, true);
+                                    drop(t);
+                                    ip_guard.mark(next);
+                                    consecutive_stale_skips += 1;
+                                    info!(
+                                        "DIAG: source {} ({}) stale-queue extend: part {} was already complete, pulled fresh part {} (skip-cycle {}/{})",
+                                        _src_idx, addr, part_idx, next,
+                                        consecutive_stale_skips, MAX_CONSECUTIVE_STALE_SKIPS,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 continue;
             }
         }
+
+        // About to do real work on this part — any prior stale-skip
+        // streak is over; reset the counter so a later skip streak on
+        // this source gets its own fresh budget.
+        consecutive_stale_skips = 0;
 
         let mut aich_recovery_data: Option<([u8; 20], Vec<u8>)> = None;
         let mut pending_compressed: HashMap<u64, PendingCompressedBlock> = HashMap::new();
