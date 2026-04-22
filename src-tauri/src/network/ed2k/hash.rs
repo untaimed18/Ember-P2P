@@ -192,6 +192,36 @@ pub fn hash_file_combined_cancellable(
     Ok((ed2k_hash, aich_hash))
 }
 
+/// In-memory equivalent of [`ed2k_hash_file`], used exclusively by
+/// transfer-verification unit tests. Gated to `#[cfg(test)]` so the
+/// production binary doesn't carry a 100-MB-capable allocator helper
+/// that only exists to produce round-trip test vectors.
+#[cfg(test)]
+pub fn ed2k_hash_bytes(data: &[u8]) -> String {
+    let file_size = data.len() as u64;
+
+    if file_size == 0 {
+        return hex::encode(Md4::digest([]));
+    }
+
+    if file_size > 0 && file_size < PARTSIZE {
+        return hex::encode(Md4::digest(data));
+    }
+
+    let num_chunks = file_size.div_ceil(PARTSIZE);
+    let mut chunk_hashes = Vec::with_capacity((num_chunks as usize + 1) * 16);
+    for chunk in data.chunks(PARTSIZE as usize) {
+        chunk_hashes.extend_from_slice(&Md4::digest(chunk));
+    }
+
+    if file_size % PARTSIZE == 0 {
+        let empty_hash = Md4::digest([]);
+        chunk_hashes.extend_from_slice(&empty_hash);
+    }
+
+    hex::encode(Md4::digest(&chunk_hashes))
+}
+
 /// MD4 digest of empty input — the ed2k file hash for a **zero-byte** file (`file_size == 0`).
 #[inline]
 pub fn empty_ed2k_file_md4() -> [u8; 16] {
