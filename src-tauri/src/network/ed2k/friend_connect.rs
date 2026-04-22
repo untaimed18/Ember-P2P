@@ -90,11 +90,30 @@ pub async fn connect_and_send_friend_request(
         }
     }
 
+    // Synchronous Ember-Hello round-trip. Without this, `hello_caps.is_ember`
+    // stays false (the public Hello / EmuleInfo no longer signals Ember-ness)
+    // and the bail below would always fire — friend-connect dials would never
+    // reach `OP_EMBER_FRIEND_REQ`. This also populates `hello_caps.ember_pubkey`,
+    // which is the gating condition for the `perform_ember_auth` call below.
+    exchange_ember_hello(
+        &mut reader,
+        &mut writer,
+        our_ember_hash,
+        our_nickname,
+        ed25519_pubkey.as_ref(),
+        &mut hello_caps,
+        addr,
+    )
+    .await?;
+
     if !hello_caps.is_ember {
         anyhow::bail!("remote peer is not an Ember client");
     }
 
-    // Ember auth challenge-response if both sides support it
+    // Ember auth challenge-response if both sides support it. With
+    // `OP_EMBER_HELLO` exchanged above, `hello_caps.ember_pubkey` is
+    // populated for any peer that advertises one and this branch
+    // actually runs full Ed25519 proof of possession.
     if let (Some(peer_pk), Some(our_pk), Some(our_sk)) = (hello_caps.ember_pubkey, ed25519_pubkey, ed25519_secret_key) {
         perform_ember_auth(&mut reader, &mut writer, &our_pk, &our_sk, &peer_pk, hello_caps.ember_hash.as_ref(), addr).await?;
     }
@@ -229,20 +248,41 @@ pub async fn open_and_run_friend_session(
         }
     }
 
+    // Synchronous Ember-Hello round-trip. Same rationale as
+    // `connect_and_send_friend_request`: without this, `is_ember`
+    // stays false, the bail below always fires, and friend sessions
+    // can't open at all.
+    exchange_ember_hello(
+        &mut reader,
+        &mut writer,
+        &our_ember_hash,
+        &our_nickname,
+        ed25519_pubkey.as_ref(),
+        &mut hello_caps,
+        addr,
+    )
+    .await?;
+
     if !hello_caps.is_ember {
         anyhow::bail!("remote peer is not an Ember client");
     }
     let peer_ember_hash = hello_caps.ember_hash
         .ok_or_else(|| anyhow::anyhow!("Ember peer has no ember_hash"))?;
 
-    // Ember auth challenge-response. Currently a no-op in practice
-    // because this function never sends `OP_EMBER_HELLO`, so
-    // `hello_caps.ember_pubkey` is never populated and the guard
-    // below short-circuits. Once `OP_EMBER_HELLO` is wired into this
-    // handshake (FUTURE_WORK.md F2), the call will run for real and
-    // `perform_ember_auth` will give us proof of possession.
+    // Ember auth challenge-response. Now that `OP_EMBER_HELLO` is
+    // exchanged above, `hello_caps.ember_pubkey` is populated and
+    // this branch performs a real Ed25519 proof-of-possession round
+    // trip — verifies BLAKE3(peer_pk)[0..16] == peer_ember_hash and
+    // that the peer can sign a fresh nonce with the matching secret
+    // key. A failure here propagates as `?` and aborts the friend
+    // session, so a peer that fails PoP never gets friend-session
+    // privileges (chat, browse, etc.). Skipped only for legacy peers
+    // who don't advertise a pubkey; their session continues with
+    // `ember_hash_binding_verified = false` per the block below.
+    let mut ember_pop_verified = false;
     if let (Some(peer_pk), Some(our_pk), Some(our_sk)) = (hello_caps.ember_pubkey, ed25519_pubkey, ed25519_secret_key) {
         perform_ember_auth(&mut reader, &mut writer, &our_pk, &our_sk, &peer_pk, Some(&peer_ember_hash), addr).await?;
+        ember_pop_verified = true;
     }
 
     let is_friend = friend_hashes.read().await.contains(&peer_ember_hash);
@@ -250,19 +290,19 @@ pub async fn open_and_run_friend_session(
         anyhow::bail!("remote peer {} is not in our friend list", hex::encode(peer_ember_hash));
     }
 
-    // Offline identity-binding state — passed into the spawned
-    // reader task below so any `OP_EMBER_FRIEND_REQ` we receive on
-    // this session reports an honest `verified` value to the UI
-    // instead of an unconditional `true`. Currently always `false`
-    // because this handshake doesn't exchange `OP_EMBER_HELLO` (see
-    // the comment on the auth call above); flips to `true`
-    // automatically once `hello_caps.ember_pubkey` starts getting
-    // populated through that wire-up.
-    let ember_hash_binding_verified = hello_caps
-        .ember_pubkey
-        .as_ref()
-        .map(|pk| crate::network::ember::crypto::verify_ember_hash_binding(pk, &peer_ember_hash))
-        .unwrap_or(false);
+    // Verification flag passed into the spawned reader task below so
+    // any `OP_EMBER_FRIEND_REQ` we receive on this session reports
+    // an honest `verified` value to the UI. Prefer the strong PoP
+    // signal (set by `perform_ember_auth` above); fall back to the
+    // offline binding check for peers that didn't advertise a pubkey
+    // — those sessions still carry a meaningful binding-verified
+    // state when one is computable, but mark unverified when not.
+    let ember_hash_binding_verified = ember_pop_verified
+        || hello_caps
+            .ember_pubkey
+            .as_ref()
+            .map(|pk| crate::network::ember::crypto::verify_ember_hash_binding(pk, &peer_ember_hash))
+            .unwrap_or(false);
 
     write_packet(&mut writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, our_nickname.as_bytes()).await?;
 
@@ -355,27 +395,16 @@ pub async fn open_and_run_friend_session(
                                 }
                                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) => {
                                     let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
-                                    // `verified` is set from the
-                                    // session-scoped
+                                    // `verified` is the session-scoped
                                     // `ember_hash_binding_verified`
-                                    // flag computed during the
-                                    // session setup (after we parsed
-                                    // the peer's `OP_EMBER_HELLO`).
-                                    //
-                                    // Today this is the offline
-                                    // BLAKE3 binding check, not full
-                                    // proof of possession. The
-                                    // `perform_ember_auth` call in
-                                    // `open_friend_session` is gated
-                                    // on `hello_caps.ember_pubkey`
-                                    // being populated, which itself
-                                    // requires `OP_EMBER_HELLO` to
-                                    // have been exchanged in this
-                                    // function — wiring that in is
-                                    // tracked as future work
-                                    // (FUTURE_WORK.md F2). When it
-                                    // lands, `ember_hash_binding_verified`
-                                    // here will also reflect PoP.
+                                    // flag set during session setup.
+                                    // For Ember-to-Ember sessions
+                                    // this folds in the result of
+                                    // `perform_ember_auth` (a real
+                                    // Ed25519 proof of possession);
+                                    // for peers that didn't advertise
+                                    // a pubkey it falls back to the
+                                    // offline BLAKE3 binding check.
                                     info!("Received friend request on outbound friend session from {} (nick='{}', verified={ember_hash_binding_verified})", addr, nick);
                                     let _ = session_ul_event_tx.send(UploadEvent {
                                         transfer_id: String::new(),
@@ -479,6 +508,162 @@ async fn read_packet_inner<R: AsyncReadExt + Unpin + ?Sized>(
     Ok((protocol, opcode, payload))
 }
 
+/// Maximum time we'll wait for the peer's `OP_EMBER_HELLO` /
+/// `OP_EMBER_HELLOANSWER` after we send ours. Short enough that a
+/// vanilla eMule peer (which will never respond) doesn't add noticeable
+/// latency to friend-connect; long enough to absorb normal-internet
+/// jitter for the small handful of packets that may queue ahead of the
+/// Ember hello.
+const EMBER_HELLO_TIMEOUT_SECS: u64 = 5;
+/// Cap on the number of unrelated packets we'll consume while looking
+/// for the peer's Ember hello. A well-behaved Ember peer sends its
+/// hello immediately after the EmuleInfo exchange, so 0–1 unrelated
+/// packets are normal (e.g. `OP_SECIDENTSTATE`); a higher count may
+/// indicate the peer is racing in unrelated traffic. Bounded so a
+/// chatty peer can't pin us in this loop.
+const EMBER_HELLO_MAX_LOOKAHEAD: usize = 4;
+
+/// Drives a synchronous `OP_EMBER_HELLO` exchange right after the
+/// EmuleInfo round-trip. We send our hello (with our Ed25519 pubkey
+/// when available) and then read packets for up to
+/// [`EMBER_HELLO_TIMEOUT_SECS`] looking for the peer's hello. On
+/// success we populate `hello_caps.is_ember`, `.ember_hash`,
+/// `.ember_pubkey`, `.mod_version`, and `.peer_name` from the parsed
+/// payload — the only place in `friend_connect.rs` that ever sets
+/// `is_ember = true` (the public Hello / EmuleInfo handshake is kept
+/// byte-identical to vanilla eMule so anti-leecher mods don't queue-ban
+/// us, see the long comment in `messages.rs::build_emule_info`).
+///
+/// If the peer beat us to it and sent `OP_EMBER_HELLO` instead of an
+/// answer, we reply with our own `OP_EMBER_HELLOANSWER` so they also
+/// learn our pubkey in the same round-trip. Vanilla peers and older
+/// Ember peers that don't speak this opcode just hit the timeout and
+/// the handshake proceeds without `ember_pubkey` set — the downstream
+/// `is_ember` check at the call sites then bails cleanly.
+async fn exchange_ember_hello<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    our_ember_hash: &[u8; 16],
+    our_nickname: &str,
+    our_pubkey: Option<&[u8; 32]>,
+    hello_caps: &mut PeerCapabilities,
+    addr: SocketAddr,
+) -> std::io::Result<()>
+where
+    R: AsyncReadExt + Unpin + ?Sized,
+    W: AsyncWriteExt + Unpin + ?Sized,
+{
+    let payload = build_ember_hello(our_ember_hash, our_nickname, our_pubkey);
+    write_packet(writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload).await?;
+
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(EMBER_HELLO_TIMEOUT_SECS);
+    for _ in 0..EMBER_HELLO_MAX_LOOKAHEAD {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, read_packet_inner(reader)).await {
+            Ok(Ok((proto, opcode, packet_payload))) => {
+                if proto == OP_EMULEPROT
+                    && (opcode == OP_EMBER_HELLO || opcode == OP_EMBER_HELLOANSWER)
+                {
+                    if let Some(ident) = parse_ember_hello(&packet_payload) {
+                        hello_caps.is_ember = true;
+                        if !ident.mod_version.is_empty() {
+                            hello_caps.mod_version = ident.mod_version;
+                        }
+                        if !ident.nickname.is_empty() {
+                            hello_caps.peer_name = ident.nickname;
+                        }
+                        if ident.ember_hash != [0u8; 16] {
+                            hello_caps.ember_hash = Some(ident.ember_hash);
+                        }
+                        if let Some(pk) = ident.ed25519_pubkey {
+                            hello_caps.ember_pubkey = Some(pk);
+                        }
+                        if opcode == OP_EMBER_HELLO {
+                            let answer = build_ember_hello(our_ember_hash, our_nickname, our_pubkey);
+                            let _ = write_packet(
+                                writer,
+                                OP_EMULEPROT,
+                                OP_EMBER_HELLOANSWER,
+                                &answer,
+                            )
+                            .await;
+                        }
+                    }
+                    return Ok(());
+                }
+                debug!(
+                    "friend_connect {addr}: skipping proto=0x{proto:02X} op=0x{opcode:02X} while waiting for OP_EMBER_HELLO"
+                );
+            }
+            // Timeout or read error → peer is vanilla eMule, an older
+            // Ember release, or the connection died. Either way the
+            // caller will surface the actual failure mode (auth skipped
+            // or `is_ember` bail).
+            _ => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
+/// Maximum unrelated packets we'll skip while looking for a
+/// specific Ember auth opcode. Bounded to prevent a chatty peer
+/// from pinning us in this loop forever; in practice we expect
+/// 0–1 skips (just OP_SECIDENTSTATE).
+const AUTH_PACKET_MAX_SKIPS: usize = 8;
+/// Per-attempt timeout while waiting for the next packet during
+/// auth. The overall budget is bounded by `AUTH_PACKET_MAX_SKIPS`
+/// times this value, currently 80 s worst case — generous because
+/// friend-connect already gave up on the wider TCP timeout if the
+/// peer is genuinely unresponsive.
+const AUTH_PACKET_TIMEOUT_SECS: u64 = 10;
+
+/// Read the next packet matching `expected_opcode` (with
+/// `expected_payload_len`), skipping a bounded number of unrelated
+/// packets first.
+///
+/// Returns the matched packet's payload. Errors if we hit the
+/// per-packet read timeout, hit `AUTH_PACKET_MAX_SKIPS` non-matching
+/// packets, or read a stream error.
+///
+/// The skipping behaviour exists specifically to handle interleaved
+/// `OP_SECIDENTSTATE` (and similar proactive packets) that
+/// `upload.rs` emits before its main dispatch loop. Friend-connect
+/// can safely drop those: it doesn't process SecIdent or other
+/// non-friend opcodes during the auth window.
+async fn read_specific_auth_packet<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
+    expected_opcode: u8,
+    expected_payload_len: usize,
+    addr: SocketAddr,
+    label: &'static str,
+) -> anyhow::Result<Vec<u8>> {
+    for _ in 0..=AUTH_PACKET_MAX_SKIPS {
+        let (proto, opcode, payload) = read_packet_with_timeout(reader, AUTH_PACKET_TIMEOUT_SECS)
+            .await
+            .map_err(|e| anyhow::anyhow!("Ember auth: failed to read {label} from {addr}: {e}"))?;
+        if proto == OP_EMULEPROT && opcode == expected_opcode {
+            if payload.len() != expected_payload_len {
+                anyhow::bail!(
+                    "Ember auth: {label} from {addr} has wrong payload length: got {}, expected {}",
+                    payload.len(),
+                    expected_payload_len,
+                );
+            }
+            return Ok(payload);
+        }
+        debug!(
+            "Ember auth: dropped intervening proto=0x{proto:02X} op=0x{opcode:02X} from {addr} while awaiting {label}"
+        );
+    }
+    anyhow::bail!(
+        "Ember auth: never received {label} from {addr} after {AUTH_PACKET_MAX_SKIPS} unrelated packets"
+    );
+}
+
 async fn read_packet_with_timeout<R: AsyncReadExt + Unpin + ?Sized>(
     reader: &mut R,
     timeout_secs: u64,
@@ -543,15 +728,28 @@ where
     rand::thread_rng().fill_bytes(&mut our_nonce);
     write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE, &our_nonce).await?;
 
-    // Read peer's challenge nonce
-    let (proto, opcode, peer_nonce_payload) = read_packet_with_timeout(reader, 10).await
-        .map_err(|e| anyhow::anyhow!("Ember auth: failed to read challenge from {addr}: {e}"))?;
-    if proto != OP_EMULEPROT || opcode != OP_EMBER_AUTH_CHALLENGE || peer_nonce_payload.len() != 32 {
-        anyhow::bail!(
-            "Ember auth: expected AUTH_CHALLENGE from {addr}, got proto=0x{proto:02X} op=0x{opcode:02X} len={}",
-            peer_nonce_payload.len()
-        );
-    }
+    // Read peer's challenge nonce, tolerating interleaved packets.
+    //
+    // The peer (typically `upload.rs`) emits proactive opcodes
+    // immediately after its OP_EMBER_HELLO — most notably
+    // `OP_SECIDENTSTATE` from `maybe_send_secident_challenge`,
+    // which sits in the TCP stream ahead of the peer's CHALLENGE
+    // response. A strict "next packet must be CHALLENGE" read
+    // would consume + reject that SecIdent frame and abort
+    // friend-connect for every Ember-to-Ember dial. We instead
+    // read up to a small bounded number of packets and accept
+    // the first one that's actually our CHALLENGE; non-matching
+    // packets are logged and dropped (acceptable here because
+    // friend-connect is short-lived and doesn't process SecIdent
+    // or other peer-initiated opcodes itself).
+    let peer_nonce_payload = read_specific_auth_packet(
+        reader,
+        OP_EMBER_AUTH_CHALLENGE,
+        32,
+        addr,
+        "AUTH_CHALLENGE",
+    )
+    .await?;
 
     // Sign the peer's nonce with our key and send response (pubkey + signature)
     let signing_key = SigningKey::from_bytes(our_secret_key);
@@ -561,15 +759,17 @@ where
     response.extend_from_slice(&signature.to_bytes());
     write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE, &response).await?;
 
-    // Read peer's response (32-byte pubkey + 64-byte signature)
-    let (proto, opcode, peer_response) = read_packet_with_timeout(reader, 10).await
-        .map_err(|e| anyhow::anyhow!("Ember auth: failed to read response from {addr}: {e}"))?;
-    if proto != OP_EMULEPROT || opcode != OP_EMBER_AUTH_RESPONSE || peer_response.len() != 96 {
-        anyhow::bail!(
-            "Ember auth: expected AUTH_RESPONSE from {addr}, got proto=0x{proto:02X} op=0x{opcode:02X} len={}",
-            peer_response.len()
-        );
-    }
+    // Read peer's response (32-byte pubkey + 64-byte signature),
+    // again tolerating intervening unrelated packets per the
+    // same rationale as the CHALLENGE read above.
+    let peer_response = read_specific_auth_packet(
+        reader,
+        OP_EMBER_AUTH_RESPONSE,
+        96,
+        addr,
+        "AUTH_RESPONSE",
+    )
+    .await?;
 
     let resp_pubkey: [u8; 32] = peer_response[..32].try_into().unwrap();
     if resp_pubkey != *peer_pubkey {

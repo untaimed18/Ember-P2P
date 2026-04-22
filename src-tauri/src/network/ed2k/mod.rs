@@ -1,6 +1,7 @@
 pub mod a4af;
 pub mod aich;
 pub mod archive_recovery;
+pub mod ember_auth;
 pub mod friend_connect;
 pub mod chunk_selection;
 pub mod collection;

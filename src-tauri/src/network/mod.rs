@@ -4616,20 +4616,29 @@ pub async fn start_network(
                 if let DownloadEvent::EmberFriendRequest { ember_hash: req_hash, ref nickname, ref peer_ip, peer_port, verified } = event {
                     let hash_hex = hex::encode(req_hash);
                     info!("Processing download-side friend request from {} (nick='{}', ip={}:{}, verified={verified})", hash_hex, nickname, peer_ip, peer_port);
-                    // `verified` is the offline BLAKE3 identity-binding
-                    // result computed at the emit site
-                    // (`verify_ember_hash_binding`): true iff the peer
-                    // advertised an Ed25519 pubkey whose 16-byte BLAKE3
-                    // prefix matches the `ember_hash` they're claiming.
-                    // It is NOT yet a proof-of-possession check (that's
-                    // FUTURE_WORK.md F2 Phase 2). We thread it through
-                    // to the DB row + UI badge so the user can see
-                    // whether the request came over a binding-consistent
-                    // channel; never auto-promote to "mutual" based on
-                    // it. If the sender is already mutual, ignore; if
-                    // they are in our list but not mutual, route through
-                    // the request queue so the user sees "<nick> wants
-                    // to confirm friendship" and must explicitly accept.
+                    // `verified` carries the strongest identity
+                    // signal available on the session that emitted
+                    // this event:
+                    //   - `multi_source.rs` download: offline BLAKE3
+                    //     binding check (advertised pubkey matches
+                    //     advertised ember_hash). The full
+                    //     challenge-response can't safely run inline
+                    //     in that loop because the uploader's
+                    //     proactive SecIdent / EPX traffic queues
+                    //     ahead of its CHALLENGE response.
+                    //   - friend-connect dial sessions: full PoP
+                    //     via `perform_ember_auth` (signature over
+                    //     a fresh nonce). This is the path that
+                    //     fires when the user accepts a request.
+                    //
+                    // Either way, `verified` propagates to the DB
+                    // row + UI badge. Never auto-promote to
+                    // "mutual" based on it. If the sender is
+                    // already mutual, ignore; if they are in our
+                    // list but not mutual, route through the
+                    // request queue so the user sees "<nick> wants
+                    // to confirm friendship" and must explicitly
+                    // accept.
                     let db_q = db.clone();
                     let h_q = hash_hex.clone();
                     let already_mutual = tokio::task::spawn_blocking(move || {
