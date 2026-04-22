@@ -1,6 +1,6 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles, cancelSearch, parseEd2kLink, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, type SearchMethod } from '$lib/api/search';
+  import { searchFiles, cancelSearch, parseEd2kLink, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, type SearchMethod } from '$lib/api/search';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { getSettings } from '$lib/api/settings';
   import { startDownload } from '$lib/api/transfers';
@@ -1127,6 +1127,31 @@
     contextMenu = null;
   }
 
+  /** Per-row delete from download history. Complements the batch-clear
+   *  buttons in Settings > Downloads: useful when a user wants a single
+   *  completed/cancelled row to stop being badged on re-searches (e.g.
+   *  they deleted the downloaded file and want to fetch it again).
+   *
+   *  After a successful remove, drop the hash from `downloadHistoryMap`
+   *  so the row's class bindings (`history-completed-row` /
+   *  `history-cancelled-row`) and the badge text update immediately —
+   *  avoiding a page reload or a full `getDownloadHistory` re-poll.
+   */
+  async function handleRemoveFromHistory(result: SearchResult) {
+    const hash = result.file.hash;
+    try {
+      await removeDownloadHistoryEntry(hash);
+      downloadHistoryMap = Object.fromEntries(
+        Object.entries(downloadHistoryMap).filter(([k]) => k !== hash),
+      );
+      addToast('success', 'Removed from download history');
+    } catch (e) {
+      console.error('Failed to remove from history:', e);
+      addToast('error', 'Failed to remove from history');
+    }
+    contextMenu = null;
+  }
+
   function requestClearResults() {
     const tab = activeTab;
     if (!tab || tab.results.length === 0) return;
@@ -1855,6 +1880,21 @@
           <button role="menuitem" onclick={() => { downloadChecked(); closeContextMenu(); }}>Download {checkedCount} Selected</button>
         {/if}
         <button role="menuitem" onclick={() => { if (contextMenu) showFileDetails(contextMenu.result); closeContextMenu(); }}>Details</button>
+        <!--
+          Only surface "Remove from history" when the row has a known
+          history entry. Without the guard the menu item would be a no-op
+          on most rows and mislead users into thinking they'd cleared
+          something when the backend had nothing matching.
+        -->
+        {#if downloadHistoryMap[contextMenu.result.file.hash]}
+          <button
+            role="menuitem"
+            onclick={() => { if (contextMenu) handleRemoveFromHistory(contextMenu.result); }}
+            title="Forget this file's download history entry so it stops being labelled as {downloadHistoryMap[contextMenu.result.file.hash]}"
+          >
+            Remove from history ({downloadHistoryMap[contextMenu.result.file.hash]})
+          </button>
+        {/if}
       </div>
     {/if}
     {#if selectedResult}

@@ -85,18 +85,21 @@ pub struct Ed2kDownload {
     pub ed2k_limits: Ed2kDownloadLimits,
     /// Our Ember identity hash, sent in EmuleInfo for friend identification
     pub ember_hash: [u8; 16],
-    /// Our Ed25519 public key. Reserved for a future patch that wires
-    /// `OP_EMBER_HELLO` parsing + `perform_ember_auth` into the
-    /// single-source `transfer.rs` download path (currently the
-    /// multi-source path in `multi_source.rs` is the one that does the
-    /// full challenge-response). Kept on the struct so plumbing from
-    /// `network/mod.rs` is already complete when that wire-up lands.
-    #[allow(dead_code)]
+    /// Our Ed25519 public key, advertised in `OP_EMBER_HELLO` /
+    /// `OP_EMBER_HELLOANSWER` so the peer can run the
+    /// `verify_ember_hash_binding` check against us. Used on the
+    /// single-source download path to advertise an Ember-verifiable
+    /// identity symmetrically with the multi-source path — so an
+    /// `EmberFriendRequest` emitted from this code reports an honest
+    /// `verified=true` whenever the peer's own pubkey + hash bind
+    /// correctly (mirrors `multi_source.rs`'s binding-only check; the
+    /// full `perform_ember_auth` proof-of-possession still runs on
+    /// friend-connect dial-back).
     pub ed25519_public_key: [u8; 32],
-    /// Our Ed25519 secret key. Same forward-looking note as
-    /// `ed25519_public_key` above — held here so the `transfer.rs`
-    /// single-source path can eventually sign peer challenges
-    /// without another plumbing pass.
+    /// Our Ed25519 secret key. Held on the struct so any future
+    /// patch that introduces the packet-buffering
+    /// `perform_ember_auth` wrapper on the download side can sign
+    /// peer challenges without another plumbing pass.
     #[allow(dead_code)]
     pub ed25519_secret_key: [u8; 32],
     /// Our nickname for friend request messages
@@ -684,6 +687,19 @@ impl Ed2kDownload {
         let mut peer_secure_ident_level: u8 = initial_caps.secure_ident_level;
         let mut peer_is_ember = initial_caps.is_ember;
         let mut peer_ember_hash: Option<[u8; 16]> = initial_caps.ember_hash;
+        // Ember-hello-derived state. Mirrors the `multi_source.rs`
+        // binding-verification flow: we learn the peer's Ed25519
+        // public key from `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER`,
+        // run the offline `verify_ember_hash_binding` check (BLAKE3
+        // prefix vs. advertised ember_hash), and thread the result
+        // through to every `DownloadEvent::EmberFriendRequest` this
+        // session emits so the Friends UI can render a trustworthy
+        // verification badge on single-source downloads — previously
+        // those always landed with `verified=false` regardless of
+        // whether the peer carried a valid identity claim.
+        let mut peer_ember_pubkey: Option<[u8; 32]> = None;
+        let mut ember_hash_binding_verified = false;
+        let mut sent_ember_hello = false;
         let mut epx_packets_received: u8 = 0;
         let mut early_upload_accept = false;
         let mut pending_secident_challenge: Option<u32> = None;
@@ -989,32 +1005,150 @@ impl Ed2kDownload {
                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) => {
                     if let Some(eh) = peer_ember_hash {
                         let nick = std::str::from_utf8(&pl).unwrap_or("").to_string();
-                        // Single-source transfer.rs doesn't currently parse
-                        // `OP_EMBER_HELLO` (only the EmuleInfo handshake),
-                        // so `peer_caps.ember_pubkey` is never populated
-                        // on this path and we cannot perform the BLAKE3
-                        // identity-binding check here. Emit as unverified;
-                        // the request still surfaces in the UI for user
-                        // approval, and acceptance triggers
-                        // `friend_connect::open_friend_session` which does
-                        // run `perform_ember_auth` against the peer's
-                        // pubkey at that point. The multi-source loop in
-                        // `multi_source.rs` does do the binding check
-                        // because it parses `OP_EMBER_HELLO` directly.
-                        info!("Received early friend request from {} (nick='{}', single-source path: emitting unverified)", self.source_addr, nick);
+                        // `ember_hash_binding_verified` is populated by
+                        // the `OP_EMBER_HELLO(ANSWER)` arm below when
+                        // the peer advertises a pubkey that BLAKE3-binds
+                        // to their hash. If the friend request arrives
+                        // before we've seen the peer's Ember-Hello
+                        // (unusual packet ordering) we'll correctly
+                        // report unverified here. Full proof-of-possession
+                        // via `perform_ember_auth` still happens on the
+                        // friend-connect dial-back that fires when the
+                        // user accepts the request.
+                        let verified = ember_hash_binding_verified;
+                        info!(
+                            "Received early friend request from {} (nick='{}', verified={verified})",
+                            self.source_addr, nick
+                        );
                         let _ = event_tx.send(DownloadEvent::EmberFriendRequest {
                             ember_hash: eh,
                             nickname: nick,
                             peer_ip: self.source_addr.ip().to_string(),
                             peer_port: self.source_addr.port(),
-                            verified: false,
+                            verified,
                         }).await;
+                    }
+                }
+                // Authoritative Ember peer detection. A peer that emits a
+                // parseable `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER`
+                // payload is, by construction, an Ember client — vanilla
+                // eMule never sends either opcode (private 0xF8/0xF9
+                // range; `ListenSocket.cpp`'s default branch just logs
+                // "Unknown extended emule protocol opcode" and returns).
+                // When the peer beat us to it and sent `OP_EMBER_HELLO`
+                // (rather than the answer), we respond with our own
+                // `OP_EMBER_HELLOANSWER` so they learn our identity in
+                // the same round trip.
+                (OP_EMULEPROT, OP_EMBER_HELLO) | (OP_EMULEPROT, OP_EMBER_HELLOANSWER) => {
+                    if let Some(ident) = parse_ember_hello(&pl) {
+                        peer_is_ember = true;
+                        if ident.ember_hash != [0u8; 16] {
+                            peer_ember_hash = Some(ident.ember_hash);
+                        }
+                        if let Some(pk) = ident.ed25519_pubkey {
+                            peer_ember_pubkey = Some(pk);
+                        }
+                        if !ident.nickname.is_empty() {
+                            peer_name_label = ident.nickname.clone();
+                        }
+                        debug!(
+                            "Peer {} identified as Ember via OP_EMBER_HELLO (mod='{}', nick='{}')",
+                            self.source_addr, ident.mod_version, ident.nickname
+                        );
+                        if o == OP_EMBER_HELLO && !sent_ember_hello {
+                            // Advertise our pubkey so the peer can run
+                            // `verify_ember_hash_binding` on us
+                            // symmetrically. Vanilla peers ignore the
+                            // opcode, so this is safe to emit whenever
+                            // we're responding to a peer-initiated
+                            // Ember-Hello.
+                            let payload = build_ember_hello(
+                                &self.ember_hash,
+                                &self.our_nickname,
+                                Some(&self.ed25519_public_key),
+                            );
+                            let _ = write_packet_async(
+                                &mut writer,
+                                OP_EMULEPROT,
+                                OP_EMBER_HELLOANSWER,
+                                &payload,
+                            )
+                            .await;
+                            sent_ember_hello = true;
+                        }
+
+                        // Offline identity-binding check.
+                        //
+                        // We deliberately do NOT run inline
+                        // `perform_ember_auth` here — mirroring the
+                        // rationale in `multi_source.rs`: the uploader
+                        // emits proactive packets (notably
+                        // `OP_SECIDENTSTATE` via
+                        // `maybe_send_secident_challenge`, plus optional
+                        // EPX) immediately after its own OP_EMBER_HELLO
+                        // and before its main dispatch loop sees our
+                        // CHALLENGE. A synchronous `perform_ember_auth`
+                        // read would consume + drop those packets and
+                        // break SecIdent credit accounting on every
+                        // download. Binding-only is still sufficient to
+                        // reject hash-only spoofers; full PoP runs on
+                        // friend-connect dial-back at user-accept time.
+                        if !ember_hash_binding_verified {
+                            if let (Some(ref pk), Some(ref eh)) =
+                                (peer_ember_pubkey, peer_ember_hash)
+                            {
+                                if crate::network::ember::crypto::verify_ember_hash_binding(pk, eh)
+                                {
+                                    ember_hash_binding_verified = true;
+                                    info!(
+                                        "Ember binding: peer {} pubkey BLAKE3-binds to advertised hash",
+                                        self.source_addr
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "Ember binding: peer {} advertised pubkey does not BLAKE3-bind to ember_hash={} (possible spoof)",
+                                        self.source_addr,
+                                        hex::encode(eh)
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {
                     deferred_packet = Some((p, o, pl));
                     break;
                 }
+            }
+        }
+
+        // Send our `OP_EMBER_HELLO` unconditionally so any real Ember
+        // peer can BLAKE3-bind our advertised identity — mirrors the
+        // unconditional send in `multi_source.rs`. Vanilla eMule peers
+        // silently ignore the unknown opcode (`ListenSocket.cpp`'s
+        // ProcessExtPacket default branch just logs + returns), so
+        // this is invisible to non-Ember clients and keeps our public
+        // handshake byte-identical to vanilla eMule (important for
+        // anti-leecher queue-ban avoidance).
+        //
+        // Skipped if the peer beat us to it during the pre-control
+        // loop above (we replied with HELLOANSWER there and set
+        // `sent_ember_hello = true`). Otherwise the peer's
+        // HELLOANSWER will land in the file-status-wait loop below
+        // and set `peer_is_ember = true`, populate
+        // `peer_ember_pubkey`, and flip `ember_hash_binding_verified`
+        // when the BLAKE3 check passes.
+        if !sent_ember_hello {
+            let payload = build_ember_hello(
+                &self.ember_hash,
+                &self.our_nickname,
+                Some(&self.ed25519_public_key),
+            );
+            if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload)
+                .await
+                .is_ok()
+            {
+                sent_ember_hello = true;
             }
         }
 
@@ -1334,17 +1468,75 @@ impl Ed2kDownload {
                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if peer_is_ember => {
                     if let Some(eh) = peer_ember_hash {
                         let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
-                        // See the early-handshake branch above: single-source
-                        // transfer.rs cannot verify identity at emit time.
-                        // Emit unverified; `friend_connect` covers the full
-                        // proof-of-possession check on user accept.
+                        // Reuse the session-scoped binding flag set by
+                        // the `OP_EMBER_HELLO(ANSWER)` arm below (or
+                        // already set in the pre-control loop).
+                        let verified = ember_hash_binding_verified;
                         let _ = event_tx.send(DownloadEvent::EmberFriendRequest {
                             ember_hash: eh,
                             nickname: nick,
                             peer_ip: self.source_addr.ip().to_string(),
                             peer_port: self.source_addr.port(),
-                            verified: false,
+                            verified,
                         }).await;
+                    }
+                }
+                // Peer may delay their `OP_EMBER_HELLOANSWER` past the
+                // pre-control loop — in which case it lands here.
+                // Same handling: update identity, run the offline
+                // binding check, echo our HELLOANSWER if they sent
+                // a HELLO rather than an answer.
+                (OP_EMULEPROT, OP_EMBER_HELLO) | (OP_EMULEPROT, OP_EMBER_HELLOANSWER) => {
+                    if let Some(ident) = parse_ember_hello(&payload) {
+                        peer_is_ember = true;
+                        if ident.ember_hash != [0u8; 16] {
+                            peer_ember_hash = Some(ident.ember_hash);
+                        }
+                        if let Some(pk) = ident.ed25519_pubkey {
+                            peer_ember_pubkey = Some(pk);
+                        }
+                        if !ident.nickname.is_empty() {
+                            peer_name_label = ident.nickname.clone();
+                        }
+                        debug!(
+                            "Peer {} identified as Ember via OP_EMBER_HELLO during file-status-wait (mod='{}', nick='{}')",
+                            self.source_addr, ident.mod_version, ident.nickname
+                        );
+                        if opcode == OP_EMBER_HELLO && !sent_ember_hello {
+                            let payload = build_ember_hello(
+                                &self.ember_hash,
+                                &self.our_nickname,
+                                Some(&self.ed25519_public_key),
+                            );
+                            let _ = write_packet_async(
+                                &mut writer,
+                                OP_EMULEPROT,
+                                OP_EMBER_HELLOANSWER,
+                                &payload,
+                            )
+                            .await;
+                            sent_ember_hello = true;
+                        }
+                        if !ember_hash_binding_verified {
+                            if let (Some(ref pk), Some(ref eh)) =
+                                (peer_ember_pubkey, peer_ember_hash)
+                            {
+                                if crate::network::ember::crypto::verify_ember_hash_binding(pk, eh)
+                                {
+                                    ember_hash_binding_verified = true;
+                                    info!(
+                                        "Ember binding: peer {} pubkey BLAKE3-binds (file-status-wait)",
+                                        self.source_addr
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "Ember binding: peer {} advertised pubkey does not BLAKE3-bind to ember_hash={} (file-status-wait, possible spoof)",
+                                        self.source_addr,
+                                        hex::encode(eh)
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && payload.len() <= 4096 => {
@@ -2301,16 +2493,72 @@ impl Ed2kDownload {
                         (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if peer_is_ember => {
                             if let Some(eh) = peer_ember_hash {
                                 let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
-                                // See earlier branches: transfer.rs emits
-                                // unverified; the authoritative check runs
-                                // later in `friend_connect`.
+                                // Reuse the session-scoped binding flag.
+                                // By the time we're in the download loop
+                                // the peer's Ember-Hello has usually already
+                                // arrived (either in the pre-control loop
+                                // or in file-status-wait), so `verified`
+                                // will be `true` for any peer whose pubkey
+                                // BLAKE3-binds to their advertised hash.
+                                let verified = ember_hash_binding_verified;
                                 let _ = event_tx.send(DownloadEvent::EmberFriendRequest {
                                     ember_hash: eh,
                                     nickname: nick,
                                     peer_ip: self.source_addr.ip().to_string(),
                                     peer_port: self.source_addr.port(),
-                                    verified: false,
+                                    verified,
                                 }).await;
+                            }
+                        }
+                        // Late Ember-Hello during the data loop. Some
+                        // peers defer OP_EMBER_HELLOANSWER well past
+                        // the handshake / file-status phases (e.g. Ember
+                        // clients that wait for the first data exchange
+                        // before publishing their identity). Handling
+                        // it here keeps the binding flag accurate for
+                        // any post-data friend requests.
+                        (OP_EMULEPROT, OP_EMBER_HELLO) | (OP_EMULEPROT, OP_EMBER_HELLOANSWER) => {
+                            if let Some(ident) = parse_ember_hello(&payload) {
+                                peer_is_ember = true;
+                                if ident.ember_hash != [0u8; 16] {
+                                    peer_ember_hash = Some(ident.ember_hash);
+                                }
+                                if let Some(pk) = ident.ed25519_pubkey {
+                                    peer_ember_pubkey = Some(pk);
+                                }
+                                if opcode == OP_EMBER_HELLO && !sent_ember_hello {
+                                    let payload = build_ember_hello(
+                                        &self.ember_hash,
+                                        &self.our_nickname,
+                                        Some(&self.ed25519_public_key),
+                                    );
+                                    let _ = write_packet_async(
+                                        &mut writer,
+                                        OP_EMULEPROT,
+                                        OP_EMBER_HELLOANSWER,
+                                        &payload,
+                                    )
+                                    .await;
+                                    sent_ember_hello = true;
+                                }
+                                if !ember_hash_binding_verified {
+                                    if let (Some(ref pk), Some(ref eh)) =
+                                        (peer_ember_pubkey, peer_ember_hash)
+                                    {
+                                        if crate::network::ember::crypto::verify_ember_hash_binding(pk, eh) {
+                                            ember_hash_binding_verified = true;
+                                            info!(
+                                                "Ember binding: peer {} pubkey BLAKE3-binds (data loop)",
+                                                self.source_addr
+                                            );
+                                        } else {
+                                            tracing::warn!(
+                                                "Ember binding: peer {} advertised pubkey does not BLAKE3-bind (data loop, possible spoof)",
+                                                self.source_addr
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                         (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && payload.len() <= 4096 => {

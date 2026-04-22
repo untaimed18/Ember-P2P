@@ -44,6 +44,23 @@ export async function downloadAndLoadIpfilter(): Promise<string> {
   return invoke('download_and_load_ipfilter');
 }
 
+/**
+ * Download and load an ipfilter from a user-supplied URL.
+ *
+ * Complements `downloadAndLoadIpfilter` (fixed default URL) and
+ * `importIpfilterFile` (local path). Used for corporate / alternate
+ * ipfilter distributions that aren't covered by the bundled default.
+ * The backend validates the URL (DNS resolved, public-IP only, host
+ * pinned), caps the response at 50 MiB, auto-extracts zip archives,
+ * atomically writes to `ipfilter.dat`, and re-enables the filter.
+ *
+ * Returns a human-readable success summary; throws with a concrete
+ * error message on failure so the UI can surface it verbatim.
+ */
+export async function updateIpfilterFromUrl(url: string): Promise<string> {
+  return invoke('update_ipfilter_from_url', { url });
+}
+
 export async function importIpfilterFile(filePath: string): Promise<string> {
   return invoke('import_ipfilter_file', { filePath });
 }

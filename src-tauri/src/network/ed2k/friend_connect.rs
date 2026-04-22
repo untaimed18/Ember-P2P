@@ -670,22 +670,29 @@ const AUTH_PACKET_TIMEOUT_SECS: u64 = 10;
 /// `expected_payload_len`), skipping a bounded number of unrelated
 /// packets first.
 ///
+/// `on_deferred` is invoked for each intervening non-AUTH packet so
+/// callers that care about those packets (e.g. the multi-source
+/// download loop, which must process `OP_SECIDENTSTATE` to keep
+/// SecIdent credit accounting correct) can capture them for later
+/// replay. Pass a no-op callback (`|_, _, _| {}`) to restore the
+/// original drop-on-the-floor behaviour used by friend-connect,
+/// which doesn't process SecIdent itself.
+///
 /// Returns the matched packet's payload. Errors if we hit the
 /// per-packet read timeout, hit `AUTH_PACKET_MAX_SKIPS` non-matching
 /// packets, or read a stream error.
-///
-/// The skipping behaviour exists specifically to handle interleaved
-/// `OP_SECIDENTSTATE` (and similar proactive packets) that
-/// `upload.rs` emits before its main dispatch loop. Friend-connect
-/// can safely drop those: it doesn't process SecIdent or other
-/// non-friend opcodes during the auth window.
-async fn read_specific_auth_packet<R: AsyncReadExt + Unpin + ?Sized>(
+async fn read_specific_auth_packet<R, D>(
     reader: &mut R,
     expected_opcode: u8,
     expected_payload_len: usize,
     addr: SocketAddr,
     label: &'static str,
-) -> anyhow::Result<Vec<u8>> {
+    mut on_deferred: D,
+) -> anyhow::Result<Vec<u8>>
+where
+    R: AsyncReadExt + Unpin + ?Sized,
+    D: FnMut(u8, u8, Vec<u8>),
+{
     for _ in 0..=AUTH_PACKET_MAX_SKIPS {
         let (proto, opcode, payload) = read_packet_with_timeout(reader, AUTH_PACKET_TIMEOUT_SECS)
             .await
@@ -701,8 +708,9 @@ async fn read_specific_auth_packet<R: AsyncReadExt + Unpin + ?Sized>(
             return Ok(payload);
         }
         debug!(
-            "Ember auth: dropped intervening proto=0x{proto:02X} op=0x{opcode:02X} from {addr} while awaiting {label}"
+            "Ember auth: deferring intervening proto=0x{proto:02X} op=0x{opcode:02X} from {addr} while awaiting {label}"
         );
+        on_deferred(proto, opcode, payload);
     }
     anyhow::bail!(
         "Ember auth: never received {label} from {addr} after {AUTH_PACKET_MAX_SKIPS} unrelated packets"
@@ -786,13 +794,15 @@ where
     // the first one that's actually our CHALLENGE; non-matching
     // packets are logged and dropped (acceptable here because
     // friend-connect is short-lived and doesn't process SecIdent
-    // or other peer-initiated opcodes itself).
+    // or other peer-initiated opcodes itself — multi_source uses
+    // `perform_ember_auth_buffered` instead).
     let peer_nonce_payload = read_specific_auth_packet(
         reader,
         OP_EMBER_AUTH_CHALLENGE,
         32,
         addr,
         "AUTH_CHALLENGE",
+        |_, _, _| {},
     )
     .await?;
 
@@ -813,6 +823,7 @@ where
         96,
         addr,
         "AUTH_RESPONSE",
+        |_, _, _| {},
     )
     .await?;
 
@@ -829,5 +840,103 @@ where
         .map_err(|e| anyhow::anyhow!("Ember auth: signature verification failed for {addr}: {e}"))?;
 
     info!("Ember auth: verified peer {} at {}", hex::encode(&peer_pubkey[..8]), addr);
+    Ok(())
+}
+
+/// Buffered variant of [`perform_ember_auth`] for callers that cannot
+/// safely drop intervening non-AUTH packets.
+///
+/// Identical to `perform_ember_auth` except that any packet read off
+/// the stream while waiting for `OP_EMBER_AUTH_CHALLENGE` /
+/// `OP_EMBER_AUTH_RESPONSE` is appended to `deferred_packets` so the
+/// caller can re-dispatch it through its main loop. This is what
+/// unblocks the multi-source download path: the uploader sends
+/// `OP_SECIDENTSTATE` (and sometimes EPX) in the same packet burst as
+/// its OP_EMBER_HELLO, and dropping those frames would break
+/// SecIdent credit accounting and silently lose source-exchange
+/// data for every Ember-to-Ember download.
+///
+/// On success (or cryptographic failure), `deferred_packets` holds the
+/// full sequence of non-AUTH frames observed during the auth round
+/// trip, in arrival order. On a timeout / read error the partial
+/// buffer is preserved so the caller can still drain it.
+pub(crate) async fn perform_ember_auth_buffered<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    our_pubkey: &[u8; 32],
+    our_secret_key: &[u8; 32],
+    peer_pubkey: &[u8; 32],
+    peer_ember_hash: Option<&[u8; 16]>,
+    addr: SocketAddr,
+    deferred_packets: &mut std::collections::VecDeque<(u8, u8, Vec<u8>)>,
+) -> anyhow::Result<()>
+where
+    R: AsyncReadExt + Unpin + ?Sized,
+    W: AsyncWriteExt + Unpin + ?Sized,
+{
+    // Same pubkey ↔ ember_hash check as the non-buffered path.
+    if let Some(expected_hash) = peer_ember_hash {
+        let peer_vk = VerifyingKey::from_bytes(peer_pubkey)
+            .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
+        let derived_hash = crypto::node_id_from_public_key(&peer_vk);
+        if derived_hash != *expected_hash {
+            anyhow::bail!(
+                "Ember auth: peer pubkey does not match ember_hash (derived={}, advertised={})",
+                hex::encode(derived_hash),
+                hex::encode(expected_hash)
+            );
+        }
+    }
+
+    let mut our_nonce = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut our_nonce);
+    write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE, &our_nonce).await?;
+
+    let peer_nonce_payload = read_specific_auth_packet(
+        reader,
+        OP_EMBER_AUTH_CHALLENGE,
+        32,
+        addr,
+        "AUTH_CHALLENGE",
+        |p, o, pl| deferred_packets.push_back((p, o, pl)),
+    )
+    .await?;
+
+    let signing_key = SigningKey::from_bytes(our_secret_key);
+    let signature = signing_key.sign(&peer_nonce_payload);
+    let mut response = Vec::with_capacity(96);
+    response.extend_from_slice(our_pubkey);
+    response.extend_from_slice(&signature.to_bytes());
+    write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE, &response).await?;
+
+    let peer_response = read_specific_auth_packet(
+        reader,
+        OP_EMBER_AUTH_RESPONSE,
+        96,
+        addr,
+        "AUTH_RESPONSE",
+        |p, o, pl| deferred_packets.push_back((p, o, pl)),
+    )
+    .await?;
+
+    let resp_pubkey: [u8; 32] = peer_response[..32].try_into().unwrap();
+    if resp_pubkey != *peer_pubkey {
+        anyhow::bail!("Ember auth: response pubkey doesn't match advertised pubkey from {addr}");
+    }
+
+    let peer_vk = VerifyingKey::from_bytes(peer_pubkey)
+        .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
+    let sig_bytes: [u8; 64] = peer_response[32..96].try_into().unwrap();
+    let peer_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    peer_vk
+        .verify(&our_nonce, &peer_sig)
+        .map_err(|e| anyhow::anyhow!("Ember auth: signature verification failed for {addr}: {e}"))?;
+
+    info!(
+        "Ember auth (buffered): verified peer {} at {} ({} deferred packet(s) captured)",
+        hex::encode(&peer_pubkey[..8]),
+        addr,
+        deferred_packets.len(),
+    );
     Ok(())
 }
