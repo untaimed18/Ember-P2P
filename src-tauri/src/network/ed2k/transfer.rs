@@ -85,6 +85,20 @@ pub struct Ed2kDownload {
     pub ed2k_limits: Ed2kDownloadLimits,
     /// Our Ember identity hash, sent in EmuleInfo for friend identification
     pub ember_hash: [u8; 16],
+    /// Our Ed25519 public key. Reserved for a future patch that wires
+    /// `OP_EMBER_HELLO` parsing + `perform_ember_auth` into the
+    /// single-source `transfer.rs` download path (currently the
+    /// multi-source path in `multi_source.rs` is the one that does the
+    /// full challenge-response). Kept on the struct so plumbing from
+    /// `network/mod.rs` is already complete when that wire-up lands.
+    #[allow(dead_code)]
+    pub ed25519_public_key: [u8; 32],
+    /// Our Ed25519 secret key. Same forward-looking note as
+    /// `ed25519_public_key` above — held here so the `transfer.rs`
+    /// single-source path can eventually sign peer challenges
+    /// without another plumbing pass.
+    #[allow(dead_code)]
+    pub ed25519_secret_key: [u8; 32],
     /// Our nickname for friend request messages
     pub our_nickname: String,
     /// Live friend user-hash set for detecting friend connections
@@ -184,11 +198,24 @@ pub enum DownloadEvent {
         tcp_port: u16,
     },
     /// Incoming friend request from an Ember peer.
+    ///
+    /// `verified` reflects the strongest identity claim that could be
+    /// established by the time the request was emitted:
+    ///   - `true` iff the peer advertised an Ed25519 public key whose
+    ///     BLAKE3 prefix matches their advertised `ember_hash` (the
+    ///     cheap offline identity-binding check in
+    ///     `crate::network::ember::crypto::verify_ember_hash_binding`).
+    ///     On paths that run `friend_connect::perform_ember_auth` this
+    ///     additionally implies signature-based proof of possession.
+    ///   - `false` when no public key was advertised, or the key was
+    ///     present but the binding check failed (mismatches are dropped
+    ///     before reaching this event in the emit paths).
     EmberFriendRequest {
         ember_hash: [u8; 16],
         nickname: String,
         peer_ip: String,
         peer_port: u16,
+        verified: bool,
     },
     /// An Ember friend was seen on a download connection (EmuleInfo exchange completed).
     FriendSeen {
@@ -962,12 +989,25 @@ impl Ed2kDownload {
                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) => {
                     if let Some(eh) = peer_ember_hash {
                         let nick = std::str::from_utf8(&pl).unwrap_or("").to_string();
-                        info!("Received early friend request from {} (nick='{}')", self.source_addr, nick);
+                        // Single-source transfer.rs doesn't currently parse
+                        // `OP_EMBER_HELLO` (only the EmuleInfo handshake),
+                        // so `peer_caps.ember_pubkey` is never populated
+                        // on this path and we cannot perform the BLAKE3
+                        // identity-binding check here. Emit as unverified;
+                        // the request still surfaces in the UI for user
+                        // approval, and acceptance triggers
+                        // `friend_connect::open_friend_session` which does
+                        // run `perform_ember_auth` against the peer's
+                        // pubkey at that point. The multi-source loop in
+                        // `multi_source.rs` does do the binding check
+                        // because it parses `OP_EMBER_HELLO` directly.
+                        info!("Received early friend request from {} (nick='{}', single-source path: emitting unverified)", self.source_addr, nick);
                         let _ = event_tx.send(DownloadEvent::EmberFriendRequest {
                             ember_hash: eh,
                             nickname: nick,
                             peer_ip: self.source_addr.ip().to_string(),
                             peer_port: self.source_addr.port(),
+                            verified: false,
                         }).await;
                     }
                 }
@@ -1294,11 +1334,16 @@ impl Ed2kDownload {
                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if peer_is_ember => {
                     if let Some(eh) = peer_ember_hash {
                         let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
+                        // See the early-handshake branch above: single-source
+                        // transfer.rs cannot verify identity at emit time.
+                        // Emit unverified; `friend_connect` covers the full
+                        // proof-of-possession check on user accept.
                         let _ = event_tx.send(DownloadEvent::EmberFriendRequest {
                             ember_hash: eh,
                             nickname: nick,
                             peer_ip: self.source_addr.ip().to_string(),
                             peer_port: self.source_addr.port(),
+                            verified: false,
                         }).await;
                     }
                 }
@@ -2256,11 +2301,15 @@ impl Ed2kDownload {
                         (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if peer_is_ember => {
                             if let Some(eh) = peer_ember_hash {
                                 let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
+                                // See earlier branches: transfer.rs emits
+                                // unverified; the authoritative check runs
+                                // later in `friend_connect`.
                                 let _ = event_tx.send(DownloadEvent::EmberFriendRequest {
                                     ember_hash: eh,
                                     nickname: nick,
                                     peer_ip: self.source_addr.ip().to_string(),
                                     peer_port: self.source_addr.port(),
+                                    verified: false,
                                 }).await;
                             }
                         }

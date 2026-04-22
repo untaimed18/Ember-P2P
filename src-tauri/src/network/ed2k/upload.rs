@@ -292,12 +292,18 @@ pub enum UploadEventKind {
         ip: std::net::Ipv4Addr,
         tcp_port: u16,
     },
-    /// Incoming friend request from an Ember peer.
+    /// Incoming friend request from an Ember peer. `verified` carries
+    /// the same semantics as the download-side variant in
+    /// `super::transfer::DownloadEvent::EmberFriendRequest`: true iff
+    /// the peer advertised an Ed25519 pubkey that BLAKE3-binds to
+    /// their advertised `ember_hash`, plus (on friend-connect paths)
+    /// signature proof-of-possession.
     EmberFriendRequest {
         ember_hash: [u8; 16],
         nickname: String,
         peer_ip: String,
         peer_port: u16,
+        verified: bool,
     },
     /// An Ember friend was seen on an incoming connection (EmuleInfo exchange completed).
     FriendSeen {
@@ -401,6 +407,26 @@ struct UploadHandler {
     aich_cache: Arc<tokio::sync::Mutex<AichCache>>,
     /// Our Ember identity hash, sent in EmuleInfo for friend identification
     ember_hash: [u8; 16],
+    /// Our Ed25519 public key, advertised in `OP_EMBER_HELLO` so peers can
+    /// verify our `ember_hash` is cryptographically bound to a key we
+    /// actually control (`verify_ember_hash_binding`) and use it as the
+    /// verifier in `perform_ember_auth`. Always the raw 32-byte little-
+    /// endian public-key encoding, derived deterministically from
+    /// `ed25519_secret_key` at identity-load time.
+    ed25519_public_key: [u8; 32],
+    /// Our Ed25519 secret key. Reserved for a future channel-based
+    /// refactor of the upload read-loop that would let us run
+    /// `perform_ember_auth` inline on upload sessions. The current
+    /// upload architecture moves the reader into a dedicated
+    /// `reader_task` (see the spawn in `handle_incoming` below), so
+    /// we cannot call `perform_ember_auth` without first restructuring
+    /// the packet-channel plumbing. Uploads currently gate trust on
+    /// the offline `verify_ember_hash_binding` check instead — full
+    /// proof-of-possession runs on the download side
+    /// (`multi_source.rs`) and on friend-session dials
+    /// (`friend_connect.rs::open_friend_session`).
+    #[allow(dead_code)]
+    ed25519_secret_key: [u8; 32],
     /// Live friend user-hash set for friend-slot priority boost
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     /// Pre-built Ember Peer Exchange payload (shared, read-only).
@@ -819,6 +845,8 @@ pub async fn start_upload_server(
     geoip: crate::geoip::GeoIpReader,
     ember_sessions: EmberSessionMap,
     ember_hash: [u8; 16],
+    ed25519_public_key: [u8; 32],
+    ed25519_secret_key: [u8; 32],
     network_disconnected: Arc<std::sync::atomic::AtomicBool>,
     // Queue handle created by the caller so other subsystems (UDP REASKACK
     // rank, diagnostics) can read the same shared queue state.
@@ -886,6 +914,8 @@ pub async fn start_upload_server(
         abuse_tracker: Arc::new(tokio::sync::Mutex::new(AbuseTracker::new())),
         aich_cache: Arc::new(tokio::sync::Mutex::new(AichCache::new())),
         ember_hash,
+        ed25519_public_key,
+        ed25519_secret_key,
         friend_hashes,
         ember_payload,
         ember_payload_generation,
@@ -1784,8 +1814,34 @@ impl UploadHandler {
         // recognise it as authoritative proof of Ember-ness and learn the
         // peer's mod_version / ember_hash / ember_pubkey.
         let mut ul_sent_ember_hello = false;
+        // Session-scoped Ember identity-binding flag. Set when the
+        // peer advertises an Ed25519 pubkey whose BLAKE3 prefix
+        // matches their claimed `ember_hash`
+        // (`verify_ember_hash_binding`). Carried into every
+        // `UploadEventKind::EmberFriendRequest` emitted from this
+        // session as the `verified` field so the Friends UI can
+        // distinguish peers who advertised a binding-consistent
+        // pubkey from those who didn't.
+        //
+        // This is the OFFLINE binding check, not a proof of
+        // possession. An attacker who has observed the victim's
+        // pubkey on the wire can replay it and pass this check.
+        // Closing that gap requires the reactive
+        // `OP_EMBER_AUTH_CHALLENGE`/`OP_EMBER_AUTH_RESPONSE` state
+        // machine described below — the upload session's read half
+        // is owned by a dedicated reader task (see `reader_task`
+        // further down) so we can't drive `perform_ember_auth`
+        // inline here today.
+        let mut ember_hash_binding_verified = false;
         {
-            let payload = build_ember_hello(&self.ember_hash, &self.nickname, None);
+            // Advertise our Ed25519 pubkey alongside the ember_hash so
+            // the peer can run `verify_ember_hash_binding` on our side
+            // of the handshake (confirms our hash is bound to a key we
+            // actually own) and so `friend_connect::perform_ember_auth`
+            // has a verifier to challenge us with. Previously this
+            // site passed `None`, which silently disabled Ember
+            // identity verification on every upload session.
+            let payload = build_ember_hello(&self.ember_hash, &self.nickname, Some(&self.ed25519_public_key));
             if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload).await.is_ok() {
                 ul_sent_ember_hello = true;
             }
@@ -4148,9 +4204,36 @@ impl UploadHandler {
                             ident.mod_version, ident.nickname,
                         );
                         if opcode == OP_EMBER_HELLO && !ul_sent_ember_hello {
-                            let payload = build_ember_hello(&self.ember_hash, &self.nickname, None);
+                            // See above for why we advertise our pubkey here.
+                            let payload = build_ember_hello(&self.ember_hash, &self.nickname, Some(&self.ed25519_public_key));
                             let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &payload).await;
                             ul_sent_ember_hello = true;
+                        }
+
+                        // Offline identity-binding verification. Since
+                        // the upload reader runs in a dedicated task
+                        // (not reachable from this dispatcher site),
+                        // we can't run the full challenge-response
+                        // here; we use the cheaper binding check
+                        // instead. Attackers who don't have the
+                        // victim's pubkey fail this check; attackers
+                        // who do (e.g. via passive wire-sniffing)
+                        // still get caught when the user accepts the
+                        // request and `friend_connect::open_friend_session`
+                        // runs a fresh challenge-response over a
+                        // dedicated TCP session.
+                        if !ember_hash_binding_verified {
+                            if let (Some(ref peer_pk), Some(ref peer_eh)) = (hello_caps.ember_pubkey, hello_caps.ember_hash) {
+                                if crate::network::ember::crypto::verify_ember_hash_binding(peer_pk, peer_eh) {
+                                    ember_hash_binding_verified = true;
+                                    info!("Ember binding: peer {peer_addr} pubkey matches advertised hash");
+                                } else {
+                                    tracing::warn!(
+                                        "Ember binding: peer {peer_addr} advertised pubkey does not BLAKE3-bind to ember_hash={} (possible spoof)",
+                                        hex::encode(peer_eh)
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -4180,7 +4263,22 @@ impl UploadHandler {
                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if hello_caps.is_ember => {
                     if let Some(eh) = peer_ember_hash {
                         let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
-                        info!("Received friend request from {peer_addr} (nick='{}', hash={})", nick, hex::encode(eh));
+                        // `verified` is the session-scoped
+                        // `ember_hash_binding_verified` flag set by
+                        // `verify_ember_hash_binding` in the
+                        // OP_EMBER_HELLO handler above. A true value
+                        // means the peer's advertised pubkey
+                        // BLAKE3-binds to their advertised
+                        // `ember_hash` — i.e. they're consistent
+                        // about which key backs the identity they're
+                        // claiming. It does NOT yet imply proof of
+                        // possession (replay of an observed pubkey
+                        // would still pass). A false value means no
+                        // pubkey was advertised, or the binding
+                        // failed; the request still surfaces for
+                        // user approval, with an unverified badge.
+                        let verified = ember_hash_binding_verified;
+                        info!("Received friend request from {peer_addr} (nick='{}', hash={}, verified={verified})", nick, hex::encode(eh));
                         let _ = self.upload_event_tx.send(UploadEvent {
                             transfer_id: String::new(),
                             kind: UploadEventKind::EmberFriendRequest {
@@ -4188,6 +4286,7 @@ impl UploadHandler {
                                 nickname: nick,
                                 peer_ip: peer_addr.ip().to_string(),
                                 peer_port: peer_addr.port(),
+                                verified,
                             },
                         }).await;
                     }

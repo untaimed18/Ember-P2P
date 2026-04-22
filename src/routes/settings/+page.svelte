@@ -1176,7 +1176,7 @@
           <div class="field toggle-row">
             <div class="toggle-info">
               <span class="toggle-title">Require Approval for Friend Requests</span>
-              <span class="hint">Always show incoming friend requests on the Friends page for explicit accept. When off, requests from peers you already added as a friend auto-confirm. Recommended on because the peer-supplied Ember Hash cannot yet be cryptographically verified.</span>
+              <span class="hint">Always show incoming friend requests on the Friends page for explicit accept. When off, requests from peers you already added as a friend auto-confirm. Requests now carry a Verified badge when the peer advertises an Ed25519 key that BLAKE3-binds to their Ember hash — an identity-consistency check that defeats simple hash-only spoofing. Recommended on, since the binding check alone does not yet prove the peer holds the corresponding private key.</span>
             </div>
             <ToggleSwitch bind:checked={settings.friend_require_approval} ariaLabel="Require Approval for Friend Requests" />
           </div>

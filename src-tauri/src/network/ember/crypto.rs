@@ -12,6 +12,33 @@ pub fn node_id_from_public_key(public_key: &VerifyingKey) -> [u8; 16] {
     id
 }
 
+/// Verify the identity-binding claim `BLAKE3(pubkey)[0..16] == advertised_hash`.
+///
+/// This is the cheap, offline half of full Ember identity verification: it
+/// confirms that the peer is consistent about which Ed25519 key they claim
+/// backs their 16-byte Ember hash, without requiring an interactive
+/// challenge-response round trip. A peer that advertises a `pubkey` whose
+/// BLAKE3 prefix doesn't match their `ember_hash` is lying about one of the
+/// two; treat them as unverified.
+///
+/// Returns `false` if `pubkey` cannot be parsed as a valid Ed25519 point
+/// (bad encoding / subgroup) — we refuse to bind an identity to a
+/// non-curve-valid key under any circumstances.
+///
+/// This check is NOT a proof of private-key possession. Anyone who has
+/// observed a peer's legitimate public key on the wire can replay it with
+/// a matching hash. The full anti-replay gate is
+/// `friend_connect::perform_ember_auth`, which runs an Ed25519 signature
+/// round-trip over a fresh nonce. Use this binding check as an always-on
+/// pre-filter and the challenge-response as the authoritative gate
+/// whenever you're granting friend-level trust.
+pub fn verify_ember_hash_binding(pubkey: &[u8; 32], advertised_hash: &[u8; 16]) -> bool {
+    match VerifyingKey::from_bytes(pubkey) {
+        Ok(vk) => node_id_from_public_key(&vk) == *advertised_hash,
+        Err(_) => false,
+    }
+}
+
 /// Sign an arbitrary message with an Ed25519 signing key.
 #[allow(dead_code)]
 pub fn sign(signing_key: &SigningKey, message: &[u8]) -> [u8; 64] {
@@ -116,6 +143,45 @@ mod tests {
         let msg = b"test message";
         let sig = sign(&sk1, msg);
         assert!(!verify(&sk2.verifying_key(), msg, &sig));
+    }
+
+    #[test]
+    fn binding_matches_deterministic_derivation() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = sk.verifying_key();
+        let pk_bytes = pk.to_bytes();
+        let hash = node_id_from_public_key(&pk);
+        assert!(verify_ember_hash_binding(&pk_bytes, &hash));
+    }
+
+    #[test]
+    fn binding_rejects_wrong_hash() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk_bytes = sk.verifying_key().to_bytes();
+        let bogus_hash = [0xABu8; 16];
+        assert!(!verify_ember_hash_binding(&pk_bytes, &bogus_hash));
+    }
+
+    #[test]
+    fn binding_rejects_mismatched_key() {
+        let sk1 = SigningKey::generate(&mut OsRng);
+        let sk2 = SigningKey::generate(&mut OsRng);
+        let hash1 = node_id_from_public_key(&sk1.verifying_key());
+        let pk2_bytes = sk2.verifying_key().to_bytes();
+        // Same 128-bit space; chance of collision between two freshly
+        // generated keys is negligible — this asserts the function
+        // correctly separates distinct identities rather than falling
+        // into a silent accept.
+        assert!(!verify_ember_hash_binding(&pk2_bytes, &hash1));
+    }
+
+    #[test]
+    fn binding_rejects_invalid_pubkey_bytes() {
+        // A 32-byte buffer that's not a valid Ed25519 point encoding —
+        // `from_bytes` must reject it, and we must refuse to bind.
+        let bad_key = [0xFFu8; 32];
+        let some_hash = [0x00u8; 16];
+        assert!(!verify_ember_hash_binding(&bad_key, &some_hash));
     }
 
     #[test]

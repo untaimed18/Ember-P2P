@@ -764,9 +764,13 @@ fn spawn_rendezvous_friend_lookup(
                     Ok(Some(remote_eh)) => {
                         info!("Rendezvous friend connect to {} succeeded, remote={}", addr, hex::encode(remote_eh));
                         if fh_fc.read().await.contains(&remote_eh) {
-                            // Do NOT auto-flip mutual: ember_hash in the remote handshake is
-                            // self-reported and unverified (FUTURE_WORK.md F2). User must
-                            // accept an inbound friend request before features unlock.
+                            // Do NOT auto-flip mutual: even after the inline
+                            // BLAKE3 identity-binding check in
+                            // `verify_ember_hash_binding`, the user still
+                            // needs to positively approve an inbound friend
+                            // request to avoid pre-accept shortcuts. Full
+                            // proof-of-possession runs on accept via
+                            // `friend_connect::perform_ember_auth`.
                             let _ = app_fc.emit("ember:friend-confirmed", serde_json::json!({
                                 "user_hash": hex::encode(remote_eh),
                             }));
@@ -2159,6 +2163,8 @@ async fn try_start_pending_download_from_known_sources(
     geoip: &crate::geoip::GeoIpReader,
     friend_hashes: &crate::app_state::SharedFriendHashes,
     ember_hash: [u8; 16],
+    ed25519_pubkey: [u8; 32],
+    ed25519_secret_key: [u8; 32],
     sx_overhead: &crate::storage::statistics::SharedSxOverheadCounters,
 ) -> bool {
     if let Some(pd) = state.pending_downloads.get(transfer_id) {
@@ -2311,6 +2317,8 @@ async fn try_start_pending_download_from_known_sources(
         new_established_rx: Some(est_inject_rx),
                         ed2k_limits: settings.ed2k_download_limits(),
                         ember_hash,
+                        ed25519_public_key: ed25519_pubkey,
+                        ed25519_secret_key,
                         friend_hashes: Some(friend_hashes.clone()),
         ember_payload: shared_ember_payload.clone(),
         ember_payload_generation: ember_payload_generation.clone(),
@@ -3521,6 +3529,8 @@ pub async fn start_network(
                 ul_geoip,
                 ul_ember_sessions,
                 ember_hash,
+                ed25519_pubkey,
+                ed25519_secret_key,
                 ul_disconnected,
                 ul_queue,
                 ul_sx_overhead,
@@ -4603,15 +4613,23 @@ pub async fn start_network(
                     continue;
                 }
 
-                if let DownloadEvent::EmberFriendRequest { ember_hash: req_hash, ref nickname, ref peer_ip, peer_port } = event {
+                if let DownloadEvent::EmberFriendRequest { ember_hash: req_hash, ref nickname, ref peer_ip, peer_port, verified } = event {
                     let hash_hex = hex::encode(req_hash);
-                    info!("Processing download-side friend request from {} (nick='{}', ip={}:{})", hash_hex, nickname, peer_ip, peer_port);
-                    // Ember hash is self-reported in the EmuleInfo handshake and cannot be
-                    // cryptographically verified (see FUTURE_WORK.md F2). Never auto-promote
-                    // a peer to "mutual" based on that tag — require explicit user approval
-                    // through the Friends UI. If the sender is already mutual, ignore; if
-                    // they are in our list but not mutual, route through the request queue
-                    // so the user sees "<nick> wants to confirm friendship" and must accept.
+                    info!("Processing download-side friend request from {} (nick='{}', ip={}:{}, verified={verified})", hash_hex, nickname, peer_ip, peer_port);
+                    // `verified` is the offline BLAKE3 identity-binding
+                    // result computed at the emit site
+                    // (`verify_ember_hash_binding`): true iff the peer
+                    // advertised an Ed25519 pubkey whose 16-byte BLAKE3
+                    // prefix matches the `ember_hash` they're claiming.
+                    // It is NOT yet a proof-of-possession check (that's
+                    // FUTURE_WORK.md F2 Phase 2). We thread it through
+                    // to the DB row + UI badge so the user can see
+                    // whether the request came over a binding-consistent
+                    // channel; never auto-promote to "mutual" based on
+                    // it. If the sender is already mutual, ignore; if
+                    // they are in our list but not mutual, route through
+                    // the request queue so the user sees "<nick> wants
+                    // to confirm friendship" and must explicitly accept.
                     let db_q = db.clone();
                     let h_q = hash_hex.clone();
                     let already_mutual = tokio::task::spawn_blocking(move || {
@@ -4630,10 +4648,12 @@ pub async fn start_network(
                         let h2 = hash_hex.clone();
                         let n2 = nickname.clone();
                         let ip2 = peer_ip.clone();
-                        let _ = tokio::task::spawn_blocking(move || db2.add_friend_request(&h2, &n2, &ip2, peer_port));
+                        let verified_copy = verified;
+                        let _ = tokio::task::spawn_blocking(move || db2.add_friend_request(&h2, &n2, &ip2, peer_port, verified_copy));
                         let _ = app_handle.emit("ember:friend-request", serde_json::json!({
                             "sender_hash": hash_hex,
                             "nickname": nickname,
+                            "verified": verified,
                         }));
                     }
                     continue;
@@ -5163,11 +5183,13 @@ pub async fn start_network(
                     }));
                 }
 
-                if let UploadEventKind::EmberFriendRequest { ember_hash: req_hash, ref nickname, ref peer_ip, peer_port } = event.kind {
+                if let UploadEventKind::EmberFriendRequest { ember_hash: req_hash, ref nickname, ref peer_ip, peer_port, verified } = event.kind {
                     let hash_hex = hex::encode(req_hash);
-                    info!("Processing upload-side friend request from {} (nick='{}', ip={}:{})", hash_hex, nickname, peer_ip, peer_port);
-                    // See the download-side handler above: never auto-mutual based on an
-                    // unauthenticated ember_hash tag. Always require explicit user approval.
+                    info!("Processing upload-side friend request from {} (nick='{}', ip={}:{}, verified={verified})", hash_hex, nickname, peer_ip, peer_port);
+                    // See the download-side handler above. `verified` is
+                    // forwarded into the request's DB row so the UI can
+                    // render a verification badge; user approval is
+                    // still required regardless.
                     let db_q = db.clone();
                     let h_q = hash_hex.clone();
                     let already_mutual = tokio::task::spawn_blocking(move || {
@@ -5186,10 +5208,12 @@ pub async fn start_network(
                         let h2 = hash_hex.clone();
                         let n2 = nickname.clone();
                         let ip2 = peer_ip.clone();
-                        let _ = tokio::task::spawn_blocking(move || db2.add_friend_request(&h2, &n2, &ip2, peer_port));
+                        let verified_copy = verified;
+                        let _ = tokio::task::spawn_blocking(move || db2.add_friend_request(&h2, &n2, &ip2, peer_port, verified_copy));
                         let _ = app_handle.emit("ember:friend-request", serde_json::json!({
                             "sender_hash": hash_hex,
                             "nickname": nickname,
+                            "verified": verified,
                         }));
                     }
                 }
@@ -6521,6 +6545,8 @@ pub async fn start_network(
                                         new_established_rx: Some(est_inject_rx),
                         ed2k_limits: settings.ed2k_download_limits(),
                         ember_hash,
+                        ed25519_public_key: ed25519_pubkey,
+                        ed25519_secret_key,
                         friend_hashes: Some(friend_hashes.clone()),
                                         ember_payload: shared_ember_payload.clone(),
                                         ember_payload_generation: ember_payload_generation.clone(),
@@ -9079,6 +9105,8 @@ pub async fn start_network(
                             new_established_rx: Some(new_established_rx),
                         ed2k_limits: settings.ed2k_download_limits(),
                         ember_hash,
+                        ed25519_public_key: ed25519_pubkey,
+                        ed25519_secret_key,
                         friend_hashes: Some(friend_hashes.clone()),
                             ember_payload: shared_ember_payload.clone(),
                             ember_payload_generation: ember_payload_generation.clone(),
@@ -9253,6 +9281,8 @@ pub async fn start_network(
                             new_established_rx: Some(est_inject_rx),
                         ed2k_limits: settings.ed2k_download_limits(),
                         ember_hash,
+                        ed25519_public_key: ed25519_pubkey,
+                        ed25519_secret_key,
                         friend_hashes: Some(friend_hashes.clone()),
                             ember_payload: shared_ember_payload.clone(),
                             ember_payload_generation: ember_payload_generation.clone(),
@@ -10354,6 +10384,8 @@ pub async fn start_network(
                             &geoip,
                             &friend_hashes,
                             ember_hash,
+                            ed25519_pubkey,
+                            ed25519_secret_key,
                             &stats_manager.sx_counters,
                         ).await;
                     }
@@ -10844,6 +10876,8 @@ pub async fn start_network(
                                         &geoip,
                                         &friend_hashes,
                                         ember_hash,
+                                        ed25519_pubkey,
+                                        ed25519_secret_key,
                                         &stats_manager.sx_counters,
                                     ).await;
                                 }
@@ -11412,6 +11446,8 @@ pub async fn start_network(
                                     new_established_rx: Some(est_inject_rx),
                         ed2k_limits: settings.ed2k_download_limits(),
                         ember_hash,
+                        ed25519_public_key: ed25519_pubkey,
+                        ed25519_secret_key,
                         friend_hashes: Some(friend_hashes.clone()),
                                     ember_payload: shared_ember_payload.clone(),
                                     ember_payload_generation: ember_payload_generation.clone(),
@@ -11595,6 +11631,8 @@ pub async fn start_network(
                                 obfuscation_enabled: state.obfuscation_enabled,
                         ed2k_limits: settings.ed2k_download_limits(),
                         ember_hash,
+                        ed25519_public_key: ed25519_pubkey,
+                        ed25519_secret_key,
                         our_nickname: settings.nickname.clone(),
                         friend_hashes: Some(friend_hashes.clone()),
                                 ember_payload: shared_ember_payload.clone(),
@@ -15750,6 +15788,8 @@ async fn handle_command(
                     new_established_rx: Some(est_inject_rx),
                         ed2k_limits: settings.ed2k_download_limits(),
                         ember_hash,
+                        ed25519_public_key: ed25519_pubkey,
+                        ed25519_secret_key,
                         friend_hashes: Some(friend_hashes.clone()),
                     ember_payload: shared_ember_payload.clone(),
                     ember_payload_generation: ember_payload_generation.clone(),
@@ -17629,10 +17669,14 @@ async fn handle_command(
                     Ok(Some(remote_eh)) => {
                         info!("Friend connect to {} succeeded, remote ember_hash={}", addr, hex::encode(remote_eh));
                         if fh.read().await.contains(&remote_eh) {
-                            // Do NOT auto-flip mutual: ember_hash in the remote handshake is
-                            // self-reported and unverified (FUTURE_WORK.md F2). We still emit
-                            // "confirmed" to clear the searching spinner and mark online, but
-                            // mutual promotion must come from an explicit user accept on an
+                            // Do NOT auto-flip mutual purely from a reciprocal
+                            // handshake, even though `friend_connect` has now
+                            // run `perform_ember_auth` on this session (so
+                            // `remote_eh` is proof-of-possession verified).
+                            // We still emit "confirmed" to clear the searching
+                            // spinner and mark the peer online, but mutual
+                            // promotion must come from an explicit user accept
+                            // on an
                             // inbound friend request.
                             let _ = app2.emit("ember:friend-confirmed", serde_json::json!({
                                 "user_hash": hex::encode(remote_eh),

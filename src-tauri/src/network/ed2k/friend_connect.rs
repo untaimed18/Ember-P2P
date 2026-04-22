@@ -235,7 +235,12 @@ pub async fn open_and_run_friend_session(
     let peer_ember_hash = hello_caps.ember_hash
         .ok_or_else(|| anyhow::anyhow!("Ember peer has no ember_hash"))?;
 
-    // Ember auth challenge-response if both sides support it
+    // Ember auth challenge-response. Currently a no-op in practice
+    // because this function never sends `OP_EMBER_HELLO`, so
+    // `hello_caps.ember_pubkey` is never populated and the guard
+    // below short-circuits. Once `OP_EMBER_HELLO` is wired into this
+    // handshake (FUTURE_WORK.md F2), the call will run for real and
+    // `perform_ember_auth` will give us proof of possession.
     if let (Some(peer_pk), Some(our_pk), Some(our_sk)) = (hello_caps.ember_pubkey, ed25519_pubkey, ed25519_secret_key) {
         perform_ember_auth(&mut reader, &mut writer, &our_pk, &our_sk, &peer_pk, Some(&peer_ember_hash), addr).await?;
     }
@@ -245,9 +250,23 @@ pub async fn open_and_run_friend_session(
         anyhow::bail!("remote peer {} is not in our friend list", hex::encode(peer_ember_hash));
     }
 
+    // Offline identity-binding state — passed into the spawned
+    // reader task below so any `OP_EMBER_FRIEND_REQ` we receive on
+    // this session reports an honest `verified` value to the UI
+    // instead of an unconditional `true`. Currently always `false`
+    // because this handshake doesn't exchange `OP_EMBER_HELLO` (see
+    // the comment on the auth call above); flips to `true`
+    // automatically once `hello_caps.ember_pubkey` starts getting
+    // populated through that wire-up.
+    let ember_hash_binding_verified = hello_caps
+        .ember_pubkey
+        .as_ref()
+        .map(|pk| crate::network::ember::crypto::verify_ember_hash_binding(pk, &peer_ember_hash))
+        .unwrap_or(false);
+
     write_packet(&mut writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, our_nickname.as_bytes()).await?;
 
-    info!("Friend session handshake with {} complete (hash={})", addr, hex::encode(peer_ember_hash));
+    info!("Friend session handshake with {} complete (hash={}, binding_verified={ember_hash_binding_verified})", addr, hex::encode(peer_ember_hash));
 
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     {
@@ -336,7 +355,28 @@ pub async fn open_and_run_friend_session(
                                 }
                                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) => {
                                     let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
-                                    info!("Received friend request on outbound session from {} (nick='{}')", addr, nick);
+                                    // `verified` is set from the
+                                    // session-scoped
+                                    // `ember_hash_binding_verified`
+                                    // flag computed during the
+                                    // session setup (after we parsed
+                                    // the peer's `OP_EMBER_HELLO`).
+                                    //
+                                    // Today this is the offline
+                                    // BLAKE3 binding check, not full
+                                    // proof of possession. The
+                                    // `perform_ember_auth` call in
+                                    // `open_friend_session` is gated
+                                    // on `hello_caps.ember_pubkey`
+                                    // being populated, which itself
+                                    // requires `OP_EMBER_HELLO` to
+                                    // have been exchanged in this
+                                    // function — wiring that in is
+                                    // tracked as future work
+                                    // (FUTURE_WORK.md F2). When it
+                                    // lands, `ember_hash_binding_verified`
+                                    // here will also reflect PoP.
+                                    info!("Received friend request on outbound friend session from {} (nick='{}', verified={ember_hash_binding_verified})", addr, nick);
                                     let _ = session_ul_event_tx.send(UploadEvent {
                                         transfer_id: String::new(),
                                         kind: UploadEventKind::EmberFriendRequest {
@@ -344,6 +384,7 @@ pub async fn open_and_run_friend_session(
                                             nickname: nick,
                                             peer_ip: addr.ip().to_string(),
                                             peer_port: addr.port(),
+                                            verified: ember_hash_binding_verified,
                                         },
                                     }).await;
                                 }
@@ -405,7 +446,7 @@ pub async fn open_and_run_friend_session(
 
 use super::multi_source::parse_browse_response;
 
-async fn write_packet<W: AsyncWriteExt + Unpin>(
+async fn write_packet<W: AsyncWriteExt + Unpin + ?Sized>(
     writer: &mut W,
     protocol: u8,
     opcode: u8,
@@ -420,7 +461,7 @@ async fn write_packet<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-async fn read_packet_inner<R: AsyncReadExt + Unpin>(
+async fn read_packet_inner<R: AsyncReadExt + Unpin + ?Sized>(
     reader: &mut R,
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
     let protocol = reader.read_u8().await?;
@@ -438,7 +479,7 @@ async fn read_packet_inner<R: AsyncReadExt + Unpin>(
     Ok((protocol, opcode, payload))
 }
 
-async fn read_packet_with_timeout<R: AsyncReadExt + Unpin>(
+async fn read_packet_with_timeout<R: AsyncReadExt + Unpin + ?Sized>(
     reader: &mut R,
     timeout_secs: u64,
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
@@ -459,7 +500,15 @@ async fn read_packet_with_timeout<R: AsyncReadExt + Unpin>(
 /// Verification checks:
 ///   1. `BLAKE3(peer_pubkey)[0..16] == peer_ember_hash` (identity binding)
 ///   2. The signature over our nonce is valid under the peer's public key
-async fn perform_ember_auth<R, W>(
+///
+/// Exposed as `pub(crate)` so the regular download/upload TCP loops in
+/// `upload.rs` and `multi_source.rs` can run the same authoritative
+/// challenge-response immediately after an `OP_EMBER_HELLO` /
+/// `OP_EMBER_HELLOANSWER` exchange reveals the peer's pubkey — without
+/// waiting for a dedicated friend-connect session. Reader/writer are
+/// generic so callers pass whatever stream pair they already have
+/// (RC4-wrapped or plain, buffered or not).
+pub(crate) async fn perform_ember_auth<R, W>(
     reader: &mut R,
     writer: &mut W,
     our_pubkey: &[u8; 32],
@@ -469,8 +518,12 @@ async fn perform_ember_auth<R, W>(
     addr: SocketAddr,
 ) -> anyhow::Result<()>
 where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
+    // `?Sized` lets the multi_source download loop pass a
+    // `&mut dyn AsyncRead/AsyncWrite` (from a `Box<dyn ...>`) without
+    // having to unbox first. Concrete-type callers (friend_connect,
+    // buffered readers) still work unchanged.
+    R: AsyncReadExt + Unpin + ?Sized,
+    W: AsyncWriteExt + Unpin + ?Sized,
 {
     // Verify peer pubkey matches their advertised ember_hash
     if let Some(expected_hash) = peer_ember_hash {

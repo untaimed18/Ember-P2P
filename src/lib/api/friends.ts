@@ -14,6 +14,23 @@ export interface FriendRequestInfo {
   sender_hash: string;
   sender_nickname: string;
   received_at: number;
+  /**
+   * True iff the peer's advertised Ed25519 public key
+   * BLAKE3-bound to `sender_hash` at request-emit time
+   * (the offline `verify_ember_hash_binding` check). The
+   * Friends page surfaces this as a "Verified" badge so users
+   * can distinguish requests over a binding-consistent channel
+   * from peers that didn't advertise a pubkey or whose advertised
+   * pubkey didn't match.
+   *
+   * NOTE: this is identity-binding only, not proof of
+   * possession. An attacker who has observed the victim's pubkey
+   * on the wire could replay it and pass this check; the full
+   * Ed25519 challenge-response is FUTURE_WORK.md F2 Phase 2.
+   * Even with a Verified badge, users should still only accept
+   * friend requests from people they recognise.
+   */
+  verified: boolean;
 }
 
 export interface ChatMessage {

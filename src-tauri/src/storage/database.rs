@@ -298,6 +298,27 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 14 {
+            // Record whether each incoming friend request arrived on a
+            // TCP channel where the peer's advertised Ed25519 pubkey
+            // BLAKE3-bound to their claimed `ember_hash` (the offline
+            // identity-binding check in
+            // `crate::network::ember::crypto::verify_ember_hash_binding`).
+            // Surfaces in the Friends UI as a "Verified" badge and is
+            // taken into account by any future server-side checks that
+            // gate friend-only features on a positive binding.
+            //
+            // Default `0` (unverified) for rows migrated from v13: we
+            // have no record of the binding state of historical
+            // requests, so the safest assumption is that they were
+            // unverified. Re-sending a friend request will refresh the
+            // flag per the latest exchange.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(&tx, "friend_requests", "verified", "INTEGER NOT NULL DEFAULT 0")?;
+            set_version(&tx, 14)?;
+            tx.commit()?;
+        }
+
         Ok(())
     }
 
@@ -841,23 +862,34 @@ impl Database {
         Ok(())
     }
 
-    pub fn add_friend_request(&self, sender_hash: &str, nickname: &str, sender_ip: &str, sender_port: u16) -> anyhow::Result<()> {
+    pub fn add_friend_request(&self, sender_hash: &str, nickname: &str, sender_ip: &str, sender_port: u16, verified: bool) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
+        // Refresh behaviour: a repeat request from the same peer
+        // can legitimately change any of the fields on the row,
+        // including the verification flag (e.g. an older request
+        // arrived on an unverified path, a later one on a verified
+        // path). We preserve the "verified once, always verified"
+        // monotonicity across refreshes so a spoofer can't silently
+        // *downgrade* an existing verified request by flooding
+        // unverified requests from another channel — a legitimate
+        // re-request from the real user always raises the flag or
+        // leaves it unchanged, never lowers it.
         conn.execute(
-            "INSERT INTO friend_requests (sender_hash, sender_nickname, received_at, sender_ip, sender_port)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO friend_requests (sender_hash, sender_nickname, received_at, sender_ip, sender_port, verified)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(sender_hash) DO UPDATE SET sender_nickname = excluded.sender_nickname,
-             sender_ip = excluded.sender_ip, sender_port = excluded.sender_port",
-            params![sender_hash, nickname, now, sender_ip, sender_port as i64],
+             sender_ip = excluded.sender_ip, sender_port = excluded.sender_port,
+             verified = MAX(friend_requests.verified, excluded.verified)",
+            params![sender_hash, nickname, now, sender_ip, sender_port as i64, verified as i64],
         )?;
         Ok(())
     }
 
-    pub fn get_friend_requests(&self) -> anyhow::Result<Vec<(String, String, i64, String, u16)>> {
+    pub fn get_friend_requests(&self) -> anyhow::Result<Vec<(String, String, i64, String, u16, bool)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT sender_hash, sender_nickname, received_at, COALESCE(sender_ip, ''), COALESCE(sender_port, 0) FROM friend_requests ORDER BY received_at DESC"
+            "SELECT sender_hash, sender_nickname, received_at, COALESCE(sender_ip, ''), COALESCE(sender_port, 0), COALESCE(verified, 0) FROM friend_requests ORDER BY received_at DESC"
         )?;
         let rows = stmt
             .query_map([], |row| {
@@ -867,6 +899,7 @@ impl Database {
                     row.get::<_, i64>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?.clamp(0, u16::MAX as i64) as u16,
+                    row.get::<_, i64>(5)? != 0,
                 ))
             })?
             .filter_map(|r| r.ok())
