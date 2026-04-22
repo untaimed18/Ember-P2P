@@ -1,5 +1,5 @@
 use crate::app_state::AppState;
-use crate::network::NetworkCommand;
+use crate::network::{NetworkCommand, PeerReputationInfo, ReputationStatsInfo};
 use crate::storage::identity::NodeIdentity;
 use crate::types::*;
 
@@ -659,3 +659,30 @@ pub async fn kad_cancel_search(
     Ok(())
 }
 
+/// Look up the reputation record for a single peer by user-hash. The
+/// backend's `ReputationTracker` runs in-memory and is consulted for
+/// ban decisions; this is the only IPC surface that exposes its state
+/// to the UI (trust badge / per-peer diagnostics).
+#[tauri::command]
+pub async fn get_peer_reputation(
+    state: tauri::State<'_, AppState>,
+    user_hash_hex: String,
+) -> Result<Option<PeerReputationInfo>, String> {
+    let hash = parse_user_hash(&user_hash_hex.to_lowercase())?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.network_tx.try_send(NetworkCommand::GetPeerReputation { user_hash: hash, tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
+    rx.await.map_err(|_| "No response".to_string())
+}
+
+/// Aggregate reputation-tracker stats for the security / statistics
+/// UI. Same-only-path rationale as `get_peer_reputation`.
+#[tauri::command]
+pub async fn get_reputation_stats(
+    state: tauri::State<'_, AppState>,
+) -> Result<ReputationStatsInfo, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.network_tx.try_send(NetworkCommand::GetReputationStats { tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
+    rx.await.map_err(|_| "No response".to_string())
+}

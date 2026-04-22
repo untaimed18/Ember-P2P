@@ -1322,7 +1322,34 @@ pub enum NetworkCommand {
     IsFriendDiscoverable {
         tx: oneshot::Sender<bool>,
     },
+    GetPeerReputation {
+        user_hash: [u8; 16],
+        tx: oneshot::Sender<Option<PeerReputationInfo>>,
+    },
+    GetReputationStats {
+        tx: oneshot::Sender<ReputationStatsInfo>,
+    },
     Shutdown,
+}
+
+/// Per-peer reputation snapshot. Returned by the `get_peer_reputation`
+/// Tauri command so the UI can render a verification / trust badge
+/// next to a peer (upload queue, transfer detail panel, etc.).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerReputationInfo {
+    pub score: i32,
+    pub successful_transfers: u64,
+    pub failed_transfers: u64,
+    pub is_banned: bool,
+    pub first_seen: u64,
+    pub last_interaction: u64,
+}
+
+/// Aggregate reputation tracker stats for the security / statistics UI.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReputationStatsInfo {
+    pub tracked_peers: usize,
+    pub banned_peers: usize,
 }
 
 struct PendingDownload {
@@ -17753,6 +17780,31 @@ async fn handle_command(
             );
 
             let _ = tx.send(Ok(()));
+        }
+
+        NetworkCommand::GetPeerReputation { user_hash, tx } => {
+            let info = state.reputation.get_peer(&user_hash).map(|p| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                PeerReputationInfo {
+                    score: p.score,
+                    successful_transfers: p.successful_transfers,
+                    failed_transfers: p.failed_transfers,
+                    is_banned: p.is_banned(now),
+                    first_seen: p.first_seen,
+                    last_interaction: p.last_interaction,
+                }
+            });
+            let _ = tx.send(info);
+        }
+
+        NetworkCommand::GetReputationStats { tx } => {
+            let _ = tx.send(ReputationStatsInfo {
+                tracked_peers: state.reputation.tracked_count(),
+                banned_peers: state.reputation.banned_count(),
+            });
         }
 
         NetworkCommand::Shutdown => {}
