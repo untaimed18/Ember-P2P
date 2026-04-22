@@ -1,5 +1,5 @@
 use crate::app_state::AppState;
-use crate::network::{NetworkCommand, PeerReputationInfo, ReputationStatsInfo};
+use crate::network::NetworkCommand;
 use crate::storage::identity::NodeIdentity;
 use crate::types::*;
 
@@ -397,21 +397,6 @@ pub async fn retry_friend_search(
 }
 
 #[tauri::command]
-pub async fn ensure_friend_session(
-    state: tauri::State<'_, AppState>,
-    user_hash_hex: String,
-) -> Result<(), String> {
-    let canonical = user_hash_hex.to_lowercase();
-    let hash = parse_user_hash(&canonical)?;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state.network_tx.send(NetworkCommand::EnsureFriendSession {
-        ember_hash: hash,
-        tx,
-    }).await.map_err(|_| "Network unavailable".to_string())?;
-    rx.await.map_err(|_| "No response".to_string())?
-}
-
-#[tauri::command]
 pub async fn browse_friend(
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
@@ -674,24 +659,3 @@ pub async fn kad_cancel_search(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn get_peer_reputation(
-    state: tauri::State<'_, AppState>,
-    user_hash_hex: String,
-) -> Result<Option<PeerReputationInfo>, String> {
-    let hash = parse_user_hash(&user_hash_hex.to_lowercase())?;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state.network_tx.try_send(NetworkCommand::GetPeerReputation { user_hash: hash, tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    rx.await.map_err(|_| "No response".to_string())
-}
-
-#[tauri::command]
-pub async fn get_reputation_stats(
-    state: tauri::State<'_, AppState>,
-) -> Result<ReputationStatsInfo, String> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state.network_tx.try_send(NetworkCommand::GetReputationStats { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    rx.await.map_err(|_| "No response".to_string())
-}
