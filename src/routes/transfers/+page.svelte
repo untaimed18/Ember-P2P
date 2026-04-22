@@ -14,6 +14,7 @@
   import { previewFile } from '$lib/api/preview';
   import { addFriend } from '$lib/api/friends';
   import { banPeer } from '$lib/api/kad';
+  import { getPeerReputation, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
   import { formatSize, formatSpeed, formatDate, formatDateWithYear, formatDuration, formatRemaining } from '$lib/utils';
   import { onMount, onDestroy } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
@@ -128,6 +129,7 @@
     { key: 'uploaded', label: 'Uploaded To', width: 100, minWidth: 80, className: 'col-k-up', sortField: 'uploaded' },
     { key: 'downloaded', label: 'Downloaded From', width: 110, minWidth: 88, className: 'col-k-down', sortField: 'downloaded' },
     { key: 'credit_ratio', label: 'Score', width: 64, minWidth: 56, className: 'col-k-score', sortField: 'credit_ratio' },
+    { key: 'reputation', label: 'Trust', width: 100, minWidth: 80, className: 'col-k-rep' },
     { key: 'ident_state', label: 'Identification', width: 110, minWidth: 96, className: 'col-k-ident', sortField: 'ident_state' },
     { key: 'last_seen', label: 'Last Seen', width: 140, minWidth: 110, className: 'col-k-seen', sortField: 'last_seen' },
   ];
@@ -589,9 +591,52 @@
     try {
       knownClients = await getKnownClients();
       knownClientsLoaded = true;
+      // Kick off reputation refresh for the just-loaded roster. Runs
+      // off-cycle because `get_peer_reputation` may return `null` for
+      // peers the tracker hasn't seen yet, which is common for known
+      // clients that only exist as SecIdent credit records.
+      void refreshReputations(knownClients.map((k) => k.user_hash));
     } catch (e) {
       console.warn('Failed to refresh known clients:', e);
     }
+  }
+
+  /** Per-hash reputation cache. Populated lazily when the Known
+   *  Clients tab refreshes. Missing entries render as the "unknown"
+   *  badge until the fetch resolves; null entries mean the backend
+   *  tracker has no record (distinct from "not yet fetched").
+   *
+   *  Using a plain object because Svelte 5 `$state` needs reference
+   *  churn for reactivity on nested mutations; `= { ...map, key: v }`
+   *  at update time is cheap at the sizes we expect (<1000 known
+   *  clients) and keeps the dependent computations reactive. */
+  let reputationMap = $state<Record<string, PeerReputationInfo | null>>({});
+  let reputationInFlight = new Set<string>();
+
+  async function refreshReputations(hashes: string[]) {
+    // Only fetch hashes we haven't already resolved or requested, to
+    // avoid spamming the backend when the user switches tabs or the
+    // 8-second known-clients poll fires.
+    const targets = hashes.filter(
+      (h) => !(h in reputationMap) && !reputationInFlight.has(h),
+    );
+    if (targets.length === 0) return;
+    for (const h of targets) reputationInFlight.add(h);
+    const results = await Promise.all(
+      targets.map(async (h) => {
+        try {
+          return [h, await getPeerReputation(h)] as const;
+        } catch {
+          return [h, null] as const;
+        }
+      }),
+    );
+    const next = { ...reputationMap };
+    for (const [h, rep] of results) {
+      next[h] = rep;
+      reputationInFlight.delete(h);
+    }
+    reputationMap = next;
   }
 
   $effect(() => {
@@ -2777,6 +2822,21 @@
                     <td class="num-cell" title={`Lifetime bytes we've downloaded from this peer`}>{kc.downloaded > 0 ? formatSize(kc.downloaded) : '\u2014'}</td>
                   {:else if column.key === 'credit_ratio'}
                     <td class="num-cell" title={!kc.has_public_key ? 'No public key cached — credit floor at 1.0' : ''}>{kc.credit_ratio.toFixed(2)}</td>
+                  {:else if column.key === 'reputation'}
+                    {@const rep = reputationMap[kc.user_hash]}
+                    {@const label = labelForReputation(rep)}
+                    <td class="status-cell">
+                      <span
+                        class="rep-badge rep-badge-{label}"
+                        title={rep
+                          ? `score=${rep.score}, successful=${rep.successful_transfers}, failed=${rep.failed_transfers}${rep.is_banned ? ' (currently banned by the tracker)' : ''}`
+                          : rep === null
+                            ? 'No reputation record yet — the tracker has not observed this peer on an active session.'
+                            : 'Fetching reputation…'}
+                      >
+                        {label === 'unknown' ? '—' : label}
+                      </span>
+                    </td>
                   {:else if column.key === 'ident_state'}
                     <td class="status-cell"><span class="status-label ident-{kc.ident_state.toLowerCase()}" title={!kc.has_public_key ? 'No public key cached' : ''}>{kc.ident_state}</span></td>
                   {:else if column.key === 'last_seen'}
@@ -3465,6 +3525,49 @@
   .ident-badguy { color: var(--danger, #e74c3c); }
   .ident-needed { color: var(--warning); }
   .ident-unknown { color: var(--text-muted); }
+
+  /* Reputation badge: mirrors the SecIdent label shape but uses the
+     `labelForReputation` thresholds from `$lib/api/reputation`. A
+     separate visual style (pill rather than dot-prefixed text) keeps
+     it distinguishable at a glance from the Identification column so
+     users don't conflate "verified SecIdent" with "trusted by the
+     reputation tracker" — they measure different things. */
+  .rep-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: capitalize;
+    line-height: 1.3;
+    border: 1px solid transparent;
+    white-space: nowrap;
+  }
+  .rep-badge-trusted {
+    color: var(--success, #2ecc71);
+    background: color-mix(in srgb, var(--success, #2ecc71) 14%, transparent);
+    border-color: color-mix(in srgb, var(--success, #2ecc71) 34%, transparent);
+  }
+  .rep-badge-neutral {
+    color: var(--text-muted);
+    background: color-mix(in srgb, var(--text-muted) 10%, transparent);
+    border-color: color-mix(in srgb, var(--text-muted) 22%, transparent);
+  }
+  .rep-badge-suspect {
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 14%, transparent);
+    border-color: color-mix(in srgb, var(--warning) 34%, transparent);
+  }
+  .rep-badge-banned {
+    color: var(--danger, #e74c3c);
+    background: color-mix(in srgb, var(--danger, #e74c3c) 14%, transparent);
+    border-color: color-mix(in srgb, var(--danger, #e74c3c) 34%, transparent);
+  }
+  .rep-badge-unknown {
+    color: var(--text-muted);
+    background: transparent;
+    border-color: var(--border);
+  }
   /* Monospace cell — used for raw user-hash columns where alignment
      across rows matters more than narrow rendering. */
   .mono { font-family: var(--font-mono, ui-monospace, 'Cascadia Code', Consolas, monospace); font-size: 11px; }

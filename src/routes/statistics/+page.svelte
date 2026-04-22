@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getStatistics, type TransferStats } from '$lib/api/statistics';
+  import { getReputationStats, type ReputationStatsInfo } from '$lib/api/reputation';
   import { formatBytes, formatSpeed as formatRate, formatDurationSecs as formatDuration } from '$lib/utils';
   import { onMount } from 'svelte';
 
@@ -11,16 +12,31 @@
   let tickCounter = $state(0);
   let unmounted = false;
 
+  // Reputation-tracker snapshot. Loaded alongside stats on the same
+  // 2-second cadence. `null` before the first successful fetch so the
+  // UI can render a "—" placeholder instead of zeros (zeros are
+  // misleading when the backend is briefly unreachable).
+  let repStats = $state<ReputationStatsInfo | null>(null);
+
   async function loadStats() {
     if (refreshBusy || unmounted) return;
     refreshBusy = true;
     try {
-      const result: TransferStats = await Promise.race([
-        getStatistics(),
-        new Promise<TransferStats>((_, reject) => setTimeout(() => reject(new Error('timeout')), 4000)),
+      // Fire both fetches concurrently — they hit different backend
+      // paths (stats reads a cached snapshot; reputation reads the
+      // in-memory tracker) so there's no reason to serialise. If
+      // reputation fails we still surface transfer stats; the inverse
+      // is protected by the existing error path.
+      const [result, repResult] = await Promise.all([
+        Promise.race([
+          getStatistics(),
+          new Promise<TransferStats>((_, reject) => setTimeout(() => reject(new Error('timeout')), 4000)),
+        ]),
+        getReputationStats().catch(() => null as ReputationStatsInfo | null),
       ]);
       if (unmounted) return;
       stats = result;
+      if (repResult) repStats = repResult;
       error = null;
     } catch (e) {
       if (unmounted) return;
@@ -326,6 +342,43 @@
       </div>
     </section>
 
+    <!--
+      Peer reputation snapshot. Surfaces the in-memory
+      `ReputationTracker` state: how many peers we have behavioural
+      records for, and how many are currently banned. Banned count
+      coloured to draw attention — a non-zero value means the tracker
+      is actively filtering out misbehaving peers on this session.
+      Rendered only when we've had at least one successful fetch
+      (`repStats != null`) so a transient backend hiccup doesn't make
+      the row flash zeros and scare the user.
+    -->
+    {#if repStats}
+      <section class="card">
+        <div class="card-head">
+          <span class="section-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M8 1.5 L2 4 V8 Q2 12.5 8 14.5 Q14 12.5 14 8 V4 Z"/>
+              <polyline points="5.5,8 7.5,10 10.5,6"/>
+            </svg>
+          </span>
+          <h3>Peer Reputation</h3>
+          <span class="head-aside">Session tracker</span>
+        </div>
+        <div class="reputation-row">
+          <div class="rep-stat">
+            <span class="rep-label">Tracked peers</span>
+            <span class="rep-value">{repStats.tracked_peers.toLocaleString()}</span>
+          </div>
+          <div class="rep-stat">
+            <span class="rep-label">Banned peers</span>
+            <span class="rep-value" class:rep-danger={repStats.banned_peers > 0}>
+              {repStats.banned_peers.toLocaleString()}
+            </span>
+          </div>
+        </div>
+      </section>
+    {/if}
+
   {/if}
 </div>
 
@@ -546,5 +599,34 @@
     padding-top: 12px;
     border-top: 1px solid var(--border);
     justify-content: start;
+  }
+
+  /* Reputation row on the statistics page. Two stat pills side-by-side
+     mirrors the "total / active" pattern the overhead session row uses,
+     keeping visual rhythm consistent across the page. */
+  .reputation-row {
+    display: flex;
+    gap: 32px;
+    padding: 4px 0 2px;
+  }
+  .rep-stat {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .rep-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .rep-value {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+  }
+  .rep-value.rep-danger {
+    color: var(--danger);
   }
 </style>

@@ -6,6 +6,7 @@
     setIpFilterEnabled,
     setBlockPrivateIps,
     downloadAndLoadIpfilter,
+    updateIpfilterFromUrl,
     importIpfilterFile,
     type IpFilterStats,
     type IpFilterEntry,
@@ -20,6 +21,13 @@
 
   let downloading = $state(false);
   let importing = $state(false);
+  // Custom-URL ipfilter state. Separate from `downloading` so the
+  // "Download default" and "Fetch from URL" buttons can surface
+  // independent spinners, and the inline URL input stays visible
+  // while the fetch is in flight.
+  let customUrl = $state('');
+  let urlFetching = $state(false);
+  let showUrlForm = $state(false);
 
   let showAddForm = $state(false);
   let newStartIp = $state('');
@@ -171,6 +179,39 @@
     }
   }
 
+  /** Fetch an ipfilter from a user-supplied URL. Validation (scheme,
+   *  host, private-IP filtering) happens backend-side in
+   *  `update_ipfilter_from_url`; we only do a cheap front-end sanity
+   *  pass here (non-empty + https://) so the most common mistake
+   *  surfaces instantly instead of round-tripping. */
+  async function handleUrlFetch() {
+    const trimmed = customUrl.trim();
+    if (!trimmed) {
+      error = 'Enter a URL';
+      return;
+    }
+    if (!trimmed.toLowerCase().startsWith('https://')) {
+      error = 'URL must start with https://';
+      return;
+    }
+    urlFetching = true;
+    error = null;
+    try {
+      const msg = await updateIpfilterFromUrl(trimmed);
+      flash(msg);
+      await loadStats();
+      // Collapse the form on success — saves a click and signals
+      // completion. The URL is preserved so users who want to refetch
+      // the same list (e.g. after an upstream update) can reopen and
+      // re-submit without retyping.
+      showUrlForm = false;
+    } catch (e: unknown) {
+      error = toErrorMsg(e);
+    } finally {
+      urlFetching = false;
+    }
+  }
+
   function isValidIpv4(ip: string): boolean {
     const parts = ip.split('.');
     if (parts.length !== 4) return false;
@@ -252,9 +293,40 @@
     <button class="ghost" onclick={handleImport} disabled={importing}>
       {importing ? 'Importing\u2026' : 'Import File'}
     </button>
+    <!--
+      Toggle the custom-URL form. Kept as a collapsible row so the
+      default/import actions stay visible without a second click, and
+      power-users who do want a custom source get a clearly-scoped
+      input instead of a modal.
+    -->
+    <button
+      class="ghost"
+      onclick={() => { showUrlForm = !showUrlForm; if (!showUrlForm) error = null; }}
+      aria-expanded={showUrlForm}
+      aria-controls="ipfilter-url-form"
+    >
+      {showUrlForm ? 'Cancel URL' : 'From URL\u2026'}
+    </button>
     <button class="ghost" onclick={loadStats}>Refresh</button>
   </div>
 </div>
+
+{#if showUrlForm}
+  <div id="ipfilter-url-form" class="ipfilter-url-form" role="group" aria-label="Fetch ipfilter from URL">
+    <label for="ipfilter-url-input" class="sr-only">IP filter URL</label>
+    <input
+      id="ipfilter-url-input"
+      type="url"
+      placeholder="https://example.com/ipfilter.zip"
+      bind:value={customUrl}
+      disabled={urlFetching}
+      onkeydown={(e) => { if (e.key === 'Enter' && !urlFetching) handleUrlFetch(); }}
+    />
+    <button onclick={handleUrlFetch} disabled={urlFetching || !customUrl.trim()}>
+      {urlFetching ? 'Fetching\u2026' : 'Fetch'}
+    </button>
+  </div>
+{/if}
 
 <div class="page-content">
   {#if error}
@@ -447,6 +519,52 @@
     display: flex;
     align-items: center;
     gap: 8px;
+  }
+
+  /* Visually-hidden label for the URL input; the placeholder
+     doubles as the visible cue while the label keeps the
+     accessibility tree honest for screen readers. */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  /* Collapsible "Fetch from URL" row. Sits directly under the
+     page header when expanded so it's clearly scoped to the
+     ipfilter actions above and doesn't disrupt the main content
+     layout. */
+  .ipfilter-url-form {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+  }
+  .ipfilter-url-form input[type='url'] {
+    flex: 1;
+    min-width: 0;
+    padding: 6px 10px;
+    border-radius: var(--radius-sm, 4px);
+    border: 1px solid var(--border);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 12px;
+  }
+  .ipfilter-url-form input[type='url']:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .ipfilter-url-form button {
+    flex-shrink: 0;
   }
 
   /* --- Banners --- */

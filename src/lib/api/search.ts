@@ -96,3 +96,17 @@ export async function getDownloadHistory(hashes: string[]): Promise<Record<strin
 export async function clearDownloadHistory(status: string): Promise<void> {
   return invoke('clear_download_history', { status });
 }
+
+/**
+ * Remove a single download-history row by file hash.
+ *
+ * Complements `clearDownloadHistory(status)`, which wipes an entire
+ * status bucket at once. This function is the per-row delete used by
+ * the search-results context menu so users can "forget" an individual
+ * stale or mistagged history entry (e.g. a `cancelled` row they want
+ * the search view to stop flagging) without blowing away every other
+ * entry of the same status.
+ */
+export async function removeDownloadHistoryEntry(fileHash: string): Promise<void> {
+  return invoke('remove_download_history_entry', { fileHash });
+}

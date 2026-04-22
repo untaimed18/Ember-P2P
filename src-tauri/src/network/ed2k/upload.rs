@@ -1940,6 +1940,15 @@ impl UploadHandler {
             }
         }
 
+        // "Claimed friend": the peer's advertised ember_hash is in our
+        // friend set. This is NOT sufficient to grant friend-slot
+        // priority on its own — a spoofer who learned a friend's hash
+        // on the wire can claim it. Privilege-granting sites below
+        // (queue insertion, score_queue_entry) additionally gate on
+        // `ember_auth_state.is_verified()` via `is_verified_friend`,
+        // which only transitions to `true` after the peer completes
+        // the Ed25519 challenge-response on THIS TCP session (see
+        // `super::ember_auth`).
         let is_friend = if let Some(eh) = peer_ember_hash {
             self.friend_hashes.read().await.contains(&eh)
         } else {
@@ -2341,12 +2350,22 @@ impl UploadHandler {
                                 let cm = self.credit_manager.read().await;
                                 let idx_snap = self.local_index.read().await;
                                 let queue = self.upload_queue.lock().await;
+                                // Gate friend-slot priority on verified PoP:
+                                // `is_friend` alone only means the peer claims
+                                // a hash we know; `is_verified` means they
+                                // signed a nonce on THIS session with the
+                                // matching Ed25519 key. Re-evaluate here
+                                // rather than capturing once because
+                                // `ember_auth_state` can advance from
+                                // `NotStarted` → `Verified` mid-session as
+                                // the peer's CHALLENGE/RESPONSE arrives.
+                                let is_verified_friend = is_friend && ember_auth_state.is_verified();
                                 let my_score = score_queue_entry(
                                     &cm, &idx_snap, &peer_user_hash,
                                     current_file_hash.unwrap_or([0u8; 16]),
                                     queue_join_time.elapsed().as_secs(),
                                     Some(peer_addr), hello_caps.emule_version_min,
-                                    is_friend,
+                                    is_verified_friend,
                                 );
                                 let rank = compute_queue_rank(
                                     &cm, &idx_snap, &queue,
@@ -2808,6 +2827,16 @@ impl UploadHandler {
                     };
 
                     if !should_accept {
+                        // Friend-slot priority requires proof-of-possession
+                        // on THIS TCP session (`ember_auth_state.is_verified()`).
+                        // Merely claiming a friend's hash (`is_friend`) is
+                        // not enough — otherwise a spoofer who observed
+                        // the hash on the wire could ride friend priority.
+                        // We evaluate this fresh at every queue-insertion /
+                        // scoring site because `ember_auth_state` can
+                        // advance mid-session as the peer's auth packets
+                        // arrive.
+                        let is_verified_friend = is_friend && ember_auth_state.is_verified();
                         let mut queue = self.upload_queue.lock().await;
                         let rank = if let Some(pos) =
                             queue.iter().position(|e| e.identity == queue_identity)
@@ -2815,6 +2844,15 @@ impl UploadHandler {
                             queue[pos].current_addr = Some(peer_addr);
                             queue[pos].user_hash = peer_user_hash;
                             queue[pos].file_hash = current_file_hash.unwrap_or([0u8; 16]);
+                            // If the peer has since completed PoP, upgrade
+                            // an existing queue entry's friend-slot flag
+                            // (it may have been added while auth was still
+                            // pending). Never downgrade: if the entry is
+                            // already marked is_friend_slot from a prior
+                            // verified state on the same session, leave it.
+                            if is_verified_friend {
+                                queue[pos].is_friend_slot = true;
+                            }
                             let cm = self.credit_manager.read().await;
                             let idx_snap = self.local_index.read().await;
                             let my_score = score_queue_entry(
@@ -2822,7 +2860,7 @@ impl UploadHandler {
                                 current_file_hash.unwrap_or([0u8; 16]),
                                 queue[pos].join_time.elapsed().as_secs(),
                                 Some(peer_addr), hello_caps.emule_version_min,
-                                is_friend,
+                                is_verified_friend,
                             );
                             let rank_val = compute_queue_rank(
                                 &cm, &idx_snap, &queue,
@@ -2844,7 +2882,7 @@ impl UploadHandler {
                             let new_score = score_queue_entry(
                                 &cm, &idx_snap, &peer_user_hash, new_fh,
                                 0, Some(peer_addr), hello_caps.emule_version_min,
-                                is_friend,
+                                is_verified_friend,
                             );
                             let avg_score = if queue.is_empty() { 0.0 } else {
                                 let total: f64 = queue.iter().map(|e| {
@@ -2866,7 +2904,7 @@ impl UploadHandler {
                                     join_time,
                                     add_next_connect: false,
                                     emule_version: hello_caps.emule_version_min,
-                                    is_friend_slot: is_friend,
+                                    is_friend_slot: is_verified_friend,
                                 });
                                 let rank_val = compute_queue_rank(
                                     &cm, &idx_snap, &queue,
@@ -2896,12 +2934,12 @@ impl UploadHandler {
                                 join_time,
                                 add_next_connect: false,
                                 emule_version: hello_caps.emule_version_min,
-                                is_friend_slot: is_friend,
+                                is_friend_slot: is_verified_friend,
                             });
                             let my_score = score_queue_entry(
                                 &cm, &idx_snap, &peer_user_hash, new_fh,
                                 0, Some(peer_addr), hello_caps.emule_version_min,
-                                is_friend,
+                                is_verified_friend,
                             );
                             let rank_val = compute_queue_rank(
                                 &cm, &idx_snap, &queue,
@@ -3536,10 +3574,14 @@ impl UploadHandler {
                             let cm = self.credit_manager.read().await;
                             let idx_snap = self.local_index.read().await;
                             let my_fh = current_file_hash.unwrap_or([0u8; 16]);
+                            // See queue-insertion site above: friend
+                            // priority only counts when PoP has landed
+                            // on this session.
+                            let is_verified_friend = is_friend && ember_auth_state.is_verified();
                             let my_score = score_queue_entry(
                                 &cm, &idx_snap, &peer_user_hash, my_fh,
                                 queue_wait_at_grant, Some(peer_addr),
-                                hello_caps.emule_version_min, is_friend,
+                                hello_caps.emule_version_min, is_verified_friend,
                             );
 
                             let mut best_queued_score = f64::MIN;
@@ -3595,6 +3637,14 @@ impl UploadHandler {
 
                         // Re-add to upload queue so they can get another turn
                         {
+                            // Same PoP gate as the initial queue-insertion
+                            // site: re-admitting after session-expire
+                            // uses the CURRENT verification state. If the
+                            // peer authenticated earlier on this session
+                            // and the flag is still true, they re-enter
+                            // with friend priority; if auth never
+                            // completed, they re-enter as a regular peer.
+                            let is_verified_friend = is_friend && ember_auth_state.is_verified();
                             let mut queue = self.upload_queue.lock().await;
                             if let Some(entry) =
                                 queue.iter_mut().find(|e| e.identity == queue_identity)
@@ -3602,6 +3652,9 @@ impl UploadHandler {
                                 entry.current_addr = Some(peer_addr);
                                 entry.user_hash = peer_user_hash;
                                 entry.file_hash = current_file_hash.unwrap_or([0u8; 16]);
+                                if is_verified_friend {
+                                    entry.is_friend_slot = true;
+                                }
                             } else if queue.len() < MAX_UPLOAD_QUEUE_SIZE {
                                 queue.push(QueueEntry {
                                     identity: queue_identity.clone(),
@@ -3611,7 +3664,7 @@ impl UploadHandler {
                                     join_time: queue_join_time,
                                     add_next_connect: false,
                                     emule_version: hello_caps.emule_version_min,
-                                    is_friend_slot: is_friend,
+                                    is_friend_slot: is_verified_friend,
                                 });
                             } else if queue.len() < HARD_UPLOAD_QUEUE_SIZE {
                                 // m7: Soft-to-hard zone – re-admit after session with score check
@@ -3621,7 +3674,7 @@ impl UploadHandler {
                                 let new_score = score_queue_entry(
                                     &cm, &idx_snap, &peer_user_hash, new_fh,
                                     0, Some(peer_addr), hello_caps.emule_version_min,
-                                    is_friend,
+                                    is_verified_friend,
                                 );
                                 let avg_score = if queue.is_empty() { 0.0 } else {
                                     let total: f64 = queue.iter().map(|e| {
@@ -3644,7 +3697,7 @@ impl UploadHandler {
                                         join_time: queue_join_time,
                                         add_next_connect: false,
                                         emule_version: hello_caps.emule_version_min,
-                                        is_friend_slot: is_friend,
+                                        is_friend_slot: is_verified_friend,
                                     });
                                 }
                             }
