@@ -266,6 +266,26 @@ impl FloodProtection {
         let key = (addr.ip(), opcode);
         let count = self.outgoing_requests.entry(key).or_insert(0);
         *count = count.saturating_add(1);
+        // `request_times` is dual-purpose:
+        //   1. `cleanup()` expires (ip, opcode) entries whose most
+        //      recent send is older than `TRACKER_EXPIRY_SECS` — this
+        //      requires the **latest** timestamp, otherwise a
+        //      continuously-active key would be expired out from
+        //      under live requests.
+        //   2. The `validate_response` ambiguous-PublishRes path picks
+        //      the earliest (ip, opcode) among {0x43, 0x44, 0x45} —
+        //      this would prefer the **oldest** timestamp.
+        //
+        // These two requirements are in tension with a single field.
+        // We favour correctness of (1) (never drop a live key) over
+        // precision of (2) (whose comment already admits it's a
+        // best-effort heuristic — the authoritative confirmation
+        // count is kept at the higher layer by `publish_pending`).
+        // The relative ordering within a burst still holds roughly
+        // because three concurrent publishes almost always get their
+        // first `track_request` in quick succession, and each
+        // subsequent send bumps all three keys' timestamps by
+        // similar amounts.
         self.request_times.insert(key, now);
         self.recent_ips.insert(addr.ip(), now);
     }

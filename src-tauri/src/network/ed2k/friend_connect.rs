@@ -269,6 +269,30 @@ pub async fn open_and_run_friend_session(
     let peer_ember_hash = hello_caps.ember_hash
         .ok_or_else(|| anyhow::anyhow!("Ember peer has no ember_hash"))?;
 
+    // Early duplicate-session check. As soon as we know the peer's
+    // ember_hash (from `exchange_ember_hello` above) we can tell whether
+    // a session is already live for them, and bail out BEFORE the
+    // expensive Ed25519 challenge-response round trip and before we
+    // send `OP_EMBER_FRIEND_REQ`. Previously we did this check only
+    // after `perform_ember_auth` + FRIEND_REQ had both completed, which:
+    //   1. Wasted ~4 RTTs of auth on a connection we immediately drop.
+    //   2. Left the peer with a ghost `EmberFriendRequest` UploadEvent
+    //      whose sender's half-connection was already being closed, so
+    //      any accept from the UI raced a TCP RST and silently failed.
+    //
+    // We re-verify the slot is still empty when we finally claim it
+    // below (after auth), so no race window widens here.
+    {
+        let sessions = ember_sessions.read().await;
+        if let Some(existing_tx) = sessions.get(&peer_ember_hash) {
+            info!(
+                "Friend session for {} already exists after Ember-Hello; skipping duplicate handshake",
+                hex::encode(peer_ember_hash)
+            );
+            return Ok(FriendSessionHandle { outbound_tx: existing_tx.clone() });
+        }
+    }
+
     // Ember auth challenge-response. Now that `OP_EMBER_HELLO` is
     // exchanged above, `hello_caps.ember_pubkey` is populated and
     // this branch performs a real Ed25519 proof-of-possession round
@@ -304,19 +328,40 @@ pub async fn open_and_run_friend_session(
             .map(|pk| crate::network::ember::crypto::verify_ember_hash_binding(pk, &peer_ember_hash))
             .unwrap_or(false);
 
-    write_packet(&mut writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, our_nickname.as_bytes()).await?;
-
-    info!("Friend session handshake with {} complete (hash={}, binding_verified={ember_hash_binding_verified})", addr, hex::encode(peer_ember_hash));
-
+    // Reserve the session slot atomically BEFORE we send our friend
+    // request. If another concurrent dial raced us and claimed the
+    // slot in the window between the pre-auth check above and here,
+    // we must NOT send our own FRIEND_REQ (the peer would get a
+    // duplicate request from the racing connection too) — return
+    // the winner's handle instead and drop this socket cleanly.
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
     {
         let mut sessions = ember_sessions.write().await;
         if let Some(existing_tx) = sessions.get(&peer_ember_hash) {
-            info!("Friend session for {} already exists, skipping duplicate", hex::encode(peer_ember_hash));
+            info!(
+                "Friend session for {} already exists (post-auth race); skipping duplicate",
+                hex::encode(peer_ember_hash)
+            );
             return Ok(FriendSessionHandle { outbound_tx: existing_tx.clone() });
         }
         sessions.insert(peer_ember_hash, outbound_tx.clone());
     }
+
+    // Only send the friend request once the slot is reserved. If
+    // this write fails we must remove the slot we just inserted —
+    // otherwise the map leaks an entry whose receiver is about to
+    // be dropped, and every subsequent `outbound_tx.send(...)` from
+    // lookups on that hash would fail with "channel closed".
+    if let Err(e) =
+        write_packet(&mut writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, our_nickname.as_bytes()).await
+    {
+        let mut sessions = ember_sessions.write().await;
+        sessions.remove(&peer_ember_hash);
+        return Err(anyhow::Error::from(e)
+            .context("failed to send OP_EMBER_FRIEND_REQ"));
+    }
+
+    info!("Friend session handshake with {} complete (hash={}, binding_verified={ember_hash_binding_verified})", addr, hex::encode(peer_ember_hash));
 
     let handle = FriendSessionHandle { outbound_tx };
 

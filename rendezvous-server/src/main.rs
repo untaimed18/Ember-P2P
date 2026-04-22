@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -99,15 +102,23 @@ struct PunchEntry {
 /// socket. The `Option` is `Some` until peer2 grabs it on join.
 ///
 /// `peer2_announce_tx` is a one-shot used by peer2 (on join) to hand its
-/// own inbound `Sender<Vec<u8>>` to peer1's still-running loop. Peer1
-/// awaits the receiver side; once it fires, peer1 forwards inbound WS
-/// payloads to peer2's inbox.
+/// own inbound `Sender<Vec<u8>>` — along with a clone of the shared
+/// `total_bytes` counter — to peer1's still-running loop. Peer1 awaits
+/// the receiver side; once it fires, peer1 forwards inbound WS payloads
+/// to peer2's inbox and counts bytes against the same shared cap that
+/// `bridge_relay` uses on peer2's side. Previously each half tracked
+/// its own local counter, which double-counted peer1→peer2 traffic (it
+/// passed through both loops) and never combined with peer2→peer1
+/// traffic — making the 256 KiB `RELAY_BANDWIDTH_CAP_BYTES` cap
+/// effectively vary per-direction and per-attach-order.
 ///
 /// Replaces the older single-direction relay where peer1's WS frames
 /// were silently dropped. The bridge is now genuinely full-duplex.
 struct RelaySessionEntry {
     peer1_inbox_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    peer2_announce_tx: Option<tokio::sync::oneshot::Sender<tokio::sync::mpsc::Sender<Vec<u8>>>>,
+    peer2_announce_tx: Option<
+        tokio::sync::oneshot::Sender<(tokio::sync::mpsc::Sender<Vec<u8>>, Arc<AtomicUsize>)>,
+    >,
     #[allow(dead_code)]
     first_ip: IpAddr,
     created_at: Instant,
@@ -604,22 +615,38 @@ async fn handle_relay_ws(
         };
 
         let (peer2_inbox_tx, peer2_inbox_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-        // Hand peer2's inbox sender to peer1. If peer1's loop has
-        // already exited (timeout/close/etc.), this fails — drop it on
-        // the floor; the bridge is moot.
-        if announce_tx.send(peer2_inbox_tx).is_err() {
+        // Allocate the shared byte counter on the peer2 side so we can
+        // hand a clone to peer1 through the announce channel. Both
+        // halves will count against it.
+        let total_bytes = Arc::new(AtomicUsize::new(0));
+        // Hand peer2's inbox sender + shared counter to peer1. If peer1's
+        // loop has already exited (timeout/close/etc.), this fails —
+        // drop it on the floor; the bridge is moot.
+        if announce_tx
+            .send((peer2_inbox_tx, total_bytes.clone()))
+            .is_err()
+        {
             let _ = socket.send(Message::Close(None)).await;
             cleanup_relay(&state, &session_id, client_ip).await;
             return;
         }
         info!("relay session {} bridged (peer2={})", &session_id[..8.min(session_id.len())], client_ip);
-        bridge_relay(socket, peer1_inbox_tx, peer2_inbox_rx, &state, &session_id, client_ip).await;
+        bridge_relay(
+            socket,
+            peer1_inbox_tx,
+            peer2_inbox_rx,
+            total_bytes,
+            &state,
+            &session_id,
+            client_ip,
+        )
+        .await;
     } else {
         // First peer — set up the rendezvous slot and run the peer1
         // loop until peer2 joins (announce_rx fires) or we time out.
         let (peer1_inbox_tx, peer1_inbox_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         let (peer2_announce_tx, peer2_announce_rx) =
-            tokio::sync::oneshot::channel::<tokio::sync::mpsc::Sender<Vec<u8>>>();
+            tokio::sync::oneshot::channel::<(tokio::sync::mpsc::Sender<Vec<u8>>, Arc<AtomicUsize>)>();
 
         sessions.insert(session_id.clone(), RelaySessionEntry {
             peer1_inbox_tx: Some(peer1_inbox_tx),
@@ -642,17 +669,30 @@ async fn handle_relay_ws(
 /// peer1 should not transmit before peer2 attaches). Once peer2's
 /// inbox sender arrives, the same loop forwards inbound WS frames
 /// to it and drains `peer1_inbox_rx` to the WebSocket.
+///
+/// Pre-bridge byte accounting note: dropped pre-bridge bytes must
+/// NOT count against `RELAY_BANDWIDTH_CAP_BYTES`. Earlier logic did
+/// count them, which let a misbehaving peer1 silently burn the
+/// session's entire relay budget with junk frames before peer2 ever
+/// attached, so peer2's legitimate first Binary frame would
+/// immediately trip the cap and tear the bridge down. We now only
+/// accumulate bytes that are actually forwarded, and only after
+/// peer2 has joined (at which point `total_bytes` is the shared
+/// counter passed from the peer2 side of the bridge).
 async fn run_peer1_loop(
     mut socket: WebSocket,
     mut peer1_inbox_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-    peer2_announce_rx: tokio::sync::oneshot::Receiver<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    peer2_announce_rx: tokio::sync::oneshot::Receiver<(
+        tokio::sync::mpsc::Sender<Vec<u8>>,
+        Arc<AtomicUsize>,
+    )>,
     session_id: &str,
 ) {
     let idle_timeout = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
     tokio::pin!(idle_timeout);
     let mut announce_rx = Some(peer2_announce_rx);
     let mut peer2_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>> = None;
-    let mut total_bytes: usize = 0;
+    let mut total_bytes: Option<Arc<AtomicUsize>> = None;
     let session_deadline = Instant::now() + RELAY_SESSION_TIMEOUT;
 
     loop {
@@ -664,8 +704,9 @@ async fn run_peer1_loop(
             announced = async { announce_rx.as_mut().unwrap().await }, if announce_rx.is_some() => {
                 announce_rx = None;
                 match announced {
-                    Ok(tx) => {
+                    Ok((tx, counter)) => {
                         peer2_tx = Some(tx);
+                        total_bytes = Some(counter);
                     }
                     Err(_) => {
                         // Sender was dropped (peer2 join handler aborted before sending).
@@ -676,20 +717,22 @@ async fn run_peer1_loop(
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
-                        total_bytes += data.len();
-                        if total_bytes > RELAY_BANDWIDTH_CAP_BYTES {
-                            info!("relay session {} bandwidth cap reached", &session_id[..8.min(session_id.len())]);
-                            break;
-                        }
-                        if let Some(ref tx) = peer2_tx {
+                        // Only count (and forward) bytes once peer2 is
+                        // attached; pre-bridge frames are dropped with
+                        // zero cap impact so a noisy peer1 can't
+                        // starve the session before peer2 joins.
+                        if let (Some(ref tx), Some(ref counter)) = (&peer2_tx, &total_bytes) {
+                            let new_total =
+                                counter.fetch_add(data.len(), Ordering::Relaxed) + data.len();
+                            if new_total > RELAY_BANDWIDTH_CAP_BYTES {
+                                info!("relay session {} bandwidth cap reached (peer1→peer2)", &session_id[..8.min(session_id.len())]);
+                                break;
+                            }
                             if tx.send(data.to_vec()).await.is_err() {
                                 break;
                             }
                         }
-                        // Pre-bridge: drop. Peer1 should not be sending
-                        // before peer2 has attached; if it does, we
-                        // refuse to buffer to avoid an unbounded queue
-                        // attack.
+                        // else: pre-bridge, drop silently.
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
@@ -716,15 +759,24 @@ async fn run_peer1_loop(
 /// established when peer2 joined: `peer1_inbox_tx` ferries inbound
 /// peer2 WS frames to peer1, `peer2_inbox_rx` drains peer1's frames
 /// onto peer2's WebSocket.
+///
+/// `total_bytes` is the per-session shared counter; peer1's loop
+/// holds a clone and increments it for peer1→peer2 frames when it
+/// forwards them, and we increment here for peer2→peer1 frames.
+/// That way the 256 KiB cap applies uniformly to the sum of both
+/// directions. We do NOT re-count on the `peer2_inbox_rx` drain
+/// side — those bytes were already counted once by peer1's loop
+/// when they entered the relay; counting them again would
+/// double-charge the same payload.
 async fn bridge_relay(
     mut socket: WebSocket,
     peer1_inbox_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     mut peer2_inbox_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    total_bytes: Arc<AtomicUsize>,
     state: &AppState,
     session_id: &str,
     client_ip: IpAddr,
 ) {
-    let mut total_bytes: usize = 0;
     let deadline = Instant::now() + RELAY_SESSION_TIMEOUT;
 
     loop {
@@ -732,8 +784,13 @@ async fn bridge_relay(
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
-                        total_bytes += data.len();
-                        if total_bytes > RELAY_BANDWIDTH_CAP_BYTES {
+                        let new_total =
+                            total_bytes.fetch_add(data.len(), Ordering::Relaxed) + data.len();
+                        if new_total > RELAY_BANDWIDTH_CAP_BYTES {
+                            info!(
+                                "relay session {} bandwidth cap reached (peer2→peer1)",
+                                &session_id[..8.min(session_id.len())]
+                            );
                             break;
                         }
                         if peer1_inbox_tx.send(data.to_vec()).await.is_err() {
@@ -747,8 +804,12 @@ async fn bridge_relay(
             data = peer2_inbox_rx.recv() => {
                 match data {
                     Some(bytes) => {
-                        total_bytes += bytes.len();
-                        if total_bytes > RELAY_BANDWIDTH_CAP_BYTES {
+                        // Cheap guard: if peer1's loop has already
+                        // pushed us over the cap via its own
+                        // `fetch_add`, don't keep forwarding. No
+                        // second `fetch_add` here — those bytes were
+                        // already counted on entry.
+                        if total_bytes.load(Ordering::Relaxed) > RELAY_BANDWIDTH_CAP_BYTES {
                             break;
                         }
                         if socket.send(Message::Binary(axum::body::Bytes::from(bytes))).await.is_err() {
@@ -804,21 +865,29 @@ async fn sweep_expired(state: AppState) {
         tokio::time::sleep(SWEEP_INTERVAL).await;
         let now = Instant::now();
 
+        // Each map gets its OWN scoped write-lock guard so only one lock
+        // is held at a time. Previously the rate_limits sweep was
+        // duplicated (the second copy was unscoped) which held that
+        // lock for the entire sweep body; meanwhile `punches` and
+        // `relays` guards below were also un-scoped, blocking all
+        // user-facing handlers that needed any of those maps for the
+        // whole sweep cycle. Scoping keeps the critical sections
+        // minimal and lets register/lookup/punch requests interleave
+        // with the sweep.
         {
             let mut limits = state.rate_limits.write().await;
             limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
         }
 
-        let mut limits = state.rate_limits.write().await;
-        limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
-
         // Sweep expired punch requests
-        let mut punches = state.punch_requests.write().await;
-        let punch_before = punches.len();
-        punches.retain(|_, e| now.duration_since(e.created_at) < PUNCH_TTL);
-        let punch_removed = punch_before - punches.len();
-        if punch_removed > 0 {
-            info!("swept {} expired punch requests", punch_removed);
+        {
+            let mut punches = state.punch_requests.write().await;
+            let punch_before = punches.len();
+            punches.retain(|_, e| now.duration_since(e.created_at) < PUNCH_TTL);
+            let punch_removed = punch_before - punches.len();
+            if punch_removed > 0 {
+                info!("swept {} expired punch requests", punch_removed);
+            }
         }
 
         // Sweep expired relay invites
@@ -831,12 +900,14 @@ async fn sweep_expired(state: AppState) {
         }
 
         // Sweep stale relay sessions (created but never bridged)
-        let mut relays = state.relay_sessions.write().await;
-        let relay_before = relays.len();
-        relays.retain(|_, e| now.duration_since(e.created_at) < RELAY_SESSION_TIMEOUT);
-        let relay_removed = relay_before - relays.len();
-        if relay_removed > 0 {
-            info!("swept {} stale relay sessions", relay_removed);
+        {
+            let mut relays = state.relay_sessions.write().await;
+            let relay_before = relays.len();
+            relays.retain(|_, e| now.duration_since(e.created_at) < RELAY_SESSION_TIMEOUT);
+            let relay_removed = relay_before - relays.len();
+            if relay_removed > 0 {
+                info!("swept {} stale relay sessions", relay_removed);
+            }
         }
     }
 }
