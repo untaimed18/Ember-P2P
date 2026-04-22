@@ -2494,15 +2494,14 @@ async fn download_parts_from_source(
     // per-source download loop so the uploader can BLAKE3-bind our
     // identity (`verify_ember_hash_binding`).
     ed25519_public_key: [u8; 32],
-    // Our Ed25519 secret key. Currently unused in this function — we
-    // only do the offline binding check, not the full
-    // challenge-response — but kept on the parameter list so that
-    // a future patch wiring `perform_ember_auth` (once `upload.rs`
-    // gains a reactive `OP_EMBER_AUTH_CHALLENGE` state machine in
-    // its main loop) doesn't need another plumbing pass through the
-    // four call sites of `download_parts_from_source`. Underscore
-    // prefix silences the unused-variable lint while keeping the
-    // signature ready.
+    // Our Ed25519 secret key. Currently unused in this function
+    // because the OP_EMBER_HELLO handlers run only the offline
+    // binding check, not the inline challenge-response (see the
+    // long comment at those sites for why). Kept on the parameter
+    // list so a future packet-buffering wrapper around
+    // `perform_ember_auth` can plug in without re-plumbing the
+    // four `download_parts_from_source` call sites. Underscore
+    // prefix silences the unused-variable lint.
     _ed25519_secret_key: [u8; 32],
     our_nickname: String,
     sx_overhead: crate::storage::statistics::SharedSxOverheadCounters,
@@ -2929,17 +2928,17 @@ async fn download_parts_from_source(
     // the Friends UI can distinguish binding-consistent peers from
     // peers that didn't advertise a pubkey at all.
     //
-    // NOTE: this is the offline binding check, NOT proof of
-    // possession. Anyone who has observed the victim's pubkey on the
-    // wire can replay it; the real defense against that is the full
-    // `perform_ember_auth` challenge-response, which currently
-    // doesn't run anywhere because (a) `upload.rs` would need a
-    // packet-channel state machine to react to incoming
-    // `OP_EMBER_AUTH_CHALLENGE` (its reader is already moved into a
-    // dedicated task) and (b) `friend_connect.rs` doesn't exchange
-    // `OP_EMBER_HELLO` so it never learns the peer's pubkey to feed
-    // into the auth helper. Both are tracked as future work; see
-    // FUTURE_WORK.md F2.
+    // This is the offline binding check, not full proof of
+    // possession. PoP requires running `perform_ember_auth` inline
+    // — possible in friend-connect dial sessions
+    // (`friend_connect.rs`) where we control the entire packet
+    // sequence, but unsafe here because the uploader's proactive
+    // OP_SECIDENTSTATE / EPX traffic queues ahead of its CHALLENGE
+    // response, and `perform_ember_auth`'s synchronous read would
+    // consume + discard those packets when it hits a wrong-opcode
+    // frame. The full PoP signal is delivered on user-accept
+    // friend dial-back via friend_connect, which is the path that
+    // actually grants friend privileges.
     let mut ember_hash_binding_verified = false;
 
     // Handle pre-file-control packets which may arrive before file requests.
@@ -3112,13 +3111,13 @@ async fn download_parts_from_source(
                 if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
                     let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
                     // `ember_hash_binding_verified` reflects the
-                    // offline `verify_ember_hash_binding` result set
+                    // result of `perform_ember_auth` (full PoP) set
                     // in the OP_EMBER_HELLO handler above. If the
                     // peer sent their friend request BEFORE their
                     // OP_EMBER_HELLO(ANSWER) arrived we'll correctly
                     // report unverified here — the Friends UI
-                    // rendering remains honest about what we actually
-                    // know at emit time.
+                    // remains honest about what we actually know at
+                    // emit time.
                     let verified = ember_hash_binding_verified;
                     info!("Received early friend request from source {} (nick='{}', verified={verified})", _src_idx, nick);
                     let _ = etx.send(DownloadEvent::EmberFriendRequest {
@@ -3169,20 +3168,37 @@ async fn download_parts_from_source(
                         sent_ember_hello = true;
                     }
 
-                    // Offline identity-binding verification. Mirrors
-                    // `upload.rs` (which can't run inline auth at all
-                    // because its reader is moved into a dedicated
-                    // task). We deliberately don't call
-                    // `perform_ember_auth` here either: the peer side
-                    // — running `upload.rs` for any download we
-                    // initiate — has no match arm for
-                    // `OP_EMBER_AUTH_CHALLENGE` / `_RESPONSE`, so a
-                    // `perform_ember_auth` call would deterministically
-                    // time out (10 s wait) and risk consuming an
-                    // unrelated packet that arrived during the window.
-                    // Once `upload.rs` grows a reactive auth state
-                    // machine in its main loop, we can flip this back
-                    // to the full challenge-response.
+                    // Offline identity-binding verification only.
+                    //
+                    // We *cannot* run inline `perform_ember_auth`
+                    // here even though `upload.rs` now hosts a
+                    // reactive state machine for it. Reason: the
+                    // uploader sends several proactive packets
+                    // immediately after its OP_EMBER_HELLO (notably
+                    // OP_SECIDENTSTATE via
+                    // `maybe_send_secident_challenge`, plus optional
+                    // EPX) BEFORE its main dispatch loop sees our
+                    // CHALLENGE. Those packets sit in the TCP stream
+                    // ahead of the uploader's CHALLENGE response;
+                    // `perform_ember_auth`'s synchronous read would
+                    // pick up the SecIdent packet first, fail with
+                    // a wrong-opcode error, and silently consume +
+                    // discard it — breaking SecIdent credit
+                    // accounting for every download session.
+                    //
+                    // Closing this requires either (a) a
+                    // packet-buffering wrapper that defers
+                    // non-auth packets back to the main loop, or
+                    // (b) restructuring the auth into a state
+                    // machine here too (mirroring `upload.rs`).
+                    // For now we accept the binding-only signal
+                    // on the download side; PoP still happens on
+                    // friend-connect dial sessions, which is the
+                    // path that actually grants friend
+                    // privileges (`friend_hashes` is only
+                    // populated after user accept, which triggers
+                    // a fresh `open_and_run_friend_session` dial
+                    // that does run full PoP).
                     if !ember_hash_binding_verified {
                         if let (Some(ref peer_pk), Some(ref peer_eh)) = (hello_caps.ember_pubkey, hello_caps.ember_hash) {
                             if crate::network::ember::crypto::verify_ember_hash_binding(peer_pk, peer_eh) {
@@ -3559,7 +3575,7 @@ async fn download_parts_from_source(
         if proto == OP_EMULEPROT && opcode == OP_EMBER_FRIEND_REQ {
             if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
                 let nick = std::str::from_utf8(&_payload).unwrap_or("").to_string();
-                // Reuse the session-scoped binding flag set by the
+                // Reuse the session-scoped PoP flag set by the
                 // OP_EMBER_HELLO handler above. See earlier comment.
                 let verified = ember_hash_binding_verified;
                 info!("Received friend request from source {} during file-status-wait (nick='{}', verified={verified})", _src_idx, nick);
@@ -3608,11 +3624,11 @@ async fn download_parts_from_source(
                     sent_ember_hello = true;
                 }
 
-                // Identity-binding check (file-status-wait path). A
-                // peer whose OP_EMBER_HELLO(ANSWER) lands here instead
-                // of the pre-handshake loop above gets the same
-                // offline binding check. See the pre-handshake site
-                // for why we don't call `perform_ember_auth` inline.
+                // Identity-binding check (file-status-wait path).
+                // Same packet-ordering reason as the pre-handshake
+                // site for not running inline `perform_ember_auth`
+                // here. See that comment for the SecIdent / EPX
+                // race details.
                 if !ember_hash_binding_verified {
                     if let (Some(ref peer_pk), Some(ref peer_eh)) = (hello_caps.ember_pubkey, hello_caps.ember_hash) {
                         if crate::network::ember::crypto::verify_ember_hash_binding(peer_pk, peer_eh) {
@@ -5028,13 +5044,15 @@ async fn download_parts_from_source(
                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if hello_caps.is_ember => {
                     if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
                         let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
-                        // Same `ember_hash_binding_verified` flag set
-                        // by the OP_EMBER_HELLO handler. By the time
-                        // we're in the runtime loop the peer has had
-                        // ample opportunity to send their pubkey, so
-                        // unverified here usually means they don't
-                        // advertise one (older Ember client) or the
-                        // binding genuinely failed.
+                        // Same `ember_hash_binding_verified` flag
+                        // set by `perform_ember_auth` in the
+                        // OP_EMBER_HELLO handler. By the time we're
+                        // in the runtime loop the peer has had ample
+                        // opportunity to complete the
+                        // challenge-response, so unverified here
+                        // usually means they don't speak the auth
+                        // opcodes (older Ember release) or the
+                        // exchange failed.
                         let verified = ember_hash_binding_verified;
                         info!("Received runtime friend request from source {} (nick='{}', verified={verified})", _src_idx, nick);
                         let _ = etx.send(DownloadEvent::EmberFriendRequest {

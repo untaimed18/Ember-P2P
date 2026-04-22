@@ -414,18 +414,11 @@ struct UploadHandler {
     /// endian public-key encoding, derived deterministically from
     /// `ed25519_secret_key` at identity-load time.
     ed25519_public_key: [u8; 32],
-    /// Our Ed25519 secret key. Reserved for a future channel-based
-    /// refactor of the upload read-loop that would let us run
-    /// `perform_ember_auth` inline on upload sessions. The current
-    /// upload architecture moves the reader into a dedicated
-    /// `reader_task` (see the spawn in `handle_incoming` below), so
-    /// we cannot call `perform_ember_auth` without first restructuring
-    /// the packet-channel plumbing. Uploads currently gate trust on
-    /// the offline `verify_ember_hash_binding` check instead — full
-    /// proof-of-possession runs on the download side
-    /// (`multi_source.rs`) and on friend-session dials
-    /// (`friend_connect.rs::open_friend_session`).
-    #[allow(dead_code)]
+    /// Our Ed25519 secret key. Used by the reactive Ember auth
+    /// state machine (`super::ember_auth`) to sign the peer's
+    /// random nonce when they initiate a challenge-response from
+    /// the download side. Never serialized to the wire or to disk
+    /// from here.
     ed25519_secret_key: [u8; 32],
     /// Live friend user-hash set for friend-slot priority boost
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
@@ -1817,22 +1810,23 @@ impl UploadHandler {
         // Session-scoped Ember identity-binding flag. Set when the
         // peer advertises an Ed25519 pubkey whose BLAKE3 prefix
         // matches their claimed `ember_hash`
-        // (`verify_ember_hash_binding`). Carried into every
-        // `UploadEventKind::EmberFriendRequest` emitted from this
-        // session as the `verified` field so the Friends UI can
-        // distinguish peers who advertised a binding-consistent
-        // pubkey from those who didn't.
-        //
-        // This is the OFFLINE binding check, not a proof of
-        // possession. An attacker who has observed the victim's
-        // pubkey on the wire can replay it and pass this check.
-        // Closing that gap requires the reactive
-        // `OP_EMBER_AUTH_CHALLENGE`/`OP_EMBER_AUTH_RESPONSE` state
-        // machine described below — the upload session's read half
-        // is owned by a dedicated reader task (see `reader_task`
-        // further down) so we can't drive `perform_ember_auth`
-        // inline here today.
+        // (`verify_ember_hash_binding`). This is the OFFLINE binding
+        // check; on its own it does NOT imply proof of possession
+        // (a peer who has merely observed the victim's pubkey on
+        // the wire could replay it). The reactive auth state
+        // machine below (`ember_auth_state`) provides the full PoP
+        // signal; we prefer that when available and fall back to
+        // this binding flag only if auth never completes.
         let mut ember_hash_binding_verified = false;
+        // Reactive Ember Ed25519 challenge-response state machine.
+        // Driven by inbound `OP_EMBER_AUTH_CHALLENGE` /
+        // `OP_EMBER_AUTH_RESPONSE` packets dispatched from the
+        // reader task; transitions to `Verified` only after we've
+        // seen a sig over our random nonce that decodes against the
+        // peer's advertised pubkey AND the pubkey BLAKE3-binds to
+        // their `ember_hash`. See `super::ember_auth` for the full
+        // state diagram and tests.
+        let mut ember_auth_state = super::ember_auth::EmberAuthState::default();
         {
             // Advertise our Ed25519 pubkey alongside the ember_hash so
             // the peer can run `verify_ember_hash_binding` on our side
@@ -4263,22 +4257,21 @@ impl UploadHandler {
                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if hello_caps.is_ember => {
                     if let Some(eh) = peer_ember_hash {
                         let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
-                        // `verified` is the session-scoped
-                        // `ember_hash_binding_verified` flag set by
-                        // `verify_ember_hash_binding` in the
-                        // OP_EMBER_HELLO handler above. A true value
-                        // means the peer's advertised pubkey
-                        // BLAKE3-binds to their advertised
-                        // `ember_hash` — i.e. they're consistent
-                        // about which key backs the identity they're
-                        // claiming. It does NOT yet imply proof of
-                        // possession (replay of an observed pubkey
-                        // would still pass). A false value means no
-                        // pubkey was advertised, or the binding
-                        // failed; the request still surfaces for
-                        // user approval, with an unverified badge.
-                        let verified = ember_hash_binding_verified;
-                        info!("Received friend request from {peer_addr} (nick='{}', hash={}, verified={verified})", nick, hex::encode(eh));
+                        // Prefer the strong PoP signal from the
+                        // reactive challenge-response state machine;
+                        // fall back to the offline binding check
+                        // when auth never completed (e.g. peer is an
+                        // older Ember release that doesn't speak the
+                        // CHALLENGE/RESPONSE opcodes). PoP true
+                        // implies binding true (the response handler
+                        // verifies the binding before transitioning
+                        // to Verified), so this never down-rates a
+                        // verified session.
+                        let verified = ember_auth_state.is_verified() || ember_hash_binding_verified;
+                        info!(
+                            "Received friend request from {peer_addr} (nick='{}', hash={}, verified={verified}, pop={}, binding={ember_hash_binding_verified})",
+                            nick, hex::encode(eh), ember_auth_state.is_verified(),
+                        );
                         let _ = self.upload_event_tx.send(UploadEvent {
                             transfer_id: String::new(),
                             kind: UploadEventKind::EmberFriendRequest {
@@ -4289,6 +4282,78 @@ impl UploadHandler {
                                 verified,
                             },
                         }).await;
+                    }
+                }
+
+                // Ember Ed25519 challenge-response — responder side.
+                // The download peer drives a synchronous round-trip
+                // via `friend_connect::perform_ember_auth`; we react
+                // here from the dispatcher because our reader is
+                // owned by `reader_task` and we can't drive a
+                // synchronous read from this site. See
+                // `super::ember_auth` for the state-machine details.
+                //
+                // Both arms write outbound packets directly via
+                // `write_packet_async` rather than rerouting through
+                // the reader task, which is safe because the
+                // dispatcher is the sole writer on this session.
+                (OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE) => {
+                    match super::ember_auth::handle_challenge(
+                        &mut ember_auth_state,
+                        &payload,
+                        &self.ed25519_public_key,
+                        &self.ed25519_secret_key,
+                    ) {
+                        Ok(out) => {
+                            if let Some(challenge_payload) = out.our_challenge_payload {
+                                let _ = write_packet_async(
+                                    &mut writer,
+                                    OP_EMULEPROT,
+                                    OP_EMBER_AUTH_CHALLENGE,
+                                    &challenge_payload,
+                                ).await;
+                            }
+                            if let Some(response_payload) = out.our_response_payload {
+                                let _ = write_packet_async(
+                                    &mut writer,
+                                    OP_EMULEPROT,
+                                    OP_EMBER_AUTH_RESPONSE,
+                                    &response_payload,
+                                ).await;
+                            }
+                            debug!("Ember auth (responder): replied to {peer_addr}'s CHALLENGE; awaiting RESPONSE");
+                        }
+                        Err(e) => {
+                            tracing::warn!("Ember auth (responder): rejected CHALLENGE from {peer_addr}: {e:?}");
+                        }
+                    }
+                }
+
+                (OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE) => {
+                    let outcome = match (hello_caps.ember_pubkey.as_ref(), peer_ember_hash.as_ref()) {
+                        (Some(pk), Some(eh)) => super::ember_auth::handle_response(
+                            &mut ember_auth_state,
+                            &payload,
+                            pk,
+                            eh,
+                        ),
+                        // Theoretical race: peer sent RESPONSE before
+                        // we finished parsing their OP_EMBER_HELLO.
+                        // TCP guarantees ordering of their writes so
+                        // this should not happen with a
+                        // well-behaved initiator (it always sends
+                        // OP_EMBER_HELLO before CHALLENGE before
+                        // RESPONSE) — but if it does, refuse to
+                        // verify rather than guess.
+                        _ => Err(super::ember_auth::AuthError::PeerPubkeyUnknown),
+                    };
+                    match outcome {
+                        Ok(()) => {
+                            info!("Ember auth (responder): peer {peer_addr} verified (proof of possession)");
+                        }
+                        Err(e) => {
+                            tracing::warn!("Ember auth (responder): rejected RESPONSE from {peer_addr}: {e:?}");
+                        }
                     }
                 }
 

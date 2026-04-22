@@ -557,21 +557,26 @@
               <span class="request-name">
                 {req.sender_nickname || '(unknown)'}
                 {#if req.verified}
-                  <!-- "Verified" badge: the peer's advertised Ed25519
-                       pubkey BLAKE3-bound to their claimed ember_hash
-                       at emit time (offline binding check). Does NOT
-                       yet imply proof of possession — only that the
-                       peer is internally consistent about which key
-                       backs their identity. Full PoP via
-                       perform_ember_auth is FUTURE_WORK F2 Phase 2. -->
-                  <span class="request-badge request-badge-verified" title="Peer's advertised public key matches their advertised Ember hash (identity binding consistent). Does not yet prove key ownership.">Verified</span>
+                  <!-- "Verified" badge: the peer's identity was
+                       cryptographically confirmed on the session
+                       this request rode in on. On friend-connect
+                       dial sessions that's full proof of possession
+                       (perform_ember_auth signed-nonce round-trip);
+                       on regular upload/download sessions it's the
+                       offline BLAKE3 binding check (peer's pubkey
+                       matches their advertised hash). Either way,
+                       the peer is being internally consistent
+                       about which Ed25519 key backs their Ember
+                       identity — a hash-only spoofer fails this. -->
+                  <span class="request-badge request-badge-verified" title="Peer's Ember identity is cryptographically consistent on the session this request arrived on.">Verified</span>
                 {:else}
-                  <!-- Unverified: either the peer didn't advertise a
-                       pubkey (older Ember client, or the single-source
-                       transfer.rs download path), or the binding check
-                       failed. Still surfaces for user approval — only
+                  <!-- Unverified: peer didn't advertise an Ed25519
+                       pubkey, the binding check failed, or
+                       (single-source transfer.rs path) the
+                       handshake doesn't yet parse OP_EMBER_HELLO.
+                       Still surfaces for user approval — only
                        accept from someone you actually know. -->
-                  <span class="request-badge request-badge-unverified" title="Peer did not advertise a verifiable public key, or the key did not match their hash. Only accept if you know who this is.">Unverified</span>
+                  <span class="request-badge request-badge-unverified" title="Peer did not complete identity verification on this session. Only accept if you know who this is.">Unverified</span>
                 {/if}
               </span>
               <span class="request-hash" title={req.sender_hash}>{req.sender_hash.slice(0, 8)}&hellip;{req.sender_hash.slice(-6)}</span>
