@@ -1315,10 +1315,6 @@ pub enum NetworkCommand {
     FindFriendAndConnect {
         ember_hash: [u8; 16],
     },
-    EnsureFriendSession {
-        ember_hash: [u8; 16],
-        tx: oneshot::Sender<Result<(), String>>,
-    },
     RetryFriendSearch {
         ember_hash: [u8; 16],
         tx: oneshot::Sender<Result<(), String>>,
@@ -1326,30 +1322,7 @@ pub enum NetworkCommand {
     IsFriendDiscoverable {
         tx: oneshot::Sender<bool>,
     },
-    GetPeerReputation {
-        user_hash: [u8; 16],
-        tx: oneshot::Sender<Option<PeerReputationInfo>>,
-    },
-    GetReputationStats {
-        tx: oneshot::Sender<ReputationStatsInfo>,
-    },
     Shutdown,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PeerReputationInfo {
-    pub score: i32,
-    pub successful_transfers: u64,
-    pub failed_transfers: u64,
-    pub is_banned: bool,
-    pub first_seen: u64,
-    pub last_interaction: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ReputationStatsInfo {
-    pub tracked_peers: usize,
-    pub banned_peers: usize,
 }
 
 struct PendingDownload {
@@ -7863,12 +7836,29 @@ pub async fn start_network(
                                         );
                                         let _ = app_handle.emit(
                                             "transfer-source-detail",
+                                            // Normalized to the full 12-field shape other emit
+                                            // sites use so the frontend source-detail listener
+                                            // sees a consistent payload whether it arrives here
+                                            // (permanent-failed source, dropped via failure ring)
+                                            // or on one of the other terminal paths. Missing
+                                            // fields get explicit `null`/`0` defaults so a
+                                            // future refactor that ever switches this emit away
+                                            // from `status="failed"` (the status the frontend
+                                            // filters out) won't leave `undefined` showing up
+                                            // in the UI's `SourceInfo.speed` / `.transferred`.
                                             serde_json::json!({
                                                 "transfer_id": tid,
                                                 "ip": ip_str,
                                                 "port": src.port,
                                                 "status": "failed",
+                                                "queue_rank": null,
+                                                "speed": 0,
+                                                "transferred": 0,
                                                 "client_software": src.client_software,
+                                                "peer_name": "",
+                                                "available_parts": null,
+                                                "total_parts": null,
+                                                "country_code": null,
                                             }),
                                         );
                                     }
@@ -17763,100 +17753,6 @@ async fn handle_command(
             );
 
             let _ = tx.send(Ok(()));
-        }
-
-        NetworkCommand::EnsureFriendSession { ember_hash: target_hash, tx } => {
-            // Already have a session?
-            if state.ember_sessions.read().await.contains_key(&target_hash) {
-                let _ = tx.send(Ok(()));
-                return;
-            }
-            // Already connecting?
-            if state.outbound_session_tasks.contains_key(&target_hash) {
-                let _ = tx.send(Ok(()));
-                return;
-            }
-            // Look up friend address from DB
-            let db2 = db.clone();
-            let hash_hex = hex::encode(target_hash);
-            let addr_opt = tokio::task::spawn_blocking(move || db2.get_friend_address(&hash_hex))
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .flatten();
-
-            if let Some((ip_str, port)) = addr_opt {
-                if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
-                    let addr = SocketAddr::new(ip.into(), port);
-                    state.outbound_session_tasks.insert(target_hash, std::time::Instant::now());
-                    let our_user_hash = state.user_hash;
-                    let nickname = settings.nickname.clone();
-                    let client_id = state.external_ip
-                        .map(|eip| u32::from_le_bytes(eip.octets()))
-                        .unwrap_or(0);
-                    let tcp = settings.tcp_port;
-                    let udp = settings.udp_port;
-                    let obfs = settings.friend_session_encryption;
-                    let sessions = state.ember_sessions.clone();
-                    let ul_tx = ul_event_tx.clone();
-                    let fh = friend_hashes.clone();
-                    info!("Opening outbound friend session to {} at {}", hex::encode(target_hash), addr);
-                    tokio::spawn(async move {
-                        match ed2k::friend_connect::open_and_run_friend_session(
-                            addr, our_user_hash, ember_hash, nickname,
-                            client_id, tcp, udp, obfs,
-                            sessions, ul_tx, fh,
-                            Some(ed25519_pubkey), Some(ed25519_secret_key),
-                        ).await {
-                            Ok(_handle) => {
-                                info!("Outbound friend session to {} established", hex::encode(target_hash));
-                            }
-                            Err(e) => {
-                                info!("Failed to open friend session to {}: {e}", hex::encode(target_hash));
-                            }
-                        }
-                    });
-                    let _ = tx.send(Ok(()));
-                } else {
-                    let _ = tx.send(Err("Invalid friend IP address".into()));
-                }
-            } else {
-                info!("No stored address for {}, trying rendezvous for session", hex::encode(target_hash));
-                let _ = app_handle.emit("ember:friend-searching", serde_json::json!({
-                    "user_hash": hex::encode(target_hash),
-                }));
-                spawn_rendezvous_friend_lookup(
-                    &settings, &state, ember_hash, target_hash,
-                    &db, &app_handle, &friend_hashes, &ul_event_tx,
-                    ed25519_pubkey, ed25519_secret_key,
-                );
-                let _ = tx.send(Ok(()));
-            }
-        }
-
-        NetworkCommand::GetPeerReputation { user_hash, tx } => {
-            let info = state.reputation.get_peer(&user_hash).map(|p| {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                PeerReputationInfo {
-                    score: p.score,
-                    successful_transfers: p.successful_transfers,
-                    failed_transfers: p.failed_transfers,
-                    is_banned: p.is_banned(now),
-                    first_seen: p.first_seen,
-                    last_interaction: p.last_interaction,
-                }
-            });
-            let _ = tx.send(info);
-        }
-
-        NetworkCommand::GetReputationStats { tx } => {
-            let _ = tx.send(ReputationStatsInfo {
-                tracked_peers: state.reputation.tracked_count(),
-                banned_peers: state.reputation.banned_count(),
-            });
         }
 
         NetworkCommand::Shutdown => {}

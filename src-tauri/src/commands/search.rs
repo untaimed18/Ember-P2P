@@ -291,17 +291,6 @@ pub async fn cancel_search(
     Ok(())
 }
 
-/// Compute the ed2k hash of raw bytes (for in-memory content)
-#[tauri::command]
-pub async fn compute_ed2k_hash(data: Vec<u8>) -> Result<String, String> {
-    if data.len() > 100 * 1024 * 1024 {
-        return Err("Input too large (max 100MB)".into());
-    }
-    tokio::task::spawn_blocking(move || hash::ed2k_hash_bytes(&data))
-        .await
-        .map_err(|e| format!("Hash task failed: {e}"))
-}
-
 #[tauri::command]
 pub fn format_ed2k_link(name: String, size: u64, file_hash: String) -> Result<String, String> {
     if name.is_empty() || name.len() > 4096 {
@@ -589,15 +578,3 @@ pub async fn clear_download_history(
     .map_err(|e| e.to_string())
 }
 
-/// Remove a single file hash from download history.
-#[tauri::command]
-pub async fn remove_download_history_entry(
-    state: tauri::State<'_, AppState>,
-    file_hash: String,
-) -> Result<(), String> {
-    let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.remove_download_history(&file_hash))
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-        .map_err(|e| e.to_string())
-}

@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { NetworkStats } from '$lib/types';
 import { getNetworkStats } from '$lib/api/kad';
+import { toastError, toastWarning } from '$lib/stores/toast';
 
 const STALE_NETWORK_MS = 12_000;
 
@@ -111,6 +112,35 @@ export async function initNetworkStore() {
     registered.push(await listen<{ message: string }>('network-error', (event) => {
       lastEventUpdate = Date.now();
       networkError.set(event.payload.message);
+    }));
+    // Fatal network errors come directly from the network-task supervisor
+    // in `lib.rs` — the payload is a bare redacted string (not an object).
+    // Surface them with maximum prominence: populate the persistent
+    // `networkError` store so the KAD-page banner renders, AND push a
+    // sticky toast so users on other pages notice. The previous version
+    // of this store had no listener at all, so catastrophic start-up or
+    // runtime failures (e.g. "port already in use", "permission denied")
+    // reached the user as a silently-dead network layer.
+    registered.push(await listen<string>('network-fatal-error', (event) => {
+      lastEventUpdate = Date.now();
+      const message = typeof event.payload === 'string'
+        ? event.payload
+        : 'Network error: network task stopped.';
+      networkError.set(message);
+      // Long duration (15 s) — fatal failures deserve more than the
+      // default 8 s of a regular error toast.
+      toastError(`Network stopped: ${message}`);
+    }));
+    // Non-fatal warnings from network start-up / ongoing operation (e.g.
+    // UDP port already in use → auto-rebound to a different port). These
+    // changes are user-visible (forwarding rules, advertised port) so
+    // popping a toast lets users correct their router / settings
+    // instead of wondering why peer reachability is lower than expected.
+    registered.push(await listen<{ message: string }>('network-warning', (event) => {
+      const msg = event.payload?.message;
+      if (msg) {
+        toastWarning(msg);
+      }
     }));
     registered.push(await listen<{ status: ServerStatus }>('server-status-changed', (event) => {
       serverStatus.set(event.payload.status);
