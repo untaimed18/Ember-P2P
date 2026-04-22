@@ -1031,6 +1031,13 @@ impl Database {
         Ok(result)
     }
 
+    /// Remove a specific file from download history (per-row user override).
+    pub fn remove_download_history(&self, file_hash: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM download_history WHERE file_hash = ?1", params![file_hash])?;
+        Ok(())
+    }
+
     /// Clear all download history entries of a given status.
     pub fn clear_download_history(&self, status: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();

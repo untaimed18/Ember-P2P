@@ -291,6 +291,24 @@ pub async fn cancel_search(
     Ok(())
 }
 
+/// Compute the ed2k hash of raw bytes (for in-memory content).
+///
+/// This is the only IPC path that hashes a byte buffer directly
+/// (the shared-folder indexer hashes files by path). Intended for
+/// UI flows like drag-drop / clipboard paste where the frontend
+/// already holds the bytes and wants a canonical ed2k hash without
+/// a round-trip through the filesystem. Capped at 100 MiB to
+/// bound IPC frame size and blocking-pool work.
+#[tauri::command]
+pub async fn compute_ed2k_hash(data: Vec<u8>) -> Result<String, String> {
+    if data.len() > 100 * 1024 * 1024 {
+        return Err("Input too large (max 100MB)".into());
+    }
+    tokio::task::spawn_blocking(move || hash::ed2k_hash_bytes(&data))
+        .await
+        .map_err(|e| format!("Hash task failed: {e}"))
+}
+
 #[tauri::command]
 pub fn format_ed2k_link(name: String, size: u64, file_hash: String) -> Result<String, String> {
     if name.is_empty() || name.len() > 4096 {
@@ -578,3 +596,21 @@ pub async fn clear_download_history(
     .map_err(|e| e.to_string())
 }
 
+/// Remove a single download-history row by file hash.
+///
+/// `clear_download_history(status)` only erases by status ("completed"
+/// / "cancelled" / "all"). This is the only IPC path that deletes a
+/// specific entry — use it when the UI surfaces a per-row "remove from
+/// history" action (e.g. a search-results context menu on a row the
+/// user has previously downloaded and wants re-surfaced as fresh).
+#[tauri::command]
+pub async fn remove_download_history_entry(
+    state: tauri::State<'_, AppState>,
+    file_hash: String,
+) -> Result<(), String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.remove_download_history(&file_hash))
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+        .map_err(|e| e.to_string())
+}

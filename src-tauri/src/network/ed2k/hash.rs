@@ -192,11 +192,10 @@ pub fn hash_file_combined_cancellable(
     Ok((ed2k_hash, aich_hash))
 }
 
-/// In-memory equivalent of [`ed2k_hash_file`], used exclusively by
-/// transfer-verification unit tests. Gated to `#[cfg(test)]` so the
-/// production binary doesn't carry a 100-MB-capable allocator helper
-/// that only exists to produce round-trip test vectors.
-#[cfg(test)]
+/// In-memory equivalent of [`ed2k_hash_file`]. Used by the
+/// `compute_ed2k_hash` Tauri command (for UI-side hashing of
+/// arbitrary byte buffers — clipboard paste, drag-drop, etc.) and by
+/// transfer-verification unit tests.
 pub fn ed2k_hash_bytes(data: &[u8]) -> String {
     let file_size = data.len() as u64;
 
