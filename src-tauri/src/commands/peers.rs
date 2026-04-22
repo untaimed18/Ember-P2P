@@ -34,6 +34,12 @@ pub struct FriendRequestInfo {
     pub sender_hash: String,
     pub sender_nickname: String,
     pub received_at: i64,
+    /// `true` iff the peer's advertised Ed25519 public key
+    /// BLAKE3-bound to `sender_hash` at request-emit time. Used by
+    /// the Friends UI to render a verification badge so users can
+    /// distinguish requests backed by cryptographic identity from
+    /// older unverified paths.
+    pub verified: bool,
 }
 
 #[tauri::command]
@@ -273,10 +279,11 @@ pub async fn get_friend_requests(
         .map_err(|e| format!("Task error: {e}"))?
         .map_err(|e| format!("Failed to load friend requests: {e}"))?;
 
-    Ok(rows.into_iter().map(|(sender_hash, sender_nickname, received_at, _ip, _port)| FriendRequestInfo {
+    Ok(rows.into_iter().map(|(sender_hash, sender_nickname, received_at, _ip, _port, verified)| FriendRequestInfo {
         sender_hash,
         sender_nickname,
         received_at,
+        verified,
     }).collect())
 }
 
@@ -318,8 +325,8 @@ pub async fn accept_friend_request(
     let db_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let requests = db.get_friend_requests()?;
         let nick = requests.iter()
-            .find(|(h, _, _, _, _)| h == &c2)
-            .map(|(_, n, _, _, _)| n.clone())
+            .find(|(h, _, _, _, _, _)| h == &c2)
+            .map(|(_, n, _, _, _, _)| n.clone())
             .unwrap_or_default();
         db.add_friend(&c2, &nick)?;
         db.set_friend_mutual(&c2)?;

@@ -554,7 +554,26 @@
               </svg>
             </div>
             <div class="request-info">
-              <span class="request-name">{req.sender_nickname || '(unknown)'}</span>
+              <span class="request-name">
+                {req.sender_nickname || '(unknown)'}
+                {#if req.verified}
+                  <!-- "Verified" badge: the peer's advertised Ed25519
+                       pubkey BLAKE3-bound to their claimed ember_hash
+                       at emit time (offline binding check). Does NOT
+                       yet imply proof of possession — only that the
+                       peer is internally consistent about which key
+                       backs their identity. Full PoP via
+                       perform_ember_auth is FUTURE_WORK F2 Phase 2. -->
+                  <span class="request-badge request-badge-verified" title="Peer's advertised public key matches their advertised Ember hash (identity binding consistent). Does not yet prove key ownership.">Verified</span>
+                {:else}
+                  <!-- Unverified: either the peer didn't advertise a
+                       pubkey (older Ember client, or the single-source
+                       transfer.rs download path), or the binding check
+                       failed. Still surfaces for user approval — only
+                       accept from someone you actually know. -->
+                  <span class="request-badge request-badge-unverified" title="Peer did not advertise a verifiable public key, or the key did not match their hash. Only accept if you know who this is.">Unverified</span>
+                {/if}
+              </span>
               <span class="request-hash" title={req.sender_hash}>{req.sender_hash.slice(0, 8)}&hellip;{req.sender_hash.slice(-6)}</span>
             </div>
             <div class="request-actions">
@@ -1554,6 +1573,9 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 6px;
   }
 
   .request-hash {
@@ -1561,6 +1583,34 @@
     font-size: 10px;
     color: var(--text-muted);
     letter-spacing: 0.3px;
+  }
+
+  /* Verification badges on incoming friend requests. "Verified"
+     means the peer advertised an Ed25519 pubkey whose BLAKE3 prefix
+     matches their claimed ember_hash (offline identity binding).
+     "Unverified" means no pubkey was advertised or the binding
+     check failed; users should only accept from people they
+     recognise until the full challenge-response runs on accept. */
+  .request-badge {
+    display: inline-flex;
+    align-items: center;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    flex-shrink: 0;
+  }
+  .request-badge-verified {
+    background: color-mix(in srgb, var(--success, #2ecc71) 18%, transparent);
+    color: var(--success, #2ecc71);
+    border: 1px solid color-mix(in srgb, var(--success, #2ecc71) 40%, transparent);
+  }
+  .request-badge-unverified {
+    background: color-mix(in srgb, var(--warning, #e0a23b) 14%, transparent);
+    color: var(--warning, #e0a23b);
+    border: 1px solid color-mix(in srgb, var(--warning, #e0a23b) 35%, transparent);
   }
 
   .request-actions {
