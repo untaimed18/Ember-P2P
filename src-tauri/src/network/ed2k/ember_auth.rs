@@ -59,6 +59,7 @@
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::RngCore;
+use tracing::warn;
 
 use crate::network::ember::crypto;
 
@@ -157,9 +158,27 @@ pub fn handle_challenge(
     our_secret_key: &[u8; 32],
 ) -> Result<AuthOutbound, AuthError> {
     if payload.len() != NONCE_LEN {
+        // Log at warn so malformed auth packets are visible in the
+        // default log stream without having to flip to debug — this
+        // is also what anomaly detection / rate-limit heuristics at
+        // higher layers want to count.
+        warn!(
+            "Ember auth: dropping CHALLENGE with wrong nonce length ({} bytes, expected {})",
+            payload.len(),
+            NONCE_LEN
+        );
         return Err(AuthError::InvalidPayloadLength);
     }
     if !matches!(state, EmberAuthState::NotStarted) {
+        // A second CHALLENGE after we already processed one (or after
+        // we've reached Verified/Failed) is either a buggy peer or a
+        // deliberate replay — either way it's anomalous and the
+        // dispatcher may want to bump a counter. Surface it at warn
+        // so "CHALLENGE replay observed" is greppable without
+        // custom instrumentation.
+        warn!(
+            "Ember auth: rejecting CHALLENGE in unexpected state {state:?} (possible replay)"
+        );
         return Err(AuthError::UnexpectedPacket);
     }
 
@@ -199,12 +218,26 @@ pub fn handle_response(
     expected_ember_hash: &[u8; 16],
 ) -> Result<(), AuthError> {
     if payload.len() != RESPONSE_LEN {
+        warn!(
+            "Ember auth: dropping RESPONSE with wrong payload length ({} bytes, expected {})",
+            payload.len(),
+            RESPONSE_LEN
+        );
         return Err(AuthError::InvalidPayloadLength);
     }
 
     let our_nonce = match state {
         EmberAuthState::PeerChallenged { our_nonce } => *our_nonce,
-        _ => return Err(AuthError::UnexpectedPacket),
+        _ => {
+            // RESPONSE in NotStarted means the peer skipped the
+            // CHALLENGE; in Verified/Failed it's a replay or a buggy
+            // peer. Same forensics rationale as the CHALLENGE path
+            // above — log at warn so the anomaly is visible.
+            warn!(
+                "Ember auth: rejecting RESPONSE in unexpected state {state:?}"
+            );
+            return Err(AuthError::UnexpectedPacket);
+        }
     };
 
     // Slice arithmetic is bounds-checked above. Unwrap is fine.

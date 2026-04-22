@@ -436,31 +436,48 @@ impl AsyncRead for WsStream {
             return Poll::Ready(Ok(()));
         }
 
-        match Stream::poll_next(Pin::new(&mut self.inner), cx) {
-            Poll::Ready(Some(Ok(msg))) => {
-                use tokio_tungstenite::tungstenite::Message;
-                match msg {
-                    Message::Binary(data) => {
-                        let to_copy = data.len().min(buf.remaining());
-                        buf.put_slice(&data[..to_copy]);
-                        if to_copy < data.len() {
-                            self.read_buf = data[to_copy..].to_vec();
-                            self.read_pos = 0;
+        // Drain non-data WebSocket frames (Ping/Pong/Text/etc.) in a
+        // single poll without waking ourselves up — the old code called
+        // `wake_by_ref()` and returned `Poll::Pending`, which makes the
+        // runtime re-poll immediately and pegs a core at 100% whenever
+        // the peer sends frames we don't care about. `tokio-tungstenite`
+        // handles ping/pong internally by default, but a buggy or
+        // hostile peer could still emit Text frames and we'd spin.
+        // Looping here also means we only return `Poll::Pending` when
+        // the underlying socket really is out of data.
+        loop {
+            match Stream::poll_next(Pin::new(&mut self.inner), cx) {
+                Poll::Ready(Some(Ok(msg))) => {
+                    use tokio_tungstenite::tungstenite::Message;
+                    match msg {
+                        Message::Binary(data) => {
+                            let to_copy = data.len().min(buf.remaining());
+                            buf.put_slice(&data[..to_copy]);
+                            if to_copy < data.len() {
+                                self.read_buf = data[to_copy..].to_vec();
+                                self.read_pos = 0;
+                            }
+                            return Poll::Ready(Ok(()));
                         }
-                        Poll::Ready(Ok(()))
-                    }
-                    Message::Close(_) => Poll::Ready(Ok(())),
-                    _ => {
-                        cx.waker().wake_by_ref();
-                        Poll::Pending
+                        // Close and stream-end both surface as EOF
+                        // (zero bytes filled). Subsequent polls will
+                        // return EOF again via `Poll::Ready(None)`.
+                        Message::Close(_) => return Poll::Ready(Ok(())),
+                        // Text, Ping, Pong, Frame: not data we should
+                        // propagate through an AsyncRead. Drop and
+                        // read the next frame in the same poll call.
+                        _ => continue,
                     }
                 }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e,
+                    )));
+                }
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Some(Err(e))) => {
-                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
-            }
-            Poll::Ready(None) => Poll::Ready(Ok(())),
-            Poll::Pending => Poll::Pending,
         }
     }
 }

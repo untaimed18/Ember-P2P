@@ -117,6 +117,17 @@ pub async fn register(base_url: &str, ember_hash: &[u8; 16], port: u16, external
 
 /// Look up a friend on the rendezvous server.
 /// Returns `Some((ip, port))` if the friend is currently registered, `None` if not found.
+///
+/// Defense-in-depth: even though `require_https` + `https_only(true)` means
+/// the response is authentic w.r.t. the configured rendezvous host, the
+/// rendezvous operator could be compromised or misconfigured. We refuse
+/// to hand back addresses that would make the caller connect to
+/// loopback / link-local / private / unspecified / reserved IPs — those
+/// could steer a friend-connect session into the local host, the LAN,
+/// or an attacker-chosen network. The rendezvous server is expected to
+/// filter these at registration time (see `rendezvous-server/src/main.rs::register`),
+/// but mirroring the check on the client side closes the gap if a
+/// future server change regresses it.
 pub async fn lookup(base_url: &str, friend_hash: &[u8; 16]) -> Result<Option<(Ipv4Addr, u16)>, String> {
     require_https(base_url)?;
     let id = hashed_id(friend_hash);
@@ -148,11 +159,19 @@ pub async fn lookup(base_url: &str, friend_hash: &[u8; 16]) -> Result<Option<(Ip
     }
     let port = raw_port as u16;
     if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-        if port > 0 {
+        if port > 0 && is_routable_public_v4(ip) {
             // Friend IP/port is effectively PII — keep it at debug rather than
             // info so it doesn't land in user-shared log bundles by default.
             debug!("Rendezvous: found {}… at {}:{}", &id[..8], ip, port);
             return Ok(Some((ip, port)));
+        }
+        if port > 0 {
+            warn!(
+                "Rendezvous: lookup for {}… returned non-public IP ({}); refusing to connect",
+                &id[..8],
+                ip
+            );
+            return Ok(None);
         }
     }
     debug!(
@@ -160,6 +179,77 @@ pub async fn lookup(base_url: &str, friend_hash: &[u8; 16]) -> Result<Option<(Ip
         &id[..8]
     );
     Ok(None)
+}
+
+/// Returns true only for IPv4 addresses that are safe to dial as a
+/// remote peer: not unspecified, not loopback, not multicast, not
+/// broadcast, not link-local, not private (RFC 1918 / CGN), not
+/// documentation/benchmark/reserved ranges. Mirrors (and intentionally
+/// duplicates, for locality) the server-side filter in
+/// `rendezvous-server/src/main.rs::register`.
+fn is_routable_public_v4(ip: Ipv4Addr) -> bool {
+    if ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.is_link_local()
+        || ip.is_private()
+        || ip.is_documentation()
+    {
+        return false;
+    }
+    let octets = ip.octets();
+    // 0.0.0.0/8 (already covered by is_unspecified for /32, but block
+    // the whole /8 per RFC 1122).
+    if octets[0] == 0 {
+        return false;
+    }
+    // 100.64.0.0/10 — Carrier-grade NAT (RFC 6598). Not reserved by
+    // `is_private()` in stable Rust.
+    if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+        return false;
+    }
+    // 240.0.0.0/4 — reserved/future use.
+    if octets[0] >= 240 {
+        return false;
+    }
+    // 198.18.0.0/15 — benchmark.
+    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod lookup_filter_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unspecified_loopback_private() {
+        assert!(!is_routable_public_v4(Ipv4Addr::new(0, 0, 0, 0)));
+        assert!(!is_routable_public_v4(Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(!is_routable_public_v4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(!is_routable_public_v4(Ipv4Addr::new(172, 16, 1, 1)));
+        assert!(!is_routable_public_v4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(!is_routable_public_v4(Ipv4Addr::new(169, 254, 1, 1)));
+        assert!(!is_routable_public_v4(Ipv4Addr::new(255, 255, 255, 255)));
+        assert!(!is_routable_public_v4(Ipv4Addr::new(224, 0, 0, 1)));
+        // Docs: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+        assert!(!is_routable_public_v4(Ipv4Addr::new(192, 0, 2, 1)));
+        assert!(!is_routable_public_v4(Ipv4Addr::new(198, 51, 100, 1)));
+        assert!(!is_routable_public_v4(Ipv4Addr::new(203, 0, 113, 1)));
+        // CGN, benchmark, reserved
+        assert!(!is_routable_public_v4(Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(!is_routable_public_v4(Ipv4Addr::new(198, 18, 0, 1)));
+        assert!(!is_routable_public_v4(Ipv4Addr::new(240, 0, 0, 1)));
+    }
+
+    #[test]
+    fn accepts_real_public_ips() {
+        assert!(is_routable_public_v4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(is_routable_public_v4(Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(is_routable_public_v4(Ipv4Addr::new(93, 184, 216, 34)));
+    }
 }
 
 /// Unregister our presence from the rendezvous server (graceful shutdown).

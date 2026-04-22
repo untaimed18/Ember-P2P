@@ -5,6 +5,11 @@ description = "A decentralized P2P file sharing application"
 authors = ["you"]
 license = "GPL-3.0-only"
 edition = "2021"
+# `str::floor_char_boundary` is used in the ed2k collection parser and
+# was stabilized in Rust 1.80. Older toolchains fail to build with a
+# non-obvious error; declaring MSRV here makes `cargo` surface a clean
+# "package requires rustc 1.80" message instead.
+rust-version = "1.80"
 
 [lib]
 name = "ember_lib"

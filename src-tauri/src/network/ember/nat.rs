@@ -265,24 +265,53 @@ async fn try_stun_server(
             .await
             .map_err(|e| format!("send: {e}"))?;
 
-        let mut buf = [0u8; 256];
-        match tokio::time::timeout(STUN_TIMEOUT, socket.recv_from(&mut buf)).await {
-            Ok(Ok((len, from))) => {
-                if from.ip() != server_addr.ip() {
-                    continue;
-                }
-                match parse_binding_response(&buf[..len], &txn_id) {
-                    Ok(external_addr) => return Ok(external_addr),
-                    Err(e) => {
-                        debug!("STUN parse error from {server}: {e}");
+        // Inner read loop: unrelated packets on the shared KAD socket
+        // (a reply from a previous STUN probe, a late KAD packet,
+        // etc.) must NOT consume a retry. We keep draining packets
+        // until one matches {server IP, expected txn_id}, the overall
+        // STUN timeout elapses, or the socket errors. Previously a
+        // single stray packet would `continue` back to the outer
+        // retry loop and re-send the request, burning one of the two
+        // retries for no reason.
+        let deadline = tokio::time::Instant::now() + STUN_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                debug!("STUN timeout from {server} (attempt {attempt})");
+                break;
+            }
+            let mut buf = [0u8; 256];
+            match tokio::time::timeout(remaining, socket.recv_from(&mut buf)).await {
+                Ok(Ok((len, from))) => {
+                    if from.ip() != server_addr.ip() {
+                        // Unrelated packet on the shared socket; keep
+                        // reading until we see a reply from this
+                        // server or the deadline fires.
+                        continue;
+                    }
+                    match parse_binding_response(&buf[..len], &txn_id) {
+                        Ok(external_addr) => return Ok(external_addr),
+                        Err(e) => {
+                            // Valid server IP but wrong txn_id /
+                            // malformed / out-of-order reply from a
+                            // prior probe. Keep reading within the
+                            // same attempt.
+                            debug!("STUN parse error from {server}: {e}");
+                            continue;
+                        }
                     }
                 }
-            }
-            Ok(Err(e)) => {
-                debug!("STUN recv error from {server}: {e}");
-            }
-            Err(_) => {
-                debug!("STUN timeout from {server} (attempt {attempt})");
+                Ok(Err(e)) => {
+                    debug!("STUN recv error from {server}: {e}");
+                    // Hard socket error — don't keep spinning on it
+                    // inside this attempt; drop out and let the
+                    // outer retry loop either resend or fail.
+                    break;
+                }
+                Err(_) => {
+                    debug!("STUN timeout from {server} (attempt {attempt})");
+                    break;
+                }
             }
         }
     }

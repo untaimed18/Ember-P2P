@@ -86,9 +86,14 @@ pub type SharedEmberPayload = Arc<RwLock<Arc<Vec<u8>>>>;
 /// Send sites compare against their last-sent generation to detect changes.
 pub type EmberPayloadGeneration = Arc<AtomicU64>;
 
-/// Build the v3 wire-format payload.
+/// Build the current (v4) EPX wire-format payload.
 ///
-/// Wire format (v3):
+/// v4 is layout-identical to v3 but introduces a new per-source flag
+/// bit (`SOURCE_FLAG_RELAY_CAPABLE = 0x04`) that v3 parsers safely
+/// ignore as "unknown bits in the flags byte." The parser here also
+/// accepts v2 and v3 payloads (see `parse_exchange_payload`).
+///
+/// Wire format (v3/v4, same layout):
 ///   version(1) + file_count(u16 LE) +
 ///     for each file:
 ///       ed2k_hash(16) + file_size(u64 LE) + file_flags(u8) +

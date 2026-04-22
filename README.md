@@ -23,10 +23,10 @@ When two Ember clients connect (during a download or upload), they exchange comp
 
 ### Wire protocol
 
-EPX uses opcode `0xF0` on the eMule extended protocol (`OP_EMULEPROT`). The current version is **v3**. The payload format:
+EPX uses opcode `0xF0` on the eMule extended protocol (`OP_EMULEPROT`). The current version is **v4**. The payload format:
 
 ```
-version       (1 byte, currently 0x03)
+version       (1 byte, currently 0x04)
 file_count    (u16 LE)
   for each file:
     ed2k_hash   (16 bytes)
@@ -38,14 +38,19 @@ file_count    (u16 LE)
         ipv4      (4 bytes, network order)
         tcp_port  (u16 LE)
         udp_port  (u16 LE)
-        flags     (u8, bit 0 = firewalled, bit 1 = obfuscation)
+        flags     (u8, bit 0 = firewalled, bit 1 = obfuscation, bit 2 = relay-capable)
 peer_count    (u16 LE)
   for each peer:
     ipv4      (4 bytes, network order)
     tcp_port  (u16 LE)
 ```
 
-v3 additions over v2: per-file AICH root hashes for corruption recovery, UDP port and capability flags per source, and a peer discovery section for Ember mesh building. v2 payloads are still accepted.
+v4 is layout-identical to v3 and adds only a new per-source flag bit
+(`relay-capable = 0x04`) used by the LowID-to-LowID broker; v3 parsers
+ignore unknown flag bits, so v4 payloads are backward-compatible. v3
+additions over v2: per-file AICH root hashes for corruption recovery,
+UDP port and capability flags per source, and a peer discovery section
+for Ember mesh building. v2 and v3 payloads are still accepted.
 
 ### Safety limits
 
@@ -137,7 +142,7 @@ These are configurable in **Settings > Network**. For best performance (HighID),
 
 #### Prerequisites
 
-- [Rust](https://rustup.rs/) (1.75+)
+- [Rust](https://rustup.rs/) (1.80+ — `str::floor_char_boundary` is used in the collection parser and was stabilized in 1.80)
 - [Node.js](https://nodejs.org/) (18+)
 - **Windows**: Visual Studio Build Tools with C++ workload
 
