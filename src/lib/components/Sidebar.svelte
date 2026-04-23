@@ -9,6 +9,24 @@
 
   let aboutOpen = $state(false);
 
+  // Persist collapsed state across sessions. Read synchronously on
+  // script init so the first render doesn't briefly flash expanded
+  // for a user who prefers collapsed.
+  const STORAGE_COLLAPSED = 'sidebar-collapsed';
+  function loadCollapsed(): boolean {
+    try {
+      return localStorage.getItem(STORAGE_COLLAPSED) === '1';
+    } catch {
+      return false;
+    }
+  }
+  let isCollapsed = $state(loadCollapsed());
+
+  function toggleCollapsed() {
+    isCollapsed = !isCollapsed;
+    try { localStorage.setItem(STORAGE_COLLAPSED, isCollapsed ? '1' : '0'); } catch { /* ignore */ }
+  }
+
   let activeDownloadCount = $derived(
     $transfers.filter(t => t.direction === 'download' && t.status !== 'completed' && t.status !== 'failed').length
   );
@@ -80,6 +98,16 @@
   }
 
   function onShortcutKey(e: KeyboardEvent) {
+    // Ctrl/Cmd+B toggles the sidebar. Matches VS Code/Slack/Discord
+    // convention and frees up horizontal space for data-dense pages
+    // without the user needing to reach for the mouse. Blocked while
+    // typing so it doesn't fight with rich-text bold shortcuts.
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.key === 'b' || e.key === 'B')) {
+      if (isTypingTarget(e.target)) return;
+      e.preventDefault();
+      toggleCollapsed();
+      return;
+    }
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     if (isTypingTarget(e.target)) return;
     const n = Number.parseInt(e.key, 10);
@@ -94,11 +122,13 @@
   });
 </script>
 
-<nav class="sidebar" aria-label="Primary">
-  <a href="/" class="logo" onclick={(e) => navigate(e, '/')} title="Go to KAD Network home">
-    <span class="logo-text">EMBER</span>
-    <span class="logo-sub">P2P File Sharing</span>
-  </a>
+<nav class="sidebar" class:collapsed={isCollapsed} aria-label="Primary">
+  <div class="sidebar-header">
+    <a href="/" class="logo" onclick={(e) => navigate(e, '/')} title="Go to KAD Network home">
+      <span class="logo-text">EMBER</span>
+      <span class="logo-sub">P2P File Sharing</span>
+    </a>
+  </div>
 
   <ul class="nav-list">
     {#each navItems as item, i}
@@ -202,6 +232,25 @@
       </span>
       <span>About</span>
     </button>
+    <button
+      type="button"
+      class="about-btn collapse-btn"
+      onclick={toggleCollapsed}
+      title={isCollapsed ? "Expand sidebar (Ctrl+B)" : "Collapse sidebar (Ctrl+B)"}
+      aria-label={isCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+      aria-keyshortcuts="Control+B"
+    >
+      <span class="about-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          {#if isCollapsed}
+            <polyline points="13 17 18 12 13 7"></polyline><polyline points="6 17 11 12 6 7"></polyline>
+          {:else}
+            <polyline points="11 17 6 12 11 7"></polyline><polyline points="18 17 13 12 18 7"></polyline>
+          {/if}
+        </svg>
+      </span>
+      <span>{isCollapsed ? 'Expand' : 'Collapse'}</span>
+    </button>
   </div>
 
   <AboutDialog bind:open={aboutOpen} />
@@ -216,15 +265,53 @@
     display: flex;
     flex-direction: column;
     flex-shrink: 0;
+    transition: width var(--transition-normal) ease;
+  }
+
+  .sidebar.collapsed {
+    width: 64px;
+  }
+
+  .sidebar-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--border);
+    position: relative;
   }
 
   .logo {
     padding: 20px 16px;
-    border-bottom: 1px solid var(--border);
     display: flex;
     flex-direction: column;
     text-decoration: none;
     cursor: pointer;
+    overflow: hidden;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .sidebar.collapsed .logo {
+    padding: 20px 8px;
+    align-items: center;
+  }
+
+  /* Scale transform instead of font-size so the shrink animation
+     doesn't reflow every frame. Origin is the left edge so the logo
+     glyphs collapse in-place toward the icon column. */
+  .sidebar.collapsed .logo-text {
+    transform: scale(0.65);
+    letter-spacing: 1px;
+  }
+
+  .sidebar.collapsed .logo-sub {
+    display: none;
+  }
+
+  .collapse-btn svg {
+    width: 20px;
+    height: 20px;
   }
 
   .logo-text {
@@ -232,6 +319,8 @@
     font-weight: 800;
     letter-spacing: 3px;
     color: var(--accent);
+    transform-origin: center;
+    transition: transform var(--transition-normal) ease, letter-spacing var(--transition-normal) ease;
   }
 
   .logo-sub {
@@ -304,8 +393,51 @@
     padding: 10px 16px;
     color: var(--text-secondary);
     text-decoration: none;
-    transition: background-color var(--transition-normal), color var(--transition-normal);
+    transition: background-color var(--transition-normal), color var(--transition-normal), padding var(--transition-normal);
     font-size: 14px;
+    overflow: hidden;
+  }
+
+  .sidebar.collapsed .nav-list li a {
+    padding: 10px 0;
+    justify-content: center;
+  }
+
+  .sidebar.collapsed .nav-label {
+    display: none;
+  }
+
+  .sidebar.collapsed .nav-dot {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    margin: 0;
+    width: 6px;
+    height: 6px;
+  }
+
+  .sidebar.collapsed .nav-badge {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    margin: 0;
+    min-width: 14px;
+    height: 14px;
+    font-size: 8px;
+    padding: 0 3px;
+  }
+
+  .sidebar.collapsed .about-btn span:not(.about-icon) {
+    display: none;
+  }
+
+  .sidebar.collapsed .about-btn {
+    padding: 10px 0;
+    justify-content: center;
+  }
+
+  .sidebar.collapsed .sidebar-footer {
+    padding: 8px 4px 12px;
   }
 
   /*
