@@ -363,7 +363,7 @@
   </div>
 {/if}
 
-<div class="page-content">
+<div class="security-content">
   {#if error}
     <div class="banner error-banner">
       <span>{error}</span>
@@ -825,6 +825,24 @@
     color: var(--text-muted);
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
+  }
+
+  /*
+   * Page root: own flex-column container that replaces the global
+   * .page-content so the inner .table-area can virtualize against a
+   * bounded viewport. With the global .page-content (which has
+   * `overflow: auto; flex: 1`) the table area would grow to the
+   * height of its contents — 60,000+ rows × 28px = 1.6M pixels of
+   * single-row spacer — and the browser would stall trying to lay
+   * that out. Here the page is overflow: hidden and the only scroll
+   * container is the table body.
+   */
+  .security-content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    min-height: 0;
   }
 
   /* --- Table --- */
