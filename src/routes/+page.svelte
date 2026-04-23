@@ -1512,19 +1512,31 @@
     background: color-mix(in srgb, var(--bg-secondary) 88%, var(--bg-primary));
   }
 
+  /*
+   * `.contact-id` and `.distance` are reused by the Searches table's
+   * Key column (monospace hex + muted color). The Contacts table
+   * additionally wants a flex layout so the hover-revealed Copy button
+   * can sit on the right edge — but turning `<td>` into `display: flex`
+   * breaks table column alignment everywhere else the class is used.
+   *
+   * Solution: keep the base style as plain table-cell, and only switch
+   * to flex layout when the cell has a `.cell-content` + `.copy-btn`
+   * wrapper inside (i.e. only the Contacts table rows).
+   */
   .contact-id {
     font-family: var(--font-mono);
     font-size: 10px;
     color: var(--text-muted);
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
   }
 
   .distance {
     font-family: var(--font-mono);
     font-size: 10px;
     color: var(--text-secondary);
+  }
+
+  .contact-id:has(> .copy-btn),
+  .distance:has(> .copy-btn) {
     display: flex;
     align-items: center;
     justify-content: space-between;
