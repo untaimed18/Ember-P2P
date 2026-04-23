@@ -1158,6 +1158,12 @@
     cursor: pointer;
     text-decoration: underline dotted;
     text-underline-offset: 2px;
+    /* Inside a flex-column tile the default button width stretches
+       to the tile's full width and `text-align: center` centers the
+       label. Align-self keeps the button at its intrinsic width so
+       the link lines up with the label above it. */
+    align-self: flex-start;
+    text-align: left;
   }
   .stat-link:hover { color: var(--accent-hover, var(--accent)); }
 
