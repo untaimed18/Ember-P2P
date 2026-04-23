@@ -5233,7 +5233,17 @@ async fn download_parts_from_source(
                         }).await;
                     }
                 }
-                (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && payload.len() <= 4096 => {
+                // Privilege-granting friend opcodes: `is_ember_friend`
+                // alone means the peer CLAIMS a hash we friend-listed,
+                // which a spoofer can do after harvesting the hash
+                // from KAD/EPX/trackers. Additional gating on
+                // `ember_auth_verified` requires the peer to have
+                // completed the full Ed25519 challenge-response on
+                // THIS session — closing the same residual window
+                // that the upload side guards against. Chat forged as
+                // our friend and spoofed browse results are the two
+                // visible attacks here.
+                (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && ember_auth_verified && payload.len() <= 4096 => {
                     if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
                         if let Ok(msg) = std::str::from_utf8(&payload) {
                             let _ = etx.send(DownloadEvent::EmberChatMessage {
@@ -5243,7 +5253,7 @@ async fn download_parts_from_source(
                         }
                     }
                 }
-                (OP_EMULEPROT, OP_EMBER_BROWSE_RES) if is_ember_friend => {
+                (OP_EMULEPROT, OP_EMBER_BROWSE_RES) if is_ember_friend && ember_auth_verified => {
                     if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
                         let entries = parse_browse_response(&payload);
                         let _ = etx.send(DownloadEvent::EmberBrowseResponse {

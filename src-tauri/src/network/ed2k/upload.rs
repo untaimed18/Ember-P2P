@@ -4410,7 +4410,32 @@ impl UploadHandler {
                     }
                 }
 
-                (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend => {
+                // The four privilege-bearing Ember friend opcodes below
+                // (CHAT, BROWSE_REQ, BROWSE_RES, KEEPALIVE) are gated on
+                // the composite `is_verified_ember_friend` flag: the
+                // peer must claim our friend's hash (`is_ember_friend`)
+                // AND have completed the Ed25519 proof-of-possession on
+                // THIS TCP session (`ember_auth_state.is_verified()`).
+                //
+                // Without the PoP clause a peer who has learned our
+                // friend's `ember_hash` on the wire (KAD publishes,
+                // EPX exchanges, public trackers, etc.) could ride the
+                // friend's identity on any upload session: inject chat
+                // that shows up in our Friends UI as from the friend,
+                // trigger browse events, silently hold the friend's
+                // ember slot via keepalives. Requiring fresh-nonce
+                // signature verification per session closes that
+                // window — a spoofer cannot produce a valid signature
+                // for a random nonce we issued here without also
+                // holding the friend's Ed25519 secret key.
+                //
+                // Check is re-evaluated per packet (not snapshotted at
+                // session open) because `ember_auth_state` advances
+                // asynchronously as the peer responds to our CHALLENGE
+                // — it's typically `NotStarted` when chat/browse
+                // requests first arrive and only flips to `Verified`
+                // a packet or two later.
+                (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && ember_auth_state.is_verified() => {
                     if let Some(eh) = peer_ember_hash {
                         if !self.friend_hashes.read().await.contains(&eh) {
                             debug!("Ignoring chat from removed friend {}", hex::encode(eh));
@@ -4428,7 +4453,7 @@ impl UploadHandler {
                     }
                 }
 
-                (OP_EMULEPROT, OP_EMBER_BROWSE_REQ) if is_ember_friend => {
+                (OP_EMULEPROT, OP_EMBER_BROWSE_REQ) if is_ember_friend && ember_auth_state.is_verified() => {
                     if let Some(eh) = peer_ember_hash {
                         if !self.friend_hashes.read().await.contains(&eh) {
                             debug!("Ignoring browse request from removed friend {}", hex::encode(eh));
@@ -4443,7 +4468,7 @@ impl UploadHandler {
                     }
                 }
 
-                (OP_EMULEPROT, OP_EMBER_BROWSE_RES) if is_ember_friend => {
+                (OP_EMULEPROT, OP_EMBER_BROWSE_RES) if is_ember_friend && ember_auth_state.is_verified() => {
                     if let Some(eh) = peer_ember_hash {
                         if !self.friend_hashes.read().await.contains(&eh) {
                             debug!("Ignoring browse response from removed friend {}", hex::encode(eh));
@@ -4460,7 +4485,7 @@ impl UploadHandler {
                     }
                 }
 
-                (OP_EMULEPROT, OP_EMBER_KEEPALIVE) if is_ember_friend => {}
+                (OP_EMULEPROT, OP_EMBER_KEEPALIVE) if is_ember_friend && ember_auth_state.is_verified() => {}
 
                 _ => {
                     debug!(

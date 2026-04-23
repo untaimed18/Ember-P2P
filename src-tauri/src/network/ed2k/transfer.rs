@@ -699,6 +699,28 @@ impl Ed2kDownload {
         // whether the peer carried a valid identity claim.
         let mut peer_ember_pubkey: Option<[u8; 32]> = None;
         let mut ember_hash_binding_verified = false;
+        // Strict proof-of-possession flag. Mirrors the `multi_source.rs`
+        // contract: `true` iff `perform_ember_auth_buffered` completed
+        // successfully on THIS TCP session — the peer signed a fresh
+        // random nonce we issued with the matching Ed25519 secret key.
+        // Implies `ember_hash_binding_verified`. Used to mark
+        // `EmberFriendRequest.verified` as PoP-backed rather than
+        // binding-only, and to gate privilege-bearing friend opcodes
+        // (CHAT_MSG) on genuine identity ownership.
+        let mut ember_auth_verified = false;
+        // FIFO of non-AUTH packets captured by
+        // `perform_ember_auth_buffered` while it waited for CHALLENGE /
+        // RESPONSE. The uploader emits proactive
+        // `OP_SECIDENTSTATE` / `OP_PUBLICKEY` / `OP_SIGNATURE` / EPX
+        // frames immediately after its `OP_EMBER_HELLO`; those queue
+        // ahead of the uploader's auth response and would be silently
+        // dropped by the non-buffered `perform_ember_auth`. We capture
+        // them here and the pre-control / file-status-wait loop heads
+        // below drain this deque before reading fresh packets from the
+        // stream, so the main dispatch arms still see them in arrival
+        // order and SecIdent credit accounting stays correct.
+        let mut auth_deferred: std::collections::VecDeque<(u8, u8, Vec<u8>)> =
+            std::collections::VecDeque::new();
         let mut sent_ember_hello = false;
         let mut epx_packets_received: u8 = 0;
         let mut early_upload_accept = false;
@@ -857,8 +879,25 @@ impl Ed2kDownload {
 
         // Handle secure identification packets that may arrive before file requests.
         // Be passive: store peer key material and answer explicit challenges.
-        for _ in 0..3 {
+        //
+        // Iteration count bumped from 3 → 12 to mirror `multi_source.rs`:
+        // `perform_ember_auth_buffered` (invoked from the OP_EMBER_HELLO
+        // handler below) can capture up to AUTH_PACKET_MAX_SKIPS (8)
+        // non-AUTH packets while waiting for the peer's CHALLENGE /
+        // RESPONSE. Those captured packets are drained from
+        // `auth_deferred` at the top of this loop on subsequent
+        // iterations, and we need enough rounds to actually replay
+        // them through the SecIdent / EPX match arms before
+        // file-status-wait kicks in.
+        for _ in 0..12 {
             let (p, o, pl) = if let Some(pkt) = deferred_packet.take() {
+                pkt
+            } else if let Some(pkt) = auth_deferred.pop_front() {
+                // Replay a packet that `perform_ember_auth_buffered`
+                // captured while waiting for an AUTH opcode — process
+                // it through the standard match arms below so
+                // SecIdent credit accounting still works for
+                // Ember-to-Ember single-source downloads.
                 pkt
             } else {
                 match tokio::time::timeout(
@@ -1005,20 +1044,21 @@ impl Ed2kDownload {
                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) => {
                     if let Some(eh) = peer_ember_hash {
                         let nick = std::str::from_utf8(&pl).unwrap_or("").to_string();
-                        // `ember_hash_binding_verified` is populated by
-                        // the `OP_EMBER_HELLO(ANSWER)` arm below when
-                        // the peer advertises a pubkey that BLAKE3-binds
-                        // to their hash. If the friend request arrives
-                        // before we've seen the peer's Ember-Hello
-                        // (unusual packet ordering) we'll correctly
-                        // report unverified here. Full proof-of-possession
-                        // via `perform_ember_auth` still happens on the
-                        // friend-connect dial-back that fires when the
-                        // user accepts the request.
-                        let verified = ember_hash_binding_verified;
+                        // Full PoP signal wins when the Ed25519
+                        // challenge-response completed on this
+                        // session; otherwise fall back to the offline
+                        // binding check. If the friend request
+                        // arrives before we've seen OP_EMBER_HELLO
+                        // (unusual packet ordering) both flags are
+                        // still false and we'll correctly report
+                        // unverified. Full PoP also re-runs on the
+                        // friend-connect dial-back if the user accepts
+                        // — so binding-only here doesn't permanently
+                        // mark the friend unverified.
+                        let verified = ember_auth_verified || ember_hash_binding_verified;
                         info!(
-                            "Received early friend request from {} (nick='{}', verified={verified})",
-                            self.source_addr, nick
+                            "Received early friend request from {} (nick='{}', verified={verified}, pop={})",
+                            self.source_addr, nick, ember_auth_verified
                         );
                         let _ = event_tx.send(DownloadEvent::EmberFriendRequest {
                             ember_hash: eh,
@@ -1077,22 +1117,9 @@ impl Ed2kDownload {
                             sent_ember_hello = true;
                         }
 
-                        // Offline identity-binding check.
-                        //
-                        // We deliberately do NOT run inline
-                        // `perform_ember_auth` here — mirroring the
-                        // rationale in `multi_source.rs`: the uploader
-                        // emits proactive packets (notably
-                        // `OP_SECIDENTSTATE` via
-                        // `maybe_send_secident_challenge`, plus optional
-                        // EPX) immediately after its own OP_EMBER_HELLO
-                        // and before its main dispatch loop sees our
-                        // CHALLENGE. A synchronous `perform_ember_auth`
-                        // read would consume + drop those packets and
-                        // break SecIdent credit accounting on every
-                        // download. Binding-only is still sufficient to
-                        // reject hash-only spoofers; full PoP runs on
-                        // friend-connect dial-back at user-accept time.
+                        // Offline identity-binding check first — cheap,
+                        // and we need it regardless of whether the
+                        // peer supports the full challenge-response.
                         if !ember_hash_binding_verified {
                             if let (Some(ref pk), Some(ref eh)) =
                                 (peer_ember_pubkey, peer_ember_hash)
@@ -1110,6 +1137,59 @@ impl Ed2kDownload {
                                         self.source_addr,
                                         hex::encode(eh)
                                     );
+                                }
+                            }
+                        }
+
+                        // Full Ed25519 proof-of-possession via the
+                        // packet-buffering auth wrapper. Mirrors the
+                        // multi_source.rs pre-control flow: only
+                        // attempt PoP when the binding check passed
+                        // (don't leak our nonce to hash-spoofers) and
+                        // we haven't already verified on this session.
+                        // Captured non-AUTH packets are pushed into
+                        // `auth_deferred` and replayed at the top of
+                        // this loop on subsequent iterations, so the
+                        // uploader's OP_SECIDENTSTATE / EPX bundled
+                        // with its auth response still flow through
+                        // the normal match arms.
+                        //
+                        // PoP failure is non-fatal — the download
+                        // itself is separable from identity
+                        // verification. We just leave
+                        // `ember_auth_verified = false` so
+                        // `DownloadEvent::EmberFriendRequest.verified`
+                        // falls back to the binding-only signal.
+                        if !ember_auth_verified && ember_hash_binding_verified {
+                            if let (Some(peer_pk), Some(peer_eh)) =
+                                (peer_ember_pubkey, peer_ember_hash)
+                            {
+                                match super::friend_connect::perform_ember_auth_buffered(
+                                    &mut reader,
+                                    &mut writer,
+                                    &self.ed25519_public_key,
+                                    &self.ed25519_secret_key,
+                                    &peer_pk,
+                                    Some(&peer_eh),
+                                    self.source_addr,
+                                    &mut auth_deferred,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        ember_auth_verified = true;
+                                        info!(
+                                            "Ember auth: peer {} verified via PoP ({} deferred packet(s) queued for replay)",
+                                            self.source_addr,
+                                            auth_deferred.len()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Ember auth: peer {} PoP failed — continuing with binding-only verification: {e}",
+                                            self.source_addr
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1294,6 +1374,13 @@ impl Ed2kDownload {
         for _ in 0..12 {
             let (proto, opcode, payload) = if let Some(pkt) = deferred_packet.take() {
                 pkt
+            } else if let Some(pkt) = auth_deferred.pop_front() {
+                // Drain any remaining auth-captured packets before
+                // reading fresh bytes off the stream. Same rationale
+                // as the pre-control loop above: the uploader's
+                // proactive opcodes must be processed in arrival
+                // order so SecIdent state stays consistent.
+                pkt
             } else {
                 read_packet_with_timeout(&mut reader)
                     .await
@@ -1468,10 +1555,13 @@ impl Ed2kDownload {
                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if peer_is_ember => {
                     if let Some(eh) = peer_ember_hash {
                         let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
-                        // Reuse the session-scoped binding flag set by
-                        // the `OP_EMBER_HELLO(ANSWER)` arm below (or
-                        // already set in the pre-control loop).
-                        let verified = ember_hash_binding_verified;
+                        // Prefer the full PoP signal over the
+                        // binding-only fallback. Both flags are set in
+                        // the OP_EMBER_HELLO arms above / in the
+                        // pre-control loop, so by the time we reach
+                        // file-status-wait most well-behaved peers
+                        // have already flipped `ember_auth_verified`.
+                        let verified = ember_auth_verified || ember_hash_binding_verified;
                         let _ = event_tx.send(DownloadEvent::EmberFriendRequest {
                             ember_hash: eh,
                             nickname: nick,
@@ -1537,9 +1627,48 @@ impl Ed2kDownload {
                                 }
                             }
                         }
+
+                        // Run PoP here too in case the peer delayed
+                        // OP_EMBER_HELLOANSWER past the pre-control
+                        // loop. Same buffering rationale: captured
+                        // non-AUTH frames are drained on subsequent
+                        // iterations of this file-status-wait loop.
+                        if !ember_auth_verified && ember_hash_binding_verified {
+                            if let (Some(peer_pk), Some(peer_eh)) =
+                                (peer_ember_pubkey, peer_ember_hash)
+                            {
+                                match super::friend_connect::perform_ember_auth_buffered(
+                                    &mut reader,
+                                    &mut writer,
+                                    &self.ed25519_public_key,
+                                    &self.ed25519_secret_key,
+                                    &peer_pk,
+                                    Some(&peer_eh),
+                                    self.source_addr,
+                                    &mut auth_deferred,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        ember_auth_verified = true;
+                                        info!(
+                                            "Ember auth: peer {} verified via PoP during file-status-wait ({} deferred packet(s) queued for replay)",
+                                            self.source_addr,
+                                            auth_deferred.len()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Ember auth: peer {} PoP failed (file-status-wait) — continuing with binding-only verification: {e}",
+                                            self.source_addr
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-                (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && payload.len() <= 4096 => {
+                (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && ember_auth_verified && payload.len() <= 4096 => {
                     if let Some(eh) = peer_ember_hash {
                         if let Ok(msg) = std::str::from_utf8(&payload) {
                             let _ = event_tx.send(DownloadEvent::EmberChatMessage {
@@ -2493,14 +2622,14 @@ impl Ed2kDownload {
                         (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if peer_is_ember => {
                             if let Some(eh) = peer_ember_hash {
                                 let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
-                                // Reuse the session-scoped binding flag.
-                                // By the time we're in the download loop
-                                // the peer's Ember-Hello has usually already
-                                // arrived (either in the pre-control loop
-                                // or in file-status-wait), so `verified`
-                                // will be `true` for any peer whose pubkey
-                                // BLAKE3-binds to their advertised hash.
-                                let verified = ember_hash_binding_verified;
+                                // By the time we reach the data loop
+                                // the peer's Ember-Hello + PoP has
+                                // usually completed in an earlier
+                                // phase, so `ember_auth_verified` is
+                                // the normal signal here. Binding-only
+                                // fallback covers peers whose Ember
+                                // stack predates the auth opcodes.
+                                let verified = ember_auth_verified || ember_hash_binding_verified;
                                 let _ = event_tx.send(DownloadEvent::EmberFriendRequest {
                                     ember_hash: eh,
                                     nickname: nick,
@@ -2561,7 +2690,7 @@ impl Ed2kDownload {
                                 }
                             }
                         }
-                        (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && payload.len() <= 4096 => {
+                        (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && ember_auth_verified && payload.len() <= 4096 => {
                             if let Some(eh) = peer_ember_hash {
                                 if let Ok(msg) = std::str::from_utf8(&payload) {
                                     let _ = event_tx.send(DownloadEvent::EmberChatMessage {
