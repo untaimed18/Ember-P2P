@@ -9,6 +9,18 @@
 
   let { open = $bindable(false) }: { open?: boolean } = $props();
 
+  let panelEl: HTMLDivElement | undefined = $state();
+
+  // Auto-focus the panel when it opens so Escape works without the
+  // user having to click inside first. Matches AboutDialog's pattern.
+  $effect(() => {
+    if (open) {
+      requestAnimationFrame(() => {
+        panelEl?.focus();
+      });
+    }
+  });
+
   const groups: Group[] = [
     {
       title: 'Global',
@@ -57,15 +69,15 @@
 
 {#if open}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="shortcut-overlay" onclick={() => (open = false)}>
+  <div class="shortcut-overlay" onclick={() => (open = false)} onkeydown={onKeydown}>
     <div
       class="shortcut-panel"
       role="dialog"
       aria-modal="true"
       aria-labelledby="kbd-shortcut-title"
       onclick={(e) => e.stopPropagation()}
-      onkeydown={onKeydown}
       tabindex="-1"
+      bind:this={panelEl}
     >
       <div class="shortcut-header">
         <h3 id="kbd-shortcut-title">Keyboard Shortcuts</h3>
