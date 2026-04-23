@@ -14,6 +14,7 @@
   import { networkError, networkStats } from '$lib/stores/network';
   import { toastSuccess, toastError, toast as toastInfo } from '$lib/stores/toast';
   import { goto } from '$app/navigation';
+  import { passiveScroll } from '$lib/actions/passiveScroll';
   import type { KadContact, KadSearchEntry } from '$lib/types';
   import { onMount, untrack } from 'svelte';
 
@@ -38,8 +39,11 @@
   type ContactTypeFilter = 'all' | 'bootstrap' | '0' | '1' | '2' | '3' | '4';
   let contactTypeFilter: ContactTypeFilter = $state('all');
 
-  let contactPage = $state(0);
-  const CONTACTS_PER_PAGE = 200;
+  let contactScrollContainer: HTMLDivElement | undefined = $state();
+  let contactScrollTop = $state(0);
+  let contactViewportHeight = $state(400);
+  const CONTACT_ROW_HEIGHT = 26;
+  const CONTACT_OVERSCAN = 15;
 
   let refreshInProgress = false;
   let mounted = $state(false);
@@ -405,22 +409,43 @@
       else if (contactSortCol === 'distance') cmp = hexCmp(a.distance, b.distance);
       return contactSortAsc ? cmp : -cmp;
     });
-    const start = contactPage * CONTACTS_PER_PAGE;
-    return sorted.slice(start, start + CONTACTS_PER_PAGE);
+    return sorted;
   });
 
-  let totalContactPages = $derived(Math.max(1, Math.ceil(filteredContacts.length / CONTACTS_PER_PAGE)));
-  let visibleContactRange = $derived.by(() => {
-    if (filteredContacts.length === 0) return { start: 0, end: 0 };
-    const start = contactPage * CONTACTS_PER_PAGE;
-    const end = Math.min(filteredContacts.length, start + CONTACTS_PER_PAGE);
-    return { start: start + 1, end };
+  let virtualContacts = $derived.by(() => {
+    const total = sortedContacts.length;
+    if (total === 0) return { visible: [], startIdx: 0, topPad: 0, bottomPad: 0 };
+    const firstVisible = Math.floor(contactScrollTop / CONTACT_ROW_HEIGHT);
+    const visibleCount = Math.ceil(contactViewportHeight / CONTACT_ROW_HEIGHT);
+    const startIdx = Math.max(0, firstVisible - CONTACT_OVERSCAN);
+    const endIdx = Math.min(total, firstVisible + visibleCount + CONTACT_OVERSCAN);
+    return {
+      visible: sortedContacts.slice(startIdx, endIdx),
+      startIdx,
+      topPad: startIdx * CONTACT_ROW_HEIGHT,
+      bottomPad: (total - endIdx) * CONTACT_ROW_HEIGHT
+    };
   });
 
-  // Reset pager when filter or type changes so the user lands on page 1.
+  $effect(() => {
+    if (!contactScrollContainer) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        contactViewportHeight = entry.contentRect.height;
+      }
+    });
+    ro.observe(contactScrollContainer);
+    contactViewportHeight = contactScrollContainer.clientHeight;
+    return () => ro.disconnect();
+  });
+
+  // Reset scroll when filter or type changes so the user lands at top.
   $effect(() => {
     void contactFilter; void contactTypeFilter;
-    untrack(() => { contactPage = 0; });
+    untrack(() => {
+      if (contactScrollContainer) contactScrollContainer.scrollTop = 0;
+      contactScrollTop = 0;
+    });
   });
 
   let sortedSearches = $derived.by(() => {
@@ -444,7 +469,8 @@
   function sortContacts(col: 'id' | 'type' | 'distance') {
     if (contactSortCol === col) contactSortAsc = !contactSortAsc;
     else { contactSortCol = col; contactSortAsc = true; }
-    contactPage = 0;
+    if (contactScrollContainer) contactScrollContainer.scrollTop = 0;
+    contactScrollTop = 0;
   }
 
   function sortSearches(col: string) {
@@ -474,17 +500,9 @@
     if ($networkStats.status === 'disconnected') {
       contacts = [];
       searches = [];
-      contactPage = 0;
+      if (contactScrollContainer) contactScrollContainer.scrollTop = 0;
+      contactScrollTop = 0;
     }
-  });
-
-  $effect(() => {
-    const maxPage = totalContactPages;
-    untrack(() => {
-      if (contactPage >= maxPage) {
-        contactPage = Math.max(0, maxPage - 1);
-      }
-    });
   });
 </script>
 
@@ -550,7 +568,8 @@
             if (contactFilterTimer) clearTimeout(contactFilterTimer);
             contactFilterTimer = setTimeout(() => {
               contactFilter = contactFilterInput;
-              contactPage = 0;
+              if (contactScrollContainer) contactScrollContainer.scrollTop = 0;
+              contactScrollTop = 0;
             }, 150);
           }}
           disabled={contacts.length === 0}
@@ -570,31 +589,28 @@
           <option value="3">New</option>
           <option value="4">Dead</option>
         </select>
-        {#if totalContactPages > 1}
-          <div class="pager">
-            <button class="pager-btn" disabled={contactPage === 0} onclick={() => contactPage--} aria-label="Previous page">&lt;</button>
-            <span class="pager-info" title="Showing items {visibleContactRange.start}–{visibleContactRange.end} of {filteredContacts.length.toLocaleString()}">
-              {visibleContactRange.start.toLocaleString()}–{visibleContactRange.end.toLocaleString()}
-            </span>
-            <button class="pager-btn" disabled={contactPage >= totalContactPages - 1} onclick={() => contactPage++} aria-label="Next page">&gt;</button>
-          </div>
-        {/if}
       </div>
 
-      <div class="panel-content scrollable scroll-shadows">
+      <div
+        class="panel-content scrollable scroll-shadows"
+        bind:this={contactScrollContainer}
+        use:passiveScroll={(e) => { contactScrollTop = (e.target as HTMLDivElement).scrollTop; }}
+      >
         {#if $networkStats.status !== 'connected' && $networkStats.status !== 'connecting'}
           <div class="empty-state compact">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path><line x1="8" y1="12" x2="16" y2="12"></line><line x1="2" y1="2" x2="22" y2="22"></line></svg>
             <p>Not connected</p>
             <p class="sub">Press Connect to join the KAD network</p>
             <button class="empty-action" onclick={handleConnect}>Connect</button>
           </div>
         {:else if loading}
           <div class="empty-state compact">
-            <div class="spinner"></div>
+            <div class="spinner lg"></div>
             <p>Loading contacts...</p>
           </div>
         {:else if contacts.length === 0}
           <div class="empty-state compact">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
             <p>No KAD contacts</p>
             <p class="sub">The routing table is empty. Bootstrap from a known node to join the network.</p>
             <div class="empty-actions">
@@ -605,6 +621,7 @@
           </div>
         {:else if filteredContacts.length === 0}
           <div class="empty-state compact">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line><line x1="11" y1="8" x2="11" y2="14"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
             <p>No contacts match the filter</p>
             <p class="sub">Try a shorter prefix or a different type.</p>
             <button class="empty-action ghost" onclick={() => { contactFilterInput = ''; contactFilter = ''; contactTypeFilter = 'all'; }}>Clear Filters</button>
@@ -633,26 +650,36 @@
               </tr>
             </thead>
             <tbody>
-              {#each sortedContacts as contact (contact.id)}
-                <tr>
-                  <td
-                    class="contact-id"
-                    title={`${contact.id}\nDouble-click to copy`}
-                    ondblclick={() => copyText(contact.id, 'Copied contact ID')}
-                  >{contact.id}</td>
+              {#if virtualContacts.topPad > 0}
+                <tr class="spacer-row" style="height: {virtualContacts.topPad}px; border: none; background: transparent;"><td colspan="3" style="padding: 0; border: none; background: transparent;"></td></tr>
+              {/if}
+              {#each virtualContacts.visible as contact, i (contact.id)}
+                <tr class="virtual-row" class:row-alt={(virtualContacts.startIdx + i) % 2 === 1}>
+                  <td class="contact-id">
+                    <!-- svelte-ignore a11y_no_static_element_interactions -->
+                    <span class="cell-content" title={`${contact.id}\nDouble-click to copy`} ondblclick={() => copyText(contact.id, 'Copied contact ID')}>{contact.id}</span>
+                    <button class="ghost copy-btn" aria-label="Copy ID" onclick={() => copyText(contact.id, 'Copied contact ID')} title="Copy ID">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                    </button>
+                  </td>
                   <td>
                     <span class="contact-type type-{contact.bootstrap ? 'bootstrap' : contact.type}" class:unverified={!contact.ip_verified && contact.type < 3 && !contact.bootstrap}>
                       <span class="type-glyph" aria-hidden="true">{getContactTypeGlyph(contact)}</span>
                       {getContactTypeLabel(contact)}
                     </span>
                   </td>
-                  <td
-                    class="distance"
-                    title={`${contact.distance}\nDouble-click to copy`}
-                    ondblclick={() => copyText(contact.distance, 'Copied distance')}
-                  >{contact.distance}</td>
+                  <td class="distance">
+                    <!-- svelte-ignore a11y_no_static_element_interactions -->
+                    <span class="cell-content" title={`${contact.distance}\nDouble-click to copy`} ondblclick={() => copyText(contact.distance, 'Copied distance')}>{contact.distance}</span>
+                    <button class="ghost copy-btn" aria-label="Copy Distance" onclick={() => copyText(contact.distance, 'Copied distance')} title="Copy Distance">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                    </button>
+                  </td>
                 </tr>
               {/each}
+              {#if virtualContacts.bottomPad > 0}
+                <tr class="spacer-row" style="height: {virtualContacts.bottomPad}px; border: none; background: transparent;"><td colspan="3" style="padding: 0; border: none; background: transparent;"></td></tr>
+              {/if}
             </tbody>
           </table>
         {/if}
@@ -902,12 +929,14 @@
     <div class="panel-content scrollable scroll-shadows">
       {#if $networkStats.status !== 'connected' && $networkStats.status !== 'connecting'}
         <div class="empty-state compact">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path><line x1="8" y1="12" x2="16" y2="12"></line><line x1="2" y1="2" x2="22" y2="22"></line></svg>
           <p>Not connected</p>
           <p class="sub">Connect to the KAD network to see active searches</p>
           <button class="empty-action" onclick={handleConnect}>Connect</button>
         </div>
       {:else if searches.length === 0}
         <div class="empty-state compact">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
           <p>No active KAD searches</p>
           <p class="sub">Searches will appear here when initiated from the Search page</p>
         </div>
@@ -968,7 +997,9 @@
                       title="Cancel this search"
                       aria-label={`Cancel search ${search.id}`}
                       onclick={() => handleCancelSearch(search.id)}
-                    >Cancel</button>
+                    >
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>
+                    </button>
                   {/if}
                 </td>
               </tr>
@@ -1284,23 +1315,60 @@
     box-shadow: var(--shadow-sm);
   }
 
+  /* Two-column grid when there's room, one-column fallback below
+     ~280px of panel width so long labels ("TCP Reachability",
+     "KAD users (est.)") can't get truncated or wrap awkwardly.
+     The container-query approach means the layout responds to the
+     panel's actual width, not the window's — so the fallback kicks
+     in correctly when the sidebar is expanded at narrow app widths. */
+  .stats-panel {
+    container-type: inline-size;
+  }
+
   .stat-rows {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px 16px;
+  }
+
+  @container (max-width: 280px) {
+    .stat-rows {
+      grid-template-columns: 1fr;
+      gap: 2px;
+    }
   }
 
   .stat-row {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 8px;
     font-size: 12px;
     padding: 4px 0;
     border-bottom: 1px dashed color-mix(in srgb, var(--border) 60%, transparent);
+    min-width: 0;
   }
 
-  .stat-row:last-child {
+  .stat-row > .stat-value,
+  .stat-row > .badge,
+  .stat-row > .stat-link {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .stat-row:nth-last-child(-n+2) {
     border-bottom: none;
+  }
+
+  @container (max-width: 280px) {
+    .stat-row:nth-last-child(-n+2) {
+      border-bottom: 1px dashed color-mix(in srgb, var(--border) 60%, transparent);
+    }
+    .stat-row:last-child {
+      border-bottom: none;
+    }
   }
 
   .stat-label {
@@ -1377,7 +1445,8 @@
     height: 26px;
   }
 
-  .compact-table tbody tr:nth-child(even) td {
+  .compact-table tbody tr.row-alt td,
+  .compact-table tbody tr:nth-child(even):not(.virtual-row):not(.spacer-row) td {
     background: color-mix(in srgb, var(--bg-secondary) 88%, var(--bg-primary));
   }
 
@@ -1385,12 +1454,51 @@
     font-family: var(--font-mono);
     font-size: 10px;
     color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
   }
 
   .distance {
     font-family: var(--font-mono);
     font-size: 10px;
     color: var(--text-secondary);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .cell-content {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .copy-btn {
+    padding: 2px !important;
+    min-width: 0;
+    width: 18px;
+    height: 18px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.1s;
+    color: var(--text-muted);
+  }
+
+  .copy-btn svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  tr:hover .copy-btn,
+  .copy-btn:focus-visible {
+    opacity: 1;
+  }
+
+  .copy-btn:hover {
+    color: var(--text-primary);
   }
 
   .contact-type {
@@ -1484,9 +1592,23 @@
      button class for the base look so the visual language stays
      consistent across the app. */
   .cancel-btn {
-    padding: 2px 8px;
-    font-size: 10px;
-    line-height: 1.4;
+    padding: 2px !important;
+    min-width: 0;
+    width: 20px;
+    height: 20px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+  }
+
+  .cancel-btn svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  .cancel-btn:hover {
+    color: var(--danger);
   }
 
   @media (max-width: 1050px) {
