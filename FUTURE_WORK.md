@@ -4,9 +4,12 @@
 
 ### F2 — Ember Hash Authentication (Protocol Change)
 **Priority:** HIGH (security) | **Effort:** Large
-**Status:** DONE on the security-critical paths; one
-gap remaining on the multi-source download read loop (see
-"Remaining gaps" below).
+**Status:** DONE across every code path that can grant trust —
+friend-connect dial, upload dispatcher, multi-source download,
+and single-source download all run full Ed25519 proof of
+possession. Privilege-bearing friend opcodes (chat, browse,
+keepalive) are gated on PoP verification on both the upload
+and download sides.
 
 Ember Ed25519 identity authentication is wired into the two TCP
 code paths that actually grant trust: friend-connect dials
@@ -38,17 +41,24 @@ their own nonce.
   EmuleInfo no longer signal Ember-ness), making the whole
   friend-connect path silently broken.
 
-- **`multi_source.rs`** (download side): runs the offline
-  `verify_ember_hash_binding` check only. Inline
-  `perform_ember_auth` was tried and reverted because the
-  uploader sends OP_SECIDENTSTATE (and optionally EPX)
-  proactively immediately after its OP_EMBER_HELLO — those
-  packets queue ahead of the uploader's CHALLENGE response,
-  and `perform_ember_auth`'s synchronous read would consume +
-  discard them with a wrong-opcode error, breaking SecIdent
-  credit accounting on every download session. The binding
-  check still rejects hash-only spoofers; the `verified`
-  flag is threaded into every `DownloadEvent::EmberFriendRequest`.
+- **`multi_source.rs`** (download side): runs both the offline
+  `verify_ember_hash_binding` check AND full Ed25519 PoP via
+  `friend_connect::perform_ember_auth_buffered`. The buffered
+  variant defers any non-AUTH packets it reads (notably
+  `OP_SECIDENTSTATE` / EPX frames that the uploader sends
+  proactively after its OP_EMBER_HELLO) into a per-session
+  FIFO; the pre-control and file-status-wait loops drain that
+  FIFO before reading fresh bytes from the stream, so SecIdent
+  credit accounting and EPX source-injection still work for
+  Ember-to-Ember downloads. `DownloadEvent::EmberFriendRequest.verified`
+  now carries `ember_auth_verified || ember_hash_binding_verified`
+  so the Friends UI can distinguish PoP-backed verification
+  from the binding-only fallback (older Ember peers that
+  haven't yet shipped the AUTH opcodes). The privilege-bearing
+  friend opcodes in the runtime loop (`OP_EMBER_CHAT_MSG`,
+  `OP_EMBER_BROWSE_RES`) additionally require
+  `ember_auth_verified` so a peer that merely claims a
+  friend's hash cannot pose as the friend.
 
 - **`upload.rs`** (responder side): cannot run a synchronous
   `perform_ember_auth` from the dispatcher because its reader is
@@ -64,6 +74,20 @@ their own nonce.
   in `Verified`, second RESPONSE, etc.) are rejected and never
   downgrade an already-Verified state.
 
+  Privilege-bearing friend opcodes (`OP_EMBER_CHAT_MSG`,
+  `OP_EMBER_BROWSE_REQ`, `OP_EMBER_BROWSE_RES`,
+  `OP_EMBER_KEEPALIVE`) are gated on
+  `is_ember_friend && ember_auth_state.is_verified()` in the
+  match arm — not just on `is_ember_friend`. Without that
+  extra clause a peer who had harvested our friend's
+  `ember_hash` from KAD / EPX / trackers could ride the
+  friend's identity on an ordinary upload session (inject
+  chat rendered as from-the-friend in the Friends UI,
+  silently hold the friend's ember slot via keepalives,
+  etc.). Requiring a fresh-nonce signature per session
+  closes that window — only the friend's Ed25519 secret key
+  can produce the signature we check.
+
 **End-to-end signal.** Verified state is persisted in the
 `friend_requests.verified` column (DB v14 migration with monotonic
 `MAX(verified, excluded.verified)` upsert so a spoofer flooding
@@ -71,35 +95,32 @@ unverified requests cannot downgrade an already-verified row),
 surfaced in `FriendRequestInfo.verified`, and rendered as a
 Verified / Unverified badge on the Friends page.
 
-**Remaining gaps (intentional, scoped follow-ups).**
+**Phase 1 follow-ups — all completed.**
 
-- **Multi-source download path PoP.** Closing this requires a
-  packet-buffering wrapper around `perform_ember_auth` that
-  defers any non-AUTH opcode it reads (notably
-  OP_SECIDENTSTATE) back into the main dispatch loop instead
-  of dropping it. With that wrapper, the inline call in
-  `multi_source.rs`'s OP_EMBER_HELLO handlers would be safe.
-  The keys (`ed25519_public_key` + `_ed25519_secret_key`) are
-  already plumbed onto `MultiSourceDownload` and through
-  `download_parts_from_source` for that purpose.
+- **Multi-source download path PoP** — DONE.
+  `perform_ember_auth_buffered` lives in `friend_connect.rs`
+  and is invoked from both the pre-control loop and the
+  file-status-wait loop in `multi_source.rs`. Captured
+  non-AUTH packets are drained back into the normal dispatch
+  match arms so SecIdent credit and EPX source-injection are
+  unaffected.
 
-- **Single-source `transfer.rs` download.** Doesn't parse
-  `OP_EMBER_HELLO` at all today, so `EmberFriendRequest` emits
-  from that path always carry `verified: false`. Mirror the
-  OP_EMBER_HELLO parsing block from `multi_source.rs`;
-  `Ed2kDownload` already carries the keys.
+- **Single-source `transfer.rs` download** — DONE.
+  `transfer.rs` now mirrors `multi_source.rs`: parses
+  `OP_EMBER_HELLO(ANSWER)`, runs the offline binding check,
+  and then runs the buffered PoP in both the pre-control and
+  file-status-wait phases. The `EmberFriendRequest.verified`
+  field now reflects `ember_auth_verified || ember_hash_binding_verified`
+  instead of the old binding-only signal, and the
+  data-loop `OP_EMBER_CHAT_MSG` arm requires PoP.
 
-- **Friend-slot priority** (`upload.rs::is_friend`): currently
-  gated on `friend_hashes` membership only, which is set after
-  the user accepts a request. Accept triggers
-  `friend_connect::open_and_run_friend_session`, which DOES
-  run full PoP on the dial-back — so spoofers who pass the
-  initial offline binding check still hit the cryptographic
-  wall when their session opens. Tightening upload's
-  is_friend check to *also* require `ember_auth_state.is_verified()`
-  (i.e. PoP on the same TCP session, not a side-channel
-  session) would close the residual window where a spoofer
-  could ride the friend's hash on a regular upload session.
+- **Friend-slot privileges** — DONE. The upload-side
+  dispatcher already gates queue insertion and scoring on
+  `is_verified_friend = is_friend && ember_auth_state.is_verified()`,
+  and the four privilege-bearing Ember friend opcodes
+  (CHAT_MSG, BROWSE_REQ, BROWSE_RES, KEEPALIVE) are now
+  gated the same way in both `upload.rs` and
+  `multi_source.rs` runtime loops.
 
 ### U4 — Pass Friend as Download Source in Browse Dialog
 **Priority:** MEDIUM (performance) | **Effort:** Small
