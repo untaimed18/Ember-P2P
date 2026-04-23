@@ -689,8 +689,12 @@
     <div class="kad-upper-right scroll-shadows">
       <div class="stats-panel">
         <div class="panel-title">Network Status</div>
-        <div class="stat-rows">
-          <div class="stat-row">
+
+        <!-- Three logical groups: overall connection, peers discovered,
+             reachability. Separators between groups replace the old
+             per-row dashed borders for a calmer, more scannable card. -->
+        <div class="stat-group">
+          <div class="stat-tile tile-wide">
             <span class="stat-label">Status</span>
             <span class="badge {$networkStats.status}">
               <span class="badge-glyph" aria-hidden="true">
@@ -699,36 +703,48 @@
               {$networkStats.status}
             </span>
           </div>
-          <div class="stat-row">
-            <span class="stat-label">Contacts</span>
-            <span class="stat-value">{contacts.length.toLocaleString()}</span>
-          </div>
-          <div class="stat-row">
-            <span class="stat-label" title="Estimated number of KAD users worldwide, derived from routing-table density">KAD users (est.)</span>
+          <div class="stat-tile tile-wide">
+            <span class="stat-label">Health</span>
             <span class="stat-value">
+              {$networkStats.stale ? 'Stale' : $networkStats.degraded ? ($networkStats.degraded_reason || 'Degraded') : 'Healthy'}
+            </span>
+          </div>
+        </div>
+
+        <div class="stat-group stat-group-grid">
+          <div class="stat-tile">
+            <span class="stat-label">Contacts</span>
+            <span class="stat-value stat-numeric">{contacts.length.toLocaleString()}</span>
+          </div>
+          <div class="stat-tile">
+            <span class="stat-label" title="Estimated number of KAD users worldwide, derived from routing-table density">KAD users</span>
+            <span class="stat-value stat-numeric">
               {$networkStats.status === 'disconnected' || !$networkStats.kad_users_estimate
                 ? '—'
                 : $networkStats.kad_users_estimate.toLocaleString()}
             </span>
           </div>
-          <div class="stat-row">
+          <div class="stat-tile">
             <span class="stat-label" title="Ember-aware peers discovered in this session">Ember peers</span>
-            <span class="stat-value">{($networkStats.ember_peers ?? 0).toLocaleString()}</span>
+            <span class="stat-value stat-numeric">{($networkStats.ember_peers ?? 0).toLocaleString()}</span>
           </div>
-          <div class="stat-row">
+          <div class="stat-tile">
             <span class="stat-label" title="Sources learned via EPX (Ember Peer Exchange)">EPX sources</span>
-            <span class="stat-value">{($networkStats.epx_sources_received ?? 0).toLocaleString()}</span>
+            <span class="stat-value stat-numeric">{($networkStats.epx_sources_received ?? 0).toLocaleString()}</span>
           </div>
-          <div class="stat-row">
+        </div>
+
+        <div class="stat-group">
+          <div class="stat-tile tile-wide">
             <span class="stat-label">External IP</span>
-            <span class="stat-value">{$networkStats.status === 'disconnected' ? 'Unknown' : ($networkStats.external_ip || 'Detecting...')}</span>
+            <span class="stat-value stat-ip">{$networkStats.status === 'disconnected' ? 'Unknown' : ($networkStats.external_ip || 'Detecting…')}</span>
           </div>
-          <div class="stat-row">
+          <div class="stat-tile tile-wide">
             <span class="stat-label">Firewall</span>
             {#if $networkStats.status === 'disconnected'}
               <span class="badge unknown"><span class="badge-glyph" aria-hidden="true">?</span> Unknown</span>
             {:else if $networkStats.status === 'connecting'}
-              <span class="badge unknown"><span class="badge-glyph" aria-hidden="true">&#x25CB;</span> Checking...</span>
+              <span class="badge unknown"><span class="badge-glyph" aria-hidden="true">&#x25CB;</span> Checking…</span>
             {:else}
               <span
                 class="badge {$networkStats.firewalled ? 'firewalled' : 'open'}"
@@ -744,21 +760,18 @@
               </span>
             {/if}
           </div>
-          <div class="stat-row">
-            <span class="stat-label">Health</span>
-            <span class="stat-value">
-              {$networkStats.stale ? 'Stale' : $networkStats.degraded ? ($networkStats.degraded_reason || 'Degraded') : 'Healthy'}
-            </span>
-          </div>
-          <div class="stat-row">
-            <span class="stat-label">TCP Reachability</span>
+        </div>
+
+        <div class="stat-group stat-group-grid">
+          <div class="stat-tile">
+            <span class="stat-label">TCP</span>
             <span class="stat-value">{$networkStats.tcp_status || 'Unknown'}</span>
           </div>
-          <div class="stat-row">
-            <span class="stat-label">UDP Reachability</span>
+          <div class="stat-tile">
+            <span class="stat-label">UDP</span>
             <span class="stat-value">{$networkStats.udp_status || 'Unknown'}</span>
           </div>
-          <div class="stat-row">
+          <div class="stat-tile">
             <span class="stat-label">UPnP</span>
             {#if !upnpEnabled}
               <button
@@ -771,7 +784,7 @@
               <span class="stat-value">{$networkStats.upnp_mapped ? 'Mapped' : 'Not Mapped'}</span>
             {/if}
           </div>
-          <div class="stat-row">
+          <div class="stat-tile">
             <span class="stat-label">Buddy</span>
             <span class="stat-value">
               {!$networkStats.buddy_status || $networkStats.buddy_status === 'none' ? 'None' :
@@ -1323,70 +1336,111 @@
     box-shadow: var(--shadow-sm);
   }
 
-  /* Two-column grid when there's room, one-column fallback below
-     ~280px of panel width so long labels ("TCP Reachability",
-     "KAD users (est.)") can't get truncated or wrap awkwardly.
-     The container-query approach means the layout responds to the
-     panel's actual width, not the window's — so the fallback kicks
-     in correctly when the sidebar is expanded at narrow app widths. */
+  /*
+   * Stats panel redesigned as stacked "stat tiles" grouped into three
+   * logical sections: overall health, peer counts, and reachability.
+   * Each tile stacks its label above its value so long values (badges,
+   * IP addresses, "Not Mapped") get the full tile width and never
+   * truncate. Group separators replace per-row dashed borders so the
+   * card reads calmer and more scannable.
+   *
+   * Container-query responsive: two / four columns when the panel is
+   * wide, one / two columns when it's narrow (sidebar-constrained).
+   */
   .stats-panel {
     container-type: inline-size;
   }
 
-  .stat-rows {
+  .stat-group {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 8px 16px;
+    gap: 2px 12px;
+    padding: 6px 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
   }
 
-  @container (max-width: 280px) {
-    .stat-rows {
-      grid-template-columns: 1fr;
-      gap: 2px;
-    }
+  .stat-group:first-of-type {
+    padding-top: 0;
   }
 
-  .stat-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    font-size: 12px;
-    padding: 4px 0;
-    border-bottom: 1px dashed color-mix(in srgb, var(--border) 60%, transparent);
-    min-width: 0;
-  }
-
-  .stat-row > .stat-value,
-  .stat-row > .badge,
-  .stat-row > .stat-link {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .stat-row:nth-last-child(-n+2) {
+  .stat-group:last-of-type {
+    padding-bottom: 0;
     border-bottom: none;
   }
 
-  @container (max-width: 280px) {
-    .stat-row:nth-last-child(-n+2) {
-      border-bottom: 1px dashed color-mix(in srgb, var(--border) 60%, transparent);
+  .stat-group-grid {
+    grid-template-columns: repeat(4, 1fr);
+    gap: 2px 8px;
+  }
+
+  .stat-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 6px 0;
+    min-width: 0;
+  }
+
+  .tile-wide {
+    grid-column: span 1;
+  }
+
+  /* At narrow panel widths, collapse the 4-up numeric group to 2-up
+     and the 2-up groups stay 2-up (labels are short enough). Below
+     ~220px everything stacks single column. */
+  @container (max-width: 330px) {
+    .stat-group-grid {
+      grid-template-columns: repeat(2, 1fr);
     }
-    .stat-row:last-child {
-      border-bottom: none;
+  }
+
+  @container (max-width: 220px) {
+    .stat-group,
+    .stat-group-grid {
+      grid-template-columns: 1fr;
     }
   }
 
   .stat-label {
     color: var(--text-muted);
     font-weight: 500;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .stat-value {
     color: var(--text-primary);
     font-weight: 600;
+    font-size: 13px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Numeric readouts get the larger "stat card" treatment so peer
+     counts read at a glance. Tabular numerals keep digits aligned
+     across rows. */
+  .stat-numeric {
+    font-size: 18px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.3px;
+  }
+
+  .stat-ip {
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+
+  /* Badges inside tiles shouldn't stretch — they sit at their natural
+     width so the tile column stays flexible. */
+  .stat-tile .badge {
+    align-self: flex-start;
   }
 
   .kad-lower {
