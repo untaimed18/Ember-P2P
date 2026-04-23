@@ -7,7 +7,7 @@
   type Shortcut = { keys: string[]; label: string };
   type Group = { title: string; shortcuts: Shortcut[] };
 
-  let { open = $bindable(false) }: { open: boolean } = $props();
+  let { open = $bindable(false) }: { open?: boolean } = $props();
 
   const groups: Group[] = [
     {
@@ -76,11 +76,11 @@
           <section class="shortcut-group">
             <h4>{group.title}</h4>
             <dl>
-              {#each group.shortcuts as shortcut (shortcut.label)}
+              {#each group.shortcuts as shortcut, i (group.title + '-' + i)}
                 <div class="shortcut-row">
                   <dt>
-                    {#each shortcut.keys as key, i (key + i)}
-                      {#if i > 0}<span class="shortcut-plus">+</span>{/if}
+                    {#each shortcut.keys as key, j (j + '-' + key)}
+                      {#if j > 0}<span class="shortcut-plus">+</span>{/if}
                       <kbd>{key}</kbd>
                     {/each}
                   </dt>
