@@ -2,12 +2,14 @@
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
   import AboutDialog from '$lib/components/AboutDialog.svelte';
+  import KeyboardShortcutsDialog from '$lib/components/KeyboardShortcutsDialog.svelte';
   import { transfers } from '$lib/stores/transfers';
   import { networkStats } from '$lib/stores/network';
   import { friendRequests } from '$lib/stores/friends';
   import { onMount } from 'svelte';
 
   let aboutOpen = $state(false);
+  let shortcutsOpen = $state(false);
 
   // Persist collapsed state across sessions. Read synchronously on
   // script init so the first render doesn't briefly flash expanded
@@ -98,6 +100,16 @@
   }
 
   function onShortcutKey(e: KeyboardEvent) {
+    // "?" or F1 — open the keyboard shortcuts cheat-sheet. F1 is the
+    // legacy desktop help key; "?" matches GitHub/Slack/Linear
+    // conventions. Blocked while typing so users can still type "?"
+    // into search fields.
+    if ((e.key === '?' || e.key === 'F1') && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      if (isTypingTarget(e.target)) return;
+      e.preventDefault();
+      shortcutsOpen = !shortcutsOpen;
+      return;
+    }
     // Ctrl/Cmd+B toggles the sidebar. Matches VS Code/Slack/Discord
     // convention and frees up horizontal space for data-dense pages
     // without the user needing to reach for the mouse. Blocked while
@@ -222,6 +234,25 @@
   </ul>
 
   <div class="sidebar-footer">
+    <button
+      type="button"
+      class="about-btn"
+      onclick={() => (shortcutsOpen = true)}
+      title="Keyboard shortcuts (?)"
+      aria-keyshortcuts="?"
+    >
+      <span class="about-icon" aria-hidden="true">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="1.5" y="5" width="17" height="10" rx="2"/>
+          <line x1="5" y1="8.5" x2="5.01" y2="8.5"/>
+          <line x1="8" y1="8.5" x2="8.01" y2="8.5"/>
+          <line x1="11" y1="8.5" x2="11.01" y2="8.5"/>
+          <line x1="14" y1="8.5" x2="14.01" y2="8.5"/>
+          <line x1="5" y1="11.5" x2="14" y2="11.5"/>
+        </svg>
+      </span>
+      <span>Shortcuts</span>
+    </button>
     <button type="button" class="about-btn" onclick={() => (aboutOpen = true)} title="About Ember">
       <span class="about-icon" aria-hidden="true">
         <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -254,6 +285,7 @@
   </div>
 
   <AboutDialog bind:open={aboutOpen} />
+  <KeyboardShortcutsDialog bind:open={shortcutsOpen} />
 </nav>
 
 <style>

@@ -692,7 +692,12 @@
         <div class="stat-rows">
           <div class="stat-row">
             <span class="stat-label">Status</span>
-            <span class="badge {$networkStats.status}">{$networkStats.status}</span>
+            <span class="badge {$networkStats.status}">
+              <span class="badge-glyph" aria-hidden="true">
+                {#if $networkStats.status === 'connected'}&#x2713;{:else if $networkStats.status === 'connecting'}&#x25CB;{:else}&#x2715;{/if}
+              </span>
+              {$networkStats.status}
+            </span>
           </div>
           <div class="stat-row">
             <span class="stat-label">Contacts</span>
@@ -721,9 +726,9 @@
           <div class="stat-row">
             <span class="stat-label">Firewall</span>
             {#if $networkStats.status === 'disconnected'}
-              <span class="badge unknown">Unknown</span>
+              <span class="badge unknown"><span class="badge-glyph" aria-hidden="true">?</span> Unknown</span>
             {:else if $networkStats.status === 'connecting'}
-              <span class="badge unknown">Checking...</span>
+              <span class="badge unknown"><span class="badge-glyph" aria-hidden="true">&#x25CB;</span> Checking...</span>
             {:else}
               <span
                 class="badge {$networkStats.firewalled ? 'firewalled' : 'open'}"
@@ -732,6 +737,9 @@
                   ? 'Firewall status: firewalled. Inbound TCP connections are blocked; KAD operates via UDP callbacks.'
                   : 'Firewall status: open. Inbound TCP connections succeed; full KAD participation is available.'}
               >
+                <span class="badge-glyph" aria-hidden="true">
+                  {#if $networkStats.firewalled}&#x26A0;{:else}&#x2713;{/if}
+                </span>
                 {$networkStats.firewalled ? 'Firewalled' : 'Open'}
               </span>
             {/if}
@@ -1567,24 +1575,47 @@
     color: var(--text-muted);
   }
 
+  /* Local badge variants. Follow the same tinted-chip recipe as the
+     global badges in app.css so the KAD page matches in both themes. */
   .badge.open {
-    background: var(--success);
-    color: #fff;
+    background: color-mix(in srgb, var(--success) 15%, transparent);
+    border-color: color-mix(in srgb, var(--success) 30%, transparent);
+    color: color-mix(in srgb, var(--success) 85%, #000);
   }
 
   .badge.firewalled {
-    background: var(--warning);
-    color: #fff;
+    background: color-mix(in srgb, var(--warning) 15%, transparent);
+    border-color: color-mix(in srgb, var(--warning) 30%, transparent);
+    color: color-mix(in srgb, var(--warning) 80%, #000);
   }
 
   .badge.unknown {
-    background: var(--bg-tertiary);
-    color: var(--text-muted);
+    background: color-mix(in srgb, var(--text-muted) 18%, transparent);
+    border-color: color-mix(in srgb, var(--text-muted) 32%, transparent);
+    color: var(--text-secondary);
   }
 
   .badge.stopping {
-    background: var(--warning);
-    color: #fff;
+    background: color-mix(in srgb, var(--warning) 15%, transparent);
+    border-color: color-mix(in srgb, var(--warning) 30%, transparent);
+    color: color-mix(in srgb, var(--warning) 80%, #000);
+  }
+
+  :global([data-theme="dark"]) .badge.open {
+    background: color-mix(in srgb, var(--success) 18%, transparent);
+    border-color: color-mix(in srgb, var(--success) 32%, transparent);
+    color: #8fd9a3;
+  }
+  :global([data-theme="dark"]) .badge.firewalled,
+  :global([data-theme="dark"]) .badge.stopping {
+    background: color-mix(in srgb, var(--warning) 18%, transparent);
+    border-color: color-mix(in srgb, var(--warning) 32%, transparent);
+    color: #f0c37a;
+  }
+  :global([data-theme="dark"]) .badge.unknown {
+    background: color-mix(in srgb, var(--text-muted) 22%, transparent);
+    border-color: color-mix(in srgb, var(--text-muted) 38%, transparent);
+    color: var(--text-secondary);
   }
 
   /* Per-row Cancel button: small ghost variant that lines up with the

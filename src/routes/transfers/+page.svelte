@@ -2409,9 +2409,27 @@
             {/if}
           {/if}
           {#if allDownloads.length === 0}
-            <tr><td colspan={dlColCount} class="empty-cell">No downloads yet. <a href="/search">Start a search</a> to find files.</td></tr>
+            <tr class="empty-row"><td colspan={dlColCount} class="empty-cell">
+              <div class="empty-cell-body">
+                <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                  <polyline points="7 10 12 15 17 10"></polyline>
+                  <line x1="12" y1="15" x2="12" y2="3"></line>
+                </svg>
+                <p class="empty-cell-title">No downloads yet</p>
+                <p class="empty-cell-sub"><a href="/search">Start a search</a> to find files on the network.</p>
+              </div>
+            </td></tr>
           {:else if filteredActiveDownloads.length === 0 && filteredCompletedDownloads.length === 0}
-            <tr><td colspan={dlColCount} class="empty-cell">No transfers match this filter.</td></tr>
+            <tr class="empty-row"><td colspan={dlColCount} class="empty-cell">
+              <div class="empty-cell-body">
+                <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                  <circle cx="11" cy="11" r="8"></circle>
+                  <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                </svg>
+                <p class="empty-cell-title">No transfers match this filter</p>
+              </div>
+            </td></tr>
           {/if}
         </tbody>
       </table>
@@ -2669,9 +2687,27 @@
               once the auto-remove landed and have been removed.
             -->
             {#if activeUploads.length === 0}
-              <tr><td colspan={ulColCount} class="empty-cell">No uploads</td></tr>
+              <tr class="empty-row"><td colspan={ulColCount} class="empty-cell">
+                <div class="empty-cell-body">
+                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                    <path d="M3 15v4a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-4"></path>
+                    <polyline points="17 8 12 3 7 8"></polyline>
+                    <line x1="12" y1="3" x2="12" y2="15"></line>
+                  </svg>
+                  <p class="empty-cell-title">No active uploads</p>
+                  <p class="empty-cell-sub">Shared files will appear here when peers request them.</p>
+                </div>
+              </td></tr>
             {:else if filteredActiveUploads.length === 0}
-              <tr><td colspan={ulColCount} class="empty-cell">No uploads match this filter</td></tr>
+              <tr class="empty-row"><td colspan={ulColCount} class="empty-cell">
+                <div class="empty-cell-body">
+                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                    <circle cx="11" cy="11" r="8"></circle>
+                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                  </svg>
+                  <p class="empty-cell-title">No uploads match this filter</p>
+                </div>
+              </td></tr>
             {/if}
           </tbody>
         </table>
@@ -2749,7 +2785,23 @@
               </tr>
             {/each}
             {#if uploadQueueClients.length === 0}
-              <tr><td colspan={queueColCount} class="empty-cell">{uploadQueueLoaded ? 'No peers are waiting in the upload queue.' : 'Loading…'}</td></tr>
+              <tr class="empty-row"><td colspan={queueColCount} class="empty-cell">
+                {#if uploadQueueLoaded}
+                  <div class="empty-cell-body">
+                    <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                      <circle cx="12" cy="12" r="10"></circle>
+                      <polyline points="12 6 12 12 16 14"></polyline>
+                    </svg>
+                    <p class="empty-cell-title">No peers waiting</p>
+                    <p class="empty-cell-sub">The upload queue is empty.</p>
+                  </div>
+                {:else}
+                  <div class="empty-cell-body">
+                    <div class="spinner"></div>
+                    <p class="empty-cell-sub">Loading…</p>
+                  </div>
+                {/if}
+              </td></tr>
             {/if}
           </tbody>
         </table>
@@ -2856,7 +2908,23 @@
               </tr>
             {/each}
             {#if knownClients.length === 0}
-              <tr><td colspan={knownColCount} class="empty-cell">{knownClientsLoaded ? 'No SecIdent credit records yet. Records appear after peers verify their identity with us.' : 'Loading…'}</td></tr>
+              <tr class="empty-row"><td colspan={knownColCount} class="empty-cell">
+                {#if knownClientsLoaded}
+                  <div class="empty-cell-body">
+                    <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                      <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                      <circle cx="12" cy="7" r="4"></circle>
+                    </svg>
+                    <p class="empty-cell-title">No credit records yet</p>
+                    <p class="empty-cell-sub">Records appear after peers verify their identity with us.</p>
+                  </div>
+                {:else}
+                  <div class="empty-cell-body">
+                    <div class="spinner"></div>
+                    <p class="empty-cell-sub">Loading…</p>
+                  </div>
+                {/if}
+              </td></tr>
             {/if}
           </tbody>
         </table>
@@ -2929,10 +2997,30 @@
                 </tr>
               {/each}
               {#if clientSources.length === 0}
-                <tr><td colspan={clientColCount} class="empty-cell">All sources failed. Double-click a download to refresh.</td></tr>
+                <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
+                  <div class="empty-cell-body">
+                    <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                      <circle cx="12" cy="12" r="10"></circle>
+                      <line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line>
+                    </svg>
+                    <p class="empty-cell-title">All sources failed</p>
+                    <p class="empty-cell-sub">Double-click a download to refresh.</p>
+                  </div>
+                </td></tr>
               {/if}
             {:else}
-              <tr><td colspan={clientColCount} class="empty-cell">Double-click a download to see its source clients here.</td></tr>
+              <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
+                <div class="empty-cell-body">
+                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                    <circle cx="9" cy="7" r="4"></circle>
+                    <path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"></path>
+                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                    <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
+                  </svg>
+                  <p class="empty-cell-title">Select a download</p>
+                  <p class="empty-cell-sub">Double-click a download above to see its source clients.</p>
+                </div>
+              </td></tr>
             {/if}
           </tbody>
         </table>
@@ -3450,6 +3538,42 @@
     padding: 30px 16px !important;
     color: var(--text-muted);
     font-size: 13px;
+  }
+  .empty-row td.empty-cell {
+    padding: 40px 16px !important;
+    background: transparent;
+  }
+  .empty-row:hover td.empty-cell {
+    background: transparent;
+  }
+  .empty-cell-body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-muted);
+  }
+  .empty-cell-icon {
+    color: var(--text-muted);
+    opacity: 0.65;
+  }
+  .empty-cell-title {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    margin: 0;
+  }
+  .empty-cell-sub {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin: 0;
+  }
+  .empty-cell-sub a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  .empty-cell-sub a:hover {
+    text-decoration: underline;
   }
   .selection-footer {
     display: flex;
