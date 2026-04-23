@@ -1251,13 +1251,6 @@
     word-break: break-all;
   }
 
-  .icon-lg {
-    font-size: 40px;
-    font-weight: 800;
-    color: var(--text-muted);
-    opacity: 0.2;
-  }
-
   .empty-state.compact {
     padding: 40px 16px;
   }
