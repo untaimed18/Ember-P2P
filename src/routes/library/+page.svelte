@@ -1837,17 +1837,31 @@
     {/if}
     {#if sortedFiles.length === 0 && !scanning && hasActiveLibraryFilters && files.length > 0}
       <div class="empty-state">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          <line x1="11" y1="8" x2="11" y2="14"></line>
+          <line x1="8" y1="11" x2="14" y2="11"></line>
+        </svg>
         <p>No files match your filters</p>
         <p class="sub"><button class="link-btn" onclick={clearLibraryFilters}>Clear Filters</button></p>
       </div>
     {:else if sortedFiles.length === 0 && !scanning}
       <div class="empty-state">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
+          <path d="M3 7v13a1 1 0 0 0 1 1h16a1 1 0 0 0 1-1V9a1 1 0 0 0-1-1h-9l-2-2H4a1 1 0 0 0-1 1z"></path>
+          <line x1="12" y1="13" x2="12" y2="17"></line>
+          <line x1="10" y1="15" x2="14" y2="15"></line>
+        </svg>
         <p>No shared files</p>
         <p class="sub">Add a folder to share files with the network</p>
         <button class="empty-action" onclick={handleAddFolder}>+ Add Folder</button>
       </div>
     {:else if sortedFiles.length === 0 && scanning}
-      <div class="empty-state"><p>Waiting for scan results&hellip;</p></div>
+      <div class="empty-state">
+        <div class="spinner lg"></div>
+        <p>Waiting for scan results&hellip;</p>
+      </div>
     {:else}
       <LibraryVirtualTable
         bind:this={libraryTableRef}
@@ -2446,8 +2460,15 @@
     transition: opacity 0.12s;
     flex-shrink: 0;
   }
+  /* Keyboard-a11y: a hover-only reveal hides the focus indicator from
+     keyboard users, so the action buttons are also surfaced whenever
+     anything inside the row is focused (:focus-within), when one of
+     the action buttons itself receives focus (:focus-visible), or when
+     the item is active. */
   .tree-item:hover .tree-actions,
-  .tree-item.active .tree-actions {
+  .tree-item.active .tree-actions,
+  .tree-item:focus-within .tree-actions,
+  .tree-actions:focus-within {
     opacity: 1;
   }
   .tree-btn {

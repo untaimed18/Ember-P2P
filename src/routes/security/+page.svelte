@@ -12,6 +12,7 @@
     type IpFilterEntry,
   } from '$lib/api/security';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import { passiveScroll } from '$lib/actions/passiveScroll';
   import { onMount, untrack } from 'svelte';
 
   let stats: IpFilterStats | null = $state(null);
@@ -41,8 +42,16 @@
   let sortBy: 'range' | 'hits' | 'description' = $state('hits');
   let sortAsc = $state(false);
 
-  let currentPage = $state(0);
-  const pageSize = 50;
+  // IP filter lists can easily contain tens of thousands of ranges
+  // (the default nipfilter.dat is ~60k rows). Virtualized scrolling
+  // replaces the old 50-per-page pagination so users can scroll the
+  // whole list without repeatedly clicking "Next". Fixed row height
+  // keeps the math simple and is already what the table CSS enforces.
+  const IP_ROW_HEIGHT = 28;
+  const IP_OVERSCAN = 15;
+  let ipScrollContainer: HTMLDivElement | undefined = $state();
+  let ipScrollTop = $state(0);
+  let ipViewportHeight = $state(400);
 
   let filteredEntries = $derived.by(() => {
     if (!stats) return [];
@@ -74,15 +83,40 @@
     return entries;
   });
 
-  let totalPages = $derived(Math.max(1, Math.ceil(filteredEntries.length / pageSize)));
-  let pagedEntries = $derived(filteredEntries.slice(currentPage * pageSize, (currentPage + 1) * pageSize));
+  let virtualIps = $derived.by(() => {
+    const total = filteredEntries.length;
+    if (total === 0) return { visible: [], startIdx: 0, topPad: 0, bottomPad: 0 };
+    const firstVisible = Math.floor(ipScrollTop / IP_ROW_HEIGHT);
+    const visibleCount = Math.ceil(ipViewportHeight / IP_ROW_HEIGHT);
+    const startIdx = Math.max(0, firstVisible - IP_OVERSCAN);
+    const endIdx = Math.min(total, firstVisible + visibleCount + IP_OVERSCAN);
+    return {
+      visible: filteredEntries.slice(startIdx, endIdx),
+      startIdx,
+      topPad: startIdx * IP_ROW_HEIGHT,
+      bottomPad: (total - endIdx) * IP_ROW_HEIGHT,
+    };
+  });
 
   $effect(() => {
-    const pages = totalPages;
-    untrack(() => {
-      if (currentPage >= pages) {
-        currentPage = Math.max(0, pages - 1);
+    if (!ipScrollContainer) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        ipViewportHeight = entry.contentRect.height;
       }
+    });
+    ro.observe(ipScrollContainer);
+    ipViewportHeight = ipScrollContainer.clientHeight;
+    return () => ro.disconnect();
+  });
+
+  // Reset scroll to top when the filter/sort reshapes the list so the
+  // user isn't looking at arbitrary rows from the previous ordering.
+  $effect(() => {
+    void searchQuery; void sortBy; void sortAsc;
+    untrack(() => {
+      if (ipScrollContainer) ipScrollContainer.scrollTop = 0;
+      ipScrollTop = 0;
     });
   });
 
@@ -270,7 +304,8 @@
       sortBy = col;
       sortAsc = col === 'range' || col === 'description';
     }
-    currentPage = 0;
+    if (ipScrollContainer) ipScrollContainer.scrollTop = 0;
+    ipScrollTop = 0;
   }
 
   function sortArrow(col: string): string {
@@ -402,10 +437,9 @@
           class="search-input"
           bind:value={searchQuery}
           placeholder="Search IP ranges or descriptions&hellip;"
-          oninput={() => (currentPage = 0)}
         />
         {#if searchQuery}
-          <button class="search-clear" onclick={() => { searchQuery = ''; currentPage = 0; }} title="Clear search" aria-label="Clear search">&times;</button>
+          <button class="search-clear" onclick={() => { searchQuery = ''; }} title="Clear search" aria-label="Clear search">&times;</button>
         {/if}
       </div>
       <span class="result-count">
@@ -415,17 +449,27 @@
 
     {#if filteredEntries.length === 0 && !searchQuery.trim()}
       <div class="empty-state">
-        <div class="empty-shield">&#x1F6E1;</div>
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
+          <path d="M12 2l7 4v6c0 4.4-3 8.5-7 10-4-1.5-7-5.6-7-10V6l7-4z"></path>
+        </svg>
         <p>No IP ranges loaded</p>
         <p class="sub">Download or import an ipfilter.dat to get started</p>
       </div>
     {:else if filteredEntries.length === 0}
       <div class="empty-state">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
+          <circle cx="11" cy="11" r="8"></circle>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+        </svg>
         <p>No matching ranges</p>
         <p class="sub">Try a different search term</p>
       </div>
     {:else}
-      <div class="table-area">
+      <div
+        class="table-area"
+        bind:this={ipScrollContainer}
+        use:passiveScroll={(e) => { ipScrollTop = (e.target as HTMLDivElement).scrollTop; }}
+      >
         <table class="ip-table">
           <thead>
             <tr>
@@ -457,8 +501,11 @@
             </tr>
           </thead>
           <tbody>
-            {#each pagedEntries as entry, i (`${entry.start_ip}-${entry.end_ip}`)}
-              <tr class:row-alt={(i & 1) === 1}>
+            {#if virtualIps.topPad > 0}
+              <tr class="spacer-row" style="height: {virtualIps.topPad}px;"><td colspan="4"></td></tr>
+            {/if}
+            {#each virtualIps.visible as entry, i (`${entry.start_ip}-${entry.end_ip}`)}
+              <tr class:row-alt={((virtualIps.startIdx + i) & 1) === 1}>
                 <td class="ip-cell">
                   <span class="ip-range">{entry.start_ip}</span>
                   <span class="range-arrow">&rarr;</span>
@@ -487,19 +534,12 @@
                 </td>
               </tr>
             {/each}
+            {#if virtualIps.bottomPad > 0}
+              <tr class="spacer-row" style="height: {virtualIps.bottomPad}px;"><td colspan="4"></td></tr>
+            {/if}
           </tbody>
         </table>
       </div>
-
-      {#if totalPages > 1}
-        <div class="pagination">
-          <button class="ghost pg-btn" disabled={currentPage === 0} onclick={() => (currentPage = 0)}>First</button>
-          <button class="ghost pg-btn" disabled={currentPage === 0} onclick={() => currentPage--}>Prev</button>
-          <span class="page-info">Page {currentPage + 1} of {totalPages}</span>
-          <button class="ghost pg-btn" disabled={currentPage >= totalPages - 1} onclick={() => currentPage++}>Next</button>
-          <button class="ghost pg-btn" disabled={currentPage >= totalPages - 1} onclick={() => (currentPage = totalPages - 1)}>Last</button>
-        </div>
-      {/if}
     {/if}
   {/if}
 </div>
@@ -851,6 +891,20 @@
   .ip-table tbody tr:hover td {
     background: var(--bg-hover);
   }
+  /* Virtual spacer rows take space but don't render any content; skip
+     the hover highlight so they don't flash on scroll-momentum
+     pointer crossings. */
+  .ip-table tbody tr.spacer-row {
+    background: transparent;
+  }
+  .ip-table tbody tr.spacer-row td {
+    border: none;
+    padding: 0;
+    background: transparent;
+  }
+  .ip-table tbody tr.spacer-row:hover td {
+    background: transparent;
+  }
 
   .ip-cell {
     font-family: var(--font-mono);
@@ -907,35 +961,7 @@
     opacity: 1;
   }
 
-  /* --- Pagination --- */
-  .pagination {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 4px;
-    padding: 6px 16px;
-    border-top: 1px solid var(--border);
-    background: var(--bg-secondary);
-    flex-shrink: 0;
-  }
-  .pg-btn {
-    font-size: 11px;
-    padding: 3px 8px;
-  }
-  .page-info {
-    font-size: 11px;
-    color: var(--text-muted);
-    min-width: 90px;
-    text-align: center;
-    font-variant-numeric: tabular-nums;
-  }
-
   /* --- Empty state --- */
-  .empty-shield {
-    font-size: 32px;
-    margin-bottom: 8px;
-    opacity: 0.5;
-  }
   .sub {
     font-size: 12px;
     color: var(--text-muted);

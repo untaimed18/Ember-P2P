@@ -624,17 +624,30 @@
       <div class="server-table-wrap">
         {#if loading && servers.length === 0}
           <div class="empty-state compact">
+            <div class="spinner lg"></div>
             <p>Loading server list...</p>
           </div>
         {:else if servers.length === 0}
           <div class="empty-state compact">
-            <div class="icon-lg">⬡</div>
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48" aria-hidden="true">
+              <rect x="2" y="3" width="20" height="7" rx="1.5"></rect>
+              <rect x="2" y="14" width="20" height="7" rx="1.5"></rect>
+              <line x1="6" y1="6.5" x2="6.01" y2="6.5"></line>
+              <line x1="6" y1="17.5" x2="6.01" y2="17.5"></line>
+              <line x1="10" y1="6.5" x2="16" y2="6.5"></line>
+              <line x1="10" y1="17.5" x2="16" y2="17.5"></line>
+            </svg>
             <p>No servers in list</p>
             <p class="sub">Add a server using the form on the right, or download a server.met file</p>
           </div>
         {:else if filteredServers.length === 0}
           <div class="empty-state compact">
-            <div class="icon-lg">⌕</div>
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48" aria-hidden="true">
+              <circle cx="11" cy="11" r="8"></circle>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+              <line x1="11" y1="8" x2="11" y2="14"></line>
+              <line x1="8" y1="11" x2="14" y2="11"></line>
+            </svg>
             <p>No servers match this filter</p>
             <p class="sub">Try a different search term or clear the filter.</p>
           </div>

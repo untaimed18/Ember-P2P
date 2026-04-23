@@ -347,39 +347,87 @@ tr:hover td {
   background: var(--bg-hover);
 }
 
+/*
+ * Badges: tinted-background + semantic-colored text + subtle border.
+ * This "status chip" recipe replaces the older solid-fill paint-chip
+ * look so badges read as refined status signals instead of loud
+ * labels. The tinted mix uses color-mix() so each theme's chroma
+ * comes through — white text on solid primaries washed out in light
+ * mode and was visually noisy everywhere.
+ */
 .badge {
-  display: inline-block;
-  padding: 2px 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 9px;
   border-radius: 10px;
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
-}
-
-.badge.connected { background: var(--success); color: #fff; }
-.badge.connecting { background: var(--warning); color: #fff; }
-.badge.disconnected { background: var(--danger); color: #fff; }
-.badge.active { background: var(--accent); color: #fff; }
-.badge.queued { background: var(--text-muted); color: #fff; }
-.badge.paused { background: var(--warning); color: #fff; }
-.badge.completed { background: var(--success); color: #fff; }
-.badge.failed { background: var(--danger); color: #fff; }
-.badge.upload { background: var(--warning); color: #fff; }
-.badge.download { background: var(--accent); color: #fff; }
-.badge.searching { background: var(--text-muted); color: #fff; }
-.badge.highid { background: var(--success); color: #fff; }
-.badge.lowid { background: var(--danger); color: #fff; }
-
-/*
- * Dark-mode badges: tinted-accent backgrounds with semantic-colored text.
- * Reads as refined "status chip" rather than loud paint chip. Each state
- * shares the same 18% tint / 1px border recipe.
- */
-[data-theme="dark"] .badge {
   letter-spacing: 0.3px;
   border: 1px solid transparent;
-  padding: 2px 9px;
 }
+
+/*
+ * Badge glyph: a small leading sigil (check, warning triangle, dot)
+ * paired with the badge color so state is legible without relying on
+ * hue alone — satisfies WCAG "use of color" for colorblind users.
+ * Rendered via an inline element so the glyph inherits the badge's
+ * current color automatically.
+ */
+.badge-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 10px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  flex-shrink: 0;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.badge.connected,
+.badge.completed,
+.badge.highid {
+  background: color-mix(in srgb, var(--success) 15%, transparent);
+  border-color: color-mix(in srgb, var(--success) 30%, transparent);
+  color: color-mix(in srgb, var(--success) 85%, #000);
+}
+.badge.connecting,
+.badge.paused,
+.badge.upload {
+  background: color-mix(in srgb, var(--warning) 15%, transparent);
+  border-color: color-mix(in srgb, var(--warning) 30%, transparent);
+  color: color-mix(in srgb, var(--warning) 80%, #000);
+}
+.badge.disconnected,
+.badge.failed,
+.badge.lowid {
+  background: color-mix(in srgb, var(--danger) 15%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 30%, transparent);
+  color: color-mix(in srgb, var(--danger) 85%, #000);
+}
+.badge.active,
+.badge.download {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  color: color-mix(in srgb, var(--accent) 85%, #000);
+}
+.badge.queued,
+.badge.searching {
+  background: color-mix(in srgb, var(--text-muted) 18%, transparent);
+  border-color: color-mix(in srgb, var(--text-muted) 32%, transparent);
+  color: var(--text-secondary);
+}
+
+/*
+ * Dark-mode badges: slightly stronger tint (18% vs 15%) and lighter
+ * text colors so they remain legible against the dark canvas. The
+ * recipe (tinted background, colored border, semantic text) is
+ * identical — only the contrast values differ per-theme.
+ */
 [data-theme="dark"] .badge.connected,
 [data-theme="dark"] .badge.completed,
 [data-theme="dark"] .badge.highid {
