@@ -642,10 +642,6 @@ impl CreditManager {
         record
     }
 
-    // The three `get_*` helpers below are the public surface Phase 3
-    // (`score_queue_entry`) will call — gate the `dead_code` warning
-    // at each site rather than at the `impl` level so accidental
-    // future unused methods still get flagged.
     #[allow(dead_code)]
     pub fn get_ember_record(&self, pub_key: &[u8; 32]) -> Option<&EmberCreditRecord> {
         self.ember_credits.get(pub_key)
@@ -724,7 +720,6 @@ impl CreditManager {
     /// peers we've downloaded less than `EMBER_MIN_DOWNLOADED_FOR_RATIO`
     /// from (matches the eMule <1 MiB guard), or peers where the
     /// decay has effectively zeroed out their historical downloads.
-    #[allow(dead_code)]
     pub fn get_ember_score_ratio(&self, pub_key: &[u8; 32]) -> f64 {
         let record = match self.ember_credits.get(pub_key) {
             Some(r) => r,
@@ -773,7 +768,6 @@ impl CreditManager {
     /// of the eMule baseline in either direction — enough to
     /// reshape rankings when history exists without producing
     /// pathological queue-jumps.
-    #[allow(dead_code)]
     pub fn get_ember_queue_score(
         &self,
         pub_key: &[u8; 32],
