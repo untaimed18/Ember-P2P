@@ -3507,6 +3507,21 @@ impl UploadHandler {
                         {
                             let mut cm = self.credit_manager.write().await;
                             cm.add_uploaded(peer_user_hash, batch_credited_bytes);
+                            // Ember credit ledger: mirrors the eMule
+                            // credit write for peers that have
+                            // advertised an Ed25519 pubkey AND
+                            // completed PoP on THIS session. Without
+                            // PoP the write is rejected inside
+                            // `add_ember_uploaded` — a spoofer
+                            // riding a friend's hash cannot farm
+                            // real reputation here. The helper also
+                            // bumps `last_upload_time` so decay
+                            // starts from the last real upload, not
+                            // from the last handshake.
+                            if let Some(pk) = hello_caps.ember_pubkey {
+                                let verified = ember_auth_state.is_verified();
+                                cm.add_ember_uploaded(pk, batch_credited_bytes, verified);
+                            }
                         }
                         self.slot_rates
                             .lock()
@@ -3608,12 +3623,34 @@ impl UploadHandler {
 
                     if session_expired && slot_guard.is_active() {
                         let reason = if preempted { "score preempted" } else { "session limit" };
+                        let session_secs = session_start
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
                         debug!(
                             "Upload {reason} for {peer_addr} ({}B / {}s, ~{} B/s), sending OutOfPartReqs",
                             uploaded,
-                            session_start.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+                            session_secs,
                             rate_tracker.smoothed_rate(),
                         );
+                        // Record the Ember session-reliability +
+                        // speed outcome. `session_limit` is treated
+                        // as a clean completion (we served them the
+                        // max allowed per session) while `score
+                        // preempted` is not — we kicked them out
+                        // because a higher-scoring peer showed up,
+                        // which from the reliability perspective is
+                        // still "they didn't voluntarily bail". We
+                        // follow the plan spec and count only the
+                        // natural session-limit case as completed so
+                        // the reliability multiplier can actually
+                        // differentiate peers that walk away
+                        // mid-transfer from peers we rotate out.
+                        if let Some(pk) = hello_caps.ember_pubkey {
+                            let verified = ember_auth_state.is_verified();
+                            let completed = !preempted;
+                            let mut cm = self.credit_manager.write().await;
+                            cm.record_ember_session(pk, uploaded, session_secs, completed, verified);
+                        }
                         write_packet_async(
                             &mut writer,
                             OP_EDONKEYHEADER,
@@ -3707,6 +3744,22 @@ impl UploadHandler {
 
                 (OP_EDONKEYHEADER, OP_CANCELTRANSFER) | (OP_EDONKEYHEADER, OP_END_OF_DOWNLOAD) => {
                     debug!("Peer {peer_addr} cancelled/ended transfer");
+                    // Same reliability rule as the session-expired
+                    // branch: "completed" iff the peer actually
+                    // received at least one byte from this session.
+                    // A peer that cancels a freshly-granted slot
+                    // without any data transferred is counted as an
+                    // aborted session so the reliability multiplier
+                    // reflects the churn.
+                    if let Some(pk) = hello_caps.ember_pubkey {
+                        let verified = ember_auth_state.is_verified();
+                        let session_secs = session_start
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let completed = uploaded > 0;
+                        let mut cm = self.credit_manager.write().await;
+                        cm.record_ember_session(pk, uploaded, session_secs, completed, verified);
+                    }
                     if let Some(tid) = &transfer_id {
                         // Mirror the connection-exit cleanup at the bottom of
                         // this function: only report a session as Completed
@@ -4515,6 +4568,23 @@ impl UploadHandler {
         self.slot_rates.lock().unwrap_or_else(|e| e.into_inner()).remove(&peer_addr);
 
         // slot_guard Drop handles upload slot release automatically
+
+        // Ember session reliability/speed bookkeeping for the
+        // disconnect path: `session_start.is_some()` iff we were
+        // mid-session when the connection dropped. Same "completed
+        // iff bytes flowed" rule as the explicit cancel branch.
+        // Doing this before the transfer-event emit keeps the
+        // credit-manager write adjacent to the other end-of-session
+        // work, and guarantees the record lands even if the event
+        // channel is full (the send after this point drops on
+        // `let _`).
+        if let (Some(pk), Some(start)) = (hello_caps.ember_pubkey, session_start) {
+            let verified = ember_auth_state.is_verified();
+            let session_secs = start.elapsed().as_secs();
+            let completed = uploaded > 0;
+            let mut cm = self.credit_manager.write().await;
+            cm.record_ember_session(pk, uploaded, session_secs, completed, verified);
+        }
 
         // Emit completion/failure for any tracked upload
         if let Some(tid) = &transfer_id {

@@ -2953,6 +2953,17 @@ impl Ed2kDownload {
                         if let Some(cm) = &self.credit_manager {
                             let mut cm = cm.write().await;
                             cm.add_downloaded(peer_user_hash, pending_credit_bytes);
+                            // Mirror for the Ember ledger — same
+                            // rationale as `multi_source.rs`. Only
+                            // write when the peer completed full
+                            // Ed25519 PoP on this session; the
+                            // binding-only fallback isn't enough for
+                            // long-term credit accumulation (the
+                            // PoP is what cryptographically ties the
+                            // bytes to the peer's Ed25519 keypair).
+                            if let Some(pk) = peer_ember_pubkey {
+                                cm.add_ember_downloaded(pk, pending_credit_bytes, ember_auth_verified);
+                            }
                         }
                         #[allow(unused_assignments)]
                         { pending_credit_bytes = 0; }

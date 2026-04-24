@@ -54,7 +54,7 @@ impl Database {
         // Ember build. Silently running would invite subtle data corruption
         // (missing columns, renamed tables, semantic changes). Bump this
         // when introducing a new migration.
-        const MAX_SUPPORTED_VERSION: i64 = 14;
+        const MAX_SUPPORTED_VERSION: i64 = 15;
         if version > MAX_SUPPORTED_VERSION {
             anyhow::bail!(
                 "Database schema version {version} is newer than this Ember build supports \
@@ -316,6 +316,39 @@ impl Database {
             let tx = conn.unchecked_transaction()?;
             Self::add_column_if_missing(&tx, "friend_requests", "verified", "INTEGER NOT NULL DEFAULT 0")?;
             set_version(&tx, 14)?;
+            tx.commit()?;
+        }
+
+        if version < 15 {
+            // Phase 2 of the Ember Credit System: an enhanced credit
+            // ledger keyed on the peer's 32-byte Ed25519 public key.
+            // Sits alongside the existing eMule `credits` table rather
+            // than replacing it — wire-compatible eMule peers continue
+            // using the `credits` table via user_hash, and Ember peers
+            // that completed PoP get a second higher-fidelity record
+            // here that feeds decayed-ratio + reliability + speed
+            // scoring.
+            //
+            // The pubkey column is `BLOB` (32 bytes) and acts as the
+            // identity anchor — unlike user_hash it's cryptographically
+            // bound to the peer's secret key, so this row can't be
+            // farmed by spoofing the on-wire hash.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS ember_credits (
+                    pub_key BLOB PRIMARY KEY,
+                    uploaded INTEGER NOT NULL DEFAULT 0,
+                    downloaded INTEGER NOT NULL DEFAULT 0,
+                    last_upload_time INTEGER NOT NULL DEFAULT 0,
+                    last_download_time INTEGER NOT NULL DEFAULT 0,
+                    completed_sessions INTEGER NOT NULL DEFAULT 0,
+                    total_sessions INTEGER NOT NULL DEFAULT 0,
+                    avg_upload_speed INTEGER NOT NULL DEFAULT 0,
+                    last_seen INTEGER NOT NULL DEFAULT 0,
+                    ident_verified INTEGER NOT NULL DEFAULT 0
+                );",
+            )?;
+            set_version(&tx, 15)?;
             tx.commit()?;
         }
 
@@ -744,6 +777,102 @@ impl Database {
             )?;
             for (hash, uploaded, downloaded, last_seen, public_key) in credits {
                 stmt.execute(params![&hash[..], i64::try_from(*uploaded).unwrap_or(i64::MAX), i64::try_from(*downloaded).unwrap_or(i64::MAX), *last_seen, *public_key])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load persisted Ember credit records. Returns raw field tuples so
+    /// the caller can rehydrate `EmberCreditRecord` without this layer
+    /// depending on the credit types — same pattern as
+    /// `load_credits`.
+    ///
+    /// Field order matches the v15 schema and the
+    /// `save_all_ember_credits` INSERT statement: pubkey, uploaded,
+    /// downloaded, last_upload_time, last_download_time,
+    /// completed_sessions, total_sessions, avg_upload_speed, last_seen,
+    /// ident_verified.
+    #[allow(clippy::type_complexity)]
+    pub fn load_ember_credits(
+        &self,
+    ) -> anyhow::Result<Vec<([u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT pub_key, uploaded, downloaded, last_upload_time, last_download_time, \
+                    completed_sessions, total_sessions, avg_upload_speed, last_seen, ident_verified \
+             FROM ember_credits",
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                let pk_blob: Vec<u8> = row.get(0)?;
+                if pk_blob.len() < 32 {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        0,
+                        "pub_key too short".into(),
+                        rusqlite::types::Type::Blob,
+                    ));
+                }
+                let mut pk = [0u8; 32];
+                pk.copy_from_slice(&pk_blob[..32]);
+                Ok((
+                    pk,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?.max(0) as u32,
+                    row.get::<_, i64>(6)?.max(0) as u32,
+                    row.get::<_, i64>(7)?.max(0) as u64,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)? != 0,
+                ))
+            })?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("Skipping malformed ember_credits row: {e}");
+                    None
+                }
+            })
+            .collect();
+        Ok(records)
+    }
+
+    /// Full-replacement save for the Ember credit table — same
+    /// contract as `save_all_credits`: DELETE followed by INSERT
+    /// inside one transaction so on-disk state matches the
+    /// in-memory `CreditManager.ember_credits` snapshot exactly. A
+    /// crash mid-flush leaves the pre-save rows intact thanks to
+    /// SQLite's all-or-nothing transaction guarantee.
+    #[allow(clippy::type_complexity)]
+    pub fn save_all_ember_credits(
+        &self,
+        credits: &[(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)],
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM ember_credits", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO ember_credits (\
+                    pub_key, uploaded, downloaded, last_upload_time, last_download_time, \
+                    completed_sessions, total_sessions, avg_upload_speed, last_seen, ident_verified\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?;
+            for (pk, up, down, last_up, last_down, completed, total, avg_speed, last_seen, verified) in credits {
+                stmt.execute(params![
+                    &pk[..],
+                    i64::try_from(*up).unwrap_or(i64::MAX),
+                    i64::try_from(*down).unwrap_or(i64::MAX),
+                    *last_up,
+                    *last_down,
+                    i64::from(*completed),
+                    i64::from(*total),
+                    i64::try_from(*avg_speed).unwrap_or(i64::MAX),
+                    *last_seen,
+                    i64::from(*verified),
+                ])?;
             }
         }
         tx.commit()?;
