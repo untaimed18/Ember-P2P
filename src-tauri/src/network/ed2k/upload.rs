@@ -2197,6 +2197,22 @@ impl UploadHandler {
         // for the symmetric "we're downloading" direction.
         const EPX_RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
+        // Wrap the outer packet loop in an `async { ... }.await` so that any
+        // `.await?` inside propagates into `session_result` instead of
+        // straight out of `handle_connection`. The cleanup block below
+        // (slot_rates removal, Ember session record, terminal
+        // `UploadEventKind::Completed`/`Failed` emit) used to be bypassed
+        // whenever a nested `?` fired — leaving the row pinned in the UI
+        // "Transferring" pane until the app restarted. The concrete
+        // repro was aMule 2.3.3 peers that stop reading mid-transfer:
+        // `write_packet_async` hits its 60 s `WRITE_PACKET_TIMEOUT`, the
+        // `?` aborts the handler, and the frontend never gets the
+        // `transfer-complete` event it needs to drop the row. With this
+        // wrap the cleanup always runs; `session_result` is returned at
+        // the end of the function so the accept-loop's
+        // `warn!("Connection from ... ended: {e}")` still surfaces the
+        // underlying cause.
+        let session_result: anyhow::Result<()> = async {
         loop {
             // eMule: terminate upload sessions when the network is disconnected.
             if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
@@ -4851,6 +4867,11 @@ impl UploadHandler {
                 }
             }
         }
+        // Every `break` path above lands here with an implicit `()`;
+        // return it as `Ok(())` so the async block's result type matches
+        // the propagated `?` errors.
+        Ok::<(), anyhow::Error>(())
+        }.await;
 
         reader_task.abort();
         let _ = reader_task.await;
@@ -4902,33 +4923,71 @@ impl UploadHandler {
         // makes every session termination visible by default.
         let session_age = session_open_at.elapsed().as_secs();
         if let Some(tid) = &transfer_id {
-            let kind_label = if uploaded > 0 { "completed" } else { "failed_zero_bytes" };
+            // Hybrid terminal-event semantics:
+            //   * uploaded > 0  → Completed. The row vanishes quietly,
+            //     matching eMule's "session ended, cumulative totals live
+            //     in stats" UX. This holds even if the session ended via
+            //     an error path (e.g. 60 s write stall): we still served
+            //     real bytes to the peer, so from the user's POV this
+            //     was a successful session that happened to end.
+            //   * uploaded == 0 AND session_result is Err → surface the
+            //     real error. The old hardcoded
+            //     "Peer disconnected before any data transferred" hid
+            //     genuinely useful diagnostics (write timeouts, TLS
+            //     errors, malformed handshakes) behind a generic
+            //     message, which made zero-byte failures in the
+            //     Completed/Failed pane indistinguishable.
+            //   * uploaded == 0 AND Ok(()) → clean handshake-only exit,
+            //     keep the legacy message.
+            let kind_label = if uploaded > 0 {
+                "completed"
+            } else if session_result.is_err() {
+                "failed_with_error"
+            } else {
+                "failed_zero_bytes"
+            };
+            let err_label = session_result
+                .as_ref()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "none".to_string());
             info!(
                 target: "ember::upload_diag",
                 "session_final {peer_addr} kind={kind_label} uploaded={uploaded}B \
                  last_part_req={}s session_age={session_age}s \
-                 iters={outer_loop_iterations} tid={tid}",
+                 iters={outer_loop_iterations} tid={tid} err=\"{err_label}\"",
                 last_part_request.elapsed().as_secs(),
             );
+            let kind = if uploaded > 0 {
+                UploadEventKind::Completed
+            } else if let Err(e) = &session_result {
+                UploadEventKind::Failed {
+                    error: format!("Session ended: {e}"),
+                }
+            } else {
+                UploadEventKind::Failed {
+                    error: "Peer disconnected before any data transferred".to_string(),
+                }
+            };
             let _ = self.upload_event_tx.send(UploadEvent {
                 transfer_id: tid.clone(),
-                kind: if uploaded > 0 {
-                    UploadEventKind::Completed
-                } else {
-                    UploadEventKind::Failed {
-                        error: "Peer disconnected before any data transferred".to_string(),
-                    }
-                },
+                kind,
             }).await;
         } else {
+            let err_label = session_result
+                .as_ref()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "none".to_string());
             info!(
                 target: "ember::upload_diag",
                 "session_final {peer_addr} kind=no_transfer_id uploaded={uploaded}B \
-                 session_age={session_age}s iters={outer_loop_iterations}",
+                 session_age={session_age}s iters={outer_loop_iterations} \
+                 err=\"{err_label}\"",
             );
         }
 
-        Ok(())
+        session_result
     }
 
     async fn acquire_upload_bandwidth(&self, bytes: u64) {
