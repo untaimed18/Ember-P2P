@@ -4,6 +4,65 @@ use zeroize::ZeroizeOnDrop;
 const MAX_CREDIT_RATIO: f64 = 10.0;
 const MIN_CREDIT_RATIO: f64 = 1.0;
 
+// --- Ember credit scoring constants ---
+//
+// The Ember credit system layers three multiplicative factors on top of the
+// baseline eMule credit-ratio formula: time-decayed ratio, session
+// reliability, and upload-speed fairness. Each factor is clamped to a
+// narrow band so no single signal can dominate scoring; the plan target is
+// "slightly more nuanced than eMule", not "completely rewrite priority".
+//
+// Exposed at module level so the unit tests can reference the same
+// constants the runtime uses — avoids the "tests pass but drift from
+// code" trap.
+
+/// Half-life for the exponential credit-ratio decay, in seconds. A peer
+/// who uploaded 10 GB 90 days ago counts for half as much as one who
+/// uploaded 10 GB yesterday. Tuned to roughly match observed session
+/// inter-arrival times on a typical P2P swarm — longer and the decay
+/// becomes imperceptible; shorter and even daily users get penalised.
+pub(crate) const EMBER_DECAY_HALF_LIFE_SECS: f64 = 90.0 * 86_400.0;
+
+/// Minimum `completed / total` reliability multiplier, applied to a peer
+/// with 0 % completion. A fully unreliable peer still gets some queue
+/// wait credit so they aren't completely shut out (plan spec: 0.8).
+pub(crate) const EMBER_RELIABILITY_MIN: f64 = 0.8;
+/// Maximum reliability multiplier at 100 % completion (plan spec: 1.5).
+pub(crate) const EMBER_RELIABILITY_MAX: f64 = 1.5;
+
+/// Minimum speed-fairness multiplier at far-below-baseline upload rate.
+pub(crate) const EMBER_SPEED_FACTOR_MIN: f64 = 0.9;
+/// Maximum speed-fairness multiplier at or above 2× the baseline.
+pub(crate) const EMBER_SPEED_FACTOR_MAX: f64 = 1.2;
+
+/// Baseline upload rate (bytes/sec) that maps to a neutral 1.0 speed
+/// multiplier. Uploads below this get penalised down to
+/// `EMBER_SPEED_FACTOR_MIN`; uploads at 2× and above cap at
+/// `EMBER_SPEED_FACTOR_MAX`. 512 KiB/s is a reasonable "decent home
+/// broadband upload" line — generous enough that most honest peers
+/// sit near 1.0 rather than eating a penalty.
+pub(crate) const EMBER_SPEED_BASELINE_BPS: f64 = 512.0 * 1024.0;
+
+/// EWMA smoothing weight for new session speed samples. The new sample
+/// contributes `EMBER_SPEED_EWMA_ALPHA` and the prior average
+/// contributes `1 - EMBER_SPEED_EWMA_ALPHA`. 0.3 gives the series a
+/// visible memory (prior ~3 sessions still show through) while still
+/// tracking persistent speed changes over ~10 sessions.
+pub(crate) const EMBER_SPEED_EWMA_ALPHA: f64 = 0.3;
+
+/// Minimum session duration (seconds) that's allowed to update the EWMA
+/// speed estimate. Sub-second sessions are dominated by handshake
+/// overhead and produce wildly noisy "speeds"; ignoring them keeps the
+/// EWMA honest for the real data-transfer sessions it's trying to
+/// characterise.
+pub(crate) const EMBER_MIN_SESSION_SECS_FOR_SPEED: u64 = 5;
+
+/// Minimum downloaded bytes before the decayed ratio contributes. Mirrors
+/// the eMule `downloaded < 1 MiB → ratio = 1.0` guard so a peer can't
+/// game scoring by trickling a few bytes and then riding a miraculously
+/// good ratio.
+pub(crate) const EMBER_MIN_DOWNLOADED_FOR_RATIO: u64 = 1_048_576;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentState {
     Unknown,
@@ -26,6 +85,118 @@ pub struct CreditRecord {
     pub public_key: Vec<u8>,
     pub ident_state: IdentState,
     pub ident_ip: u32,
+}
+
+/// Enhanced credit record for verified Ember peers.
+///
+/// Identity is anchored on the peer's 32-byte Ed25519 public key rather
+/// than the wire `user_hash` so a peer can't farm credit by cycling
+/// user_hash bytes — the credit row is bound to a keypair they must
+/// prove possession of via the PoP state machine in `ember_auth.rs`.
+/// `ident_verified == true` implies the peer completed full Ed25519
+/// proof-of-possession on at least one session; binding-only peers
+/// (older Ember releases that don't ship the AUTH opcodes) still get a
+/// record so their activity is tracked, but they don't earn the
+/// enhanced scoring bonuses until they pass PoP on a future session.
+///
+/// `completed_sessions / total_sessions` rewards peers who stay
+/// connected through a full upload session rather than disconnecting
+/// mid-transfer. `avg_upload_speed` is an EWMA of observed bytes/sec so
+/// artificially throttled uploaders don't score as high as peers doing
+/// honest fast work.
+#[derive(Debug, Clone)]
+pub struct EmberCreditRecord {
+    pub pub_key: [u8; 32],
+    pub uploaded: u64,
+    pub downloaded: u64,
+    pub last_upload_time: i64,
+    pub last_download_time: i64,
+    pub completed_sessions: u32,
+    pub total_sessions: u32,
+    pub avg_upload_speed: u64,
+    pub last_seen: i64,
+    pub ident_verified: bool,
+}
+
+impl EmberCreditRecord {
+    pub fn new(pub_key: [u8; 32]) -> Self {
+        Self {
+            pub_key,
+            uploaded: 0,
+            downloaded: 0,
+            last_upload_time: 0,
+            last_download_time: 0,
+            completed_sessions: 0,
+            total_sessions: 0,
+            avg_upload_speed: 0,
+            last_seen: chrono::Utc::now().timestamp(),
+            ident_verified: false,
+        }
+    }
+
+    /// Reliability multiplier: `EMBER_RELIABILITY_MIN` at 0 %
+    /// completion → `EMBER_RELIABILITY_MAX` at 100 %. Neutral (1.0)
+    /// for new peers with no session history so they aren't
+    /// penalised for having no track record. Visible units keep the
+    /// formula debuggable in logs without a separate helper.
+    pub fn reliability_multiplier(&self) -> f64 {
+        if self.total_sessions == 0 {
+            return 1.0;
+        }
+        let completed = self.completed_sessions.min(self.total_sessions) as f64;
+        let total = self.total_sessions as f64;
+        let rate = completed / total;
+        EMBER_RELIABILITY_MIN + rate * (EMBER_RELIABILITY_MAX - EMBER_RELIABILITY_MIN)
+    }
+
+    /// Speed-fairness multiplier: piecewise-linear ramp centred on
+    /// `EMBER_SPEED_BASELINE_BPS`. No sample (0 bytes/sec average)
+    /// is neutral so a first-contact peer isn't penalised, but ANY
+    /// recorded sample enters the band — including very slow uploads
+    /// that tip towards `EMBER_SPEED_FACTOR_MIN`.
+    pub fn speed_multiplier(&self) -> f64 {
+        if self.avg_upload_speed == 0 {
+            return 1.0;
+        }
+        let speed = self.avg_upload_speed as f64;
+        let baseline = EMBER_SPEED_BASELINE_BPS;
+        if speed >= 2.0 * baseline {
+            EMBER_SPEED_FACTOR_MAX
+        } else if speed >= baseline {
+            // Interpolate 1.0 → max over [baseline, 2×baseline].
+            1.0 + (EMBER_SPEED_FACTOR_MAX - 1.0) * ((speed - baseline) / baseline)
+        } else {
+            // Interpolate min → 1.0 over [0, baseline]. Clamp the
+            // bottom at MIN so an absurdly slow upload (bytes/sec in
+            // the single digits) doesn't punch below the floor.
+            let frac = (speed / baseline).clamp(0.0, 1.0);
+            EMBER_SPEED_FACTOR_MIN + frac * (1.0 - EMBER_SPEED_FACTOR_MIN)
+        }
+    }
+
+    /// Apply a new session-observation to the EWMA. Ignores sessions
+    /// too short to produce a useful speed sample (handshake noise
+    /// dominates). The first real sample seeds the EWMA rather than
+    /// being smoothed with the 0 default — that way a fresh record
+    /// reflects what we actually measured rather than half-mixing
+    /// with a zero.
+    pub fn record_session(&mut self, bytes_transferred: u64, duration_secs: u64, completed: bool) {
+        self.total_sessions = self.total_sessions.saturating_add(1);
+        if completed {
+            self.completed_sessions = self.completed_sessions.saturating_add(1);
+        }
+        if duration_secs >= EMBER_MIN_SESSION_SECS_FOR_SPEED && bytes_transferred > 0 {
+            let sample = (bytes_transferred as f64) / (duration_secs as f64);
+            let new_avg = if self.avg_upload_speed == 0 {
+                sample
+            } else {
+                EMBER_SPEED_EWMA_ALPHA * sample
+                    + (1.0 - EMBER_SPEED_EWMA_ALPHA) * (self.avg_upload_speed as f64)
+            };
+            self.avg_upload_speed = new_avg.round().max(0.0) as u64;
+        }
+        self.last_seen = chrono::Utc::now().timestamp();
+    }
 }
 
 impl CreditRecord {
@@ -81,6 +252,15 @@ impl CreditRecord {
 pub struct CreditManager {
     #[zeroize(skip)]
     credits: HashMap<[u8; 16], CreditRecord>,
+    /// Enhanced credit records for Ember peers, keyed on Ed25519
+    /// public key. Parallel to `credits` rather than sharing storage
+    /// because the key material is different (32-byte pubkey vs.
+    /// 16-byte user_hash) and the scoring formula is different
+    /// (decay + reliability + speed factors, not just bytes).
+    /// Only populated for peers that have either passed binding
+    /// verification or full PoP on at least one session.
+    #[zeroize(skip)]
+    ember_credits: HashMap<[u8; 32], EmberCreditRecord>,
     #[zeroize(skip)]
     our_public_key: Vec<u8>,
     our_private_key: Vec<u8>,
@@ -92,6 +272,7 @@ impl CreditManager {
     pub fn new() -> Self {
         Self {
             credits: HashMap::new(),
+            ember_credits: HashMap::new(),
             our_public_key: Vec::new(),
             our_private_key: Vec::new(),
             crypto_available: false,
@@ -436,6 +617,175 @@ impl CreditManager {
     pub fn cleanup_stale(&mut self, max_age_days: i64) {
         let cutoff = chrono::Utc::now().timestamp() - (max_age_days * 86400);
         self.credits.retain(|_, r| r.last_seen > cutoff);
+        // Same cutoff for Ember records so the two tables age in
+        // lockstep. `last_seen` on EmberCreditRecord is bumped by
+        // every credit-granting or session-recording operation, so
+        // active peers stay regardless of their public-key format.
+        self.ember_credits.retain(|_, r| r.last_seen > cutoff);
+    }
+
+    // ---- Ember credit helpers ----
+
+    /// Look up or create an Ember credit record for this pubkey.
+    /// Mirrors `get_or_create` on the eMule side: bumps `last_seen`
+    /// so evictions track contact freshness. Non-mutating queries
+    /// (`get_ember_record`, `get_ember_score_ratio`,
+    /// `get_ember_queue_score`) route through `ember_credits.get`
+    /// and deliberately do NOT bump the timestamp.
+    pub fn get_or_create_ember(&mut self, pub_key: [u8; 32]) -> &mut EmberCreditRecord {
+        let now = chrono::Utc::now().timestamp();
+        let record = self
+            .ember_credits
+            .entry(pub_key)
+            .or_insert_with(|| EmberCreditRecord::new(pub_key));
+        record.last_seen = now;
+        record
+    }
+
+    // The three `get_*` helpers below are the public surface Phase 3
+    // (`score_queue_entry`) will call — gate the `dead_code` warning
+    // at each site rather than at the `impl` level so accidental
+    // future unused methods still get flagged.
+    #[allow(dead_code)]
+    pub fn get_ember_record(&self, pub_key: &[u8; 32]) -> Option<&EmberCreditRecord> {
+        self.ember_credits.get(pub_key)
+    }
+
+    pub fn all_ember_records(&self) -> Vec<&EmberCreditRecord> {
+        self.ember_credits.values().collect()
+    }
+
+    /// Credit peer `pub_key` for `bytes` they uploaded to us. `verified`
+    /// must be `true` (full PoP completed on this session) for bytes to
+    /// land on the record — without PoP a spoofer who claimed the
+    /// pubkey could farm credit for a genuine peer. Binding-only
+    /// peers still get their bytes tracked via the legacy `CreditRecord`
+    /// upstream; this method only governs the Ember-specific ledger.
+    ///
+    /// Returns `true` when the write landed, `false` when it was
+    /// rejected so callers can emit a metric/log.
+    pub fn add_ember_uploaded(&mut self, pub_key: [u8; 32], bytes: u64, verified: bool) -> bool {
+        if !verified {
+            return false;
+        }
+        let now = chrono::Utc::now().timestamp();
+        let record = self.get_or_create_ember(pub_key);
+        record.uploaded = record.uploaded.saturating_add(bytes);
+        record.last_upload_time = now;
+        record.ident_verified = true;
+        true
+    }
+
+    pub fn add_ember_downloaded(&mut self, pub_key: [u8; 32], bytes: u64, verified: bool) -> bool {
+        if !verified {
+            return false;
+        }
+        let now = chrono::Utc::now().timestamp();
+        let record = self.get_or_create_ember(pub_key);
+        record.downloaded = record.downloaded.saturating_add(bytes);
+        record.last_download_time = now;
+        record.ident_verified = true;
+        true
+    }
+
+    /// Record a completed/aborted upload session for the peer so the
+    /// reliability multiplier and speed EWMA stay up to date. Called
+    /// from `upload.rs` once per session (normal completion OR
+    /// preemption OR mid-session failure) — NOT once per chunk.
+    ///
+    /// `completed == true` iff the session ended in the "healthy"
+    /// state (out-of-parts, session-limit expired, queue rotation).
+    /// `false` for aborted sessions (connection closed mid-transfer,
+    /// queue-full reissues, etc.) so the reliability multiplier
+    /// actually penalises peers that cut and run.
+    pub fn record_ember_session(
+        &mut self,
+        pub_key: [u8; 32],
+        bytes_transferred: u64,
+        duration_secs: u64,
+        completed: bool,
+        verified: bool,
+    ) {
+        if !verified {
+            return;
+        }
+        let record = self.get_or_create_ember(pub_key);
+        record.record_session(bytes_transferred, duration_secs, completed);
+        record.ident_verified = true;
+    }
+
+    /// Decayed credit ratio — like the eMule formula but with an
+    /// exponential time-decay on downloaded bytes so stale credit
+    /// fades out. Clamped to the same [MIN_CREDIT_RATIO,
+    /// MAX_CREDIT_RATIO] band as the eMule version so the Ember
+    /// scoring formula's multiplier structure doesn't blow up.
+    ///
+    /// Returns `MIN_CREDIT_RATIO` for peers we have no record of,
+    /// peers we've downloaded less than `EMBER_MIN_DOWNLOADED_FOR_RATIO`
+    /// from (matches the eMule <1 MiB guard), or peers where the
+    /// decay has effectively zeroed out their historical downloads.
+    #[allow(dead_code)]
+    pub fn get_ember_score_ratio(&self, pub_key: &[u8; 32]) -> f64 {
+        let record = match self.ember_credits.get(pub_key) {
+            Some(r) => r,
+            None => return MIN_CREDIT_RATIO,
+        };
+        if record.downloaded < EMBER_MIN_DOWNLOADED_FOR_RATIO {
+            return MIN_CREDIT_RATIO;
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let age_secs = (now - record.last_download_time).max(0) as f64;
+        let decay = 0.5f64.powf(age_secs / EMBER_DECAY_HALF_LIFE_SECS);
+        let decayed_downloaded = (record.downloaded as f64) * decay;
+        if decayed_downloaded < EMBER_MIN_DOWNLOADED_FOR_RATIO as f64 {
+            return MIN_CREDIT_RATIO;
+        }
+
+        let uploaded = record.uploaded.max(1) as f64;
+        // Mirror the eMule three-way minimum so the ratio grows
+        // sub-linearly with download volume. Dropping any of the
+        // three would let a peer ride a single large download
+        // forever; keeping them all keeps scoring bounded.
+        let ratio1 = (decayed_downloaded * 2.0) / uploaded;
+        let ratio2 = (decayed_downloaded / 1_048_576.0 + 2.0).sqrt();
+        let ratio3 = if decayed_downloaded < 9_646_899.0 {
+            (decayed_downloaded - 1_048_576.0) / 8_598_323.0 * 2.34 + 1.0
+        } else {
+            MAX_CREDIT_RATIO
+        };
+
+        ratio1
+            .min(ratio2)
+            .min(ratio3)
+            .min(MAX_CREDIT_RATIO)
+            .max(MIN_CREDIT_RATIO)
+    }
+
+    /// Composite Ember queue score.
+    ///
+    /// `wait_seconds * decayed_ratio * file_priority * reliability * speed_factor`
+    ///
+    /// Call this INSTEAD of `get_queue_score` when the peer has a
+    /// verified Ember credit record. The three extra factors are
+    /// clamped narrowly (reliability ∈ [0.8, 1.5], speed ∈ [0.9,
+    /// 1.2]) so the overall scoring stays within a ~2.25× multiplier
+    /// of the eMule baseline in either direction — enough to
+    /// reshape rankings when history exists without producing
+    /// pathological queue-jumps.
+    #[allow(dead_code)]
+    pub fn get_ember_queue_score(
+        &self,
+        pub_key: &[u8; 32],
+        wait_secs: u64,
+        file_priority: f64,
+    ) -> f64 {
+        let ratio = self.get_ember_score_ratio(pub_key);
+        let (reliability, speed) = match self.ember_credits.get(pub_key) {
+            Some(r) => (r.reliability_multiplier(), r.speed_multiplier()),
+            None => (1.0, 1.0),
+        };
+        (wait_secs as f64) * ratio * file_priority * reliability * speed
     }
 
     /// Serialize credits to bytes (eMule clients.met format).
@@ -865,5 +1215,257 @@ mod tests {
         cm.cleanup_stale(90);
         assert!(cm.get_record(&fresh).is_some(), "fresh record must survive 90d cutoff");
         assert!(cm.get_record(&stale).is_none(), "100d-old record must be pruned");
+    }
+
+    // ---- Ember credit tests ----
+
+    /// Unverified peers cannot farm Ember credit — the `add_ember_uploaded`
+    /// and `add_ember_downloaded` helpers must reject writes when
+    /// `verified == false`. Without this check a hash-spoofer could
+    /// claim a verified friend's pubkey on the wire and burn
+    /// their real reputation by uploading garbage in their name.
+    #[test]
+    fn ember_credit_writes_require_verification() {
+        let mut cm = CreditManager::new();
+        let pk = [0xEBu8; 32];
+
+        assert!(!cm.add_ember_uploaded(pk, 4096, false), "unverified upload must be rejected");
+        assert!(!cm.add_ember_downloaded(pk, 4096, false), "unverified download must be rejected");
+        assert!(cm.get_ember_record(&pk).is_none(), "rejected writes must not create a record");
+
+        assert!(cm.add_ember_uploaded(pk, 4096, true));
+        assert!(cm.add_ember_downloaded(pk, 2048, true));
+        let r = cm.get_ember_record(&pk).expect("verified writes must land");
+        assert_eq!(r.uploaded, 4096);
+        assert_eq!(r.downloaded, 2048);
+        assert!(r.ident_verified, "verified writes must set ident_verified");
+    }
+
+    /// `record_ember_session` tracks completion + speed EWMA. A first
+    /// session seeds the EWMA directly (no smoothing with the zero
+    /// default) so the ratio is honest on cold start.
+    #[test]
+    fn record_ember_session_seeds_ewma_on_first_sample() {
+        let mut cm = CreditManager::new();
+        let pk = [0xC0u8; 32];
+
+        // Short/fast session — 1 MiB over 10s = ~104857 bytes/sec.
+        // Below the 5s floor this would be dropped; above it the
+        // first real sample should seed the EWMA directly.
+        cm.record_ember_session(pk, 1_048_576, 10, true, true);
+        let r = cm.get_ember_record(&pk).unwrap();
+        assert_eq!(r.total_sessions, 1);
+        assert_eq!(r.completed_sessions, 1);
+        let expected = (1_048_576u64 as f64 / 10.0).round() as u64;
+        assert_eq!(r.avg_upload_speed, expected, "first sample must seed EWMA without prior-zero mixing");
+    }
+
+    /// Subsequent sessions smooth with `EMBER_SPEED_EWMA_ALPHA` so a
+    /// single outlier can't yank the long-run estimate. A fast
+    /// session after a slow one should move the average but not
+    /// all the way to the new value.
+    #[test]
+    fn record_ember_session_ewma_smooths_subsequent_samples() {
+        let mut cm = CreditManager::new();
+        let pk = [0xA1u8; 32];
+
+        cm.record_ember_session(pk, 100 * 1024, 10, true, true);
+        let base = cm.get_ember_record(&pk).unwrap().avg_upload_speed;
+
+        // Now a 10× faster session. The EWMA should move upward but
+        // well short of the full 10× — with α = 0.3, expect roughly
+        // 0.3 × fast + 0.7 × base.
+        cm.record_ember_session(pk, 1000 * 1024, 10, true, true);
+        let after = cm.get_ember_record(&pk).unwrap().avg_upload_speed;
+        assert!(after > base, "fast session should pull average up");
+        let new_sample = 1000u64 * 1024 / 10;
+        assert!(
+            after < new_sample,
+            "α=0.3 smoothing must NOT fully adopt the new sample (got {after}, new {new_sample})",
+        );
+    }
+
+    /// Too-short sessions skip the EWMA update (noise dominates) but
+    /// still count toward total_sessions / completed_sessions so
+    /// reliability doesn't get hidden for rapid disconnects.
+    #[test]
+    fn record_ember_session_skips_ewma_for_tiny_sessions() {
+        let mut cm = CreditManager::new();
+        let pk = [0x07u8; 32];
+
+        cm.record_ember_session(pk, 99_999, 1, false, true);
+        let r = cm.get_ember_record(&pk).unwrap();
+        assert_eq!(r.total_sessions, 1);
+        assert_eq!(r.completed_sessions, 0, "aborted session must NOT count completed");
+        assert_eq!(r.avg_upload_speed, 0, "sub-threshold sessions must NOT touch EWMA");
+    }
+
+    /// Reliability multiplier is neutral (1.0) with no history, grows
+    /// toward `EMBER_RELIABILITY_MAX` with successful completions,
+    /// and sinks toward `EMBER_RELIABILITY_MIN` for peers that abort.
+    #[test]
+    fn reliability_multiplier_spans_expected_range() {
+        let mut r = EmberCreditRecord::new([0u8; 32]);
+        assert_eq!(r.reliability_multiplier(), 1.0, "no sessions = neutral");
+
+        // 100% completion → max.
+        r.total_sessions = 10;
+        r.completed_sessions = 10;
+        assert!((r.reliability_multiplier() - EMBER_RELIABILITY_MAX).abs() < 1e-9);
+
+        // 0% completion → min.
+        r.completed_sessions = 0;
+        assert!((r.reliability_multiplier() - EMBER_RELIABILITY_MIN).abs() < 1e-9);
+
+        // 50% completion lands halfway in the band.
+        r.completed_sessions = 5;
+        let expected = EMBER_RELIABILITY_MIN + 0.5 * (EMBER_RELIABILITY_MAX - EMBER_RELIABILITY_MIN);
+        assert!((r.reliability_multiplier() - expected).abs() < 1e-9);
+    }
+
+    /// Speed multiplier: zero avg (no sample yet) is neutral, below-
+    /// baseline is penalised toward MIN, exactly-baseline is 1.0,
+    /// and ≥2× baseline caps at MAX.
+    #[test]
+    fn speed_multiplier_covers_piecewise_ramp() {
+        let mut r = EmberCreditRecord::new([0u8; 32]);
+        assert_eq!(r.speed_multiplier(), 1.0, "no sample = neutral");
+
+        // Exactly baseline → 1.0.
+        r.avg_upload_speed = EMBER_SPEED_BASELINE_BPS as u64;
+        assert!((r.speed_multiplier() - 1.0).abs() < 1e-6);
+
+        // 0 bytes/sec interpolation anchor (but we can't set avg = 0
+        // and expect the penalised branch, because 0 trips the neutral
+        // guard). Use a very small positive speed instead: should be
+        // very close to MIN but may float-jitter above it.
+        r.avg_upload_speed = 1;
+        assert!(
+            r.speed_multiplier() < 1.0 && r.speed_multiplier() >= EMBER_SPEED_FACTOR_MIN - 1e-9,
+            "slow upload must sit in the [MIN, 1.0) band, got {}",
+            r.speed_multiplier()
+        );
+
+        // 2× baseline → capped at MAX.
+        r.avg_upload_speed = (2.0 * EMBER_SPEED_BASELINE_BPS) as u64;
+        assert!((r.speed_multiplier() - EMBER_SPEED_FACTOR_MAX).abs() < 1e-6);
+
+        // Way past 2× → still capped at MAX, never above.
+        r.avg_upload_speed = (100.0 * EMBER_SPEED_BASELINE_BPS) as u64;
+        assert!((r.speed_multiplier() - EMBER_SPEED_FACTOR_MAX).abs() < 1e-6);
+    }
+
+    /// Score-ratio decay: a peer that downloaded from us yesterday
+    /// scores higher than a peer that downloaded from us long ago,
+    /// even with identical upload/download totals. The half-life is
+    /// `EMBER_DECAY_HALF_LIFE_SECS` — so a record back-dated that
+    /// long should have ratio roughly halved (approximately).
+    #[test]
+    fn score_ratio_decays_over_time() {
+        let mut cm = CreditManager::new();
+        let fresh = [0xF1u8; 32];
+        let aged = [0xA1u8; 32];
+
+        // Two peers with identical uploaded / downloaded. Only the
+        // `last_download_time` differs: `fresh` downloaded just now,
+        // `aged` downloaded `EMBER_DECAY_HALF_LIFE_SECS` seconds ago.
+        for pk in [fresh, aged] {
+            let r = cm.get_or_create_ember(pk);
+            r.uploaded = 5_000_000;
+            r.downloaded = 20_000_000;
+        }
+        let now = chrono::Utc::now().timestamp();
+        cm.get_or_create_ember(fresh).last_download_time = now;
+        cm.get_or_create_ember(aged).last_download_time =
+            now - EMBER_DECAY_HALF_LIFE_SECS as i64;
+
+        let fresh_ratio = cm.get_ember_score_ratio(&fresh);
+        let aged_ratio = cm.get_ember_score_ratio(&aged);
+        assert!(
+            fresh_ratio > aged_ratio,
+            "fresh downloads should score higher than aged (got fresh={fresh_ratio}, aged={aged_ratio})",
+        );
+        assert!(aged_ratio >= MIN_CREDIT_RATIO, "aged must floor at MIN");
+        assert!(fresh_ratio <= MAX_CREDIT_RATIO, "fresh must cap at MAX");
+    }
+
+    /// Ratio guard: peers who've downloaded below the 1 MiB floor
+    /// score at MIN, same as eMule. Prevents trivial transfers from
+    /// producing spuriously large ratios via tiny denominators.
+    #[test]
+    fn score_ratio_returns_min_below_one_mib_downloaded() {
+        let mut cm = CreditManager::new();
+        let pk = [0xABu8; 32];
+        {
+            let r = cm.get_or_create_ember(pk);
+            r.uploaded = 1;
+            r.downloaded = 1024; // well under 1 MiB
+            r.last_download_time = chrono::Utc::now().timestamp();
+        }
+        assert_eq!(cm.get_ember_score_ratio(&pk), MIN_CREDIT_RATIO);
+    }
+
+    /// Queue score composition: all five factors multiply, so a
+    /// 100% reliable fast peer with decent ratio should outscore an
+    /// unreliable slow peer with identical ratio even at the same
+    /// wait time.
+    #[test]
+    fn queue_score_rewards_reliable_fast_peers() {
+        let mut cm = CreditManager::new();
+        let good = [0x01u8; 32];
+        let bad = [0x02u8; 32];
+
+        // Identical "headline" credits for both peers so only the
+        // reliability+speed factors separate them.
+        let now = chrono::Utc::now().timestamp();
+        for pk in [good, bad] {
+            let r = cm.get_or_create_ember(pk);
+            r.uploaded = 1_000_000;
+            r.downloaded = 5_000_000;
+            r.last_download_time = now;
+        }
+
+        // `good`: 100% completion, 2× baseline speed.
+        {
+            let r = cm.get_or_create_ember(good);
+            r.total_sessions = 10;
+            r.completed_sessions = 10;
+            r.avg_upload_speed = (2.0 * EMBER_SPEED_BASELINE_BPS) as u64;
+        }
+        // `bad`: 0% completion, well below baseline speed.
+        {
+            let r = cm.get_or_create_ember(bad);
+            r.total_sessions = 10;
+            r.completed_sessions = 0;
+            r.avg_upload_speed = (0.1 * EMBER_SPEED_BASELINE_BPS) as u64;
+        }
+
+        let good_score = cm.get_ember_queue_score(&good, 300, 1.0);
+        let bad_score = cm.get_ember_queue_score(&bad, 300, 1.0);
+        assert!(
+            good_score > bad_score,
+            "reliable+fast peer must outscore unreliable+slow (got good={good_score} bad={bad_score})",
+        );
+        // Bracket the split: it should be meaningfully different,
+        // not just float-jitter. `good` picks up 1.5 × 1.2 = 1.8;
+        // `bad` eats 0.8 × 0.9 = 0.72 → ~2.5× gap. Asserting 1.5×
+        // leaves headroom for ratio differences if we ever retune.
+        assert!(good_score >= bad_score * 1.5);
+    }
+
+    /// `cleanup_stale` prunes the Ember table in lockstep with the
+    /// eMule table so one doesn't silently outlast the other.
+    #[test]
+    fn cleanup_stale_also_prunes_ember_records() {
+        let mut cm = CreditManager::new();
+        let fresh = [0xF0u8; 32];
+        let stale = [0x5Au8; 32];
+        let now = chrono::Utc::now().timestamp();
+        cm.get_or_create_ember(fresh).last_seen = now;
+        cm.get_or_create_ember(stale).last_seen = now - 100 * 86400;
+
+        cm.cleanup_stale(90);
+        assert!(cm.get_ember_record(&fresh).is_some());
+        assert!(cm.get_ember_record(&stale).is_none());
     }
 }

@@ -5784,6 +5784,21 @@ async fn download_parts_from_source(
                         if let Some(cm) = &credit_mgr {
                             let mut cm = cm.write().await;
                             cm.add_downloaded(peer_user_hash, verified_bytes);
+                            // Ember credit mirror: record how much
+                            // PoP-verified peers have uploaded to
+                            // us, so their `downloaded` column (from
+                            // our perspective) feeds the decayed
+                            // ratio in `get_ember_score_ratio` when
+                            // THEY later ask to be served by us.
+                            // Gated on `ember_auth_verified` — the
+                            // binding-only fallback isn't strong
+                            // enough to prevent a spoofer from
+                            // claiming credit for a friend's upload
+                            // (they'd still need the friend's secret
+                            // key, but we're belt-and-braces here).
+                            if let Some(pk) = hello_caps.ember_pubkey {
+                                cm.add_ember_downloaded(pk, verified_bytes, ember_auth_verified);
+                            }
                         }
                     }
                 }

@@ -2063,7 +2063,7 @@ async fn flush_credit_state(
         cm_w.cleanup_stale(90);
     }
 
-    let (serialized_bytes, owned) = {
+    let (serialized_bytes, owned, ember_owned) = {
         let cm = credit_manager.read().await;
         let bytes = cm.serialize();
         let records: Vec<([u8; 16], u64, u64, i64, Vec<u8>)> = cm
@@ -2071,7 +2071,27 @@ async fn flush_credit_state(
             .iter()
             .map(|r| (r.user_hash, r.uploaded, r.downloaded, r.last_seen, r.public_key.clone()))
             .collect();
-        (bytes, records)
+        // Snapshot the Ember table too. The columns are plain scalars
+        // so an owned copy is cheap; holding the read lock only long
+        // enough to clone keeps the upload dispatcher un-blocked
+        // while the disk write runs below.
+        let ember_records: Vec<([u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)> = cm
+            .all_ember_records()
+            .iter()
+            .map(|r| (
+                r.pub_key,
+                r.uploaded,
+                r.downloaded,
+                r.last_upload_time,
+                r.last_download_time,
+                r.completed_sessions,
+                r.total_sessions,
+                r.avg_upload_speed,
+                r.last_seen,
+                r.ident_verified,
+            ))
+            .collect();
+        (bytes, records, ember_records)
     };
     // Ordering note: persist credits to the SQLite database *first* (the
     // authoritative source on load — see `CreditManager` loader, which
@@ -2086,8 +2106,18 @@ async fn flush_credit_state(
             .map(|(h, u, d, l, p)| (h, *u, *d, *l, p.as_slice()))
             .collect();
         let result = db_ref.save_all_credits(&refs);
+        // Persist Ember records in the same blocking task so the two
+        // tables can't get out of sync across crashes — either both
+        // land or neither does (each save is its own transaction, but
+        // the two run back-to-back within the same spawn_blocking so
+        // there's no async scheduling gap).
+        let ember_refs: Vec<(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)> = ember_owned
+            .iter()
+            .map(|(pk, u, d, lu, ld, c, t, s, ls, v)| (pk, *u, *d, *lu, *ld, *c, *t, *s, *ls, *v))
+            .collect();
+        let ember_result = db_ref.save_all_ember_credits(&ember_refs);
         db_ref.incremental_vacuum();
-        result
+        result.and(ember_result)
     })
     .await;
     match db_save {
@@ -3405,6 +3435,29 @@ pub async fn start_network(
                 record.public_key = public_key;
             }
             info!("Loaded {} credit records from database", cm.all_records().len());
+        }
+        // Ember credit records live in a separate v15 table. Same
+        // "bump-last-seen in helper, overwrite after load" dance as
+        // the eMule table above: the `get_or_create_ember` accessor
+        // sets `last_seen = now`, which we then overwrite with the
+        // persisted value so the 90-day prune honours real ages.
+        if let Ok(records) = db.load_ember_credits() {
+            let loaded_count = records.len();
+            for (pk, up, down, last_up, last_down, completed, total, avg_speed, last_seen, verified) in records {
+                let record = cm.get_or_create_ember(pk);
+                record.uploaded = up;
+                record.downloaded = down;
+                record.last_upload_time = last_up;
+                record.last_download_time = last_down;
+                record.completed_sessions = completed;
+                record.total_sessions = total;
+                record.avg_upload_speed = avg_speed;
+                record.last_seen = last_seen;
+                record.ident_verified = verified;
+            }
+            if loaded_count > 0 {
+                info!("Loaded {loaded_count} Ember credit records from database");
+            }
         }
         let clients_met = data_dir.join("clients.met");
         if clients_met.exists() && cm.all_records().is_empty() {
