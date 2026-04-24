@@ -145,6 +145,25 @@ const PROGRESS_EMIT_MIN_INTERVAL: std::time::Duration = std::time::Duration::fro
 /// (discovery / secident / handshake) states where long silences are
 /// normal.
 const SLOT_IDLE_TIMEOUT_SECS: u64 = 60;
+
+/// Diagnostic: cadence of the per-session "heartbeat" log emitted at the
+/// top of the outer packet loop. Keeps log volume bounded (≤ 1 line per
+/// session per interval) while still surfacing enough state to answer
+/// "did the idle-rotation branch ever run?" in a field trace. Only
+/// emitted when the session has moved at least one byte OR holds an
+/// active slot — pre-grant sessions would otherwise spam the log.
+const UPLOAD_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Diagnostic: wall-clock threshold beyond which a single `write_packet_async`
+/// call is logged at info. Intended to catch TCP back-pressure stalls (peer
+/// shrinking its RWND or refusing to read) that would otherwise go
+/// invisible — we already have a 60 s hard stop inside `write_packet_async`,
+/// but anything over a second for a ≤10 KiB packet means the peer is
+/// nearly non-draining and explains why a session can appear stuck in
+/// "Transferring" while we're in fact stranded inside an OP_REQUESTPARTS
+/// serving loop.
+const UPLOAD_SLOW_WRITE_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(1000);
+
 /// Maximum concurrent TCP connections from a single IP address
 const MAX_CONNECTIONS_PER_IP: usize = 3;
 /// Maximum total concurrent TCP connections to the upload server
@@ -2105,6 +2124,20 @@ impl UploadHandler {
         // minutes and only cleared when the app closed.
         let mut last_part_request: std::time::Instant = std::time::Instant::now();
 
+        // Diagnostic: when the last per-session heartbeat log was emitted,
+        // and how many outer-loop iterations have run since the session
+        // began. If a field trace shows the row stuck in "Transferring"
+        // but the iteration counter is frozen at the same value across
+        // multiple heartbeats, we're stranded inside an inner serving
+        // loop (e.g. OP_REQUESTPARTS backpressure on a peer that barely
+        // reads) rather than idling at the outer `tokio::time::timeout`.
+        // Conversely, an iteration counter that climbs while
+        // `last_part_request` ages past SLOT_IDLE_TIMEOUT_SECS points at
+        // a gate logic bug. Either reading is decisive.
+        let mut last_heartbeat_log: Option<std::time::Instant> = None;
+        let mut outer_loop_iterations: u64 = 0;
+        let session_open_at: std::time::Instant = std::time::Instant::now();
+
         // Session-local caches populated lazily on OP_REQUESTPARTS and reused
         // across batches / blocks so we don't re-open the serve file, re-read
         // the `.part.met`, or re-compute the video-extension flag for every
@@ -2207,12 +2240,43 @@ impl UploadHandler {
             if (slot_guard.is_active() || uploaded > 0)
                 && last_part_request.elapsed().as_secs() >= SLOT_IDLE_TIMEOUT_SECS
             {
-                debug!(
+                info!(
                     "Upload to {peer_addr} idle >{SLOT_IDLE_TIMEOUT_SECS}s with no useful \
-                     activity (slot_active={}, uploaded={uploaded} bytes) — closing",
+                     activity (slot_active={}, uploaded={uploaded}B, \
+                     last_part_request={}s ago, iterations={outer_loop_iterations}) — closing",
                     slot_guard.is_active(),
+                    last_part_request.elapsed().as_secs(),
                 );
                 break;
+            }
+
+            // Diagnostic heartbeat. Fires at most once per
+            // UPLOAD_HEARTBEAT_INTERVAL per session, and only for
+            // sessions that have either a granted slot or non-zero
+            // uploaded bytes (i.e. the ones that could plausibly
+            // appear in the UI as "Transferring"). The tuple logged
+            // here is exactly the information needed to distinguish
+            // "outer loop frozen inside an inner serving routine"
+            // (iterations stop climbing) from "outer loop iterating
+            // but gate logic failing to fire" (iterations climb but
+            // last_part_request keeps aging past the threshold).
+            outer_loop_iterations = outer_loop_iterations.saturating_add(1);
+            if (slot_guard.is_active() || uploaded > 0)
+                && last_heartbeat_log
+                    .map(|t| t.elapsed() >= UPLOAD_HEARTBEAT_INTERVAL)
+                    .unwrap_or(true)
+            {
+                last_heartbeat_log = Some(std::time::Instant::now());
+                info!(
+                    target: "ember::upload_diag",
+                    "heartbeat {peer_addr} slot_active={} uploaded={uploaded}B \
+                     last_part_req={}s session_age={}s iters={outer_loop_iterations} \
+                     tid={}",
+                    slot_guard.is_active(),
+                    last_part_request.elapsed().as_secs(),
+                    session_open_at.elapsed().as_secs(),
+                    transfer_id.as_deref().unwrap_or("-"),
+                );
             }
 
             // Re-share EPX with Ember peers when our shared payload has
@@ -2283,11 +2347,25 @@ impl UploadHandler {
                 match read_result {
                     Ok(Some(Ok(p))) => p,
                     Ok(Some(Err(e))) => {
-                        debug!("Client disconnected: {e}");
+                        info!(
+                            target: "ember::upload_diag",
+                            "session_end {peer_addr} reason=peer_disconnected err={e} \
+                             uploaded={uploaded}B last_part_req={}s \
+                             session_age={}s iters={outer_loop_iterations}",
+                            last_part_request.elapsed().as_secs(),
+                            session_open_at.elapsed().as_secs(),
+                        );
                         break;
                     }
                     Ok(None) => {
-                        debug!("Reader task ended unexpectedly");
+                        info!(
+                            target: "ember::upload_diag",
+                            "session_end {peer_addr} reason=reader_task_ended \
+                             uploaded={uploaded}B last_part_req={}s \
+                             session_age={}s iters={outer_loop_iterations}",
+                            last_part_request.elapsed().as_secs(),
+                            session_open_at.elapsed().as_secs(),
+                        );
                         break;
                     }
                     Err(_) => {
@@ -2468,11 +2546,22 @@ impl UploadHandler {
                         // `handle_connection` emits the appropriate
                         // `Completed` / `Failed` UploadEvent.
                         if slot_guard.is_active() {
-                            debug!(
-                                "Upload slot idle >{SLOT_IDLE_TIMEOUT_SECS}s for {peer_addr} — closing to rotate slot"
+                            info!(
+                                target: "ember::upload_diag",
+                                "session_end {peer_addr} reason=slot_idle_timeout \
+                                 uploaded={uploaded}B last_part_req={}s \
+                                 session_age={}s iters={outer_loop_iterations}",
+                                last_part_request.elapsed().as_secs(),
+                                session_open_at.elapsed().as_secs(),
                             );
                         } else {
-                            debug!("Client {peer_addr} timed out before slot grant");
+                            info!(
+                                target: "ember::upload_diag",
+                                "session_end {peer_addr} reason=pre_grant_timeout \
+                                 uploaded={uploaded}B session_age={}s \
+                                 iters={outer_loop_iterations}",
+                                session_open_at.elapsed().as_secs(),
+                            );
                         }
                         break;
                     }
@@ -3105,6 +3194,12 @@ impl UploadHandler {
                         continue;
                     };
                     if !slot_guard.is_active() {
+                        debug!(
+                            target: "ember::upload_diag",
+                            "reqparts_rejected {peer_addr} slot_inactive uploaded={uploaded}B \
+                             last_part_req={}s",
+                            last_part_request.elapsed().as_secs(),
+                        );
                         write_packet_async(
                             &mut writer,
                             OP_EDONKEYHEADER,
@@ -3115,11 +3210,17 @@ impl UploadHandler {
                         continue;
                     }
 
+                    // Diagnostic: time the whole batch so we can correlate
+                    // "peer sent REQUESTPARTS but we never responded in
+                    // reasonable time" with the slow-write log below.
+                    let req_batch_start = std::time::Instant::now();
+
                     let offsets = if opcode == OP_REQUESTPARTS_I64 {
                         parse_request_parts_i64(&payload)?
                     } else {
                         parse_request_parts_32(&payload)?
                     };
+                    let raw_offset_count = offsets.len();
 
                     let mut offsets: Vec<(u64, u64)> = offsets
                         .into_iter()
@@ -3194,6 +3295,26 @@ impl UploadHandler {
                         }
                         offsets = split;
                     }
+
+                    // Diagnostic: summarise the batch shape for this REQUESTPARTS
+                    // before we touch the disk. A peer sending REQUESTPARTS with
+                    // all ranges filtered away (past EOF, zero-length, etc.) lands
+                    // here with `offsets.is_empty()` and no bytes will move — the
+                    // `last_part_request` gauge below won't be bumped, so the
+                    // session will eventually time out via SLOT_IDLE_TIMEOUT. If
+                    // the field log shows these repeatedly followed by silence,
+                    // it's diagnosis-useful to see the raw count / ranges that
+                    // arrived from the peer.
+                    let total_bytes_requested: u64 =
+                        offsets.iter().map(|&(s, e)| e.saturating_sub(s)).sum();
+                    debug!(
+                        target: "ember::upload_diag",
+                        "reqparts_in {peer_addr} raw_offsets={raw_offset_count} \
+                         after_filter_merge_split={} total_bytes={total_bytes_requested} \
+                         uploaded={uploaded}B last_part_req={}s",
+                        offsets.len(),
+                        last_part_request.elapsed().as_secs(),
+                    );
 
                     let resolved = match self.resolve_upload_file(&hash).await {
                         Some(file) => file,
@@ -3285,6 +3406,22 @@ impl UploadHandler {
                     // slot_rate is a smoothed EWMA that doesn't need
                     // block-granular updates).
                     let mut batch_credited_bytes: u64 = 0;
+
+                    // Diagnostic: per-batch back-pressure counters.
+                    // Each individual OP_SENDINGPART / OP_COMPRESSEDPART
+                    // packet has its own elapsed timer so we can
+                    // distinguish "kernel SO_SNDBUF is backing up
+                    // because peer stopped reading" (large `slowest_write`)
+                    // from "we're CPU-bound compressing" (many packets,
+                    // all fast). `write_packet_async` already has a
+                    // 60 s hard stop — anything shorter but above
+                    // UPLOAD_SLOW_WRITE_THRESHOLD is an early warning
+                    // that the session is stalling even though bytes
+                    // are technically still moving.
+                    let mut slowest_write: std::time::Duration =
+                        std::time::Duration::ZERO;
+                    let mut slow_writes_this_batch: u32 = 0;
+                    let mut packets_this_batch: u32 = 0;
 
                     for (start, end) in offsets {
                         if start >= end {
@@ -3448,6 +3585,7 @@ impl UploadHandler {
                                             part_payload.extend_from_slice(chunk);
 
                                             self.acquire_upload_bandwidth(chunk_len as u64).await;
+                                            let write_start = std::time::Instant::now();
                                             write_packet_async(
                                                 &mut writer,
                                                 OP_EMULEPROT,
@@ -3455,6 +3593,22 @@ impl UploadHandler {
                                                 &part_payload,
                                             )
                                             .await?;
+                                            let write_elapsed = write_start.elapsed();
+                                            packets_this_batch = packets_this_batch.saturating_add(1);
+                                            if write_elapsed > slowest_write {
+                                                slowest_write = write_elapsed;
+                                            }
+                                            if write_elapsed >= UPLOAD_SLOW_WRITE_THRESHOLD {
+                                                slow_writes_this_batch =
+                                                    slow_writes_this_batch.saturating_add(1);
+                                                info!(
+                                                    target: "ember::upload_diag",
+                                                    "slow_write {peer_addr} kind=compressed \
+                                                     chunk_len={chunk_len} elapsed_ms={} \
+                                                     uploaded={uploaded}B — TCP back-pressure",
+                                                    write_elapsed.as_millis(),
+                                                );
+                                            }
 
                                             cursor += chunk_len;
 
@@ -3548,7 +3702,24 @@ impl UploadHandler {
                             part_payload.extend_from_slice(chunk);
 
                             self.acquire_upload_bandwidth(chunk_len as u64).await;
+                            let write_start = std::time::Instant::now();
                             write_packet_async(&mut writer, proto, op, &part_payload).await?;
+                            let write_elapsed = write_start.elapsed();
+                            packets_this_batch = packets_this_batch.saturating_add(1);
+                            if write_elapsed > slowest_write {
+                                slowest_write = write_elapsed;
+                            }
+                            if write_elapsed >= UPLOAD_SLOW_WRITE_THRESHOLD {
+                                slow_writes_this_batch =
+                                    slow_writes_this_batch.saturating_add(1);
+                                info!(
+                                    target: "ember::upload_diag",
+                                    "slow_write {peer_addr} kind=uncompressed \
+                                     chunk_len={chunk_len} elapsed_ms={} \
+                                     uploaded={uploaded}B — TCP back-pressure",
+                                    write_elapsed.as_millis(),
+                                );
+                            }
 
                             uploaded += chunk_len as u64;
                             rate_tracker.record_send(chunk_len as u64);
@@ -3576,6 +3747,24 @@ impl UploadHandler {
                             cursor += chunk_len;
                         }
                     }
+
+                    // Diagnostic: batch-level summary. `credited_bytes == 0`
+                    // means the peer's REQUESTPARTS produced no outgoing
+                    // bytes — every range was filtered (past EOF, zero-length,
+                    // or rejected by the part tracker) and `last_part_request`
+                    // will NOT be bumped, so the outer idle gate is still
+                    // ticking. That's the shape we need to see to distinguish
+                    // "peer sent garbage REQUESTPARTS and we correctly
+                    // ignored them, timeout imminent" from "we served bytes
+                    // normally, peer got them, timeout reset".
+                    debug!(
+                        target: "ember::upload_diag",
+                        "reqparts_out {peer_addr} credited={batch_credited_bytes}B \
+                         packets={packets_this_batch} slow_writes={slow_writes_this_batch} \
+                         slowest_ms={} batch_elapsed_ms={} uploaded_total={uploaded}B",
+                        slowest_write.as_millis(),
+                        req_batch_start.elapsed().as_millis(),
+                    );
 
                     // Flush the batched credit + slot-rate updates once per
                     // OP_REQUESTPARTS batch. These used to be taken per block
@@ -3707,10 +3896,11 @@ impl UploadHandler {
                         let session_secs = session_start
                             .map(|t| t.elapsed().as_secs())
                             .unwrap_or(0);
-                        debug!(
-                            "Upload {reason} for {peer_addr} ({}B / {}s, ~{} B/s), sending OutOfPartReqs",
-                            uploaded,
-                            session_secs,
+                        info!(
+                            target: "ember::upload_diag",
+                            "session_end {peer_addr} reason={reason} uploaded={uploaded}B \
+                             session_secs={session_secs} smoothed_bps={} \
+                             sending OP_OUTOFPARTREQS",
                             rate_tracker.smoothed_rate(),
                         );
                         // Record the Ember session-reliability +
@@ -3845,7 +4035,19 @@ impl UploadHandler {
                 }
 
                 (OP_EDONKEYHEADER, OP_CANCELTRANSFER) | (OP_EDONKEYHEADER, OP_END_OF_DOWNLOAD) => {
-                    debug!("Peer {peer_addr} cancelled/ended transfer");
+                    let cancel_kind = if opcode == OP_CANCELTRANSFER {
+                        "peer_cancel"
+                    } else {
+                        "peer_end_of_download"
+                    };
+                    info!(
+                        target: "ember::upload_diag",
+                        "session_end {peer_addr} reason={cancel_kind} \
+                         uploaded={uploaded}B last_part_req={}s \
+                         session_age={}s iters={outer_loop_iterations}",
+                        last_part_request.elapsed().as_secs(),
+                        session_open_at.elapsed().as_secs(),
+                    );
                     // Same reliability rule as the session-expired
                     // branch: "completed" iff the peer actually
                     // received at least one byte from this session.
@@ -4688,8 +4890,26 @@ impl UploadHandler {
             cm.record_ember_session(pk, uploaded, session_secs, completed, verified);
         }
 
-        // Emit completion/failure for any tracked upload
+        // Emit completion/failure for any tracked upload. This is the
+        // single bottleneck through which every upload session
+        // terminates — the `transfer-complete` / `transfer-failed`
+        // event emitted here is what drops the row from the frontend
+        // uploads pane. If a field trace shows a "Transferring" row
+        // persisting without a matching `session_final` log line,
+        // the connection handler hasn't actually returned yet, which
+        // is the only way a row could sit beyond
+        // CLIENT_TIMEOUT_SECS. Emitting this as `info!` (not debug)
+        // makes every session termination visible by default.
+        let session_age = session_open_at.elapsed().as_secs();
         if let Some(tid) = &transfer_id {
+            let kind_label = if uploaded > 0 { "completed" } else { "failed_zero_bytes" };
+            info!(
+                target: "ember::upload_diag",
+                "session_final {peer_addr} kind={kind_label} uploaded={uploaded}B \
+                 last_part_req={}s session_age={session_age}s \
+                 iters={outer_loop_iterations} tid={tid}",
+                last_part_request.elapsed().as_secs(),
+            );
             let _ = self.upload_event_tx.send(UploadEvent {
                 transfer_id: tid.clone(),
                 kind: if uploaded > 0 {
@@ -4700,6 +4920,12 @@ impl UploadHandler {
                     }
                 },
             }).await;
+        } else {
+            info!(
+                target: "ember::upload_diag",
+                "session_final {peer_addr} kind=no_transfer_id uploaded={uploaded}B \
+                 session_age={session_age}s iters={outer_loop_iterations}",
+            );
         }
 
         Ok(())
