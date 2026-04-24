@@ -2585,6 +2585,8 @@ async fn upload_queue_snapshot(
             entry.current_addr,
             entry.emule_version,
             entry.is_friend_slot,
+            entry.ember_pubkey.as_ref(),
+            entry.ember_verified,
         );
         let rank = ed2k::upload::compute_queue_rank(
             &cm,
