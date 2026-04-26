@@ -308,7 +308,7 @@ pub struct NetworkStats {
 /// Diagnostic counters for the Ember mesh (EPX, LowID broker). Surfaced
 /// via `get_ember_diagnostics` only — kept off `NetworkStats` so the
 /// hot status-bar IPC payload stays focused on user-visible state.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EmberDiagnostics {
     /// Source-exchange events accepted from a connected Ember peer this session.
     pub epx_events_received: u32,
@@ -326,6 +326,24 @@ pub struct EmberDiagnostics {
     pub broker_relay_successes: u32,
     /// LowID broker: relay failures reported this session.
     pub broker_relay_failures: u32,
+    /// Whether the Ember-native Noise transport is currently routing
+    /// UDP packets (mirrors `AppSettings::ember_native_enabled`).
+    pub ember_native_enabled: bool,
+    /// Established Noise sessions held by `EmberTransport`.
+    pub ember_sessions: u32,
+    /// `EmberControlMessage::Ping` packets we sent over the transport
+    /// this session. Bumped when `prepare_outgoing` succeeds.
+    pub ember_pings_sent: u32,
+    /// `EmberControlMessage::Ping` packets we received and replied to.
+    pub ember_pings_received: u32,
+    /// `EmberControlMessage::Pong` packets we received in response to
+    /// a ping we initiated.
+    pub ember_pongs_received: u32,
+    /// Local Noise X25519 public key advertised by `EmberTransport`,
+    /// hex-encoded. Surfaces here so the harness can dial this node
+    /// without needing a separate identity command.
+    #[serde(default)]
+    pub local_noise_public_key: String,
 }
 
 /// Serializable KAD contact info for the frontend (mirrors eMule KadContactListCtrl columns)
@@ -516,6 +534,16 @@ pub struct AppSettings {
     /// Rendezvous server URL for friend discovery
     #[serde(default = "default_rendezvous_url")]
     pub rendezvous_url: String,
+    /// **Experimental**: enable the Ember-native Noise-encrypted UDP
+    /// transport alongside the existing eMule KAD/eD2K stack. When off
+    /// (default), Ember-magic UDP packets are dropped and the live
+    /// network task behaves exactly as before. When on, packets that
+    /// match `EmberTransport::is_ember_packet` are routed to the
+    /// Ember transport, which currently understands `Ping` / `Pong`
+    /// control messages only — a diagnostic surface for harness
+    /// validation, not a replacement for any user-facing feature.
+    #[serde(default)]
+    pub ember_native_enabled: bool,
 }
 
 /// Sanitized ed2k download limits derived from [`AppSettings`] (clamped for safety).
@@ -755,6 +783,7 @@ impl Default for AppSettings {
             friend_session_encryption: true,
             max_friends: default_max_friends(),
             rendezvous_url: default_rendezvous_url(),
+            ember_native_enabled: false,
         }
     }
 }
