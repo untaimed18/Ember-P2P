@@ -18,6 +18,13 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+# Local multi-node harness build. Enables Tauri's runtime devtools so
+# `scripts\harness.ps1` users can invoke `ember_ping_peer` and friends
+# from the webview console (Ctrl+Shift+I) without shipping that
+# capability to production builds.
+harness = ["tauri/devtools"]
+
 [dependencies]
 tauri = { version = "2", features = [] }
 

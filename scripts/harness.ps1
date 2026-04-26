@@ -110,16 +110,20 @@ function Invoke-Node {
     # Pre-seed config.json so the node starts on the harness rendezvous
     # URL with non-conflicting ports. AppConfig::load merges this with
     # defaults on first launch, and treats setup_complete=true as
-    # "skip the wizard" so the run is fully unattended.
+    # "skip the wizard" so the run is fully unattended. The Ember-native
+    # transport flag is seeded on so `ember_ping_peer` works without
+    # any post-launch settings edit; toggling it off via the in-app
+    # settings still works.
     $configPath = Join-Path $dataDir 'config.json'
     if (-not (Test-Path $configPath)) {
         $rendezvousUrl = "http://127.0.0.1:$RendezvousPort"
         $seed = @{
-            tcp_port        = $TcpPort
-            udp_port        = $UdpPort
-            rendezvous_url  = $rendezvousUrl
-            auto_connect_kad = $false
-            setup_complete  = $true
+            tcp_port             = $TcpPort
+            udp_port             = $UdpPort
+            rendezvous_url       = $rendezvousUrl
+            auto_connect_kad     = $false
+            setup_complete       = $true
+            ember_native_enabled = $true
         } | ConvertTo-Json -Depth 4
         Set-Content -Path $configPath -Value $seed -NoNewline
         Write-Host "Seeded $configPath" -ForegroundColor DarkCyan
@@ -127,10 +131,12 @@ function Invoke-Node {
 
     $env:EMBER_DATA_DIR = $dataDir
     Write-Host "Launching Ember node '$Node' (tcp=$TcpPort udp=$UdpPort) with EMBER_DATA_DIR=$dataDir" -ForegroundColor Cyan
+    Write-Host "  • Press Ctrl+Shift+I in the window to open devtools." -ForegroundColor DarkGray
+    Write-Host "  • Use window.__TAURI__.core.invoke('get_ember_diagnostics') to read the local pubkey." -ForegroundColor DarkGray
 
     Push-Location $RepoRoot
     try {
-        & npm run tauri build -- --no-bundle
+        & npm run tauri build -- --features harness --no-bundle
         if ($LASTEXITCODE -ne 0) { throw "tauri build failed (exit $LASTEXITCODE)" }
 
         $exe = Join-Path $RepoRoot 'src-tauri/target/release/ember.exe'
