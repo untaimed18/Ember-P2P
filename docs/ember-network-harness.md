@@ -48,9 +48,32 @@ which returns:
 - Mesh peers known
 - Broker punch attempts / successes / failures
 - Broker relay attempts / successes / failures
+- Ember-native: `ember_native_enabled`, session count, pings sent /
+  received, pongs received, and the local Noise public key
 
 This is the right surface to watch for harness scenarios; the regular
 status bar continues to show only user-facing state.
+
+## Ember-native ping (feature-flagged)
+
+The harness can drive the Ember-native transport end-to-end without
+DHT or native file transfer:
+
+1. Edit each node's `<EMBER_DATA_DIR>\config.json` to set
+   `"ember_native_enabled": true` (off by default — no production
+   builds route Ember-magic UDP).
+2. Call `get_ember_diagnostics` on the target node and copy its
+   `local_noise_public_key`.
+3. From the initiator, invoke `ember_ping_peer` with the target's IP,
+   UDP port, and Noise pubkey. The command returns
+   `{ success: true, rtt_ms: <ms> }` on success.
+4. Refresh `get_ember_diagnostics` on both nodes — counters for
+   `ember_pings_sent`, `ember_pings_received`, `ember_pongs_received`,
+   and `ember_sessions` should reflect the round trip.
+
+Toggling `ember_native_enabled` off via `update_settings` clears the
+transport's sessions immediately, so a re-enable starts from a clean
+state.
 
 ## Scenarios
 

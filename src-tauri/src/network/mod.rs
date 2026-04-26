@@ -1342,7 +1342,25 @@ pub enum NetworkCommand {
     GetEmberDiagnostics {
         tx: oneshot::Sender<EmberDiagnostics>,
     },
+    /// Send an Ember-native `Ping` over the Noise transport to a
+    /// `(addr, peer_noise_pubkey)` and return either the round-trip
+    /// time of the matching `Pong` or an error string. Backs the
+    /// `ember_ping_peer` harness command; gated by
+    /// `ember_native_enabled` on both ends.
+    SendEmberPing {
+        addr: SocketAddr,
+        peer_pubkey: [u8; 32],
+        tx: oneshot::Sender<Result<EmberPingPending, String>>,
+    },
     Shutdown,
+}
+
+/// Returned by the network task when an outgoing Ember ping has been
+/// scheduled. The Tauri command awaits the `pong_rx` oneshot with a
+/// timeout to convert this into a final `EmberPingResult`.
+#[derive(Debug)]
+pub struct EmberPingPending {
+    pub pong_rx: oneshot::Receiver<std::time::Duration>,
 }
 
 /// Per-peer reputation snapshot. Returned by the `get_peer_reputation`
@@ -1812,7 +1830,27 @@ struct NetworkState {
     /// our routing table is repopulated at startup, so the cache
     /// rebuilds quickly on each session.
     ember_capable_peers: HashSet<(Ipv4Addr, u16)>,
+    /// Ember-native Noise transport. Always initialised at network
+    /// startup so the dispatch decision in `handle_udp_packet` can be
+    /// gated purely on `settings.ember_native_enabled` — toggling the
+    /// flag at runtime is observable on the next packet without
+    /// reinitialising state. Sessions are cleared when the flag flips
+    /// off so a stale handshake from the "on" period cannot decrypt
+    /// later traffic if the user re-enables.
+    ember_transport: ember::transport::EmberTransport,
+    /// Pending `EmberControlMessage::Ping` requests we sent and are
+    /// waiting on a `Pong` for. Keyed by the wire `nonce`. Each entry
+    /// carries the start time (for RTT) and a oneshot the harness
+    /// command awaits with a timeout. Bounded by the cap below so
+    /// a misbehaving peer cannot grow the map without limit.
+    ember_pending_pings: HashMap<u64, (std::time::Instant, oneshot::Sender<std::time::Duration>)>,
 }
+
+/// Maximum concurrent pending Ember pings tracked in `NetworkState`.
+/// Each entry costs ~24 B + a oneshot; this cap keeps the map under
+/// 50 KB even in a degenerate flood, while still allowing a harness
+/// to fan out hundreds of probes in parallel.
+const MAX_EMBER_PENDING_PINGS: usize = 1024;
 
 /// Filter search results by file type, matching eMule's AddToList behavior:
 /// when a type filter is active, reject any result whose inferred type
@@ -3313,6 +3351,11 @@ pub async fn start_network(
         relay_manager: Arc::new(tokio::sync::Mutex::new(ember::relay::RelayManager::new())),
         reputation: ember::reputation::ReputationManager::load(&data_dir.join("reputation.json")),
         ember_capable_peers: HashSet::new(),
+        ember_transport: ember::transport::EmberTransport::new(
+            identity.noise_private_key,
+            identity.noise_public_key,
+        ),
+        ember_pending_pings: HashMap::new(),
     };
 
     // Load known files for hash cache
@@ -3992,12 +4035,22 @@ pub async fn start_network(
                         state.uss_host = None;
                         state.pending_uss_pings.clear();
                     }
+                    // Reset Ember transport state when the feature flag flips
+                    // off, so sessions established during the "on" period
+                    // cannot decrypt traffic if the user re-enables it later
+                    // (different harness session, different intent).
+                    if settings.ember_native_enabled && !new_settings.ember_native_enabled {
+                        state.ember_transport.cleanup_all();
+                        state.ember_pending_pings.clear();
+                        info!("Ember-native transport disabled — cleared all sessions");
+                    }
                     info!(
-                        "Network settings updated: obfuscation={}, uss={}, nickname={}, max_uploads={}",
+                        "Network settings updated: obfuscation={}, uss={}, nickname={}, max_uploads={}, ember_native={}",
                         new_settings.obfuscation_enabled,
                         new_settings.uss_enabled,
                         new_settings.nickname,
                         new_settings.max_concurrent_uploads,
+                        new_settings.ember_native_enabled,
                     );
                     settings = new_settings;
                 }
@@ -4134,12 +4187,18 @@ pub async fn start_network(
                             state.uss_host = None;
                             state.pending_uss_pings.clear();
                         }
+                        if settings.ember_native_enabled && !new_settings.ember_native_enabled {
+                            state.ember_transport.cleanup_all();
+                            state.ember_pending_pings.clear();
+                            info!("Ember-native transport disabled — cleared all sessions");
+                        }
                         info!(
-                            "Network settings updated (recv): obfuscation={}, uss={}, nickname={}, max_uploads={}",
+                            "Network settings updated (recv): obfuscation={}, uss={}, nickname={}, max_uploads={}, ember_native={}",
                             new_settings.obfuscation_enabled,
                             new_settings.uss_enabled,
                             new_settings.nickname,
                             new_settings.max_concurrent_uploads,
+                            new_settings.ember_native_enabled,
                         );
                         settings = new_settings;
                     }
@@ -13551,6 +13610,93 @@ async fn write_ed2k_packet_simple(
     Ok(())
 }
 
+/// Drive `EmberTransport` for an inbound Ember-magic UDP packet:
+/// step the Noise state machine, send any handshake-response packets
+/// back over the same socket, decode `EmberControlMessage` payloads,
+/// and respond to `Ping` with a `Pong`. Bumps the relevant counters
+/// in `state.ember_diagnostics` and resolves any pending ping
+/// oneshots when a matching `Pong` arrives.
+async fn handle_ember_native_udp(
+    socket: &UdpSocket,
+    data: &[u8],
+    from: SocketAddr,
+    state: &mut NetworkState,
+) {
+    use ember::transport::{EmberControlMessage, IncomingResult, OutgoingResult};
+
+    let result = state.ember_transport.process_incoming(data, from);
+
+    let (decoded_payload, response_packets) = match result {
+        IncomingResult::Message { payload, .. } => (Some(payload), Vec::new()),
+        IncomingResult::HandshakeResponse { packets, .. } => (None, packets),
+        IncomingResult::HandshakeComplete {
+            packets_to_send,
+            decrypted_payload,
+            ..
+        } => (decrypted_payload, packets_to_send),
+        IncomingResult::Rejected => {
+            debug!("Ember transport rejected UDP packet from {from}");
+            return;
+        }
+    };
+
+    for pkt in response_packets {
+        if let Err(e) = socket.send_to(&pkt, from).await {
+            debug!("Ember transport: failed to send handshake reply to {from}: {e}");
+        }
+    }
+
+    let Some(payload) = decoded_payload else { return };
+
+    let Some(message) = EmberControlMessage::decode(&payload) else {
+        debug!(
+            "Ember transport: dropping unknown control payload from {from} ({} bytes)",
+            payload.len()
+        );
+        return;
+    };
+
+    match message {
+        EmberControlMessage::Ping { nonce } => {
+            state.ember_diagnostics.ember_pings_received = state
+                .ember_diagnostics
+                .ember_pings_received
+                .saturating_add(1);
+
+            let pong = EmberControlMessage::Pong { nonce }.encode();
+            match state.ember_transport.prepare_outgoing(from, None, &pong) {
+                OutgoingResult::Ready { packet } => {
+                    if let Err(e) = socket.send_to(&packet, from).await {
+                        debug!("Ember transport: failed to send Pong to {from}: {e}");
+                    }
+                }
+                OutgoingResult::Queued | OutgoingResult::HandshakeStarted { .. } => {
+                    // Should not happen in practice: receiving the Ping
+                    // means a session is already established. Log for
+                    // diagnostics but otherwise drop — the sender will
+                    // time out client-side and the harness will report it.
+                    debug!("Ember transport: Pong reply queued behind handshake to {from}");
+                }
+                OutgoingResult::Error(err) => {
+                    debug!("Ember transport: Pong encode error for {from}: {err}");
+                }
+            }
+        }
+        EmberControlMessage::Pong { nonce } => {
+            state.ember_diagnostics.ember_pongs_received = state
+                .ember_diagnostics
+                .ember_pongs_received
+                .saturating_add(1);
+
+            if let Some((sent_at, tx)) = state.ember_pending_pings.remove(&nonce) {
+                let _ = tx.send(sent_at.elapsed());
+            } else {
+                debug!("Ember transport: Pong nonce {nonce} from {from} did not match a pending ping");
+            }
+        }
+    }
+}
+
 async fn handle_udp_packet(
     socket: &UdpSocket,
     data: &[u8],
@@ -13588,6 +13734,29 @@ async fn handle_udp_packet(
     }
     if state.banned_ips.contains(&from_ipv4) {
         debug!("Dropping UDP packet from banned peer {from}");
+        return;
+    }
+
+    // Ember-native UDP dispatch (feature-gated).
+    //
+    // KAD/eD2K packets begin with `OP_EDONKEYHEADER` (0xE3) or
+    // `OP_EMULEPROT` (0xC5); the obfuscated KAD path uses other first
+    // bytes too, but never the Ember magic `0xEB 0x3E`. Routing on the
+    // magic prefix means we never accidentally divert real KAD traffic
+    // to the Noise transport, even when the feature flag is on.
+    //
+    // When the flag is off, we silently drop the packet — this matches
+    // the documented "designed but not yet integrated" behavior of any
+    // future Ember-native peer that finds itself talking to a build
+    // where the user hasn't opted in. We deliberately don't fall
+    // through to KAD parsing (which would log "unknown packet type"
+    // warnings and waste cycles parsing garbage).
+    if ember::transport::EmberTransport::is_ember_packet(data) {
+        if settings.ember_native_enabled {
+            handle_ember_native_udp(socket, data, from, state).await;
+        } else {
+            debug!("Dropping Ember-magic UDP packet from {from}: ember_native_enabled=false");
+        }
         return;
     }
 
@@ -16232,8 +16401,12 @@ async fn handle_command(
         }
 
         NetworkCommand::GetEmberDiagnostics { tx } => {
-            let mut diag = state.ember_diagnostics;
+            let mut diag = state.ember_diagnostics.clone();
             diag.ember_peers_known = state.known_ember_peers.len() as u32;
+            diag.ember_native_enabled = settings.ember_native_enabled;
+            diag.ember_sessions = state.ember_transport.session_count() as u32;
+            diag.local_noise_public_key =
+                hex::encode(state.ember_transport.local_noise_public_key());
             if let Some(ref broker) = state.connection_broker {
                 let bs = broker.stats();
                 diag.broker_punch_attempts = bs.punch_attempts;
@@ -16244,6 +16417,69 @@ async fn handle_command(
                 diag.broker_relay_failures = bs.relay_failures;
             }
             let _ = tx.send(diag);
+        }
+
+        NetworkCommand::SendEmberPing { addr, peer_pubkey, tx } => {
+            // Feature gate: refuse here so the harness gets a clear
+            // "feature off" string instead of a silent timeout.
+            if !settings.ember_native_enabled {
+                let _ = tx.send(Err("Ember-native transport is disabled".to_string()));
+                return;
+            }
+
+            // Bound the pending map. A stuck peer (no Pong reply) keeps
+            // an entry around until `cleanup` reaps the session, but
+            // each entry is small and the cap prevents a misbehaving
+            // peer or a chatty harness from growing the map unboundedly.
+            if state.ember_pending_pings.len() >= MAX_EMBER_PENDING_PINGS {
+                let _ = tx.send(Err(format!(
+                    "Too many in-flight Ember pings ({})",
+                    state.ember_pending_pings.len()
+                )));
+                return;
+            }
+
+            // Cryptographically random nonce so two harness operators
+            // probing the same peer do not collide on a sequential
+            // counter (and so the entry cannot be predicted by a
+            // third party watching the wire).
+            let nonce: u64 = rand::random();
+
+            let payload =
+                ember::transport::EmberControlMessage::Ping { nonce }.encode();
+
+            match state
+                .ember_transport
+                .prepare_outgoing(addr, Some(&peer_pubkey), &payload)
+            {
+                ember::transport::OutgoingResult::Ready { packet }
+                | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                    if let Err(e) = socket.send_to(&packet, addr).await {
+                        let _ = tx.send(Err(format!("send_to({addr}) failed: {e}")));
+                        return;
+                    }
+                }
+                ember::transport::OutgoingResult::Queued => {
+                    // Message queued behind an in-progress handshake;
+                    // it'll be flushed when the handshake completes,
+                    // and the matching Pong will resolve the oneshot
+                    // exactly the same way as the Ready path.
+                }
+                ember::transport::OutgoingResult::Error(err) => {
+                    let _ = tx.send(Err(format!("Ember transport error: {err}")));
+                    return;
+                }
+            }
+
+            state.ember_diagnostics.ember_pings_sent =
+                state.ember_diagnostics.ember_pings_sent.saturating_add(1);
+
+            let (pong_tx, pong_rx) = oneshot::channel();
+            state
+                .ember_pending_pings
+                .insert(nonce, (std::time::Instant::now(), pong_tx));
+
+            let _ = tx.send(Ok(EmberPingPending { pong_rx }));
         }
 
         NetworkCommand::GetUploadQueueSnapshot { tx } => {

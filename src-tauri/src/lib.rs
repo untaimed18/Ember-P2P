@@ -576,6 +576,7 @@ pub fn run() {
             commands::peers::get_peer_reputation,
             commands::peers::get_reputation_stats,
             commands::peers::get_ember_diagnostics,
+            commands::peers::ember_ping_peer,
             commands::settings::get_settings,
             commands::settings::update_settings,
             commands::settings::download_nodes_dat,

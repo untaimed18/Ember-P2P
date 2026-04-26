@@ -277,6 +277,16 @@ impl EmberTransport {
         self.pending.remove(addr);
     }
 
+    /// Drop every session and pending handshake. Used when the
+    /// `ember_native_enabled` feature flag flips off so a session
+    /// established during an "on" period cannot decrypt later traffic
+    /// when the user re-enables it (different harness session,
+    /// different intent, possibly different peer trust).
+    pub fn cleanup_all(&mut self) {
+        self.sessions.clear();
+        self.pending.clear();
+    }
+
     // ── Noise_IK handshake (1-RTT, we know the peer's static key) ──
 
     fn start_ik_handshake(
@@ -993,6 +1003,72 @@ mod tests {
         let mut transport = EmberTransport::new(priv_key, pub_key);
         assert_eq!(transport.session_count(), 0);
         transport.cleanup(); // should not panic on empty
+    }
+
+    #[test]
+    fn cleanup_all_drops_active_sessions() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        // Establish a session via Noise IK so cleanup_all has something
+        // to drop.
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"hello") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let resp = match bob.process_incoming(&init, alice_addr) {
+            IncomingResult::HandshakeComplete { packets_to_send, .. } => packets_to_send,
+            _ => panic!("expected HandshakeComplete on responder side"),
+        };
+        assert_eq!(resp.len(), 1);
+        match alice.process_incoming(&resp[0], bob_addr) {
+            IncomingResult::HandshakeComplete { .. } => {}
+            _ => panic!("expected HandshakeComplete on initiator side"),
+        }
+
+        assert!(alice.has_session(&bob_addr));
+        assert!(bob.has_session(&alice_addr));
+        assert_eq!(alice.session_count(), 1);
+
+        alice.cleanup_all();
+        bob.cleanup_all();
+
+        assert_eq!(alice.session_count(), 0);
+        assert_eq!(bob.session_count(), 0);
+        assert!(!alice.has_session(&bob_addr));
+        assert!(!bob.has_session(&alice_addr));
+    }
+
+    #[test]
+    fn ember_magic_is_distinct_from_kad_and_emule_headers() {
+        // Sanity-check the dispatch decision in `handle_udp_packet`: KAD
+        // packets begin with `OP_EDONKEYHEADER = 0xE3` or
+        // `OP_EMULEPROT = 0xC5`, never `0xEB`. Without this property,
+        // gating on the magic prefix could divert a real KAD packet
+        // into the Noise transport.
+        const OP_EDONKEYHEADER: u8 = 0xE3;
+        const OP_EMULEPROT: u8 = 0xC5;
+        assert_ne!(EMBER_MAGIC[0], OP_EDONKEYHEADER);
+        assert_ne!(EMBER_MAGIC[0], OP_EMULEPROT);
+
+        // And the magic-detector itself rejects KAD-style packets.
+        assert!(!EmberTransport::is_ember_packet(&[OP_EDONKEYHEADER, 0x00, 0x00]));
+        assert!(!EmberTransport::is_ember_packet(&[OP_EMULEPROT, 0x00, 0x00]));
+        // Ember packets need at least header_len bytes too.
+        assert!(!EmberTransport::is_ember_packet(&[EMBER_MAGIC[0]]));
+        assert!(!EmberTransport::is_ember_packet(&[]));
+        // Real Ember-shaped prefix is detected.
+        assert!(EmberTransport::is_ember_packet(&[
+            EMBER_MAGIC[0],
+            EMBER_MAGIC[1],
+            0x10,
+        ]));
     }
 
     fn variant_name(r: &OutgoingResult) -> &'static str {

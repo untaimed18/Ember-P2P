@@ -180,9 +180,10 @@ export interface NetworkStats {
 }
 
 /** Diagnostic counters for the Ember mesh (EPX events, LowID broker
- *  outcomes). Populated by `invoke('get_ember_diagnostics')`; surfaced
- *  separately from `NetworkStats` to keep the hot status-bar payload
- *  focused on user-visible state. */
+ *  outcomes, native transport ping/pong). Populated by
+ *  `invoke('get_ember_diagnostics')`; surfaced separately from
+ *  `NetworkStats` to keep the hot status-bar payload focused on
+ *  user-visible state. */
 export interface EmberDiagnostics {
   epx_events_received: number;
   ember_peers_known: number;
@@ -192,6 +193,20 @@ export interface EmberDiagnostics {
   broker_relay_attempts: number;
   broker_relay_successes: number;
   broker_relay_failures: number;
+  ember_native_enabled: boolean;
+  ember_sessions: number;
+  ember_pings_sent: number;
+  ember_pings_received: number;
+  ember_pongs_received: number;
+  local_noise_public_key: string;
+}
+
+/** Result of an `ember_ping_peer` harness round-trip. `rtt_ms` is set
+ *  iff `success` is true. */
+export interface EmberPingResult {
+  success: boolean;
+  rtt_ms?: number;
+  error?: string;
 }
 
 export interface ServerInfo {

@@ -1,8 +1,29 @@
+use std::net::{IpAddr, SocketAddr};
+
 use crate::app_state::AppState;
 use crate::network::{NetworkCommand, PeerReputationInfo, ReputationStatsInfo};
 use crate::storage::identity::NodeIdentity;
 use crate::types::*;
 use crate::types::EmberDiagnostics;
+
+/// Result returned by the `ember_ping_peer` harness command — either
+/// the round-trip time of the matching `Pong` or the reason the
+/// transport could not deliver it.
+#[derive(serde::Serialize)]
+pub struct EmberPingResult {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Default round-trip timeout in milliseconds for `ember_ping_peer`.
+/// Matches what the harness defaults the TS side to; explicit value
+/// here so the backend has a sane bound even if the caller omits it.
+const DEFAULT_EMBER_PING_TIMEOUT_MS: u64 = 5_000;
+const MIN_EMBER_PING_TIMEOUT_MS: u64 = 100;
+const MAX_EMBER_PING_TIMEOUT_MS: u64 = 60_000;
 
 /// Maximum stored friend nickname size. Same cap is enforced in
 /// `update_friend_nickname`; centralizing it here keeps the two
@@ -694,4 +715,91 @@ pub async fn get_ember_diagnostics(
     state.network_tx.try_send(NetworkCommand::GetEmberDiagnostics { tx })
         .map_err(|e| format!("Network busy: {e}"))?;
     rx.await.map_err(|_| "No response".to_string())
+}
+
+/// Send an Ember-native `Ping` to a peer over the Noise transport and
+/// wait up to `timeout_ms` for the matching `Pong`. Used by the local
+/// harness (`scripts\harness.ps1`) to verify the feature-flagged
+/// integration end-to-end.
+///
+/// `peer_pubkey_hex` must be the 64-char hex encoding of the peer's
+/// `local_noise_public_key` (also returned by
+/// `get_ember_diagnostics`). `peer_ip` is parsed as an IPv4 / IPv6
+/// literal — DNS is intentionally not resolved here, since the
+/// harness deals in `127.0.0.1` and explicit addresses only.
+#[tauri::command]
+pub async fn ember_ping_peer(
+    state: tauri::State<'_, AppState>,
+    peer_ip: String,
+    peer_port: u16,
+    peer_pubkey_hex: String,
+    timeout_ms: Option<u64>,
+) -> Result<EmberPingResult, String> {
+    let timeout = timeout_ms
+        .unwrap_or(DEFAULT_EMBER_PING_TIMEOUT_MS)
+        .clamp(MIN_EMBER_PING_TIMEOUT_MS, MAX_EMBER_PING_TIMEOUT_MS);
+
+    if peer_port == 0 {
+        return Err("peer_port must be > 0".into());
+    }
+
+    let ip: IpAddr = peer_ip
+        .parse()
+        .map_err(|e| format!("Invalid peer_ip '{peer_ip}': {e}"))?;
+    let addr = SocketAddr::new(ip, peer_port);
+
+    let pubkey_bytes = hex::decode(&peer_pubkey_hex)
+        .map_err(|e| format!("peer_pubkey_hex is not valid hex: {e}"))?;
+    if pubkey_bytes.len() != 32 {
+        return Err(format!(
+            "peer_pubkey_hex must decode to 32 bytes, got {}",
+            pubkey_bytes.len()
+        ));
+    }
+    let mut peer_pubkey = [0u8; 32];
+    peer_pubkey.copy_from_slice(&pubkey_bytes);
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::SendEmberPing {
+            addr,
+            peer_pubkey,
+            tx,
+        })
+        .map_err(|e| format!("Network busy: {e}"))?;
+
+    let scheduled = match rx.await.map_err(|_| "No response from network".to_string())? {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(EmberPingResult {
+                success: false,
+                rtt_ms: None,
+                error: Some(e),
+            })
+        }
+    };
+
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout),
+        scheduled.pong_rx,
+    )
+    .await
+    {
+        Ok(Ok(rtt)) => Ok(EmberPingResult {
+            success: true,
+            rtt_ms: Some(rtt.as_secs_f64() * 1_000.0),
+            error: None,
+        }),
+        Ok(Err(_)) => Ok(EmberPingResult {
+            success: false,
+            rtt_ms: None,
+            error: Some("Network task dropped pong oneshot".into()),
+        }),
+        Err(_) => Ok(EmberPingResult {
+            success: false,
+            rtt_ms: None,
+            error: Some(format!("Timed out after {timeout} ms")),
+        }),
+    }
 }
