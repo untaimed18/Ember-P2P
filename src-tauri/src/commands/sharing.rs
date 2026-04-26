@@ -62,9 +62,7 @@ pub(crate) async fn refresh_file_cache(index: &Arc<RwLock<LocalIndex>>, cache: &
 }
 
 fn load_known_files() -> KnownFileList {
-    let data_dir = directories::ProjectDirs::from("com", "ember", "p2p")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let data_dir = crate::storage::paths::resolve_data_dir();
     KnownFileList::load(&data_dir.join("known.met"))
 }
 

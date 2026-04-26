@@ -197,7 +197,10 @@ async fn handle_epx_sources(
     ember_peers: &[(Ipv4Addr, u16)],
     label: &str,
 ) -> usize {
-    state.stats.epx_events_received = state.stats.epx_events_received.saturating_add(1);
+    state.ember_diagnostics.epx_events_received = state
+        .ember_diagnostics
+        .epx_events_received
+        .saturating_add(1);
 
     let mut total_injected = 0usize;
     let mut total_sources_this_event = 0usize;
@@ -1331,6 +1334,14 @@ pub enum NetworkCommand {
     GetReputationStats {
         tx: oneshot::Sender<ReputationStatsInfo>,
     },
+    /// Snapshot of Ember diagnostic counters (EPX events, broker punch /
+    /// relay outcomes, mesh peer count). Backs the developer-facing
+    /// `get_ember_diagnostics` Tauri command; not on the regular
+    /// `NetworkStats` payload to keep the status-bar IPC focused on
+    /// user-visible state.
+    GetEmberDiagnostics {
+        tx: oneshot::Sender<EmberDiagnostics>,
+    },
     Shutdown,
 }
 
@@ -1716,6 +1727,10 @@ struct NetworkState {
     /// (`ember::MAX_EPX_PEERS = 50`); the in-memory headroom exists so we
     /// can rotate which subset gets advertised across rebuilds.
     known_ember_peers: HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    /// Diagnostic counters surfaced via `get_ember_diagnostics`. Increment
+    /// from inside `network/mod.rs` (EPX events, peer-count snapshots) or
+    /// from `ConnectionBroker::stats()` for broker-owned counters.
+    ember_diagnostics: EmberDiagnostics,
     /// Shared anti-leech client-software filter. Held here so the
     /// settings command path can hot-swap the pattern list without the
     /// upload listener needing to re-subscribe; the upload server
@@ -2818,10 +2833,8 @@ pub async fn start_network(
     uss_enabled_flag: crate::bandwidth::UssEnabledFlag,
     spam_filter: Arc<RwLock<crate::search::spam::SpamFilter>>,
 ) -> anyhow::Result<()> {
-    let data_dir = directories::ProjectDirs::from("com", "ember", "p2p")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    std::fs::create_dir_all(&data_dir)?;
+    let data_dir = crate::storage::paths::ensure_data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
 
     let geoip = {
         let resource_dir = app_handle.path().resource_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -3277,6 +3290,7 @@ pub async fn start_network(
         upload_max_slots: Arc::new(std::sync::atomic::AtomicUsize::new(settings.max_concurrent_uploads as usize)),
         ember_payload_dirty: true,
         known_ember_peers: HashMap::new(),
+        ember_diagnostics: EmberDiagnostics::default(),
         antileech: shared_antileech.clone(),
         aich_root_map: HashMap::new(),
         callback_buddy_attempts: HashMap::new(),
@@ -8117,7 +8131,6 @@ pub async fn start_network(
                     while let Ok(event) = rx.try_recv() {
                         match event {
                             ember::broker::BrokerEvent::StartPunch { ref attempt_key, source_ip, source_port, our_external_addr, our_nat_type, .. } => {
-                                state.stats.broker_punch_attempts = state.stats.broker_punch_attempts.saturating_add(1);
                                 tracing::info!("Broker: initiating hole-punch for {} -> {}:{} (ext={})", attempt_key, source_ip, source_port, our_external_addr);
                                 let rv_url = settings.rendezvous_url.clone();
                                 // Both `from_id` and `target_id` MUST be 64 chars or
@@ -8221,7 +8234,6 @@ pub async fn start_network(
                                 });
                             }
                             ember::broker::BrokerEvent::StartRelay { ref attempt_key, source_ip, source_port, file_hash, relay_addr, .. } => {
-                                state.stats.broker_relay_attempts = state.stats.broker_relay_attempts.saturating_add(1);
                                 tracing::info!("Broker: initiating relay for {} -> {}:{} (relay={:?})", attempt_key, source_ip, source_port, relay_addr);
 
                                 let attempt_key_owned = attempt_key.clone();
@@ -8398,15 +8410,9 @@ pub async fn start_network(
                                 }
                             }
                             ember::broker::BrokerEvent::ConnectionReady(conn) => {
-                                match conn.method {
-                                    ember::broker::ConnectionMethod::HolePunch => {
-                                        state.stats.broker_punch_successes = state.stats.broker_punch_successes.saturating_add(1);
-                                    }
-                                    ember::broker::ConnectionMethod::PeerRelay | ember::broker::ConnectionMethod::ServerRelay => {
-                                        state.stats.broker_relay_successes = state.stats.broker_relay_successes.saturating_add(1);
-                                    }
-                                }
                                 tracing::info!("Broker: connection ready for transfer {} from {}:{} via {:?}", conn.transfer_id, conn.source_ip, conn.source_port, conn.method);
+                                let method = conn.method;
+                                let relay_addr = conn.relay_addr;
                                 let parts = upload_server::KadCallbackParts {
                                     peer_ip: conn.source_ip,
                                     peer_port: conn.source_port,
@@ -8416,12 +8422,12 @@ pub async fn start_network(
                                     writer: conn.writer,
                                     emule_info_done: true,
                                 };
+                                let key = format!("{}:{}:{}", conn.transfer_id, conn.source_ip, conn.source_port);
                                 let _ = kad_callback_tx.send(parts).await;
                                 if let Some(ref mut broker) = state.connection_broker {
-                                    let key = format!("{}:{}:{}", conn.transfer_id, conn.source_ip, conn.source_port);
-                                    broker.mark_succeeded(&key);
-                                    if conn.method == ember::broker::ConnectionMethod::PeerRelay {
-                                        if let Some((relay_ip, relay_port)) = conn.relay_addr {
+                                    broker.mark_succeeded(&key, method);
+                                    if method == ember::broker::ConnectionMethod::PeerRelay {
+                                        if let Some((relay_ip, relay_port)) = relay_addr {
                                             broker.increment_relay_sessions(relay_ip, relay_port);
                                         }
                                     }
@@ -8434,13 +8440,11 @@ pub async fn start_network(
                                 }
                             }
                             ember::broker::BrokerEvent::PunchFailed { ref attempt_key, ref reason } => {
-                                state.stats.broker_punch_failures = state.stats.broker_punch_failures.saturating_add(1);
                                 if let Some(ref mut broker) = state.connection_broker {
                                     broker.punch_failed(attempt_key, reason).await;
                                 }
                             }
                             ember::broker::BrokerEvent::RelayFailed { ref attempt_key, ref reason } => {
-                                state.stats.broker_relay_failures = state.stats.broker_relay_failures.saturating_add(1);
                                 if let Some(ref mut broker) = state.connection_broker {
                                     broker.relay_failed(attempt_key, reason).await;
                                 }
@@ -16225,6 +16229,21 @@ async fn handle_command(
 
         NetworkCommand::GetNetworkStatsSnapshot { tx } => {
             let _ = tx.send(state.stats.clone());
+        }
+
+        NetworkCommand::GetEmberDiagnostics { tx } => {
+            let mut diag = state.ember_diagnostics;
+            diag.ember_peers_known = state.known_ember_peers.len() as u32;
+            if let Some(ref broker) = state.connection_broker {
+                let bs = broker.stats();
+                diag.broker_punch_attempts = bs.punch_attempts;
+                diag.broker_punch_successes = bs.punch_successes;
+                diag.broker_punch_failures = bs.punch_failures;
+                diag.broker_relay_attempts = bs.relay_attempts;
+                diag.broker_relay_successes = bs.relay_successes;
+                diag.broker_relay_failures = bs.relay_failures;
+            }
+            let _ = tx.send(diag);
         }
 
         NetworkCommand::GetUploadQueueSnapshot { tx } => {

@@ -171,19 +171,27 @@ export interface NetworkStats {
   udp_status?: string;
   ember_peers: number;
   epx_sources_received: number;
-  epx_events_received: number;
-  broker_punch_attempts: number;
-  broker_punch_successes: number;
-  broker_punch_failures: number;
-  broker_relay_attempts: number;
-  broker_relay_successes: number;
-  broker_relay_failures: number;
   server_status?: string;
   stale?: boolean;
   degraded?: boolean;
   degraded_reason?: string;
   last_update_at?: number;
   last_poll_ok_at?: number;
+}
+
+/** Diagnostic counters for the Ember mesh (EPX events, LowID broker
+ *  outcomes). Populated by `invoke('get_ember_diagnostics')`; surfaced
+ *  separately from `NetworkStats` to keep the hot status-bar payload
+ *  focused on user-visible state. */
+export interface EmberDiagnostics {
+  epx_events_received: number;
+  ember_peers_known: number;
+  broker_punch_attempts: number;
+  broker_punch_successes: number;
+  broker_punch_failures: number;
+  broker_relay_attempts: number;
+  broker_relay_successes: number;
+  broker_relay_failures: number;
 }
 
 export interface ServerInfo {

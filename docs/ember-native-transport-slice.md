@@ -1,48 +1,72 @@
 # First Ember-Native Slice
 
-The first Ember-native vertical slice should be the transport control message,
-not DHT search or native file transfer.
+Status: **designed and unit-tested, not yet integrated**.
 
-## Slice
+The first Ember-native vertical slice is the encrypted control message
+on top of the existing Noise transport in
+`src-tauri/src/network/ember/transport.rs`. The protocol bits are in
+place and proven by tests; integration into the live UDP loop is
+intentionally deferred until after the harness work and is the next
+thing to land before any DHT or native-transfer work begins.
 
-Use `src-tauri/src/network/ember/transport.rs` to carry one authenticated
-`EmberControlMessage` over the existing Noise UDP framing:
+## What exists today
 
-```text
-EmberTransport.prepare_outgoing(peer, remote_noise_pub, Ping.encode())
-peer UDP socket
-EmberTransport.process_incoming(packet, from)
-IncomingResult::HandshakeComplete { decrypted_payload: Ping.encode(), ... }
-EmberTransport.prepare_outgoing(peer, remote_noise_pub, Pong.encode())
-IncomingResult::Message { payload: Pong.encode(), ... }
-```
+- `EmberControlMessage::Ping { nonce }` and `EmberControlMessage::Pong { nonce }`
+  with a fixed 10-byte versioned encoding (`encode` / `decode` round-trip).
+- `EmberTransport::prepare_outgoing` / `process_incoming` already speak
+  Noise IK and Noise XX with full handshake and transport state.
+- A focused unit test
+  (`control_message_crosses_established_noise_session`) drives a Noise
+  IK handshake between two `EmberTransport` instances and verifies the
+  encoded Ping payload arrives intact, then sends a Pong on the
+  established session.
 
-## Why This Slice First
+## What integration requires (next)
 
-- It validates the dormant Noise transport without changing file transfer
-  behavior.
-- It gives the Ember DHT a secure message carrier later.
-- It can be tested locally with two in-memory `EmberTransport` instances before
-  it is attached to the main UDP loop.
-- It avoids taking a dependency on the unfinished Ember DHT store/search
-  semantics or the higher-risk BLAKE3 chunk transfer protocol.
+1. Decide where Ember-native UDP traffic should bind: alongside the
+   existing KAD UDP socket via shared dispatch, or on a dedicated
+   socket. (Recommendation: shared socket with `is_ember_packet`
+   dispatch on first three bytes — zero cost when no Ember peers are
+   talking to us.)
+2. Persist the local Noise X25519 keypair in the data directory under
+   the EMBER_DATA_DIR-aware path resolver so each harness node has its
+   own identity.
+3. Add a feature flag (settings or env-only) to opt the live network
+   loop into Ember-native UDP receive, so the integration can be tested
+   on a single harness node without affecting eMule compatibility for
+   everyone else.
+4. Add a tiny in-app diagnostic that issues a `Ping` to a peer's
+   advertised Noise key and reports the round-trip time, mirroring how
+   we'd verify the path against a real network.
 
-## Acceptance Criteria
+## Why not skip ahead
 
-1. A focused unit test completes a Noise handshake between two transports and
-   delivers a decrypted `Ping`/`Pong` control payload.
-2. The control payload is versioned, small, and distinct from future DHT/file
-   messages.
-3. The main network loop still ignores Ember-native UDP packets until a later
-   integration step explicitly routes them.
-4. No eMule KAD/eD2K behavior changes while this slice is being proven.
+- Integration without a harness or diagnostic surface invites silent
+  regressions in the production eMule path.
+- The DHT and native transfer slices both depend on this transport
+  layer; landing them first means re-doing them once transport
+  evolves.
+- The EPX + LowID-to-LowID path is the user-visible Ember mesh today.
+  It deserves stable telemetry before a parallel transport starts
+  attracting bug reports.
 
-## Follow-On Order
+## Acceptance criteria when integration lands
 
-1. Attach the proven control message to the UDP receive loop behind a feature
-   flag or internal setting.
-2. Add a rendezvous/bootstrap control exchange.
-3. Wire the smallest Ember DHT lookup.
+1. Live UDP loop dispatches Ember-magic packets to `EmberTransport`
+   without mis-routing them as KAD/eD2K.
+2. Two harness nodes can complete a Noise IK handshake over real UDP
+   and exchange a `Ping` / `Pong`.
+3. eMule KAD/eD2K behavior is unchanged for builds where the Ember
+   feature flag is off.
+4. Connection state, key material, and counters reset cleanly on
+   shutdown and on `EMBER_DATA_DIR` swaps.
+
+## Follow-on order
+
+1. Attach the proven control message to the UDP receive loop behind
+   the feature flag.
+2. Add a rendezvous/bootstrap exchange that uses `EmberControlMessage`
+   for liveness checks.
+3. Wire the smallest Ember DHT lookup using the verified transport.
 4. Defer native file transfer until transport and discovery have live
-   observability.
-
+   observability through the harness.
