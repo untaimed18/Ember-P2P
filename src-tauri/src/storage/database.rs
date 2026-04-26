@@ -1,9 +1,9 @@
 use parking_lot::Mutex;
 
 use rusqlite::{params, Connection};
-use tauri::Manager;
 use tracing::info;
 
+use crate::storage::paths;
 use crate::types::*;
 
 pub struct Database {
@@ -12,12 +12,9 @@ pub struct Database {
 
 impl Database {
     pub fn new(app_handle: &tauri::AppHandle) -> anyhow::Result<Self> {
-        let app_dir = app_handle
-            .path()
-            .app_data_dir()
-            .map_err(|e| anyhow::anyhow!("Failed to get app data dir: {e}"))?;
+        let app_dir = paths::ensure_data_dir_with_app(app_handle)
+            .map_err(|e| anyhow::anyhow!("Failed to prepare data dir: {e}"))?;
 
-        std::fs::create_dir_all(&app_dir)?;
         let db_path = app_dir.join("ember.db");
         let conn = Connection::open(&db_path)?;
         crate::security::restrict_file_permissions(&db_path);

@@ -102,6 +102,21 @@ pub async fn punch_quic(
     Ok((send, recv))
 }
 
+/// Session counters for the LowID-to-LowID broker. Owned by
+/// `ConnectionBroker` so the state machine itself is the source of truth
+/// for what counts as an "attempt" or "failure" — consumers should
+/// snapshot via `ConnectionBroker::stats()` rather than incrementing
+/// from the outside.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BrokerStats {
+    pub punch_attempts: u32,
+    pub punch_successes: u32,
+    pub punch_failures: u32,
+    pub relay_attempts: u32,
+    pub relay_successes: u32,
+    pub relay_failures: u32,
+}
+
 /// Orchestrates LowID-to-LowID connections: hole-punch first, relay fallback.
 pub struct ConnectionBroker {
     attempts: HashMap<String, ConnectionAttempt>,
@@ -109,6 +124,7 @@ pub struct ConnectionBroker {
     relay_candidates: Vec<RelayCandidate>,
     event_tx: mpsc::Sender<BrokerEvent>,
     quic_endpoint: Option<Arc<quinn::Endpoint>>,
+    stats: BrokerStats,
 }
 
 /// Events emitted by the broker for the main network loop to act on.
@@ -159,7 +175,13 @@ impl ConnectionBroker {
             relay_candidates: Vec::new(),
             event_tx,
             quic_endpoint: None,
+            stats: BrokerStats::default(),
         }
+    }
+
+    /// Snapshot the broker's session counters. Cheap (`Copy`).
+    pub fn stats(&self) -> BrokerStats {
+        self.stats
     }
 
     /// Clone the internal event sender so spawned tasks can report results back.
@@ -243,6 +265,7 @@ impl ConnectionBroker {
         match start_phase {
             AttemptPhase::HolePunch => {
                 if let Some(ext_addr) = our_external_addr {
+                    self.stats.punch_attempts = self.stats.punch_attempts.saturating_add(1);
                     let _ = self.event_tx.send(BrokerEvent::StartPunch {
                         attempt_key,
                         source_ip,
@@ -254,6 +277,7 @@ impl ConnectionBroker {
             }
             AttemptPhase::FindRelay => {
                 let relay_addr = self.pick_relay_candidate();
+                self.stats.relay_attempts = self.stats.relay_attempts.saturating_add(1);
                 let _ = self.event_tx.send(BrokerEvent::StartRelay {
                     attempt_key,
                     source_ip,
@@ -273,10 +297,12 @@ impl ConnectionBroker {
         let relay_addr = self.pick_relay_candidate();
         if let Some(attempt) = self.attempts.get_mut(attempt_key) {
             info!("Broker: punch failed for {attempt_key}: {reason}");
+            self.stats.punch_failures = self.stats.punch_failures.saturating_add(1);
             attempt.phase = AttemptPhase::FindRelay;
             attempt.phase_started = Instant::now();
             attempt.relay_candidate = relay_addr;
 
+            self.stats.relay_attempts = self.stats.relay_attempts.saturating_add(1);
             let _ = self.event_tx.send(BrokerEvent::StartRelay {
                 attempt_key: attempt_key.to_string(),
                 source_ip: attempt.source_ip,
@@ -291,6 +317,7 @@ impl ConnectionBroker {
     pub async fn relay_failed(&mut self, attempt_key: &str, reason: &str) {
         if let Some(attempt) = self.attempts.remove(attempt_key) {
             warn!("Broker: relay failed for {attempt_key}: {reason}");
+            self.stats.relay_failures = self.stats.relay_failures.saturating_add(1);
             let _ = self.event_tx.send(BrokerEvent::ConnectionFailed {
                 transfer_id: attempt.transfer_id,
                 source_ip: attempt.source_ip,
@@ -301,8 +328,20 @@ impl ConnectionBroker {
     }
 
     /// Called when either punch or relay succeeds.
-    pub fn mark_succeeded(&mut self, attempt_key: &str) {
+    ///
+    /// `method` lets us distinguish punch successes from relay successes
+    /// (peer or server) so the diagnostics counters reflect what actually
+    /// carried the connection.
+    pub fn mark_succeeded(&mut self, attempt_key: &str, method: ConnectionMethod) {
         self.attempts.remove(attempt_key);
+        match method {
+            ConnectionMethod::HolePunch => {
+                self.stats.punch_successes = self.stats.punch_successes.saturating_add(1);
+            }
+            ConnectionMethod::PeerRelay | ConnectionMethod::ServerRelay => {
+                self.stats.relay_successes = self.stats.relay_successes.saturating_add(1);
+            }
+        }
     }
 
     /// Add a relay-capable peer discovered via EPX.

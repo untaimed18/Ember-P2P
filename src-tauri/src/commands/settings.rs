@@ -1,6 +1,5 @@
 use tracing::info;
 
-use tauri::Manager;
 
 use crate::app_state::AppState;
 use crate::network::kad::bootstrap;
@@ -266,8 +265,7 @@ pub async fn download_nodes_dat(
         body
     };
 
-    let data_dir = app.path().app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {e}"))?;
+    let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
     tokio::fs::create_dir_all(&data_dir)
         .await
         .map_err(|e| format!("Failed to create data dir: {e}"))?;
@@ -362,8 +360,7 @@ pub async fn download_ipfilter(
         body
     };
 
-    let data_dir = app.path().app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {e}"))?;
+    let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
     tokio::fs::create_dir_all(&data_dir)
         .await
         .map_err(|e| format!("Failed to create data dir: {e}"))?;

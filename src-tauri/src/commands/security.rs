@@ -1,7 +1,6 @@
 use std::net::Ipv4Addr;
 use std::io::{Cursor, Read};
 
-use tauri::Manager;
 use tokio::sync::oneshot;
 use tracing::info;
 use zip::ZipArchive;
@@ -223,10 +222,7 @@ pub async fn download_and_load_ipfilter(
         .await
         .map_err(|e| format!("Extraction task failed: {e}"))??;
 
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {e}"))?;
+    let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
     tokio::fs::create_dir_all(&data_dir)
         .await
         .map_err(|e| format!("Failed to create data dir: {e}"))?;
@@ -345,10 +341,7 @@ pub async fn update_ipfilter_from_url(
         bytes
     };
 
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to get app data dir: {e}"))?;
+    let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
     tokio::fs::create_dir_all(&data_dir)
         .await
         .map_err(|e| format!("Failed to create data dir: {e}"))?;
@@ -446,9 +439,7 @@ pub async fn import_ipfilter_file(
         .unwrap_or_default();
 
     let load_path = if ext == "gz" || ext == "zip" {
-        let data_dir = app.path()
-            .app_data_dir()
-            .map_err(|e| format!("Failed to get app data dir: {e}"))?;
+        let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
         tokio::fs::create_dir_all(&data_dir).await
             .map_err(|e| format!("Failed to create data dir: {e}"))?;
         let dest = data_dir.join("ipfilter.dat");

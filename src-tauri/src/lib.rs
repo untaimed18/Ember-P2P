@@ -48,9 +48,7 @@ pub fn run() {
     // initializer). We don't care about that case, hence `let _ =`.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let log_dir = directories::ProjectDirs::from("com", "ember", "p2p")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let log_dir = storage::paths::resolve_data_dir();
     let _ = std::fs::create_dir_all(&log_dir);
     security::cleanup_old_logs(&log_dir, 7);
     let file_appender = tracing_appender::rolling::daily(&log_dir, "ember.log");
@@ -67,12 +65,31 @@ pub fn run() {
     // Keep the guard alive for the entire app lifetime
     let _log_guard = _guard;
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+    // Multi-instance harness path: when `EMBER_DATA_DIR` is set, every
+    // launched process is meant to be an *isolated* node (own config,
+    // identity, database, downloads). The `tauri-plugin-single-instance`
+    // plugin enforces uniqueness at the OS level via the Tauri identifier,
+    // so without this guard a second harness node would silently focus
+    // the first instead of starting up. Production launches (no env var)
+    // keep the original "click again to focus the existing window"
+    // behavior intact.
+    let mut builder = tauri::Builder::default();
+    if std::env::var(storage::paths::EMBER_DATA_DIR_ENV)
+        .map(|v| v.trim().is_empty())
+        .unwrap_or(true)
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_focus();
             }
-        }))
+        }));
+    } else {
+        info!(
+            "Skipping single-instance plugin: {} is set for harness mode",
+            storage::paths::EMBER_DATA_DIR_ENV
+        );
+    }
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
@@ -101,10 +118,7 @@ pub fn run() {
             })?;
             let settings = config.settings.clone();
 
-            let spam_data_dir = app_handle
-                .path()
-                .app_data_dir()
-                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let spam_data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
             let spam_filter = Arc::new(RwLock::new(
                 search::spam::SpamFilter::load(&spam_data_dir),
             ));
@@ -178,9 +192,7 @@ pub fn run() {
             // via `AppState::known_files`, so we materialise it here rather
             // than leaking `Option<...>` all over the struct.
             let known_files = {
-                let data_dir = directories::ProjectDirs::from("com", "ember", "p2p")
-                    .map(|d| d.data_dir().to_path_buf())
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
                 Arc::new(RwLock::new(storage::known_files::KnownFileList::load(
                     &data_dir.join("known.met"),
                 )))
@@ -256,9 +268,7 @@ pub fn run() {
                 }
 
                 let known_list = {
-                    let data_dir = directories::ProjectDirs::from("com", "ember", "p2p")
-                        .map(|d| d.data_dir().to_path_buf())
-                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    let data_dir = storage::paths::resolve_data_dir_with_app(&startup_app);
                     storage::known_files::KnownFileList::load(&data_dir.join("known.met"))
                 };
 
@@ -565,6 +575,7 @@ pub fn run() {
             commands::peers::kad_cancel_search,
             commands::peers::get_peer_reputation,
             commands::peers::get_reputation_stats,
+            commands::peers::get_ember_diagnostics,
             commands::settings::get_settings,
             commands::settings::update_settings,
             commands::settings::download_nodes_dat,

@@ -300,30 +300,32 @@ pub struct NetworkStats {
     /// Ember Peer Exchange: total sources received via EPX this session
     #[serde(default)]
     pub epx_sources_received: u32,
-    /// Ember Peer Exchange: source events received from download/upload peers
-    #[serde(default)]
-    pub epx_events_received: u32,
-    /// LowID broker: QUIC hole-punch attempts scheduled this session
-    #[serde(default)]
-    pub broker_punch_attempts: u32,
-    /// LowID broker: QUIC hole-punch connections that reached the transfer path
-    #[serde(default)]
-    pub broker_punch_successes: u32,
-    /// LowID broker: QUIC hole-punch failures reported before relay fallback
-    #[serde(default)]
-    pub broker_punch_failures: u32,
-    /// LowID broker: peer/server relay attempts scheduled this session
-    #[serde(default)]
-    pub broker_relay_attempts: u32,
-    /// LowID broker: peer/server relay connections that reached the transfer path
-    #[serde(default)]
-    pub broker_relay_successes: u32,
-    /// LowID broker: peer/server relay failures reported this session
-    #[serde(default)]
-    pub broker_relay_failures: u32,
     /// Current eD2K server connection status: "connected", "connecting", or "disconnected"
     #[serde(default)]
     pub server_status: String,
+}
+
+/// Diagnostic counters for the Ember mesh (EPX, LowID broker). Surfaced
+/// via `get_ember_diagnostics` only — kept off `NetworkStats` so the
+/// hot status-bar IPC payload stays focused on user-visible state.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct EmberDiagnostics {
+    /// Source-exchange events accepted from a connected Ember peer this session.
+    pub epx_events_received: u32,
+    /// Total unique Ember peers tracked in the mesh discovery cache.
+    pub ember_peers_known: u32,
+    /// LowID broker: QUIC hole-punch attempts scheduled this session.
+    pub broker_punch_attempts: u32,
+    /// LowID broker: hole-punch connections that reached the transfer path.
+    pub broker_punch_successes: u32,
+    /// LowID broker: hole-punch failures reported before relay fallback.
+    pub broker_punch_failures: u32,
+    /// LowID broker: peer/server relay attempts scheduled this session.
+    pub broker_relay_attempts: u32,
+    /// LowID broker: relay connections that reached the transfer path.
+    pub broker_relay_successes: u32,
+    /// LowID broker: relay failures reported this session.
+    pub broker_relay_failures: u32,
 }
 
 /// Serializable KAD contact info for the frontend (mirrors eMule KadContactListCtrl columns)
@@ -378,13 +380,6 @@ impl Default for NetworkStats {
             udp_status: String::from("Unknown"),
             ember_peers: 0,
             epx_sources_received: 0,
-            epx_events_received: 0,
-            broker_punch_attempts: 0,
-            broker_punch_successes: 0,
-            broker_punch_failures: 0,
-            broker_relay_attempts: 0,
-            broker_relay_successes: 0,
-            broker_relay_failures: 0,
             server_status: String::from("disconnected"),
         }
     }

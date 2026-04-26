@@ -2,6 +2,7 @@ use crate::app_state::AppState;
 use crate::network::{NetworkCommand, PeerReputationInfo, ReputationStatsInfo};
 use crate::storage::identity::NodeIdentity;
 use crate::types::*;
+use crate::types::EmberDiagnostics;
 
 /// Maximum stored friend nickname size. Same cap is enforced in
 /// `update_friend_nickname`; centralizing it here keeps the two
@@ -58,9 +59,7 @@ pub async fn add_friend(
     }
 
     let our_ember_hash = {
-        let data_dir = directories::ProjectDirs::from("com", "ember", "p2p")
-            .map(|d| d.data_dir().to_path_buf())
-            .ok_or_else(|| "Failed to determine data directory".to_string())?;
+        let data_dir = crate::storage::paths::resolve_data_dir();
         let id = tokio::task::spawn_blocking(move || NodeIdentity::load_or_create(&data_dir))
             .await.map_err(|e| format!("Task error: {e}"))?.map_err(|e| format!("{e}"))?;
         hex::encode(id.ember_hash)
@@ -184,9 +183,7 @@ pub async fn get_friends(
 
 #[tauri::command]
 pub async fn get_my_ember_hash(_app: tauri::AppHandle) -> Result<String, String> {
-    let data_dir = directories::ProjectDirs::from("com", "ember", "p2p")
-        .map(|d| d.data_dir().to_path_buf())
-        .ok_or_else(|| "Failed to determine data directory".to_string())?;
+    let data_dir = crate::storage::paths::resolve_data_dir();
     let identity = tokio::task::spawn_blocking(move || NodeIdentity::load_or_create(&data_dir))
         .await
         .map_err(|e| format!("Task error: {e}"))?
@@ -296,9 +293,7 @@ pub async fn accept_friend_request(
     let hash = parse_user_hash(&canonical)?;
 
     let our_ember_hash = {
-        let data_dir = directories::ProjectDirs::from("com", "ember", "p2p")
-            .map(|d| d.data_dir().to_path_buf())
-            .ok_or_else(|| "Failed to determine data directory".to_string())?;
+        let data_dir = crate::storage::paths::resolve_data_dir();
         let id = tokio::task::spawn_blocking(move || NodeIdentity::load_or_create(&data_dir))
             .await.map_err(|e| format!("Task error: {e}"))?.map_err(|e| format!("{e}"))?;
         hex::encode(id.ember_hash)
@@ -683,6 +678,20 @@ pub async fn get_reputation_stats(
 ) -> Result<ReputationStatsInfo, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state.network_tx.try_send(NetworkCommand::GetReputationStats { tx })
+        .map_err(|e| format!("Network busy: {e}"))?;
+    rx.await.map_err(|_| "No response".to_string())
+}
+
+/// Developer / harness-facing diagnostic counters for the Ember mesh:
+/// EPX event counts, broker punch / relay outcomes, and the size of
+/// the mesh peer cache. Distinct from `get_network_stats` so the
+/// hot status-bar IPC payload stays small and user-focused.
+#[tauri::command]
+pub async fn get_ember_diagnostics(
+    state: tauri::State<'_, AppState>,
+) -> Result<EmberDiagnostics, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.network_tx.try_send(NetworkCommand::GetEmberDiagnostics { tx })
         .map_err(|e| format!("Network busy: {e}"))?;
     rx.await.map_err(|_| "No response".to_string())
 }

@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use tauri::Manager;
 use tracing::info;
 
+use crate::storage::paths;
 use crate::types::AppSettings;
 
 pub struct AppConfig {
@@ -12,12 +12,9 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn load(app_handle: &tauri::AppHandle) -> anyhow::Result<Self> {
-        let app_dir = app_handle
-            .path()
-            .app_data_dir()
-            .map_err(|e| anyhow::anyhow!("Failed to get app data dir: {e}"))?;
+        let app_dir = paths::ensure_data_dir_with_app(app_handle)
+            .map_err(|e| anyhow::anyhow!("Failed to prepare data dir: {e}"))?;
 
-        std::fs::create_dir_all(&app_dir)?;
         let config_path = app_dir.join("config.json");
 
         let config_existed = config_path.exists();
