@@ -20,6 +20,11 @@ const NOISE_PATTERN_XX: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 /// Overhead per packet: 2 (magic) + 1 (type) = 3 bytes header
 const HEADER_LEN: usize = 3;
 
+/// Version byte for small Ember-native control payloads carried inside Noise.
+const CONTROL_VERSION: u8 = 1;
+const CONTROL_KIND_PING: u8 = 1;
+const CONTROL_KIND_PONG: u8 = 2;
+
 /// Sessions idle longer than this are evicted.
 const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -92,6 +97,44 @@ pub enum OutgoingResult {
     Queued,
     /// Error during encryption or handshake creation.
     Error(String),
+}
+
+/// Minimal Ember-native control payload used to prove the Noise transport
+/// before routing DHT or file-transfer messages through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmberControlMessage {
+    Ping { nonce: u64 },
+    Pong { nonce: u64 },
+}
+
+impl EmberControlMessage {
+    pub fn encode(self) -> [u8; 10] {
+        let (kind, nonce) = match self {
+            EmberControlMessage::Ping { nonce } => (CONTROL_KIND_PING, nonce),
+            EmberControlMessage::Pong { nonce } => (CONTROL_KIND_PONG, nonce),
+        };
+        let mut out = [0u8; 10];
+        out[0] = CONTROL_VERSION;
+        out[1] = kind;
+        out[2..].copy_from_slice(&nonce.to_le_bytes());
+        out
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        if data.len() != 10 || data[0] != CONTROL_VERSION {
+            return None;
+        }
+
+        let mut nonce = [0u8; 8];
+        nonce.copy_from_slice(&data[2..]);
+        let nonce = u64::from_le_bytes(nonce);
+
+        match data[1] {
+            CONTROL_KIND_PING => Some(EmberControlMessage::Ping { nonce }),
+            CONTROL_KIND_PONG => Some(EmberControlMessage::Pong { nonce }),
+            _ => None,
+        }
+    }
 }
 
 pub struct EmberTransport {
@@ -887,6 +930,61 @@ mod tests {
 
         assert!(alice.has_session(&bob_addr));
         assert!(bob.has_session(&alice_addr));
+    }
+
+    #[test]
+    fn control_message_crosses_established_noise_session() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let bootstrap = EmberControlMessage::Ping { nonce: 1 }.encode();
+        let init_packet = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), &bootstrap) {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got: {}", variant_name(&other)),
+        };
+
+        let resp_packets = match bob.process_incoming(&init_packet, alice_addr) {
+            IncomingResult::HandshakeComplete {
+                packets_to_send,
+                decrypted_payload,
+                ..
+            } => {
+                assert_eq!(
+                    decrypted_payload.as_deref().and_then(EmberControlMessage::decode),
+                    Some(EmberControlMessage::Ping { nonce: 1 }),
+                );
+                packets_to_send
+            }
+            _ => panic!("expected HandshakeComplete"),
+        };
+        assert_eq!(resp_packets.len(), 1);
+
+        match alice.process_incoming(&resp_packets[0], bob_addr) {
+            IncomingResult::HandshakeComplete { .. } => {}
+            _ => panic!("expected HandshakeComplete"),
+        }
+
+        let pong = EmberControlMessage::Pong { nonce: 1 }.encode();
+        let packet = match bob.prepare_outgoing(alice_addr, Some(&alice_pub), &pong) {
+            OutgoingResult::Ready { packet } => packet,
+            other => panic!("expected Ready, got: {}", variant_name(&other)),
+        };
+
+        match alice.process_incoming(&packet, bob_addr) {
+            IncomingResult::Message { payload, .. } => {
+                assert_eq!(
+                    EmberControlMessage::decode(&payload),
+                    Some(EmberControlMessage::Pong { nonce: 1 }),
+                );
+            }
+            _ => panic!("expected Message"),
+        }
     }
 
     #[test]

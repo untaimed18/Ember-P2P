@@ -300,6 +300,27 @@ pub struct NetworkStats {
     /// Ember Peer Exchange: total sources received via EPX this session
     #[serde(default)]
     pub epx_sources_received: u32,
+    /// Ember Peer Exchange: source events received from download/upload peers
+    #[serde(default)]
+    pub epx_events_received: u32,
+    /// LowID broker: QUIC hole-punch attempts scheduled this session
+    #[serde(default)]
+    pub broker_punch_attempts: u32,
+    /// LowID broker: QUIC hole-punch connections that reached the transfer path
+    #[serde(default)]
+    pub broker_punch_successes: u32,
+    /// LowID broker: QUIC hole-punch failures reported before relay fallback
+    #[serde(default)]
+    pub broker_punch_failures: u32,
+    /// LowID broker: peer/server relay attempts scheduled this session
+    #[serde(default)]
+    pub broker_relay_attempts: u32,
+    /// LowID broker: peer/server relay connections that reached the transfer path
+    #[serde(default)]
+    pub broker_relay_successes: u32,
+    /// LowID broker: peer/server relay failures reported this session
+    #[serde(default)]
+    pub broker_relay_failures: u32,
     /// Current eD2K server connection status: "connected", "connecting", or "disconnected"
     #[serde(default)]
     pub server_status: String,
@@ -357,6 +378,13 @@ impl Default for NetworkStats {
             udp_status: String::from("Unknown"),
             ember_peers: 0,
             epx_sources_received: 0,
+            epx_events_received: 0,
+            broker_punch_attempts: 0,
+            broker_punch_successes: 0,
+            broker_punch_failures: 0,
+            broker_relay_attempts: 0,
+            broker_relay_successes: 0,
+            broker_relay_failures: 0,
             server_status: String::from("disconnected"),
         }
     }

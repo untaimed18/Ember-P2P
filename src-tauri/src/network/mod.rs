@@ -197,6 +197,8 @@ async fn handle_epx_sources(
     ember_peers: &[(Ipv4Addr, u16)],
     label: &str,
 ) -> usize {
+    state.stats.epx_events_received = state.stats.epx_events_received.saturating_add(1);
+
     let mut total_injected = 0usize;
     let mut total_sources_this_event = 0usize;
     let mut per_hash_persisted: HashMap<String, u32> = HashMap::new();
@@ -8115,6 +8117,7 @@ pub async fn start_network(
                     while let Ok(event) = rx.try_recv() {
                         match event {
                             ember::broker::BrokerEvent::StartPunch { ref attempt_key, source_ip, source_port, our_external_addr, our_nat_type, .. } => {
+                                state.stats.broker_punch_attempts = state.stats.broker_punch_attempts.saturating_add(1);
                                 tracing::info!("Broker: initiating hole-punch for {} -> {}:{} (ext={})", attempt_key, source_ip, source_port, our_external_addr);
                                 let rv_url = settings.rendezvous_url.clone();
                                 // Both `from_id` and `target_id` MUST be 64 chars or
@@ -8218,6 +8221,7 @@ pub async fn start_network(
                                 });
                             }
                             ember::broker::BrokerEvent::StartRelay { ref attempt_key, source_ip, source_port, file_hash, relay_addr, .. } => {
+                                state.stats.broker_relay_attempts = state.stats.broker_relay_attempts.saturating_add(1);
                                 tracing::info!("Broker: initiating relay for {} -> {}:{} (relay={:?})", attempt_key, source_ip, source_port, relay_addr);
 
                                 let attempt_key_owned = attempt_key.clone();
@@ -8394,6 +8398,14 @@ pub async fn start_network(
                                 }
                             }
                             ember::broker::BrokerEvent::ConnectionReady(conn) => {
+                                match conn.method {
+                                    ember::broker::ConnectionMethod::HolePunch => {
+                                        state.stats.broker_punch_successes = state.stats.broker_punch_successes.saturating_add(1);
+                                    }
+                                    ember::broker::ConnectionMethod::PeerRelay | ember::broker::ConnectionMethod::ServerRelay => {
+                                        state.stats.broker_relay_successes = state.stats.broker_relay_successes.saturating_add(1);
+                                    }
+                                }
                                 tracing::info!("Broker: connection ready for transfer {} from {}:{} via {:?}", conn.transfer_id, conn.source_ip, conn.source_port, conn.method);
                                 let parts = upload_server::KadCallbackParts {
                                     peer_ip: conn.source_ip,
@@ -8422,11 +8434,13 @@ pub async fn start_network(
                                 }
                             }
                             ember::broker::BrokerEvent::PunchFailed { ref attempt_key, ref reason } => {
+                                state.stats.broker_punch_failures = state.stats.broker_punch_failures.saturating_add(1);
                                 if let Some(ref mut broker) = state.connection_broker {
                                     broker.punch_failed(attempt_key, reason).await;
                                 }
                             }
                             ember::broker::BrokerEvent::RelayFailed { ref attempt_key, ref reason } => {
+                                state.stats.broker_relay_failures = state.stats.broker_relay_failures.saturating_add(1);
                                 if let Some(ref mut broker) = state.connection_broker {
                                     broker.relay_failed(attempt_key, reason).await;
                                 }

@@ -171,6 +171,13 @@ export interface NetworkStats {
   udp_status?: string;
   ember_peers: number;
   epx_sources_received: number;
+  epx_events_received: number;
+  broker_punch_attempts: number;
+  broker_punch_successes: number;
+  broker_punch_failures: number;
+  broker_relay_attempts: number;
+  broker_relay_successes: number;
+  broker_relay_failures: number;
   server_status?: string;
   stale?: boolean;
   degraded?: boolean;

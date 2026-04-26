@@ -4,7 +4,8 @@ pub mod quic;
 pub mod broker;
 pub mod relay;
 
-// Scaffolded modules — designed but not yet wired into the network loop.
+// Ember-native modules below are still dormant. `reputation` is the exception:
+// it is persisted and consulted by the live eD2K/EPX paths in network/mod.rs.
 #[allow(dead_code)]
 pub mod dht;
 #[allow(dead_code)]
@@ -421,6 +422,51 @@ mod tests {
     fn accepts_current_version() {
         let payload = build_exchange_payload(&[], &[]);
         assert!(parse_exchange_payload(&payload).is_ok());
+    }
+
+    #[test]
+    fn rejects_payload_larger_than_limit() {
+        let payload = vec![0u8; MAX_EPX_PAYLOAD + 1];
+        let err = parse_exchange_payload(&payload).unwrap_err().to_string();
+        assert!(err.contains("too large"));
+    }
+
+    #[test]
+    fn rejects_declared_file_count_over_limit() {
+        let mut payload = Vec::new();
+        payload.write_u8(EPX_VERSION).unwrap();
+        payload.write_u16::<LittleEndian>((MAX_EPX_FILES + 1) as u16).unwrap();
+
+        let err = parse_exchange_payload(&payload).unwrap_err().to_string();
+        assert!(err.contains("file_count"));
+    }
+
+    #[test]
+    fn rejects_declared_source_count_over_limit() {
+        let mut payload = Vec::new();
+        payload.write_u8(EPX_VERSION).unwrap();
+        payload.write_u16::<LittleEndian>(1).unwrap();
+        payload.write_all(&[7u8; 16]).unwrap();
+        payload.write_u64::<LittleEndian>(123).unwrap();
+        payload.write_u8(0).unwrap();
+        payload.write_u16::<LittleEndian>((MAX_EPX_SOURCES_PER_FILE + 1) as u16).unwrap();
+
+        let err = parse_exchange_payload(&payload).unwrap_err().to_string();
+        assert!(err.contains("source_count"));
+    }
+
+    #[test]
+    fn caps_peer_discovery_section() {
+        let peers: Vec<EmberPeer> = (0..(MAX_EPX_PEERS + 25))
+            .map(|i| EmberPeer {
+                ip: Ipv4Addr::new(44, 55, (i >> 8) as u8, (i & 0xFF) as u8),
+                tcp_port: 4662,
+            })
+            .collect();
+
+        let payload = build_exchange_payload(&[], &peers);
+        let result = parse_exchange_payload(&payload).unwrap();
+        assert_eq!(result.peers.len(), MAX_EPX_PEERS);
     }
 
     #[test]

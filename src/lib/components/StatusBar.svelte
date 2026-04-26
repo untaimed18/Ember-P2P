@@ -11,7 +11,9 @@
     const status = epxStatus(stats);
     if (status === 'inactive') return 'EPX: Network offline';
     if (status === 'idle') return 'EPX: Waiting for Ember peers';
-    return `EPX: ${stats.ember_peers} peer${stats.ember_peers === 1 ? '' : 's'}, ${stats.epx_sources_received} source${stats.epx_sources_received === 1 ? '' : 's'} received`;
+    const punch = `${stats.broker_punch_successes}/${stats.broker_punch_attempts} punch`;
+    const relay = `${stats.broker_relay_successes}/${stats.broker_relay_attempts} relay`;
+    return `EPX: ${stats.ember_peers} peer${stats.ember_peers === 1 ? '' : 's'}, ${stats.epx_sources_received} source${stats.epx_sources_received === 1 ? '' : 's'} received, ${punch}, ${relay}`;
   }
 </script>
 
