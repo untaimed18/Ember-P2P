@@ -99,6 +99,24 @@ pub enum OutgoingResult {
     Error(String),
 }
 
+/// Outcome of [`EmberTransport::dispatch_incoming`]: every side
+/// effect needed to handle one inbound Ember-native UDP packet,
+/// returned as data so the caller decides when to perform IO and so
+/// the dispatch logic can be unit-tested without spinning up a
+/// `NetworkState`.
+#[derive(Debug, Default)]
+pub struct DispatchOutcome {
+    /// Raw packets to send back to the source address. May contain
+    /// handshake responses, an encoded Pong reply, or both.
+    pub responses: Vec<Vec<u8>>,
+    /// Decoded control message embedded in the packet. `None` for
+    /// pure handshake-progress packets and rejected packets.
+    pub control: Option<EmberControlMessage>,
+    /// `true` when the transport rejected the packet (bad magic,
+    /// unknown handshake state). The caller should drop it.
+    pub rejected: bool,
+}
+
 /// Minimal Ember-native control payload used to prove the Noise transport
 /// before routing DHT or file-transfer messages through it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +303,80 @@ impl EmberTransport {
     pub fn cleanup_all(&mut self) {
         self.sessions.clear();
         self.pending.clear();
+    }
+
+    /// Drive the Noise state machine for an inbound UDP packet and
+    /// produce every side effect as data: response packets to send
+    /// back, plus the decoded control message if the packet carried
+    /// a payload.
+    ///
+    /// When the decoded payload is a `Ping`, the matching `Pong` is
+    /// encoded on the same session and appended to `responses`, so
+    /// the caller only has to drain the response list and update its
+    /// counters / pending-ping registry. Pure handshake-progress
+    /// packets (no embedded payload) yield `control: None`. Garbled
+    /// or malformed packets yield `rejected: true` and an empty
+    /// `responses` vector.
+    ///
+    /// Pulled out of the network task's `handle_ember_native_udp` so
+    /// the same code path can be exercised by `cargo test` over real
+    /// loopback UDP without constructing a full `NetworkState`.
+    pub fn dispatch_incoming(
+        &mut self,
+        data: &[u8],
+        from: SocketAddr,
+    ) -> DispatchOutcome {
+        let mut outcome = DispatchOutcome::default();
+        let result = self.process_incoming(data, from);
+
+        let payload = match result {
+            IncomingResult::Message { payload, .. } => Some(payload),
+            IncomingResult::HandshakeResponse { packets, .. } => {
+                outcome.responses = packets;
+                None
+            }
+            IncomingResult::HandshakeComplete {
+                packets_to_send,
+                decrypted_payload,
+                ..
+            } => {
+                outcome.responses = packets_to_send;
+                decrypted_payload
+            }
+            IncomingResult::Rejected => {
+                outcome.rejected = true;
+                return outcome;
+            }
+        };
+
+        let Some(payload) = payload else {
+            return outcome;
+        };
+
+        let Some(message) = EmberControlMessage::decode(&payload) else {
+            // Unknown control payload. We still hand back the
+            // handshake responses (if any) and let the caller log /
+            // ignore the unknown message.
+            return outcome;
+        };
+
+        outcome.control = Some(message);
+
+        if let EmberControlMessage::Ping { nonce } = message {
+            // The session is established by definition (we just
+            // decrypted a payload from it), so `prepare_outgoing`
+            // should hit the fast Ready path. If anything else
+            // happens, surface it via the empty-responses + Some(Ping)
+            // shape and let the caller log the diagnostic miss.
+            let pong = EmberControlMessage::Pong { nonce }.encode();
+            if let OutgoingResult::Ready { packet } =
+                self.prepare_outgoing(from, None, &pong)
+            {
+                outcome.responses.push(packet);
+            }
+        }
+
+        outcome
     }
 
     // ── Noise_IK handshake (1-RTT, we know the peer's static key) ──
@@ -1043,6 +1135,107 @@ mod tests {
         assert_eq!(bob.session_count(), 0);
         assert!(!alice.has_session(&bob_addr));
         assert!(!bob.has_session(&alice_addr));
+    }
+
+    /// End-to-end integration test that drives the same code path
+    /// `handle_ember_native_udp` uses, but over **real loopback UDP
+    /// sockets**: two `EmberTransport`s, two `tokio::net::UdpSocket`s
+    /// on `127.0.0.1`, and `dispatch_incoming` on each side.
+    ///
+    /// This is the verification that used to require the GUI harness
+    /// (build a release `ember.exe`, launch two windows, copy pubkeys,
+    /// invoke `ember_ping_peer` from devtools). It now runs in
+    /// `cargo test` in well under a second and asserts:
+    ///
+    /// 1. The Noise IK handshake succeeds with the Ping payload
+    ///    embedded in message 1.
+    /// 2. The responder's `dispatch_incoming` extracts the Ping AND
+    ///    encodes the matching Pong on the freshly-established
+    ///    session.
+    /// 3. The initiator's `dispatch_incoming` decodes the Pong on
+    ///    arrival, with no further responses to send.
+    ///
+    /// Together those steps cover what `handle_ember_native_udp`
+    /// would observe in production, minus the IO and the diagnostics
+    /// counters (which are owned by `NetworkState`).
+    #[tokio::test]
+    async fn ember_native_round_trip_over_real_loopback_udp() {
+        use tokio::net::UdpSocket;
+
+        let (a_priv, a_pub) = make_keypair();
+        let (b_priv, b_pub) = make_keypair();
+
+        let mut transport_a = EmberTransport::new(a_priv, a_pub);
+        let mut transport_b = EmberTransport::new(b_priv, b_pub);
+
+        let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+
+        // ── Step 1: A initiates Ping → B over Noise IK ──
+        let nonce: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        let ping = EmberControlMessage::Ping { nonce }.encode();
+
+        let init_packet = match transport_a.prepare_outgoing(addr_b, Some(&b_pub), &ping) {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        sock_a.send_to(&init_packet, addr_b).await.unwrap();
+
+        // ── Step 2: B receives, dispatch_incoming should yield ──
+        //   - Ping as the decoded control
+        //   - Two responses: Noise IK msg 2 + the encoded Pong reply
+        let mut buf = vec![0u8; 65535];
+        let (len, from) = sock_b.recv_from(&mut buf).await.unwrap();
+        assert_eq!(from, addr_a);
+
+        let outcome_b = transport_b.dispatch_incoming(&buf[..len], from);
+        assert!(!outcome_b.rejected, "B rejected the init packet");
+        assert_eq!(
+            outcome_b.control,
+            Some(EmberControlMessage::Ping { nonce }),
+            "B should decode the Ping payload",
+        );
+        assert_eq!(
+            outcome_b.responses.len(),
+            2,
+            "B should send back IK msg 2 + the Pong reply, got {} packet(s)",
+            outcome_b.responses.len()
+        );
+
+        for pkt in &outcome_b.responses {
+            sock_b.send_to(pkt, from).await.unwrap();
+        }
+
+        // ── Step 3: A receives Noise IK msg 2 (handshake completes,
+        //           no payload, no further responses). ──
+        let (len, _) = sock_a.recv_from(&mut buf).await.unwrap();
+        let outcome_a_handshake = transport_a.dispatch_incoming(&buf[..len], addr_b);
+        assert!(!outcome_a_handshake.rejected);
+        assert_eq!(outcome_a_handshake.control, None);
+        assert!(
+            outcome_a_handshake.responses.is_empty(),
+            "A should not send anything in response to msg 2"
+        );
+
+        // ── Step 4: A receives the Pong on the now-established session. ──
+        let (len, _) = sock_a.recv_from(&mut buf).await.unwrap();
+        let outcome_a_pong = transport_a.dispatch_incoming(&buf[..len], addr_b);
+        assert!(!outcome_a_pong.rejected);
+        assert_eq!(
+            outcome_a_pong.control,
+            Some(EmberControlMessage::Pong { nonce }),
+            "A should decode the matching Pong"
+        );
+        assert!(
+            outcome_a_pong.responses.is_empty(),
+            "A should not send anything in response to a Pong"
+        );
+
+        // Both ends should now report exactly one established session.
+        assert_eq!(transport_a.session_count(), 1);
+        assert_eq!(transport_b.session_count(), 1);
     }
 
     #[test]

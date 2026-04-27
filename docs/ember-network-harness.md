@@ -17,7 +17,14 @@ downloads, and logs do not collide.
 
 ## Quick start
 
+Building is a separate step from launching. Windows holds an exclusive
+lock on a running `ember.exe`, so the script refuses to rebuild while
+any node is up.
+
 ```powershell
+# One-time (also rerun after Rust or frontend changes):
+.\scripts\harness.ps1 build
+
 # Terminal 1 — local rendezvous server (port 8080 by default).
 .\scripts\harness.ps1 rendezvous
 
