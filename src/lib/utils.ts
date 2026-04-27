@@ -78,6 +78,46 @@ export function formatDateWithYear(ts: number): string {
 }
 
 /**
+ * Format a unix timestamp as a short relative duration vs `now`
+ * ("just now", "5m ago", "3h ago", "2d ago", "4w ago", "1y ago").
+ *
+ * Intended for ledger views where what matters is "how stale is this
+ * row" rather than the exact wall-clock date. Pair with a tooltip
+ * showing the absolute date for users who need precision. Returns
+ * the em-dash sentinel for missing or future timestamps so callers
+ * can treat it as a drop-in replacement for `formatDate*`.
+ */
+export function formatRelativeTime(ts: number, nowSecs: number = Math.floor(Date.now() / 1000)): string {
+  if (!ts || ts <= 0) return '\u2014';
+  const diff = nowSecs - ts;
+  if (!Number.isFinite(diff)) return '\u2014';
+  if (diff < 0) return 'just now';
+  if (diff < 45) return 'just now';
+  if (diff < 3600) {
+    const m = Math.round(diff / 60);
+    return `${m}m ago`;
+  }
+  if (diff < 86400) {
+    const h = Math.round(diff / 3600);
+    return `${h}h ago`;
+  }
+  if (diff < 7 * 86400) {
+    const d = Math.round(diff / 86400);
+    return `${d}d ago`;
+  }
+  if (diff < 30 * 86400) {
+    const w = Math.round(diff / (7 * 86400));
+    return `${w}w ago`;
+  }
+  if (diff < 365 * 86400) {
+    const mo = Math.round(diff / (30 * 86400));
+    return `${mo}mo ago`;
+  }
+  const y = Math.round(diff / (365 * 86400));
+  return `${y}y ago`;
+}
+
+/**
  * Format milliseconds as HH:MM (eMule CastSecondsToHM style).
  * Returns "\u2014" for zero or invalid values.
  *

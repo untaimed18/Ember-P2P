@@ -12,10 +12,13 @@
   } from '$lib/api/transfers';
   import { findSources, parseEd2kLink, formatEd2kLink } from '$lib/api/search';
   import { previewFile } from '$lib/api/preview';
-  import { addFriend } from '$lib/api/friends';
+  import { addFriend, getFriends } from '$lib/api/friends';
   import { banPeer } from '$lib/api/kad';
   import { getPeerReputation, labelForReputation, type PeerReputationInfo } from '$lib/api/reputation';
-  import { formatSize, formatSpeed, formatDate, formatDateWithYear, formatDuration, formatRemaining } from '$lib/utils';
+  import {
+    formatSize, formatSpeed, formatDate, formatDateWithYear, formatDuration,
+    formatRemaining, formatRelativeTime, copyToClipboard,
+  } from '$lib/utils';
   import { onMount, onDestroy } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import type { UnlistenFn } from '@tauri-apps/api/event';
@@ -305,7 +308,18 @@
     searchUnlisten = () => { for (const u of searchUnsubs) u(); searchUnsubs.length = 0; };
   });
 
-  onDestroy(() => { mounted = false; sourceUnlisten?.(); searchUnlisten?.(); infoTimers.forEach(clearTimeout); columnDragCleanup?.(); speedHistory.clear(); });
+  onDestroy(() => {
+    mounted = false;
+    sourceUnlisten?.();
+    searchUnlisten?.();
+    infoTimers.forEach(clearTimeout);
+    columnDragCleanup?.();
+    speedHistory.clear();
+    if (knownCopyTimer !== undefined) {
+      clearTimeout(knownCopyTimer);
+      knownCopyTimer = undefined;
+    }
+  });
 
   let searchStatus: Map<string, string> = $state(new Map());
   let transferError: string | null = $state(null);
@@ -594,7 +608,10 @@
       // Kick off reputation refresh for the just-loaded roster. Runs
       // off-cycle because `get_peer_reputation` may return `null` for
       // peers the tracker hasn't seen yet, which is common for known
-      // clients that only exist as SecIdent credit records.
+      // clients that only exist as SecIdent credit records. Null
+      // entries are now eligible for re-fetch on subsequent polls
+      // (see `refreshReputations`) so a peer the tracker only later
+      // observes will eventually pick up a real badge.
       void refreshReputations(knownClients.map((k) => k.user_hash));
     } catch (e) {
       console.warn('Failed to refresh known clients:', e);
@@ -604,7 +621,11 @@
   /** Per-hash reputation cache. Populated lazily when the Known
    *  Clients tab refreshes. Missing entries render as the "unknown"
    *  badge until the fetch resolves; null entries mean the backend
-   *  tracker has no record (distinct from "not yet fetched").
+   *  tracker had no record at the time of the fetch — we still allow
+   *  null entries to be re-fetched on subsequent polls so a peer that
+   *  the tracker only later observes can graduate to a real
+   *  reputation badge without the user having to leave and revisit
+   *  the tab.
    *
    *  Using a plain object because Svelte 5 `$state` needs reference
    *  churn for reactivity on nested mutations; `= { ...map, key: v }`
@@ -614,11 +635,11 @@
   let reputationInFlight = new Set<string>();
 
   async function refreshReputations(hashes: string[]) {
-    // Only fetch hashes we haven't already resolved or requested, to
-    // avoid spamming the backend when the user switches tabs or the
-    // 8-second known-clients poll fires.
+    // Skip hashes already resolved to a non-null record or currently
+    // in flight. `null` entries are eligible for re-fetch — the
+    // tracker may only have started recording them between polls.
     const targets = hashes.filter(
-      (h) => !(h in reputationMap) && !reputationInFlight.has(h),
+      (h) => reputationMap[h] == null && !reputationInFlight.has(h),
     );
     if (targets.length === 0) return;
     for (const h of targets) reputationInFlight.add(h);
@@ -638,6 +659,88 @@
     }
     reputationMap = next;
   }
+
+  // --- Known Clients sub-toolbar state ---
+  // Filter string applied case-insensitively across user_hash, last_known_ip,
+  // country_code, and (when the peer is a friend) the friend nickname so a
+  // user can find a peer they know about by any cue available to them.
+  let knownFilter = $state('');
+  // Set of friend user-hashes (lowercased hex). Refreshed when the Known
+  // Clients tab is opened — friend status doesn't churn at sub-second
+  // granularity so we don't need a separate poll.
+  let friendHashSet = $state<Set<string>>(new Set());
+  let friendNickById = $state<Record<string, string>>({});
+  // Click-to-copy feedback. Cleared after a short delay so the badge
+  // doesn't linger after the user moves on.
+  let knownCopiedHash = $state<string | null>(null);
+  let knownCopyTimer: ReturnType<typeof setTimeout> | undefined;
+  async function copyKnownHash(hash: string) {
+    if (await copyToClipboard(hash)) {
+      knownCopiedHash = hash;
+      if (knownCopyTimer !== undefined) clearTimeout(knownCopyTimer);
+      knownCopyTimer = setTimeout(() => {
+        knownCopiedHash = null;
+        knownCopyTimer = undefined;
+      }, 1400);
+    }
+  }
+
+  async function refreshFriendHashes() {
+    try {
+      const list = await getFriends();
+      const hashes = new Set<string>();
+      const nicks: Record<string, string> = {};
+      for (const f of list) {
+        const lower = f.user_hash.toLowerCase();
+        hashes.add(lower);
+        if (f.nickname) nicks[lower] = f.nickname;
+      }
+      friendHashSet = hashes;
+      friendNickById = nicks;
+    } catch (e) {
+      // Non-fatal: an unavailable friends list just means we won't
+      // mark friend rows. The rest of the table still renders.
+      console.warn('Failed to load friend hashes for Known Clients:', e);
+    }
+  }
+
+  // Filtered + sorted view that the table actually iterates over. Search
+  // matches any of: user_hash (full or truncated form the user might have
+  // copied), last IP, country code, or — when the row is a friend — the
+  // friend nickname. Empty filter passes through everything.
+  let filteredKnownClients = $derived.by(() => {
+    const q = knownFilter.trim().toLowerCase();
+    if (!q) return sortedKnownClients;
+    return sortedKnownClients.filter((kc) => {
+      const hash = kc.user_hash.toLowerCase();
+      if (hash.includes(q)) return true;
+      if (kc.last_known_ip && kc.last_known_ip.toLowerCase().includes(q)) return true;
+      if (kc.country_code && kc.country_code.toLowerCase().includes(q)) return true;
+      const nick = friendNickById[hash];
+      if (nick && nick.toLowerCase().includes(q)) return true;
+      return false;
+    });
+  });
+
+  // Top-line stats for the Known Clients sub-toolbar. Computed off the
+  // unfiltered list so the totals reflect the full ledger regardless of
+  // the current search.
+  let knownStats = $derived.by(() => {
+    let totalUp = 0;
+    let totalDown = 0;
+    let friendCount = 0;
+    for (const kc of knownClients) {
+      totalUp += kc.uploaded;
+      totalDown += kc.downloaded;
+      if (friendHashSet.has(kc.user_hash.toLowerCase())) friendCount++;
+    }
+    return {
+      total: knownClients.length,
+      friends: friendCount,
+      totalUp,
+      totalDown,
+    };
+  });
 
   $effect(() => {
     // Poll the upload queue only while its tab is visible. Refresh
@@ -662,9 +765,14 @@
 
   $effect(() => {
     // Same pattern as the queue poll; longer interval because credit
-    // records change far less often than queue rank.
+    // records change far less often than queue rank. Friend hashes
+    // are pulled at the same time so the friend marker / nickname
+    // search work without the user having to load the Friends page
+    // first; the friend list rarely changes so we don't poll it on
+    // the same interval.
     if (bottomView === 'known_clients') {
       refreshKnownClients();
+      void refreshFriendHashes();
       if (knownPollHandle === null) {
         knownPollHandle = setInterval(refreshKnownClients, KNOWN_POLL_INTERVAL_MS);
       }
@@ -2811,6 +2919,62 @@
              connected; this is the cumulative view that drives upload
              priority across sessions. Polled at a longer cadence than
              the queue tab because credit records change far less often. -->
+        <!--
+          Sub-toolbar: search box + summary stats. Sits above the
+          table inside the same scroll container so the table content
+          scrolls but the toolbar stays put — feels closer to a
+          purpose-built ledger view than the bare grid we used to
+          dump every row into. Search matches user_hash, last IP,
+          country code, and friend nickname (when applicable);
+          totals reflect the full ledger, not the filtered view.
+        -->
+        <div class="known-toolbar" role="group" aria-label="Known Clients filters">
+          <label class="known-search">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+              <circle cx="7" cy="7" r="4.5"/>
+              <line x1="10.5" y1="10.5" x2="14" y2="14"/>
+            </svg>
+            <input
+              type="text"
+              bind:value={knownFilter}
+              placeholder="Filter by hash, IP, country, or friend nickname"
+              aria-label="Filter known clients"
+            />
+            {#if knownFilter}
+              <button
+                type="button"
+                class="known-search-clear"
+                aria-label="Clear filter"
+                onclick={() => (knownFilter = '')}
+              >&times;</button>
+            {/if}
+          </label>
+          {#if knownClientsLoaded}
+            <div class="known-stats" aria-live="polite">
+              <span class="known-stat">
+                <strong>{knownStats.total}</strong>
+                {knownStats.total === 1 ? 'peer' : 'peers'}
+              </span>
+              {#if knownStats.friends > 0}
+                <span class="known-stat known-stat-friends" title="Peers in this list that you have added as friends">
+                  <strong>{knownStats.friends}</strong>
+                  {knownStats.friends === 1 ? 'friend' : 'friends'}
+                </span>
+              {/if}
+              <span class="known-stat" title="Lifetime bytes uploaded to all known peers (drives our credit on their side)">
+                &uarr; <strong>{formatSize(knownStats.totalUp)}</strong>
+              </span>
+              <span class="known-stat" title="Lifetime bytes downloaded from all known peers">
+                &darr; <strong>{formatSize(knownStats.totalDown)}</strong>
+              </span>
+              {#if knownFilter && filteredKnownClients.length !== knownStats.total}
+                <span class="known-stat known-stat-match" aria-live="polite">
+                  showing <strong>{filteredKnownClients.length}</strong>
+                </span>
+              {/if}
+            </div>
+          {/if}
+        </div>
         <table
           class="transfer-table clients-table"
           bind:this={knownTableEl}
@@ -2859,13 +3023,43 @@
             </tr>
           </thead>
           <tbody>
-            {#each sortedKnownClients as kc (kc.user_hash)}
-              <tr class="client-row">
+            {#each filteredKnownClients as kc (kc.user_hash)}
+              {@const isFriend = friendHashSet.has(kc.user_hash.toLowerCase())}
+              {@const friendNick = isFriend ? friendNickById[kc.user_hash.toLowerCase()] : undefined}
+              <tr class="client-row" class:client-row-friend={isFriend}>
                 {#each visibleKnownColumns as column (column.key)}
                   {#if column.key === 'country'}
                     <td class="flag-cell" title={kc.country_code ?? ''}>{#if countryFlagSrc(kc.country_code ?? undefined)}<img src={countryFlagSrc(kc.country_code ?? undefined)} alt={kc.country_code ?? ''} class="flag-img" />{/if}</td>
                   {:else if column.key === 'user_hash'}
-                    <td class="client-cell mono" title={kc.user_hash}>{kc.user_hash.slice(0, 16) + '\u2026'}</td>
+                    <!-- Click-to-copy: the truncated form is unrecognisable, so a
+                         user wanting to look up the peer or share the hash
+                         needs the full 32-char hex. We show the truncated
+                         form for layout, full hash on hover, and copy the
+                         full hash on click with brief inline feedback. The
+                         friend marker (small filled dot) sits before the
+                         hash so the eye picks out friends without having to
+                         scan the IP / country columns first. -->
+                    <td class="client-cell mono known-hash-cell" title={knownCopiedHash === kc.user_hash ? 'Copied!' : (friendNick ? `${friendNick} — click to copy ${kc.user_hash}` : `Click to copy ${kc.user_hash}`)}>
+                      <button
+                        type="button"
+                        class="known-hash-btn"
+                        class:copied={knownCopiedHash === kc.user_hash}
+                        onclick={() => copyKnownHash(kc.user_hash)}
+                      >
+                        {#if isFriend}
+                          <span class="known-friend-dot" aria-label="Friend" title={friendNick ? `Friend: ${friendNick}` : 'Friend'}></span>
+                        {/if}
+                        {#if friendNick}
+                          <span class="known-hash-nick">{friendNick}</span>
+                          <span class="known-hash-hex">{kc.user_hash.slice(0, 8) + '\u2026'}</span>
+                        {:else}
+                          <span class="known-hash-hex">{kc.user_hash.slice(0, 16) + '\u2026'}</span>
+                        {/if}
+                        {#if knownCopiedHash === kc.user_hash}
+                          <span class="known-hash-copied" aria-live="polite">Copied</span>
+                        {/if}
+                      </button>
+                    </td>
                   {:else if column.key === 'last_known_ip'}
                     <td class="client-cell" title={kc.last_known_ip ?? 'Never identified'}>{kc.last_known_ip ?? '\u2014'}</td>
                   {:else if column.key === 'uploaded'}
@@ -2873,7 +3067,7 @@
                   {:else if column.key === 'downloaded'}
                     <td class="num-cell" title={`Lifetime bytes we've downloaded from this peer`}>{kc.downloaded > 0 ? formatSize(kc.downloaded) : '\u2014'}</td>
                   {:else if column.key === 'credit_ratio'}
-                    <td class="num-cell" title={!kc.has_public_key ? 'No public key cached — credit floor at 1.0' : ''}>{kc.credit_ratio.toFixed(2)}</td>
+                    <td class="num-cell" title={!kc.has_public_key ? 'No public key cached — credit floor at 1.0' : `Credit ratio (1.0 = baseline, higher means we owe upload to them)`}>{kc.credit_ratio.toFixed(2)}</td>
                   {:else if column.key === 'reputation'}
                     {@const rep = reputationMap[kc.user_hash]}
                     {@const label = labelForReputation(rep)}
@@ -2890,26 +3084,28 @@
                       </span>
                     </td>
                   {:else if column.key === 'ident_state'}
-                    <td class="status-cell"><span class="status-label ident-{kc.ident_state.toLowerCase()}" title={!kc.has_public_key ? 'No public key cached' : ''}>{kc.ident_state}</span></td>
+                    <td class="status-cell"><span class="status-label ident-{kc.ident_state.toLowerCase()}" title={!kc.has_public_key ? 'No public key cached' : `eD2K identification state: ${kc.ident_state}`}>{kc.ident_state}</span></td>
                   {:else if column.key === 'last_seen'}
-                    <!-- Use `formatDateWithYear` (not the year-omitting
-                         `formatDate`) because Known Clients rows can be
-                         months or years old, and the previous label
-                         hid exactly the information needed to spot a
-                         stale row. The earlier `kc.last_seen * 1000`
-                         double-multiply through `formatDate` landed
-                         every row in year ~56,000 with the year hidden,
-                         producing convincing-looking "current year"
-                         labels for records that had genuinely been
-                         pruned-eligible for ages. -->
-                    <td class="date-cell">{kc.last_seen > 0 ? formatDateWithYear(kc.last_seen) : '\u2014'}</td>
+                    <!-- Show relative time ("3d ago") so users can scan
+                         freshness at a glance, but keep the absolute date
+                         (with year, since rows can be months old) on
+                         hover for triage. The earlier `kc.last_seen * 1000`
+                         double-multiply landed every row in year ~56,000
+                         which the year-less label hid; the absolute
+                         tooltip now also serves as a regression check. -->
+                    <td class="date-cell" title={kc.last_seen > 0 ? formatDateWithYear(kc.last_seen) : 'Never seen'}>{kc.last_seen > 0 ? formatRelativeTime(kc.last_seen) : '\u2014'}</td>
                   {/if}
                 {/each}
               </tr>
             {/each}
-            {#if knownClients.length === 0}
+            {#if filteredKnownClients.length === 0}
               <tr class="empty-row"><td colspan={knownColCount} class="empty-cell">
-                {#if knownClientsLoaded}
+                {#if !knownClientsLoaded}
+                  <div class="empty-cell-body">
+                    <div class="spinner"></div>
+                    <p class="empty-cell-sub">Loading…</p>
+                  </div>
+                {:else if knownClients.length === 0}
                   <div class="empty-cell-body">
                     <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
                       <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
@@ -2920,8 +3116,13 @@
                   </div>
                 {:else}
                   <div class="empty-cell-body">
-                    <div class="spinner"></div>
-                    <p class="empty-cell-sub">Loading…</p>
+                    <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                      <circle cx="11" cy="11" r="7"/>
+                      <line x1="16" y1="16" x2="20" y2="20"/>
+                    </svg>
+                    <p class="empty-cell-title">No matches</p>
+                    <p class="empty-cell-sub">Nothing in this ledger matches "{knownFilter}".</p>
+                    <button class="empty-cell-action" type="button" onclick={() => (knownFilter = '')}>Clear filter</button>
                   </div>
                 {/if}
               </td></tr>
@@ -3563,6 +3764,23 @@
     color: var(--text-secondary);
     margin: 0;
   }
+  .empty-cell-action {
+    margin-top: 4px;
+    padding: 4px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 4px);
+    cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+  }
+  .empty-cell-action:hover {
+    background: var(--bg-hover);
+    color: var(--accent);
+    border-color: var(--accent);
+  }
   .empty-cell-sub {
     font-size: 12px;
     color: var(--text-muted);
@@ -3911,6 +4129,172 @@
   .client-row {
     user-select: none;
     -webkit-user-select: none;
+  }
+
+  /* --- Known Clients sub-toolbar (search + stats) --- */
+  /*
+    Sits between the bottom-pane tabs and the table itself, matching
+    the muted background of the main pane toolbar so it reads as part
+    of the chrome. Kept outside `.transfer-table` because the table
+    already participates in the resizable column / drag / scroll
+    machinery — adding rows above it there would interfere with the
+    `<colgroup>` widths.
+  */
+  .known-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 6px 10px;
+    background: color-mix(in srgb, var(--bg-secondary) 90%, var(--bg-primary));
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+  .known-search {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 8px;
+    background: var(--bg-input, var(--bg-primary));
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 4px);
+    flex: 1 1 240px;
+    max-width: 360px;
+    transition: border-color var(--transition-fast);
+  }
+  .known-search:focus-within {
+    border-color: var(--accent);
+  }
+  .known-search svg {
+    width: 14px;
+    height: 14px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+  .known-search input {
+    flex: 1;
+    border: none;
+    background: transparent;
+    color: var(--text-primary);
+    font-size: 12px;
+    padding: 2px 0;
+    outline: none;
+    min-width: 0;
+  }
+  .known-search input::placeholder {
+    color: var(--text-muted);
+  }
+  .known-search-clear {
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 2px;
+    transition: color var(--transition-fast);
+  }
+  .known-search-clear:hover {
+    color: var(--text-primary);
+  }
+  .known-stats {
+    display: inline-flex;
+    align-items: center;
+    gap: 14px;
+    font-size: 11px;
+    color: var(--text-muted);
+    flex-wrap: wrap;
+  }
+  .known-stat {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+  }
+  .known-stat strong {
+    color: var(--text-primary);
+    font-weight: 600;
+  }
+  .known-stat-friends strong {
+    color: var(--accent);
+  }
+  .known-stat-match strong {
+    color: var(--warning);
+  }
+
+  /* --- Known Clients hash cell (friend marker + click-to-copy) --- */
+  .known-hash-cell {
+    padding: 0 !important;
+  }
+  .known-hash-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    height: 100%;
+    padding: 3px 6px;
+    border: none;
+    background: transparent;
+    color: var(--text-primary);
+    text-align: left;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: inherit;
+    transition: background var(--transition-fast), color var(--transition-fast);
+  }
+  .known-hash-btn:hover,
+  .known-hash-btn:focus-visible {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    color: var(--accent);
+    outline: none;
+  }
+  .known-hash-btn.copied {
+    background: color-mix(in srgb, var(--success, #2ecc71) 14%, transparent);
+    color: var(--success, #2ecc71);
+  }
+  .known-friend-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
+    flex-shrink: 0;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+  }
+  .known-hash-nick {
+    font-family: var(--font-sans, inherit);
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-right: 2px;
+  }
+  .known-hash-hex {
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+  .known-hash-btn:hover .known-hash-hex,
+  .known-hash-btn:focus-visible .known-hash-hex {
+    color: var(--accent);
+  }
+  .known-hash-copied {
+    margin-left: auto;
+    font-family: var(--font-sans, inherit);
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--success, #2ecc71);
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
+
+  /* Subtle row tint for friends so the eye lands on them while
+     scanning a long ledger. Avoids a colored background for the
+     whole row (which fights with the column hover) by tinting
+     only the leading cells. */
+  .client-row-friend > .flag-cell,
+  .client-row-friend > .known-hash-cell {
+    background: color-mix(in srgb, var(--accent) 6%, transparent);
   }
   .source-child-row td {
     padding: 3px 6px 3px 0 !important;
