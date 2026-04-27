@@ -1086,6 +1086,11 @@
           </div>
         </div>
         <div class="card-body">
+          <div class="advanced-warning" role="note">
+            <strong>Use care with advanced settings.</strong>
+            These options can affect connectivity, performance, and friend discovery. Change them only if you know what they do or are troubleshooting a specific issue.
+          </div>
+
           <div class="field-row">
             <div class="field half">
               <label for="max-sources">Max Sources / File</label>
@@ -1537,6 +1542,22 @@
     margin-top: 4px;
     display: block;
     line-height: 1.4;
+  }
+
+  .advanced-warning {
+    padding: 10px 12px;
+    margin-bottom: 16px;
+    border: 1px solid color-mix(in srgb, var(--warning) 30%, transparent);
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--warning) 10%, transparent);
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.45;
+  }
+
+  .advanced-warning strong {
+    color: var(--warning);
+    margin-right: 4px;
   }
 
   /* ── Restart badge ─────────────────────────────── */
