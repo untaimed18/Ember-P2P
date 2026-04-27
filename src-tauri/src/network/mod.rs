@@ -1392,6 +1392,12 @@ pub enum NetworkCommand {
         file_size: u64,
         peer_ip: String,
         peer_port: u16,
+        /// Additional candidate sources known up-front (e.g. the rest
+        /// of `source_addresses` from a search result). Validated and
+        /// IP-filtered in the handler before being merged into the
+        /// initial multi-source download seed list. Empty means the
+        /// caller only had the primary `peer_ip:peer_port` (or none).
+        extra_sources: Vec<(String, u16)>,
         transfer_id: String,
         control: Arc<TransferControl>,
     },
@@ -5515,6 +5521,7 @@ pub async fn start_network(
                             file_size: t.total_size,
                             peer_ip: t.peer_id.split(':').next().unwrap_or("").to_string(),
                             peer_port: t.peer_id.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(0),
+                            extra_sources: Vec::new(),
                             transfer_id: t.id.clone(),
                             control,
                         },
@@ -5946,6 +5953,7 @@ pub async fn start_network(
                             file_size: t.total_size,
                             peer_ip: t.peer_id.split(':').next().unwrap_or("").to_string(),
                             peer_port: t.peer_id.split(':').nth(1).and_then(|p| p.parse().ok()).unwrap_or(0),
+                            extra_sources: Vec::new(),
                             transfer_id: t.id.clone(),
                             control,
                         },
@@ -16376,6 +16384,7 @@ async fn handle_command(
             file_size,
             peer_ip,
             peer_port,
+            extra_sources,
             transfer_id,
             control,
         } => {
@@ -16407,10 +16416,44 @@ async fn handle_command(
                     }
                 };
 
+                // Validate every extra source up-front so we don't
+                // hand the multi-source manager addresses we know are
+                // unsafe (special-use IPv4, IP-filtered, banned, or
+                // duplicates of the primary). The cap mirrors
+                // `MAX_SOURCE_ADDRS` from the search merge path so a
+                // bug in the frontend can't push an unbounded list.
+                const MAX_SEED_EXTRA_SOURCES: usize = 49;
+                let mut seen_addrs: std::collections::HashSet<(Ipv4Addr, u16)> =
+                    std::collections::HashSet::new();
+                if let std::net::IpAddr::V4(primary_v4) = source_addr.ip() {
+                    seen_addrs.insert((primary_v4, source_addr.port()));
+                }
+                let mut validated_extras: Vec<(Ipv4Addr, u16, String)> =
+                    Vec::with_capacity(extra_sources.len().min(MAX_SEED_EXTRA_SOURCES));
+                for (extra_ip_str, extra_port) in extra_sources.iter().take(MAX_SEED_EXTRA_SOURCES) {
+                    if extra_ip_str.is_empty() || *extra_port == 0 {
+                        continue;
+                    }
+                    let parsed_ip: Ipv4Addr = match extra_ip_str.parse() {
+                        Ok(ip) => ip,
+                        Err(_) => continue,
+                    };
+                    if !is_search_source_safe(&state, parsed_ip) {
+                        continue;
+                    }
+                    if !seen_addrs.insert((parsed_ip, *extra_port)) {
+                        continue;
+                    }
+                    validated_extras.push((parsed_ip, *extra_port, extra_ip_str.clone()));
+                }
+
                 {
                     let mut sm = source_manager.write().await;
                     if let std::net::IpAddr::V4(v4) = source_addr.ip() {
                         sm.register_source(hash_bytes, v4, source_addr.port());
+                    }
+                    for (parsed_ip, extra_port, _) in &validated_extras {
+                        sm.register_source(hash_bytes, *parsed_ip, *extra_port);
                     }
                 }
                 let download_sources = {
@@ -16421,14 +16464,42 @@ async fn handle_command(
                     let co = if let std::net::IpAddr::V4(v4) = source_addr.ip() {
                         sm.get_connect_options(&hash_bytes, v4, source_addr.port())
                     } else { None };
-                    vec![DownloadSource {
+                    let mut sources = Vec::with_capacity(1 + validated_extras.len());
+                    sources.push(DownloadSource {
                         peer_ip: peer_ip.clone(),
                         peer_port,
                         available_parts: Vec::new(),
                         peer_user_hash: uh,
                         peer_connect_options: co,
-                    }]
+                    });
+                    for (parsed_ip, extra_port, extra_ip_str) in &validated_extras {
+                        // Look up cached identity for the extra in the
+                        // same way as the primary, so a peer the source
+                        // manager already has metadata for (from a
+                        // previous session) gets a head start on
+                        // authentication when the multi-source worker
+                        // dials it.
+                        let uh = sm.get_user_hash(&hash_bytes, *parsed_ip, *extra_port);
+                        let co = sm.get_connect_options(&hash_bytes, *parsed_ip, *extra_port);
+                        sources.push(DownloadSource {
+                            peer_ip: extra_ip_str.clone(),
+                            peer_port: *extra_port,
+                            available_parts: Vec::new(),
+                            peer_user_hash: uh,
+                            peer_connect_options: co,
+                        });
+                    }
+                    sources
                 };
+                if !validated_extras.is_empty() {
+                    info!(
+                        "Seeded multi-source download {} with primary {}:{} + {} extra source(s)",
+                        transfer_id,
+                        peer_ip,
+                        peer_port,
+                        validated_extras.len()
+                    );
+                }
                 let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
                 let (est_inject_tx, est_inject_rx) =
                     mpsc::channel::<ed2k::multi_source::EstablishedSource>(8);
