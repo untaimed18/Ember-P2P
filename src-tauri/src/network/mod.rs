@@ -16433,7 +16433,9 @@ async fn handle_command(
                 let (est_inject_tx, est_inject_rx) =
                     mpsc::channel::<ed2k::multi_source::EstablishedSource>(8);
                 let ms_download = MultiSourceDownload {
-                    transfer_id,
+                    // Clone instead of move so the outer `transfer_id`
+                    // survives for the source-discovery dispatch below.
+                    transfer_id: transfer_id.clone(),
                     file_hash: hash_bytes,
                     file_name,
                     file_size,
@@ -16474,7 +16476,6 @@ async fn handle_command(
                 let tid2 = tid.clone();
                 state.active_source_senders.insert(tid.clone(), src_inject_tx);
                 state.active_established_senders.insert(tid.clone(), est_inject_tx);
-                state.active_kad_search_state.insert(tid.clone(), (chrono::Utc::now().timestamp(), 0));
                 let tx2 = tx.clone();
                 if let Some(old_handle) = state.download_handles.remove(&tid2) {
                     warn!("Aborting existing download task for {tid2} before starting new one");
@@ -16488,6 +16489,132 @@ async fn handle_command(
                     }
                 });
                 state.download_handles.insert(tid2, handle);
+
+                // ─── Source-discovery fan-out for new downloads ──────────────
+                //
+                // Without these three dispatches a download added with a
+                // single seed peer (the common path: user clicks Download
+                // on a search result, frontend passes the first
+                // `source_addresses` entry) would only see that one peer
+                // until the next periodic sweep — the source_retry_timer
+                // for KAD (15s+ on `active_download_kad_interval(0)`)
+                // and the 4-minute TCP `OP_GETSOURCES` batch. A search
+                // result reporting "27 sources" then looked like it had
+                // exactly one in the transfer view, and a single failed
+                // connection left the file stuck. Match the
+                // `has_source = false` branch's behavior so the moment a
+                // download starts, every source-discovery channel is
+                // already in flight.
+                let now_ts = chrono::Utc::now().timestamp();
+                let kad_available = state.stats.status != NetworkStatus::Disconnected;
+                let kad_hash = md4_bytes_to_kad_id(&hash_bytes);
+
+                let initial_kad_search_started = if kad_available {
+                    let mut closest = state
+                        .routing_table
+                        .find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
+                    if !closest.is_empty() {
+                        closest.sort_by_key(|c| c.is_tcp_firewalled() as u8);
+                        let sid = state.search_manager.start_search(
+                            kad_hash,
+                            SearchType::FindSource { file_size },
+                            closest,
+                        );
+                        if sid != SearchId(0) {
+                            state
+                                .download_source_searches
+                                .insert(sid, (transfer_id.clone(), hash_bytes));
+                            stats_manager.add_overhead(
+                                crate::storage::statistics::OverheadCategory::FileRequest,
+                                crate::storage::statistics::OverheadDirection::Upload,
+                                48,
+                            );
+                            info!(
+                                "Started KAD source search {} for new active download {}",
+                                sid.0, transfer_id
+                            );
+                            let _ = app_handle.emit(
+                                "transfer:source-search",
+                                serde_json::json!({
+                                    "transfer_id": &transfer_id,
+                                    "kind": "kad_search",
+                                }),
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                // Seed `active_kad_search_state` so the periodic sweep
+                // schedules the next KAD search on its normal cadence
+                // (~30s after this one when count==1) instead of
+                // re-firing immediately. When the initial dispatch
+                // didn't run (no KAD contacts / KAD disconnected) we
+                // fall back to (now, 0) which lets the sweep retry as
+                // soon as KAD is available again.
+                state.active_kad_search_state.insert(
+                    transfer_id.clone(),
+                    (
+                        now_ts,
+                        if initial_kad_search_started { 1 } else { 0 },
+                    ),
+                );
+
+                // Immediate TCP `OP_GETSOURCES` to the connected eD2K
+                // server. Mirrors the on-login batch and the periodic
+                // 4-minute batch.
+                if state.server_connected {
+                    if let Some(conn) = state.server_connection.as_mut() {
+                        if let Ok(bytes) = conn
+                            .send_get_sources(&hash_bytes, file_size)
+                            .await
+                        {
+                            if bytes > 0 {
+                                stats_manager.add_overhead(
+                                    crate::storage::statistics::OverheadCategory::SourceExchange,
+                                    crate::storage::statistics::OverheadDirection::Upload,
+                                    bytes,
+                                );
+                                let _ = app_handle.emit(
+                                    "transfer:source-search",
+                                    serde_json::json!({
+                                        "transfer_id": &transfer_id,
+                                        "kind": "server_query",
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // UDP fan-out to every eligible known server, paced via
+                // `udp_source_queue` so we don't burst-send on add.
+                {
+                    let packets = build_all_getsources_packets(
+                        &state,
+                        &hash_bytes,
+                        file_size,
+                    );
+                    if !packets.is_empty() {
+                        let room = MAX_UDP_SOURCE_QUEUE
+                            .saturating_sub(state.udp_source_queue.len());
+                        debug!(
+                            "Queuing {}/{} UDP source requests for new active download {}",
+                            packets.len().min(room),
+                            packets.len(),
+                            transfer_id
+                        );
+                        state
+                            .udp_source_queue
+                            .extend(packets.into_iter().take(room));
+                    }
+                }
             } else {
                 info!("No source address for {file_hash}, starting KAD source search");
 
