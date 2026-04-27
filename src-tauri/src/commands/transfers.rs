@@ -148,6 +148,97 @@ async fn cleanup_partial_files(download_folder: &str, transfer_id: &str) {
     );
 }
 
+/// Walk `<download_folder>/Temp/` and remove any `.part` / `.part.met`
+/// files whose `<uuid>` prefix doesn't match a transfer ID the
+/// `transfer_manager` knows about. Idempotent and safe to call at
+/// process startup once the DB-backed resume logic has populated the
+/// manager — workers that own a known `.part` are skipped because
+/// their UUID is in `known_ids`.
+///
+/// Catches:
+///   * orphans left over from a previous crash where the cleanup path
+///     didn't run,
+///   * orphans from a `cleanup_partial_files` attempt that failed
+///     because the upload server briefly held the .part open on Windows,
+///   * orphans from a cross-device `move_part_to_final` whose source
+///     remove step failed after the copy already succeeded, and
+///   * .part files left behind by users who wiped or replaced their
+///     transfers DB without also clearing the Temp folder.
+///
+/// Files whose basename isn't a valid UUID are ignored — only Ember-
+/// created part files use UUID basenames, so user-managed files in the
+/// same folder are never touched.
+pub async fn sweep_orphan_part_files(
+    download_folder: &str,
+    known_ids: &std::collections::HashSet<String>,
+) {
+    let temp_dir = std::path::PathBuf::from(download_folder).join("Temp");
+    if !temp_dir.is_dir() {
+        return;
+    }
+    let mut entries = match tokio::fs::read_dir(&temp_dir).await {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(
+                "Orphan sweep: failed to read {}: {e}",
+                temp_dir.display()
+            );
+            return;
+        }
+    };
+    let mut swept_part: u32 = 0;
+    let mut swept_met: u32 = 0;
+    let mut skipped_known: u32 = 0;
+    let mut failed: u32 = 0;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Match `<uuid>.part.met` first (longer suffix) so we don't
+        // accidentally treat the `.met` file as a `.part` whose UUID
+        // ends in `.met`.
+        let (uuid_str, is_met) = if let Some(stem) = name.strip_suffix(".part.met") {
+            (stem, true)
+        } else if let Some(stem) = name.strip_suffix(".part") {
+            (stem, false)
+        } else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(uuid_str).is_err() {
+            // Not an Ember-managed file; leave it alone.
+            continue;
+        }
+        if known_ids.contains(uuid_str) {
+            skipped_known += 1;
+            continue;
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {
+                if is_met {
+                    swept_met += 1;
+                } else {
+                    swept_part += 1;
+                }
+                tracing::info!("Orphan sweep: removed {}", path.display());
+            }
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(
+                    "Orphan sweep: failed to remove {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+    if swept_part > 0 || swept_met > 0 || failed > 0 {
+        tracing::info!(
+            "Orphan sweep finished: removed {swept_part} .part and {swept_met} .part.met file(s) from {} ({skipped_known} skipped — still in use, {failed} failed to delete)",
+            temp_dir.display()
+        );
+    }
+}
+
 #[tauri::command]
 pub async fn start_download(
     app: tauri::AppHandle,
