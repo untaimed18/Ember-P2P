@@ -188,7 +188,19 @@ fn record_known_ember_peer(
 /// the EPX rebuild iterates the map so we never advertise a peer we
 /// haven't heard about in a day.
 fn prune_stale_ember_peers(map: &mut HashMap<(Ipv4Addr, u16), std::time::Instant>) {
-    let now = std::time::Instant::now();
+    prune_stale_ember_peers_at(map, std::time::Instant::now());
+}
+
+/// `prune_stale_ember_peers` factored to take an explicit "now". Used by
+/// tests so they can forward-shift the comparison clock instead of
+/// trying to backdate timestamps with `Instant::checked_sub`, which
+/// fails on platforms where the monotonic counter origin is younger
+/// than `KNOWN_EMBER_PEER_TTL` (notably Windows shortly after boot or
+/// inside short-lived CI containers).
+fn prune_stale_ember_peers_at(
+    map: &mut HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    now: std::time::Instant,
+) {
     map.retain(|_, ts| now.duration_since(*ts) < KNOWN_EMBER_PEER_TTL);
 }
 
@@ -236,8 +248,20 @@ fn lookup_ember_noise_key(
     ip: Ipv4Addr,
     port: u16,
 ) -> Option<[u8; 32]> {
+    lookup_ember_noise_key_at(map, ip, port, std::time::Instant::now())
+}
+
+/// `lookup_ember_noise_key` with an explicit comparison clock. Same
+/// rationale as `prune_stale_ember_peers_at` — lets tests forward-shift
+/// `now` instead of relying on `Instant::checked_sub`.
+fn lookup_ember_noise_key_at(
+    map: &HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
+    ip: Ipv4Addr,
+    port: u16,
+    now: std::time::Instant,
+) -> Option<[u8; 32]> {
     let (key, ts) = map.get(&(ip, port))?;
-    if ts.elapsed() < KNOWN_EMBER_PEER_TTL {
+    if now.duration_since(*ts) < KNOWN_EMBER_PEER_TTL {
         Some(*key)
     } else {
         None
@@ -250,7 +274,15 @@ fn lookup_ember_noise_key(
 fn prune_stale_ember_noise_keys(
     map: &mut HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
 ) {
-    let now = std::time::Instant::now();
+    prune_stale_ember_noise_keys_at(map, std::time::Instant::now());
+}
+
+/// `prune_stale_ember_noise_keys` with an explicit "now" for the same
+/// testability rationale as `prune_stale_ember_peers_at`.
+fn prune_stale_ember_noise_keys_at(
+    map: &mut HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
+    now: std::time::Instant,
+) {
     map.retain(|_, (_, ts)| now.duration_since(*ts) < KNOWN_EMBER_PEER_TTL);
 }
 
@@ -1042,27 +1074,44 @@ mod tests {
 
     #[test]
     fn lookup_ember_noise_key_respects_ttl() {
+        // Forward-shift the comparison clock instead of backdating the
+        // timestamps. Backdating with `Instant::checked_sub(TTL + 60s)`
+        // returns `None` on Windows when the system has been up for
+        // less than the TTL (the monotonic counter origin is too
+        // young), which used to make this test panic with
+        // "clock supports a backdated Instant" in fresh CI containers.
         let mut map = HashMap::new();
         let fresh_ip = Ipv4Addr::new(1, 2, 3, 4);
         let stale_ip = Ipv4Addr::new(5, 6, 7, 8);
         let port = 4662u16;
-        let now = std::time::Instant::now();
+
+        let stale_ts = std::time::Instant::now();
+        // `now` is one minute past the TTL boundary measured from
+        // `stale_ts`, so `now - stale_ts == TTL + 60s` (clearly stale)
+        // and `now - fresh_ts == 60s` (clearly fresh, comfortably under
+        // TTL with both the lookup and prune comparisons being strict
+        // less-than).
+        let now = stale_ts + KNOWN_EMBER_PEER_TTL + std::time::Duration::from_secs(60);
+        let fresh_ts = now - std::time::Duration::from_secs(60);
 
         let key_fresh = [0x11u8; 32];
         let key_stale = [0x22u8; 32];
 
-        let stale_ts = now
-            .checked_sub(KNOWN_EMBER_PEER_TTL + std::time::Duration::from_secs(60))
-            .expect("clock supports a backdated Instant");
-        map.insert((fresh_ip, port), (key_fresh, now));
+        map.insert((fresh_ip, port), (key_fresh, fresh_ts));
         map.insert((stale_ip, port), (key_stale, stale_ts));
 
-        assert_eq!(lookup_ember_noise_key(&map, fresh_ip, port), Some(key_fresh));
+        assert_eq!(
+            lookup_ember_noise_key_at(&map, fresh_ip, port, now),
+            Some(key_fresh)
+        );
         // Stale entry is hidden from lookups even before the prune sweep.
-        assert_eq!(lookup_ember_noise_key(&map, stale_ip, port), None);
+        assert_eq!(
+            lookup_ember_noise_key_at(&map, stale_ip, port, now),
+            None
+        );
 
         // Prune sweep evicts the stale entry from the map itself.
-        prune_stale_ember_noise_keys(&mut map);
+        prune_stale_ember_noise_keys_at(&mut map, now);
         assert!(map.contains_key(&(fresh_ip, port)));
         assert!(!map.contains_key(&(stale_ip, port)));
     }
@@ -1160,20 +1209,25 @@ mod tests {
 
     #[test]
     fn prune_stale_ember_peers_drops_expired_entries() {
+        // Same forward-shift trick as `lookup_ember_noise_key_respects_ttl`:
+        // pin the "stale" timestamp at `Instant::now()` and call the
+        // `_at` variant with a synthetic `now` advanced past the TTL.
+        // Backdating `Instant` with `checked_sub` is unreliable on
+        // Windows / freshly-booted systems where the monotonic clock
+        // reference is younger than `KNOWN_EMBER_PEER_TTL`.
         let mut map = HashMap::new();
         let fresh_ip = Ipv4Addr::new(1, 2, 3, 4);
         let stale_ip = Ipv4Addr::new(5, 6, 7, 8);
-        let now = std::time::Instant::now();
-        // Forge a stale entry by inserting with a timestamp older than
-        // the TTL. We use checked_sub to avoid panicking on systems where
-        // `Instant` was just initialised.
-        let stale_ts = now
-            .checked_sub(KNOWN_EMBER_PEER_TTL + std::time::Duration::from_secs(60))
-            .expect("clock supports a backdated Instant");
-        map.insert((fresh_ip, 4662), now);
+        let stale_ts = std::time::Instant::now();
+        // `now - stale_ts == TTL + 60s` (stale), `now - fresh_ts == 60s`
+        // (fresh under the strict less-than comparison in `prune`).
+        let now = stale_ts + KNOWN_EMBER_PEER_TTL + std::time::Duration::from_secs(60);
+        let fresh_ts = now - std::time::Duration::from_secs(60);
+
+        map.insert((fresh_ip, 4662), fresh_ts);
         map.insert((stale_ip, 4662), stale_ts);
 
-        prune_stale_ember_peers(&mut map);
+        prune_stale_ember_peers_at(&mut map, now);
         assert!(map.contains_key(&(fresh_ip, 4662)));
         assert!(!map.contains_key(&(stale_ip, 4662)));
     }
@@ -1976,6 +2030,19 @@ struct NetworkState {
     aich_hash_sets: Vec<ed2k::aich::AICHRecoveryHashSet>,
     /// Shared max upload slots (updated on settings change, read by upload handler)
     upload_max_slots: Arc<std::sync::atomic::AtomicUsize>,
+    /// Shared obfuscation flag mirroring `state.obfuscation_enabled`. The
+    /// upload listener captures this `Arc` at spawn time and reads it on
+    /// every Hello / EmuleInfo build, so toggling obfuscation in
+    /// Settings hot-reloads inbound advertised crypt support to match
+    /// the outbound paths (which use `state.obfuscation_enabled`
+    /// directly). Without this, inbound and outbound diverge until
+    /// restart.
+    obfuscation_enabled_shared: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared "skip video compression" flag for the upload sender loop.
+    skip_compress_video_shared: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared "filter incoming connections via IP filter" flag for the
+    /// TCP accept loop.
+    filter_incoming_shared: Arc<std::sync::atomic::AtomicBool>,
     /// Whether the EPX payload needs rebuilding (set on source changes, cleared after rebuild)
     ember_payload_dirty: bool,
     /// Known Ember peer addresses for peer discovery mesh building.
@@ -3074,11 +3141,8 @@ fn antileech_set_patterns(
 }
 
 fn antileech_set_enabled(state: &NetworkState, enabled: bool) -> Result<(), String> {
-    {
-        let mut f = state.antileech.write();
-        f.set_enabled(enabled);
-    }
-    Ok(())
+    let mut f = state.antileech.write();
+    f.set_enabled(enabled)
 }
 
 fn antileech_reset_defaults(
@@ -3577,6 +3641,15 @@ pub async fn start_network(
         uss_enabled_flag,
         aich_hash_sets: Vec::new(),
         upload_max_slots: Arc::new(std::sync::atomic::AtomicUsize::new(settings.max_concurrent_uploads as usize)),
+        obfuscation_enabled_shared: Arc::new(std::sync::atomic::AtomicBool::new(
+            settings.obfuscation_enabled,
+        )),
+        skip_compress_video_shared: Arc::new(std::sync::atomic::AtomicBool::new(
+            settings.skip_compress_video,
+        )),
+        filter_incoming_shared: Arc::new(std::sync::atomic::AtomicBool::new(
+            settings.filter_incoming_connections,
+        )),
         ember_payload_dirty: true,
         known_ember_peers: HashMap::new(),
         ember_noise_keys: HashMap::new(),
@@ -3836,7 +3909,9 @@ pub async fn start_network(
         let ul_banned = shared_banned_ips.clone();
         let ul_banned_hashes = shared_banned_hashes.clone();
         let ul_antileech = shared_antileech.clone();
-        let ul_skip_compress = settings.skip_compress_video;
+        let ul_skip_compress = state.skip_compress_video_shared.clone();
+        let ul_filter_incoming = state.filter_incoming_shared.clone();
+        let ul_obfuscation = state.obfuscation_enabled_shared.clone();
         let ul_download_folder = settings.download_folder.clone();
         let ul_fw_probes = firewall_probe_ips.clone();
         let ul_fw_shared = state.firewalled_shared.clone();
@@ -3880,14 +3955,14 @@ pub async fn start_network(
                 ul_banned_hashes,
                 ul_antileech,
                 ul_skip_compress,
-                settings.filter_incoming_connections,
+                ul_filter_incoming,
                 ul_fw_probes,
                 ul_fw_shared,
                 ul_ext_ip_shared,
                 ul_kad_cbs,
                 ul_kad_cb_tx,
                 ul_udp_fw_tx,
-                settings.obfuscation_enabled,
+                ul_obfuscation,
                 ul_server_addr,
                 ul_friends,
                 ul_ember,
@@ -4278,6 +4353,18 @@ pub async fn start_network(
                 }
                 NetworkCommand::UpdateSettings { settings: new_settings } => {
                     state.obfuscation_enabled = new_settings.obfuscation_enabled;
+                    state.obfuscation_enabled_shared.store(
+                        new_settings.obfuscation_enabled,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    state.skip_compress_video_shared.store(
+                        new_settings.skip_compress_video,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    state.filter_incoming_shared.store(
+                        new_settings.filter_incoming_connections,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     state.uss_enabled_flag.store(new_settings.uss_enabled, std::sync::atomic::Ordering::Relaxed);
                     state.upload_max_slots.store(
                         new_settings.max_concurrent_uploads as usize,
@@ -4286,6 +4373,21 @@ pub async fn start_network(
                     if !new_settings.uss_enabled {
                         state.uss_host = None;
                         state.pending_uss_pings.clear();
+                    }
+                    // Hot-reload the IP filter toggles. Without this, the
+                    // Settings page's IP-filter and block-private toggles
+                    // would be persisted to disk but the live `state.ip_filter`
+                    // would keep enforcing the previous mode until restart.
+                    // The dedicated Security-page commands push the same way
+                    // (`SetIpFilterEnabled` / `SetBlockPrivateIps`); doing it
+                    // here too keeps both UIs in sync after a save.
+                    if state.ip_filter.is_enabled() != new_settings.ip_filter_enabled {
+                        state.ip_filter.set_enabled(new_settings.ip_filter_enabled);
+                        state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
+                    }
+                    if state.ip_filter.blocks_private() != new_settings.block_private_ips {
+                        state.ip_filter.set_block_private(new_settings.block_private_ips);
+                        state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
                     }
                     // Reset Ember transport state when the feature flag flips
                     // off, so sessions established during the "on" period
@@ -4297,11 +4399,13 @@ pub async fn start_network(
                         info!("Ember-native transport disabled — cleared all sessions");
                     }
                     info!(
-                        "Network settings updated: obfuscation={}, uss={}, nickname={}, max_uploads={}, ember_native={}",
+                        "Network settings updated: obfuscation={}, uss={}, nickname={}, max_uploads={}, ip_filter={}, block_private={}, ember_native={}",
                         new_settings.obfuscation_enabled,
                         new_settings.uss_enabled,
                         new_settings.nickname,
                         new_settings.max_concurrent_uploads,
+                        new_settings.ip_filter_enabled,
+                        new_settings.block_private_ips,
                         new_settings.ember_native_enabled,
                     );
                     settings = new_settings;
@@ -4454,6 +4558,18 @@ pub async fn start_network(
                     // had no effect until the next message woke the loop).
                     Some(NetworkCommand::UpdateSettings { settings: new_settings }) => {
                         state.obfuscation_enabled = new_settings.obfuscation_enabled;
+                        state.obfuscation_enabled_shared.store(
+                            new_settings.obfuscation_enabled,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        state.skip_compress_video_shared.store(
+                            new_settings.skip_compress_video,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        state.filter_incoming_shared.store(
+                            new_settings.filter_incoming_connections,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         state.uss_enabled_flag.store(
                             new_settings.uss_enabled,
                             std::sync::atomic::Ordering::Relaxed,
@@ -4466,17 +4582,28 @@ pub async fn start_network(
                             state.uss_host = None;
                             state.pending_uss_pings.clear();
                         }
+                        // Same hot-reload as the try_recv arm above.
+                        if state.ip_filter.is_enabled() != new_settings.ip_filter_enabled {
+                            state.ip_filter.set_enabled(new_settings.ip_filter_enabled);
+                            state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
+                        }
+                        if state.ip_filter.blocks_private() != new_settings.block_private_ips {
+                            state.ip_filter.set_block_private(new_settings.block_private_ips);
+                            state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
+                        }
                         if settings.ember_native_enabled && !new_settings.ember_native_enabled {
                             state.ember_transport.cleanup_all();
                             state.ember_pending_pings.clear();
                             info!("Ember-native transport disabled — cleared all sessions");
                         }
                         info!(
-                            "Network settings updated (recv): obfuscation={}, uss={}, nickname={}, max_uploads={}, ember_native={}",
+                            "Network settings updated (recv): obfuscation={}, uss={}, nickname={}, max_uploads={}, ip_filter={}, block_private={}, ember_native={}",
                             new_settings.obfuscation_enabled,
                             new_settings.uss_enabled,
                             new_settings.nickname,
                             new_settings.max_concurrent_uploads,
+                            new_settings.ip_filter_enabled,
+                            new_settings.block_private_ips,
                             new_settings.ember_native_enabled,
                         );
                         settings = new_settings;

@@ -130,12 +130,25 @@ pub async fn download_collection_files(
     if files.len() > 200 {
         return Err("Collection too large (max 200 files)".into());
     }
-    let add_paused = {
+    // Mirror `start_download` (D16): reject collection entries that
+    // exceed the user's `max_download_file_size_gib` cap up front, so
+    // the batch path enforces the same policy as the single-file path.
+    // `validate_settings` rejects `0`, so under normal flow the cap is
+    // always active; the `> 0` guard is defense for hand-edited configs
+    // that bypass validation.
+    let (add_paused, max_dl_bytes) = {
         let config = state.config.read().await;
-        config.settings.add_downloads_paused
+        let cap_gib = config.settings.max_download_file_size_gib;
+        let cap_bytes = if cap_gib > 0 {
+            (cap_gib as u64).saturating_mul(1024 * 1024 * 1024)
+        } else {
+            0
+        };
+        (config.settings.add_downloads_paused, cap_bytes)
     };
     let mut queued_count = 0usize;
     let mut skipped_count = 0usize;
+    let mut oversize_count = 0usize;
     for file in files {
         if file.hash.is_empty() || file.name.is_empty() {
             skipped_count += 1;
@@ -145,6 +158,14 @@ pub async fn download_collection_files(
         if file.hash.len() != 32 || hex::decode(&file.hash).is_err() {
             skipped_count += 1;
             tracing::debug!("Skipping collection entry '{}': invalid hash", file.name);
+            continue;
+        }
+        if max_dl_bytes > 0 && file.size > max_dl_bytes {
+            oversize_count += 1;
+            tracing::debug!(
+                "Skipping collection entry '{}': size {} exceeds configured cap {}",
+                file.name, file.size, max_dl_bytes
+            );
             continue;
         }
         let safe_name = crate::security::sanitize_filename(&file.name);
@@ -233,5 +254,16 @@ pub async fn download_collection_files(
     if skipped_count > 0 {
         tracing::warn!("Collection download: skipped {skipped_count} invalid entries");
     }
-    Ok(format!("Queued {queued_count} files for download"))
+    if oversize_count > 0 {
+        tracing::warn!(
+            "Collection download: skipped {oversize_count} entries that exceed max_download_file_size_gib"
+        );
+    }
+    let mut msg = format!("Queued {queued_count} files for download");
+    if oversize_count > 0 {
+        msg.push_str(&format!(
+            " ({oversize_count} skipped: exceeds Max File Size in Settings > Downloads)"
+        ));
+    }
+    Ok(msg)
 }
