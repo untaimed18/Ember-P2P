@@ -87,7 +87,7 @@
   let spamStatsLoading = $state(false);
   let spamStatsError: string | null = $state(null);
   let spamResetting = $state(false);
-  type SettingsSection = 'general' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'search';
+  type SettingsSection = 'general' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'search' | 'advanced';
   let activeSection: SettingsSection = $state('general');
 
   const sections: Array<{ id: SettingsSection; label: string }> = [
@@ -98,6 +98,7 @@
     { id: 'security', label: 'Security' },
     { id: 'friends', label: 'Friends' },
     { id: 'search', label: 'Search' },
+    { id: 'advanced', label: 'Advanced' },
   ];
 
   let hasUnsavedChanges = $derived(settings ? JSON.stringify(settings) !== originalSettings : false);
@@ -176,10 +177,10 @@
     // thing we still require is that the port is in the 1-65535 range.
     s.max_upload_speed = clampNonNegInt(s.max_upload_speed, 2_147_483_647, 0);
     s.max_download_speed = clampNonNegInt(s.max_download_speed, 2_147_483_647, 0);
-    s.max_concurrent_downloads = clampInt(s.max_concurrent_downloads, 1, 100, 3);
-    s.max_concurrent_uploads = clampInt(s.max_concurrent_uploads, 1, 100, 4);
-    s.max_sources_per_file = clampInt(s.max_sources_per_file, 1, 10_000, 1000);
-    s.max_connections = clampInt(s.max_connections, 10, 5000, 500);
+    s.max_concurrent_downloads = clampInt(s.max_concurrent_downloads, 1, 50, 3);
+    s.max_concurrent_uploads = clampInt(s.max_concurrent_uploads, 1, 50, 4);
+    s.max_sources_per_file = clampInt(s.max_sources_per_file, 1, 2000, 1000);
+    s.max_connections = clampInt(s.max_connections, 1, 2000, 500);
     s.download_queue_wait_secs = clampInt(s.download_queue_wait_secs, 60, 7200, 600);
     s.multisource_retry_rounds = clampInt(s.multisource_retry_rounds, 1, 20, 3);
     s.download_part_retry_rounds = clampInt(s.download_part_retry_rounds, 1, 20, 3);
@@ -376,7 +377,7 @@
     }
   }
 
-  // Anti-leech filter state — loaded lazily when the Security section
+  // Anti-leech filter state — loaded lazily when the Advanced section
   // is first opened so the rest of Settings doesn't pay the IPC round
   // trip. The textarea below is bound to `antileechDraft` (newline-
   // joined patterns); we only push to the backend when the user clicks
@@ -449,10 +450,12 @@
         antileechSnapshot = snap;
       }
     } catch (e: unknown) {
+      const text = `Toggle failed: ${e instanceof Error ? e.message : String(e)}`;
       antileechMessage = {
         kind: 'err',
-        text: `Toggle failed: ${e instanceof Error ? e.message : String(e)}`,
+        text,
       };
+      showSaveMsg(text, true, 5000);
       // Revert UI toggle state since the backend refused the change.
       if (settings) settings.antileech_enabled = !checked;
     }
@@ -481,11 +484,11 @@
     }
   }
 
-  // Lazy-load the snapshot the first time the Security section is opened
+  // Lazy-load the snapshot the first time the Advanced section is opened
   // (or on initial load if it's the active section). Avoids paying the
   // backend round-trip just to render the rest of Settings.
   $effect(() => {
-    if (activeSection === 'security' && !antileechLoaded) {
+    if (activeSection === 'advanced' && !antileechLoaded) {
       loadAntileech();
     }
   });
@@ -624,6 +627,11 @@
                   <circle cx="8.5" cy="8.5" r="5.5"/>
                   <line x1="12.5" y1="12.5" x2="17" y2="17"/>
                 </svg>
+              {:else if section.id === 'advanced'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="10" cy="10" r="2.5"/>
+                  <path d="M10 2.5v2M10 15.5v2M2.5 10h2M15.5 10h2M4.7 4.7l1.4 1.4M13.9 13.9l1.4 1.4M4.7 15.3l1.4-1.4M13.9 6.1l1.4-1.4"/>
+                </svg>
               {/if}
             </span>
             <span>{section.label}</span>
@@ -708,30 +716,18 @@
           <div class="field-row">
             <div class="field half">
               <label for="max-concurrent">Max Downloads</label>
-              <input id="max-concurrent" type="number" min="1" max="100" bind:value={settings.max_concurrent_downloads} />
+              <input id="max-concurrent" type="number" min="1" max="50" bind:value={settings.max_concurrent_downloads} />
             </div>
             <div class="field half">
               <label for="max-uploads">Max Uploads</label>
-              <input id="max-uploads" type="number" min="1" max="100" bind:value={settings.max_concurrent_uploads} />
+              <input id="max-uploads" type="number" min="1" max="50" bind:value={settings.max_concurrent_uploads} />
             </div>
           </div>
 
-          <div class="field-row">
-            <div class="field half">
-              <label for="max-sources">Max Sources / File</label>
-              <!-- The DOM `max` is the backend's hard cap (10000 in
-                   `validateSettings`). The previous UI cap of 2000
-                   contradicted the actual rule; users could enter
-                   higher values from the backend perspective but the
-                   spinner clamped them silently. -->
-              <input id="max-sources" type="number" min="1" max="10000" bind:value={settings.max_sources_per_file} />
-              <span class="hint">Max tracked sources per download (default 400, max 10000)</span>
-            </div>
-            <div class="field half">
-              <label for="max-dl-gib">Max File Size (GiB)</label>
-              <input id="max-dl-gib" type="number" min="1" max="16384" bind:value={settings.max_download_file_size_gib} />
-              <span class="hint">Reject downloads larger than this (default 4096 GiB)</span>
-            </div>
+          <div class="field">
+            <label for="max-dl-gib">Max File Size (GiB)</label>
+            <input id="max-dl-gib" type="number" min="1" max="16384" bind:value={settings.max_download_file_size_gib} />
+            <span class="hint">Reject downloads larger than this (default 4096 GiB)</span>
           </div>
 
           <div class="field toggle-row">
@@ -755,28 +751,6 @@
             </div>
             <ToggleSwitch bind:checked={settings.skip_compress_video} ariaLabel="Skip Compress Video" />
           </div>
-
-          <div class="divider"></div>
-
-          <div class="field">
-            <label for="queue-wait">Queue Wait Timeout (seconds)</label>
-            <input id="queue-wait" type="number" min="60" max="7200" bind:value={settings.download_queue_wait_secs} />
-            <span class="hint">How long to wait in a remote upload queue before giving up (default 1800).</span>
-          </div>
-          <div class="field-row">
-            <div class="field half">
-              <label for="ms-retry">Multi-Source Retries</label>
-              <input id="ms-retry" type="number" min="1" max="20" bind:value={settings.multisource_retry_rounds} />
-              <span class="hint">Extra retry rounds after initial source tasks.</span>
-            </div>
-            <div class="field half">
-              <label for="part-retry">Part Retry Rounds</label>
-              <input id="part-retry" type="number" min="1" max="20" bind:value={settings.download_part_retry_rounds} />
-              <span class="hint">Hash failure retries per part during transfer.</span>
-            </div>
-          </div>
-
-          <div class="divider"></div>
 
           <div class="field">
             <span class="toggle-title">Download History</span>
@@ -859,12 +833,6 @@
               bind:value={settings.search_timeout_secs}
             />
           </div>
-          <div class="field">
-            <label for="filename-cleanups">Filename Cleanup Strings</label>
-            <span class="hint">Pipe-separated substrings to remove from filenames for display. Leave empty to disable cleanup.</span>
-            <input id="filename-cleanups" type="text" bind:value={settings.filename_cleanups} placeholder="http|www.|.com|.de|.org|.net" />
-          </div>
-
         </div>
       </section>
 
@@ -929,7 +897,7 @@
           <span class="card-icon">&#8942;</span>
           <div>
             <h3>Network</h3>
-            <p class="card-desc">Ports, UPnP, and bootstrap nodes</p>
+            <p class="card-desc">Ports, UPnP, and connection startup</p>
           </div>
         </div>
         <div class="card-body">
@@ -974,64 +942,6 @@
               <span class="hint">Automatically connect to an eD2K server on startup.</span>
             </div>
             <ToggleSwitch bind:checked={settings.auto_connect_server} />
-          </div>
-
-          <div class="field">
-            <label for="max-connections">Max TCP Connections</label>
-            <input id="max-connections" type="number" min="50" max="2000" bind:value={settings.max_connections} />
-            <span class="hint">Maximum simultaneous TCP connections (default 500).</span>
-          </div>
-
-          <div class="divider"></div>
-
-          <!--
-            eD2K server-list discovery. These mirror the three eMule
-            options under Options → Servers and are saved live (no
-            restart). When "Update server list when connecting" is on,
-            Ember sends OP_GETSERVERLIST shortly after login and merges
-            the response into server.met; otherwise the current server
-            list stays exactly as you curated it.
-          -->
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">Update server list when connecting</span>
-              <span class="hint">Ask each eD2K server you connect to for its known peer servers and merge them into your list. (eMule: "Update server list when connecting to a server")</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.add_servers_from_server} ariaLabel="Update server list when connecting to a server" />
-          </div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">Update server list from clients</span>
-              <span class="hint">Accept new servers advertised by other eD2K clients during peer connections. Off if you prefer a curated list.</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.add_servers_from_clients} ariaLabel="Update server list from clients" />
-          </div>
-
-          <div class="field toggle-row">
-            <div class="toggle-info">
-              <span class="toggle-title">Filter servers by IP</span>
-              <span class="hint">Apply your IP filter (ipfilter.dat) to newly-discovered servers as well as peers, so blocked ranges can't sneak in via the server list.</span>
-            </div>
-            <ToggleSwitch bind:checked={settings.filter_servers_by_ip} ariaLabel="Filter servers by IP" />
-          </div>
-
-          <div class="divider"></div>
-
-          <div class="field">
-            <label for="nodes-dat">Bootstrap Path</label>
-            <input id="nodes-dat" bind:value={settings.nodes_dat_path} placeholder="Auto-detected" />
-            <span class="hint">Custom nodes.dat path. Leave blank for auto.</span>
-          </div>
-          <div class="field">
-            <div class="action-row">
-              <button class="action-btn" onclick={handleDownloadNodes} disabled={downloadingNodes}>
-                {downloadingNodes ? 'Downloading...' : 'Download nodes.dat'}
-              </button>
-              {#if nodesResult}<span class="feedback success">{nodesResult}</span>{/if}
-              {#if nodesError}<span class="feedback error">{nodesError}</span>{/if}
-            </div>
-            <span class="hint">Fetch latest bootstrap nodes from emule-security.org</span>
           </div>
 
         </div>
@@ -1094,71 +1004,15 @@
 
           <div class="divider"></div>
 
-          <!--
-            Anti-Leech filter — eMule's `AntiLeech.dat` equivalent.
-            Pattern editing is independent of the main Save button so a
-            user can hot-reload patterns without touching unrelated
-            settings; the toggle does go through the main settings
-            object so it's saved/restored alongside everything else.
-          -->
           <div class="field toggle-row">
             <div class="toggle-info">
               <span class="toggle-title">Anti-Leech Filter</span>
               <span class="hint">
-                Reject incoming peer connections whose advertised client-software string matches any pattern below
-                (eMule's <code>AntiLeech.dat</code> equivalent). Closed at handshake — leech mods don't queue, don't
-                hold rank, don't move bytes.
+                Reject incoming peer connections from known leech clients. Pattern editing is available in Advanced.
               </span>
             </div>
             <ToggleSwitch bind:checked={settings.antileech_enabled} ariaLabel="Anti-Leech Filter" />
           </div>
-          {#if settings.antileech_enabled}
-            <div class="field nested antileech-block">
-              {#if !antileechLoaded}
-                <div class="hint">Loading patterns…</div>
-              {:else}
-                <label for="antileech-textarea" class="antileech-label">
-                  Patterns — one regex per line. <code>#</code> starts a comment.
-                </label>
-                <textarea
-                  id="antileech-textarea"
-                  class="antileech-textarea"
-                  bind:value={antileechDraft}
-                  rows="10"
-                  spellcheck="false"
-                  placeholder={`# Examples:\nVeryCD\nMagicMule\n^eMule 0\\.[0-2]\\d`}
-                ></textarea>
-                <div class="antileech-actions">
-                  <button class="action-btn" onclick={handleSaveAntileech} disabled={antileechSaving}>
-                    {antileechSaving ? 'Saving…' : 'Save patterns'}
-                  </button>
-                  <button class="action-btn ghost" onclick={handleResetAntileech} disabled={antileechSaving}>
-                    Restore defaults
-                  </button>
-                  {#if antileechSnapshot}
-                    <span class="hint antileech-path" title={antileechSnapshot.file_path}>
-                      File: {antileechSnapshot.file_path}
-                    </span>
-                  {/if}
-                </div>
-                {#if antileechMessage}
-                  <span class="feedback {antileechMessage.kind === 'err' ? 'error' : antileechMessage.kind === 'warn' ? 'warning' : 'success'}">
-                    {antileechMessage.text}
-                  </span>
-                {/if}
-                {#if antileechCompileErrors.length > 0}
-                  <div class="antileech-errors">
-                    <div class="antileech-errors-title">Patterns rejected by the regex compiler:</div>
-                    <ul>
-                      {#each antileechCompileErrors as [pattern, error]}
-                        <li><code>{pattern}</code> — {error}</li>
-                      {/each}
-                    </ul>
-                  </div>
-                {/if}
-              {/if}
-            </div>
-          {/if}
 
         </div>
       </section>
@@ -1219,12 +1073,172 @@
             <span class="hint">Limit the total number of friends you can add (1–500, default 200).</span>
           </div>
 
+        </div>
+      </section>
+
+      <!-- Advanced -->
+      <section class="card" class:hidden={activeSection !== 'advanced'}>
+        <div class="card-header">
+          <span class="card-icon">&#9881;</span>
+          <div>
+            <h3>Advanced</h3>
+            <p class="card-desc">Protocol tuning and infrastructure settings</p>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="field-row">
+            <div class="field half">
+              <label for="max-sources">Max Sources / File</label>
+              <input id="max-sources" type="number" min="1" max="2000" bind:value={settings.max_sources_per_file} />
+              <span class="hint">Max tracked sources per download (default 400, max 2000).</span>
+            </div>
+            <div class="field half">
+              <label for="max-connections">Max TCP Connections</label>
+              <input id="max-connections" type="number" min="1" max="2000" bind:value={settings.max_connections} />
+              <span class="hint">Maximum simultaneous TCP connections (default 500).</span>
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="queue-wait">Queue Wait Timeout (seconds)</label>
+            <input id="queue-wait" type="number" min="60" max="7200" bind:value={settings.download_queue_wait_secs} />
+            <span class="hint">How long to wait in a remote upload queue before giving up (default 1800).</span>
+          </div>
+          <div class="field-row">
+            <div class="field half">
+              <label for="ms-retry">Multi-Source Retries</label>
+              <input id="ms-retry" type="number" min="1" max="20" bind:value={settings.multisource_retry_rounds} />
+              <span class="hint">Extra retry rounds after initial source tasks.</span>
+            </div>
+            <div class="field half">
+              <label for="part-retry">Part Retry Rounds</label>
+              <input id="part-retry" type="number" min="1" max="20" bind:value={settings.download_part_retry_rounds} />
+              <span class="hint">Hash failure retries per part during transfer.</span>
+            </div>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="field">
+            <label for="filename-cleanups">Filename Cleanup Strings</label>
+            <span class="hint">Pipe-separated substrings to remove from filenames for display. Leave empty to disable cleanup.</span>
+            <input id="filename-cleanups" type="text" bind:value={settings.filename_cleanups} placeholder="http|www.|.com|.de|.org|.net" />
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="field">
+            <label for="nodes-dat">Bootstrap Path</label>
+            <input id="nodes-dat" bind:value={settings.nodes_dat_path} placeholder="Auto-detected" />
+            <span class="hint">Custom nodes.dat path. Leave blank for auto.</span>
+          </div>
+          <div class="field">
+            <div class="action-row">
+              <button class="action-btn" onclick={handleDownloadNodes} disabled={downloadingNodes}>
+                {downloadingNodes ? 'Downloading...' : 'Download nodes.dat'}
+              </button>
+              {#if nodesResult}<span class="feedback success">{nodesResult}</span>{/if}
+              {#if nodesError}<span class="feedback error">{nodesError}</span>{/if}
+            </div>
+            <span class="hint">Fetch latest bootstrap nodes from emule-security.org.</span>
+          </div>
+
+          <div class="divider"></div>
+
+          <!--
+            eD2K server-list discovery. These mirror the three eMule
+            options under Options -> Servers and are saved live (no
+            restart). When "Update server list when connecting" is on,
+            Ember sends OP_GETSERVERLIST shortly after login and merges
+            the response into server.met; otherwise the current server
+            list stays exactly as curated.
+          -->
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Update server list when connecting</span>
+              <span class="hint">Ask each eD2K server you connect to for its known peer servers and merge them into your list.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.add_servers_from_server} ariaLabel="Update server list when connecting to a server" />
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Update server list from clients</span>
+              <span class="hint">Accept new servers advertised by other eD2K clients during peer connections. Off if you prefer a curated list.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.add_servers_from_clients} ariaLabel="Update server list from clients" />
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Filter servers by IP</span>
+              <span class="hint">Apply your IP filter to newly discovered servers as well as peers.</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.filter_servers_by_ip} ariaLabel="Filter servers by IP" />
+          </div>
+
           <div class="divider"></div>
 
           <div class="field">
             <label for="rendezvous-url">Rendezvous Server URL</label>
             <input id="rendezvous-url" bind:value={settings.rendezvous_url} placeholder="https://ember-rendezvous.fly.dev" />
             <span class="hint">Ember rendezvous server for friend discovery and relay coordination.</span>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">Anti-Leech Pattern Editor</span>
+              <span class="hint">
+                Edit the regex patterns used by the Anti-Leech filter. The main toggle stays in Security.
+              </span>
+            </div>
+          </div>
+          <div class="field nested antileech-block">
+            {#if !antileechLoaded}
+              <div class="hint">Loading patterns...</div>
+            {:else}
+              <label for="antileech-textarea" class="antileech-label">
+                Patterns - one regex per line. <code>#</code> starts a comment.
+              </label>
+              <textarea
+                id="antileech-textarea"
+                class="antileech-textarea"
+                bind:value={antileechDraft}
+                rows="10"
+                spellcheck="false"
+                placeholder={`# Examples:\nVeryCD\nMagicMule\n^eMule 0\\.[0-2]\\d`}
+              ></textarea>
+              <div class="antileech-actions">
+                <button class="action-btn" onclick={handleSaveAntileech} disabled={antileechSaving}>
+                  {antileechSaving ? 'Saving...' : 'Save patterns'}
+                </button>
+                <button class="action-btn ghost" onclick={handleResetAntileech} disabled={antileechSaving}>
+                  Restore defaults
+                </button>
+                {#if antileechSnapshot}
+                  <span class="hint antileech-path" title={antileechSnapshot.file_path}>
+                    File: {antileechSnapshot.file_path}
+                  </span>
+                {/if}
+              </div>
+              {#if antileechMessage}
+                <span class="feedback {antileechMessage.kind === 'err' ? 'error' : antileechMessage.kind === 'warn' ? 'warning' : 'success'}">
+                  {antileechMessage.text}
+                </span>
+              {/if}
+              {#if antileechCompileErrors.length > 0}
+                <div class="antileech-errors">
+                  <div class="antileech-errors-title">Patterns rejected by the regex compiler:</div>
+                  <ul>
+                    {#each antileechCompileErrors as [pattern, error]}
+                      <li><code>{pattern}</code> - {error}</li>
+                    {/each}
+                  </ul>
+                </div>
+              {/if}
+            {/if}
           </div>
         </div>
       </section>
