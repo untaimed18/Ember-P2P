@@ -63,7 +63,7 @@
         </div>
         <div class="about-wordmark">
           <h2 id="about-title-{instanceId}">EMBER</h2>
-          <p class="about-tagline">eMule KAD Network</p>
+          <p class="about-tagline">P2P File Sharing</p>
         </div>
       </div>
 

@@ -53,7 +53,7 @@
 
   const navItems: NavItem[] = [
     { href: '/', label: 'KAD Network', id: 'kad', aliases: ['/kad-network'] },
-    { href: '/servers', label: 'Servers', id: 'servers' },
+    { href: '/servers', label: 'ED2K Servers', id: 'servers' },
     { href: '/search', label: 'Search', id: 'search' },
     { href: '/transfers', label: 'Transfers', id: 'transfers' },
     { href: '/library', label: 'Library', id: 'library' },
