@@ -1,0 +1,67 @@
+# Make line endings deterministic across Windows / macOS / Linux
+# checkouts so editors and build tools see the same bytes
+# regardless of `core.autocrlf`.
+#
+# Strategy: every text file is normalized to LF in the repo AND
+# checked out as LF on every platform. This matches what already
+# lives in the index (`git ls-files --eol` reported `i/lf` for every
+# tracked file before this attributes file was added) and silences
+# the "LF will be replaced by CRLF" warnings developers see on
+# Windows when the global `core.autocrlf=true` default is active.
+
+# Default for everything Git can detect as text.
+* text=auto eol=lf
+
+# Source / config — be explicit so future additions inherit the
+# same policy without relying on `text=auto`'s heuristics.
+*.rs        text eol=lf
+*.toml      text eol=lf
+*.lock      text eol=lf
+*.svelte    text eol=lf
+*.ts        text eol=lf
+*.tsx       text eol=lf
+*.js        text eol=lf
+*.jsx       text eol=lf
+*.mjs       text eol=lf
+*.cjs       text eol=lf
+*.json      text eol=lf
+*.html      text eol=lf
+*.css       text eol=lf
+*.md        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.sh        text eol=lf
+
+# Windows-only script formats need CRLF or some shells will refuse
+# to run them. Keep them out of the LF default.
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# Common binaries — disable line-ending and diff normalization so
+# Git never mangles them and large diffs stay readable.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.webp      binary
+*.ico       binary
+*.icns      binary
+*.bmp       binary
+*.woff      binary
+*.woff2     binary
+*.ttf       binary
+*.otf       binary
+*.eot       binary
+*.pdf       binary
+*.zip       binary
+*.gz        binary
+*.tar       binary
+*.7z        binary
+*.exe       binary
+*.dll       binary
+*.dmg       binary
+*.dylib     binary
+*.so        binary
+*.mmdb      binary
+*.wasm      binary
