@@ -196,6 +196,25 @@ pub fn decode_relay_message(data: &[u8]) -> Option<(u8, u32, &[u8])> {
     Some((msg_type, session_id, &data[7..7 + payload_len]))
 }
 
+/// Decode just the 7-byte relay header. Used by the QUIC accept loop
+/// where we have only read the fixed-size header and still need to
+/// know how much body to `read_exact` next; calling
+/// [`decode_relay_message`] on the bare header would always fail for
+/// any message with a non-zero `payload_len` (e.g. `RELAY_REQUEST`),
+/// which previously broke peer-relay accept entirely.
+///
+/// Returns `(msg_type, session_id, payload_len)`. Always succeeds when
+/// `data.len() >= 7`.
+pub fn decode_relay_header(data: &[u8]) -> Option<(u8, u32, u16)> {
+    if data.len() < 7 {
+        return None;
+    }
+    let msg_type = data[0];
+    let session_id = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+    let payload_len = u16::from_le_bytes([data[5], data[6]]);
+    Some((msg_type, session_id, payload_len))
+}
+
 /// Build a RELAY_REQUEST message.
 pub fn build_relay_request(session_id: u32, target_ip: Ipv4Addr, target_port: u16, file_hash: &[u8; 16]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(22);
@@ -628,14 +647,25 @@ pub async fn run_quic_accept_loop(
 
             if msg_type == MSG_RELAY_REQUEST {
                 // === Peer relay request: initiator wants us to relay ===
-                let (_mt, peer_session_id, _) =
-                    match decode_relay_message(&header) {
+                // We have only read the 7-byte header, so call the
+                // header-only decoder rather than `decode_relay_message`,
+                // which requires the full body (payload_len = 22 for
+                // RELAY_REQUEST) to be present and would otherwise reject
+                // every spec-compliant initiator.
+                let (_mt, peer_session_id, payload_len) =
+                    match decode_relay_header(&header) {
                         Some(decoded) => decoded,
                         None => {
                             debug!("QUIC accept: invalid RELAY_REQUEST header from {remote}");
                             return;
                         }
                     };
+                if payload_len as usize != 22 {
+                    debug!(
+                        "QUIC accept: RELAY_REQUEST from {remote} has unexpected payload_len {payload_len} (want 22)"
+                    );
+                    return;
+                }
 
                 let mut payload_buf = [0u8; 22];
                 if let Err(e) = init_recv.read_exact(&mut payload_buf).await {

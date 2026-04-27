@@ -311,7 +311,7 @@ export interface AppSettings {
   filename_cleanups: string;
   spam_filter_enabled: boolean;
   spam_filter_profile: SpamFilterProfile;
-  /** Seconds to wait in remote upload queue before giving up (60–7200) */
+  /** Seconds to wait in remote upload queue before giving up (60–14400) */
   download_queue_wait_secs: number;
   /** Extra multi-source retry rounds after initial tasks (1–20) */
   multisource_retry_rounds: number;
@@ -336,4 +336,6 @@ export interface AppSettings {
   max_friends: number;
   /** Rendezvous server URL for Ember friend discovery */
   rendezvous_url: string;
+  /** Experimental: enable the Ember-native Noise-encrypted UDP transport. */
+  ember_native_enabled: boolean;
 }

@@ -166,6 +166,44 @@ impl BandwidthLimiter {
     pub fn set_limits(&self, upload: u64, download: u64) {
         self.max_upload_rate.store(upload, Ordering::Relaxed);
         self.max_download_rate.store(download, Ordering::Relaxed);
+        // Clamp existing token balances down to the new burst cap (2× max).
+        // Without this, lowering a limit at runtime would leave a stale
+        // token balance from the previous cap that callers can spend
+        // immediately, allowing transfers to run above the user's just-
+        // saved limit until those tokens drain. `0` means "unlimited" on
+        // the rate side; we leave the token pool alone in that case.
+        if upload > 0 {
+            let cap = upload.saturating_mul(2);
+            loop {
+                let current = self.upload_tokens.load(Ordering::Relaxed);
+                if current <= cap {
+                    break;
+                }
+                if self
+                    .upload_tokens
+                    .compare_exchange_weak(current, cap, Ordering::Release, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+        if download > 0 {
+            let cap = download.saturating_mul(2);
+            loop {
+                let current = self.download_tokens.load(Ordering::Relaxed);
+                if current <= cap {
+                    break;
+                }
+                if self
+                    .download_tokens
+                    .compare_exchange_weak(current, cap, Ordering::Release, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
     }
 
     pub fn set_configured_limits(&self, upload: u64, download: u64) {
