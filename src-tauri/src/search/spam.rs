@@ -122,6 +122,13 @@ const LOAD_MAX_NOT_SPAM_HASHES: usize = 10_000;
 const LOAD_MAX_SPAM_FILENAMES: usize = 500;
 const LOAD_MAX_SPAM_SERVER_IPS: usize = 1_000;
 const LOAD_MAX_SPAM_SOURCE_IPS: usize = 5_000;
+const LOAD_MAX_SPAM_SIMILAR_NAMES: usize = 500;
+const LOAD_MAX_SPAM_SIZES: usize = 1_000;
+// Match the runtime `MAX_SERVER_RATIOS` (=500) cap enforced by
+// `mark_spam_server_ip`. A larger load cap would let a hand-edited or
+// migrated `search_spam.json` outgrow what the runtime would ever
+// produce on its own.
+const LOAD_MAX_UDP_SERVER_RATIOS: usize = 500;
 
 /// Maximum decoded JSON file size (bytes) we'll attempt to parse.
 /// At >50 MB of `search_spam.json` something is broken or malicious.
@@ -153,8 +160,30 @@ impl SpamFilter {
                             if db.spam_filenames.len() > LOAD_MAX_SPAM_FILENAMES {
                                 db.spam_filenames.truncate(LOAD_MAX_SPAM_FILENAMES);
                             }
+                            if db.spam_similar_names.len() > LOAD_MAX_SPAM_SIMILAR_NAMES {
+                                db.spam_similar_names.truncate(LOAD_MAX_SPAM_SIMILAR_NAMES);
+                            }
+                            if db.spam_sizes.len() > LOAD_MAX_SPAM_SIZES {
+                                db.spam_sizes.truncate(LOAD_MAX_SPAM_SIZES);
+                            }
                             truncate_set(&mut db.spam_server_ips, LOAD_MAX_SPAM_SERVER_IPS);
                             truncate_set(&mut db.spam_source_ips, LOAD_MAX_SPAM_SOURCE_IPS);
+                            // HashMap<String, f32>: the runtime path
+                            // (`mark_spam_server_ip`) caps to ~1k entries,
+                            // but the load path was previously free to
+                            // ingest an arbitrarily large map. Cap to
+                            // match the spirit of the runtime caps.
+                            if db.udp_server_spam_ratios.len() > LOAD_MAX_UDP_SERVER_RATIOS {
+                                let to_drop: Vec<String> = db
+                                    .udp_server_spam_ratios
+                                    .keys()
+                                    .skip(LOAD_MAX_UDP_SERVER_RATIOS)
+                                    .cloned()
+                                    .collect();
+                                for k in to_drop {
+                                    db.udp_server_spam_ratios.remove(&k);
+                                }
+                            }
                             info!(
                                 "Loaded spam filter: {} hashes, {} filenames",
                                 db.spam_hashes.len(),

@@ -56,8 +56,14 @@ enum PendingHandshake {
         created: Instant,
     },
     /// Noise_XX: responder read message 1, sent message 2, waiting for message 3.
+    /// Application payloads enqueued here while we wait for the initiator's
+    /// final handshake message are flushed as transport-mode packets in
+    /// `handle_xx_msg3` once the session is established. Without this
+    /// queue, calls to `prepare_outgoing` during the brief msg2→msg3
+    /// window would silently drop the payload.
     XxResponderMsg2 {
         state: snow::HandshakeState,
+        queued: Vec<Vec<u8>>,
         created: Instant,
     },
 }
@@ -252,11 +258,9 @@ impl EmberTransport {
         if let Some(pending) = self.pending.get_mut(&peer) {
             match pending {
                 PendingHandshake::IkInitiator { queued, .. }
-                | PendingHandshake::XxInitiatorMsg1 { queued, .. } => {
+                | PendingHandshake::XxInitiatorMsg1 { queued, .. }
+                | PendingHandshake::XxResponderMsg2 { queued, .. } => {
                     queued.push(message.to_vec());
-                    return OutgoingResult::Queued;
-                }
-                PendingHandshake::XxResponderMsg2 { .. } => {
                     return OutgoingResult::Queued;
                 }
             }
@@ -663,6 +667,7 @@ impl EmberTransport {
             from,
             PendingHandshake::XxResponderMsg2 {
                 state: responder,
+                queued: Vec::new(),
                 created: Instant::now(),
             },
         );
@@ -762,8 +767,8 @@ impl EmberTransport {
     }
 
     fn handle_xx_msg3(&mut self, from: SocketAddr, data: &[u8]) -> IncomingResult {
-        let pending = match self.pending.remove(&from) {
-            Some(PendingHandshake::XxResponderMsg2 { state, .. }) => state,
+        let (mut state, queued) = match self.pending.remove(&from) {
+            Some(PendingHandshake::XxResponderMsg2 { state, queued, .. }) => (state, queued),
             Some(other) => {
                 self.pending.insert(from, other);
                 debug!("Unexpected XX msg3 from {from}");
@@ -775,7 +780,6 @@ impl EmberTransport {
             }
         };
 
-        let mut state = pending;
         let mut payload_buf = vec![0u8; data.len()];
         let payload_len = match state.read_message(data, &mut payload_buf) {
             Ok(len) => len,
@@ -792,13 +796,35 @@ impl EmberTransport {
                 return IncomingResult::Rejected;
             }
         };
-        let transport = match state.into_transport_mode() {
+        let mut transport = match state.into_transport_mode() {
             Ok(t) => t,
             Err(e) => {
                 debug!("XX into_transport failed for {from}: {e}");
                 return IncomingResult::Rejected;
             }
         };
+
+        // Drain any application payloads that the local app tried to
+        // send while we were still in the msg2→msg3 window. Each one
+        // becomes a transport-mode packet that the caller will emit on
+        // the wire; without this loop those payloads were silently
+        // dropped by `prepare_outgoing`'s queue case.
+        let mut packets_to_send: Vec<Vec<u8>> = Vec::with_capacity(queued.len());
+        for msg in &queued {
+            let mut pkt = vec![0u8; HEADER_LEN + msg.len() + 64];
+            pkt[0] = EMBER_MAGIC[0];
+            pkt[1] = EMBER_MAGIC[1];
+            pkt[2] = PKT_TRANSPORT;
+            match transport.write_message(msg, &mut pkt[HEADER_LEN..]) {
+                Ok(len) => {
+                    pkt.truncate(HEADER_LEN + len);
+                    packets_to_send.push(pkt);
+                }
+                Err(e) => {
+                    warn!("XX msg3: failed to encrypt queued message for {from}: {e}");
+                }
+            }
+        }
 
         if self.sessions.len() >= MAX_SESSIONS {
             self.evict_oldest_session();
@@ -811,7 +837,10 @@ impl EmberTransport {
                 last_activity: Instant::now(),
             },
         );
-        trace!("XX handshake completed (responder) with {from}");
+        trace!(
+            "XX handshake completed (responder) with {from}; flushed {} queued message(s)",
+            queued.len()
+        );
 
         let decrypted = if payload_len > 0 {
             Some(payload_buf[..payload_len].to_vec())
@@ -822,7 +851,7 @@ impl EmberTransport {
         IncomingResult::HandshakeComplete {
             peer: from,
             remote_noise_pub,
-            packets_to_send: vec![],
+            packets_to_send,
             decrypted_payload: decrypted,
         }
     }
@@ -1086,6 +1115,85 @@ mod tests {
                 );
             }
             _ => panic!("expected Message"),
+        }
+    }
+
+    /// Regression: Bob (XX responder) calls `prepare_outgoing` while
+    /// still in `XxResponderMsg2` (waiting for Alice's msg3). The
+    /// payload must be queued and flushed as a transport packet once
+    /// the handshake completes — not silently dropped (the previous
+    /// behavior, which made dev-panel pings hang during this race).
+    #[test]
+    fn xx_responder_flushes_payload_queued_during_msg2_window() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        // Alice → Bob: XX msg1 (no remote pubkey known yet)
+        let init_packet = match alice.prepare_outgoing(bob_addr, None, b"first msg from alice") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+
+        // Bob receives msg1 → emits msg2, parks state in XxResponderMsg2.
+        let msg2_packets = match bob.process_incoming(&init_packet, alice_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => packets,
+            other => panic!(
+                "expected HandshakeResponse after Bob sees msg1, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        };
+        assert_eq!(msg2_packets.len(), 1);
+
+        // Bob immediately tries to send a control message back to Alice
+        // (e.g. unsolicited ping). With the bug, this returned Queued
+        // and dropped the payload. Now it must Queue it for flush.
+        let bob_msg = b"queued by bob during msg2 window";
+        match bob.prepare_outgoing(alice_addr, Some(&alice_pub), bob_msg) {
+            OutgoingResult::Queued => {}
+            other => panic!(
+                "expected Queued during XxResponderMsg2 window, got {}",
+                variant_name(&other)
+            ),
+        }
+
+        // Alice receives msg2 → emits msg3 (and her own queued payload).
+        let msg3_packets = match alice.process_incoming(&msg2_packets[0], bob_addr) {
+            IncomingResult::HandshakeComplete {
+                packets_to_send, ..
+            } => packets_to_send,
+            _ => panic!("expected HandshakeComplete on alice after msg2"),
+        };
+        assert!(!msg3_packets.is_empty());
+
+        // Bob receives msg3 → handshake completes AND must flush the
+        // previously-queued application payload as a transport packet.
+        let bob_emitted = match bob.process_incoming(&msg3_packets[0], alice_addr) {
+            IncomingResult::HandshakeComplete {
+                packets_to_send, ..
+            } => packets_to_send,
+            _ => panic!("expected HandshakeComplete on bob after msg3"),
+        };
+        assert_eq!(
+            bob_emitted.len(),
+            1,
+            "responder must emit exactly the one queued message it deferred"
+        );
+
+        // Alice decrypts the flushed packet and recovers Bob's payload.
+        match alice.process_incoming(&bob_emitted[0], bob_addr) {
+            IncomingResult::Message { payload, .. } => {
+                assert_eq!(payload, bob_msg.to_vec());
+            }
+            other => panic!(
+                "expected decrypted Message, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 

@@ -310,14 +310,27 @@ pub async fn download_nodes_dat(
     let contact_count = contacts.len();
     let byte_count = bytes.len();
 
-    // Inject contacts into the running network
-    state
+    // Inject contacts into the running network. The file is already
+    // safely on disk above, so a saturated channel here should not
+    // surface as a failed save — bootstrap will pick the contacts up
+    // on the next launch (or as soon as the network drains the queue
+    // and we manually re-trigger). Mirrors the "saved but not applied
+    // live" message style used by `update_settings`.
+    let live_msg = match state
         .network_tx
         .try_send(NetworkCommand::BootstrapContacts { contacts })
-        .map_err(|e| format!("Network busy: {e}"))?;
+    {
+        Ok(()) => "bootstrapping now",
+        Err(e) => {
+            tracing::warn!(
+                "nodes.dat saved to disk, but live bootstrap injection was dropped (channel full): {e}"
+            );
+            "will bootstrap on next launch"
+        }
+    };
 
     let msg = format!(
-        "Downloaded and loaded {contact_count} contacts ({byte_count} bytes) — bootstrapping now",
+        "Downloaded and loaded {contact_count} contacts ({byte_count} bytes) — {live_msg}",
     );
     info!("{msg}");
     Ok(msg)
