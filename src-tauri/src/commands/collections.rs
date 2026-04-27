@@ -242,6 +242,10 @@ pub async fn download_collection_files(
                     file_size: file.size,
                     peer_ip: String::new(),
                     peer_port: 0,
+                    // Collection entries don't carry per-file source
+                    // addresses; the network task handles full source
+                    // discovery for each.
+                    extra_sources: Vec::new(),
                     transfer_id,
                     control,
                 })
