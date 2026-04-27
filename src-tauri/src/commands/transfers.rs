@@ -87,6 +87,10 @@ async fn start_promoted_downloads(state: &AppState, promoted: &[Transfer]) {
                 file_size: transfer.total_size,
                 peer_ip: parse_peer_ip(&transfer.peer_id),
                 peer_port: parse_peer_port(&transfer.peer_id),
+                // Promoting a queued transfer from the DB doesn't carry
+                // the original search-result address list — the network
+                // task does its own discovery as usual.
+                extra_sources: Vec::new(),
                 transfer_id: transfer.id.clone(),
                 control,
             })
@@ -153,6 +157,18 @@ pub async fn start_download(
     file_size: u64,
     peer_ip: String,
     peer_port: u16,
+    // `extra_sources`: additional candidate sources known up-front,
+    // e.g. the rest of `result.source_addresses` from a search hit
+    // beyond the primary peer the frontend already passes as
+    // `peer_ip`/`peer_port`. Each entry is an "ip:port" string.
+    // Optional and capped server-side; a missing/empty list is
+    // treated as "no extras" and the network task does its own
+    // discovery (KAD + server queries) as usual. We cap the parsed
+    // result here at 64 to avoid pushing pathological lists across
+    // the IPC boundary; the network task applies its own stricter
+    // cap (`MAX_SEED_EXTRA_SOURCES = 49`) after IP-filter / ban /
+    // dedup validation.
+    extra_sources: Option<Vec<String>>,
 ) -> Result<StartDownloadResponse, String> {
     let file_name = crate::security::sanitize_filename(&file_name);
 
@@ -165,6 +181,37 @@ pub async fn start_download(
             .parse::<std::net::IpAddr>()
             .map_err(|_| "Invalid peer IP")?;
     }
+
+    // Parse + cheap-validate extra sources at the IPC boundary. Anything
+    // that doesn't parse as `ip:port` with a non-zero IPv4/IPv6 host and
+    // a non-zero port is dropped silently — the search-result feed
+    // sometimes carries "0.0.0.0:0" placeholders for LowID rows we can't
+    // dial directly. Full security validation (IP filter, banned IPs,
+    // dedup against primary, special-use addresses) runs in the network
+    // task where the live state is available.
+    const MAX_EXTRA_SOURCES_IPC: usize = 64;
+    let parsed_extras: Vec<(String, u16)> = extra_sources
+        .unwrap_or_default()
+        .into_iter()
+        .take(MAX_EXTRA_SOURCES_IPC)
+        .filter_map(|addr| {
+            let addr = addr.trim();
+            if addr.is_empty() {
+                return None;
+            }
+            let (ip_part, port_part) = addr.rsplit_once(':')?;
+            let port: u16 = port_part.parse().ok()?;
+            if port == 0 {
+                return None;
+            }
+            // Strip IPv6 brackets if present so the network task's
+            // `Ipv4Addr::parse` path matches. IPv6 sources aren't
+            // supported on the eD2K download path; drop them now.
+            let ip_str = ip_part.trim_start_matches('[').trim_end_matches(']').to_string();
+            ip_str.parse::<std::net::Ipv4Addr>().ok()?;
+            Some((ip_str, port))
+        })
+        .collect();
 
     // Zero-byte ed2k files are valid (hash must be empty-file MD4 on the network stack).
 
@@ -288,6 +335,7 @@ pub async fn start_download(
             file_size,
             peer_ip,
             peer_port,
+            extra_sources: parsed_extras,
             transfer_id: transfer_id.clone(),
             control,
         })

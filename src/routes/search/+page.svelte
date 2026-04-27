@@ -1026,12 +1026,23 @@
     downloadPending[key] = true;
     try {
       const { ip: peerIp, port: peerPort } = pickInitialSource(networkAddresses);
+      // Pass every other valid address from the search hit as extras
+      // so the multi-source manager can attempt them in parallel
+      // instead of waiting for the backend's KAD / server source
+      // discovery to find them again. The backend re-validates and
+      // dedups against the primary anyway, but we can save it the
+      // round-trip by stripping the exact primary string here.
+      const primaryAddr = peerIp && peerPort > 0 ? `${peerIp}:${peerPort}` : '';
+      const extraSources = primaryAddr
+        ? networkAddresses.filter((addr) => addr !== primaryAddr)
+        : networkAddresses.slice();
       const res = await startDownload(
         result.file.hash,
         result.file.name,
         result.file.size,
         peerIp,
-        peerPort
+        peerPort,
+        extraSources
       );
       addToast('success', res.already_queued ? 'Already in queue' : 'Download queued');
     } catch (e: unknown) {
@@ -1265,7 +1276,21 @@
         }
         try {
           const { ip: peerIp, port: peerPort } = pickInitialSource(networkAddrs);
-          await startDownload(result.file.hash, result.file.name, result.file.size, peerIp, peerPort);
+          // Same bulk-seed treatment as the single-row download path
+          // — pass the rest of the search hit's addresses so the
+          // multi-source manager can fan out in parallel.
+          const primaryAddr = peerIp && peerPort > 0 ? `${peerIp}:${peerPort}` : '';
+          const extraSources = primaryAddr
+            ? networkAddrs.filter((addr) => addr !== primaryAddr)
+            : networkAddrs.slice();
+          await startDownload(
+            result.file.hash,
+            result.file.name,
+            result.file.size,
+            peerIp,
+            peerPort,
+            extraSources
+          );
           queued++;
         } catch (e) {
           failed++;

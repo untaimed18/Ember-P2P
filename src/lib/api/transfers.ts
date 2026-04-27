@@ -12,7 +12,17 @@ export async function startDownload(
   fileName: string,
   fileSize: number,
   peerIp: string,
-  peerPort: number
+  peerPort: number,
+  /**
+   * Optional list of additional candidate sources known up-front
+   * (e.g. the rest of `result.source_addresses` from a search hit
+   * beyond the primary peer). Each entry must be an "ip:port"
+   * string; placeholders like "0.0.0.0:0" or "local" are dropped
+   * server-side. The network task runs IP-filter / ban / dedup
+   * validation before seeding, and falls back to its normal KAD +
+   * server source discovery whether or not extras are provided.
+   */
+  extraSources?: string[]
 ): Promise<StartDownloadResponse> {
   return invoke('start_download', {
     fileHash,
@@ -20,6 +30,7 @@ export async function startDownload(
     fileSize,
     peerIp,
     peerPort,
+    extraSources: extraSources ?? null,
   });
 }
 
