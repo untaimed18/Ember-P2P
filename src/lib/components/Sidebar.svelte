@@ -63,6 +63,12 @@
     { href: '/settings', label: 'Settings', id: 'settings' },
   ];
 
+  // Developer-only diagnostic page for the Ember-native transport.
+  // Rendered as a footer entry rather than mixed into the main nav so
+  // it doesn't take an Alt+N keyboard slot away from the user-facing
+  // pages and reads visually as "tooling, not a feature page".
+  const devNavItem: NavItem = { href: '/dev/ember', label: 'Ember Dev', id: 'dev-ember' };
+
   function isActive(item: NavItem, pathname: string): boolean {
     return pathname === item.href || (item.aliases?.includes(pathname) ?? false);
   }
@@ -234,6 +240,22 @@
   </ul>
 
   <div class="sidebar-footer">
+    <a
+      href={devNavItem.href}
+      class="about-btn dev-link"
+      class:active={isActive(devNavItem, $page.url.pathname)}
+      onclick={(e: MouseEvent) => navigate(e, devNavItem.href)}
+      title="Ember-native transport diagnostics (developer)"
+    >
+      <span class="about-icon" aria-hidden="true">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="6 7 2 10 6 13"/>
+          <polyline points="14 7 18 10 14 13"/>
+          <line x1="11" y1="4" x2="9" y2="16"/>
+        </svg>
+      </span>
+      <span>{devNavItem.label}</span>
+    </a>
     <button
       type="button"
       class="about-btn"
@@ -401,6 +423,23 @@
   .about-btn:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: -2px;
+  }
+
+  /* Developer-page entry. Visually demoted compared to the main
+     nav (smaller font, dotted edge) so it reads as tooling rather
+     than a regular page. Active highlight reuses the accent colour
+     so navigating there still feels consistent with the rest of
+     the sidebar. */
+  .about-btn.dev-link {
+    text-decoration: none;
+    font-size: 12px;
+    border: 1px dashed transparent;
+    margin-bottom: 4px;
+  }
+  .about-btn.dev-link.active {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
   }
 
   .about-icon {
