@@ -13610,79 +13610,41 @@ async fn write_ed2k_packet_simple(
     Ok(())
 }
 
-/// Drive `EmberTransport` for an inbound Ember-magic UDP packet:
-/// step the Noise state machine, send any handshake-response packets
-/// back over the same socket, decode `EmberControlMessage` payloads,
-/// and respond to `Ping` with a `Pong`. Bumps the relevant counters
-/// in `state.ember_diagnostics` and resolves any pending ping
-/// oneshots when a matching `Pong` arrives.
+/// Drive `EmberTransport` for an inbound Ember-magic UDP packet,
+/// send any side-effect packets back over the same socket, and
+/// update diagnostics + the pending-ping registry. Pure transport
+/// state-machine work lives in `EmberTransport::dispatch_incoming`
+/// so it can be exercised by `cargo test` over loopback UDP without
+/// constructing a `NetworkState`.
 async fn handle_ember_native_udp(
     socket: &UdpSocket,
     data: &[u8],
     from: SocketAddr,
     state: &mut NetworkState,
 ) {
-    use ember::transport::{EmberControlMessage, IncomingResult, OutgoingResult};
+    use ember::transport::EmberControlMessage;
 
-    let result = state.ember_transport.process_incoming(data, from);
+    let outcome = state.ember_transport.dispatch_incoming(data, from);
 
-    let (decoded_payload, response_packets) = match result {
-        IncomingResult::Message { payload, .. } => (Some(payload), Vec::new()),
-        IncomingResult::HandshakeResponse { packets, .. } => (None, packets),
-        IncomingResult::HandshakeComplete {
-            packets_to_send,
-            decrypted_payload,
-            ..
-        } => (decrypted_payload, packets_to_send),
-        IncomingResult::Rejected => {
-            debug!("Ember transport rejected UDP packet from {from}");
-            return;
-        }
-    };
+    if outcome.rejected {
+        debug!("Ember transport rejected UDP packet from {from}");
+        return;
+    }
 
-    for pkt in response_packets {
-        if let Err(e) = socket.send_to(&pkt, from).await {
-            debug!("Ember transport: failed to send handshake reply to {from}: {e}");
+    for pkt in &outcome.responses {
+        if let Err(e) = socket.send_to(pkt, from).await {
+            debug!("Ember transport: failed to send packet to {from}: {e}");
         }
     }
 
-    let Some(payload) = decoded_payload else { return };
-
-    let Some(message) = EmberControlMessage::decode(&payload) else {
-        debug!(
-            "Ember transport: dropping unknown control payload from {from} ({} bytes)",
-            payload.len()
-        );
-        return;
-    };
-
-    match message {
-        EmberControlMessage::Ping { nonce } => {
+    match outcome.control {
+        Some(EmberControlMessage::Ping { .. }) => {
             state.ember_diagnostics.ember_pings_received = state
                 .ember_diagnostics
                 .ember_pings_received
                 .saturating_add(1);
-
-            let pong = EmberControlMessage::Pong { nonce }.encode();
-            match state.ember_transport.prepare_outgoing(from, None, &pong) {
-                OutgoingResult::Ready { packet } => {
-                    if let Err(e) = socket.send_to(&packet, from).await {
-                        debug!("Ember transport: failed to send Pong to {from}: {e}");
-                    }
-                }
-                OutgoingResult::Queued | OutgoingResult::HandshakeStarted { .. } => {
-                    // Should not happen in practice: receiving the Ping
-                    // means a session is already established. Log for
-                    // diagnostics but otherwise drop — the sender will
-                    // time out client-side and the harness will report it.
-                    debug!("Ember transport: Pong reply queued behind handshake to {from}");
-                }
-                OutgoingResult::Error(err) => {
-                    debug!("Ember transport: Pong encode error for {from}: {err}");
-                }
-            }
         }
-        EmberControlMessage::Pong { nonce } => {
+        Some(EmberControlMessage::Pong { nonce }) => {
             state.ember_diagnostics.ember_pongs_received = state
                 .ember_diagnostics
                 .ember_pongs_received
@@ -13693,6 +13655,10 @@ async fn handle_ember_native_udp(
             } else {
                 debug!("Ember transport: Pong nonce {nonce} from {from} did not match a pending ping");
             }
+        }
+        None => {
+            // Pure handshake-progress packet, or unknown control
+            // payload. Either way nothing more to do here.
         }
     }
 }

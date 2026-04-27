@@ -100,9 +100,25 @@ pub fn run() {
             // wix product version we ship and the value reported by the
             // About / Update dialog). `package_info().version` reads the
             // `version` field of `tauri.conf.json` at build time.
+            //
+            // In harness mode (`EMBER_DATA_DIR` set), we also tag the
+            // title with the basename of the data dir so two side-by-side
+            // harness instances are visually distinguishable from the
+            // taskbar without opening devtools. Production launches
+            // (no env var) keep the original title.
             if let Some(window) = app.get_webview_window("main") {
                 let version = &app.package_info().version;
-                let _ = window.set_title(&format!("Ember v{version}"));
+                let title = match std::env::var(storage::paths::EMBER_DATA_DIR_ENV) {
+                    Ok(dir) if !dir.trim().is_empty() => {
+                        let label = std::path::Path::new(dir.trim())
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("harness");
+                        format!("Ember v{version} [{label}]")
+                    }
+                    _ => format!("Ember v{version}"),
+                };
+                let _ = window.set_title(&title);
             }
 
             let db = Arc::new(

@@ -14,6 +14,9 @@ static/flags/
 src-tauri/target/
 rendezvous-server/target/
 
+# Local multi-node harness (per-node config / identity / database / downloads / logs)
+.harness/
+
 # Tauri generated files
 src-tauri/gen/schemas
 
