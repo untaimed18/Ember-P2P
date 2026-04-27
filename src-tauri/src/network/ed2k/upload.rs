@@ -373,7 +373,12 @@ struct UploadHandler {
     download_folder: PathBuf,
     user_hash: [u8; 16],
     nickname: String,
-    obfuscation_enabled: bool,
+    /// Live-toggleable obfuscation preference. The Settings page can
+    /// flip this at runtime; we read it on every Hello / EmuleInfo
+    /// build so inbound and outbound advertise the same value as the
+    /// rest of the network stack — without this the listener would be
+    /// stuck on whatever value was active at process start.
+    obfuscation_enabled: Arc<std::sync::atomic::AtomicBool>,
     tcp_port: u16,
     udp_port: u16,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -410,10 +415,12 @@ struct UploadHandler {
     /// after Hello/EmuleInfo, before any slot is granted or queue position
     /// is held. Hot-reloadable from disk via the Settings UI.
     antileech: crate::security::antileech::SharedAntiLeechFilter,
-    /// eMule: dontcompressavi — skip compression for video files
-    skip_compress_video: bool,
-    /// Apply IP filter to incoming TCP connections (when false, only outbound is filtered)
-    filter_incoming_connections: bool,
+    /// eMule: dontcompressavi — skip compression for video files. Live-
+    /// toggleable from the Settings page; read on every send loop iter.
+    skip_compress_video: Arc<std::sync::atomic::AtomicBool>,
+    /// Apply IP filter to incoming TCP connections (when false, only
+    /// outbound is filtered). Live-toggleable; checked once per accept.
+    filter_incoming_connections: Arc<std::sync::atomic::AtomicBool>,
     /// IPs we probed with FirewalledReq -- connect-back proves TCP is open
     firewall_probe_ips: FirewallProbeSet,
     /// Shared atomic: set to false when TCP is proven open
@@ -898,8 +905,8 @@ pub async fn start_upload_server(
     banned_ips: SharedBannedIps,
     banned_hashes: SharedBannedHashes,
     antileech: crate::security::antileech::SharedAntiLeechFilter,
-    skip_compress_video: bool,
-    filter_incoming_connections: bool,
+    skip_compress_video: Arc<std::sync::atomic::AtomicBool>,
+    filter_incoming_connections: Arc<std::sync::atomic::AtomicBool>,
     firewall_probe_ips: FirewallProbeSet,
     firewalled_shared: Arc<std::sync::atomic::AtomicBool>,
     // Our current external IPv4 in ed2k HighID encoding (little-endian u32
@@ -911,7 +918,7 @@ pub async fn start_upload_server(
     pending_kad_callbacks: PendingKadCallbacks,
     kad_callback_tx: tokio::sync::mpsc::Sender<KadCallbackParts>,
     udp_fw_check_tx: tokio::sync::mpsc::Sender<UdpFirewallCheckRequest>,
-    obfuscation_enabled: bool,
+    obfuscation_enabled: Arc<std::sync::atomic::AtomicBool>,
     shared_server_addr: Arc<RwLock<Option<SocketAddr>>>,
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     ember_payload: crate::network::ember::SharedEmberPayload,
@@ -1028,7 +1035,7 @@ pub async fn start_upload_server(
                             },
                         };
 
-                        if server.filter_incoming_connections {
+                        if server.filter_incoming_connections.load(std::sync::atomic::Ordering::Relaxed) {
                             // Fail closed on poisoned lock: if we can't read
                             // the filter snapshot we refuse the connection
                             // rather than silently letting potentially-blocked
@@ -1361,8 +1368,8 @@ impl UploadHandler {
         HelloOptions {
             udp_port: self.udp_port,
             kad_port: self.udp_port,
-            supports_crypt_layer: self.obfuscation_enabled,
-            requests_crypt_layer: self.obfuscation_enabled,
+            supports_crypt_layer: self.obfuscation_enabled.load(std::sync::atomic::Ordering::Relaxed),
+            requests_crypt_layer: self.obfuscation_enabled.load(std::sync::atomic::Ordering::Relaxed),
             requires_crypt_layer: false,
             supports_direct_udp_callback: false,
             supports_captcha: false,
@@ -1532,7 +1539,12 @@ impl UploadHandler {
                         raw_writer.write_all(&enc).await?;
                         raw_writer.flush().await?;
 
-                        let emule_payload = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash), None);
+                        let emule_payload = build_emule_info(
+                            self.udp_port,
+                            self.obfuscation_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                            Some(&self.ember_hash),
+                            None,
+                        );
                         let mut epkt = Vec::with_capacity(6 + emule_payload.len());
                         epkt.push(OP_EMULEPROT);
                         epkt.extend_from_slice(&((1 + emule_payload.len()) as u32).to_le_bytes());
@@ -1871,7 +1883,12 @@ impl UploadHandler {
             if !hello_caps.peer_name.is_empty() {
                 ul_peer_name = hello_caps.peer_name.clone();
             }
-            let emule_payload = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash), None);
+            let emule_payload = build_emule_info(
+                self.udp_port,
+                self.obfuscation_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                Some(&self.ember_hash),
+                None,
+            );
             write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_payload).await?;
         } else {
             deferred_packet = Some((proto2, opcode2, payload2));
@@ -3561,7 +3578,12 @@ impl UploadHandler {
                         const SMALL_PACKET_THRESHOLD: usize = 13000;
 
                         // Skip compression for video files when configured (eMule: dontcompressavi)
-                        let use_compression = peer_compression_ver > 0 && data.len() > 1024 && !(is_video_ext && self.skip_compress_video);
+                        let use_compression = peer_compression_ver > 0
+                            && data.len() > 1024
+                            && !(is_video_ext
+                                && self
+                                    .skip_compress_video
+                                    .load(std::sync::atomic::Ordering::Relaxed));
                         let mut sent_compressed = false;
                         if use_compression {
                             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());

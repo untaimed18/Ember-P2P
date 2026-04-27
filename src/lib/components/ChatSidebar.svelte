@@ -183,7 +183,13 @@
   }
 
   async function markAsRead() {
-    try { await markMessagesRead(friendHash); } catch {}
+    try {
+      await markMessagesRead(friendHash);
+    } catch (e) {
+      // Non-fatal — the badge will retry next time the conversation is
+      // opened — but log so a persistent failure is visible in devtools.
+      console.warn('markMessagesRead failed:', e);
+    }
   }
 
   function scrollToBottom() {

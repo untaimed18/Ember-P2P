@@ -330,8 +330,28 @@ impl AntiLeechFilter {
         self.enabled
     }
 
-    pub fn set_enabled(&mut self, enabled: bool) {
+    /// Toggle the filter on or off.
+    ///
+    /// Returns `Err` when the caller asks to enable the filter but the
+    /// pattern set has not been compiled (e.g. every pattern in the
+    /// on-disk file failed to compile). Without this guard the filter
+    /// would report `enabled = true` while `check()` returns `None` for
+    /// every peer — i.e. silently allow-all while the UI claims it is
+    /// blocking. Callers should surface the error to the user so they
+    /// can fix or repopulate the pattern list before re-enabling.
+    pub fn set_enabled(&mut self, enabled: bool) -> Result<(), String> {
+        if enabled && self.set.is_none() {
+            warn!(
+                "AntiLeech: refusing to enable — no compiled pattern set is loaded \
+                 (load patterns or restore defaults first)"
+            );
+            return Err(
+                "Anti-leech filter has no compiled patterns; load or restore defaults first"
+                    .to_string(),
+            );
+        }
         self.enabled = enabled;
+        Ok(())
     }
 
     pub fn pattern_count(&self) -> usize {
@@ -540,5 +560,28 @@ MagicMule
         assert!(filter.check("BADMOD 1.0").is_some());
         assert!(filter.check("badmod 2.0").is_some());
         assert!(filter.check("BaDmOd").is_some());
+    }
+
+    /// `set_enabled(true)` must refuse to enable when no compiled
+    /// pattern set exists. Without this guard the filter would silently
+    /// allow every peer through while the UI claimed it was active.
+    #[test]
+    fn set_enabled_refuses_without_pattern_set() {
+        let (mut filter, _) = AntiLeechFilter::from_patterns(Vec::<String>::new(), false);
+        // Empty pattern list compiles fine but produces an empty
+        // RegexSet — which still counts as "has a set". Build a state
+        // explicitly without one by simulating a build failure: pass a
+        // single pattern that is invalid as a regex so RegexSet::new
+        // fails and `set` becomes None.
+        let (mut bad_filter, errors) =
+            AntiLeechFilter::from_patterns(vec!["[invalid".to_string()], true);
+        assert!(!errors.is_empty(), "invalid regex must surface in errors");
+        assert!(!bad_filter.enabled(), "enabled must be forced off when set is None");
+        let res = bad_filter.set_enabled(true);
+        assert!(res.is_err(), "must refuse to enable without a compiled set");
+        assert!(!bad_filter.enabled(), "state must remain disabled after refusal");
+        // Disabling should always succeed regardless of set state.
+        let _ = filter.set_enabled(false);
+        assert!(filter.set_enabled(false).is_ok());
     }
 }

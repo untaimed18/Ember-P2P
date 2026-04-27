@@ -55,6 +55,7 @@
   let searchingFriends: Set<string> = $state(new Set());
   let isFirewalled = $state(false);
   let recheckingFirewall = $state(false);
+  let recheckError: string | null = $state(null);
 
   let chatOpen = $state(false);
   let chatFriendHash = $state('');
@@ -195,9 +196,12 @@
 
   async function handleRecheckFirewall() {
     recheckingFirewall = true;
+    recheckError = null;
     try {
       await kadRecheckFirewall();
-    } catch { /* best-effort */ }
+    } catch (e) {
+      recheckError = e instanceof Error ? e.message : String(e);
+    }
     clearTimeout(recheckTimer);
     recheckTimer = setTimeout(() => { recheckingFirewall = false; }, 5000);
   }
@@ -534,6 +538,9 @@
       <button class="firewall-recheck" onclick={handleRecheckFirewall} disabled={recheckingFirewall}>
         {recheckingFirewall ? 'Checking\u2026' : 'Recheck'}
       </button>
+      {#if recheckError}
+        <span class="firewall-recheck-error" role="status">Recheck failed: {recheckError}</span>
+      {/if}
     </div>
   {/if}
 
@@ -1700,6 +1707,7 @@
     align-items: center;
     justify-content: space-between;
     gap: 14px;
+    flex-wrap: wrap;
   }
 
   .firewall-banner-content {
@@ -1739,6 +1747,14 @@
     white-space: nowrap;
     flex-shrink: 0;
     transition: background var(--transition-fast), opacity var(--transition-fast);
+  }
+
+  .firewall-recheck-error {
+    margin-left: 10px;
+    font-size: 11px;
+    color: var(--danger, #ef4444);
+    align-self: center;
+    flex-basis: 100%;
   }
 
   .firewall-recheck:hover:not(:disabled) {

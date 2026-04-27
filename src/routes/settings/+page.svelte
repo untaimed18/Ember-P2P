@@ -106,7 +106,18 @@
   onMount(() => {
     refreshSpamStats();
     getSettings()
-      .then((s) => { settings = s; originalSettings = JSON.stringify(s); })
+      .then((s) => {
+        // Seed the antileech toggle baseline BEFORE assigning `settings`
+        // so the sync `$effect` below treats the persisted value as
+        // already-applied and doesn't fire a redundant
+        // `setAntileechEnabled(persistedValue)`. Without this, an IPC
+        // failure on that redundant call could flip `settings.antileech_enabled`
+        // in the catch handler and the next effect run would actually
+        // disable the filter the user never asked to disable.
+        lastAppliedAntileechToggle = s.antileech_enabled;
+        settings = s;
+        originalSettings = JSON.stringify(s);
+      })
       .catch((e) => { loadError = e instanceof Error ? e.message : 'Failed to load settings'; });
 
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
@@ -181,7 +192,7 @@
     s.max_concurrent_uploads = clampInt(s.max_concurrent_uploads, 1, 50, 4);
     s.max_sources_per_file = clampInt(s.max_sources_per_file, 1, 2000, 1000);
     s.max_connections = clampInt(s.max_connections, 1, 2000, 500);
-    s.download_queue_wait_secs = clampInt(s.download_queue_wait_secs, 60, 7200, 600);
+    s.download_queue_wait_secs = clampInt(s.download_queue_wait_secs, 60, 14400, 600);
     s.multisource_retry_rounds = clampInt(s.multisource_retry_rounds, 1, 20, 3);
     s.download_part_retry_rounds = clampInt(s.download_part_retry_rounds, 1, 20, 3);
     s.max_download_file_size_gib = clampInt(s.max_download_file_size_gib, 1, 16384, 4096);
@@ -495,11 +506,12 @@
 
   // Push the enabled-flag to the backend whenever the toggle moves.
   // Done as an effect so the ToggleSwitch can stay generic
-  // (`bind:checked`) without needing an onchange prop. We snapshot
-  // `lastAppliedAntileechToggle` to debounce same-state writes (e.g.
-  // on initial load or when `loadSettings` re-applies the persisted
-  // value) and to avoid firing the API call before settings have
-  // loaded for the first time.
+  // (`bind:checked`) without needing an onchange prop. The baseline
+  // is seeded from the loaded settings in `onMount` so the initial
+  // assignment of `settings` is treated as already-applied and we do
+  // not re-push the persisted value on first paint (which used to
+  // race with `handleAntileechToggle`'s catch path and could flip the
+  // backend off if that redundant call ever failed).
   let lastAppliedAntileechToggle: boolean | null = $state(null);
   $effect(() => {
     if (!settings) return;
@@ -1106,8 +1118,8 @@
 
           <div class="field">
             <label for="queue-wait">Queue Wait Timeout (seconds)</label>
-            <input id="queue-wait" type="number" min="60" max="7200" bind:value={settings.download_queue_wait_secs} />
-            <span class="hint">How long to wait in a remote upload queue before giving up (default 1800).</span>
+            <input id="queue-wait" type="number" min="60" max="14400" bind:value={settings.download_queue_wait_secs} />
+            <span class="hint">How long to wait in a remote upload queue before giving up (default 1800; max 14400).</span>
           </div>
           <div class="field-row">
             <div class="field half">
