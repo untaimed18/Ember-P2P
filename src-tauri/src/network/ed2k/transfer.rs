@@ -3371,14 +3371,26 @@ pub(crate) fn move_part_to_final(
     let final_path = dedup_path(target);
     if let Err(e) = std::fs::rename(part_path, &final_path) {
         if is_cross_device_error(&e) {
+            // Cross-device fallback: copy into the final location,
+            // then try to delete the source. The download is
+            // *complete* the moment the copy succeeds — if the
+            // remove fails (e.g. the upload server is still serving
+            // a chunk from this .part on Windows, or the filesystem
+            // is briefly read-only), we log it and leave the orphan
+            // for the startup sweep to reap on next launch. Failing
+            // the whole move here would mark a perfectly-good
+            // completed download as Failed in the UI even though the
+            // user's bytes are safely on disk.
             std::fs::copy(part_path, &final_path)?;
-            std::fs::remove_file(part_path).map_err(|rm_err| {
+            if let Err(rm_err) = std::fs::remove_file(part_path) {
                 tracing::warn!(
-                    "Failed to remove .part after cross-device copy: {}",
-                    rm_err
+                    "Cross-device move: copied {} -> {} but failed to remove the source .part: {}. \
+                     Orphan will be cleaned by the next startup sweep.",
+                    part_path.display(),
+                    final_path.display(),
+                    rm_err,
                 );
-                rm_err
-            })?;
+            }
         } else {
             return Err(e.into());
         }

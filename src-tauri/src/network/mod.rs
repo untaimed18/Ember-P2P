@@ -4325,6 +4325,26 @@ pub async fn start_network(
         }
     }
 
+    // Reap orphan `.part` / `.part.met` files in `<download_folder>/Temp/`
+    // whose UUID basename doesn't match any transfer the manager just
+    // restored from the DB. Idempotent — workers that own a known
+    // .part are skipped because their UUID is in `known_ids`. Catches
+    // crashes that bypassed `cleanup_partial_files`, Windows-locked
+    // file deletions that ran out of retries, cross-device move
+    // fallbacks where the source remove failed after the copy
+    // succeeded, and Temp folders left behind by a wiped DB.
+    {
+        let known_ids: std::collections::HashSet<String> = {
+            let mgr = transfer_manager.read().await;
+            mgr.get_all().into_iter().map(|t| t.id).collect()
+        };
+        crate::commands::transfers::sweep_orphan_part_files(
+            &settings.download_folder,
+            &known_ids,
+        )
+        .await;
+    }
+
     #[cfg(target_os = "windows")]
     {
         crate::security::firewall::ensure_firewall_rules(tcp_port, udp_port);
