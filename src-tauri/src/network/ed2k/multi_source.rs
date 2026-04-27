@@ -1195,6 +1195,14 @@ impl MultiSourceDownload {
         let mut next_src_idx = self.sources.len();
         let mut injected_sources: Vec<DownloadSource> = Vec::new();
 
+        // Hold the source-injection receiver in an outer-scope Option so it
+        // survives the active-source phase and can be polled during the
+        // retry-rounds cooldown sleep below — otherwise a fresh KAD or
+        // server source arriving while we wait out a dropped peer's
+        // 29-min cooldown would be silently dropped because the
+        // receiver had gone out of scope.
+        let mut post_phase_new_source_rx: Option<mpsc::Receiver<DownloadSource>> = None;
+
         if let Some(mut new_source_rx) = self.new_source_rx.take() {
             // Established-stream injection channel — populated by the
             // KAD/server callback path in `network/mod.rs` when a
@@ -1691,6 +1699,13 @@ impl MultiSourceDownload {
                 for ah in &injected_abort_handles { ah.abort(); }
             }
             while let Some(_) = pending_futs.next().await {}
+
+            // Hand the still-open injection channel back to the outer
+            // scope so the retry-rounds loop below can keep accepting
+            // fresh sources during cooldown sleeps.
+            if injection_channel_open {
+                post_phase_new_source_rx = Some(new_source_rx);
+            }
         } else {
             let all_parts_done = {
                 let t = tracker.read().await;
@@ -1827,6 +1842,33 @@ impl MultiSourceDownload {
                     );
                     tokio::time::sleep(wait).await;
                     check_control(&self.control).await?;
+                }
+            }
+
+            // Drain any sources that arrived via the injection channel
+            // while we were running the previous retry round (or
+            // sleeping a cooldown). This is the retry-phase counterpart
+            // to the active-phase select! arm at line 1270; without it,
+            // KAD/server discovery results that land between rounds
+            // would only take effect on the next download attempt.
+            if let Some(rx) = post_phase_new_source_rx.as_mut() {
+                loop {
+                    match rx.try_recv() {
+                        Ok(source) => {
+                            info!(
+                                "Retry round {}: accepting injected source {}:{} from KAD/server discovery",
+                                retry_round + 1,
+                                source.peer_ip,
+                                source.peer_port
+                            );
+                            injected_sources.push(source);
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            post_phase_new_source_rx = None;
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -1983,13 +2025,52 @@ impl MultiSourceDownload {
                         break;
                     }
                     Some(wait) => {
+                        // Cap each individual sleep slice at
+                        // `COOLDOWN_WAKE_INTERVAL` so we re-evaluate
+                        // candidates periodically — the visible source
+                        // set can grow between rounds via KAD or server
+                        // discovery, and a 29-minute single sleep would
+                        // hide newly-discovered sources from the
+                        // dispatcher until it elapsed. Within that slice
+                        // we also wake immediately on any source arriving
+                        // via the injection channel, so a fresh
+                        // discovery doesn't have to wait out the next
+                        // 60-second wake either.
+                        const COOLDOWN_WAKE_INTERVAL: std::time::Duration =
+                            std::time::Duration::from_secs(60);
+                        let slice = wait.min(COOLDOWN_WAKE_INTERVAL);
                         info!(
-                            "Retry round {}/{}: all candidate sources on cooldown, sleeping {:.1}s before re-evaluating",
+                            "Retry round {}/{}: all candidate sources on cooldown ({:.1}s remaining), sleeping {:.1}s before re-evaluating",
                             retry_round + 1,
                             max_retry_rounds,
                             wait.as_secs_f64(),
+                            slice.as_secs_f64(),
                         );
-                        tokio::time::sleep(wait).await;
+                        if let Some(rx) = post_phase_new_source_rx.as_mut() {
+                            tokio::select! {
+                                biased;
+                                _ = tokio::time::sleep(slice) => {}
+                                new_src = rx.recv() => {
+                                    match new_src {
+                                        Some(source) => {
+                                            info!(
+                                                "Cooldown sleep on round {}/{} woken early by injected source {}:{}",
+                                                retry_round + 1,
+                                                max_retry_rounds,
+                                                source.peer_ip,
+                                                source.peer_port,
+                                            );
+                                            injected_sources.push(source);
+                                        }
+                                        None => {
+                                            post_phase_new_source_rx = None;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            tokio::time::sleep(slice).await;
+                        }
                         // Loop back without incrementing retry_round so
                         // a cooldown-only round doesn't burn the budget.
                         continue;
