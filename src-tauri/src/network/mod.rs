@@ -4349,30 +4349,48 @@ pub async fn start_network(
             // Incoming UDP packets: batch up to 20 per iteration so we re-check
             // commands and timers between batches
             result = udp_socket.recv_from(&mut udp_buf) => {
-                if state.stats.status == NetworkStatus::Disconnected {
-                    continue;
-                }
                 match result {
                     Ok((len, from)) => {
-                        last_kad_activity_at = chrono::Utc::now().timestamp();
-                        stats_manager.add_overhead(
-                            crate::storage::statistics::OverheadCategory::Kad,
-                            crate::storage::statistics::OverheadDirection::Download,
-                            len as u64,
-                        );
-                        handle_udp_packet(
-                            &udp_socket,
-                            &udp_buf[..len],
-                            from,
-                            &mut state,
-                            &app_handle,
-                            &local_index,
-                            &settings,
-                            &db,
-                            &active_port_tests,
-                            &upload_queue_handle,
-                            &credit_manager,
-                        ).await;
+                        // Ember-native UDP is dispatched *above* the KAD
+                        // disconnected gate. The harness explicitly runs
+                        // with `auto_connect_kad = false`, which used to
+                        // mean every received packet got silently dropped
+                        // — including the Ping/Pong frames the dev panel
+                        // is trying to deliver. Ember packets piggyback
+                        // on the KAD UDP socket but are not KAD traffic,
+                        // so they shouldn't be gated by KAD's connect
+                        // state, and they shouldn't roll up into the
+                        // KAD overhead counter either.
+                        if settings.ember_native_enabled
+                            && ember::transport::EmberTransport::is_ember_packet(&udp_buf[..len])
+                        {
+                            handle_ember_native_udp(
+                                &udp_socket,
+                                &udp_buf[..len],
+                                from,
+                                &mut state,
+                            ).await;
+                        } else if state.stats.status != NetworkStatus::Disconnected {
+                            last_kad_activity_at = chrono::Utc::now().timestamp();
+                            stats_manager.add_overhead(
+                                crate::storage::statistics::OverheadCategory::Kad,
+                                crate::storage::statistics::OverheadDirection::Download,
+                                len as u64,
+                            );
+                            handle_udp_packet(
+                                &udp_socket,
+                                &udp_buf[..len],
+                                from,
+                                &mut state,
+                                &app_handle,
+                                &local_index,
+                                &settings,
+                                &db,
+                                &active_port_tests,
+                                &upload_queue_handle,
+                                &credit_manager,
+                            ).await;
+                        }
                     }
                     Err(e) => {
                         warn!("UDP recv error: {e}");
@@ -4382,7 +4400,16 @@ pub async fn start_network(
                 for _ in 0..19 {
                     match udp_socket.try_recv_from(&mut udp_buf) {
                         Ok((len, from)) => {
-                            if state.stats.status != NetworkStatus::Disconnected {
+                            if settings.ember_native_enabled
+                                && ember::transport::EmberTransport::is_ember_packet(&udp_buf[..len])
+                            {
+                                handle_ember_native_udp(
+                                    &udp_socket,
+                                    &udp_buf[..len],
+                                    from,
+                                    &mut state,
+                                ).await;
+                            } else if state.stats.status != NetworkStatus::Disconnected {
                                 last_kad_activity_at = chrono::Utc::now().timestamp();
                                 stats_manager.add_overhead(
                                     crate::storage::statistics::OverheadCategory::Kad,
@@ -4395,13 +4422,13 @@ pub async fn start_network(
                                     from,
                                     &mut state,
                                     &app_handle,
-                            &local_index,
-                            &settings,
-                            &db,
-                            &active_port_tests,
-                            &upload_queue_handle,
-                            &credit_manager,
-                        ).await;
+                                    &local_index,
+                                    &settings,
+                                    &db,
+                                    &active_port_tests,
+                                    &upload_queue_handle,
+                                    &credit_manager,
+                                ).await;
                             }
                         }
                         Err(_) => break,
