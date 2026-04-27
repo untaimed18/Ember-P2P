@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { getEmberDiagnostics, emberPingPeer } from '$lib/api/ember';
+  import { getSettings } from '$lib/api/settings';
   import type { EmberDiagnostics, EmberPingResult } from '$lib/types';
 
   /**
@@ -20,6 +21,23 @@
   let refreshTimer: ReturnType<typeof setInterval> | null = null;
   let unmounted = false;
   let inFlightDiag = false;
+
+  // Local UDP port read once on mount from `get_settings`. Surfaced
+  // next to the ping form so the user can see at a glance which port
+  // belongs to *this* node, and so the form can warn when they
+  // accidentally type it as the peer port (the most common cause of
+  // a "ping always times out" report — the packet loops back, lands
+  // in `handle_transport` with no matching session, and is dropped).
+  let localUdpPort = $state<number | null>(null);
+
+  async function refreshLocalSettings() {
+    try {
+      const s = await getSettings();
+      localUdpPort = s.udp_port;
+    } catch {
+      // Non-fatal — the form still works, just without the port hint.
+    }
+  }
 
   async function refreshDiag() {
     if (unmounted || inFlightDiag) return;
@@ -85,12 +103,25 @@
 
   onMount(() => {
     refreshDiag();
+    refreshLocalSettings();
     refreshTimer = setInterval(refreshDiag, 2000);
     return () => {
       unmounted = true;
       if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
       if (copyResetTimer) { clearTimeout(copyResetTimer); copyResetTimer = null; }
     };
+  });
+
+  let pingsSelf = $derived.by(() => {
+    if (localUdpPort === null) return false;
+    if (formPort === '' || formPort === null) return false;
+    if (Number(formPort) !== localUdpPort) return false;
+    // Only flag IPv4 / IPv6 loopback and the unspecified address —
+    // pinging another machine on the same port is a perfectly normal
+    // scenario (two harness nodes on different hosts using the same
+    // default UDP port).
+    const host = formIp.trim();
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '0.0.0.0';
   });
 </script>
 
@@ -202,6 +233,23 @@
 
   <section class="card">
     <h2>Ping a peer</h2>
+    {#if localUdpPort !== null}
+      <p class="hint">
+        This node's UDP port is <code>{localUdpPort}</code>. Use the
+        <em>other</em> node's UDP port below — pinging your own port
+        loops the packet back to this process and silently times out.
+      </p>
+    {/if}
+    {#if pingsSelf}
+      <div class="banner banner-warn" role="alert">
+        <strong>Heads up:</strong> the form is pointing at this node's own
+        UDP port (<code>{localUdpPort}</code>) on a loopback address.
+        The packet will return to this process, find no matching
+        session, and get dropped. Set the port to the <em>other</em>
+        node's UDP port (e.g. <code>4672</code> for node A,
+        <code>4772</code> for node B).
+      </div>
+    {/if}
     <form onsubmit={submitPing} class="ping-form">
       <label>
         <span>Peer IP</span>
