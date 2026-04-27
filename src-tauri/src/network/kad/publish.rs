@@ -14,6 +14,15 @@ const REPUBLISH_SOURCE_SECS: i64 = 5 * 3600;
 /// relay fallback). See `build_source_publish` for the full rationale.
 pub const EMBER_CAP_RELAY_PUNCH_V1: u8 = 0x01;
 
+/// Free-string KAD source tag name carrying the publisher's Ember
+/// Noise X25519 static public key (32 bytes, raw). Recipients cache
+/// `(ip, port) -> noise_pub` from this tag so they can dial the
+/// publisher's Ember-native UDP transport without manual key
+/// distribution. Vanilla eMule clients see an unknown blob tag and
+/// silently drop it; clients that don't yet speak Ember-native
+/// transport simply ignore it.
+pub const EMBER_NOISE_PUB_TAG: &str = "ember_npub";
+
 #[derive(Debug, Clone)]
 pub struct PublishableFile {
     pub file_hash: KadId,
@@ -43,6 +52,13 @@ pub struct PublishManager {
     user_hash: [u8; 16],
     tcp_port: u16,
     udp_port: u16,
+    /// Local Ember Noise X25519 static public key. Emitted in source
+    /// publishes via [`EMBER_NOISE_PUB_TAG`] so other Ember peers can
+    /// learn how to dial our Ember-native transport without manual
+    /// key distribution. All-zero (the default) suppresses emission,
+    /// matching the legacy behavior of nodes that pre-date the
+    /// Noise-static-key field on `NodeIdentity`.
+    pub noise_pub: [u8; 32],
     pub firewalled: bool,
     pub use_extern_kad_port: bool,
     pub direct_udp_callback: bool,
@@ -60,6 +76,7 @@ impl PublishManager {
             user_hash,
             tcp_port,
             udp_port,
+            noise_pub: [0u8; 32],
             firewalled: false,
             use_extern_kad_port: false,
             direct_udp_callback: false,
@@ -269,6 +286,20 @@ impl PublishManager {
             value: TagValue::Uint8(EMBER_CAP_RELAY_PUNCH_V1),
         });
 
+        // Ember Noise pubkey advertisement. Lets recipients dial our
+        // Ember-native UDP transport without copying hex from devtools
+        // or running a separate identity exchange — the KAD source
+        // record we already publish carries the pubkey alongside the
+        // capability bit. Skipped when the pubkey is all-zero (legacy
+        // identity that pre-dates the Noise-key field), matching the
+        // suppression rule in `extract_kad_sources` for safety.
+        if self.noise_pub != [0u8; 32] {
+            tags.push(KadTag {
+                name: TagName::Str(EMBER_NOISE_PUB_TAG.to_string()),
+                value: TagValue::Blob(self.noise_pub.to_vec()),
+            });
+        }
+
         // eMule Search.cpp STOREFILE uses client hash (user hash), not KadID:
         // CUInt128 uID(CKademlia::GetPrefs()->GetClientHash())
         // user_hash is raw ed2k bytes; wrap in CUInt128 wire format for KAD.
@@ -476,6 +507,59 @@ mod tests {
             value & EMBER_CAP_RELAY_PUNCH_V1 != 0,
             "v1 relay+punch capability bit must be set, got {:#04x}",
             value,
+        );
+    }
+
+    /// HighID Ember publish must carry the Noise pubkey blob so that
+    /// recipients can dial the publisher's Ember-native UDP transport
+    /// without a separate key exchange.
+    #[test]
+    fn build_source_publish_includes_noise_pubkey_blob() {
+        let mut publisher = make_publisher(false);
+        let mut npub = [0u8; 32];
+        for (i, b) in npub.iter_mut().enumerate() {
+            *b = i as u8 + 1;
+        }
+        publisher.noise_pub = npub;
+
+        let msg = publisher
+            .build_source_publish(&sample_file())
+            .expect("HighID publish should not be skipped");
+        let tags = match msg {
+            KadMessage::PublishSourceReq { tags, .. } => tags,
+            _ => panic!("unexpected message type"),
+        };
+
+        let npub_tag = tags
+            .iter()
+            .find(|t| matches!(&t.name, TagName::Str(s) if s == EMBER_NOISE_PUB_TAG))
+            .expect("ember Noise pubkey tag must be present");
+        let blob = match &npub_tag.value {
+            TagValue::Blob(b) => b,
+            _ => panic!("ember_npub tag must be a Blob"),
+        };
+        assert_eq!(blob.len(), 32, "Noise pubkey wire size");
+        assert_eq!(blob.as_slice(), &npub);
+    }
+
+    /// The Noise pubkey tag is suppressed for legacy identities that
+    /// pre-date the keypair field — the all-zero default acts as a
+    /// "nothing to publish" sentinel and the recipient also rejects
+    /// all-zero on read.
+    #[test]
+    fn build_source_publish_skips_zero_noise_pubkey() {
+        let publisher = make_publisher(false);
+        // noise_pub left at its default `[0u8; 32]`.
+        let msg = publisher.build_source_publish(&sample_file()).unwrap();
+        let tags = match msg {
+            KadMessage::PublishSourceReq { tags, .. } => tags,
+            _ => panic!("unexpected message type"),
+        };
+        assert!(
+            !tags
+                .iter()
+                .any(|t| matches!(&t.name, TagName::Str(s) if s == EMBER_NOISE_PUB_TAG)),
+            "all-zero Noise pubkey must not be published"
         );
     }
 

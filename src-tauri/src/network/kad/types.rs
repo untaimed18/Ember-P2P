@@ -760,6 +760,17 @@ impl KadTag {
             _ => None,
         }
     }
+
+    /// Borrow the tag's payload as a byte blob. Returns `None` for any
+    /// non-`Blob` value type. Used by the Ember Noise-pubkey publish
+    /// path (see `kad::publish::EMBER_NOISE_PUB_TAG`) where the wire
+    /// payload is a raw 32-byte X25519 key carried as `TAGTYPE_BLOB`.
+    pub fn blob_value(&self) -> Option<&[u8]> {
+        match &self.value {
+            TagValue::Blob(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    }
 }
 
 /// Maximum tags per tag list (eMule typically sends < 10 tags per message)

@@ -202,7 +202,9 @@ export interface EmberDiagnostics {
 }
 
 /** Result of an `ember_ping_peer` harness round-trip. `rtt_ms` is set
- *  iff `success` is true. */
+ *  iff `success` is true. The `peerPubkeyHex` argument is optional —
+ *  when omitted, the backend resolves the peer's Noise pubkey from
+ *  the KAD-fed cache. */
 export interface EmberPingResult {
   success: boolean;
   rtt_ms?: number;
