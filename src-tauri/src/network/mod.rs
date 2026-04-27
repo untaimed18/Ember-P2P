@@ -148,6 +148,12 @@ const KNOWN_EMBER_PEER_TTL: std::time::Duration = std::time::Duration::from_secs
 /// per-session memory bounded (≈12 KB worst case).
 const MAX_KNOWN_EMBER_PEERS: usize = 500;
 
+/// Hard cap on `ember_noise_keys` size. Each entry is roughly 50 bytes
+/// (key + timestamp + map overhead), so the same 500-entry cap bounds
+/// the noise-key cache to ≈25 KB in the worst case while letting the
+/// harness scale to a few hundred peers without churn.
+const MAX_KNOWN_EMBER_NOISE_KEYS: usize = 500;
+
 /// Insert or refresh an Ember peer in `known_ember_peers`. Returns true
 /// when this is the first time we've seen the address (caller uses that
 /// signal to mark `ember_payload_dirty`). When the map is at capacity
@@ -184,6 +190,68 @@ fn record_known_ember_peer(
 fn prune_stale_ember_peers(map: &mut HashMap<(Ipv4Addr, u16), std::time::Instant>) {
     let now = std::time::Instant::now();
     map.retain(|_, ts| now.duration_since(*ts) < KNOWN_EMBER_PEER_TTL);
+}
+
+/// Insert or refresh an Ember Noise pubkey for `(ip, port)`. Mirrors
+/// `record_known_ember_peer`'s LRU-by-timestamp eviction policy at the
+/// `MAX_KNOWN_EMBER_NOISE_KEYS` cap. A re-publish overwrites the
+/// stored key (last-write-wins) so a peer that rotates its Noise
+/// identity is reachable on the next dial. Returns the *previous*
+/// pubkey when the entry already existed and the value changed; this
+/// is used by callers that want to log key rotation events.
+fn record_ember_noise_key(
+    map: &mut HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
+    ip: Ipv4Addr,
+    port: u16,
+    noise_pub: [u8; 32],
+) -> Option<[u8; 32]> {
+    let now = std::time::Instant::now();
+    let key = (ip, port);
+    if let Some((existing, ts)) = map.get_mut(&key) {
+        let prev = if *existing != noise_pub { Some(*existing) } else { None };
+        *existing = noise_pub;
+        *ts = now;
+        return prev;
+    }
+    if map.len() >= MAX_KNOWN_EMBER_NOISE_KEYS {
+        if let Some(oldest_key) = map
+            .iter()
+            .min_by_key(|(_, (_, ts))| *ts)
+            .map(|(k, _)| *k)
+        {
+            map.remove(&oldest_key);
+        }
+    }
+    map.insert(key, (noise_pub, now));
+    None
+}
+
+/// Look up a peer's Ember Noise pubkey, respecting `KNOWN_EMBER_PEER_TTL`.
+/// Returns `None` for unknown peers and for entries past their TTL —
+/// stale entries are not pruned here so the lookup can stay `&` not
+/// `&mut`; the periodic prune (or a fresh insert on the next observed
+/// publish) reaps them.
+fn lookup_ember_noise_key(
+    map: &HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
+    ip: Ipv4Addr,
+    port: u16,
+) -> Option<[u8; 32]> {
+    let (key, ts) = map.get(&(ip, port))?;
+    if ts.elapsed() < KNOWN_EMBER_PEER_TTL {
+        Some(*key)
+    } else {
+        None
+    }
+}
+
+/// Drop expired entries from the noise-key cache. Called next to
+/// `prune_stale_ember_peers` so the two Ember-mesh caches stay in
+/// step on the same TTL.
+fn prune_stale_ember_noise_keys(
+    map: &mut HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
+) {
+    let now = std::time::Instant::now();
+    map.retain(|_, (_, ts)| now.duration_since(*ts) < KNOWN_EMBER_PEER_TTL);
 }
 
 /// Shared EPX source injection logic used by both DownloadEvent::EmberSources
@@ -921,6 +989,176 @@ mod tests {
     }
 
     #[test]
+    fn record_ember_noise_key_overwrites_on_rotation() {
+        let mut map = HashMap::new();
+        let ip = Ipv4Addr::new(1, 2, 3, 4);
+        let port = 4662u16;
+
+        let key1 = [0xAAu8; 32];
+        let key2 = [0xBBu8; 32];
+
+        // First insert: nothing previous to report.
+        assert_eq!(record_ember_noise_key(&mut map, ip, port, key1), None);
+        assert_eq!(map[&(ip, port)].0, key1);
+
+        // Same key → no rotation reported.
+        assert_eq!(record_ember_noise_key(&mut map, ip, port, key1), None);
+
+        // Different key → caller learns the previous value so it can
+        // log a rotation event if it wants to.
+        assert_eq!(record_ember_noise_key(&mut map, ip, port, key2), Some(key1));
+        assert_eq!(map[&(ip, port)].0, key2);
+    }
+
+    #[test]
+    fn record_ember_noise_key_evicts_oldest_at_capacity() {
+        let mut map = HashMap::new();
+        // Fill to the cap with sequentially-aged entries so the first
+        // insert is the oldest by timestamp.
+        for i in 0..MAX_KNOWN_EMBER_NOISE_KEYS {
+            let i16 = i as u16;
+            let ip = Ipv4Addr::new(10, 0, (i16 >> 8) as u8, (i16 & 0xFF) as u8);
+            let mut key = [0u8; 32];
+            key[0] = (i & 0xFF) as u8;
+            assert_eq!(record_ember_noise_key(&mut map, ip, 4662, key), None);
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        let oldest = (Ipv4Addr::new(10, 0, 0, 0), 4662u16);
+        assert!(map.contains_key(&oldest));
+        assert_eq!(map.len(), MAX_KNOWN_EMBER_NOISE_KEYS);
+
+        // Inserting one more brand-new address must evict the oldest.
+        let newcomer = (Ipv4Addr::new(11, 0, 0, 1), 4662u16);
+        let mut key = [0u8; 32];
+        key[31] = 0xFF;
+        assert_eq!(
+            record_ember_noise_key(&mut map, newcomer.0, newcomer.1, key),
+            None
+        );
+        assert_eq!(map.len(), MAX_KNOWN_EMBER_NOISE_KEYS);
+        assert!(!map.contains_key(&oldest));
+        assert!(map.contains_key(&newcomer));
+    }
+
+    #[test]
+    fn lookup_ember_noise_key_respects_ttl() {
+        let mut map = HashMap::new();
+        let fresh_ip = Ipv4Addr::new(1, 2, 3, 4);
+        let stale_ip = Ipv4Addr::new(5, 6, 7, 8);
+        let port = 4662u16;
+        let now = std::time::Instant::now();
+
+        let key_fresh = [0x11u8; 32];
+        let key_stale = [0x22u8; 32];
+
+        let stale_ts = now
+            .checked_sub(KNOWN_EMBER_PEER_TTL + std::time::Duration::from_secs(60))
+            .expect("clock supports a backdated Instant");
+        map.insert((fresh_ip, port), (key_fresh, now));
+        map.insert((stale_ip, port), (key_stale, stale_ts));
+
+        assert_eq!(lookup_ember_noise_key(&map, fresh_ip, port), Some(key_fresh));
+        // Stale entry is hidden from lookups even before the prune sweep.
+        assert_eq!(lookup_ember_noise_key(&map, stale_ip, port), None);
+
+        // Prune sweep evicts the stale entry from the map itself.
+        prune_stale_ember_noise_keys(&mut map);
+        assert!(map.contains_key(&(fresh_ip, port)));
+        assert!(!map.contains_key(&(stale_ip, port)));
+    }
+
+    /// Round-trip from publish-side blob tag → wire bytes →
+    /// `extract_kad_sources` consumer. Confirms the tag we emit in
+    /// `build_source_publish` is exactly what `extract_kad_sources`
+    /// reads back, without manually building a hand-crafted entry.
+    #[test]
+    fn extract_kad_sources_round_trip_picks_up_noise_pubkey() {
+        use crate::network::kad::messages::SearchResultEntry;
+        use crate::network::kad::publish::{EMBER_CAP_RELAY_PUNCH_V1, EMBER_NOISE_PUB_TAG};
+        use crate::network::kad::types::{KadId, KadTag, TagName, TagValue, TAG_SOURCEIP, TAG_SOURCEPORT, TAG_SOURCETYPE};
+
+        let mut npub = [0u8; 32];
+        for (i, b) in npub.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+
+        let entry = SearchResultEntry {
+            id: KadId([0; 16]),
+            tags: vec![
+                KadTag {
+                    name: TagName::Id(TAG_SOURCEIP),
+                    value: TagValue::Uint32(u32::from(Ipv4Addr::new(80, 1, 2, 3)).to_be()),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_SOURCEPORT),
+                    value: TagValue::Uint16(4662),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_SOURCETYPE),
+                    value: TagValue::Uint8(1),
+                },
+                KadTag {
+                    name: TagName::Str("ember".to_string()),
+                    value: TagValue::Uint8(EMBER_CAP_RELAY_PUNCH_V1),
+                },
+                KadTag {
+                    name: TagName::Str(EMBER_NOISE_PUB_TAG.to_string()),
+                    value: TagValue::Blob(npub.to_vec()),
+                },
+            ],
+        };
+
+        let sources = extract_kad_sources(&[entry]);
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].is_ember_capable);
+        assert_eq!(sources[0].ember_noise_pub, Some(npub));
+    }
+
+    /// Wrong-length and all-zero Noise pubkey blobs must be rejected
+    /// at extract time so the cache cannot be poisoned with a key
+    /// that no one can ever decrypt under.
+    #[test]
+    fn extract_kad_sources_rejects_invalid_noise_pubkey_blobs() {
+        use crate::network::kad::messages::SearchResultEntry;
+        use crate::network::kad::publish::EMBER_NOISE_PUB_TAG;
+        use crate::network::kad::types::{KadId, KadTag, TagName, TagValue, TAG_SOURCEIP, TAG_SOURCEPORT, TAG_SOURCETYPE};
+
+        let make_entry = |blob: Vec<u8>| SearchResultEntry {
+            id: KadId([0; 16]),
+            tags: vec![
+                KadTag {
+                    name: TagName::Id(TAG_SOURCEIP),
+                    value: TagValue::Uint32(u32::from(Ipv4Addr::new(80, 1, 2, 3)).to_be()),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_SOURCEPORT),
+                    value: TagValue::Uint16(4662),
+                },
+                KadTag {
+                    name: TagName::Id(TAG_SOURCETYPE),
+                    value: TagValue::Uint8(1),
+                },
+                KadTag {
+                    name: TagName::Str(EMBER_NOISE_PUB_TAG.to_string()),
+                    value: TagValue::Blob(blob),
+                },
+            ],
+        };
+
+        // 31 bytes (truncated)
+        let sources = extract_kad_sources(&[make_entry(vec![0x42u8; 31])]);
+        assert_eq!(sources[0].ember_noise_pub, None);
+
+        // 33 bytes (overlong)
+        let sources = extract_kad_sources(&[make_entry(vec![0x42u8; 33])]);
+        assert_eq!(sources[0].ember_noise_pub, None);
+
+        // All-zero (matches the publish-side suppression sentinel)
+        let sources = extract_kad_sources(&[make_entry(vec![0u8; 32])]);
+        assert_eq!(sources[0].ember_noise_pub, None);
+    }
+
+    #[test]
     fn prune_stale_ember_peers_drops_expired_entries() {
         let mut map = HashMap::new();
         let fresh_ip = Ipv4Addr::new(1, 2, 3, 4);
@@ -1342,14 +1580,18 @@ pub enum NetworkCommand {
     GetEmberDiagnostics {
         tx: oneshot::Sender<EmberDiagnostics>,
     },
-    /// Send an Ember-native `Ping` over the Noise transport to a
-    /// `(addr, peer_noise_pubkey)` and return either the round-trip
-    /// time of the matching `Pong` or an error string. Backs the
-    /// `ember_ping_peer` harness command; gated by
-    /// `ember_native_enabled` on both ends.
+    /// Send an Ember-native `Ping` over the Noise transport to a peer.
+    ///
+    /// When `peer_pubkey` is `Some`, the network task uses it directly
+    /// (the harness path: caller already knows the pubkey). When
+    /// `None`, the task looks the pubkey up in the cache populated
+    /// from KAD source publishes (`ember_noise_keys`), which is how
+    /// production peers will eventually dial each other without
+    /// out-of-band key distribution. A cache miss with `None` is
+    /// surfaced as a clear error rather than a silent timeout.
     SendEmberPing {
         addr: SocketAddr,
-        peer_pubkey: [u8; 32],
+        peer_pubkey: Option<[u8; 32]>,
         tx: oneshot::Sender<Result<EmberPingPending, String>>,
     },
     Shutdown,
@@ -1745,6 +1987,14 @@ struct NetworkState {
     /// (`ember::MAX_EPX_PEERS = 50`); the in-memory headroom exists so we
     /// can rotate which subset gets advertised across rebuilds.
     known_ember_peers: HashMap<(Ipv4Addr, u16), std::time::Instant>,
+    /// `(ip, port) -> (noise_pub, last_seen)` cache populated from KAD
+    /// source publishes that carry `kad::publish::EMBER_NOISE_PUB_TAG`.
+    /// Lets `ember_ping_peer` (and future Ember-native callers) dial a
+    /// peer's Noise transport without copying hex pubkeys around.
+    /// Bounded by `MAX_KNOWN_EMBER_NOISE_KEYS` and pruned by
+    /// `KNOWN_EMBER_PEER_TTL` so a long session can't unboundedly
+    /// retain stale keys for peers that have rotated.
+    ember_noise_keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
     /// Diagnostic counters surfaced via `get_ember_diagnostics`. Increment
     /// from inside `network/mod.rs` (EPX events, peer-count snapshots) or
     /// from `ConnectionBroker::stats()` for broker-owned counters.
@@ -2977,7 +3227,8 @@ pub async fn start_network(
 
     let mut routing_table = RoutingTable::new(local_id, settings.block_private_ips);
     let search_manager = SearchManager::new();
-    let publish_manager = PublishManager::new(local_id, user_hash, tcp_port, udp_port);
+    let mut publish_manager = PublishManager::new(local_id, user_hash, tcp_port, udp_port);
+    publish_manager.noise_pub = identity.noise_public_key;
 
     // Load bootstrap contacts from the app's own nodes.dat.
     // K3: if the file format is the older "no verified bit" variant we
@@ -3328,6 +3579,7 @@ pub async fn start_network(
         upload_max_slots: Arc::new(std::sync::atomic::AtomicUsize::new(settings.max_concurrent_uploads as usize)),
         ember_payload_dirty: true,
         known_ember_peers: HashMap::new(),
+        ember_noise_keys: HashMap::new(),
         ember_diagnostics: EmberDiagnostics::default(),
         antileech: shared_antileech.clone(),
         aich_root_map: HashMap::new(),
@@ -5786,10 +6038,23 @@ pub async fn start_network(
                             // future broker attempts for them are unlocked. We update
                             // the cache *before* filtering self-sources because we want
                             // to learn about peers from every search response, not just
-                            // ones we end up handing back to the caller.
+                            // ones we end up handing back to the caller. The Noise-pubkey
+                            // cache is fed off the same iteration so `ember_ping_peer`
+                            // can dial the peer's Ember-native UDP transport without
+                            // needing the harness to copy hex from devtools.
                             for s in &all {
-                                if s.is_ember_capable && !s.ip.is_unspecified() && s.tcp_port != 0 {
-                                    state.ember_capable_peers.insert((s.ip, s.tcp_port));
+                                if !s.ip.is_unspecified() && s.tcp_port != 0 {
+                                    if s.is_ember_capable {
+                                        state.ember_capable_peers.insert((s.ip, s.tcp_port));
+                                    }
+                                    if let Some(npub) = s.ember_noise_pub {
+                                        record_ember_noise_key(
+                                            &mut state.ember_noise_keys,
+                                            s.ip,
+                                            s.tcp_port,
+                                            npub,
+                                        );
+                                    }
                                 }
                             }
                             let before = all.len();
@@ -5850,13 +6115,24 @@ pub async fn start_network(
                             let all = extract_kad_sources(&search.results);
                             // Same cache update as the pending_source_searches branch:
                             // record every peer that advertised Ember capability so the
-                            // broker dispatch sites can unblock them. Doing this in both
-                            // branches (rather than once inside `extract_kad_sources`)
-                            // keeps that helper a pure function with no `state`
-                            // dependency.
+                            // broker dispatch sites can unblock them, and learn the peer's
+                            // Noise pubkey so Ember-native dialing doesn't require a
+                            // separate exchange. Doing this in both branches (rather
+                            // than once inside `extract_kad_sources`) keeps that helper
+                            // a pure function with no `state` dependency.
                             for s in &all {
-                                if s.is_ember_capable && !s.ip.is_unspecified() && s.tcp_port != 0 {
-                                    state.ember_capable_peers.insert((s.ip, s.tcp_port));
+                                if !s.ip.is_unspecified() && s.tcp_port != 0 {
+                                    if s.is_ember_capable {
+                                        state.ember_capable_peers.insert((s.ip, s.tcp_port));
+                                    }
+                                    if let Some(npub) = s.ember_noise_pub {
+                                        record_ember_noise_key(
+                                            &mut state.ember_noise_keys,
+                                            s.ip,
+                                            s.tcp_port,
+                                            npub,
+                                        );
+                                    }
                                 }
                             }
                             let before = all.len();
@@ -12399,9 +12675,12 @@ pub async fn start_network(
                 // Drop entries older than `KNOWN_EMBER_PEER_TTL` before
                 // building the wire list so we never advertise a peer
                 // we haven't heard from in a day. Cheap O(N) sweep — N
-                // is hard-capped at MAX_KNOWN_EMBER_PEERS = 500.
+                // is hard-capped at MAX_KNOWN_EMBER_PEERS = 500. The
+                // sibling Noise-key cache uses the same TTL so prune
+                // it on the same cadence.
                 let pruned_before = state.known_ember_peers.len();
                 prune_stale_ember_peers(&mut state.known_ember_peers);
+                prune_stale_ember_noise_keys(&mut state.ember_noise_keys);
                 let pruned_after = state.known_ember_peers.len();
                 if pruned_after != pruned_before {
                     state.stats.ember_peers = pruned_after as u32;
@@ -16393,6 +16672,38 @@ async fn handle_command(
                 return;
             }
 
+            // Resolve the peer's Noise pubkey: prefer an explicit
+            // value from the caller, otherwise fall back to the cache
+            // populated from KAD source publishes carrying
+            // `EMBER_NOISE_PUB_TAG`. A cache miss is surfaced as a
+            // clear error so the harness can distinguish "we have no
+            // key for this peer" from "Noise handshake failed".
+            let resolved_pubkey = match peer_pubkey {
+                Some(k) => k,
+                None => match (addr.ip(), addr.port()) {
+                    (std::net::IpAddr::V4(v4), port) => {
+                        match lookup_ember_noise_key(&state.ember_noise_keys, v4, port) {
+                            Some(k) => k,
+                            None => {
+                                let _ = tx.send(Err(format!(
+                                    "No cached Ember Noise pubkey for {addr}; \
+                                     pass peer_pubkey_hex explicitly or wait for \
+                                     a KAD source publish to populate the cache"
+                                )));
+                                return;
+                            }
+                        }
+                    }
+                    _ => {
+                        let _ = tx.send(Err(
+                            "Noise pubkey lookup is IPv4-only — pass peer_pubkey_hex explicitly"
+                                .into(),
+                        ));
+                        return;
+                    }
+                },
+            };
+
             // Bound the pending map. A stuck peer (no Pong reply) keeps
             // an entry around until `cleanup` reaps the session, but
             // each entry is small and the cap prevents a misbehaving
@@ -16416,7 +16727,7 @@ async fn handle_command(
 
             match state
                 .ember_transport
-                .prepare_outgoing(addr, Some(&peer_pubkey), &payload)
+                .prepare_outgoing(addr, Some(&resolved_pubkey), &payload)
             {
                 ember::transport::OutgoingResult::Ready { packet }
                 | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
@@ -19077,6 +19388,12 @@ struct KadSource {
     /// sources from the ed2k server, or older Ember peers from before
     /// this tag existed).
     is_ember_capable: bool,
+    /// Ember Noise X25519 static public key, when the source publish
+    /// carried [`kad::publish::EMBER_NOISE_PUB_TAG`]. Cached by the
+    /// network task on receive so callers like `ember_ping_peer` can
+    /// dial the peer's Ember-native UDP transport without a separate
+    /// key exchange.
+    ember_noise_pub: Option<[u8; 32]>,
 }
 
 /// Returns true if this `KadSource` actually describes us — either by
@@ -19121,6 +19438,7 @@ fn extract_kad_sources(
         let mut server_port = 0u16;
         let mut buddy_hash: Option<[u8; 16]> = None;
         let mut is_ember_capable = false;
+        let mut ember_noise_pub: Option<[u8; 32]> = None;
         for tag in &entry.tags {
             match &tag.name {
                 TagName::Id(TAG_SOURCEIP) => {
@@ -19169,6 +19487,21 @@ fn extract_kad_sources(
                             (v & kad::publish::EMBER_CAP_RELAY_PUNCH_V1) != 0;
                     }
                 }
+                // Ember Noise pubkey for the publisher — see
+                // `kad::publish::EMBER_NOISE_PUB_TAG` for the emit
+                // side. Reject anything that isn't exactly 32 bytes
+                // (the X25519 raw key length) and reject all-zero
+                // keys (suppressed on emission, treat as malformed
+                // on receive too).
+                TagName::Str(s) if s == kad::publish::EMBER_NOISE_PUB_TAG => {
+                    if let Some(blob) = tag.blob_value() {
+                        if blob.len() == 32 && blob != [0u8; 32] {
+                            let mut key = [0u8; 32];
+                            key.copy_from_slice(&blob);
+                            ember_noise_pub = Some(key);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -19198,6 +19531,7 @@ fn extract_kad_sources(
                             ed2k_server_ip: 0,
                             ed2k_server_port: 0,
                             is_ember_capable,
+                            ember_noise_pub,
                         });
                     }
                 }
@@ -19219,6 +19553,7 @@ fn extract_kad_sources(
                             ed2k_server_ip: server_ip,
                             ed2k_server_port: server_port,
                             is_ember_capable,
+                            ember_noise_pub,
                         });
                     }
                 } else if ip != 0 && port != 0 {
@@ -19238,6 +19573,7 @@ fn extract_kad_sources(
                             ed2k_server_ip: 0,
                             ed2k_server_port: 0,
                             is_ember_capable,
+                            ember_noise_pub,
                         });
                     }
                 }
@@ -19264,6 +19600,7 @@ fn extract_kad_sources(
                             ed2k_server_ip: 0,
                             ed2k_server_port: 0,
                             is_ember_capable,
+                            ember_noise_pub,
                         });
                     }
                 } else if ip != 0 && port != 0 {
@@ -19284,6 +19621,7 @@ fn extract_kad_sources(
                             ed2k_server_ip: 0,
                             ed2k_server_port: 0,
                             is_ember_capable,
+                            ember_noise_pub,
                         });
                     }
                 }
@@ -19307,6 +19645,7 @@ fn extract_kad_sources(
                             ed2k_server_ip: 0,
                             ed2k_server_port: 0,
                             is_ember_capable,
+                            ember_noise_pub,
                         });
                     }
                 }
@@ -19329,6 +19668,7 @@ fn extract_kad_sources(
                             ed2k_server_ip: 0,
                             ed2k_server_port: 0,
                             is_ember_capable,
+                            ember_noise_pub,
                         });
                     }
                 }

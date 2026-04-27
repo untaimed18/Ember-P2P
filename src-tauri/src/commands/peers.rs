@@ -722,17 +722,23 @@ pub async fn get_ember_diagnostics(
 /// harness (`scripts\harness.ps1`) to verify the feature-flagged
 /// integration end-to-end.
 ///
-/// `peer_pubkey_hex` must be the 64-char hex encoding of the peer's
-/// `local_noise_public_key` (also returned by
-/// `get_ember_diagnostics`). `peer_ip` is parsed as an IPv4 / IPv6
-/// literal — DNS is intentionally not resolved here, since the
-/// harness deals in `127.0.0.1` and explicit addresses only.
+/// `peer_pubkey_hex` is **optional**. When provided, it must be the
+/// 64-char hex encoding of the peer's `local_noise_public_key` (also
+/// returned by `get_ember_diagnostics`). When omitted (or empty), the
+/// network task looks the pubkey up in the cache populated from KAD
+/// source publishes — the production path. A cache miss is reported
+/// as a clear error so the harness can distinguish "we don't know
+/// this peer" from "Noise handshake failed".
+///
+/// `peer_ip` is parsed as an IPv4 / IPv6 literal — DNS is
+/// intentionally not resolved here, since the harness deals in
+/// `127.0.0.1` and explicit addresses only.
 #[tauri::command]
 pub async fn ember_ping_peer(
     state: tauri::State<'_, AppState>,
     peer_ip: String,
     peer_port: u16,
-    peer_pubkey_hex: String,
+    peer_pubkey_hex: Option<String>,
     timeout_ms: Option<u64>,
 ) -> Result<EmberPingResult, String> {
     let timeout = timeout_ms
@@ -748,16 +754,28 @@ pub async fn ember_ping_peer(
         .map_err(|e| format!("Invalid peer_ip '{peer_ip}': {e}"))?;
     let addr = SocketAddr::new(ip, peer_port);
 
-    let pubkey_bytes = hex::decode(&peer_pubkey_hex)
-        .map_err(|e| format!("peer_pubkey_hex is not valid hex: {e}"))?;
-    if pubkey_bytes.len() != 32 {
-        return Err(format!(
-            "peer_pubkey_hex must decode to 32 bytes, got {}",
-            pubkey_bytes.len()
-        ));
-    }
-    let mut peer_pubkey = [0u8; 32];
-    peer_pubkey.copy_from_slice(&pubkey_bytes);
+    // Treat both an absent field and an empty string as "look it up
+    // from the KAD-fed Noise key cache". The IPC layer can't
+    // distinguish those two on the JS side cleanly, so collapsing
+    // them here keeps the two valid invocations
+    // (`ember_ping_peer({...})` with no pubkey and
+    // `ember_ping_peer({..., peerPubkeyHex: ''})`) both working.
+    let peer_pubkey: Option<[u8; 32]> = match peer_pubkey_hex.as_deref() {
+        Some(s) if !s.is_empty() => {
+            let bytes = hex::decode(s)
+                .map_err(|e| format!("peer_pubkey_hex is not valid hex: {e}"))?;
+            if bytes.len() != 32 {
+                return Err(format!(
+                    "peer_pubkey_hex must decode to 32 bytes, got {}",
+                    bytes.len()
+                ));
+            }
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&bytes);
+            Some(k)
+        }
+        _ => None,
+    };
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
