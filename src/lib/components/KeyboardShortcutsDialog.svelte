@@ -29,7 +29,7 @@
         { keys: ['F1'], label: 'Show this shortcut list' },
         { keys: ['Ctrl', 'B'], label: 'Collapse or expand the sidebar' },
         { keys: ['Alt', '1'], label: 'Jump to KAD Network' },
-        { keys: ['Alt', '2'], label: 'Jump to Servers' },
+        { keys: ['Alt', '2'], label: 'Jump to ED2K Servers' },
         { keys: ['Alt', '3'], label: 'Jump to Search' },
         { keys: ['Alt', '4'], label: 'Jump to Transfers' },
         { keys: ['Alt', '5'], label: 'Jump to Library' },
