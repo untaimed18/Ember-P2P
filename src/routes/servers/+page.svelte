@@ -541,7 +541,7 @@
 }} />
 
 <div class="page-header">
-  <h2>Servers</h2>
+  <h2>ED2K Servers</h2>
   <div class="header-actions">
     <button class="ghost" onclick={handleManualRefresh} disabled={loading}>Refresh</button>
     {#if selectionCount > 1}
