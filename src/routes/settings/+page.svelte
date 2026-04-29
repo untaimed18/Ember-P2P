@@ -541,6 +541,15 @@
     applyTheme(t);
   }
 
+  // Local helper used by the close-behavior radio cards. The arrow
+  // callbacks the buttons emit lose the `settings != null` narrowing
+  // svelte-check derives from the surrounding `{:else}` branch, so we
+  // route the assignment through a function with an explicit guard.
+  function pickCloseBehavior(behavior: 'ask' | 'tray' | 'exit') {
+    if (!settings) return;
+    settings.close_to_tray_behavior = behavior;
+  }
+
   $effect(() => {
     activeSection;
     untrack(() => {
@@ -705,18 +714,74 @@
             <input id="nickname" bind:value={settings.nickname} placeholder="Your display name" />
           </div>
           <div class="field">
-            <label for="close-behavior">When closing the window</label>
+            <span class="field-label">When closing the window</span>
             <span class="hint">
-              Choose what happens when you click the title-bar X. "Ask each
-              time" (default) opens a dialog with both options. The system
+              Choose what happens when you click the title-bar X. The system
               tray icon stays available either way so you can reopen Ember
               from there.
             </span>
-            <select id="close-behavior" bind:value={settings.close_to_tray_behavior}>
-              <option value="ask">Ask each time</option>
-              <option value="tray">Minimize to system tray</option>
-              <option value="exit">Exit Ember</option>
-            </select>
+            <div class="behavior-picker" role="radiogroup" aria-label="When closing the window">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={settings.close_to_tray_behavior === 'ask'}
+                class="behavior-card"
+                class:selected={settings.close_to_tray_behavior === 'ask'}
+                onclick={() => pickCloseBehavior('ask')}
+              >
+                <span class="behavior-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h13A1.5 1.5 0 0 1 20 5.5v9A1.5 1.5 0 0 1 18.5 16H13l-4 4v-4H5.5A1.5 1.5 0 0 1 4 14.5z"/>
+                    <path d="M9.5 8.5a2.5 2.5 0 1 1 3.7 2.2c-.7.4-1.2.9-1.2 1.6"/>
+                    <circle cx="12" cy="14" r="0.6" fill="currentColor"/>
+                  </svg>
+                </span>
+                <span class="behavior-title">Ask each time</span>
+                <span class="behavior-desc">Show a dialog with both options</span>
+                {#if settings.close_to_tray_behavior === 'ask'}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
+              </button>
+
+              <button
+                type="button"
+                role="radio"
+                aria-checked={settings.close_to_tray_behavior === 'tray'}
+                class="behavior-card"
+                class:selected={settings.close_to_tray_behavior === 'tray'}
+                onclick={() => pickCloseBehavior('tray')}
+              >
+                <span class="behavior-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3.5" y="3.5" width="17" height="11" rx="2"/>
+                    <line x1="12" y1="6.5" x2="12" y2="13"/>
+                    <polyline points="9,10.5 12,13.5 15,10.5"/>
+                    <line x1="3.5" y1="19" x2="20.5" y2="19"/>
+                  </svg>
+                </span>
+                <span class="behavior-title">Minimize to tray</span>
+                <span class="behavior-desc">Keep running in the background</span>
+                {#if settings.close_to_tray_behavior === 'tray'}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
+              </button>
+
+              <button
+                type="button"
+                role="radio"
+                aria-checked={settings.close_to_tray_behavior === 'exit'}
+                class="behavior-card"
+                class:selected={settings.close_to_tray_behavior === 'exit'}
+                onclick={() => pickCloseBehavior('exit')}
+              >
+                <span class="behavior-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M13 4h5a1.5 1.5 0 0 1 1.5 1.5v13A1.5 1.5 0 0 1 18 20h-5"/>
+                    <line x1="15" y1="12" x2="4" y2="12"/>
+                    <polyline points="7.5,8.5 4,12 7.5,15.5"/>
+                  </svg>
+                </span>
+                <span class="behavior-title">Exit Ember</span>
+                <span class="behavior-desc">Quit the app fully each time</span>
+                {#if settings.close_to_tray_behavior === 'exit'}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
+              </button>
+            </div>
           </div>
         </div>
       </section>
@@ -1900,6 +1965,106 @@
     font-weight: 500;
     color: var(--text-secondary);
     padding: 6px 0 8px;
+  }
+
+  /* ── Close-behavior picker ─────────────────────── */
+  .behavior-picker {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+    margin-top: 8px;
+  }
+
+  .behavior-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 14px 14px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    text-align: left;
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+  }
+
+  .behavior-card:hover {
+    border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+    background: var(--bg-hover);
+  }
+
+  .behavior-card:focus-visible {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 30%, transparent);
+  }
+
+  .behavior-card.selected {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, var(--bg-surface));
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+
+  .behavior-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+    margin-bottom: 2px;
+  }
+
+  .behavior-icon :global(svg) {
+    width: 18px;
+    height: 18px;
+    display: block;
+  }
+
+  .behavior-card.selected .behavior-icon {
+    background: var(--accent);
+    color: #fff;
+  }
+
+  .behavior-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    line-height: 1.25;
+  }
+
+  .behavior-desc {
+    font-size: 11.5px;
+    color: var(--text-muted);
+    line-height: 1.35;
+  }
+
+  .behavior-check {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: var(--shadow-sm);
+  }
+
+  @media (max-width: 640px) {
+    .behavior-picker {
+      grid-template-columns: 1fr;
+    }
   }
 
   .speed-test-section {
