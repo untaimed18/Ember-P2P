@@ -12,6 +12,8 @@ mod types;
 use tauri::Emitter;
 
 use std::sync::Arc;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 use tokio::sync::{mpsc, RwLock};
 use tracing::info;
@@ -235,7 +237,85 @@ pub fn run() {
                 shared_folder_watcher,
                 background_scans: Arc::new(RwLock::new(std::collections::HashMap::new())),
                 background_scan_seq: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                quit_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                close_behavior: Arc::new(parking_lot::RwLock::new(
+                    settings.close_to_tray_behavior.clone(),
+                )),
             });
+
+            // System tray icon. Rendered unconditionally so users who pick
+            // "Minimize to Tray" (or the saved `tray` behavior) always have
+            // a way back into the running app — without this, hiding the
+            // window would orphan the process. The menu also exposes an
+            // explicit Quit entry that routes through `app.exit(0)` so the
+            // existing `RunEvent::Exit` shutdown sequence still runs.
+            let show_item = MenuItem::with_id(
+                app,
+                "tray_show",
+                "Show Ember",
+                true,
+                None::<&str>,
+            )?;
+            let quit_item = MenuItem::with_id(
+                app,
+                "tray_quit",
+                "Quit Ember",
+                true,
+                None::<&str>,
+            )?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+            let tray_icon = app
+                .default_window_icon()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing default window icon for tray"))?;
+
+            let _tray = TrayIconBuilder::with_id("main")
+                .icon(tray_icon)
+                .tooltip("Ember")
+                .menu(&tray_menu)
+                // Default to "the menu shows on left-click" so users who
+                // can't right-click (touchscreens, accessibility tools)
+                // can still get to Show/Quit. Linux ignores this flag.
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "tray_show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.unminimize();
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "tray_quit" => {
+                        if let Some(state) = app.try_state::<AppState>() {
+                            state
+                                .quit_confirmed
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    // Single left-click reveals the window. The double-click
+                    // event is platform-conditional (macOS doesn't fire it),
+                    // so we settle for the click-up flavor of the single
+                    // click which is universal.
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.unminimize();
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
 
             let index_clone = local_index.clone();
             let shared_folders = settings.shared_folders.clone();
@@ -597,6 +677,10 @@ pub fn run() {
             commands::settings::update_settings,
             commands::settings::download_nodes_dat,
             commands::settings::download_ipfilter,
+            commands::settings::hide_to_tray,
+            commands::settings::show_main_window,
+            commands::settings::quit_app,
+            commands::settings::set_close_behavior,
             commands::security::get_ip_filter_stats,
             commands::security::add_ip_filter_range,
             commands::security::remove_ip_filter_range,
@@ -625,6 +709,79 @@ pub fn run() {
             commands::preview::preview_file,
             commands::speed_test::run_speed_test,
         ])
+        .on_window_event(|window, event| {
+            // Title-bar X handler. Decides whether to fully exit, hide to
+            // the system tray, or hand off to the frontend dialog based on
+            // the user's saved `close_to_tray_behavior`. Only the main
+            // window participates — auxiliary windows (none today, but
+            // future about/preview popups) keep their normal close path.
+            if window.label() != "main" {
+                return;
+            }
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else { return };
+
+            let app_handle = window.app_handle();
+            let Some(state) = app_handle.try_state::<AppState>() else {
+                return;
+            };
+
+            // User already explicitly chose Quit (dialog button or tray
+            // menu) — `quit_app` set the flag and called `app.exit(0)`.
+            // Let the destroy proceed; `RunEvent::Exit` runs the shutdown.
+            if state
+                .quit_confirmed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+
+            // Read the saved close behavior. We mirror the canonical value
+            // into `state.close_behavior` (a synchronous `parking_lot`
+            // RwLock) precisely so this UI-thread handler doesn't have to
+            // block on the async tokio lock that wraps `AppConfig`.
+            let behavior = {
+                let guard = state.close_behavior.read();
+                match guard.as_str() {
+                    "exit" => "exit",
+                    "tray" => "tray",
+                    _ => "ask",
+                }
+            };
+
+            match behavior {
+                "exit" => {
+                    // Default close path. Don't call `prevent_close`; let
+                    // Tauri tear the window down and fire `RunEvent::Exit`.
+                }
+                "tray" => {
+                    api.prevent_close();
+                    if let Err(e) = window.hide() {
+                        tracing::warn!("Failed to hide window for close-to-tray: {e}");
+                    }
+                }
+                _ => {
+                    // "ask" — bounce to the frontend so it can render the
+                    // themed three-button confirmation dialog (Cancel /
+                    // Minimize to Tray / Exit Ember). The frontend then
+                    // re-issues either `hide_to_tray` or `quit_app` to
+                    // continue down one of the other branches above.
+                    api.prevent_close();
+                    if let Err(e) = app_handle.emit("close-requested", ()) {
+                        tracing::warn!(
+                            "Failed to emit close-requested event; falling back to exit: {e}"
+                        );
+                        // The webview never got the message, so the user
+                        // would be stuck with an unresponsive close button.
+                        // Mark the close as confirmed and exit so they
+                        // aren't trapped.
+                        state
+                            .quit_confirmed
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        app_handle.exit(0);
+                    }
+                }
+            }
+        })
         .build(tauri::generate_context!())
         .unwrap_or_else(|e| {
             tracing::error!("Fatal: failed to build Tauri application: {e}");
