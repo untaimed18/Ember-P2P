@@ -26,7 +26,10 @@ tauri-build = { version = "2", features = [] }
 harness = ["tauri/devtools"]
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `tray-icon` enables the `tauri::tray` and `tauri::menu` APIs we use to
+# render the "Ember is still running in the system tray" icon when the
+# user closes the window with the close-to-tray behavior selected.
+tauri = { version = "2", features = ["tray-icon"] }
 
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
