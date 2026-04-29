@@ -1,3 +1,4 @@
+use tauri::Manager;
 use tracing::info;
 
 
@@ -29,6 +30,15 @@ const MAX_FILENAME_CLEANUPS_LEN: usize = 16 * 1024;
 fn validate_settings(settings: &AppSettings) -> Result<(), String> {
     if settings.spam_filter_profile != "relaxed" && settings.spam_filter_profile != "balanced" && settings.spam_filter_profile != "aggressive" {
         return Err("Spam filter profile must be 'relaxed', 'balanced', or 'aggressive'".into());
+    }
+    // Accept the same three values the UI exposes; reject anything else
+    // so a future migration / hand-edited config can't silently disable
+    // the close-confirmation dialog by dropping a typo into config.json.
+    if settings.close_to_tray_behavior != "ask"
+        && settings.close_to_tray_behavior != "tray"
+        && settings.close_to_tray_behavior != "exit"
+    {
+        return Err("Close behavior must be 'ask', 'tray', or 'exit'".into());
     }
     if settings.download_folder.len() > MAX_PATH_LEN {
         return Err(format!("Download folder path exceeds {MAX_PATH_LEN} bytes"));
@@ -172,6 +182,7 @@ pub async fn update_settings(
 ) -> Result<String, String> {
     let mut settings = settings;
     settings.spam_filter_profile = settings.spam_filter_profile.trim().to_ascii_lowercase();
+    settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
     validate_settings(&settings)?;
 
     let old_settings = {
@@ -193,6 +204,11 @@ pub async fn update_settings(
             crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
         }).await.map_err(|e| format!("Save failed: {e}"))?.map_err(|e| format!("Save failed: {e}"))?;
     }
+
+    // Keep the synchronous mirror used by the close-event handler in sync
+    // with the canonical config so that a behavior change made here takes
+    // effect on the very next title-bar X click without restarting.
+    *state.close_behavior.write() = settings.close_to_tray_behavior.clone();
 
     state
         .bandwidth_limiter
@@ -411,4 +427,85 @@ pub async fn download_ipfilter(
     };
     info!("{msg}");
     Ok(msg)
+}
+
+// ---------------------------------------------------------------------------
+// Window lifecycle commands wired up to the close-to-tray UX.
+//
+// `hide_to_tray` is invoked from the close-confirmation dialog when the user
+// picks "Minimize to Tray". `quit_app` is the explicit-exit path (dialog's
+// "Exit Ember" button + the tray menu's Quit entry); we route through
+// `app.exit(0)` so the existing `RunEvent::Exit` handler in `lib::run` drains
+// the network/save pipeline before the process dies.
+//
+// `set_close_behavior` is a thin wrapper over `update_settings` for the case
+// where the dialog flips the saved preference at the same moment as the
+// close action — keeps the round trip on a tiny payload instead of pushing
+// the entire AppSettings struct just to change a single string.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        window
+            .hide()
+            .map_err(|e| format!("Failed to hide main window: {e}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        // Unminimize first — `show()` doesn't restore from minimized on
+        // Windows, only from the hidden state. Without this the tray-icon
+        // double-click would be a no-op for users who minimized through
+        // the title-bar instead of closing.
+        let _ = window.unminimize();
+        window
+            .show()
+            .map_err(|e| format!("Failed to show main window: {e}"))?;
+        let _ = window.set_focus();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn quit_app(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    // Mark the close as user-confirmed so the `WindowEvent::CloseRequested`
+    // hook in `lib::run` lets the destroy proceed even when the saved
+    // behavior is "tray" or "ask". Exit is initiated via `app.exit(0)`,
+    // which still triggers `RunEvent::Exit` and the network shutdown.
+    state
+        .quit_confirmed
+        .store(true, std::sync::atomic::Ordering::Release);
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_close_behavior(
+    state: tauri::State<'_, AppState>,
+    behavior: String,
+) -> Result<(), String> {
+    let normalized = behavior.trim().to_ascii_lowercase();
+    if normalized != "ask" && normalized != "tray" && normalized != "exit" {
+        return Err("Close behavior must be 'ask', 'tray', or 'exit'".into());
+    }
+    let save_data = {
+        let mut config = state.config.write().await;
+        config.settings.close_to_tray_behavior = normalized.clone();
+        config
+            .prepare_save()
+            .map_err(|e| format!("Failed to serialize settings: {e}"))?
+    };
+    let (data, tmp, final_path) = save_data;
+    tokio::task::spawn_blocking(move || {
+        crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+    })
+    .await
+    .map_err(|e| format!("Save failed: {e}"))?
+    .map_err(|e| format!("Save failed: {e}"))?;
+    *state.close_behavior.write() = normalized;
+    Ok(())
 }

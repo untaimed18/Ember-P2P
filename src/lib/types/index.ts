@@ -338,4 +338,11 @@ export interface AppSettings {
   rendezvous_url: string;
   /** Experimental: enable the Ember-native Noise-encrypted UDP transport. */
   ember_native_enabled: boolean;
+  /** What to do when the user closes the main window via the title-bar X.
+   *
+   *  - `'ask'` (default): show a dialog letting the user pick.
+   *  - `'tray'`: hide the window to the system tray; Ember keeps running.
+   *  - `'exit'`: fully quit the application.
+   */
+  close_to_tray_behavior: 'ask' | 'tray' | 'exit';
 }

@@ -5,15 +5,17 @@
   import SetupWizard from '$lib/components/SetupWizard.svelte';
   import StatusBar from '$lib/components/StatusBar.svelte';
   import Toast from '$lib/components/Toast.svelte';
+  import CloseAppDialog from '$lib/components/CloseAppDialog.svelte';
 
   import { initNetworkStore, cleanupNetworkStore, startStatsPoll } from '$lib/stores/network';
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
-  import { getSettings } from '$lib/api/settings';
+  import { getSettings, hideToTray, quitApp, setCloseBehavior } from '$lib/api/settings';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
   let { children } = $props();
   let initialized = $state(false);
@@ -22,10 +24,50 @@
   let splashExiting = $state(false);
   let showWizard = $state(false);
   let wizardSettings: AppSettings | null = $state(null);
+  let showCloseDialog = $state(false);
 
   async function onWizardComplete(_updated: AppSettings) {
     showWizard = false;
     wizardSettings = null;
+  }
+
+  // Close-confirmation dialog handlers. The Tauri side has already called
+  // `prevent_close()` by the time we hear the `close-requested` event, so
+  // these handlers are responsible for telling the backend what to do
+  // next: hide to tray, exit, or (cancel) leave the window visible.
+  async function handleCloseToTray(remember: boolean) {
+    if (remember) {
+      try {
+        await setCloseBehavior('tray');
+      } catch (e) {
+        console.error('Failed to persist close-to-tray preference:', e);
+      }
+    }
+    try {
+      await hideToTray();
+    } catch (e) {
+      console.error('Failed to hide window to tray:', e);
+    }
+  }
+
+  async function handleCloseExit(remember: boolean) {
+    if (remember) {
+      try {
+        await setCloseBehavior('exit');
+      } catch (e) {
+        console.error('Failed to persist exit-on-close preference:', e);
+      }
+    }
+    try {
+      await quitApp();
+    } catch (e) {
+      console.error('Failed to quit Ember:', e);
+    }
+  }
+
+  function handleCloseCancel() {
+    // Nothing to do — the window is already visible because the backend
+    // called `prevent_close`. Closing the dialog is enough.
   }
 
   // Register all event listeners immediately — don't wait for onMount/render.
@@ -35,6 +77,16 @@
     initSearchStore(),
     initFriendsStore(),
   ]);
+
+  // Register the close-requested listener at the top of the module so it's
+  // active before the splash exits — otherwise a fast user pressing X
+  // during init would slip through to a default-exit and skip the dialog.
+  const closeListenerPromise: Promise<UnlistenFn> = listen('close-requested', () => {
+    showCloseDialog = true;
+  }).catch((e) => {
+    console.error('Failed to register close-requested listener:', e);
+    return (() => {}) as UnlistenFn;
+  });
 
   onMount(() => {
     initTheme();
@@ -152,6 +204,7 @@
       cleanupTransferStore();
       cleanupSearchStore();
       cleanupFriendsStore();
+      void closeListenerPromise.then((unlisten) => unlisten());
     };
   });
 </script>
@@ -192,6 +245,13 @@
   </div>
   <Toast />
 </div>
+
+<CloseAppDialog
+  bind:open={showCloseDialog}
+  onhide={handleCloseToTray}
+  onexit={handleCloseExit}
+  oncancel={handleCloseCancel}
+/>
 
 <style>
   .skip-to-content {

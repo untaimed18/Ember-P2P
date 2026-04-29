@@ -71,6 +71,21 @@ pub struct AppState {
     /// Monotonic counter for assigning unique ids in `background_scans`.
     #[allow(dead_code)]
     pub background_scan_seq: Arc<AtomicUsize>,
+    /// Set to `true` when the user has explicitly chosen "Exit Ember" (via the
+    /// close-confirmation dialog or the tray-menu Quit entry). Read inside the
+    /// `WindowEvent::CloseRequested` handler so a confirmed quit bypasses the
+    /// "hide to tray / show dialog" branches and lets the window destroy
+    /// proceed normally. Without this flag, picking Exit from a custom dialog
+    /// would still get intercepted by the close-to-tray policy and the window
+    /// would just hide instead of quitting.
+    pub quit_confirmed: Arc<AtomicBool>,
+    /// Mirror of `config.settings.close_to_tray_behavior` behind a synchronous
+    /// `parking_lot::RwLock` so the `WindowEvent::CloseRequested` handler can
+    /// read it from the main UI thread without blocking on the async tokio
+    /// `RwLock` that wraps `AppConfig`. Updated alongside the canonical config
+    /// in `update_settings` and `set_close_behavior`. Holds one of the
+    /// validated strings: `"ask"`, `"tray"`, or `"exit"`.
+    pub close_behavior: Arc<parking_lot::RwLock<String>>,
 }
 
 impl AppState {
