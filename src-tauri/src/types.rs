@@ -544,6 +544,19 @@ pub struct AppSettings {
     /// validation, not a replacement for any user-facing feature.
     #[serde(default)]
     pub ember_native_enabled: bool,
+    /// What to do when the user closes the main window via the title-bar X.
+    ///
+    /// - `"ask"` (default): emit a dialog asking the user to choose.
+    /// - `"tray"`: hide the window to the system tray; the app keeps
+    ///   running and seeding/downloading in the background.
+    /// - `"exit"`: fully quit the application as if the user picked
+    ///   File → Exit.
+    ///
+    /// Stored as a string (not an enum) to mirror `spam_filter_profile`
+    /// — easier to extend later without breaking deserialization for
+    /// users on older configs.
+    #[serde(default = "default_close_to_tray_behavior")]
+    pub close_to_tray_behavior: String,
 }
 
 /// Sanitized ed2k download limits derived from [`AppSettings`] (clamped for safety).
@@ -722,6 +735,10 @@ fn default_spam_filter_profile() -> String {
     "balanced".to_string()
 }
 
+fn default_close_to_tray_behavior() -> String {
+    "ask".to_string()
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         let download_dir = directories::UserDirs::new()
@@ -784,6 +801,7 @@ impl Default for AppSettings {
             max_friends: default_max_friends(),
             rendezvous_url: default_rendezvous_url(),
             ember_native_enabled: false,
+            close_to_tray_behavior: default_close_to_tray_behavior(),
         }
     }
 }

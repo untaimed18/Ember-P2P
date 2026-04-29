@@ -704,6 +704,20 @@
             <label for="nickname">Nickname</label>
             <input id="nickname" bind:value={settings.nickname} placeholder="Your display name" />
           </div>
+          <div class="field">
+            <label for="close-behavior">When closing the window</label>
+            <span class="hint">
+              Choose what happens when you click the title-bar X. "Ask each
+              time" (default) opens a dialog with both options. The system
+              tray icon stays available either way so you can reopen Ember
+              from there.
+            </span>
+            <select id="close-behavior" bind:value={settings.close_to_tray_behavior}>
+              <option value="ask">Ask each time</option>
+              <option value="tray">Minimize to system tray</option>
+              <option value="exit">Exit Ember</option>
+            </select>
+          </div>
         </div>
       </section>
 
