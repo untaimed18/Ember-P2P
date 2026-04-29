@@ -792,6 +792,29 @@ pub fn run() {
                 network::ed2k::preview::cleanup_previews();
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     state.bw_shutdown.store(true, std::sync::atomic::Ordering::Release);
+
+                    // Signal every in-flight hash worker to stop ASAP. The
+                    // startup indexer (and `reload_shared_files`) check
+                    // these flags between files and mid-file via
+                    // `FileIndexer::hash_file_cancellable`, so flipping
+                    // them cuts the worst-case shutdown wait from the
+                    // full 5-second `scanning_count` grace window down
+                    // to ~100ms (one MD4 chunk). Without this the
+                    // window disappears immediately after the user
+                    // clicks Exit but the process keeps running until
+                    // the deadline elapses, which surfaces visually
+                    // as "stuck on the Chromium UnregisterClass error".
+                    {
+                        let cancel_flags = state.hash_cancel_flags.clone();
+                        let rt = tauri::async_runtime::handle();
+                        rt.block_on(async move {
+                            let flags = cancel_flags.read().await;
+                            for flag in flags.values() {
+                                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        });
+                    }
+
                     let tx = state.network_tx.clone();
                     match tx.blocking_send(network::NetworkCommand::Shutdown) {
                         Ok(()) => info!("Sent shutdown command to network, waiting for save..."),
