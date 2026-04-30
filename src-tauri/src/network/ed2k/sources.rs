@@ -87,6 +87,10 @@ impl DownloadSourceEntry {
     /// eMule GetTimeUntilReask(): seconds until this source should be reasked.
     /// Returns 0 when the source is ready for a new connection attempt.
     pub fn time_until_reask(&self) -> u64 {
+        self.time_until_reask_at(Instant::now())
+    }
+
+    fn time_until_reask_at(&self, now: Instant) -> u64 {
         let interval = match &self.state {
             DownloadSourceState::New => return 0,
             DownloadSourceState::NoneNeededParts => (FILEREASKTIME_SECS * 2) as u64,
@@ -101,20 +105,24 @@ impl DownloadSourceEntry {
                 // leaves the source permanently "active" and the
                 // scheduler can't pick it up again until the next full
                 // list reset.
-                if self.state_changed.elapsed().as_secs() >= Self::CONNECTING_WATCHDOG_SECS {
+                if now.saturating_duration_since(self.state_changed).as_secs() >= Self::CONNECTING_WATCHDOG_SECS {
                     return 0;
                 }
                 return u64::MAX;
             }
             DownloadSourceState::LowToLowIp | DownloadSourceState::EmberRelay | DownloadSourceState::Banned => return u64::MAX,
         };
-        let elapsed = self.last_asked.elapsed().as_secs();
+        let elapsed = now.saturating_duration_since(self.last_asked).as_secs();
         interval.saturating_sub(elapsed)
     }
 
     /// Whether enough time has passed since the last TCP attempt.
     pub fn can_try_tcp(&self) -> bool {
-        self.last_asked.elapsed().as_secs() >= MIN_TCP_RECONNECT_SECS as u64
+        self.can_try_tcp_at(Instant::now())
+    }
+
+    fn can_try_tcp_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_asked).as_secs() >= MIN_TCP_RECONNECT_SECS as u64
             || matches!(self.state, DownloadSourceState::New)
     }
 
@@ -271,11 +279,17 @@ impl PerFileSourceList {
     /// filter the returned sources through `DeadSourceList::is_dead_source_for_file`
     /// before initiating connections.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub fn sources_ready_for_reask(&self) -> Vec<(Ipv4Addr, u16)> {
+        self.sources_ready_for_reask_at(Instant::now())
+    }
+
+    #[cfg(test)]
+    fn sources_ready_for_reask_at(&self, now: Instant) -> Vec<(Ipv4Addr, u16)> {
         let mut ready: Vec<&DownloadSourceEntry> = self.sources.iter()
             .filter(|s| {
-                s.time_until_reask() == 0
-                    && s.can_try_tcp()
+                s.time_until_reask_at(now) == 0
+                    && s.can_try_tcp_at(now)
                     && !matches!(s.state, DownloadSourceState::Banned | DownloadSourceState::LowToLowIp | DownloadSourceState::EmberRelay)
             })
             .collect();
@@ -1052,10 +1066,9 @@ mod tests {
 
         pfs.set_on_queue(a, 4662, Some(50));
         pfs.set_on_queue(b, 4663, Some(5));
-        pfs.sources[0].last_asked = pfs.sources[0].last_asked - Duration::from_secs(2000);
-        pfs.sources[1].last_asked = pfs.sources[1].last_asked - Duration::from_secs(2000);
+        let now = Instant::now() + Duration::from_secs(2000);
 
-        let ready = pfs.sources_ready_for_reask();
+        let ready = pfs.sources_ready_for_reask_at(now);
         assert_eq!(ready, vec![(b, 4663), (a, 4662)]);
     }
 

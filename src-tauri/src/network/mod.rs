@@ -1092,7 +1092,9 @@ mod tests {
         // TTL with both the lookup and prune comparisons being strict
         // less-than).
         let now = stale_ts + KNOWN_EMBER_PEER_TTL + std::time::Duration::from_secs(60);
-        let fresh_ts = now - std::time::Duration::from_secs(60);
+        let fresh_ts = now
+            .checked_sub(std::time::Duration::from_secs(60))
+            .expect("synthetic test instant is advanced enough");
 
         let key_fresh = [0x11u8; 32];
         let key_stale = [0x22u8; 32];
@@ -1222,7 +1224,9 @@ mod tests {
         // `now - stale_ts == TTL + 60s` (stale), `now - fresh_ts == 60s`
         // (fresh under the strict less-than comparison in `prune`).
         let now = stale_ts + KNOWN_EMBER_PEER_TTL + std::time::Duration::from_secs(60);
-        let fresh_ts = now - std::time::Duration::from_secs(60);
+        let fresh_ts = now
+            .checked_sub(std::time::Duration::from_secs(60))
+            .expect("synthetic test instant is advanced enough");
 
         map.insert((fresh_ip, 4662), fresh_ts);
         map.insert((stale_ip, 4662), stale_ts);
