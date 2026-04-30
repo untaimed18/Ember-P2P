@@ -242,8 +242,12 @@ mod tests {
             data: vec![1],
             signature: [0u8; 64],
             publisher_key: [0xAA; 32],
-            stored_at: Instant::now() - Duration::from_secs(100),
-            expires_at: Instant::now() - Duration::from_secs(1),
+            stored_at: Instant::now()
+                .checked_sub(Duration::from_secs(100))
+                .unwrap_or_else(Instant::now),
+            expires_at: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
         };
         store.entries.entry(key).or_default().push(record);
 
