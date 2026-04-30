@@ -2140,7 +2140,8 @@ impl Ed2kDownload {
         // ~180 KiB blocks otherwise hits the webview hundreds of times per
         // second. ~200 ms is smooth enough for the UI without saturating it.
         let mut last_progress_emit = std::time::Instant::now()
-            - std::time::Duration::from_millis(500);
+            .checked_sub(std::time::Duration::from_millis(500))
+            .unwrap_or_else(std::time::Instant::now);
         const PROGRESS_EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
         let mut last_epx_resend = std::time::Instant::now();
         // Use the generation we sent at handshake as the resend baseline so

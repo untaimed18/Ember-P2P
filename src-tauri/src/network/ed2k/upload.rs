@@ -4506,7 +4506,7 @@ impl UploadHandler {
                         } else {
                             None
                         };
-                        
+
                         let hash_hex = hex::encode(req_hash);
                         if let Some(file) = self.resolve_upload_file(&req_hash).await {
                             let cached = {
@@ -4545,7 +4545,7 @@ impl UploadHandler {
                                     // Create recovery data for the requested part
                                     // PARTSIZE is constant 9.28MB
                                     let recovery_data = hs.create_part_recovery_data(part_idx, PARTSIZE as usize);
-                                    
+
                                     let mut resp = Vec::with_capacity(16 + 2 + 20 + recovery_data.len());
                                     resp.extend_from_slice(&req_hash);
                                     resp.extend_from_slice(&(part_idx as u16).to_le_bytes());
