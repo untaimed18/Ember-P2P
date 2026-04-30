@@ -101,12 +101,12 @@ impl NatInfo {
         Self {
             nat_type: NatType::Unknown,
             external_addr: None,
-            last_probed: Instant::now() - NAT_REPROBE_INTERVAL * 2,
+            last_probed: Instant::now(),
         }
     }
 
     pub fn needs_reprobe(&self) -> bool {
-        self.last_probed.elapsed() >= NAT_REPROBE_INTERVAL
+        self.nat_type == NatType::Unknown || self.last_probed.elapsed() >= NAT_REPROBE_INTERVAL
     }
 
     #[allow(dead_code)]
