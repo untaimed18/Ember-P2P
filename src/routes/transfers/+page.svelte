@@ -19,7 +19,7 @@
     formatSize, formatSpeed, formatDate, formatDateWithYear, formatDuration,
     formatRemaining, formatRelativeTime, copyToClipboard,
   } from '$lib/utils';
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, untrack } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import type { Transfer, SourceInfo, UploadQueueClient, KnownClient } from '$lib/types';
@@ -2124,6 +2124,23 @@
     }
   });
 
+  // Auto-expand the selected download whenever the Download Clients
+  // bottom tab is the active view. Without this, the tab shows its
+  // "Select a download" placeholder forever — the source list is
+  // bound to `expandedTransferId`, which historically was only set by
+  // double-clicking a row in the Downloads pane, a hidden interaction
+  // with no visual cue. Now a single-click selection is enough.
+  // `activeDownloads` is read inside `untrack` so a download progress
+  // tick (which mutates the array) doesn't re-run the effect.
+  $effect(() => {
+    if (bottomView !== 'download_clients') return;
+    if (selectedDownloadIds.length !== 1) return;
+    const id = selectedDownloadIds[0];
+    if (expandedTransferId === id) return;
+    const t = untrack(() => activeDownloads.find((x) => x.id === id));
+    if (t) toggleSourceDetail(t);
+  });
+
   $effect.pre(() => {
     const visible = visibleActiveDownloadIds;
     const next = selectedDownloadIds.filter((id) => visible.has(id));
@@ -3205,10 +3222,43 @@
                       <line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line>
                     </svg>
                     <p class="empty-cell-title">All sources failed</p>
-                    <p class="empty-cell-sub">Double-click a download to refresh.</p>
+                    <p class="empty-cell-sub">Sources will reappear once the download contacts a peer.</p>
                   </div>
                 </td></tr>
               {/if}
+            {:else if loadingSources && expandedTransferId}
+              <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
+                <div class="empty-cell-body">
+                  <div class="spinner"></div>
+                  <p class="empty-cell-sub">Loading sources…</p>
+                </div>
+              </td></tr>
+            {:else if selectedDownloadIds.length > 1}
+              <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
+                <div class="empty-cell-body">
+                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                    <circle cx="9" cy="7" r="4"></circle>
+                    <path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"></path>
+                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                    <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
+                  </svg>
+                  <p class="empty-cell-title">Multiple downloads selected</p>
+                  <p class="empty-cell-sub">Select a single download above to view its source clients.</p>
+                </div>
+              </td></tr>
+            {:else if activeDownloads.length === 0}
+              <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
+                <div class="empty-cell-body">
+                  <svg class="empty-cell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
+                    <circle cx="9" cy="7" r="4"></circle>
+                    <path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"></path>
+                    <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                    <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
+                  </svg>
+                  <p class="empty-cell-title">No active downloads</p>
+                  <p class="empty-cell-sub">Source clients will appear here once a download is running.</p>
+                </div>
+              </td></tr>
             {:else}
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
                 <div class="empty-cell-body">
@@ -3219,7 +3269,7 @@
                     <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
                   </svg>
                   <p class="empty-cell-title">Select a download</p>
-                  <p class="empty-cell-sub">Double-click a download above to see its source clients.</p>
+                  <p class="empty-cell-sub">Click a download above to see its source clients.</p>
                 </div>
               </td></tr>
             {/if}
