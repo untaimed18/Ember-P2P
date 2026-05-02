@@ -858,14 +858,12 @@ fn spawn_rendezvous_friend_lookup(
     state: &NetworkState,
     ember_hash: [u8; 16],
     target_hash: [u8; 16],
-    _db: &Arc<crate::storage::database::Database>,
     app_handle: &tauri::AppHandle,
     friend_hashes: &crate::app_state::SharedFriendHashes,
     ul_event_tx: &mpsc::Sender<upload_server::UploadEvent>,
     ed25519_pubkey: [u8; 32],
     ed25519_secret_key: [u8; 32],
 ) {
-    // _db is kept in the signature for future authenticated-mutual promotion.
     let rv_url = settings.rendezvous_url.clone();
     let our_uh = state.user_hash;
     let our_eh = ember_hash;
@@ -898,24 +896,66 @@ fn spawn_rendezvous_friend_lookup(
                             // request to avoid pre-accept shortcuts. Full
                             // proof-of-possession runs on accept via
                             // `friend_connect::perform_ember_auth`.
+                            //
+                            // Only `ember:friend-confirmed` (clears the
+                            // searching spinner) is safe to emit eagerly.
+                            // `ember:friend-online` is intentionally
+                            // deferred until the persistent session is
+                            // up — emitting it optimistically here and
+                            // then rolling back via
+                            // `EmberFriendDisconnected` on failure
+                            // raced with the trailing
+                            // `EmberFriendSearchFailed` cleanup below
+                            // and could leave a freshly-spawned
+                            // reconnect attempt with no
+                            // `outbound_session_tasks` slot
+                            // (`Disconnected` re-inserts the slot when
+                            // it schedules its reconnect, then
+                            // `SearchFailed` clobbers it).
                             let _ = app_fc.emit("ember:friend-confirmed", serde_json::json!({
                                 "user_hash": hex::encode(remote_eh),
                             }));
-                            let _ = app_fc.emit("ember:friend-online", serde_json::json!({
-                                "user_hash": hex::encode(remote_eh),
-                            }));
-                            if !sess_fc.read().await.contains_key(&remote_eh) {
+                            if sess_fc.read().await.contains_key(&remote_eh) {
+                                // A session for this peer is already
+                                // alive (e.g. an inbound `FriendSeen`
+                                // path opened it concurrently). Emit
+                                // online for visibility — duplicate
+                                // events are idempotent in the
+                                // frontend's Set-based handler.
+                                let _ = app_fc.emit("ember:friend-online", serde_json::json!({
+                                    "user_hash": hex::encode(remote_eh),
+                                }));
+                            } else {
                                 info!("Opening persistent session to {} after rendezvous friend discovery", addr);
-                                if let Err(e) = ed2k::friend_connect::open_and_run_friend_session(
+                                match ed2k::friend_connect::open_and_run_friend_session(
                                     addr, our_uh, our_eh, nick,
                                     cid, tcp, udp, obfuscate, sess_fc, ultx_fc.clone(), fh_fc,
                                     Some(ed25519_pubkey), Some(ed25519_secret_key),
                                 ).await {
-                                    info!("Persistent session to {} failed: {e}", addr);
-                                    let _ = ultx_fc.send(upload_server::UploadEvent {
-                                        transfer_id: String::new(),
-                                        kind: upload_server::UploadEventKind::EmberFriendDisconnected { ember_hash: remote_eh },
-                                    }).await;
+                                    Ok(_) => {
+                                        // Session is up — only NOW are
+                                        // we sure the peer is reachable
+                                        // for chat / browse, so this is
+                                        // the correct moment to mark
+                                        // them online.
+                                        let _ = app_fc.emit("ember:friend-online", serde_json::json!({
+                                            "user_hash": hex::encode(remote_eh),
+                                        }));
+                                    }
+                                    Err(e) => {
+                                        info!("Persistent session to {} failed: {e}", addr);
+                                        // No `EmberFriendDisconnected`
+                                        // — we never emitted online for
+                                        // this peer so there's nothing
+                                        // to roll back. The trailing
+                                        // `EmberFriendSearchFailed`
+                                        // below releases the
+                                        // outbound-task slot, and the
+                                        // 5-min auto-retry sweep will
+                                        // pick the friend up again
+                                        // without an immediate
+                                        // dogpiled retry.
+                                    }
                                 }
                             }
                         }
@@ -951,6 +991,35 @@ fn spawn_rendezvous_friend_lookup(
                 }));
             }
         }
+
+        // Always release the `outbound_session_tasks[target_hash]`
+        // slot the caller reserved before spawning. Idempotent and
+        // correct in every path:
+        //
+        //  - If we successfully opened a persistent session for
+        //    `target_hash`, the live entry lives in `ember_sessions`;
+        //    when that session eventually dies the
+        //    `EmberFriendDisconnected` handler fires + schedules
+        //    reconnect (it re-inserts the slot before respawning), so
+        //    nothing is lost by clearing it here.
+        //  - If we opened a session for a *different* friend
+        //    (`remote_eh != target_hash`), that hash's lifecycle is
+        //    independent of ours and we MUST clear `target_hash`'s
+        //    slot or `FindFriendAndConnect` and the periodic
+        //    auto-retry sweep will skip it for the next 10 min.
+        //  - If no session was opened (rendezvous miss, dial error,
+        //    no reciprocal, identity check failed), we have to clear
+        //    or auto-retry won't fire again until the 10 min
+        //    `outbound_session_tasks.retain` sweep prunes us.
+        //
+        // Distinct from `EmberFriendDisconnected` so we don't fire
+        // misleading `ember:friend-offline` / `ember:browse-error`
+        // events for a peer who was never online from the user's
+        // point of view.
+        let _ = ultx_fc.send(upload_server::UploadEvent {
+            transfer_id: String::new(),
+            kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: target_hash },
+        }).await;
     });
 }
 
@@ -1634,12 +1703,6 @@ pub enum NetworkCommand {
     },
     FriendRemoved {
         ember_hash: [u8; 16],
-    },
-    #[allow(dead_code)]
-    ConnectForFriendRequest {
-        ember_hash: [u8; 16],
-        ip: std::net::Ipv4Addr,
-        port: u16,
     },
     FindFriendAndConnect {
         ember_hash: [u8; 16],
@@ -5977,13 +6040,29 @@ pub async fn start_network(
                             }));
                             spawn_rendezvous_friend_lookup(
                                 &settings, &state, ember_hash, dc_eh,
-                                &db, &app_handle, &friend_hashes, &ul_event_tx,
+                                &app_handle, &friend_hashes, &ul_event_tx,
                                 ed25519_pubkey, ed25519_secret_key,
                             );
                         } else {
                             debug!("Friend {} reconnect skipped (backoff cooldown)", hash_hex);
                         }
                     }
+                }
+
+                if let UploadEventKind::EmberFriendSearchFailed { ember_hash: failed_eh } = event.kind {
+                    // Pure cleanup signal from the rendezvous /
+                    // chat-auto-connect / browse-auto-connect spawns.
+                    // Distinct from `EmberFriendDisconnected` so we
+                    // don't fire `ember:friend-offline` /
+                    // `ember:browse-error` for a peer who was never
+                    // online in this session, and don't kick off a
+                    // reconnect attempt (the spawn just gave up — an
+                    // immediate retry would dogpile rendezvous and
+                    // hammer the same dead address). The user-facing
+                    // `ember:friend-search-failed` event with a
+                    // structured reason is emitted from inside the
+                    // spawn itself; here we only mutate state.
+                    state.outbound_session_tasks.remove(&failed_eh);
                 }
 
                 // Reputation: record upload-side events
@@ -8126,7 +8205,7 @@ pub async fn start_network(
                         }));
                         spawn_rendezvous_friend_lookup(
                             &settings, &state, ember_hash, *target_hash,
-                            &db, &app_handle, &friend_hashes, &ul_event_tx,
+                            &app_handle, &friend_hashes, &ul_event_tx,
                             ed25519_pubkey, ed25519_secret_key,
                         );
                     }
@@ -8648,7 +8727,7 @@ pub async fn start_network(
                             }));
                             spawn_rendezvous_friend_lookup(
                                 &settings, &state, ember_hash, *target_hash,
-                                &db, &app_handle, &friend_hashes, &ul_event_tx,
+                                &app_handle, &friend_hashes, &ul_event_tx,
                                 ed25519_pubkey, ed25519_secret_key,
                             );
                         }
@@ -18584,8 +18663,9 @@ async fn handle_command(
                                         if handle.outbound_tx.try_send(packet).is_ok() {
                                             let hash_hex = hex::encode(friend_eh);
                                             let msg_for_db = msg.clone();
+                                            let db_for_msg = db3.clone();
                                             tokio::task::spawn_blocking(move || {
-                                                if let Err(e) = db3.insert_chat_message(&hash_hex, "sent", &msg_for_db) {
+                                                if let Err(e) = db_for_msg.insert_chat_message(&hash_hex, "sent", &msg_for_db) {
                                                     tracing::warn!("Failed to persist sent chat message: {e}");
                                                 }
                                             });
@@ -18603,14 +18683,36 @@ async fn handle_command(
                                     Err(e) => {
                                         debug!("Auto-connect for chat to {} failed: {e}", hex::encode(friend_eh));
                                         let _ = tx.send(Err(format!("Auto-connect failed: {e}")));
+                                        // Stored IP is dead — clear it so the
+                                        // next chat attempt skips the
+                                        // multi-second TCP timeout against
+                                        // the same address and goes straight
+                                        // to rendezvous.
+                                        let hash_hex_clear = hex::encode(friend_eh);
+                                        let db_for_clear = db3.clone();
+                                        let _ = tokio::task::spawn_blocking(move || db_for_clear.clear_friend_address(&hash_hex_clear)).await;
+                                        // EmberFriendSearchFailed not
+                                        // EmberFriendDisconnected: we never
+                                        // had a session and emitting offline
+                                        // / browse-error / scheduling a
+                                        // reconnect would just dogpile.
                                         let _ = ul_tx2.send(upload_server::UploadEvent {
                                             transfer_id: String::new(),
-                                            kind: upload_server::UploadEventKind::EmberFriendDisconnected { ember_hash: friend_eh },
+                                            kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
                                         }).await;
                                     }
                                 }
                             });
                         } else {
+                            // Stored IP wasn't a parseable v4 address —
+                            // wipe it so the next attempt falls through
+                            // to rendezvous instead of repeating the
+                            // same parse failure. No `outbound_session_tasks`
+                            // entry was inserted in this branch, so no
+                            // cleanup event is required here.
+                            let hash_hex_clear = hex::encode(friend_eh);
+                            let db_for_clear = db.clone();
+                            let _ = tokio::task::spawn_blocking(move || db_for_clear.clear_friend_address(&hash_hex_clear)).await;
                             let _ = tx.send(Err("Invalid friend IP address".into()));
                         }
                     } else {
@@ -18632,6 +18734,7 @@ async fn handle_command(
                         state.outbound_session_tasks.insert(friend_eh, std::time::Instant::now());
                         debug!("No stored address for {}, trying rendezvous for chat", hex::encode(friend_eh));
                         tokio::spawn(async move {
+                            let mut session_alive = false;
                             match crate::network::rendezvous::lookup(&rv_url, &friend_eh).await {
                                 Ok(Some((ip, port))) => {
                                     let addr = std::net::SocketAddr::new(ip.into(), port);
@@ -18640,6 +18743,7 @@ async fn handle_command(
                                         Some(ed25519_pubkey), Some(ed25519_secret_key),
                                     ).await {
                                         Ok(handle) => {
+                                            session_alive = true;
                                             let msg_bytes = msg.as_bytes();
                                             let mut packet = Vec::with_capacity(6 + msg_bytes.len());
                                             packet.push(OP_EMULEPROT);
@@ -18650,8 +18754,9 @@ async fn handle_command(
                                             if handle.outbound_tx.try_send(packet).is_ok() {
                                                 let hash_hex = hex::encode(friend_eh);
                                                 let msg_for_db = msg.clone();
+                                                let db_for_msg = db3.clone();
                                                 tokio::task::spawn_blocking(move || {
-                                                    if let Err(e) = db3.insert_chat_message(&hash_hex, "sent", &msg_for_db) {
+                                                    if let Err(e) = db_for_msg.insert_chat_message(&hash_hex, "sent", &msg_for_db) {
                                                         tracing::warn!("Failed to persist sent chat message: {e}");
                                                     }
                                                 });
@@ -18671,16 +18776,29 @@ async fn handle_command(
                                         }
                                         Err(e) => {
                                             let _ = tx.send(Err(format!("Could not connect: {e}")));
-                                            let _ = ultx2.send(upload_server::UploadEvent {
-                                                transfer_id: String::new(),
-                                                kind: upload_server::UploadEventKind::EmberFriendDisconnected { ember_hash: friend_eh },
-                                            }).await;
                                         }
                                     }
                                 }
                                 _ => {
                                     let _ = tx.send(Err("Friend is offline".into()));
                                 }
+                            }
+                            if !session_alive {
+                                // No live session was opened for
+                                // `friend_eh`; release the outbound
+                                // task slot so the next chat / browse
+                                // / auto-retry can proceed without
+                                // waiting for the 10-min TTL sweep.
+                                // EmberFriendSearchFailed (not
+                                // EmberFriendDisconnected) avoids the
+                                // misleading offline UI events and
+                                // the automatic reconnect cycle that
+                                // would just hammer the same
+                                // unreachable peer.
+                                let _ = ultx2.send(upload_server::UploadEvent {
+                                    transfer_id: String::new(),
+                                    kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                }).await;
                             }
                         });
                     }
@@ -18732,6 +18850,7 @@ async fn handle_command(
                                 let fh = friend_hashes.clone();
                                 let ul_tx2 = ul_event_tx.clone();
                                 info!("Auto-connecting to friend {} for browse at {}", hex::encode(friend_eh), addr);
+                                let db3 = db.clone();
                                 tokio::spawn(async move {
                                     match ed2k::friend_connect::open_and_run_friend_session(
                                         addr, our_user_hash, our_ember_hash, nickname,
@@ -18765,14 +18884,29 @@ async fn handle_command(
                                         Err(e) => {
                                             info!("Auto-connect for browse to {} failed: {e}", hex::encode(friend_eh));
                                             let _ = tx.send(Err(format!("Could not connect: {e}")));
+                                            // Stored IP is dead; clear it so
+                                            // the next browse / chat attempt
+                                            // jumps straight to rendezvous
+                                            // instead of paying for the same
+                                            // dial timeout. Same rationale as
+                                            // the chat path above.
+                                            let hash_hex_clear = hex::encode(friend_eh);
+                                            let _ = tokio::task::spawn_blocking(move || db3.clear_friend_address(&hash_hex_clear)).await;
                                             let _ = ul_tx2.send(upload_server::UploadEvent {
                                                 transfer_id: String::new(),
-                                                kind: upload_server::UploadEventKind::EmberFriendDisconnected { ember_hash: friend_eh },
+                                                kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
                                             }).await;
                                         }
                                     }
                                 });
                             } else {
+                                // Stored IP isn't a parseable v4 address; wipe
+                                // it so the next attempt falls through to
+                                // rendezvous. No outbound-task slot was
+                                // inserted in this branch.
+                                let hash_hex_clear = hex::encode(friend_eh);
+                                let db_for_clear = db.clone();
+                                let _ = tokio::task::spawn_blocking(move || db_for_clear.clear_friend_address(&hash_hex_clear)).await;
                                 let _ = tx.send(Err("Invalid friend IP address".into()));
                             }
                         } else {
@@ -18792,6 +18926,7 @@ async fn handle_command(
                             state.outbound_session_tasks.insert(friend_eh, std::time::Instant::now());
                             info!("No stored address for {}, trying rendezvous for browse", hex::encode(friend_eh));
                             tokio::spawn(async move {
+                                let mut session_alive = false;
                                 match crate::network::rendezvous::lookup(&rv_url, &friend_eh).await {
                                     Ok(Some((ip, port))) => {
                                         let addr = std::net::SocketAddr::new(ip.into(), port);
@@ -18800,6 +18935,7 @@ async fn handle_command(
                                             Some(ed25519_pubkey), Some(ed25519_secret_key),
                                         ).await {
                                             Ok(handle) => {
+                                                session_alive = true;
                                                 let mut packet = Vec::with_capacity(6);
                                                 packet.push(OP_EMULEPROT);
                                                 let size: u32 = 1;
@@ -18825,16 +18961,24 @@ async fn handle_command(
                                             }
                                             Err(e) => {
                                                 let _ = tx.send(Err(format!("Could not connect: {e}")));
-                                                let _ = ultx2.send(upload_server::UploadEvent {
-                                                    transfer_id: String::new(),
-                                                    kind: upload_server::UploadEventKind::EmberFriendDisconnected { ember_hash: friend_eh },
-                                                }).await;
                                             }
                                         }
                                     }
                                     _ => {
                                         let _ = tx.send(Err("Friend is offline".into()));
                                     }
+                                }
+                                if !session_alive {
+                                    // No session opened; release the
+                                    // outbound-task slot so subsequent
+                                    // commands or auto-retry can proceed.
+                                    // EmberFriendSearchFailed not
+                                    // EmberFriendDisconnected — see chat
+                                    // path for rationale.
+                                    let _ = ultx2.send(upload_server::UploadEvent {
+                                        transfer_id: String::new(),
+                                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed { ember_hash: friend_eh },
+                                    }).await;
                                 }
                             });
                         }
@@ -18846,101 +18990,37 @@ async fn handle_command(
         NetworkCommand::FriendRemoved { ember_hash: removed_hash } => {
             state.online_friends.remove(&removed_hash);
             state.ember_sessions.write().await.remove(&removed_hash);
-        }
-
-        NetworkCommand::ConnectForFriendRequest { ember_hash: target_hash, ip, port } => {
-            let addr = SocketAddr::new(ip.into(), port);
-            let our_user_hash = state.user_hash;
-            let our_ember_hash = ember_hash;
-            let nickname = settings.nickname.clone();
-            let client_id = state.external_ip
-                .map(|eip| u32::from_le_bytes(eip.octets()))
-                .unwrap_or(0);
-            let tcp = settings.tcp_port;
-            let udp = settings.udp_port;
-            let obfs = settings.friend_session_encryption;
-            let db3 = db.clone();
-            let app2 = app_handle.clone();
-            let fh = friend_hashes.clone();
-            let sess = state.ember_sessions.clone();
-            let ultx = ul_event_tx.clone();
-            let target_hex = hex::encode(target_hash);
-            info!("Initiating proactive friend connect to {} at {}", target_hex, addr);
-            tokio::spawn(async move {
-                match ed2k::friend_connect::connect_and_send_friend_request(
-                    addr,
-                    &our_user_hash,
-                    &our_ember_hash,
-                    &nickname,
-                    client_id,
-                    tcp,
-                    udp,
-                    obfs,
-                    Some(ed25519_pubkey),
-                    Some(ed25519_secret_key),
-                ).await {
-                    Ok(Some(remote_eh)) => {
-                        info!("Friend connect to {} succeeded, remote ember_hash={}", addr, hex::encode(remote_eh));
-                        if fh.read().await.contains(&remote_eh) {
-                            // Do NOT auto-flip mutual purely from a reciprocal
-                            // handshake, even though `friend_connect` has now
-                            // run `perform_ember_auth` on this session (so
-                            // `remote_eh` is proof-of-possession verified).
-                            // We still emit "confirmed" to clear the searching
-                            // spinner and mark the peer online, but mutual
-                            // promotion must come from an explicit user accept
-                            // on an
-                            // inbound friend request.
-                            let _ = app2.emit("ember:friend-confirmed", serde_json::json!({
-                                "user_hash": hex::encode(remote_eh),
-                            }));
-                            let _ = app2.emit("ember:friend-online", serde_json::json!({
-                                "user_hash": hex::encode(remote_eh),
-                            }));
-                            if !sess.read().await.contains_key(&remote_eh) {
-                                info!("Opening persistent session to {} after proactive friend connect", addr);
-                                if let Err(e) = ed2k::friend_connect::open_and_run_friend_session(
-                                    addr, our_user_hash, our_ember_hash, nickname,
-                                    client_id, tcp, udp, obfs, sess, ultx.clone(), fh,
-                                    Some(ed25519_pubkey), Some(ed25519_secret_key),
-                                ).await {
-                                    info!("Persistent session to {} failed: {e}", addr);
-                                    let _ = ultx.send(upload_server::UploadEvent {
-                                        transfer_id: String::new(),
-                                        kind: upload_server::UploadEventKind::EmberFriendDisconnected { ember_hash: remote_eh },
-                                    }).await;
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        info!("Friend connect to {} succeeded (no reciprocal request yet)", addr);
-                    }
-                    Err(e) => {
-                        let emsg = format!("{e}");
-                        let reason = if emsg.contains("timeout") { "timeout" }
-                            else if emsg.contains("refused") { "refused" }
-                            else { "error" };
-                        info!("Friend connect to {} failed (clearing stale address): {e}", addr);
-                        let _ = tokio::task::spawn_blocking(move || db3.clear_friend_address(&target_hex));
-                        let _ = app2.emit("ember:friend-search-failed", serde_json::json!({
-                            "user_hash": hex::encode(target_hash),
-                            "reason": reason,
-                        }));
-                    }
-                }
-            });
+            // Also drop any pending outbound-search slot so a remove
+            // immediately followed by re-add isn't blocked for up to
+            // 10 minutes by a stale entry.
+            state.outbound_session_tasks.remove(&removed_hash);
         }
 
         NetworkCommand::FindFriendAndConnect { ember_hash: target_hash } => {
-            if !state.outbound_session_tasks.contains_key(&target_hash) {
+            // Skip if the friend is already online or has a live
+            // session. Mirrors the pre-existing guard in
+            // `RetryFriendSearch`. Without this, the new
+            // `EmberFriendSearchFailed` cleanup (which clears
+            // `outbound_session_tasks[target_hash]` even when a
+            // session for `target_hash` is alive) would let a
+            // subsequent `FindFriendAndConnect` re-trigger a
+            // wasteful rendezvous + dial against a peer we're
+            // already talking to.
+            if state.online_friends.contains_key(&target_hash)
+                || state.ember_sessions.read().await.contains_key(&target_hash)
+            {
+                debug!(
+                    "FindFriendAndConnect: {} already online/connected, skipping",
+                    hex::encode(target_hash),
+                );
+            } else if !state.outbound_session_tasks.contains_key(&target_hash) {
                 state.outbound_session_tasks.insert(target_hash, std::time::Instant::now());
                 let _ = app_handle.emit("ember:friend-searching", serde_json::json!({
                     "user_hash": hex::encode(target_hash),
                 }));
                 spawn_rendezvous_friend_lookup(
                     &settings, &state, ember_hash, target_hash,
-                    &db, &app_handle, &friend_hashes, &ul_event_tx,
+                    &app_handle, &friend_hashes, &ul_event_tx,
                     ed25519_pubkey, ed25519_secret_key,
                 );
             }
@@ -18962,7 +19042,7 @@ async fn handle_command(
 
             spawn_rendezvous_friend_lookup(
                 &settings, &state, ember_hash, target_hash,
-                &db, &app_handle, &friend_hashes, &ul_event_tx,
+                &app_handle, &friend_hashes, &ul_event_tx,
                 ed25519_pubkey, ed25519_secret_key,
             );
 
@@ -19577,6 +19657,7 @@ async fn handle_upload_event(
         | UploadEventKind::EmberBrowseRequest { .. }
         | UploadEventKind::EmberBrowseResponse { .. }
         | UploadEventKind::EmberFriendDisconnected { .. }
+        | UploadEventKind::EmberFriendSearchFailed { .. }
         | UploadEventKind::EmberFriendRequest { .. } => {
             // Handled directly in the network event loop.
         }
