@@ -3947,8 +3947,27 @@
     flex-wrap: wrap;
   }
 
-  /* --- Status labels --- */
-  .status-cell { display: flex; flex-direction: column; gap: 1px; }
+  /* --- Status labels ---
+   *
+   * `.status-cell` keeps its default `table-cell` display so it stays
+   * anchored to the column grid defined by `<colgroup>`. The earlier
+   * rule used `display: flex` directly on `<td>`, which lifts the
+   * cell out of the table layout — the Trust and Identification
+   * cells then collapsed to their content width and visually drifted
+   * out of their column headers, making the ident_state badge appear
+   * under the Trust column. Stack multi-child variants (status +
+   * failure-hint) by making text-style children `display: block` so
+   * they flow vertically. `.rep-badge` keeps its `inline-block` to
+   * preserve the pill shape — it's only ever a single-child cell. */
+  .status-cell > .status-label,
+  .status-cell > .failure-hint {
+    display: block;
+    margin-top: 1px;
+  }
+  .status-cell > .status-label:first-child,
+  .status-cell > .failure-hint:first-child {
+    margin-top: 0;
+  }
   .status-label {
     font-size: 11px;
     font-weight: 500;
