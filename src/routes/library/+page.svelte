@@ -1282,10 +1282,17 @@
 
   onMount(() => {
     mounted = true;
-    const saved = localStorage.getItem('library-sidebar-w');
-    if (saved) {
-      const val = parseInt(saved);
-      if (!isNaN(val)) sidebarWidth = Math.max(120, Math.min(400, val));
+    // localStorage can throw in private mode / quota-exceeded; wrap
+    // the read so a storage failure doesn't abort onMount and leave
+    // the library page without its event listeners attached.
+    try {
+      const saved = localStorage.getItem('library-sidebar-w');
+      if (saved) {
+        const val = parseInt(saved);
+        if (!isNaN(val)) sidebarWidth = Math.max(120, Math.min(400, val));
+      }
+    } catch (e) {
+      console.warn('library: localStorage unavailable for sidebar width', e);
     }
 
     loadPersistedFilters();
@@ -1314,12 +1321,22 @@
     const unlisteners: Array<() => void> = [];
     let destroyed = false;
 
+    // Sequential listen + rollback on partial failure. Earlier this
+    // used `Promise.all([listen, listen])`, but if the second listen
+    // rejected the first one's unlisten function was lost — leaving an
+    // orphan subscription registered for the rest of the webview's
+    // lifetime. Awaiting them one at a time means we always have a
+    // handle to anything that successfully registered, and a thrown
+    // error just unregisters whatever has already attached.
     (async () => {
-      const [u1, u2] = await Promise.all([
-        listen<{ phase: string; count: number }>(
+      let u1: (() => void) | null = null;
+      let u2: (() => void) | null = null;
+      try {
+        u1 = await listen<{ phase: string; count: number }>(
           'shared-files-changed', () => { if (mounted) debouncedRefresh(); }
-        ),
-        listen<{ current: number; total: number; file_name: string; done?: boolean }>(
+        );
+        if (destroyed) { u1(); return; }
+        u2 = await listen<{ current: number; total: number; file_name: string; done?: boolean }>(
           'file-hash-progress', (event) => {
             if (!mounted || stoppedByUser) return;
             if (event.payload.done) {
@@ -1335,9 +1352,14 @@
               scanning = true;
             }
           }
-        ),
-      ]);
-      if (destroyed) { u1(); u2(); } else { unlisteners.push(u1, u2); }
+        );
+        if (destroyed) { u1(); u2(); return; }
+        unlisteners.push(u1, u2);
+      } catch (e) {
+        console.warn('library: failed to register file-system event listeners', e);
+        if (u1) u1();
+        if (u2) u2();
+      }
     })();
 
     (async () => {

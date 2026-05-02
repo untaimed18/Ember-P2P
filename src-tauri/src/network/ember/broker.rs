@@ -8,6 +8,27 @@ use tracing::{debug, info, warn};
 
 use super::nat::NatType;
 
+/// Helper that emits a `BrokerEvent` without ever blocking the network
+/// task. Earlier code used `event_tx.send(...).await`, which silently
+/// deadlocked when the bounded broker channel filled up: every producer
+/// in this module is invoked from the same select! loop that drains
+/// `broker_rx`, so awaiting on a full channel meant the drain arm could
+/// never run. `try_send` always returns immediately; on overflow we drop
+/// the event and log it. The broker's periodic `tick()` reaps any
+/// orphaned attempt so a dropped event never strands state forever.
+fn emit_event(tx: &mpsc::Sender<BrokerEvent>, event: BrokerEvent) {
+    if let Err(e) = tx.try_send(event) {
+        match e {
+            mpsc::error::TrySendError::Full(_) => {
+                warn!("Broker event channel full; dropping event (drain stalled?)");
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                debug!("Broker event channel closed; dropping event");
+            }
+        }
+    }
+}
+
 const MAX_ACTIVE_ATTEMPTS: usize = 8;
 const PUNCH_TIMEOUT: Duration = Duration::from_secs(20);
 const RELAY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -266,25 +287,25 @@ impl ConnectionBroker {
             AttemptPhase::HolePunch => {
                 if let Some(ext_addr) = our_external_addr {
                     self.stats.punch_attempts = self.stats.punch_attempts.saturating_add(1);
-                    let _ = self.event_tx.send(BrokerEvent::StartPunch {
+                    emit_event(&self.event_tx, BrokerEvent::StartPunch {
                         attempt_key,
                         source_ip,
                         source_port,
                         our_external_addr: ext_addr,
                         our_nat_type: our_nat,
-                    }).await;
+                    });
                 }
             }
             AttemptPhase::FindRelay => {
                 let relay_addr = self.pick_relay_candidate();
                 self.stats.relay_attempts = self.stats.relay_attempts.saturating_add(1);
-                let _ = self.event_tx.send(BrokerEvent::StartRelay {
+                emit_event(&self.event_tx, BrokerEvent::StartRelay {
                     attempt_key,
                     source_ip,
                     source_port,
                     file_hash,
                     relay_addr,
-                }).await;
+                });
             }
             _ => {}
         }
@@ -303,13 +324,13 @@ impl ConnectionBroker {
             attempt.relay_candidate = relay_addr;
 
             self.stats.relay_attempts = self.stats.relay_attempts.saturating_add(1);
-            let _ = self.event_tx.send(BrokerEvent::StartRelay {
+            emit_event(&self.event_tx, BrokerEvent::StartRelay {
                 attempt_key: attempt_key.to_string(),
                 source_ip: attempt.source_ip,
                 source_port: attempt.source_port,
                 file_hash: attempt.file_hash,
                 relay_addr,
-            }).await;
+            });
         }
     }
 
@@ -318,12 +339,12 @@ impl ConnectionBroker {
         if let Some(attempt) = self.attempts.remove(attempt_key) {
             warn!("Broker: relay failed for {attempt_key}: {reason}");
             self.stats.relay_failures = self.stats.relay_failures.saturating_add(1);
-            let _ = self.event_tx.send(BrokerEvent::ConnectionFailed {
+            emit_event(&self.event_tx, BrokerEvent::ConnectionFailed {
                 transfer_id: attempt.transfer_id,
                 source_ip: attempt.source_ip,
                 source_port: attempt.source_port,
                 reason: reason.to_string(),
-            }).await;
+            });
         }
     }
 

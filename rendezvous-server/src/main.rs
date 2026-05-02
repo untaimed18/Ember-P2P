@@ -133,7 +133,18 @@ struct RelayInvite {
 #[derive(Clone)]
 struct AppState {
     store: Arc<RwLock<HashMap<String, PresenceEntry>>>,
+    /// Per-IP rate-limit window for the **general** API surface
+    /// (`register`, `lookup`, `unregister`, `relay-invite`, etc.).
+    /// Punch traffic now lives in `punch_rate_limits` so a flood of
+    /// punch registrations no longer steals the budget from unrelated
+    /// endpoints — earlier this map was shared, and a single LowID
+    /// peer's punch retries could 429 lookup/register for the same IP.
     rate_limits: Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
+    /// Per-IP rate-limit window for hole-punch register traffic.
+    /// Counted separately from `rate_limits` so the documented
+    /// `MAX_PUNCH_PER_MINUTE` budget is the only thing throttling
+    /// punch attempts.
+    punch_rate_limits: Arc<RwLock<HashMap<IpAddr, RateEntry>>>,
     /// Pending hole-punch registrations, keyed by `(target_id, from_id)`.
     /// Keying by both IDs (rather than just `target_id`) prevents an
     /// unauthenticated attacker from overwriting a legit registrant's
@@ -351,7 +362,12 @@ async fn punch_register(
     headers: HeaderMap,
     Json(body): Json<PunchRequest>,
 ) -> StatusCode {
-    if body.from_id.len() != 64 || body.target_id.len() != 64 {
+    // Reject anything that isn't a well-formed 64-char hex id. The
+    // earlier `len != 64` check let punk inputs through (high-byte
+    // unicode, garbage from buggy clients) which then polluted logs
+    // and downstream `from_id` storage. `register` already enforced
+    // this; punch endpoints now match.
+    if !validate_hex_id(&body.from_id) || !validate_hex_id(&body.target_id) {
         return StatusCode::BAD_REQUEST;
     }
     if body.port == 0 {
@@ -360,12 +376,16 @@ async fn punch_register(
 
     let client_ip = extract_client_ip(&headers, addr);
 
-    // Punch-specific rate limit
+    // Punch-specific rate limit. Uses its own per-IP map so heavy
+    // punch retries don't consume the budget for `register` /
+    // `lookup` / `relay-invite` from the same IP.
     {
-        let mut limits = state.rate_limits.write().await;
+        let mut limits = state.punch_rate_limits.write().await;
+        if limits.len() >= MAX_RATE_ENTRIES && !limits.contains_key(&client_ip) {
+            return StatusCode::TOO_MANY_REQUESTS;
+        }
         let now = Instant::now();
-        let key_ip = client_ip;
-        let entry = limits.entry(key_ip).or_insert(RateEntry {
+        let entry = limits.entry(client_ip).or_insert(RateEntry {
             count: 0,
             window_start: now,
         });
@@ -420,7 +440,7 @@ async fn punch_poll(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<PunchResponse>, StatusCode> {
-    if id.len() != 64 {
+    if !validate_hex_id(&id) {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -879,6 +899,14 @@ async fn sweep_expired(state: AppState) {
             limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
         }
 
+        // Sweep the punch-specific rate-limit map on the same cadence
+        // as the general one so the per-IP entries don't pile up after
+        // a punch burst goes quiet.
+        {
+            let mut limits = state.punch_rate_limits.write().await;
+            limits.retain(|_, entry| now.duration_since(entry.window_start) < RATE_WINDOW * 2);
+        }
+
         // Sweep expired punch requests
         {
             let mut punches = state.punch_requests.write().await;
@@ -924,6 +952,7 @@ async fn main() {
     let state = AppState {
         store: Arc::new(RwLock::new(HashMap::new())),
         rate_limits: Arc::new(RwLock::new(HashMap::new())),
+        punch_rate_limits: Arc::new(RwLock::new(HashMap::new())),
         punch_requests: Arc::new(RwLock::new(HashMap::new())),
         relay_sessions: Arc::new(RwLock::new(HashMap::new())),
         relay_ip_counts: Arc::new(RwLock::new(HashMap::new())),
