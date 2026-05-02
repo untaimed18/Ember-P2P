@@ -30,6 +30,7 @@
   // isn't actually empty — previously failures became a silent zero.
   let loadError: string | null = $state(null);
   let messagesEnd: HTMLDivElement | undefined = $state();
+  let messagesContainerEl: HTMLDivElement | undefined = $state();
   let chatInputEl: HTMLTextAreaElement | undefined = $state();
   let panelEl: HTMLDivElement | undefined = $state();
   let unlisten: UnlistenFn | null = null;
@@ -137,6 +138,10 @@
       fn = await listen<{ user_hash: string; message: string; direction: string; timestamp: number }>('ember:chat-message', (event) => {
         if (gen !== loadGen) return;
         if (event.payload.user_hash === friendHash) {
+          // Snapshot pin state BEFORE the new bubble is added — once
+          // the DOM grows the old `scrollTop` no longer reflects
+          // "user was reading the bottom".
+          const wasPinned = isPinnedToBottom();
           const next = [...messages, {
             id: --msgIdCounter,
             direction: event.payload.direction as 'sent' | 'received',
@@ -147,7 +152,15 @@
           messages = next.length > MAX_LIVE_MESSAGES
             ? next.slice(next.length - MAX_LIVE_MESSAGES)
             : next;
-          scrollToBottom();
+          // Always follow our own outbound messages — the user just
+          // hit Enter and expects to see the bubble. For inbound
+          // messages, only auto-scroll when the user was already
+          // reading the tail of the conversation; if they had
+          // scrolled up to read history, hijacking the viewport on
+          // every received message is hostile UX.
+          if (event.payload.direction === 'sent' || wasPinned) {
+            scrollToBottom();
+          }
           if (event.payload.direction === 'received') {
             markAsRead();
           }
@@ -227,6 +240,21 @@
     });
   }
 
+  /**
+   * `true` when the user is reading the very end of the
+   * conversation. The 80 px slack lets short-message volleys still
+   * count as pinned even when the previous bubble pushes the viewport
+   * a few pixels up from the absolute bottom. Returns `true` when the
+   * container ref isn't bound yet (initial load before the first
+   * paint) so the snapshot scroll-to-bottom in `loadMessages` always
+   * fires on conversation open.
+   */
+  function isPinnedToBottom(): boolean {
+    const el = messagesContainerEl;
+    if (!el) return true;
+    return el.scrollHeight - (el.scrollTop + el.clientHeight) < 80;
+  }
+
   async function handleSend() {
     const text = inputText.trim();
     if (!text || sending) return;
@@ -300,7 +328,7 @@
       </button>
     </div>
 
-    <div class="chat-messages">
+    <div class="chat-messages" bind:this={messagesContainerEl}>
       {#if loading}
         <div class="chat-loading">Loading messages...</div>
       {:else if loadError}
