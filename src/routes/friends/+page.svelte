@@ -728,8 +728,23 @@
               </button>
             {/if}
             <span class="card-status-label">
-              {#if !f.mutual}
+              {#if searchingFriends.has(f.user_hash)}
+                <!-- Active rendezvous lookup / dial in flight for
+                     this friend. Distinct from the "Waiting for
+                     accept" idle state below — the spinner only
+                     animates while there's real network work
+                     happening, which keeps the UI honest about
+                     whether the app is doing something on the
+                     friend's behalf. -->
                 <span class="status-searching">Searching&hellip;</span>
+              {:else if !f.mutual}
+                <!-- We've added this peer but they haven't accepted
+                     our friend request yet (or we haven't seen the
+                     reciprocal request to accept on our side). No
+                     active search is running, so don't show the
+                     spinner — show a static label that reflects the
+                     idle "waiting on user action" state. -->
+                <span class="status-pending">Waiting for accept</span>
               {:else if presence === 'online'}
                 <span class="status-online">Online</span>
               {:else if f.last_seen}
@@ -1458,6 +1473,17 @@
     color: var(--warning, #eab308);
     font-weight: 500;
     animation: badge-pulse 2s ease-in-out infinite;
+  }
+
+  /* Idle "we added them, they haven't accepted yet" state. Static
+     (no pulse animation) to distinguish from the active-search
+     spinner above and to avoid implying the app is doing work
+     when it isn't. Same warning hue as `.status-searching` so the
+     two pre-mutual states still read as a single "not yet
+     friends" group. */
+  .status-pending {
+    color: var(--text-muted);
+    font-weight: 500;
   }
 
   @media (prefers-reduced-motion: reduce) {

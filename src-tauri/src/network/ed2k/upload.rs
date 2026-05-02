@@ -361,6 +361,23 @@ pub enum UploadEventKind {
     EmberFriendDisconnected {
         ember_hash: [u8; 16],
     },
+    /// Outbound friend-search lookup failed *before* a session was
+    /// ever established (rendezvous returned None / Err, or the
+    /// initial dial failed). Used purely as an internal signal from
+    /// `spawn_rendezvous_friend_lookup` and the chat / browse
+    /// auto-connect spawns back into the network task so the
+    /// `outbound_session_tasks` slot can be cleared without the
+    /// side-effects of `EmberFriendDisconnected` — that variant
+    /// fires `ember:friend-offline` + `ember:browse-error` and
+    /// schedules a backoff-gated reconnect, all of which would be
+    /// wrong for a peer that was never online from our point of
+    /// view in the first place. The user-facing
+    /// `ember:friend-search-failed` event is emitted by the spawn
+    /// itself (with a finer-grained reason); this kind is
+    /// state-mutation only and never reaches the UI.
+    EmberFriendSearchFailed {
+        ember_hash: [u8; 16],
+    },
 }
 
 /// Handles incoming TCP connections from other peers requesting file uploads.
