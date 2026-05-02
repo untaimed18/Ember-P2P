@@ -12,6 +12,28 @@ export const isDiscoverable = writable(false);
 let initialized = false;
 let unlisteners: UnlistenFn[] = [];
 
+// Coalesces bursts of `ember:friend-request` events into a single
+// `getFriendRequests` IPC call. The optimistic merge in the event
+// listener handles the common case (one peer, one request); the
+// debounced refetch is a safety net for edge cases like
+// "request arrived before this window finished its initial load"
+// or "a sibling window mutated the table". 250 ms is short enough
+// that the user perceives the panel as responsive but long enough
+// that a duplicate event from the upload + download side of a
+// single peer connection collapses into one fetch.
+let friendRequestRefetchTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleFriendRequestRefetch() {
+  if (friendRequestRefetchTimer !== null) return;
+  friendRequestRefetchTimer = setTimeout(() => {
+    friendRequestRefetchTimer = null;
+    getFriendRequests()
+      .then((reqs) => friendRequests.set(reqs))
+      .catch(() => {
+        /* backend may have shut down between schedule and fire */
+      });
+  }, 250);
+}
+
 export async function initFriendsStore() {
   if (initialized) return;
   initialized = true;
@@ -42,11 +64,51 @@ export async function initFriendsStore() {
       }),
     );
     registered.push(
-      await listen<{ sender_hash: string; nickname: string }>('ember:friend-request', () => {
-        getFriendRequests()
-          .then((reqs) => friendRequests.set(reqs))
-          .catch(() => {});
-      }),
+      await listen<{ sender_hash: string; nickname: string; verified?: boolean }>(
+        'ember:friend-request',
+        (event) => {
+          const { sender_hash, nickname, verified } = event.payload;
+          // Optimistic merge from the event payload so we don't pay
+          // for a full DB round-trip on every inbound request. The
+          // backend may emit the same logical request twice in quick
+          // succession (the upload-side handler in `upload.rs` and
+          // the download-side handler in `mod.rs` can both fire from
+          // a single peer connection), and a peer doing the
+          // `connect_and_send_friend_request` + `open_and_run_friend_session`
+          // double-handshake doubles that again. Without a local
+          // dedupe each event triggered a fresh `getFriendRequests`
+          // IPC call.
+          friendRequests.update((cur) => {
+            const idx = cur.findIndex((r) => r.sender_hash === sender_hash);
+            const newRow: FriendRequestInfo = {
+              sender_hash,
+              sender_nickname: nickname || '',
+              received_at: Math.floor(Date.now() / 1000),
+              // "verified once, always verified" mirrors the backend
+              // `MAX(verified, excluded.verified)` upsert in
+              // `db.add_friend_request`. A spoofer can't down-rate
+              // an existing verified row by flooding unverified
+              // duplicates from another channel.
+              verified:
+                (idx >= 0 && cur[idx].verified) || verified === true,
+            };
+            if (idx === -1) return [...cur, newRow];
+            const next = cur.slice();
+            // Preserve the original received_at on update so the
+            // sort order (most-recent-first) stays stable across
+            // duplicate events.
+            next[idx] = { ...newRow, received_at: cur[idx].received_at };
+            return next;
+          });
+
+          // Trailing-edge debounced reconciliation against the
+          // backend, in case the optimistic merge missed something
+          // (older request rows from a previous session, or fields
+          // we don't carry on the event). Coalesces bursts into a
+          // single fetch.
+          scheduleFriendRequestRefetch();
+        },
+      ),
     );
     registered.push(
       await listen<{ user_hash: string }>('ember:friend-confirmed', (event) => {
@@ -95,6 +157,10 @@ export function cleanupFriendsStore() {
   for (const unlisten of unlisteners) unlisten();
   unlisteners = [];
   initialized = false;
+  if (friendRequestRefetchTimer !== null) {
+    clearTimeout(friendRequestRefetchTimer);
+    friendRequestRefetchTimer = null;
+  }
   onlineFriends.set(new Set());
   unreadCounts.set(new Map());
   friendRequests.set([]);

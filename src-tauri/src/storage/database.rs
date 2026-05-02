@@ -913,13 +913,17 @@ impl Database {
         Ok(rows)
     }
 
-    pub fn update_friend_nickname(&self, user_hash: &str, nickname: &str) -> anyhow::Result<()> {
+    /// Update the nickname for an existing friend. Returns `Ok(true)`
+    /// if the row existed and was updated, `Ok(false)` if no friend
+    /// matches `user_hash` (so the caller can surface a real error
+    /// instead of silently succeeding).
+    pub fn update_friend_nickname(&self, user_hash: &str, nickname: &str) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
-        conn.execute(
+        let updated = conn.execute(
             "UPDATE friends SET nickname = ?2 WHERE user_hash = ?1",
             params![user_hash, nickname],
         )?;
-        Ok(())
+        Ok(updated > 0)
     }
 
     pub fn update_friend_address(&self, user_hash: &str, ip: &str, port: u16) -> anyhow::Result<()> {
@@ -979,15 +983,6 @@ impl Database {
         Ok(rows)
     }
 
-    pub fn set_friend_mutual(&self, user_hash: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE friends SET mutual = 1 WHERE user_hash = ?1",
-            params![user_hash],
-        )?;
-        Ok(())
-    }
-
     pub fn add_friend_request(&self, sender_hash: &str, nickname: &str, sender_ip: &str, sender_port: u16, verified: bool) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
@@ -1037,6 +1032,90 @@ impl Database {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM friend_requests WHERE sender_hash = ?1", params![sender_hash])?;
         Ok(())
+    }
+
+    /// Atomic "accept friend request" path used by the
+    /// `accept_friend_request` Tauri command.
+    ///
+    /// In a single transaction:
+    ///   1. Read the matching `friend_requests` row (if any) so we can
+    ///      seed the new friend's nickname and last-known address from
+    ///      what the peer sent at request time.
+    ///   2. Insert / update the `friends` row with `mutual = 1`,
+    ///      preserving the inserted `added_at` for first-time rows.
+    ///   3. If the request carried a usable IP / port, write them onto
+    ///      the friend so the auto-connect path in `SendChatMessage` /
+    ///      `BrowseFriend` can dial directly without paying for a
+    ///      rendezvous round trip.
+    ///   4. Delete the originating `friend_requests` row.
+    ///
+    /// Returns the (nickname, ip, port) tuple that was on the request,
+    /// or `None` if no matching request existed (e.g. user accepted via
+    /// stale UI state). The caller can use the returned address as a
+    /// hint for an immediate friend-session dial.
+    ///
+    /// Doing this transactionally fixes a subtle inconsistency where
+    /// the previous implementation issued three independent
+    /// `conn.execute` calls; if `set_friend_mutual` failed mid-way the
+    /// row would persist with `mutual = 0` while the in-memory
+    /// `friend_hashes` set was rolled back, leaving `get_friends()`
+    /// reporting an orphan friend that the upload path's
+    /// `friend_hashes.contains(&eh)` gate would silently reject.
+    pub fn accept_friend_request(
+        &self,
+        sender_hash: &str,
+    ) -> anyhow::Result<Option<(String, String, u16)>> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+
+        let request_data: Option<(String, String, u16)> = {
+            let mut stmt = tx.prepare(
+                "SELECT sender_nickname, COALESCE(sender_ip, ''), COALESCE(sender_port, 0) \
+                 FROM friend_requests WHERE sender_hash = ?1",
+            )?;
+            stmt.query_row(params![sender_hash], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?.clamp(0, u16::MAX as i64) as u16,
+                ))
+            })
+            .ok()
+        };
+
+        let nickname = request_data
+            .as_ref()
+            .map(|(n, _, _)| n.clone())
+            .unwrap_or_default();
+        let now = chrono::Utc::now().timestamp();
+
+        // Insert the friend with `mutual = 1` directly (matches the
+        // previous `add_friend` + `set_friend_mutual` semantics). On
+        // conflict we refresh the nickname and re-assert mutual so a
+        // re-accept after a previous demotion still flips the flag.
+        // `added_at` is intentionally NOT overwritten on conflict so
+        // long-standing friends keep their original add timestamp.
+        tx.execute(
+            "INSERT INTO friends (user_hash, nickname, added_at, mutual) VALUES (?1, ?2, ?3, 1) \
+             ON CONFLICT(user_hash) DO UPDATE SET nickname = excluded.nickname, mutual = 1",
+            params![sender_hash, nickname, now],
+        )?;
+
+        if let Some((_, ref ip, port)) = request_data {
+            if !ip.is_empty() && port > 0 {
+                tx.execute(
+                    "UPDATE friends SET last_ip = ?2, last_port = ?3, last_seen = ?4 WHERE user_hash = ?1",
+                    params![sender_hash, ip, port as i64, now],
+                )?;
+            }
+        }
+
+        tx.execute(
+            "DELETE FROM friend_requests WHERE sender_hash = ?1",
+            params![sender_hash],
+        )?;
+        tx.commit()?;
+        Ok(request_data)
     }
 
     pub fn insert_chat_message(&self, friend_hash: &str, direction: &str, message: &str) -> anyhow::Result<i64> {

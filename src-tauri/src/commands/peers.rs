@@ -174,10 +174,20 @@ pub async fn update_friend_nickname(
     let db = state.db.clone();
     let db_hash = canonical;
     let db_nick = nickname;
-    tokio::task::spawn_blocking(move || db.update_friend_nickname(&db_hash, &db_nick))
+    let updated = tokio::task::spawn_blocking(move || db.update_friend_nickname(&db_hash, &db_nick))
         .await
         .map_err(|e| format!("Task error: {e}"))?
         .map_err(|e| format!("Failed to update friend: {e}"))?;
+    // Returning Err for "no matching row" rather than the previous
+    // silent success: the UI used to accept the result and write the
+    // typed nickname into local state, then `loadFriends()` would
+    // overwrite it back to the original. The failure mode looked like
+    // a UI bug ("rename didn't stick") but was really a backend
+    // contract problem — the friend may have been removed from
+    // another window while the user was editing.
+    if !updated {
+        return Err("Friend no longer exists".into());
+    }
     Ok(())
 }
 
@@ -336,23 +346,46 @@ pub async fn accept_friend_request(
         friends.insert(hash);
     }
 
+    // Atomic DB write: nickname pull from the matching friend_request
+    // row, INSERT/UPDATE friend with `mutual = 1` and the address
+    // captured at request time, DELETE the request — all in one
+    // transaction. Replaces three independent execute() calls that
+    // could half-succeed and leave an orphan unmutual friend in the
+    // DB while the in-memory friend_hashes set was rolled back. See
+    // `Database::accept_friend_request` for details.
     let db = state.db.clone();
     let c2 = canonical.clone();
-    let db_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let requests = db.get_friend_requests()?;
-        let nick = requests.iter()
-            .find(|(h, _, _, _, _, _)| h == &c2)
-            .map(|(_, n, _, _, _, _)| n.clone())
-            .unwrap_or_default();
-        db.add_friend(&c2, &nick)?;
-        db.set_friend_mutual(&c2)?;
-        db.remove_friend_request(&c2)?;
-        Ok(())
-    })
-    .await;
-    if let Err(e) = db_result.as_ref().map_err(|e| e.to_string()).and_then(|r| r.as_ref().map_err(|e| e.to_string())) {
-        state.friend_hashes.write().await.remove(&hash);
-        return Err(format!("Failed to accept friend request: {e}"));
+    let db_result = tokio::task::spawn_blocking(move || db.accept_friend_request(&c2)).await;
+    let request_addr = match db_result {
+        Ok(Ok(addr)) => addr,
+        Ok(Err(e)) => {
+            state.friend_hashes.write().await.remove(&hash);
+            return Err(format!("Failed to accept friend request: {e}"));
+        }
+        Err(e) => {
+            state.friend_hashes.write().await.remove(&hash);
+            return Err(format!("Task error: {e}"));
+        }
+    };
+
+    // Reuse the IP/port the requester left in their friend_requests
+    // row (captured by `add_friend_request` at receive time). Without
+    // this, every accept paid for a fresh rendezvous round trip even
+    // though we already had a known-good address moments ago.
+    // `request_addr` may be `None` for requests that arrived without
+    // an address (legacy data migrated up); fall back to the rendezvous
+    // path in that case.
+    let has_seed_addr = request_addr
+        .as_ref()
+        .map(|(_, ip, port)| !ip.is_empty() && *port > 0)
+        .unwrap_or(false);
+    if has_seed_addr {
+        // We've already written `last_ip` / `last_port` inside the
+        // transaction above; the network task's `SendChatMessage` /
+        // `BrowseFriend` paths read those columns directly when the
+        // user starts a conversation, so no extra plumbing is needed
+        // here. Trigger a friend-search anyway so the friend goes
+        // online immediately after the first dial succeeds.
     }
 
     // Same rationale as `add_friend`: the friend row is already
