@@ -58,6 +58,7 @@
 //!   (e.g. friend-slot priority, EmberFriendRequest emit).
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use rand::rngs::OsRng;
 use rand::RngCore;
 use tracing::warn;
 
@@ -185,8 +186,13 @@ pub fn handle_challenge(
     let mut their_nonce = [0u8; NONCE_LEN];
     their_nonce.copy_from_slice(payload);
 
+    // OsRng (system CSPRNG) for protocol nonces — `thread_rng` is
+    // typically OK in practice but `OsRng` makes the cryptographic
+    // sourcing explicit, removes any reliance on the thread-local
+    // seeding chain, and matches the rest of the Ember crypto code
+    // (`SigningKey::generate(&mut OsRng)` in tests).
     let mut our_nonce = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut our_nonce);
+    OsRng.fill_bytes(&mut our_nonce);
 
     let signing_key = SigningKey::from_bytes(our_secret_key);
     let signature = signing_key.sign(&their_nonce);
@@ -296,7 +302,7 @@ mod tests {
 
         // Initiator generates and sends CHALLENGE.
         let mut init_nonce = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut init_nonce);
+        OsRng.fill_bytes(&mut init_nonce);
 
         // Responder receives initiator's CHALLENGE.
         let mut resp_state = EmberAuthState::default();

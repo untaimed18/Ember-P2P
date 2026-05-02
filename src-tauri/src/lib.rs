@@ -141,7 +141,18 @@ pub fn run() {
                 search::spam::SpamFilter::load(&spam_data_dir),
             ));
 
-            let (network_tx, network_rx) = mpsc::channel(256);
+            // Capacity 1024 (was 256): every Tauri command that mutates
+            // persistent state (`UpdateSettings`, `BanPeer`, `BootstrapContacts`,
+            // `ReloadIpFilter`, `FriendRemoved`, etc.) dispatches a live
+            // `NetworkCommand` here via `try_send` after the DB/config write
+            // succeeds. The on-disk write is the source of truth, so a
+            // dropped live update only delays application until the next
+            // restart, but security-relevant changes (ipfilter reload, peer
+            // ban) shouldn't degrade silently under burst. 1024 covers the
+            // realistic worst case (a user clicking through many rows in
+            // rapid succession) with a comfortable margin while the network
+            // task drains continuously.
+            let (network_tx, network_rx) = mpsc::channel(1024);
 
             let local_index = Arc::new(RwLock::new(LocalIndex::new()));
 

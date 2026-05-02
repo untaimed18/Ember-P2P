@@ -136,26 +136,43 @@ pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// Maximum URL length accepted by [`validate_fetch_url`]. RFC 7230 doesn't
+/// pin a hard limit, but mainstream HTTP servers and clients struggle past
+/// ~8 KB; 2048 fits every documented bootstrap / ipfilter source comfortably
+/// while rejecting pathological inputs early before the DNS / TLS round trip.
+pub const MAX_FETCH_URL_LEN: usize = 2048;
+
 /// Validate a URL for safe fetching. Blocks non-HTTP schemes and private IPs.
 /// Also resolves hostnames and returns the validated (host, resolved_addrs) pair
 /// so callers can pin DNS with `reqwest::Client::builder().resolve()`,
 /// preventing TOCTOU DNS rebinding attacks.
+///
+/// HTTPS-only by design: every default URL we ship (nodes.dat, ipfilter)
+/// is already https, and accepting plaintext http would expose the
+/// downloaded payload to trivial network tampering even with DNS pinning
+/// (the pin only proves *which* host you reached, not that the bytes
+/// weren't modified in flight). Users who paste a custom http:// URL
+/// into the IP filter import field get a clear "https only" error.
 pub async fn validate_fetch_url(url: &str) -> Result<(String, String, Vec<std::net::SocketAddr>), String> {
     let url = url.trim();
     if url.is_empty() {
         return Err("URL is empty".into());
     }
+    if url.len() > MAX_FETCH_URL_LEN {
+        return Err(format!(
+            "URL exceeds {MAX_FETCH_URL_LEN} bytes",
+        ));
+    }
     let url_lower = url.to_ascii_lowercase();
-    if !url_lower.starts_with("https://") && !url_lower.starts_with("http://") {
-        return Err("Only http:// and https:// URLs are allowed".into());
+    if !url_lower.starts_with("https://") {
+        return Err("Only https:// URLs are allowed".into());
     }
 
-    let scheme_port: u16 = if url_lower.starts_with("https://") { 443 } else { 80 };
-    let scheme_str = if url_lower.starts_with("https://") { "https://" } else { "http://" };
+    let scheme_port: u16 = 443;
+    let scheme_str = "https://";
 
     let host_part = url_lower
         .strip_prefix("https://")
-        .or_else(|| url_lower.strip_prefix("http://"))
         .unwrap_or("");
     let raw_authority = host_part.split('/').next().unwrap_or("");
     if raw_authority.contains('@') {

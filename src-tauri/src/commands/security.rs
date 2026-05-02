@@ -401,6 +401,15 @@ pub async fn import_ipfilter_file(
     state: tauri::State<'_, AppState>,
     file_path: String,
 ) -> Result<String, String> {
+    // Match the cap used by `add_shared_folder` / `validate_settings`
+    // so a degenerate frontend caller can't pass a multi-megabyte
+    // string into IPC. The blocking canonicalize / read paths below
+    // would still cope, but bounding here avoids ferrying a giant
+    // string across thread boundaries unnecessarily.
+    const MAX_PATH_LEN: usize = 4 * 1024;
+    if file_path.len() > MAX_PATH_LEN {
+        return Err(format!("File path exceeds {MAX_PATH_LEN} bytes"));
+    }
     let path = tokio::task::spawn_blocking(move || {
         let path = std::path::PathBuf::from(&file_path);
         if !path.exists() {
