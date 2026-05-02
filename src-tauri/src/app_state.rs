@@ -106,6 +106,17 @@ impl AppState {
 
     /// Await all currently-tracked background scans. Aborts any still running
     /// after a grace period so shutdown can't hang on a frozen hasher.
+    ///
+    /// Earlier this just dropped the `JoinHandle`s when the grace timer
+    /// fired and "continued shutdown" — which technically lets the
+    /// shutdown sequence proceed but leaves the task running and still
+    /// touching shared state (`local_index`, `known_files`, the
+    /// in-flight `KnownFileList` we're about to flush). The on-disk
+    /// flush could then race against a writer that's still alive in a
+    /// detached task, producing a half-written `known.met`. Snapshotting
+    /// `abort_handle()` for every scan up front and calling `.abort()`
+    /// on each one when the grace window elapses guarantees no further
+    /// writes after this method returns.
     #[allow(dead_code)]
     pub async fn await_background_scans(&self, grace: std::time::Duration) {
         let handles: Vec<_> = {
@@ -115,13 +126,21 @@ impl AppState {
         if handles.is_empty() {
             return;
         }
-        let fut = async {
+        let abort_handles: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
+        let count = handles.len();
+        let fut = async move {
             for h in handles {
                 let _ = h.await;
             }
         };
         if tokio::time::timeout(grace, fut).await.is_err() {
-            tracing::warn!("background scans still running after grace window; continuing shutdown");
+            tracing::warn!(
+                "background scans still running after {:?}; aborting {} task(s)",
+                grace, count,
+            );
+            for ah in abort_handles {
+                ah.abort();
+            }
         }
     }
 

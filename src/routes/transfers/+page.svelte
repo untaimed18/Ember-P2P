@@ -223,9 +223,24 @@
   let mounted = false;
   onMount(() => {
     mounted = true;
-    const saved = localStorage.getItem('transfers-split');
-    if (saved) { const v = parseFloat(saved); if (Number.isFinite(v)) splitPercent = Math.max(20, Math.min(80, v)); }
-    const savedAdvancedCols = localStorage.getItem('transfers-advanced-cols');
+    // Wrap `localStorage` reads at mount in try/catch. Browser storage
+    // can throw `SecurityError` in private/incognito mode, when the
+    // user has disabled third-party cookies, or when the storage
+    // quota is exhausted. An unhandled throw here used to abort the
+    // whole `onMount` body before listeners attached, leaving the
+    // transfers page non-functional.
+    try {
+      const saved = localStorage.getItem('transfers-split');
+      if (saved) { const v = parseFloat(saved); if (Number.isFinite(v)) splitPercent = Math.max(20, Math.min(80, v)); }
+    } catch (e) {
+      console.warn('transfers: localStorage unavailable for split prefs', e);
+    }
+    let savedAdvancedCols: string | null = null;
+    try {
+      savedAdvancedCols = localStorage.getItem('transfers-advanced-cols');
+    } catch (e) {
+      console.warn('transfers: localStorage unavailable for advanced col prefs', e);
+    }
     loadStoredColumnWidths();
     loadStoredColumnSetup(savedAdvancedCols === '0');
     syncAdvancedDlState();
@@ -2122,6 +2137,57 @@
       sourceDetailRequestId += 1;
       loadingSources = false;
     }
+  });
+
+  // Prune `searchStatus` entries for transfers that have left
+  // `allDownloads`. Without this, every transfer the user ever
+  // started in this session leaves a row in the map (one
+  // `transfer:source-search` event suffices), so a long-lived window
+  // accumulates unbounded UI state. `untrack` shields the effect from
+  // re-running on every progress tick — only the *set of ids*
+  // matters here.
+  $effect(() => {
+    const ids = new Set(allDownloads.map((t) => t.id));
+    untrack(() => {
+      let mutated = false;
+      for (const key of searchStatus.keys()) {
+        if (!ids.has(key)) {
+          searchStatus.delete(key);
+          mutated = true;
+        }
+      }
+      if (mutated) {
+        searchStatus = new Map(searchStatus);
+      }
+    });
+  });
+
+  // Same idea for `reputationMap` / `reputationInFlight`. The known-
+  // clients ledger is the only producer of hashes for these caches;
+  // when a peer leaves the ledger (eviction in the credit manager,
+  // user wipes credits, etc.) the cached reputation entry is dead
+  // weight. Run inside `untrack` so the typical "fetch in-flight,
+  // result lands, map gets a new key" cycle doesn't trigger a full
+  // sweep on every reactive read.
+  $effect(() => {
+    const liveHashes = new Set(knownClients.map((c) => c.user_hash));
+    untrack(() => {
+      let mutated = false;
+      for (const hash of Object.keys(reputationMap)) {
+        if (!liveHashes.has(hash)) {
+          delete reputationMap[hash];
+          mutated = true;
+        }
+      }
+      for (const hash of [...reputationInFlight]) {
+        if (!liveHashes.has(hash)) {
+          reputationInFlight.delete(hash);
+        }
+      }
+      if (mutated) {
+        reputationMap = { ...reputationMap };
+      }
+    });
   });
 
   // Auto-expand the selected download whenever the Download Clients

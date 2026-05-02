@@ -110,21 +110,32 @@
     const unlisteners: Array<() => void> = [];
     let destroyed = false;
 
+    // Sequential listen + rollback on partial failure. Earlier this
+    // used `Promise.all([listen, listen])`, which would leak the
+    // first subscription's unlisten function if the second rejected.
     (async () => {
-      const [u1, u2] = await Promise.all([
-        listen<{ message: string }>('server-log', (event) => {
+      let u1: (() => void) | null = null;
+      let u2: (() => void) | null = null;
+      try {
+        u1 = await listen<{ message: string }>('server-log', (event) => {
           if (!mounted) return;
           log(event.payload.message);
           requestAnimationFrame(() => {
             if (logArea) logArea.scrollTop = logArea.scrollHeight;
           });
-        }),
-        listen<{ status: 'connected' | 'connecting' | 'disconnected' }>('server-status-changed', (_event) => {
+        });
+        if (destroyed) { u1(); return; }
+        u2 = await listen<{ status: 'connected' | 'connecting' | 'disconnected' }>('server-status-changed', (_event) => {
           if (!mounted) return;
           refresh();
-        }),
-      ]);
-      if (destroyed) { u1(); u2(); } else { unlisteners.push(u1, u2); }
+        });
+        if (destroyed) { u1(); u2(); return; }
+        unlisteners.push(u1, u2);
+      } catch (e) {
+        console.warn('servers: failed to register server event listeners', e);
+        if (u1) u1();
+        if (u2) u2();
+      }
     })();
 
     return () => {
