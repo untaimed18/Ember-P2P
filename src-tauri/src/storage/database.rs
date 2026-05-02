@@ -1040,13 +1040,36 @@ impl Database {
     }
 
     pub fn insert_chat_message(&self, friend_hash: &str, direction: &str, message: &str) -> anyhow::Result<i64> {
+        // Per-friend retention cap. The frontend chat sidebar paginates
+        // the most-recent messages, so storing more than this provides
+        // no UX benefit while letting `chat_messages` grow without
+        // bound across long-lived friendships. 5000 messages per friend
+        // covers months-to-years of normal conversation; beyond that we
+        // age out the oldest entries on insert so the DB stays compact.
+        const MAX_MESSAGES_PER_FRIEND: i64 = 5_000;
         let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
         let now = chrono::Utc::now().timestamp();
-        conn.execute(
+        tx.execute(
             "INSERT INTO chat_messages (friend_hash, direction, message, timestamp, read) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![friend_hash, direction, message, now, if direction == "sent" { 1 } else { 0 }],
         )?;
-        Ok(conn.last_insert_rowid())
+        let new_id = tx.last_insert_rowid();
+        // Trim oldest messages above the cap. SQLite's `LIMIT -1 OFFSET ?`
+        // means "everything past the first ? newest rows"; we delete
+        // those. Friend hash is already validated upstream so we can
+        // pass it directly into the parameterised SQL.
+        tx.execute(
+            "DELETE FROM chat_messages WHERE id IN (
+                 SELECT id FROM chat_messages
+                 WHERE friend_hash = ?1
+                 ORDER BY id DESC
+                 LIMIT -1 OFFSET ?2
+             )",
+            params![friend_hash, MAX_MESSAGES_PER_FRIEND],
+        )?;
+        tx.commit()?;
+        Ok(new_id)
     }
 
     pub fn get_chat_messages(&self, friend_hash: &str, limit: i64, before_id: Option<i64>) -> anyhow::Result<Vec<(i64, String, String, i64, bool)>> {

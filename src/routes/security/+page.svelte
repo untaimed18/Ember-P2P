@@ -65,15 +65,31 @@
           e.description.toLowerCase().includes(q)
       );
     }
+    // Parse a dotted-quad IPv4 into a 32-bit unsigned key suitable
+    // for ordering. Any non-numeric octet falls back to the lexical
+    // path below, which guarantees a total order even on garbage
+    // input (otherwise `NaN - NaN === NaN` propagates and
+    // `Array.sort` produces an unstable, undefined permutation).
+    const ipKey = (s: string): number | null => {
+      const parts = s.split('.');
+      if (parts.length !== 4) return null;
+      let acc = 0;
+      for (const part of parts) {
+        const n = Number(part);
+        if (!Number.isFinite(n) || n < 0 || n > 255) return null;
+        acc = acc * 256 + n;
+      }
+      return acc;
+    };
     entries.sort((a, b) => {
       let cmp = 0;
       if (sortBy === 'hits') cmp = a.hits - b.hits;
       else if (sortBy === 'description') cmp = a.description.localeCompare(b.description);
       else {
-        const pa = a.start_ip.split('.').map(Number);
-        const pb = b.start_ip.split('.').map(Number);
-        if (pa.length === 4 && pb.length === 4) {
-          cmp = (pa[0] - pb[0]) || (pa[1] - pb[1]) || (pa[2] - pb[2]) || (pa[3] - pb[3]);
+        const ka = ipKey(a.start_ip);
+        const kb = ipKey(b.start_ip);
+        if (ka !== null && kb !== null) {
+          cmp = ka - kb;
         } else {
           cmp = a.start_ip.localeCompare(b.start_ip);
         }

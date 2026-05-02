@@ -411,10 +411,18 @@ pub async fn remove_shared_folder(
     if path.len() > MAX_PATH_LEN {
         return Err(format!("Folder path exceeds {MAX_PATH_LEN} bytes"));
     }
+    // Earlier this fell back to the raw `path` string when canonicalize
+    // failed. That made the unshare operation silently incomplete: the
+    // index keys are stored in canonical form (see `add_shared_folder`),
+    // so the index/cancel-flag retain step would no-op while the
+    // `shared_folders` config row was happily stripped — causing the
+    // folder to come back on the next reload, but with the index
+    // already torn down. Reject the call instead so the UI can surface
+    // a clear error and the on-disk state stays consistent.
     let canonical_path = std::path::Path::new(&path)
         .canonicalize()
         .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| path.clone());
+        .map_err(|e| format!("Invalid folder path '{path}': {e}"))?;
     // `add_shared_folder` stores the *canonical* form in
     // `shared_folders` and `upload_shared_folders`; the cancel-flag
     // map is also keyed by canonical paths. Comparing against the
@@ -1180,6 +1188,9 @@ pub async fn open_shared_file(
     state: tauri::State<'_, AppState>,
     file_path: String,
 ) -> Result<(), String> {
+    if file_path.len() > MAX_PATH_LEN {
+        return Err(format!("File path exceeds {MAX_PATH_LEN} bytes"));
+    }
     let allowed_dirs = {
         let config = state.config.read().await;
         shared_access_dirs(&config)
@@ -1209,6 +1220,9 @@ pub async fn open_shared_folder(
     state: tauri::State<'_, AppState>,
     file_path: String,
 ) -> Result<(), String> {
+    if file_path.len() > MAX_PATH_LEN {
+        return Err(format!("File path exceeds {MAX_PATH_LEN} bytes"));
+    }
     let allowed_dirs = {
         let config = state.config.read().await;
         shared_access_dirs(&config)

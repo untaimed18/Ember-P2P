@@ -105,15 +105,22 @@
       inputText = '';
       // Bump both generations at the start so any in-flight loadMessages or
       // setupListener from a previous conversation abandon their work before
-      // touching the UI. We pass the captured generation into setupListener
-      // so a slow getChatMessages() doesn't re-attach a listener after the
-      // user switched friends or closed the sidebar.
+      // touching the UI.
       const gen = ++loadGen;
       if (unlisten) { unlisten(); unlisten = null; }
-      loadMessages(gen).then(() => {
+      messages = [];
+      // Await the listener registration BEFORE the historical snapshot
+      // fetch starts. Otherwise a chat-message that arrives during the
+      // (possibly 50–200 ms) `getChatMessages` round trip is dropped on
+      // the floor — the listener isn't attached yet, and the snapshot
+      // doesn't include rows that were inserted after it began.
+      // `loadMessages` then merges its result against any push events
+      // that landed in the meantime, deduping by content tuple.
+      (async () => {
+        await setupListener(gen);
         if (gen !== loadGen) return;
-        setupListener(gen);
-      });
+        await loadMessages(gen);
+      })();
       markAsRead();
     }
     return () => {
@@ -163,12 +170,35 @@
     try {
       const rows = await getChatMessages(friendHash, 100);
       if (gen !== loadGen) return;
-      messages = rows.reverse();
+      // Merge the historical snapshot with any live messages that
+      // pushed into `messages` while the round trip was in flight.
+      // Push events use negative `msgIdCounter` ids; snapshot rows
+      // use positive DB ids, so identity collision is impossible.
+      // To avoid double-displaying a message that was in flight at
+      // the moment the snapshot was taken (e.g. backend emitted the
+      // event AND already persisted the row), dedupe by the
+      // `timestamp + direction + message` tuple — the same message
+      // can't be both newer AND identical at the byte level.
+      const snapshot = rows.reverse();
+      if (messages.length === 0) {
+        messages = snapshot;
+      } else {
+        const liveSig = new Set(
+          messages.map((m) => `${m.timestamp}|${m.direction}|${m.message}`),
+        );
+        const filteredSnapshot = snapshot.filter(
+          (m) => !liveSig.has(`${m.timestamp}|${m.direction}|${m.message}`),
+        );
+        messages = [...filteredSnapshot, ...messages];
+      }
       scrollToBottom();
     } catch (e: unknown) {
       if (gen !== loadGen) return;
-      messages = [];
-      loadError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to load messages';
+      // Don't wipe live-pushed messages on snapshot failure — they
+      // are real and visible to the user even without history.
+      if (messages.length === 0) {
+        loadError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to load messages';
+      }
     } finally {
       if (gen === loadGen) loading = false;
     }
@@ -177,9 +207,8 @@
   async function retryLoad() {
     if (!friendHash) return;
     const gen = ++loadGen;
-    await loadMessages(gen);
-    if (gen !== loadGen) return;
     setupListener(gen);
+    await loadMessages(gen);
   }
 
   async function markAsRead() {

@@ -258,8 +258,8 @@
       } else if (bootstrapMode === 'url') {
         const url = bootstrapUrl.trim();
         if (!url) { toastError('URL is required'); return; }
-        if (!/^https?:\/\//i.test(url)) {
-          toastError('Only http:// or https:// URLs are allowed');
+        if (!/^https:\/\//i.test(url)) {
+          toastError('Only https:// URLs are allowed');
           return;
         }
         const msg = await kadBootstrapUrl(url);

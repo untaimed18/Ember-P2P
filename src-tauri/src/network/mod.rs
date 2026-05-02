@@ -396,6 +396,19 @@ async fn handle_epx_sources(
         if state.aich_root_map.contains_key(file_hash) {
             continue;
         }
+        // Honour the same soft cap the periodic save timer warns
+        // against. Refusing the insert (rather than evicting an
+        // entry) keeps the security invariant — every retained root
+        // came from a trusted hashset match — while bounding RAM
+        // growth from a flood of EPX-advertised roots.
+        if state.aich_root_map.len() >= MAX_AICH_ROOT_MAP_SOFT_CAP {
+            tracing::warn!(
+                "EPX: aich_root_map at soft cap ({}); skipping AICH pin for file {}",
+                MAX_AICH_ROOT_MAP_SOFT_CAP,
+                hex::encode(file_hash),
+            );
+            continue;
+        }
         let matches_trusted = state.aich_hash_sets.iter().any(|hs| hs.root_hash == *aich_root);
         if matches_trusted {
             state.aich_root_map.insert(*file_hash, *aich_root);
@@ -474,6 +487,15 @@ fn try_inject_source(
 
 const MAX_ACTIVE_SOURCE_OVERFLOW: usize = 128;
 const MAX_UDP_SOURCE_QUEUE: usize = 500;
+/// Mirrors `MAX_UDP_SOURCE_QUEUE`. Without this cap a single
+/// `start_search` call enqueues one packet per known server, so a user
+/// who imported a 5000-entry server.met would buffer 5000 packets and
+/// drain at one packet per `udp_search_timer` tick (~750 ms each), i.e.
+/// over an hour of useless trailing search traffic. The drained packet
+/// is small (~50 B), so 500 ≈ 25 KB peak, comfortably under any
+/// realistic working-set memory budget while letting eMule's typical
+/// 100–200 servers fit without truncation.
+const MAX_UDP_SEARCH_QUEUE: usize = 500;
 
 fn enqueue_overflow_source(
     state: &mut NetworkState,
@@ -2179,6 +2201,23 @@ struct NetworkState {
 /// to fan out hundreds of probes in parallel.
 const MAX_EMBER_PENDING_PINGS: usize = 1024;
 
+/// Hard cap on `aich_hash_sets` (full per-file recovery hash sets
+/// loaded from / persisted to `known2_64.met`). Each set is on the
+/// order of `(file_size / PARTSIZE) * 20` bytes — a 4 GiB file is
+/// ~9 KiB. At 10k entries the persisted file would be ~90 MB, which
+/// is already implausibly large for a single user; pushing past this
+/// cap most likely indicates a hashing-loop bug rather than legitimate
+/// growth, so we refuse the insert and log a warning.
+const MAX_AICH_HASH_SETS: usize = 10_000;
+
+/// Soft cap on `aich_root_map` (ed2k → AICH root hash). At ~60 B per
+/// entry, 100k mappings is ~6 MB — well within budget, but we log a
+/// warning past this point so a runaway insert path is observable in
+/// production logs without silently degrading corruption-recovery
+/// integrity (eviction would risk losing the only trusted root for
+/// a given file).
+const MAX_AICH_ROOT_MAP_SOFT_CAP: usize = 100_000;
+
 /// Filter search results by file type, matching eMule's AddToList behavior:
 /// when a type filter is active, reject any result whose inferred type
 /// doesn't match the requested type.
@@ -3698,17 +3737,35 @@ pub async fn start_network(
     let mut known_files = KnownFileList::load(&known_met_path);
     info!("Loaded {} known files", known_files.file_count());
 
-    // Load AICH hash sets from known2_64.met (eMule SHAHashSet.cpp)
+    // Load AICH hash sets from known2_64.met (eMule SHAHashSet.cpp).
+    // Truncate at the same `MAX_AICH_HASH_SETS` cap that the periodic
+    // save timer enforces — otherwise an existing on-disk file with
+    // implausibly many entries (corrupted, attacker-supplied, or
+    // legacy build with no cap) would blow past the runtime limit
+    // immediately on startup. Excess entries are dropped with a
+    // visible warning so the operator can investigate.
     let known2_met_path = data_dir.join("known2_64.met");
     match ed2k::aich::load_known2_met(&known2_met_path) {
         Ok(sets) => {
-            info!("Loaded {} AICH hash sets from known2_64.met", sets.len());
-            state.aich_hash_sets = sets.into_iter().map(|(root, leaves)| {
-                ed2k::aich::AICHRecoveryHashSet {
+            let total = sets.len();
+            let kept: Vec<_> = sets
+                .into_iter()
+                .take(MAX_AICH_HASH_SETS)
+                .map(|(root, leaves)| ed2k::aich::AICHRecoveryHashSet {
                     root_hash: root,
                     leaf_hashes: leaves,
-                }
-            }).collect();
+                })
+                .collect();
+            if total > MAX_AICH_HASH_SETS {
+                warn!(
+                    "known2_64.met has {} sets (cap {}); dropping {} oldest on load",
+                    total,
+                    MAX_AICH_HASH_SETS,
+                    total - MAX_AICH_HASH_SETS,
+                );
+            }
+            info!("Loaded {} AICH hash sets from known2_64.met", kept.len());
+            state.aich_hash_sets = kept;
         }
         Err(e) => {
             if known2_met_path.exists() {
@@ -3717,13 +3774,22 @@ pub async fn start_network(
         }
     };
 
-    // Load ed2k hash → AICH root mapping from cache
+    // Load ed2k hash → AICH root mapping from cache. Same logic as
+    // above — refuse new mappings past `MAX_AICH_ROOT_MAP_SOFT_CAP`
+    // even on startup so a tampered cache can't trick us into
+    // exceeding the documented soft cap before the warn-only sweep
+    // would even catch it.
     let aich_cache_path = data_dir.join("aich_cache.dat");
     if let Ok(contents) = std::fs::read_to_string(&aich_cache_path) {
+        let mut skipped_at_cap = 0usize;
         for line in contents.lines() {
             if let Some((ed2k_hex, aich_hex)) = line.split_once('=') {
                 if let (Ok(ed2k_bytes), Ok(aich_bytes)) = (hex::decode(ed2k_hex.trim()), hex::decode(aich_hex.trim())) {
                     if ed2k_bytes.len() == 16 && aich_bytes.len() == 20 {
+                        if state.aich_root_map.len() >= MAX_AICH_ROOT_MAP_SOFT_CAP {
+                            skipped_at_cap = skipped_at_cap.saturating_add(1);
+                            continue;
+                        }
                         let mut fh = [0u8; 16];
                         let mut ah = [0u8; 20];
                         fh.copy_from_slice(&ed2k_bytes);
@@ -3732,6 +3798,12 @@ pub async fn start_network(
                     }
                 }
             }
+        }
+        if skipped_at_cap > 0 {
+            warn!(
+                "aich_cache.dat had {} entries past soft cap {}; ignored on load",
+                skipped_at_cap, MAX_AICH_ROOT_MAP_SOFT_CAP,
+            );
         }
         info!("Loaded {} AICH root mappings from cache", state.aich_root_map.len());
     }
@@ -3800,7 +3872,14 @@ pub async fn start_network(
 
     // Callback connection channel: upload listener sends firewalled sources that
     // connected back (both KAD buddy callbacks and server LowID callbacks).
-    let (kad_callback_tx, mut kad_callback_rx) = mpsc::channel::<upload_server::KadCallbackParts>(32);
+    //
+    // Capacity 256 (was 32): the broker's `BrokerEvent::ConnectionReady` arm
+    // forwards established LowID-to-LowID connections here via `try_send`,
+    // and the upload accept paths also push direct callbacks. Under bursty
+    // discovery the old 32-slot buffer regularly hit its cap and the
+    // network task self-deadlocked when awaiting on it — `try_send` plus a
+    // larger cushion prevents both.
+    let (kad_callback_tx, mut kad_callback_rx) = mpsc::channel::<upload_server::KadCallbackParts>(256);
     let (udp_fw_check_tx, mut udp_fw_check_rx) = mpsc::channel::<upload_server::UdpFirewallCheckRequest>(16);
     let pending_kad_callbacks: upload_server::PendingKadCallbacks =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
@@ -7932,7 +8011,15 @@ pub async fn start_network(
                     // fall back from `tcp_port` if it's already in use
                     // (e.g. tcp_port == udp_port).
                     if state.connection_broker.is_none() {
-                        let (broker_tx, broker_rx) = mpsc::channel(32);
+                        // Capacity 1024 (was 32): every broker producer
+                        // already calls `try_send`, so the cap acts as
+                        // pure cushion against burst bookkeeping events
+                        // (StartPunch / StartRelay / ConnectionReady /
+                        // *Failed). Small caps used to drop legitimate
+                        // events under load; this gives the periodic
+                        // drain plenty of headroom while staying well
+                        // under the per-attempt MAX_ACTIVE_ATTEMPTS=8.
+                        let (broker_tx, broker_rx) = mpsc::channel(1024);
                         let mut broker = ember::broker::ConnectionBroker::new(
                             settings.rendezvous_url.clone(),
                             broker_tx,
@@ -8944,7 +9031,26 @@ pub async fn start_network(
                                     emule_info_done: true,
                                 };
                                 let key = format!("{}:{}:{}", conn.transfer_id, conn.source_ip, conn.source_port);
-                                let _ = kad_callback_tx.send(parts).await;
+                                // `try_send` rather than `send().await`: the
+                                // kad-callback channel is drained by another
+                                // arm of THIS same select! loop, so awaiting
+                                // on a full channel would self-deadlock the
+                                // network task. The connection is dropped
+                                // on overflow; the multi-source scheduler
+                                // re-asks the peer on its next reask cycle.
+                                if let Err(e) = kad_callback_tx.try_send(parts) {
+                                    match e {
+                                        tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                                            tracing::warn!(
+                                                "Broker: kad-callback channel full; dropping connection for transfer {} from {}:{}",
+                                                conn.transfer_id, conn.source_ip, conn.source_port,
+                                            );
+                                        }
+                                        tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                                            tracing::debug!("Broker: kad-callback channel closed during shutdown");
+                                        }
+                                    }
+                                }
                                 if let Some(ref mut broker) = state.connection_broker {
                                     broker.mark_succeeded(&key, method);
                                     if method == ember::broker::ConnectionMethod::PeerRelay {
@@ -9391,6 +9497,51 @@ pub async fn start_network(
                         .collect();
                     state.banned_ips = db_banned;
                 }
+
+                // Sweep orphaned Ember ping waiters. Each entry is created
+                // when we send `EmberControlMessage::Ping` to a peer; the
+                // entry is normally removed when the matching `Pong` lands
+                // in `handle_udp_packet`. If the peer never replies (lost
+                // packet, peer dropped, peer doesn't speak the protocol),
+                // the entry would otherwise stay until process exit and
+                // eventually saturate `MAX_EMBER_PENDING_PINGS=1024` so
+                // no further pings could register. The awaiting caller's
+                // own `tokio::time::timeout` already returned long ago by
+                // the time `MAX_PING_AGE` elapses, so dropping the
+                // oneshot here only frees backend memory — no
+                // user-visible behaviour change.
+                {
+                    const MAX_PING_AGE: std::time::Duration =
+                        std::time::Duration::from_secs(120);
+                    let now = std::time::Instant::now();
+                    let stale: Vec<u64> = state
+                        .ember_pending_pings
+                        .iter()
+                        .filter(|(_, (sent_at, _))| now.duration_since(*sent_at) >= MAX_PING_AGE)
+                        .map(|(nonce, _)| *nonce)
+                        .collect();
+                    if !stale.is_empty() {
+                        for nonce in &stale {
+                            state.ember_pending_pings.remove(nonce);
+                        }
+                        debug!(
+                            "Ember: swept {} orphaned pending ping(s) older than {}s",
+                            stale.len(),
+                            MAX_PING_AGE.as_secs(),
+                        );
+                    }
+                }
+
+                // Reap idle Noise sessions and pending handshakes. The
+                // documented TTLs in `EmberTransport::cleanup` (300s
+                // session, 30s pending) were previously dead code — only
+                // the absolute caps (`MAX_SESSIONS=4096`, `MAX_PENDING=512`)
+                // bounded growth. Calling the sweep on the same 30s
+                // cadence as flood-protection cleanup makes the TTL the
+                // primary eviction signal again, so memory tracks live
+                // peer activity instead of accumulating until the cap
+                // forces eviction.
+                state.ember_transport.cleanup();
             }
 
             // Retry source search for pending downloads (eMule: never auto-fail, search forever)
@@ -12668,6 +12819,25 @@ pub async fn start_network(
                     }
                 }
                 while let Ok(hs) = aich_set_rx.try_recv() {
+                    // Cap aich_hash_sets to a sane upper bound. The
+                    // recovery sets are persisted to known2_64.met and
+                    // grow with the local file corpus; in normal use
+                    // this is bounded by user activity, but a buggy
+                    // hashing path or a maliciously-named file ingested
+                    // through the indexer could in principle insert
+                    // without limit. We refuse new sets past the cap
+                    // (rather than evicting) because dropping a stored
+                    // set risks losing the only AICH root we trust for
+                    // a file — eviction would silently downgrade
+                    // corruption-recovery integrity.
+                    if state.aich_hash_sets.len() >= MAX_AICH_HASH_SETS {
+                        warn!(
+                            "aich_hash_sets at cap ({}), dropping new set for root {}",
+                            MAX_AICH_HASH_SETS,
+                            hex::encode(hs.root_hash),
+                        );
+                        continue;
+                    }
                     state.aich_hash_sets.push(hs);
                 }
                 if !state.aich_hash_sets.is_empty() {
@@ -12675,6 +12845,20 @@ pub async fn start_network(
                     if let Err(e) = ed2k::aich::save_known2_met(&known2_path, &state.aich_hash_sets) {
                         error!("Failed to save known2_64.met: {e}");
                     }
+                }
+
+                // Visibility for the other AICH cache. Same eviction-is-
+                // unsafe argument applies, so we surface a soft warning
+                // instead of silently dropping entries — operators
+                // running pathological libraries will see the log and
+                // can intervene (split shares, increase the cap).
+                if state.aich_root_map.len() >= MAX_AICH_ROOT_MAP_SOFT_CAP {
+                    warn!(
+                        "aich_root_map size {} above soft cap {}; \
+                         consider trimming the file library",
+                        state.aich_root_map.len(),
+                        MAX_AICH_ROOT_MAP_SOFT_CAP,
+                    );
                 }
             }
 
@@ -13566,8 +13750,23 @@ pub async fn start_network(
     if let Err(e) = known_files.save(&known_path) {
         error!("Failed to save known.met on shutdown: {e}");
     }
+    // Drain remaining AICH sets, but honour the same cap as the
+    // periodic timer — we don't want shutdown to be the one place
+    // that silently writes a known2_64.met file larger than every
+    // subsequent startup is willing to load.
+    let mut shutdown_dropped = 0usize;
     while let Ok(hs) = aich_set_rx.try_recv() {
+        if state.aich_hash_sets.len() >= MAX_AICH_HASH_SETS {
+            shutdown_dropped = shutdown_dropped.saturating_add(1);
+            continue;
+        }
         state.aich_hash_sets.push(hs);
+    }
+    if shutdown_dropped > 0 {
+        warn!(
+            "Shutdown drain hit AICH cap {}; dropped {} new set(s)",
+            MAX_AICH_HASH_SETS, shutdown_dropped,
+        );
     }
     if !state.aich_hash_sets.is_empty() {
         let known2_path = state.data_dir.join("known2_64.met");
@@ -16171,10 +16370,21 @@ async fn handle_command(
             // --- UDP global search ---
             if run_udp {
                 let servers = state.server_list.servers();
+                let mut dropped = 0usize;
                 for server in servers {
                     if let Some(pkt) = ServerUdpSocket::build_global_search_packet(server, &search_expr) {
+                        if state.udp_search_queue.len() >= MAX_UDP_SEARCH_QUEUE {
+                            dropped = dropped.saturating_add(1);
+                            continue;
+                        }
                         state.udp_search_queue.push_back(pkt);
                     }
+                }
+                if dropped > 0 {
+                    debug!(
+                        "UDP global search queue at cap ({}); dropped {} additional server packet(s)",
+                        MAX_UDP_SEARCH_QUEUE, dropped,
+                    );
                 }
                 if !state.udp_search_queue.is_empty() {
                     active_request.udp_pending = true;
