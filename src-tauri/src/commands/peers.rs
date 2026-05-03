@@ -77,7 +77,19 @@ pub async fn add_friend(
 ) -> Result<(), String> {
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
-    let nick = nickname.unwrap_or_default();
+    // L20: strip bidi/zero-width/control formatters from
+    // user-supplied nicknames before they're written to the DB.
+    // The friends list uses `<bdi>` to neutralise visual
+    // reordering at render time (M14), but storing the override
+    // character means it comes back the next time the user
+    // exports the friends list, copies a name, or syncs to a
+    // future sibling client.
+    let nick = crate::security::sanitize_display_name(&nickname.unwrap_or_default());
+    // `sanitize_display_name` substitutes "Anonymous" for empty
+    // input; treat that the same as a too-short nickname so
+    // adding a friend without specifying one keeps a sensible
+    // default rather than the literal string "Anonymous".
+    let nick = if nick == "Anonymous" { String::new() } else { nick };
     if nick.len() > MAX_FRIEND_NICKNAME_LEN {
         return Err(format!(
             "Nickname too long (max {MAX_FRIEND_NICKNAME_LEN} bytes)"
@@ -168,7 +180,15 @@ pub async fn update_friend_nickname(
     user_hash_hex: String,
     nickname: String,
 ) -> Result<(), String> {
-    if nickname.len() > MAX_FRIEND_NICKNAME_LEN {
+    // L20: same sanitisation pass as `add_friend` so a rename to
+    // an injected bidi/zero-width payload doesn't slip past.
+    let cleaned = crate::security::sanitize_display_name(&nickname);
+    let cleaned = if cleaned == "Anonymous" && nickname.trim().is_empty() {
+        String::new()
+    } else {
+        cleaned
+    };
+    if cleaned.len() > MAX_FRIEND_NICKNAME_LEN {
         return Err(format!(
             "Nickname too long (max {MAX_FRIEND_NICKNAME_LEN} bytes)"
         ));
@@ -178,7 +198,7 @@ pub async fn update_friend_nickname(
 
     let db = state.db.clone();
     let db_hash = canonical;
-    let db_nick = nickname;
+    let db_nick = cleaned;
     let updated = tokio::task::spawn_blocking(move || db.update_friend_nickname(&db_hash, &db_nick))
         .await
         .map_err(|e| format!("Task error: {e}"))?
@@ -245,12 +265,24 @@ pub async fn send_chat_message(
     if message.is_empty() || message.len() > 4096 {
         return Err("Message must be between 1 and 4096 bytes".into());
     }
+    // L20: strip control / bidi-override / zero-width / variation
+    // selector code points from outbound chat. Inbound chat is
+    // already protected from visual reordering by the `<bdi>`
+    // wrapping in `ChatSidebar.svelte` (M14), but the underlying
+    // text would still carry the override characters across the
+    // wire and into the recipient's database. Sanitising on
+    // egress means our peers see only the visible content and
+    // never store the spoofing primitive.
+    let cleaned = crate::security::sanitize_chat_text(&message);
+    if cleaned.trim().is_empty() {
+        return Err("Message is empty after sanitisation".into());
+    }
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     state.network_tx.send(NetworkCommand::SendChatMessage {
         ember_hash: hash,
-        message,
+        message: cleaned,
         tx,
     }).await.map_err(|_| "Network unavailable".to_string())?;
     rx.await.map_err(|_| "No response".to_string())?
