@@ -183,6 +183,24 @@ pub async fn update_settings(
     let mut settings = settings;
     settings.spam_filter_profile = settings.spam_filter_profile.trim().to_ascii_lowercase();
     settings.close_to_tray_behavior = settings.close_to_tray_behavior.trim().to_ascii_lowercase();
+    // L20: strip bidi/zero-width/control formatters from the
+    // local user's own nickname before it's stored or sent on the
+    // wire (Hello/EmuleInfo/HelloAnswer all carry it). Without
+    // this the local user could paste an override character and
+    // every peer's friends list would render the spoofed string;
+    // with this, the field is normalised at the boundary so wire
+    // and storage are consistent. We avoid the
+    // `sanitize_display_name` fallback to "Anonymous" so a user
+    // whose entire nickname was invisible characters still trips
+    // the empty-nickname check below — we'd rather reject than
+    // silently rewrite their identity.
+    settings.nickname = settings
+        .nickname
+        .chars()
+        .filter(|c| !c.is_control() && *c != '\0' && !crate::security::is_invisible_or_bidi_control_pub(*c))
+        .collect::<String>()
+        .trim()
+        .to_string();
     validate_settings(&settings)?;
 
     let old_settings = {

@@ -4025,14 +4025,26 @@ pub async fn start_network(
         let pruned_before = cm.all_records().len();
         cm.cleanup_stale(90);
         let pruned_after = cm.all_records().len();
-        if pruned_before != pruned_after {
+        let any_pruned = pruned_before != pruned_after;
+        if any_pruned {
             info!(
                 "Pruned {} stale credit record(s) on startup (now {})",
                 pruned_before - pruned_after,
                 pruned_after
             );
         }
-        Arc::new(RwLock::new(cm))
+        let arc = Arc::new(RwLock::new(cm));
+        // L6: pair the startup prune with an immediate disk flush so
+        // a crash inside the first 60-s save tick can't reload the
+        // pre-prune rows from the DB on next start. Skip the flush
+        // when nothing was pruned to avoid paying for a full-table
+        // rewrite on every cold boot. The flush itself is
+        // already-transactional (DELETE + INSERT inside a single
+        // SQLite tx in `save_all_credits`).
+        if any_pruned {
+            flush_credit_state(&arc, &db, &data_dir, false).await;
+        }
+        arc
     };
 
     let a4af_shared: Arc<RwLock<A4AFManager>> = Arc::new(RwLock::new(A4AFManager::new()));
@@ -5407,9 +5419,20 @@ pub async fn start_network(
                 if let DownloadEvent::EmberChatMessage { ember_hash: chat_ember_hash, ref message } = event {
                     if !settings.friend_chat_disabled {
                         let hash_hex = hex::encode(chat_ember_hash);
+                        // L20: even though we strip bidi / zero-width
+                        // controls on egress, an honest local install
+                        // can't speak for the friend's client. A
+                        // peer running a forked or pre-L20 build is
+                        // still free to ship overrides on the wire,
+                        // and the recipient's `<bdi>` wrapping (M14)
+                        // only neutralises the *visual* effect — the
+                        // raw character is still in the DB and would
+                        // be exported intact. Sanitising on ingress
+                        // closes that storage and roundtrip path.
+                        let cleaned = crate::security::sanitize_chat_text(message);
                         let db2 = db.clone();
                         let h2 = hash_hex.clone();
-                        let msg2 = message.clone();
+                        let msg2 = cleaned.clone();
                         tokio::task::spawn_blocking(move || {
                             if let Err(e) = db2.insert_chat_message(&h2, "received", &msg2) {
                                 tracing::warn!("Failed to persist received chat message: {e}");
@@ -5417,7 +5440,7 @@ pub async fn start_network(
                         });
                         let _ = app_handle.emit("ember:chat-message", serde_json::json!({
                             "user_hash": hash_hex,
-                            "message": message,
+                            "message": cleaned,
                             "direction": "received",
                             "timestamp": chrono::Utc::now().timestamp(),
                         }));
@@ -5950,9 +5973,18 @@ pub async fn start_network(
                 if let UploadEventKind::EmberChatMessage { ember_hash: chat_eh, ref message } = event.kind {
                     if !settings.friend_chat_disabled {
                         let hash_hex = hex::encode(chat_eh);
+                        // L20: same ingress sanitisation as the
+                        // download-event path above. Inbound chat
+                        // arrives via two upload-listener routes
+                        // (`upload.rs` direct, plus the
+                        // friend-session reader in
+                        // `friend_connect.rs`) and both ultimately
+                        // land here, so this single call covers
+                        // every inbound chat persistence point.
+                        let cleaned = crate::security::sanitize_chat_text(message);
                         let db2 = db.clone();
                         let h2 = hash_hex.clone();
-                        let msg2 = message.clone();
+                        let msg2 = cleaned.clone();
                         tokio::task::spawn_blocking(move || {
                             if let Err(e) = db2.insert_chat_message(&h2, "received", &msg2) {
                                 tracing::warn!("Failed to persist received chat message: {e}");
@@ -5960,7 +5992,7 @@ pub async fn start_network(
                         });
                         let _ = app_handle.emit("ember:chat-message", serde_json::json!({
                             "user_hash": hash_hex,
-                            "message": message,
+                            "message": cleaned,
                             "direction": "received",
                             "timestamp": chrono::Utc::now().timestamp(),
                         }));
@@ -8793,10 +8825,18 @@ pub async fn start_network(
                 }
 
                 // Prune stale credit records (older than 90 days)
-                {
-                    let mut cm = credit_manager.write().await;
-                    cm.cleanup_stale(90);
-                }
+                // and immediately flush the result to disk in the same
+                // critical section. L6: previously this only mutated
+                // the in-memory map; the next `credit_save_timer` tick
+                // (up to 60 s away) was the only thing that wrote the
+                // pruned snapshot back. A crash inside that window
+                // would lose the prune (the DB still held the stale
+                // rows, which got reloaded into memory on next start),
+                // and any operator who'd correlated metrics off the
+                // pruned in-memory count would see them re-appear. The
+                // periodic flush still runs; this just guarantees the
+                // disk catches up at the moment we mutated memory.
+                flush_credit_state(&credit_manager, &db, &state.data_dir, true).await;
 
                 // Remove contacts not seen in 2 hours
                 let stale_removed = state.routing_table.remove_stale(7200);

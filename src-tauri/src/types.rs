@@ -727,6 +727,54 @@ fn default_max_friends() -> u32 {
     200
 }
 
+/// Default rendezvous server URL.
+///
+/// L13: trust model for the V1 default rendezvous host.
+///
+/// The rendezvous server's role is narrow: it stores
+/// `(ember_id, ip, port, pubkey)` tuples that other Ember nodes
+/// can look up to find each other when KAD doesn't know the peer.
+/// It can NOT impersonate a friend on the data plane — every
+/// friend session does its own Ed25519 proof-of-possession before
+/// accepting chat, browse, or files (`friend_connect.rs`,
+/// `ember_auth.rs`). It can NOT silently rewrite a friend's
+/// address to attacker infrastructure either: after C4 the client
+/// signs the (id, port, ipv4, pubkey, ts) tuple with the node's
+/// Ed25519 secret, the server pins the pubkey to the id on first
+/// register, and the lookup endpoint refuses to hand back loopback,
+/// link-local, private, or unspecified IPv4 addresses. The HTTPS
+/// transport is also pinned by the client (`require_https` +
+/// `https_only(true)` in `network/rendezvous.rs::client`), so a
+/// network-position attacker between the user and the rendezvous
+/// edge cannot rewrite responses without breaking TLS.
+///
+/// What the rendezvous operator CAN still do:
+///   1. **Refuse to answer.** The lookup just returns "no peer found"
+///      and the friend stays unreachable until KAD or a cached IP
+///      bridges them. This is a denial-of-service, not a confidentiality
+///      or integrity issue.
+///   2. **Selectively delay queries** to give an attacker time to set
+///      up infrastructure at a *new* IP that the real peer is about
+///      to register from. The signature still has to verify, so this
+///      requires the operator to also be the keypair holder — which
+///      means the attacker is impersonating the friend, not the
+///      rendezvous, and the user already has a problem the rendezvous
+///      can't make worse.
+///   3. **Decline future protocol changes** that would tighten the
+///      contract further (e.g. signed lookup nonces in V2).
+///
+/// What it CANNOT do:
+///   - Steer chat, browse, or file traffic to an attacker. Every data
+///     channel does PoP after the dial.
+///   - Impersonate the keypair holder. The pubkey-pin gate forces every
+///     post-first registration to come from the same private key.
+///   - Inflate or backdate `last_seen` in a way the friend's UI honours.
+///     The UI sources liveness from the live session, not the lookup.
+///
+/// Operators who want to run their own rendezvous can change this URL
+/// in Settings; the rest of the stack treats the URL as configuration,
+/// not as a trust anchor. Mirror this string in
+/// `rendezvous-server/README.md` if you change the default.
 fn default_rendezvous_url() -> String {
     "https://ember-rendezvous.fly.dev".to_string()
 }

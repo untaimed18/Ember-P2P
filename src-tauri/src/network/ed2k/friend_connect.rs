@@ -393,7 +393,22 @@ pub async fn open_and_run_friend_session(
     let session_friend_hashes = friend_hashes.clone();
     tokio::spawn(async move {
         const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(90);
+        // L8: dead-peer detector. The eMule wire protocol has no
+        // ack on application-level packets, so a peer whose NAT
+        // mapping silently expired (or whose process is hung) will
+        // happily accept our outbound bytes for ages before the
+        // OS-level TCP retransmission storm finally surfaces an
+        // error — typically 5–15 minutes on Windows. We instead
+        // track the last *inbound* activity and disconnect when
+        // we've heard nothing back in 3× the keepalive interval
+        // (~4.5 min). 3× is the minimum that tolerates a single
+        // lost keepalive in each direction without flapping; the
+        // peer's reciprocal keepalive should reach us within one
+        // window in steady state.
+        const STALL_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(KEEPALIVE_INTERVAL.as_secs() * 3);
         let mut last_activity = tokio::time::Instant::now();
+        let mut last_inbound = tokio::time::Instant::now();
 
         // Dedicated reader task: reading an ed2k packet requires multiple
         // sequential awaits (protocol byte, length, opcode, payload). If the
@@ -428,7 +443,14 @@ pub async fn open_and_run_friend_session(
                     };
                     match result {
                         Ok((proto, opcode, payload)) => {
-                            last_activity = tokio::time::Instant::now();
+                            let now = tokio::time::Instant::now();
+                            last_activity = now;
+                            // Even an OP_EMBER_KEEPALIVE (which we
+                            // otherwise drop in the match below)
+                            // counts as inbound liveness — that's
+                            // exactly what the peer is signalling
+                            // by sending it.
+                            last_inbound = now;
                             match (proto, opcode) {
                                 (OP_EMULEPROT, OP_EMBER_CHAT_MSG) => {
                                     if payload.len() <= 4096 {
@@ -511,6 +533,24 @@ pub async fn open_and_run_friend_session(
                 _ = keepalive => {
                     if !session_friend_hashes.read().await.contains(&peer_ember_hash) {
                         info!("Friend {} removed, terminating outbound session", hex::encode(peer_ember_hash));
+                        break;
+                    }
+                    // L8: stall check. Run BEFORE we send another
+                    // keepalive so we don't pointlessly burn one more
+                    // round trip on a peer that's already dead. The
+                    // STALL_TIMEOUT is wider than KEEPALIVE_INTERVAL
+                    // by enough margin to absorb a single
+                    // packet-loss-and-retry cycle in either
+                    // direction; if the peer is genuinely alive its
+                    // reciprocal keepalive will have refreshed
+                    // `last_inbound` long before we get here.
+                    if last_inbound.elapsed() >= STALL_TIMEOUT {
+                        info!(
+                            "Friend session to {} ({}) stalled — no inbound traffic in {:?}; disconnecting",
+                            addr,
+                            hex::encode(peer_ember_hash),
+                            last_inbound.elapsed(),
+                        );
                         break;
                     }
                     if write_packet(&mut writer, OP_EMULEPROT, OP_EMBER_KEEPALIVE, &[]).await.is_err() {

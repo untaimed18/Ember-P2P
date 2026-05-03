@@ -14,6 +14,38 @@ export const friendRequests = writable<FriendRequestInfo[]>([]);
 export const searchingFriends = writable<Set<string>>(new Set());
 export const isDiscoverable = writable(false);
 
+// L19: per-friend timers that automatically clear stale "searching"
+// state. The backend emits `friend-searching` and is supposed to
+// follow up with either `friend-confirmed`, `friend-search-failed`,
+// or `friend-online` — but if the worker crashes mid-search or the
+// terminal event is lost on the IPC bridge, the friend-row spinner
+// would otherwise spin forever. After SEARCH_TTL_MS we forcibly
+// drop the entry; the user can re-trigger the search if they
+// actually want one.
+const SEARCH_TTL_MS = 60_000;
+const searchTimers = new Map<string, ReturnType<typeof setTimeout>>();
+function clearSearchTimer(hash: string) {
+  const t = searchTimers.get(hash);
+  if (t !== undefined) {
+    clearTimeout(t);
+    searchTimers.delete(hash);
+  }
+}
+function armSearchTimer(hash: string) {
+  clearSearchTimer(hash);
+  searchTimers.set(
+    hash,
+    setTimeout(() => {
+      searchTimers.delete(hash);
+      searchingFriends.update((s) => {
+        const next = new Set(s);
+        next.delete(hash);
+        return next;
+      });
+    }, SEARCH_TTL_MS),
+  );
+}
+
 // The friend hash of the chat that's currently open and focused in
 // the UI. Set by `ChatSidebar` when it mounts/unmounts. Used to skip
 // `unreadCounts` increments for messages the user is actively
@@ -71,6 +103,7 @@ export async function initFriendsStore() {
         const hash = event.payload.user_hash;
         onlineFriends.update((s) => new Set([...s, hash]));
         searchingFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
+        clearSearchTimer(hash);
       }),
     );
     registered.push(
@@ -144,6 +177,7 @@ export async function initFriendsStore() {
     registered.push(
       await listen<{ user_hash: string }>('ember:friend-confirmed', (event) => {
         searchingFriends.update((s) => { const next = new Set(s); next.delete(event.payload.user_hash); return next; });
+        clearSearchTimer(event.payload.user_hash);
       }),
     );
     registered.push(
@@ -154,11 +188,16 @@ export async function initFriendsStore() {
     registered.push(
       await listen<{ user_hash: string }>('ember:friend-searching', (event) => {
         searchingFriends.update((s) => new Set([...s, event.payload.user_hash]));
+        // Arm/refresh the auto-clear so a missing terminal event
+        // (e.g. backend crash mid-search) doesn't strand the
+        // spinner.
+        armSearchTimer(event.payload.user_hash);
       }),
     );
     registered.push(
       await listen<{ user_hash: string; reason?: string }>('ember:friend-search-failed', (event) => {
         searchingFriends.update((s) => { const next = new Set(s); next.delete(event.payload.user_hash); return next; });
+        clearSearchTimer(event.payload.user_hash);
       }),
     );
   } catch (e) {
@@ -204,6 +243,10 @@ export function cleanupFriendsStore() {
     clearTimeout(friendRequestRefetchTimer);
     friendRequestRefetchTimer = null;
   }
+  // L19: tear down any outstanding search-TTL timers; otherwise
+  // a re-init would re-arm them on top of stale state.
+  for (const t of searchTimers.values()) clearTimeout(t);
+  searchTimers.clear();
   onlineFriends.set(new Set());
   unreadCounts.set(new Map());
   friendRequests.set([]);
