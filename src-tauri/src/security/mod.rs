@@ -574,14 +574,55 @@ pub fn validate_path_within(base: &Path, relative: &str) -> Option<PathBuf> {
     Some(full)
 }
 
-/// Sanitize a nickname/display name from a peer. Removes control characters
-/// and limits length to prevent UI injection.
+/// Returns `true` for code points that are visually invisible or
+/// reorder neighbouring text — bidi controls, zero-width spaces,
+/// the BOM, and other Cf-category formatters that don't render.
+///
+/// L20: even with `<bdi>` wrapping (M14) the underlying text still
+/// contains the override characters, so they roundtrip through chat,
+/// copy-paste, and the friends list. Stripping at sanitise time
+/// removes the spoofing primitive entirely instead of just hiding
+/// its rendering effects.
+/// Public re-export of `is_invisible_or_bidi_control` for callers
+/// (e.g. the settings update path) that need the same predicate
+/// but a different empty-input fallback than `sanitize_display_name`.
+pub fn is_invisible_or_bidi_control_pub(c: char) -> bool {
+    is_invisible_or_bidi_control(c)
+}
+
+fn is_invisible_or_bidi_control(c: char) -> bool {
+    matches!(c,
+        // Mongolian vowel separator: invisible, used in some
+        // historical spoofing payloads.
+        '\u{180E}'
+        // Zero-width spaces, joiners, LTR/RTL marks.
+        | '\u{200B}'..='\u{200F}'
+        // LTR/RTL embedding, pop, override.
+        | '\u{202A}'..='\u{202E}'
+        // Word joiner, function application, invisible separator
+        // / times / plus.
+        | '\u{2060}'..='\u{2064}'
+        // LTR/RTL/first-strong isolate, pop directional isolate.
+        | '\u{2066}'..='\u{2069}'
+        // BOM / zero-width no-break space.
+        | '\u{FEFF}'
+        // Variation selectors (rarely legitimate in user input,
+        // sometimes used to alter visual identity of preceding
+        // characters).
+        | '\u{FE00}'..='\u{FE0F}'
+        | '\u{E0100}'..='\u{E01EF}'
+    )
+}
+
+/// Sanitize a nickname/display name from a peer. Removes control
+/// characters, bidi-override / zero-width formatters, and limits
+/// length to prevent UI injection.
 pub fn sanitize_display_name(name: &str) -> String {
     const MAX_DISPLAY_NAME_LEN: usize = 128;
 
     let sanitized: String = name
         .chars()
-        .filter(|c| !c.is_control() && *c != '\0')
+        .filter(|c| !c.is_control() && *c != '\0' && !is_invisible_or_bidi_control(*c))
         .take(MAX_DISPLAY_NAME_LEN)
         .collect();
 
@@ -590,6 +631,37 @@ pub fn sanitize_display_name(name: &str) -> String {
     } else {
         sanitized.trim().to_string()
     }
+}
+
+/// Sanitize free-form chat text from the local user before
+/// sending. Mirrors `sanitize_display_name` but preserves newlines
+/// (the chat textarea allows Shift+Enter), and does NOT default to
+/// "Anonymous" on empty input — an empty chat string just means
+/// "don't send".
+///
+/// L20: applied to outbound chat so a malicious paste of
+/// `"\u202EnoitPircsed eht"` doesn't ship to friends as a
+/// legitimate-looking but bidi-flipped message. Inbound chat is
+/// rendered through `<bdi>` (M14) which neutralises the visual
+/// effect; stripping on the way out closes the storage and
+/// roundtrip vector.
+pub fn sanitize_chat_text(text: &str) -> String {
+    const MAX_CHAT_LEN: usize = 4096;
+
+    text.chars()
+        .filter(|c| {
+            // Drop ASCII control chars except newline (\n) and
+            // carriage return (\r) — the textarea normalises CRLF
+            // to LF on submit, and a lone CR is rare but harmless.
+            // Tab (\t) is also kept; users sometimes paste tab-
+            // delimited fragments.
+            if *c == '\n' || *c == '\r' || *c == '\t' {
+                return true;
+            }
+            !c.is_control() && *c != '\0' && !is_invisible_or_bidi_control(*c)
+        })
+        .take(MAX_CHAT_LEN)
+        .collect()
 }
 
 #[cfg(test)]
@@ -617,5 +689,39 @@ mod tests {
         assert_eq!(sanitize_display_name("\n\r\t"), "Anonymous");
         let long_name = "A".repeat(200);
         assert_eq!(sanitize_display_name(&long_name).len(), 128);
+    }
+
+    #[test]
+    fn sanitize_display_name_strips_bidi_and_zero_width() {
+        // L20: invisible / reordering code points must not survive.
+        assert_eq!(sanitize_display_name("Al\u{202E}ice"), "Alice");
+        assert_eq!(sanitize_display_name("Bo\u{200B}b"), "Bob");
+        assert_eq!(sanitize_display_name("Carol\u{2066}\u{2069}"), "Carol");
+        assert_eq!(sanitize_display_name("Dave\u{FEFF}"), "Dave");
+        assert_eq!(sanitize_display_name("E\u{202A}v\u{202C}e"), "Eve");
+        // Variation selectors are also dropped.
+        assert_eq!(sanitize_display_name("Frank\u{FE0F}"), "Frank");
+        // A nickname that's purely invisible chars falls back like
+        // an empty input would.
+        assert_eq!(sanitize_display_name("\u{202E}\u{200B}\u{FEFF}"), "Anonymous");
+    }
+
+    #[test]
+    fn sanitize_chat_text_keeps_newlines_strips_overrides() {
+        // L20: chat text preserves whitespace newlines but drops
+        // override / zero-width formatting.
+        assert_eq!(sanitize_chat_text("hello\nworld"), "hello\nworld");
+        assert_eq!(sanitize_chat_text("hello\rworld"), "hello\rworld");
+        assert_eq!(sanitize_chat_text("a\tb"), "a\tb");
+        assert_eq!(
+            sanitize_chat_text("paypal\u{202E}moc.lapyap"),
+            "paypalmoc.lapyap",
+        );
+        assert_eq!(sanitize_chat_text("invisible\u{200B}text"), "invisibletext");
+        // NUL bytes are still stripped.
+        assert_eq!(sanitize_chat_text("a\0b"), "ab");
+        // Cap respected.
+        let big = "x".repeat(8_000);
+        assert_eq!(sanitize_chat_text(&big).len(), 4096);
     }
 }
