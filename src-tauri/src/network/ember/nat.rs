@@ -152,6 +152,15 @@ impl NatInfo {
     }
 }
 
+/// Hard ceiling on how long the main network task is willing to block
+/// inside a `probe_nat` call. Each STUN server attempt is itself
+/// `STUN_MAX_RETRIES * STUN_TIMEOUT = 10s`; with 5 servers in
+/// `DEFAULT_STUN_SERVERS` an all-fail run could otherwise stall the
+/// main `select!` loop for ~50s, blocking downloads, broker ticks,
+/// and friend reconnects. The probe early-exits at 2 successful
+/// results so most successful runs finish well under this cap.
+pub const PROBE_NAT_OVERALL_TIMEOUT: Duration = Duration::from_secs(6);
+
 /// Probe STUN servers to discover our external address and infer NAT type.
 ///
 /// Stops after two successful results (enough to disambiguate symmetric
@@ -161,6 +170,12 @@ impl NatInfo {
 /// final WARN message — they used to be `debug!` only, which made
 /// "all STUN servers failed" essentially undebuggable in `info`-level
 /// logs.
+///
+/// Callers on the main network event loop should wrap this in
+/// `tokio::time::timeout(PROBE_NAT_OVERALL_TIMEOUT, ...)` to bound the
+/// worst-case stall. Spawning the probe onto its own task is not
+/// currently safe — `local_socket` is the shared KAD UDP socket and
+/// concurrent `recv_from` calls would steal each other's packets.
 pub async fn probe_nat(local_socket: &UdpSocket) -> NatInfo {
     let mut results = Vec::new();
     let mut failures: Vec<String> = Vec::new();

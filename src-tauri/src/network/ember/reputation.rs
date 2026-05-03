@@ -114,7 +114,17 @@ impl PeerReputation {
         if intervals == 0 || self.score == 0 {
             return;
         }
-        let factor = DECAY_FACTOR.powi(intervals as i32);
+        // L5: cap the exponent before casting to i32. `intervals` is a
+        // u32 derived from `elapsed / DECAY_INTERVAL` which can in
+        // pathological cases (clock skew, persisted-state replay)
+        // exceed `i32::MAX`. Casting wraps to a negative exponent and
+        // sends `factor` to infinity, then `score * factor` is NaN ⇒
+        // 0 after the cast. Saturating to a generous ceiling keeps
+        // decay monotonic-toward-zero and bounded — `DECAY_FACTOR`
+        // raised to ~10000 is already numerically zero, so any
+        // larger exponent lands at the same fixed point regardless.
+        let exp = intervals.min(10_000) as i32;
+        let factor = DECAY_FACTOR.powi(exp);
         self.score = (self.score as f64 * factor).round() as i32;
         self.score = self.score.clamp(MIN_REPUTATION, MAX_REPUTATION);
     }

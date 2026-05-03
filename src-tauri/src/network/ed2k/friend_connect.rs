@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use ed25519_dalek::{Signer, Verifier, SigningKey, VerifyingKey};
+use rand::rngs::OsRng;
 use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -300,33 +301,55 @@ pub async fn open_and_run_friend_session(
     // that the peer can sign a fresh nonce with the matching secret
     // key. A failure here propagates as `?` and aborts the friend
     // session, so a peer that fails PoP never gets friend-session
-    // privileges (chat, browse, etc.). Skipped only for legacy peers
-    // who don't advertise a pubkey; their session continues with
-    // `ember_hash_binding_verified = false` per the block below.
-    let mut ember_pop_verified = false;
-    if let (Some(peer_pk), Some(our_pk), Some(our_sk)) = (hello_caps.ember_pubkey, ed25519_pubkey, ed25519_secret_key) {
+    // privileges (chat, browse, etc.).
+    //
+    // V1 hardening (M1): if the peer didn't advertise an Ed25519
+    // pubkey at all (legacy / spoofed `OP_EMBER_HELLO` from a
+    // vanilla eMule), we refuse to open the friend session
+    // entirely — the only thing we'd have to bind chat/browse to
+    // is the unproven 16-byte hash claim. Pre-V1 we used to
+    // continue with `ember_hash_binding_verified=false`; that
+    // window let an attacker iterate Ember hashes from EPX dumps,
+    // dial us, and claim an existing friend's hash without ever
+    // proving possession. Closing the door here is safe: every
+    // honest Ember client builds its hash from its own pubkey so
+    // it always advertises one in the same `OP_EMBER_HELLO`.
+    let our_have_keys = ed25519_pubkey.is_some() && ed25519_secret_key.is_some();
+    let peer_pk = match hello_caps.ember_pubkey {
+        Some(pk) => pk,
+        None => {
+            anyhow::bail!(
+                "remote peer {} did not advertise an Ed25519 pubkey in OP_EMBER_HELLO; refusing friend session",
+                hex::encode(peer_ember_hash)
+            );
+        }
+    };
+    let ember_pop_verified = if our_have_keys {
+        let our_pk = ed25519_pubkey.unwrap();
+        let our_sk = ed25519_secret_key.unwrap();
         perform_ember_auth(&mut reader, &mut writer, &our_pk, &our_sk, &peer_pk, Some(&peer_ember_hash), addr).await?;
-        ember_pop_verified = true;
-    }
+        true
+    } else {
+        // We can't drive the challenge-response without our own
+        // identity. Refuse rather than silently downgrading.
+        anyhow::bail!(
+            "local node has no Ed25519 identity; refusing friend session with {}",
+            hex::encode(peer_ember_hash)
+        );
+    };
 
     let is_friend = friend_hashes.read().await.contains(&peer_ember_hash);
     if !is_friend {
         anyhow::bail!("remote peer {} is not in our friend list", hex::encode(peer_ember_hash));
     }
 
-    // Verification flag passed into the spawned reader task below so
-    // any `OP_EMBER_FRIEND_REQ` we receive on this session reports
-    // an honest `verified` value to the UI. Prefer the strong PoP
-    // signal (set by `perform_ember_auth` above); fall back to the
-    // offline binding check for peers that didn't advertise a pubkey
-    // — those sessions still carry a meaningful binding-verified
-    // state when one is computable, but mark unverified when not.
-    let ember_hash_binding_verified = ember_pop_verified
-        || hello_caps
-            .ember_pubkey
-            .as_ref()
-            .map(|pk| crate::network::ember::crypto::verify_ember_hash_binding(pk, &peer_ember_hash))
-            .unwrap_or(false);
+    // Verification flag passed into the spawned reader task below
+    // so any `OP_EMBER_FRIEND_REQ` we receive on this session
+    // reports an honest `verified` value to the UI. By the time we
+    // reach this line PoP has already succeeded (otherwise we
+    // bailed above), so this is `true`. Kept as a named binding
+    // for clarity at the use sites below.
+    let ember_hash_binding_verified = ember_pop_verified;
 
     // Reserve the session slot atomically BEFORE we send our friend
     // request. If another concurrent dial raced us and claimed the
@@ -658,13 +681,17 @@ where
 /// specific Ember auth opcode. Bounded to prevent a chatty peer
 /// from pinning us in this loop forever; in practice we expect
 /// 0–1 skips (just OP_SECIDENTSTATE).
-const AUTH_PACKET_MAX_SKIPS: usize = 8;
+const AUTH_PACKET_MAX_SKIPS: usize = 3;
 /// Per-attempt timeout while waiting for the next packet during
-/// auth. The overall budget is bounded by `AUTH_PACKET_MAX_SKIPS`
-/// times this value, currently 80 s worst case — generous because
-/// friend-connect already gave up on the wider TCP timeout if the
-/// peer is genuinely unresponsive.
-const AUTH_PACKET_TIMEOUT_SECS: u64 = 10;
+/// auth. L7: tightened from 10 s × 8 skips (~80 s worst case) to
+/// 5 s × 3 skips (~15 s worst case). The previous 80 s window let
+/// a chatty peer pin our auth path for over a minute by spraying
+/// unrelated frames, which made friend-connect look hung. In
+/// practice the only legitimate skip is a single OP_SECIDENTSTATE
+/// emitted by the upload side as part of its initial burst, so
+/// 3 skips is plenty of headroom while still bounding the total
+/// stall a misbehaving peer can inflict.
+const AUTH_PACKET_TIMEOUT_SECS: u64 = 5;
 
 /// Read the next packet matching `expected_opcode` (with
 /// `expected_payload_len`), skipping a bounded number of unrelated
@@ -778,7 +805,7 @@ where
 
     // Generate and send our challenge nonce
     let mut our_nonce = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut our_nonce);
+    OsRng.fill_bytes(&mut our_nonce);
     write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE, &our_nonce).await?;
 
     // Read peer's challenge nonce, tolerating interleaved packets.
@@ -889,7 +916,7 @@ where
     }
 
     let mut our_nonce = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut our_nonce);
+    OsRng.fill_bytes(&mut our_nonce);
     write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE, &our_nonce).await?;
 
     let peer_nonce_payload = read_specific_auth_packet(

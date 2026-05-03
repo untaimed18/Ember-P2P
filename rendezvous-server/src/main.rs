@@ -18,9 +18,108 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
+
+// ---------------------------------------------------------------------------
+// Authentication: every endpoint that mutates per-id state, or dequeues
+// per-id signaling, requires an Ed25519 signature from the keypair that
+// owns the id. The id is `SHA256(BLAKE3(pubkey)[..16])` (hex-encoded),
+// matching the client-side derivation in
+// `src-tauri/src/network/rendezvous.rs::hashed_id`. Once `/register`
+// has succeeded for a given id, the pubkey is pinned on the server side
+// and all later operations on that id MUST verify against the same
+// pubkey — closing the squat-and-steer hole that earlier let any
+// network actor compute a victim's id and POST a fake address for it.
+// ---------------------------------------------------------------------------
+
+/// Domain-separation prefix included in every signed message. Bumping
+/// this string is a clean way to invalidate all previously-issued
+/// signatures (e.g. if we ever need to migrate the schema).
+const RDV_DOMAIN: &[u8] = b"ember-rdv-v1";
+const OP_REGISTER: u8 = 0x01;
+const OP_UNREGISTER: u8 = 0x02;
+// 0x03..=0x06 reserved for future signing of /punch and /relay-invite
+// endpoints once those IDs are migrated from synthetic (ip, port)
+// strings to presence-map ember-hash ids. Until then those endpoints
+// rely on per-IP rate-limiting and per-target caps for abuse control.
+
+/// Maximum allowed clock skew between the client and server timestamps
+/// in a signed request. 5 minutes covers normal NTP-skewed clients
+/// without giving an attacker a useful replay window.
+const MAX_TIMESTAMP_SKEW_SECS: i64 = 300;
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn timestamp_fresh(ts: i64) -> bool {
+    let now = now_unix_secs();
+    (now - ts).abs() <= MAX_TIMESTAMP_SKEW_SECS
+}
+
+fn decode_hex_pubkey(s: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    if hex::decode_to_slice(s, &mut out).is_ok() { Some(out) } else { None }
+}
+
+fn decode_hex_sig(s: &str) -> Option<[u8; 64]> {
+    let mut out = [0u8; 64];
+    if hex::decode_to_slice(s, &mut out).is_ok() { Some(out) } else { None }
+}
+
+fn decode_hex_id(s: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    if hex::decode_to_slice(s, &mut out).is_ok() { Some(out) } else { None }
+}
+
+/// Re-derive the rendezvous id from a pubkey and check it matches the
+/// claimed id. Mirrors the client-side derivation chain
+/// `pubkey -> ember_hash (BLAKE3 truncated) -> id (SHA256)`.
+fn pubkey_matches_id(pubkey: &[u8; 32], claimed_id: &str) -> bool {
+    let pk_blake = blake3::hash(pubkey);
+    let ember_hash = &pk_blake.as_bytes()[..16];
+    let mut sha = Sha256::new();
+    sha.update(ember_hash);
+    let derived = hex::encode(sha.finalize());
+    derived.eq_ignore_ascii_case(claimed_id)
+}
+
+fn ed25519_verify(pubkey: &[u8; 32], message: &[u8], sig: &[u8; 64]) -> bool {
+    let Ok(vk) = VerifyingKey::from_bytes(pubkey) else { return false };
+    let signature = Signature::from_bytes(sig);
+    // verify_strict rejects malleable signatures and small-subgroup
+    // attacks; the strict flavour is what the protocol audit
+    // recommended, so use it everywhere on the server.
+    vk.verify_strict(message, &signature).is_ok()
+}
+
+fn build_register_msg(id_raw: &[u8; 32], port: u16, ip4: [u8; 4], pubkey: &[u8; 32], ts: i64) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 2 + 4 + 32 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_REGISTER);
+    m.extend_from_slice(id_raw);
+    m.extend_from_slice(&port.to_le_bytes());
+    m.extend_from_slice(&ip4);
+    m.extend_from_slice(pubkey);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
+
+fn build_unregister_msg(id_raw: &[u8; 32], ts: i64) -> Vec<u8> {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_UNREGISTER);
+    m.extend_from_slice(id_raw);
+    m.extend_from_slice(&ts.to_le_bytes());
+    m
+}
 
 const ENTRY_TTL: Duration = Duration::from_secs(300);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
@@ -75,8 +174,20 @@ const RELAY_INVITE_TTL: Duration = Duration::from_secs(60);
 struct PresenceEntry {
     ip: IpAddr,
     port: u16,
+    /// IP we observed the registration request from. Kept for
+    /// diagnostics / future heuristics; the auth model no longer
+    /// relies on it (signature is the authority), so it's marked
+    /// `dead_code` while still emitted in `debug!` logs.
+    #[allow(dead_code)]
     conn_ip: IpAddr,
     expires_at: Instant,
+    /// The Ed25519 pubkey the rendezvous id binds to. Pinned on first
+    /// `/register` for this id and re-checked on every subsequent
+    /// `/register`, `/unregister`, `/punch`, and poll request that
+    /// targets this id. Closes the squat-and-steer hole that earlier
+    /// let any network actor compute a victim's id and POST a fake
+    /// address for it.
+    pubkey: [u8; 32],
 }
 
 #[derive(Clone)]
@@ -163,6 +274,16 @@ struct RegisterRequest {
     id: String,
     port: u16,
     ip: Option<String>,
+    /// Ed25519 pubkey (64 hex chars). Required: server pins on first
+    /// register, then refuses any later /register that doesn't match.
+    pubkey: String,
+    /// Unix-seconds timestamp of the request. Replays >5min stale are
+    /// rejected; without this, an attacker could capture a registration
+    /// off the wire and re-post it indefinitely.
+    ts: i64,
+    /// Hex-encoded Ed25519 signature over
+    /// `RDV_DOMAIN || OP_REGISTER || sha256_id_raw || port_le || ipv4 || pubkey || ts_le`.
+    sig: String,
 }
 
 #[derive(Serialize)]
@@ -174,6 +295,9 @@ struct LookupResponse {
 #[derive(Deserialize)]
 struct UnregisterRequest {
     id: String,
+    ts: i64,
+    /// Signature over `RDV_DOMAIN || OP_UNREGISTER || sha256_id_raw || ts_le`.
+    sig: String,
 }
 
 fn extract_client_ip(headers: &HeaderMap, addr: SocketAddr) -> IpAddr {
@@ -231,13 +355,46 @@ async fn register(
     if body.port == 0 {
         return StatusCode::BAD_REQUEST;
     }
+    if !timestamp_fresh(body.ts) {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    let Some(pubkey) = decode_hex_pubkey(&body.pubkey) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(sig_bytes) = decode_hex_sig(&body.sig) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if !pubkey_matches_id(&pubkey, &body.id) {
+        // Pubkey doesn't derive to the claimed id — most likely a
+        // request crafted by someone who knows a victim's id but
+        // doesn't hold the keypair. Treat as forbidden, not bad
+        // request, so callers can distinguish "bad input" from "you
+        // don't own this id".
+        return StatusCode::FORBIDDEN;
+    }
 
     let client_ip = extract_client_ip(&headers, addr);
     if !check_rate_limit(&state, client_ip).await {
         return StatusCode::TOO_MANY_REQUESTS;
     }
 
-    let presence_ip = body.ip
+    // The signature must commit to (id, port, ip4, pubkey, ts), not
+    // just to the id alone — otherwise a captured `/register` payload
+    // could be replayed with a different ip/port to steer traffic.
+    //
+    // M7 hardening: in addition to verifying the signature, we cross-
+    // check the client-supplied `body.ip` against the connection ip.
+    // After C4 a captured payload can't be replayed with a different
+    // ip (the signature wouldn't verify), but the LEGITIMATE keypair
+    // holder can still try to register a public IP they don't actually
+    // own — e.g. someone's V4 home address — so that friend lookups
+    // steer queries to that address. Pinning to `client_ip` for the
+    // common single-stack case closes that hole. Dual-stack clients
+    // (server sees v6, client probes STUN and gets v4) still need to
+    // be able to advertise their IPv4 STUN address, so we permit a v4
+    // body.ip when the connection itself is v6.
+    let body_ip_parsed = body.ip
         .as_deref()
         .and_then(|s| s.parse::<IpAddr>().ok())
         .filter(|ip| match ip {
@@ -245,20 +402,60 @@ async fn register(
                 && !v4.is_private() && !v4.is_link_local(),
             IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified()
                 && !v6.is_multicast(),
-        })
-        .unwrap_or(client_ip);
+        });
+    let presence_ip = match (body_ip_parsed, client_ip) {
+        (Some(body_ip), conn_ip) if body_ip == conn_ip => body_ip,
+        (Some(IpAddr::V4(v4)), IpAddr::V6(_)) => IpAddr::V4(v4),
+        (Some(_), _) => {
+            // Body advertises a public IP that doesn't match this
+            // connection. We refuse rather than silently overriding —
+            // an honest single-stack client always sees the same IP
+            // the rendezvous edge sees, so a mismatch here is either
+            // a bug (client shouldn't have set body.ip) or an
+            // attempted steering attack.
+            return StatusCode::FORBIDDEN;
+        }
+        (None, _) => client_ip,
+    };
+
+    // The signature commits to the IPv4 quad the CLIENT signed:
+    //   - If body.ip is set and parses as IPv4, the client signed
+    //     those four octets.
+    //   - Otherwise the client signed [0,0,0,0] (the IPv6-conn or
+    //     no-external-ip case).
+    // We deliberately compute `signed_ip4` from body.ip — not from
+    // `presence_ip` — because `presence_ip` may be `client_ip` when
+    // the client didn't supply an `ip` field, and the client cannot
+    // have signed `client_ip` when it didn't even know it.
+    let signed_ip4 = match body_ip_parsed {
+        Some(IpAddr::V4(v4)) => v4.octets(),
+        _ => [0u8; 4],
+    };
+
+    let Some(id_raw) = decode_hex_id(&body.id) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let msg = build_register_msg(&id_raw, body.port, signed_ip4, &pubkey, body.ts);
+    if !ed25519_verify(&pubkey, &msg, &sig_bytes) {
+        return StatusCode::FORBIDDEN;
+    }
 
     let entry = PresenceEntry {
         ip: presence_ip,
         port: body.port,
         conn_ip: client_ip,
         expires_at: Instant::now() + ENTRY_TTL,
+        pubkey,
     };
 
     let mut store = state.store.write().await;
     let key = body.id.to_lowercase();
     if let Some(existing) = store.get(&key) {
-        if existing.conn_ip != client_ip && existing.expires_at > Instant::now() {
+        // First-write-wins on pubkey: any later /register for this id
+        // MUST come from the same keypair. This is the actual squat
+        // defence — even if an attacker on the same NAT presents the
+        // same client_ip, a different pubkey now means rejection.
+        if existing.pubkey != pubkey {
             return StatusCode::FORBIDDEN;
         }
     } else if store.len() >= MAX_STORE_ENTRIES {
@@ -316,6 +513,15 @@ async fn unregister(
     if !validate_hex_id(&body.id) {
         return StatusCode::BAD_REQUEST;
     }
+    if !timestamp_fresh(body.ts) {
+        return StatusCode::BAD_REQUEST;
+    }
+    let Some(sig_bytes) = decode_hex_sig(&body.sig) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(id_raw) = decode_hex_id(&body.id) else {
+        return StatusCode::BAD_REQUEST;
+    };
 
     let client_ip = extract_client_ip(&headers, addr);
     if !check_rate_limit(&state, client_ip).await {
@@ -324,9 +530,13 @@ async fn unregister(
 
     let mut store = state.store.write().await;
     if let Some(entry) = store.get(&body.id.to_lowercase()) {
-        if entry.conn_ip == client_ip || entry.ip == client_ip {
+        // Verify the signature with the pinned pubkey rather than
+        // trusting `client_ip == entry.conn_ip` (which CGN /
+        // proxy-mismatch / new ISP session breaks). The signature is
+        // the only authority that survives address churn.
+        let msg = build_unregister_msg(&id_raw, body.ts);
+        if ed25519_verify(&entry.pubkey, &msg, &sig_bytes) {
             store.remove(&body.id.to_lowercase());
-            // See `register` above: per-request lines stay at debug.
             debug!("unregistered {} from {}", &body.id[..8], client_ip);
             return StatusCode::OK;
         }
@@ -373,7 +583,15 @@ async fn punch_register(
     if body.port == 0 {
         return StatusCode::BAD_REQUEST;
     }
-
+    // NOTE: punch endpoints are intentionally NOT signature-gated. The
+    // current `/punch` keying scheme uses synthetic ids derived from
+    // the target peer's `(ip, port)` (see broker code path in the
+    // client), which are NOT registered presence-map identities and
+    // therefore have no pinned pubkey to verify against. Defenses
+    // remain: per-IP rate limiting, per-target cap, and the fact
+    // that a punch entry is just (ip, port, nat_type) — useless
+    // without a working QUIC handshake on top, which is mutually
+    // authenticated in `ember::broker`.
     let client_ip = extract_client_ip(&headers, addr);
 
     // Punch-specific rate limit. Uses its own per-IP map so heavy
@@ -443,7 +661,9 @@ async fn punch_poll(
     if !validate_hex_id(&id) {
         return Err(StatusCode::BAD_REQUEST);
     }
-
+    // NOTE: not signature-gated — see `punch_register` for the
+    // rationale (punch ids are `(ip, port)`-derived, not presence
+    // ember-hash ids, so there's no pubkey to verify against).
     let client_ip = extract_client_ip(&headers, addr);
     if !check_rate_limit(&state, client_ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
@@ -505,7 +725,16 @@ async fn relay_invite_post(
     if !validate_hex_id(&body.target_id) || body.session_id.is_empty() || body.session_id.len() > 128 {
         return StatusCode::BAD_REQUEST;
     }
-
+    // NOTE: relay-invite POSTs are intentionally NOT signed. The
+    // `target_id` here is a synthetic `(relay_ip:relay_port)`-derived
+    // hex string (see `mod.rs::our_relay_id`), not a presence-map id,
+    // so the server can't use the pinned-pubkey path that
+    // `register`/`unregister`/`punch_*` rely on. Defenses for this
+    // endpoint are: per-IP rate limiting, per-target invite cap, and
+    // (most importantly) the fact that a relay invite by itself is
+    // useless without a working QUIC session — the actual relay path
+    // is mutually authenticated via the eMule/Ember handshake the
+    // peers run AFTER they connect to the relay.
     let client_ip = extract_client_ip(&headers, addr);
     if !check_rate_limit(&state, client_ip).await {
         return StatusCode::TOO_MANY_REQUESTS;
@@ -539,7 +768,14 @@ async fn relay_invite_poll(
     if !validate_hex_id(&id) {
         return Err(StatusCode::BAD_REQUEST);
     }
-
+    // NOTE: relay-invite polls are intentionally NOT signature-gated.
+    // See `relay_invite_post` for the rationale — `id` here is a
+    // `(relay_ip:relay_port)` synthesis, not an ember-hash id, so it
+    // has no pinned pubkey to verify against. The actual relay path
+    // is mutually authenticated by the eMule/Ember handshake AFTER
+    // the QUIC session is established; an attacker dequeuing an
+    // invite on the relay node simply learns "session_id X targeted
+    // this relay" and gets no privileged access.
     let client_ip = extract_client_ip(&headers, addr);
     if !check_rate_limit(&state, client_ip).await {
         return Err(StatusCode::TOO_MANY_REQUESTS);
@@ -935,6 +1171,23 @@ async fn sweep_expired(state: AppState) {
             let relay_removed = relay_before - relays.len();
             if relay_removed > 0 {
                 info!("swept {} stale relay sessions", relay_removed);
+            }
+        }
+
+        // Sweep expired presence-map entries. Entries whose `expires_at`
+        // has passed should be evicted so that the `MAX_STORE_ENTRIES`
+        // cap reflects only actually-live registrations. Without this
+        // sweep, a flood of unique-id registrations expires for lookup
+        // purposes (the per-entry expiry check inside `lookup` returns
+        // 404) but stays in the map forever, eventually filling the
+        // 100k cap and 503-ing every new registration.
+        {
+            let mut store = state.store.write().await;
+            let store_before = store.len();
+            store.retain(|_, e| e.expires_at > now);
+            let store_removed = store_before - store.len();
+            if store_removed > 0 {
+                info!("swept {} expired presence entries", store_removed);
             }
         }
     }

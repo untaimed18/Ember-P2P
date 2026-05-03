@@ -107,7 +107,19 @@ fn build_server_config(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<Server
 }
 
 /// Create the client-side QUIC configuration.
-pub fn build_client_config(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<ClientConfig> {
+///
+/// `expected_node_id` is the target peer's ember node id when known
+/// at connect time, in which case the verifier pins the cert's
+/// `ember-{hex}` SAN to that id (true per-peer authentication, MITM-
+/// safe). When `None`, the verifier still requires the cert to be a
+/// well-formed Ember self-signed cert (smoke-test only — no
+/// authentication, but rejects external CAs / random certs an
+/// on-path attacker might inject).
+pub fn build_client_config(
+    cert_der: &[u8],
+    key_der: &[u8],
+    expected_node_id: Option<[u8; 16]>,
+) -> anyhow::Result<ClientConfig> {
     let cert = CertificateDer::from(cert_der.to_vec());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der.to_vec()));
 
@@ -115,7 +127,7 @@ pub fn build_client_config(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<Cl
     let mut tls_config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_custom_certificate_verifier(Arc::new(EmberCertVerifier { expected_node_id }))
         .with_client_auth_cert(vec![cert], key)?;
     tls_config.alpn_protocols = vec![b"ember/1".to_vec()];
 
@@ -148,20 +160,77 @@ fn bind_tuned_udp(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     Ok(socket)
 }
 
-/// Certificate verifier that accepts any server certificate (P2P trust model).
-/// Peer authentication is done at the Ember protocol layer, not TLS PKI.
-#[derive(Debug)]
-struct SkipServerVerification;
+/// Extract the first SAN / CN that follows our `ember-{32 hex chars}`
+/// convention from a DER-encoded certificate. Returns the 32-hex
+/// suffix on success, `None` otherwise. We deliberately don't pull in
+/// a full X.509 parser: rcgen-issued Ember certs put the SAN in
+/// `subject_alt_names`, which the cert encodes verbatim. A linear
+/// byte search for the marker prefix is sufficient for the smoke
+/// check we need here.
+fn extract_ember_san_hex(cert_der: &[u8]) -> Option<String> {
+    const PREFIX: &[u8] = b"ember-";
+    let mut i = 0usize;
+    while i + PREFIX.len() + 32 <= cert_der.len() {
+        if &cert_der[i..i + PREFIX.len()] == PREFIX {
+            let candidate = &cert_der[i + PREFIX.len()..i + PREFIX.len() + 32];
+            if candidate.iter().all(|c| c.is_ascii_hexdigit()) {
+                return Some(String::from_utf8_lossy(candidate).to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
 
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+/// Certificate verifier for QUIC connections to Ember peers.
+///
+/// Behaviour:
+/// - If `expected_node_id` is `Some(nid)`, the cert's first
+///   `ember-{32 hex chars}` SAN/CN must hex-match `nid`. This is a
+///   real per-peer pin: an MITM can't substitute their own
+///   self-signed cert because it would carry a different CN.
+/// - If `expected_node_id` is `None`, we still require the cert to
+///   look like an Ember self-signed cert (the prefix is present and
+///   the suffix is 32 hex chars). This is a smoke check, not
+///   authentication — but it does reject the all-too-easy "trust any
+///   cert any CA ever issued" failure mode that the prior
+///   `SkipServerVerification` allowed. Per-peer pinning will replace
+///   the smoke path once all QUIC connect sites know their target's
+///   `ember_node_id` at connect time (broker/relay candidates today
+///   come in via unauthenticated rendezvous and EPX channels, so we
+///   don't always have the node_id).
+///
+/// File-transfer integrity does NOT depend on this verifier: the
+/// eMule/Ember TCP layer runs its own mutual Ed25519 PoP. A QUIC MITM
+/// can disrupt broker/relay setup but can't read file content or
+/// impersonate a specific friend.
+#[derive(Debug)]
+struct EmberCertVerifier {
+    expected_node_id: Option<[u8; 16]>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for EmberCertVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let Some(hex_id) = extract_ember_san_hex(end_entity.as_ref()) else {
+            return Err(rustls::Error::General(
+                "ember cert: no `ember-{hex}` marker found in certificate".into(),
+            ));
+        };
+        if let Some(nid) = self.expected_node_id {
+            let expected = hex::encode(nid);
+            if !hex_id.eq_ignore_ascii_case(&expected) {
+                return Err(rustls::Error::General(format!(
+                    "ember cert: pinned node_id mismatch (expected {expected}, got {hex_id})"
+                )));
+            }
+        }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -209,7 +278,10 @@ impl EmberQuicEndpoint {
     /// Create and bind a new QUIC endpoint with tuned UDP buffer sizes.
     pub fn new(bind_addr: SocketAddr, config: &QuicConfig) -> anyhow::Result<Self> {
         let server_config = build_server_config(&config.cert_der, &config.key_der)?;
-        let client_config = build_client_config(&config.cert_der, &config.key_der)?;
+        // Default client config for incoming connections from this
+        // endpoint (no specific peer pin). Use `connect_pinned` for
+        // outbound connections where the target's node_id is known.
+        let client_config = build_client_config(&config.cert_der, &config.key_der, None)?;
 
         let socket = bind_tuned_udp(bind_addr)?;
         let endpoint = Endpoint::new(
@@ -261,7 +333,10 @@ impl EmberQuicEndpoint {
 /// (used by the connection broker for hole-punching and relay).
 #[allow(dead_code)]
 pub fn build_client_endpoint(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<Endpoint> {
-    let client_config = build_client_config(cert_der, key_der)?;
+    // Default to the unpinned smoke-test verifier; per-peer pinning
+    // requires knowing the target's node_id at connect time, which
+    // broker/hole-punch sites don't always have.
+    let client_config = build_client_config(cert_der, key_der, None)?;
     let socket = bind_tuned_udp("0.0.0.0:0".parse::<SocketAddr>()?)?;
     let mut endpoint = Endpoint::new(
         EndpointConfig::default(),
@@ -289,7 +364,7 @@ pub fn build_server_client_endpoint(
     bind_port: u16,
 ) -> anyhow::Result<Endpoint> {
     let server_config = build_server_config(cert_der, key_der)?;
-    let client_config = build_client_config(cert_der, key_der)?;
+    let client_config = build_client_config(cert_der, key_der, None)?;
 
     // Ordered: requested port first, then a few neighbours, then OS-assigned.
     // Don't include port 0 in the visible range to avoid hiding a typo'd
