@@ -170,6 +170,17 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
 
     let mut cursor = Cursor::new(data);
     let version = cursor.read_u8()?;
+    // L14: reject `version=0` explicitly. The previous match
+    // collapsed `version=0` into the v2 branch (because the only
+    // hardcoded branch was `if version >= 3`), which was
+    // accidental forward-compat — v0 was never a deployed wire
+    // format. A peer that sends `version=0` is either a buggy
+    // implementation we don't want to interop with or a probe
+    // looking for parsers that fall through; either way, refusing
+    // it is honest and removes one ambiguous code path.
+    if version == 0 {
+        anyhow::bail!("EPX version 0 is reserved and not a supported wire format");
+    }
     if version > EPX_VERSION {
         anyhow::bail!("unsupported EPX version {version} (we support up to {EPX_VERSION})");
     }
@@ -262,7 +273,24 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
 
     // Only parse peer discovery if every declared file was fully read;
     // otherwise the cursor is mid-record and remaining bytes are not the peer section.
+    //
+    // L15: log when we suppress the peer section because the file
+    // section was truncated. This is intentional safety behaviour
+    // (we can't reliably locate the peer-count u16 mid-record), but
+    // until now the suppression was silent — making a wire-format
+    // mismatch with a non-conformant peer indistinguishable from a
+    // legitimate "no peers advertised" payload. A `debug!` line is
+    // enough: an operator chasing missing peer-mesh entries can
+    // bump `RUST_LOG=ember=debug` and see exactly which peer's
+    // payload is malformed.
     let mut peers = Vec::new();
+    if version >= 3 && !files_fully_parsed {
+        tracing::debug!(
+            "EPX v{version}: suppressing peer section because file section was truncated ({} of {} files parsed)",
+            entries.len(),
+            file_count,
+        );
+    }
     if version >= 3 && files_fully_parsed {
         let remaining = data.len() - cursor.position() as usize;
         if remaining >= 2 {

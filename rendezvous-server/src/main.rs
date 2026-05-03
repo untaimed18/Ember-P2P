@@ -1116,6 +1116,24 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// L12: DHT bootstrap stub.
+///
+/// `ember/dht/bootstrap.rs::fetch_bootstrap_nodes` GETs
+/// `<rendezvous>/bootstrap` and expects a JSON array of
+/// `BootstrapNode { node_id, addr, noise_pub, ed25519_pub }`. The
+/// V1 client never actually consumes the result (DHT is dormant
+/// behind `ember_native_enabled = false`), but until L12 the route
+/// didn't exist on the server side and every probe returned 404,
+/// which the client logs as a warning. We return an empty array
+/// so the client's "no peers known yet" branch fires cleanly. When
+/// the Ember DHT goes live, replace the empty body with a
+/// signed-and-pinned bootstrap pool — until then there's no value
+/// in publishing addresses for a network that nothing is talking
+/// to yet.
+async fn bootstrap_stub() -> Json<Vec<serde_json::Value>> {
+    Json(Vec::new())
+}
+
 async fn sweep_expired(state: AppState) {
     loop {
         tokio::time::sleep(SWEEP_INTERVAL).await;
@@ -1224,6 +1242,18 @@ async fn main() {
         .route("/relay/{session_id}", get(relay_ws))
         .route("/relay-invite", post(relay_invite_post))
         .route("/relay-invites/{id}", get(relay_invite_poll))
+        // L12: DHT bootstrap stub. The Ember DHT (`ember/dht/*`) is
+        // dormant in V1 (`ember_native_enabled=false`), but the
+        // bootstrap module probes `/bootstrap` proactively whenever
+        // the runtime hands it a rendezvous URL. Returning an empty
+        // 200 OK keeps that probe quiet — the client treats an
+        // empty list as "no peers known yet" and falls back to its
+        // local cache, which is the correct V1 behaviour. When the
+        // DHT goes live in a later version this handler can grow
+        // into a real bootstrap-node serializer; for now an empty
+        // array keeps the wire contract honest without adding any
+        // attack surface.
+        .route("/bootstrap", get(bootstrap_stub))
         .route("/health", get(health))
         .route("/stats", get(stats_handler))
         .with_state(state);

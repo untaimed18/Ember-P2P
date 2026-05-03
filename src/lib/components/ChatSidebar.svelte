@@ -47,6 +47,18 @@
   let unlisten: UnlistenFn | null = null;
   let loadGen = 0;
   let msgIdCounter = 0;
+
+  // L17: pagination state for "Load older". `hasMoreHistory` is
+  // true while the most-recent snapshot fetch came back at the
+  // page-size cap (i.e. there might be older messages still in
+  // the DB). It flips to false once a fetch returns fewer rows
+  // than we asked for. `loadingOlder` blocks the button while a
+  // fetch is in flight so a quick double-click doesn't paginate
+  // twice. Page size mirrors the initial-load size so a single
+  // "Load older" press doubles the visible history.
+  const PAGE_SIZE = 100;
+  let loadingOlder = $state(false);
+  let hasMoreHistory = $state(false);
   // Captured opener so focus returns to wherever the user came from
   // when the sidebar closes. Without this, focus snaps back to <body>
   // and keyboard users lose their place in the friends grid.
@@ -208,8 +220,13 @@
     loading = true;
     loadError = null;
     try {
-      const rows = await getChatMessages(friendHash, 100);
+      const rows = await getChatMessages(friendHash, PAGE_SIZE);
       if (gen !== loadGen) return;
+      // L17: if the backend returned a full page, there is
+      // probably more history to scroll back through. If it
+      // returned fewer rows than we asked for, this is the entire
+      // conversation and the "Load older" button should hide.
+      hasMoreHistory = rows.length >= PAGE_SIZE;
       // Merge the historical snapshot with any live messages that
       // pushed into `messages` while the round trip was in flight.
       // Push events use negative `msgIdCounter` ids; snapshot rows
@@ -241,6 +258,57 @@
       }
     } finally {
       if (gen === loadGen) loading = false;
+    }
+  }
+
+  /// L17: load older messages, paginating backwards from the
+  /// oldest visible row. `getChatMessages` accepts a `beforeId`
+  /// cursor on its third parameter; passing the DB id of the
+  /// current oldest snapshot row asks the backend for the next
+  /// page strictly older than it. Live-pushed rows have negative
+  /// msgIdCounter ids so we have to find the first row with a
+  /// real DB id (positive number) to use as the cursor — without
+  /// that, the cursor would be `-1, -2, ...` and the backend would
+  /// ignore it (no row is older than a negative id).
+  async function loadOlderMessages() {
+    if (loadingOlder || !hasMoreHistory || !friendHash) return;
+    loadingOlder = true;
+    const gen = loadGen;
+    try {
+      const cursor = messages.find((m) => m.id > 0)?.id;
+      if (cursor === undefined) {
+        hasMoreHistory = false;
+        return;
+      }
+      const rows = await getChatMessages(friendHash, PAGE_SIZE, cursor);
+      if (gen !== loadGen) return;
+      if (rows.length === 0) {
+        hasMoreHistory = false;
+        return;
+      }
+      hasMoreHistory = rows.length >= PAGE_SIZE;
+      // The fetched page is newest-first; reverse so the oldest
+      // row is at index 0. Then prepend.
+      const olderPage = rows.reverse();
+      // Preserve the current scroll position. Without this, the
+      // viewport jumps to the new top of the list whenever we
+      // prepend; the user would lose their place. We capture the
+      // previous scrollHeight + scrollTop, prepend, and on the
+      // next animation frame restore the offset so the user's
+      // current message stays under their cursor.
+      const el = messagesContainerEl;
+      const prevScrollHeight = el?.scrollHeight ?? 0;
+      const prevScrollTop = el?.scrollTop ?? 0;
+      messages = [...olderPage, ...messages];
+      requestAnimationFrame(() => {
+        if (!messagesContainerEl) return;
+        const delta = messagesContainerEl.scrollHeight - prevScrollHeight;
+        messagesContainerEl.scrollTop = prevScrollTop + delta;
+      });
+    } catch (e) {
+      console.warn('loadOlderMessages failed:', e);
+    } finally {
+      if (gen === loadGen) loadingOlder = false;
     }
   }
 
@@ -407,6 +475,26 @@
       {:else if messages.length === 0}
         <div class="chat-empty">No messages yet. Say hello!</div>
       {:else}
+        <!--
+          L17: pagination control. Sits at the top of the message
+          list and is the click target for fetching older history.
+          Hidden once the backend returns a short page (no more
+          history to fetch) so the user has a clear "you've
+          reached the beginning" signal.
+        -->
+        {#if hasMoreHistory}
+          <div class="chat-load-older">
+            <button
+              class="chat-load-older-btn"
+              type="button"
+              onclick={loadOlderMessages}
+              disabled={loadingOlder}
+              aria-label="Load older messages"
+            >
+              {loadingOlder ? 'Loading…' : 'Load older messages'}
+            </button>
+          </div>
+        {/if}
         {#each messages as msg (msg.id)}
           <div class="chat-bubble" class:sent={msg.direction === 'sent'} class:received={msg.direction === 'received'}>
             <!--
@@ -683,6 +771,29 @@
   .chat-load-retry {
     padding: 4px 14px;
     font-size: 12px;
+  }
+
+  .chat-load-older {
+    display: flex;
+    justify-content: center;
+    padding: 8px 0 4px;
+  }
+  .chat-load-older-btn {
+    padding: 4px 12px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm, 4px);
+    cursor: pointer;
+  }
+  .chat-load-older-btn:hover:not(:disabled) {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+  }
+  .chat-load-older-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
   }
 
   .chat-send {
