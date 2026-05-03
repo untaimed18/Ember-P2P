@@ -8201,12 +8201,30 @@ pub async fn start_network(
                         state.broker_event_rx = Some(broker_rx);
                     }
 
-                    // Use the *actual* QUIC port if the broker bound one,
-                    // otherwise fall back to the configured tcp_port (so
-                    // we still register even if QUIC failed entirely —
-                    // friend presence works without QUIC).
+                    // Advertise our TCP listener port. Friend dialers
+                    // call `friend_connect::connect_and_send_friend_request`
+                    // / `open_and_run_friend_session`, both of which
+                    // open a `TcpStream` to whatever (ip, port) the
+                    // rendezvous lookup returns and immediately do the
+                    // Hello / HelloAnswer / EmuleInfo / OP_EMBER_HELLO
+                    // handshake over TCP. Earlier this site used
+                    // `state.quic_port.unwrap_or(settings.tcp_port)`,
+                    // which silently broke every node whose QUIC
+                    // endpoint had to fall back to a different port
+                    // (the common cause is `tcp_port == udp_port` —
+                    // Kad UDP grabs the port first, QUIC binds on
+                    // `tcp_port + 1`, the warning at startup is
+                    // exactly that). On those nodes the rendezvous
+                    // entry advertised a UDP/QUIC port that has no
+                    // TCP listener at all, so any friend dialing us
+                    // saw "waiting for HelloAnswer" timeouts and the
+                    // user reported "it never finds my friend
+                    // online". The QUIC port is still discovered via
+                    // the broker / relay path, which has its own
+                    // `(ip, advertised_port)` keying — rendezvous is
+                    // exclusively about friend-presence over TCP.
                     let rv_url = settings.rendezvous_url.clone();
-                    let rv_port = state.quic_port.unwrap_or(settings.tcp_port);
+                    let rv_port = settings.tcp_port;
                     let rv_hash = ember_hash;
                     // The outer `if !state.friend_presence_initial_done
                     // && state.external_ip.is_some()` already guarantees
@@ -8323,10 +8341,11 @@ pub async fn start_network(
                             state.rendezvous_last_register = Some(std::time::Instant::now());
                             let rv_url = settings.rendezvous_url.clone();
                             // Heartbeat must advertise the same port we
-                            // registered with — i.e. the QUIC bind port,
-                            // which can differ from `tcp_port` when QUIC
-                            // had to fall back.
-                            let rv_port = state.quic_port.unwrap_or(settings.tcp_port);
+                            // registered with — see the friend-dial
+                            // rationale at the initial registration
+                            // site for why this is the TCP listener
+                            // port and not the QUIC bind port.
+                            let rv_port = settings.tcp_port;
                             let rv_hash = ember_hash;
                             let rv_pubkey = ed25519_pubkey;
                             let rv_secret = ed25519_secret_key;
