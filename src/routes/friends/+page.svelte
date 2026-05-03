@@ -562,7 +562,16 @@
             </div>
             <div class="request-info">
               <span class="request-name">
-                {req.sender_nickname || '(unknown)'}
+                <!--
+                  M14: nickname is peer-controlled. Wrap in `<bdi>`
+                  so RTL/LTR override characters embedded in a
+                  malicious nickname can't reorder the surrounding
+                  layout (e.g. flipping "Verified"/"Unverified"
+                  next to a different name). Default Svelte
+                  escaping prevents XSS; this closes the
+                  bidi-spoofing presentation gap.
+                -->
+                <bdi>{req.sender_nickname || '(unknown)'}</bdi>
                 {#if req.verified}
                   <!-- "Verified" badge: the peer's identity was
                        cryptographically confirmed on the session

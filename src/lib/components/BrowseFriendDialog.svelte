@@ -21,6 +21,13 @@
   let unlisten: UnlistenFn | null = null;
   let listenerGen = 0;
   let browseTimeout: ReturnType<typeof setTimeout> | undefined;
+  // M4: per-request gen used to disambiguate result/error events
+  // from successive browses. Without it, a late error from request
+  // N is dropped by the `loading` guard if request N+1 already
+  // finished; with it, only events whose payload carries the gen
+  // we're currently tracking land in the UI, so a real failure
+  // never gets silently swallowed.
+  let currentBrowseGen = 0;
 
   $effect(() => {
     if (open && friendHash) {
@@ -61,13 +68,23 @@
     let fn: UnlistenFn;
     try {
       fn = await listen<{ user_hash: string; files: BrowseFileEntry[] }>('ember:browse-result', (event) => {
-        if (event.payload.user_hash === friendHash) {
-          clearTimeout(browseTimeout);
-          // Defensive: treat missing/invalid `files` as empty rather than
-          // crashing the dialog if the backend ever emits a malformed payload.
-          files = Array.isArray(event.payload.files) ? event.payload.files : [];
-          loading = false;
-        }
+        if (event.payload.user_hash !== friendHash) return;
+        // Only accept results while a browse is in flight. If
+        // `currentBrowseGen` is 0 the event belongs to a previous
+        // browse the user already dismissed; ignoring it stops a
+        // stale result from overwriting the dialog after the user
+        // navigated past it.
+        if (currentBrowseGen === 0) return;
+        clearTimeout(browseTimeout);
+        // Defensive: treat missing/invalid `files` as empty rather than
+        // crashing the dialog if the backend ever emits a malformed payload.
+        files = Array.isArray(event.payload.files) ? event.payload.files : [];
+        loading = false;
+        // Successful result terminates this browse generation; a
+        // later error for the same friend is most likely from a
+        // separate (subsequent) request and shouldn't replace the
+        // result we just rendered.
+        currentBrowseGen = 0;
       });
     } catch (e) {
       console.warn('BrowseFriendDialog: failed to register browse-result listener', e);
@@ -81,11 +98,20 @@
     let errFn: UnlistenFn;
     try {
       errFn = await listen<{ user_hash: string; reason: string }>('ember:browse-error', (event) => {
-        if (event.payload.user_hash === friendHash && loading) {
-          clearTimeout(browseTimeout);
-          error = event.payload.reason || 'Browse failed — friend went offline.';
-          loading = false;
-        }
+        if (event.payload.user_hash !== friendHash) return;
+        // M4: previously this guard required `loading`, which meant
+        // an error that arrived shortly after a result was silently
+        // dropped — including the common case where the backend
+        // emits a partial result then a transport failure for the
+        // same browse. We now key on `currentBrowseGen`: as long as
+        // this dialog still has an open browse generation, surface
+        // the error. After a successful result clears the gen, late
+        // errors for that browse are discarded as expected.
+        if (currentBrowseGen === 0) return;
+        clearTimeout(browseTimeout);
+        error = event.payload.reason || 'Browse failed — friend went offline.';
+        loading = false;
+        currentBrowseGen = 0;
       });
     } catch (e) {
       console.warn('BrowseFriendDialog: failed to register browse-error listener', e);
@@ -110,17 +136,24 @@
     downloadedHashes = new Set();
     files = [];
     clearTimeout(browseTimeout);
+    // Open a fresh browse generation so the listeners above will
+    // accept events for THIS request even if a result and a late
+    // error race each other on the wire.
+    currentBrowseGen++;
+    const myGen = currentBrowseGen;
     try {
       await browseFriend(friendHash);
       browseTimeout = setTimeout(() => {
-        if (loading) {
+        if (currentBrowseGen === myGen && loading) {
           loading = false;
           error = 'Browse request timed out. The friend may be offline.';
+          currentBrowseGen = 0;
         }
       }, 30_000);
     } catch (e: unknown) {
       error = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to browse';
       loading = false;
+      if (currentBrowseGen === myGen) currentBrowseGen = 0;
     }
   }
 
@@ -165,7 +198,7 @@
   <!-- svelte-ignore a11y_interactive_supports_focus -->
   <div class="browse-modal" role="dialog" onkeydown={handleKeydown}>
     <div class="browse-header">
-      <h3>Browsing {friendName || friendHash.slice(0, 8) + '\u2026'}</h3>
+      <h3>Browsing <bdi>{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi></h3>
       <button class="browse-close" onclick={onclose} title="Close">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
           <line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/>
@@ -197,7 +230,17 @@
             <tbody>
               {#each files as file (file.hash)}
                 <tr>
-                  <td class="col-name" title={file.name}>{file.name}</td>
+                  <!--
+                    M14: file names come from the remote peer and
+                    can contain RTL/LTR override characters that
+                    reorder neighbouring elements ("Trojan Source"
+                    style spoof). `<bdi>` isolates each name's
+                    bidi influence to the cell, so a malicious
+                    name can't reverse the size column or action
+                    button next to it. The text itself is still
+                    rendered exactly as written.
+                  -->
+                  <td class="col-name" title={file.name}><bdi>{file.name}</bdi></td>
                   <td class="col-size">{formatSize(file.size)}</td>
                   <td class="col-action">
                     {#if downloadedHashes.has(file.hash)}

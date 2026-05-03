@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { getChatMessages, sendChatMessage, markMessagesRead, type ChatMessage } from '$lib/api/friends';
+  import { activeChatHash, clearUnread, onlineFriends } from '$lib/stores/friends';
 
   interface Props {
     open: boolean;
@@ -11,6 +12,16 @@
   }
 
   let { open = $bindable(), friendHash, friendName, onclose }: Props = $props();
+
+  // M15: live verification/online indicator in the chat header.
+  // After the H1 fix the `ember:friend-online` event is only emitted
+  // after the peer's Ed25519 proof-of-possession succeeded, so
+  // membership in `onlineFriends` is a reliable "the live session
+  // with this peer is PoP-verified RIGHT NOW" signal. When the
+  // friend is offline we surface a warning that the message will be
+  // queued and may reach a peer that hasn't been re-authenticated
+  // since this session opened.
+  let isOnline = $derived(friendHash ? $onlineFriends.has(friendHash) : false);
 
   /**
    * Hard cap on in-memory chat messages per conversation. Old messages beyond
@@ -104,6 +115,18 @@
     if (open && friendHash) {
       sendError = null;
       inputText = '';
+      // Tell the global friends store that this chat is active and
+      // focused — the chat-message listener in friends.ts uses this
+      // to skip `unreadCounts` increments for messages the user is
+      // actively reading. Mirroring the conversation hash here also
+      // means a chat that swaps friends without unmounting (no real
+      // route, but defensive) updates the active hash atomically.
+      activeChatHash.set(friendHash);
+      // Drop any unread badge we accumulated for this friend BEFORE
+      // the chat opened. `markAsRead` clears the DB rows; the global
+      // store mirrored those counts and would stay stuck on the
+      // pre-open value otherwise.
+      clearUnread(friendHash);
       // Bump both generations at the start so any in-flight loadMessages or
       // setupListener from a previous conversation abandon their work before
       // touching the UI.
@@ -127,6 +150,10 @@
     return () => {
       loadGen++;
       if (unlisten) { unlisten(); unlisten = null; }
+      // Clear active-chat tracking when the conversation closes or
+      // the friend hash changes, so subsequent chat-message events
+      // resume bumping `unreadCounts` as usual.
+      activeChatHash.set(null);
     };
   });
 
@@ -220,13 +247,28 @@
   async function retryLoad() {
     if (!friendHash) return;
     const gen = ++loadGen;
-    setupListener(gen);
+    // M3: previously this fire-and-forgot the listener registration
+    // and started fetching the snapshot in parallel, opening the
+    // exact race the open-effect already closes — a chat-message
+    // that arrives between `getChatMessages` issuing and the
+    // listener attaching gets dropped. Await the listener first so
+    // `loadMessages` can dedupe push events vs snapshot rows.
+    if (unlisten) { unlisten(); unlisten = null; }
+    await setupListener(gen);
+    if (gen !== loadGen) return;
     await loadMessages(gen);
   }
 
   async function markAsRead() {
     try {
       await markMessagesRead(friendHash);
+      // Mirror the DB-side mark-read into the frontend store so the
+      // unread badge clears immediately. Without this, `markAsRead`
+      // updated only the DB and the visual badge stuck around until
+      // the next `getUnreadMessageCounts` round trip (e.g. on
+      // reload). Cheap to call — `clearUnread` deletes the entry if
+      // present and is a no-op otherwise.
+      clearUnread(friendHash);
     } catch (e) {
       // Non-fatal — the badge will retry next time the conversation is
       // opened — but log so a persistent failure is visible in devtools.
@@ -320,6 +362,32 @@
         <span class="chat-name" id={titleId}>
           <span class="sr-only">Chat with </span><bdi>{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi>
         </span>
+        <!--
+          M15: short, honest verification badge. `isOnline` is
+          membership in the `onlineFriends` store, which the
+          backend only populates after Ed25519 proof-of-possession
+          succeeded on the live session (post-H1). When the peer
+          is offline we don't know that the next session will be
+          PoP-verified yet, so we tell the user the message will
+          queue rather than silently shipping to whatever future
+          identity claims the hash.
+        -->
+        {#if isOnline}
+          <span class="chat-status verified" title="Live session is cryptographically verified" aria-label="verified online">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 8l3 3 7-7"/>
+            </svg>
+            <span>Verified</span>
+          </span>
+        {:else}
+          <span class="chat-status offline" title="Friend is offline — message will be queued until a verified session is re-established" aria-label="offline, message will queue">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="8" cy="8" r="6"/>
+              <path d="M8 5v3M8 11v.01"/>
+            </svg>
+            <span>Offline</span>
+          </span>
+        {/if}
       </div>
       <button class="chat-close" onclick={onclose} title="Close chat" aria-label="Close chat">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
@@ -450,6 +518,33 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .chat-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+
+  .chat-status svg {
+    width: 11px;
+    height: 11px;
+  }
+
+  .chat-status.verified {
+    color: var(--status-success, #137a4a);
+    background: var(--status-success-bg, rgba(19, 122, 74, 0.12));
+  }
+
+  .chat-status.offline {
+    color: var(--status-warning, #a05a00);
+    background: var(--status-warning-bg, rgba(160, 90, 0, 0.12));
   }
 
   .chat-close {

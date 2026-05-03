@@ -3018,6 +3018,11 @@ async fn download_parts_from_source(
     // `ember_hash_binding_verified`. Used to suppress repeated auth
     // attempts if the same session sees both HELLO and HELLOANSWER.
     let mut ember_auth_verified = false;
+    // Whether we've already promoted this session's PoP to a
+    // `DownloadEvent::FriendSeen`. We only emit once per session so
+    // the dispatcher doesn't get repeated address-update events for
+    // the same peer.
+    let mut friend_seen_emitted = false;
     // FIFO of non-AUTH packets captured by `perform_ember_auth_buffered`
     // while it waited for CHALLENGE / RESPONSE frames. The uploader's
     // proactive `OP_SECIDENTSTATE` / `OP_PUBLICKEY` / `OP_SIGNATURE`
@@ -3220,16 +3225,14 @@ async fn download_parts_from_source(
                     //     to their hash (cheap offline check —
                     //     ember_hash_binding_verified).
                     //
-                    // PoP strictly implies binding (auth runs only
-                    // after binding succeeds), so `verified` below
-                    // is equivalent to plain `ember_hash_binding_verified`,
-                    // but we combine explicitly for clarity. If the
-                    // peer sent their friend request before their
-                    // OP_EMBER_HELLO(ANSWER) arrived we correctly
-                    // report unverified — the Friends UI stays honest
-                    // about what we actually know at emit time.
-                    let verified = ember_auth_verified || ember_hash_binding_verified;
-                    info!("Received early friend request from source {} (nick='{}', verified={verified}, pop={})", _src_idx, nick, ember_auth_verified);
+                    // We deliberately require PoP for `verified`.
+                    // The binding-only fallback let a peer replay a
+                    // victim's public (pubkey, ember_hash) pair and
+                    // get the Friends UI to show "Verified" without
+                    // ever proving private-key possession. Binding
+                    // is still logged for diagnostics.
+                    let verified = ember_auth_verified;
+                    info!("Received early friend request from source {} (nick='{}', verified={verified}, pop={}, binding={ember_hash_binding_verified})", _src_idx, nick, ember_auth_verified);
                     let _ = etx.send(DownloadEvent::EmberFriendRequest {
                         ember_hash: eh,
                         nickname: nick,
@@ -3252,6 +3255,26 @@ async fn download_parts_from_source(
             (OP_EMULEPROT, OP_EMBER_HELLO) | (OP_EMULEPROT, OP_EMBER_HELLOANSWER) => {
                 if let Some(ident) = parse_ember_hello(&payload) {
                     hello_caps.is_ember = true;
+                    // Identity lock: refuse to swap pubkey/hash after
+                    // PoP verification (see upload.rs/transfer.rs for
+                    // the same fix; the risk is credit accounting on
+                    // the new key while the session still claims to
+                    // be `Verified`).
+                    let identity_changed = ember_auth_verified
+                        && (
+                            (ident.ed25519_pubkey.is_some()
+                                && hello_caps.ember_pubkey.is_some()
+                                && ident.ed25519_pubkey != hello_caps.ember_pubkey)
+                            || (ident.ember_hash != [0u8; 16]
+                                && hello_caps.ember_hash.is_some()
+                                && Some(ident.ember_hash) != hello_caps.ember_hash)
+                        );
+                    if identity_changed {
+                        tracing::warn!(
+                            "Ember identity-swap rejected from source {} at {}: peer already PoP-verified",
+                            _src_idx, addr,
+                        );
+                    }
                     if !ident.mod_version.is_empty() {
                         hello_caps.mod_version = ident.mod_version.clone();
                     }
@@ -3259,12 +3282,14 @@ async fn download_parts_from_source(
                         hello_caps.peer_name = ident.nickname.clone();
                         src_peer_name = ident.nickname.clone();
                     }
-                    if ident.ember_hash != [0u8; 16] {
+                    if ident.ember_hash != [0u8; 16] && !identity_changed {
                         hello_caps.ember_hash = Some(ident.ember_hash);
                         peer_ember_hash = Some(ident.ember_hash);
                     }
                     if let Some(pk) = ident.ed25519_pubkey {
-                        hello_caps.ember_pubkey = Some(pk);
+                        if !identity_changed {
+                            hello_caps.ember_pubkey = Some(pk);
+                        }
                     }
                     src_client_software = client_software_from_caps(&hello_caps);
                     debug!("Source {} identified as Ember via OP_EMBER_HELLO (mod='{}', nick='{}')",
@@ -3333,6 +3358,28 @@ async fn download_parts_from_source(
                                         "Ember auth: source {} at {} verified via PoP ({} deferred packet(s) queued for replay)",
                                         _src_idx, addr, auth_deferred.len()
                                     );
+                                    // PoP done — if this peer's
+                                    // ember_hash is in our friend
+                                    // set, emit FriendSeen so the
+                                    // dispatcher can refresh the
+                                    // friend's last known IP and the
+                                    // UI online flag. Pre-control
+                                    // path runs before the
+                                    // `peer_is_friend` binding
+                                    // below, so we re-check
+                                    // `friend_hashes` inline.
+                                    if let (Some(ref fh_arc), Some(eh)) = (&friend_hashes, hello_caps.ember_hash) {
+                                        if fh_arc.read().await.contains(&eh) {
+                                            if let Some(ref etx) = event_tx {
+                                                let _ = etx.send(DownloadEvent::FriendSeen {
+                                                    ember_hash: eh,
+                                                    ip: addr.ip(),
+                                                    port: addr.port(),
+                                                }).await;
+                                                friend_seen_emitted = true;
+                                            }
+                                        }
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -3427,15 +3474,11 @@ async fn download_parts_from_source(
     } else if peer_is_friend {
         info!("Source {} is a friend but is_ember=false, skipping friend request", _src_idx);
     }
-    if let (true, Some(eh)) = (peer_is_friend, peer_ember_hash) {
-        if let Some(ref etx) = event_tx {
-            let _ = etx.send(DownloadEvent::FriendSeen {
-                ember_hash: eh,
-                ip: addr.ip(),
-                port: addr.port(),
-            }).await;
-        }
-    }
+    // FriendSeen emit is deferred to the PoP-success sites in the
+    // file-status-wait loop and the runtime loop. Without PoP a peer
+    // who only knows the friend's `ember_hash` (KAD publishes, EPX,
+    // public trackers) could overwrite the friend's last known IP in
+    // the DB and flip the UI online state for that friend.
     let is_ember_friend = hello_caps.is_ember && peer_is_friend;
 
     // File request in eMule order:
@@ -3710,10 +3753,11 @@ async fn download_parts_from_source(
         if proto == OP_EMULEPROT && opcode == OP_EMBER_FRIEND_REQ {
             if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
                 let nick = std::str::from_utf8(&_payload).unwrap_or("").to_string();
-                // Reuse the session-scoped auth / binding flags set by
-                // the OP_EMBER_HELLO handlers.
-                let verified = ember_auth_verified || ember_hash_binding_verified;
-                info!("Received friend request from source {} during file-status-wait (nick='{}', verified={verified}, pop={})", _src_idx, nick, ember_auth_verified);
+                // PoP-only `verified` (see early-friend-request site
+                // for rationale: binding-only would accept a replayed
+                // pubkey+hash pair).
+                let verified = ember_auth_verified;
+                info!("Received friend request from source {} during file-status-wait (nick='{}', verified={verified}, pop={}, binding={ember_hash_binding_verified})", _src_idx, nick, ember_auth_verified);
                 let _ = etx.send(DownloadEvent::EmberFriendRequest {
                     ember_hash: eh,
                     nickname: nick,
@@ -3733,6 +3777,21 @@ async fn download_parts_from_source(
         if proto == OP_EMULEPROT && (opcode == OP_EMBER_HELLO || opcode == OP_EMBER_HELLOANSWER) {
             if let Some(ident) = parse_ember_hello(&_payload) {
                 hello_caps.is_ember = true;
+                let identity_changed = ember_auth_verified
+                    && (
+                        (ident.ed25519_pubkey.is_some()
+                            && hello_caps.ember_pubkey.is_some()
+                            && ident.ed25519_pubkey != hello_caps.ember_pubkey)
+                        || (ident.ember_hash != [0u8; 16]
+                            && hello_caps.ember_hash.is_some()
+                            && Some(ident.ember_hash) != hello_caps.ember_hash)
+                    );
+                if identity_changed {
+                    tracing::warn!(
+                        "Ember identity-swap rejected from source {} at {} (file-status-wait): peer already PoP-verified",
+                        _src_idx, addr,
+                    );
+                }
                 if !ident.mod_version.is_empty() {
                     hello_caps.mod_version = ident.mod_version.clone();
                 }
@@ -3740,12 +3799,14 @@ async fn download_parts_from_source(
                     hello_caps.peer_name = ident.nickname.clone();
                     src_peer_name = ident.nickname.clone();
                 }
-                if ident.ember_hash != [0u8; 16] {
+                if ident.ember_hash != [0u8; 16] && !identity_changed {
                     hello_caps.ember_hash = Some(ident.ember_hash);
                     peer_ember_hash = Some(ident.ember_hash);
                 }
                 if let Some(pk) = ident.ed25519_pubkey {
-                    hello_caps.ember_pubkey = Some(pk);
+                    if !identity_changed {
+                        hello_caps.ember_pubkey = Some(pk);
+                    }
                 }
                 src_client_software = client_software_from_caps(&hello_caps);
                 debug!("Source {} identified as Ember via OP_EMBER_HELLO during file-status-wait (mod='{}', nick='{}')",
@@ -3792,6 +3853,18 @@ async fn download_parts_from_source(
                                     "Ember auth: source {} at {} verified via PoP during file-status-wait ({} deferred packet(s) queued for replay)",
                                     _src_idx, addr, auth_deferred.len()
                                 );
+                                if !friend_seen_emitted {
+                                    if let (true, Some(eh)) = (peer_is_friend, hello_caps.ember_hash) {
+                                        if let Some(ref etx) = event_tx {
+                                            let _ = etx.send(DownloadEvent::FriendSeen {
+                                                ember_hash: eh,
+                                                ip: addr.ip(),
+                                                port: addr.port(),
+                                            }).await;
+                                            friend_seen_emitted = true;
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -5296,15 +5369,11 @@ async fn download_parts_from_source(
                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if hello_caps.is_ember => {
                     if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
                         let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
-                        // Reuses the session-scoped auth + binding
-                        // flags. By the time we're in the runtime
-                        // loop the peer has had ample opportunity to
-                        // complete the challenge-response, so
-                        // unverified here usually means they don't
-                        // speak the auth opcodes (older Ember
-                        // release) or the exchange failed.
-                        let verified = ember_auth_verified || ember_hash_binding_verified;
-                        info!("Received runtime friend request from source {} (nick='{}', verified={verified}, pop={})", _src_idx, nick, ember_auth_verified);
+                        // PoP-only `verified` (see early-friend-request
+                        // site for rationale). Binding tracked
+                        // separately for the log line.
+                        let verified = ember_auth_verified;
+                        info!("Received runtime friend request from source {} (nick='{}', verified={verified}, pop={}, binding={ember_hash_binding_verified})", _src_idx, nick, ember_auth_verified);
                         let _ = etx.send(DownloadEvent::EmberFriendRequest {
                             ember_hash: eh,
                             nickname: nick,
@@ -6654,12 +6723,24 @@ mod tests {
     }
 }
 
+/// Hard cap on the number of file entries surfaced from a browse
+/// response. L9: the upstream packet limit is 5 MB so a malicious
+/// peer could pack ~5000 entries with very long names (tens of KB
+/// each) and stress the non-virtualised browse table in the UI.
+/// 1000 entries is a generous ceiling for honest peers (eMule
+/// shared-files lists rarely exceed a few hundred) while keeping
+/// the rendered DOM under control. Names are truncated to 256
+/// bytes — UTF-8 boundary preserved by `String::from_utf8_lossy` —
+/// so a single oversized name can't wedge the layout either.
+const MAX_BROWSE_ENTRIES: usize = 1000;
+const MAX_BROWSE_NAME_BYTES: usize = 256;
+
 pub(crate) fn parse_browse_response(data: &[u8]) -> Vec<(String, u64, String)> {
     let mut entries = Vec::new();
     if data.len() < 4 { return entries; }
     let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
     let mut pos = 4;
-    for _ in 0..count.min(5000) {
+    for _ in 0..count.min(MAX_BROWSE_ENTRIES) {
         if pos + 16 + 8 + 2 > data.len() { break; }
         let hash = hex::encode(&data[pos..pos+16]);
         pos += 16;
@@ -6668,7 +6749,11 @@ pub(crate) fn parse_browse_response(data: &[u8]) -> Vec<(String, u64, String)> {
         let name_len = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
         pos += 2;
         if pos + name_len > data.len() { break; }
-        let name = String::from_utf8_lossy(&data[pos..pos+name_len]).to_string();
+        // Truncate the *byte view* of the name before lossy decode,
+        // not the resulting String, so we never pay for decoding a
+        // multi-megabyte mojibake string.
+        let name_byte_end = name_len.min(MAX_BROWSE_NAME_BYTES);
+        let name = String::from_utf8_lossy(&data[pos..pos+name_byte_end]).to_string();
         pos += name_len;
         entries.push((hash, size, name));
     }
