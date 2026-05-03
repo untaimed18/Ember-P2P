@@ -2064,7 +2064,27 @@ impl UploadHandler {
         // which only transitions to `true` after the peer completes
         // the Ed25519 challenge-response on THIS TCP session (see
         // `super::ember_auth`).
-        let is_friend = if let Some(eh) = peer_ember_hash {
+        //
+        // Mutable because Ember identity is exchanged out-of-band
+        // from the public Hello/EmuleInfo (in `OP_EMBER_HELLO`, kept
+        // private so anti-leecher mods don't queue-ban us). At this
+        // point in the session `peer_ember_hash` is almost always
+        // still `None` — the peer's `OP_EMBER_HELLO` is processed by
+        // the dispatcher loop further down, where we re-evaluate
+        // these flags and ship the deferred `OP_EMBER_FRIEND_REQ`.
+        // Without that re-evaluation, a friend who initiates a
+        // download from us would never receive our reciprocal
+        // friend request: their upload session here sees `is_friend
+        // = false` at this early gate and silently skips the send,
+        // even though we know seconds later they're actually our
+        // friend. (The downloader-side checks in `transfer.rs` /
+        // `multi_source.rs` don't have this asymmetry because they
+        // pre-block-read for OP_EMBER_HELLO before their friend
+        // check.) The previously-`let`-only binding made every
+        // `is_ember_friend`-gated arm below (CHAT_MSG, BROWSE_REQ,
+        // BROWSE_RES, KEEPALIVE) and the `owns_ember_slot`
+        // reservation permanently dead for these sessions too.
+        let mut is_friend = if let Some(eh) = peer_ember_hash {
             self.friend_hashes.read().await.contains(&eh)
         } else {
             false
@@ -2078,16 +2098,30 @@ impl UploadHandler {
         // this session. Emission is moved to the OK arm of
         // `OP_EMBER_AUTH_RESPONSE` below.
 
+        // Tracks whether we've already shipped our outbound
+        // `OP_EMBER_FRIEND_REQ` on this session. Both the early gate
+        // here and the deferred re-check in the `OP_EMBER_HELLO` arm
+        // gate on it so a peer who beat us to it (sent us their
+        // `OP_EMBER_HELLO` *and* a FRIEND_REQ before we got around to
+        // ours) doesn't get a duplicate from us.
+        let mut friend_request_sent = false;
         if is_friend && hello_caps.is_ember {
             info!("Sending friend request to Ember peer {peer_addr}");
             let nick_bytes = self.nickname.as_bytes();
-            let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, nick_bytes).await;
+            if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, nick_bytes).await.is_ok() {
+                friend_request_sent = true;
+            }
         } else if is_friend {
             info!("Peer {peer_addr} is a friend but is_ember=false, skipping friend request");
         }
 
         let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-        let is_ember_friend = is_friend && hello_caps.is_ember;
+        // Mutable for the same reason as `is_friend` above: the
+        // OP_EMBER_HELLO arm below re-evaluates this once peer
+        // identity is known so the `is_ember_friend`-gated chat /
+        // browse / keepalive arms and the `owns_ember_slot` claim
+        // in the AUTH_RESPONSE arm all see the up-to-date answer.
+        let mut is_ember_friend = is_friend && hello_caps.is_ember;
         // Inbound `ember_sessions` slot reservation is deferred until the
         // peer completes Ed25519 proof-of-possession on this TCP session
         // (see `OP_EMBER_AUTH_RESPONSE` arm below). Reserving the slot
@@ -4722,6 +4756,64 @@ impl UploadHandler {
                                         hex::encode(peer_eh)
                                     );
                                 }
+                            }
+                        }
+
+                        // Deferred friend-request emit. The early
+                        // gate above the dispatcher fires before any
+                        // `OP_EMBER_HELLO` has been processed and so
+                        // sees `peer_ember_hash = None` /
+                        // `is_friend = false` for every Ember peer
+                        // that hasn't pre-loaded an obfuscation-layer
+                        // ember_hash — which is the common case
+                        // because we deliberately stripped Ember
+                        // identity from the public Hello/EmuleInfo
+                        // (anti-leecher-mod queue-ban avoidance). On
+                        // those sessions the original code would
+                        // never send `OP_EMBER_FRIEND_REQ`, so a
+                        // friend who already has us in their list
+                        // could initiate a download from us, see our
+                        // upload's friend request flow silently no-op,
+                        // and never get the reciprocal acceptance
+                        // prompt — exactly the asymmetric "they see
+                        // me but I never see them" bug users hit.
+                        //
+                        // Re-evaluating `is_friend` /
+                        // `is_ember_friend` here also keeps the
+                        // `is_ember_friend`-gated CHAT_MSG /
+                        // BROWSE_REQ / BROWSE_RES / KEEPALIVE arms
+                        // honest and lets the AUTH_RESPONSE arm
+                        // actually claim `owns_ember_slot` for this
+                        // friend — both of which were previously
+                        // dead code on the same Ember sessions.
+                        //
+                        // `friend_request_sent` ensures we only ever
+                        // emit one request per session; OP_EMBER_HELLO
+                        // arrives at most twice (HELLO + HELLOANSWER)
+                        // so the guard is what stops the duplicate.
+                        if !is_friend {
+                            if let Some(eh) = peer_ember_hash {
+                                if self.friend_hashes.read().await.contains(&eh) {
+                                    is_friend = true;
+                                    is_ember_friend = is_friend && hello_caps.is_ember;
+                                }
+                            }
+                        }
+                        if is_friend && hello_caps.is_ember && !friend_request_sent {
+                            info!(
+                                "Sending deferred friend request to Ember peer {peer_addr} after OP_EMBER_HELLO",
+                            );
+                            let nick_bytes = self.nickname.as_bytes();
+                            if write_packet_async(
+                                &mut writer,
+                                OP_EMULEPROT,
+                                OP_EMBER_FRIEND_REQ,
+                                nick_bytes,
+                            )
+                            .await
+                            .is_ok()
+                            {
+                                friend_request_sent = true;
                             }
                         }
                     }
