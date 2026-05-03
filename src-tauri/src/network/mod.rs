@@ -8208,7 +8208,15 @@ pub async fn start_network(
                     let rv_url = settings.rendezvous_url.clone();
                     let rv_port = state.quic_port.unwrap_or(settings.tcp_port);
                     let rv_hash = ember_hash;
-                    let rv_ip = state.external_ip;
+                    // The outer `if !state.friend_presence_initial_done
+                    // && state.external_ip.is_some()` already guarantees
+                    // `external_ip` is `Some` here. The expect is purely
+                    // a tripwire in case the gate is ever loosened —
+                    // rendezvous::register now requires a confirmed
+                    // IPv4 (no client_ip fallback on the server) so we
+                    // must never spawn this task without one.
+                    let rv_ip = state.external_ip
+                        .expect("friend_presence_initial gate guarantees external_ip is Some");
                     let rv_pubkey = ed25519_pubkey;
                     let rv_secret = ed25519_secret_key;
                     let app_rv = app_handle.clone();
@@ -8298,35 +8306,48 @@ pub async fn start_network(
                 );
                 // Rendezvous heartbeat: re-register every 2 minutes to keep
                 // our presence alive on the rendezvous server.
+                //
+                // Defensive: also re-check `state.external_ip.is_some()`
+                // before firing. `rendezvous_registered` only flips back
+                // to `false` on a full disconnect (which also resets
+                // `external_ip`), but if a future code path ever clears
+                // `external_ip` without resetting the registered flag we
+                // would otherwise hit `register()`'s required-IP contract
+                // and panic the spawned task.
                 if state.rendezvous_registered {
                     let needs_heartbeat = state.rendezvous_last_register
                         .map(|t| t.elapsed() >= std::time::Duration::from_secs(120))
                         .unwrap_or(true);
                     if needs_heartbeat {
-                        state.rendezvous_last_register = Some(std::time::Instant::now());
-                        let rv_url = settings.rendezvous_url.clone();
-                        // Heartbeat must advertise the same port we
-                        // registered with — i.e. the QUIC bind port,
-                        // which can differ from `tcp_port` when QUIC
-                        // had to fall back.
-                        let rv_port = state.quic_port.unwrap_or(settings.tcp_port);
-                        let rv_hash = ember_hash;
-                        let rv_ip = state.external_ip;
-                        let rv_pubkey = ed25519_pubkey;
-                        let rv_secret = ed25519_secret_key;
-                        let app_rv = app_handle.clone();
-                        tokio::spawn(async move {
-                            match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret).await {
-                                Ok(()) => {
-                                    let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
-                                        "discoverable": true,
-                                    }));
+                        if let Some(rv_ip) = state.external_ip {
+                            state.rendezvous_last_register = Some(std::time::Instant::now());
+                            let rv_url = settings.rendezvous_url.clone();
+                            // Heartbeat must advertise the same port we
+                            // registered with — i.e. the QUIC bind port,
+                            // which can differ from `tcp_port` when QUIC
+                            // had to fall back.
+                            let rv_port = state.quic_port.unwrap_or(settings.tcp_port);
+                            let rv_hash = ember_hash;
+                            let rv_pubkey = ed25519_pubkey;
+                            let rv_secret = ed25519_secret_key;
+                            let app_rv = app_handle.clone();
+                            tokio::spawn(async move {
+                                match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret).await {
+                                    Ok(()) => {
+                                        let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
+                                            "discoverable": true,
+                                        }));
+                                    }
+                                    Err(e) => {
+                                        warn!("Rendezvous heartbeat failed: {e}");
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!("Rendezvous heartbeat failed: {e}");
-                                }
-                            }
-                        });
+                            });
+                        } else {
+                            debug!(
+                                "Rendezvous heartbeat skipped: external_ip not currently known",
+                            );
+                        }
                     }
                 }
 

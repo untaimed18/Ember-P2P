@@ -273,6 +273,14 @@ struct AppState {
 struct RegisterRequest {
     id: String,
     port: u16,
+    /// Routable public IP the client wants registered as its
+    /// presence address. Required (we removed the `client_ip`
+    /// fallback so VPN / split-tunnel users aren't pinned to the
+    /// wrong egress) — the request handler returns `BAD_REQUEST`
+    /// when this is missing, unparseable, or non-routable. Kept
+    /// `Option` purely so older clients (which omit the field) get a
+    /// crisp 400 from the handler instead of a serde reject before
+    /// we can log it.
     ip: Option<String>,
     /// Ed25519 pubkey (64 hex chars). Required: server pins on first
     /// register, then refuses any later /register that doesn't match.
@@ -383,18 +391,38 @@ async fn register(
     // just to the id alone — otherwise a captured `/register` payload
     // could be replayed with a different ip/port to steer traffic.
     //
-    // M7 hardening: in addition to verifying the signature, we cross-
-    // check the client-supplied `body.ip` against the connection ip.
-    // After C4 a captured payload can't be replayed with a different
-    // ip (the signature wouldn't verify), but the LEGITIMATE keypair
-    // holder can still try to register a public IP they don't actually
-    // own — e.g. someone's V4 home address — so that friend lookups
-    // steer queries to that address. Pinning to `client_ip` for the
-    // common single-stack case closes that hole. Dual-stack clients
-    // (server sees v6, client probes STUN and gets v4) still need to
-    // be able to advertise their IPv4 STUN address, so we permit a v4
-    // body.ip when the connection itself is v6.
-    let body_ip_parsed = body.ip
+    // VPN-aware policy (replaces the earlier "body.ip must equal
+    // conn.ip" pin from M7):
+    //
+    //   - `body.ip` is REQUIRED. We refuse to fall back to `client_ip`
+    //     so a VPN / split-tunnel client whose HTTPS to rendezvous
+    //     egresses through ISP A while their P2P listener is reachable
+    //     via VPN exit B doesn't get its presence pinned to ISP A —
+    //     that pin would steer every friend lookup to an unreachable
+    //     address. It also means rendezvous never records a presence
+    //     IP unless the app has actually detected one and signed it,
+    //     which is what the user wanted: "ensure the rendezvous server
+    //     doesn't get an external IP until one has been reported in
+    //     the app".
+    //
+    //   - We TRUST `body.ip` even when it differs from `client_ip`
+    //     (e.g. split-tunnel VPN). The pubkey-pin + Ed25519 PoP that
+    //     friend dials still run on the actual TCP/QUIC session is the
+    //     real authority: a malicious keypair holder pointing friends
+    //     at a wrong IP just causes the friend dial to fail handshake.
+    //     The DDoS-amplifier scenario (attacker steers many lookups
+    //     at a victim) requires the attacker to first be on those
+    //     friends' lists, which they can't be without manual user
+    //     consent. That's a self-DoS of the attacker's own friends,
+    //     not a real amplification primitive — the pin to conn.ip we
+    //     used to enforce traded a real VPN-user breakage for that
+    //     near-zero-risk improvement, so we drop the pin.
+    //
+    //   - The routability filter (no loopback / private / link-local /
+    //     CGN / docs / 240.0.0.0/4) still applies, so an attacker
+    //     can't point rendezvous at e.g. 127.0.0.1 to make friends
+    //     dial themselves.
+    let body_ip_parsed = match body.ip
         .as_deref()
         .and_then(|s| s.parse::<IpAddr>().ok())
         .filter(|ip| match ip {
@@ -402,34 +430,26 @@ async fn register(
                 && !v4.is_private() && !v4.is_link_local(),
             IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified()
                 && !v6.is_multicast(),
-        });
-    let presence_ip = match (body_ip_parsed, client_ip) {
-        (Some(body_ip), conn_ip) if body_ip == conn_ip => body_ip,
-        (Some(IpAddr::V4(v4)), IpAddr::V6(_)) => IpAddr::V4(v4),
-        (Some(_), _) => {
-            // Body advertises a public IP that doesn't match this
-            // connection. We refuse rather than silently overriding —
-            // an honest single-stack client always sees the same IP
-            // the rendezvous edge sees, so a mismatch here is either
-            // a bug (client shouldn't have set body.ip) or an
-            // attempted steering attack.
-            return StatusCode::FORBIDDEN;
+        }) {
+        Some(ip) => ip,
+        None => {
+            // Either missing, unparseable, or a non-routable address
+            // (loopback / private / link-local / etc). Refuse rather
+            // than silently substituting `client_ip` — see policy
+            // comment above.
+            return StatusCode::BAD_REQUEST;
         }
-        (None, _) => client_ip,
     };
+    let presence_ip = body_ip_parsed;
 
     // The signature commits to the IPv4 quad the CLIENT signed:
-    //   - If body.ip is set and parses as IPv4, the client signed
-    //     those four octets.
-    //   - Otherwise the client signed [0,0,0,0] (the IPv6-conn or
-    //     no-external-ip case).
-    // We deliberately compute `signed_ip4` from body.ip — not from
-    // `presence_ip` — because `presence_ip` may be `client_ip` when
-    // the client didn't supply an `ip` field, and the client cannot
-    // have signed `client_ip` when it didn't even know it.
+    //   - If body.ip parses as IPv4, the client signed those four octets.
+    //   - For IPv6 body.ip the client signed [0,0,0,0].
+    // (We never reach the no-body-ip case anymore — that's rejected
+    // above.)
     let signed_ip4 = match body_ip_parsed {
-        Some(IpAddr::V4(v4)) => v4.octets(),
-        _ => [0u8; 4],
+        IpAddr::V4(v4) => v4.octets(),
+        IpAddr::V6(_) => [0u8; 4],
     };
 
     let Some(id_raw) = decode_hex_id(&body.id) else {

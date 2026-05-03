@@ -180,13 +180,18 @@ async fn read_bounded_bytes(resp: reqwest::Response, limit: usize) -> Result<Vec
 /// this id MUST come from this same keypair, which is what blocks
 /// the squat-and-steer attack on the rendezvous /register endpoint.
 ///
-/// If `external_ip` is provided, it is sent so the server stores our
-/// true IPv4 address instead of the (possibly IPv6) connection address.
+/// `external_ip` is REQUIRED. The server has no `client_ip` fallback
+/// anymore (a VPN / split-tunnel user's HTTPS to rendezvous can egress
+/// from a different address than their P2P listener, so pinning to the
+/// connection address would steer every friend lookup at an
+/// unreachable host). Callers must therefore wait until the firewall
+/// checker / KAD probe has produced a confirmed IPv4 address before
+/// invoking this function.
 pub async fn register(
     base_url: &str,
     ember_hash: &[u8; 16],
     port: u16,
-    external_ip: Option<Ipv4Addr>,
+    external_ip: Ipv4Addr,
     pubkey: &[u8; 32],
     secret_key: &[u8; 32],
 ) -> Result<(), String> {
@@ -195,21 +200,16 @@ pub async fn register(
     let id = hashed_id(ember_hash);
     let id_raw = sha256_id_raw(ember_hash);
     let ts = current_timestamp();
-    // The server signs over a fixed IPv4 quad. If we don't have an
-    // external IP we sign 0.0.0.0; the server then resolves
-    // presence_ip from the connection IP and signs the same.
-    let signed_ip4 = external_ip.map(|ip| ip.octets()).unwrap_or([0u8; 4]);
+    let signed_ip4 = external_ip.octets();
     let sig = sign_register(secret_key, pubkey, &id_raw, port, signed_ip4, ts);
-    let mut body = serde_json::json!({
+    let body = serde_json::json!({
         "id": id,
         "port": port,
+        "ip": external_ip.to_string(),
         "pubkey": hex::encode(pubkey),
         "ts": ts,
         "sig": hex::encode(sig.to_bytes()),
     });
-    if let Some(ip) = external_ip {
-        body["ip"] = serde_json::Value::String(ip.to_string());
-    }
     let resp = client()
         .post(&url)
         .json(&body)
@@ -222,7 +222,7 @@ pub async fn register(
         // success message at info and the identifying bits at debug.
         info!("Rendezvous: registration succeeded on port {port}");
         debug!(
-            "Rendezvous: registered {}… (ip={:?})",
+            "Rendezvous: registered {}… (ip={})",
             &id[..8],
             external_ip
         );
