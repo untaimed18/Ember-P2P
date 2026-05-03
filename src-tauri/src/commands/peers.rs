@@ -25,10 +25,15 @@ const DEFAULT_EMBER_PING_TIMEOUT_MS: u64 = 5_000;
 const MIN_EMBER_PING_TIMEOUT_MS: u64 = 100;
 const MAX_EMBER_PING_TIMEOUT_MS: u64 = 60_000;
 
-/// Maximum stored friend nickname size. Same cap is enforced in
-/// `update_friend_nickname`; centralizing it here keeps the two
-/// command paths in sync.
-const MAX_FRIEND_NICKNAME_LEN: usize = 256;
+/// Maximum stored friend nickname size. L18: aligned with the
+/// frontend `maxlength="64"` constraints in `+page.svelte` so a
+/// peer who advertises a longer nickname (or a future rogue UI
+/// surface) doesn't end up with rows that overflow the friends
+/// list ellipsis breakpoints. The previous 256-byte ceiling was
+/// generous-but-inconsistent: foreign nicknames truncated by the
+/// backend at 256 chars couldn't be rendered cleanly anyway, and a
+/// 256-char nickname pushed several columns of UI off-screen.
+const MAX_FRIEND_NICKNAME_LEN: usize = 64;
 
 fn parse_user_hash(hex_str: &str) -> Result<[u8; 16], String> {
     if hex_str.len() != 32 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {

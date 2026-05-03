@@ -708,6 +708,11 @@ impl Ed2kDownload {
         // binding-only, and to gate privilege-bearing friend opcodes
         // (CHAT_MSG) on genuine identity ownership.
         let mut ember_auth_verified = false;
+        // Whether we've already promoted this session's PoP success
+        // to a `DownloadEvent::FriendSeen`. We only emit once per
+        // session so the dispatcher doesn't get repeated address-
+        // update events for the same peer.
+        let mut friend_seen_emitted = false;
         // FIFO of non-AUTH packets captured by
         // `perform_ember_auth_buffered` while it waited for CHALLENGE /
         // RESPONSE. The uploader emits proactive
@@ -1044,20 +1049,18 @@ impl Ed2kDownload {
                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) => {
                     if let Some(eh) = peer_ember_hash {
                         let nick = std::str::from_utf8(&pl).unwrap_or("").to_string();
-                        // Full PoP signal wins when the Ed25519
-                        // challenge-response completed on this
-                        // session; otherwise fall back to the offline
-                        // binding check. If the friend request
-                        // arrives before we've seen OP_EMBER_HELLO
-                        // (unusual packet ordering) both flags are
-                        // still false and we'll correctly report
-                        // unverified. Full PoP also re-runs on the
-                        // friend-connect dial-back if the user accepts
-                        // — so binding-only here doesn't permanently
-                        // mark the friend unverified.
-                        let verified = ember_auth_verified || ember_hash_binding_verified;
+                        // `verified` requires PoP (Ed25519 challenge-
+                        // response). Binding-only is replayable — a
+                        // peer who learned a victim's public
+                        // (pubkey, ember_hash) on the wire could
+                        // otherwise post a "Verified" friend request
+                        // in the recipient's UI. PoP also re-runs on
+                        // the friend-connect dial-back if the user
+                        // accepts, so this never permanently marks a
+                        // legitimate friend unverified.
+                        let verified = ember_auth_verified;
                         info!(
-                            "Received early friend request from {} (nick='{}', verified={verified}, pop={})",
+                            "Received early friend request from {} (nick='{}', verified={verified}, pop={}, binding={ember_hash_binding_verified})",
                             self.source_addr, nick, ember_auth_verified
                         );
                         let _ = event_tx.send(DownloadEvent::EmberFriendRequest {
@@ -1082,11 +1085,33 @@ impl Ed2kDownload {
                 (OP_EMULEPROT, OP_EMBER_HELLO) | (OP_EMULEPROT, OP_EMBER_HELLOANSWER) => {
                     if let Some(ident) = parse_ember_hello(&pl) {
                         peer_is_ember = true;
-                        if ident.ember_hash != [0u8; 16] {
+                        // Identity lock: refuse to swap pubkey/hash
+                        // after PoP verification (see upload.rs for
+                        // the full rationale — same accounting risk).
+                        let identity_changed = ember_auth_verified
+                            && (
+                                (ident.ed25519_pubkey.is_some()
+                                    && peer_ember_pubkey.is_some()
+                                    && ident.ed25519_pubkey != peer_ember_pubkey)
+                                || (ident.ember_hash != [0u8; 16]
+                                    && peer_ember_hash.is_some()
+                                    && Some(ident.ember_hash) != peer_ember_hash)
+                            );
+                        if identity_changed {
+                            tracing::warn!(
+                                "Ember identity-swap rejected from {}: peer already PoP-verified, ignoring re-keyed OP_EMBER_HELLO (old_hash={:?}, new_hash={})",
+                                self.source_addr,
+                                peer_ember_hash.as_ref().map(hex::encode),
+                                hex::encode(ident.ember_hash),
+                            );
+                        }
+                        if ident.ember_hash != [0u8; 16] && !identity_changed {
                             peer_ember_hash = Some(ident.ember_hash);
                         }
                         if let Some(pk) = ident.ed25519_pubkey {
-                            peer_ember_pubkey = Some(pk);
+                            if !identity_changed {
+                                peer_ember_pubkey = Some(pk);
+                            }
                         }
                         if !ident.nickname.is_empty() {
                             peer_name_label = ident.nickname.clone();
@@ -1183,6 +1208,23 @@ impl Ed2kDownload {
                                             self.source_addr,
                                             auth_deferred.len()
                                         );
+                                        // Pre-control PoP runs before
+                                        // `peer_is_friend` is bound,
+                                        // so re-check `friend_hashes`
+                                        // inline to gate the
+                                        // FriendSeen emit on PoP.
+                                        if !friend_seen_emitted {
+                                            if let (Some(ref fh_arc), Some(eh)) = (&self.friend_hashes, peer_ember_hash) {
+                                                if fh_arc.read().await.contains(&eh) {
+                                                    let _ = event_tx.send(DownloadEvent::FriendSeen {
+                                                        ember_hash: eh,
+                                                        ip: self.source_addr.ip(),
+                                                        port: self.source_addr.port(),
+                                                    }).await;
+                                                    friend_seen_emitted = true;
+                                                }
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::warn!(
@@ -1266,13 +1308,12 @@ impl Ed2kDownload {
             let nick_bytes = self.our_nickname.as_bytes();
             let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, nick_bytes).await;
         }
-        if let (true, Some(eh)) = (peer_is_friend, peer_ember_hash) {
-            let _ = event_tx.send(DownloadEvent::FriendSeen {
-                ember_hash: eh,
-                ip: self.source_addr.ip(),
-                port: self.source_addr.port(),
-            }).await;
-        }
+        // FriendSeen emit is deferred to PoP-success sites. The
+        // dispatcher promotes FriendSeen to `update_friend_address`
+        // (overwriting the friend's last known IP) and an
+        // `ember:friend-online` UI event; both are user-facing facts
+        // about *that friend*, so they require Ed25519 PoP, not just
+        // the unauthenticated `is_friend && hello_caps.is_ember` claim.
         let is_ember_friend = peer_is_ember && peer_is_friend;
 
         // Send file request in eMule order:
@@ -1561,7 +1602,9 @@ impl Ed2kDownload {
                         // pre-control loop, so by the time we reach
                         // file-status-wait most well-behaved peers
                         // have already flipped `ember_auth_verified`.
-                        let verified = ember_auth_verified || ember_hash_binding_verified;
+                        // PoP-only (binding is replayable; see early
+                        // friend-request site).
+                        let verified = ember_auth_verified;
                         let _ = event_tx.send(DownloadEvent::EmberFriendRequest {
                             ember_hash: eh,
                             nickname: nick,
@@ -1579,11 +1622,29 @@ impl Ed2kDownload {
                 (OP_EMULEPROT, OP_EMBER_HELLO) | (OP_EMULEPROT, OP_EMBER_HELLOANSWER) => {
                     if let Some(ident) = parse_ember_hello(&payload) {
                         peer_is_ember = true;
-                        if ident.ember_hash != [0u8; 16] {
+                        // Identity lock (see pre-control arm).
+                        let identity_changed = ember_auth_verified
+                            && (
+                                (ident.ed25519_pubkey.is_some()
+                                    && peer_ember_pubkey.is_some()
+                                    && ident.ed25519_pubkey != peer_ember_pubkey)
+                                || (ident.ember_hash != [0u8; 16]
+                                    && peer_ember_hash.is_some()
+                                    && Some(ident.ember_hash) != peer_ember_hash)
+                            );
+                        if identity_changed {
+                            tracing::warn!(
+                                "Ember identity-swap rejected from {} (file-status-wait): peer already PoP-verified",
+                                self.source_addr,
+                            );
+                        }
+                        if ident.ember_hash != [0u8; 16] && !identity_changed {
                             peer_ember_hash = Some(ident.ember_hash);
                         }
                         if let Some(pk) = ident.ed25519_pubkey {
-                            peer_ember_pubkey = Some(pk);
+                            if !identity_changed {
+                                peer_ember_pubkey = Some(pk);
+                            }
                         }
                         if !ident.nickname.is_empty() {
                             peer_name_label = ident.nickname.clone();
@@ -1656,6 +1717,16 @@ impl Ed2kDownload {
                                             self.source_addr,
                                             auth_deferred.len()
                                         );
+                                        if !friend_seen_emitted {
+                                            if let (true, Some(eh)) = (peer_is_friend, peer_ember_hash) {
+                                                let _ = event_tx.send(DownloadEvent::FriendSeen {
+                                                    ember_hash: eh,
+                                                    ip: self.source_addr.ip(),
+                                                    port: self.source_addr.port(),
+                                                }).await;
+                                                friend_seen_emitted = true;
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::warn!(
@@ -2627,10 +2698,11 @@ impl Ed2kDownload {
                                 // the peer's Ember-Hello + PoP has
                                 // usually completed in an earlier
                                 // phase, so `ember_auth_verified` is
-                                // the normal signal here. Binding-only
-                                // fallback covers peers whose Ember
-                                // stack predates the auth opcodes.
-                                let verified = ember_auth_verified || ember_hash_binding_verified;
+                                // the normal signal here. PoP-only —
+                                // binding is replayable from public
+                                // (pubkey, ember_hash) leaks (KAD,
+                                // EPX, public trackers).
+                                let verified = ember_auth_verified;
                                 let _ = event_tx.send(DownloadEvent::EmberFriendRequest {
                                     ember_hash: eh,
                                     nickname: nick,
@@ -2650,11 +2722,29 @@ impl Ed2kDownload {
                         (OP_EMULEPROT, OP_EMBER_HELLO) | (OP_EMULEPROT, OP_EMBER_HELLOANSWER) => {
                             if let Some(ident) = parse_ember_hello(&payload) {
                                 peer_is_ember = true;
-                                if ident.ember_hash != [0u8; 16] {
+                                // Identity lock (see pre-control arm).
+                                let identity_changed = ember_auth_verified
+                                    && (
+                                        (ident.ed25519_pubkey.is_some()
+                                            && peer_ember_pubkey.is_some()
+                                            && ident.ed25519_pubkey != peer_ember_pubkey)
+                                        || (ident.ember_hash != [0u8; 16]
+                                            && peer_ember_hash.is_some()
+                                            && Some(ident.ember_hash) != peer_ember_hash)
+                                    );
+                                if identity_changed {
+                                    tracing::warn!(
+                                        "Ember identity-swap rejected from {} (data-loop): peer already PoP-verified",
+                                        self.source_addr,
+                                    );
+                                }
+                                if ident.ember_hash != [0u8; 16] && !identity_changed {
                                     peer_ember_hash = Some(ident.ember_hash);
                                 }
                                 if let Some(pk) = ident.ed25519_pubkey {
-                                    peer_ember_pubkey = Some(pk);
+                                    if !identity_changed {
+                                        peer_ember_pubkey = Some(pk);
+                                    }
                                 }
                                 if opcode == OP_EMBER_HELLO && !sent_ember_hello {
                                     let payload = build_ember_hello(

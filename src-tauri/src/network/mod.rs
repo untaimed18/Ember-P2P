@@ -364,7 +364,18 @@ async fn handle_epx_sources(
                 udp_port,
             );
             total_injected += stats.injected;
-            total_sources_this_event += 1;
+            // Only count sources that were actually new injections
+            // against the per-event ceiling. The earlier behaviour
+            // counted every source the EPX packet listed even when
+            // `inject_source_into_active_transfers` deduped it as a
+            // re-announcement; an attacker could then flood EPX with
+            // many duplicate sources to saturate `MAX_EPX_TOTAL_SOURCES`
+            // and force legitimate later-in-packet unique sources to
+            // be dropped without being processed. Using `injected`
+            // makes the cap track effective work, not packet bytes.
+            if stats.injected > 0 {
+                total_sources_this_event += stats.injected;
+            }
             if stats.persisted > 0 {
                 let hex = hex::encode(file_hash);
                 *per_hash_persisted.entry(hex).or_default() += 1;
@@ -7868,7 +7879,19 @@ pub async fn start_network(
                     // Initial NAT probe as soon as we learn our external IP
                     if !had_ip && state.external_ip.is_some() && state.nat_info.nat_type == ember::nat::NatType::Unknown {
                         info!("External IP discovered via firewall check — running initial NAT probe");
-                        state.nat_info = ember::nat::probe_nat(&udp_socket).await;
+                        state.nat_info = match tokio::time::timeout(
+                            ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
+                            ember::nat::probe_nat(&udp_socket),
+                        ).await {
+                            Ok(info) => info,
+                            Err(_) => {
+                                tracing::warn!(
+                                    "NAT probe timed out after {:?} on the main network task; keeping existing NatInfo",
+                                    ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
+                                );
+                                state.nat_info.clone()
+                            }
+                        };
                         // Same HighID fallback as the KAD-discovery and
                         // server-HighID paths: STUN can fail wholesale
                         // even when we know our external IP. Without
@@ -8154,9 +8177,11 @@ pub async fn start_network(
                     let rv_port = state.quic_port.unwrap_or(settings.tcp_port);
                     let rv_hash = ember_hash;
                     let rv_ip = state.external_ip;
+                    let rv_pubkey = ed25519_pubkey;
+                    let rv_secret = ed25519_secret_key;
                     let app_rv = app_handle.clone();
                     tokio::spawn(async move {
-                        match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip).await {
+                        match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret).await {
                             Ok(()) => {
                                 let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
                                     "discoverable": true,
@@ -8255,9 +8280,11 @@ pub async fn start_network(
                         let rv_port = state.quic_port.unwrap_or(settings.tcp_port);
                         let rv_hash = ember_hash;
                         let rv_ip = state.external_ip;
+                        let rv_pubkey = ed25519_pubkey;
+                        let rv_secret = ed25519_secret_key;
                         let app_rv = app_handle.clone();
                         tokio::spawn(async move {
-                            match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip).await {
+                            match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret).await {
                                 Ok(()) => {
                                     let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
                                         "discoverable": true,
@@ -8680,7 +8707,19 @@ pub async fn start_network(
 
                 // Periodic NAT reprobe (every 5 minutes)
                 if state.nat_info.needs_reprobe() && state.external_ip.is_some() {
-                    let nat_info = ember::nat::probe_nat(&udp_socket).await;
+                    let nat_info = match tokio::time::timeout(
+                        ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
+                        ember::nat::probe_nat(&udp_socket),
+                    ).await {
+                        Ok(info) => info,
+                        Err(_) => {
+                            tracing::warn!(
+                                "Periodic NAT reprobe timed out after {:?}; keeping existing NatInfo",
+                                ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
+                            );
+                            state.nat_info.clone()
+                        }
+                    };
                     state.nat_info = nat_info;
                     // Same HighID fallback as the initial probe: if STUN
                     // is still down but we know our external IP, don't
@@ -11914,7 +11953,19 @@ pub async fn start_network(
                                 state.firewall_checker.handle_server_highid_response(ext_ip);
                                 if was_none && state.nat_info.nat_type == ember::nat::NatType::Unknown {
                                     info!("External IP discovered via server HighID — running initial NAT probe");
-                                    state.nat_info = ember::nat::probe_nat(&udp_socket).await;
+                                    state.nat_info = match tokio::time::timeout(
+                                        ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
+                                        ember::nat::probe_nat(&udp_socket),
+                                    ).await {
+                                        Ok(info) => info,
+                                        Err(_) => {
+                                            tracing::warn!(
+                                                "NAT probe (post-HighID) timed out after {:?}; keeping existing NatInfo",
+                                                ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
+                                            );
+                                            state.nat_info.clone()
+                                        }
+                                    };
                                     // STUN can fail (firewall, DNS, blocked egress)
                                     // even when the host is perfectly punchable.
                                     // HighID + a successful TCP connect-back is
@@ -13809,7 +13860,7 @@ pub async fn start_network(
     if state.rendezvous_registered {
         let rv_url = settings.rendezvous_url.clone();
         let rv_hash = ember_hash;
-        if let Err(e) = rendezvous::unregister(&rv_url, &rv_hash).await {
+        if let Err(e) = rendezvous::unregister(&rv_url, &rv_hash, &ed25519_secret_key).await {
             warn!("Failed to unregister from rendezvous server: {e}");
         }
     }
@@ -16055,7 +16106,19 @@ async fn handle_udp_packet(
 
             if prev_ip.is_none() && state.external_ip.is_some() && state.nat_info.nat_type == ember::nat::NatType::Unknown {
                 info!("External IP discovered via KAD — running initial NAT probe");
-                state.nat_info = ember::nat::probe_nat(socket).await;
+                state.nat_info = match tokio::time::timeout(
+                    ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
+                    ember::nat::probe_nat(socket),
+                ).await {
+                    Ok(info) => info,
+                    Err(_) => {
+                        tracing::warn!(
+                            "NAT probe (post-KAD-confirm) timed out after {:?}; keeping existing NatInfo",
+                            ember::nat::PROBE_NAT_OVERALL_TIMEOUT,
+                        );
+                        state.nat_info.clone()
+                    }
+                };
                 // STUN can fail wholesale (firewall, DNS, blocked egress).
                 // We still know our external IP from KAD votes, so fall
                 // back to `PortRestricted` rather than leaving `Unknown`,
