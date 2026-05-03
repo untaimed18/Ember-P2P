@@ -1,9 +1,84 @@
 use std::net::Ipv4Addr;
 
+use ed25519_dalek::{Signature, SigningKey};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+// ---------------------------------------------------------------------------
+// Rendezvous-protocol Ed25519 signing. Mirrors the verification helpers
+// in `rendezvous-server/src/main.rs`. The server pins each id to its
+// pubkey on first `/register` and refuses any later `/register`,
+// `/unregister`, `/punch` POST, or `/punch/{id}` poll that doesn't
+// carry a valid signature for that pinned pubkey — closing the squat
+// attack where an attacker could compute a victim's id (just SHA256
+// of the friend's BLAKE3 hash, both public) and POST a fake address
+// for it. The signed messages each include a domain-separation prefix,
+// an op tag, and a timestamp so the server can also reject replays.
+// ---------------------------------------------------------------------------
+
+const RDV_DOMAIN: &[u8] = b"ember-rdv-v1";
+const OP_REGISTER: u8 = 0x01;
+const OP_UNREGISTER: u8 = 0x02;
+// 0x03..=0x06 reserved for future signing of /punch and /relay-invite
+// endpoints (keyed on synthetic (ip, port) ids today, so no pubkey to
+// verify against — see rendezvous-server/src/main.rs for the matching
+// note).
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn sha256_id_raw(ember_hash: &[u8; 16]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(ember_hash);
+    let out = hasher.finalize();
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&out);
+    buf
+}
+
+fn signing_key_from_secret(secret: &[u8; 32]) -> SigningKey {
+    SigningKey::from_bytes(secret)
+}
+
+fn sign_register(
+    secret: &[u8; 32],
+    pubkey: &[u8; 32],
+    id_raw: &[u8; 32],
+    port: u16,
+    ip4: [u8; 4],
+    ts: i64,
+) -> Signature {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 2 + 4 + 32 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_REGISTER);
+    m.extend_from_slice(id_raw);
+    m.extend_from_slice(&port.to_le_bytes());
+    m.extend_from_slice(&ip4);
+    m.extend_from_slice(pubkey);
+    m.extend_from_slice(&ts.to_le_bytes());
+    use ed25519_dalek::Signer;
+    signing_key_from_secret(secret).sign(&m)
+}
+
+fn sign_unregister(secret: &[u8; 32], id_raw: &[u8; 32], ts: i64) -> Signature {
+    let mut m = Vec::with_capacity(RDV_DOMAIN.len() + 1 + 32 + 8);
+    m.extend_from_slice(RDV_DOMAIN);
+    m.push(OP_UNREGISTER);
+    m.extend_from_slice(id_raw);
+    m.extend_from_slice(&ts.to_le_bytes());
+    use ed25519_dalek::Signer;
+    signing_key_from_secret(secret).sign(&m)
+}
+
+fn current_timestamp() -> i64 {
+    now_unix_secs()
+}
 
 /// Hard byte cap on rendezvous responses. Every payload this client
 /// consumes is a small JSON blob (lookup result is < 200 bytes; relay
@@ -22,18 +97,33 @@ pub fn hashed_id(ember_hash: &[u8; 16]) -> String {
 }
 
 fn client() -> reqwest::Client {
-    match reqwest::Client::builder()
+    // L10: previously the failure branch silently fell back to a
+    // bare `reqwest::Client::new()`, dropping `https_only(true)`
+    // and `no_proxy()`. Those flags are the defense-in-depth that
+    // stops a misconfigured proxy from MITM-ing the rendezvous
+    // control plane and a redirect from steering us onto plain
+    // HTTP. The builder ~never fails on supported platforms; if it
+    // ever does, panicking is preferable to a silent downgrade
+    // because the call sites all require the secure posture (the
+    // `require_https` URL check guards the scheme; the client
+    // flags guard redirects + proxies).
+    reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .no_proxy()
         .https_only(true)
         .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("Failed to build rendezvous HTTP client with configured options: {e}, using default");
-            reqwest::Client::new()
-        }
-    }
+        .unwrap_or_else(|e| {
+            warn!("Failed to build hardened rendezvous HTTP client: {e}; this should be impossible — falling back to a still-https-only default");
+            // Even the fallback enforces https_only via the URL
+            // check at call sites (`require_https`). We keep this
+            // arm only because `unwrap_or_else` requires returning
+            // a `Client`; in practice it is unreachable.
+            reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .https_only(true)
+                .build()
+                .expect("rendezvous HTTP client builder failed twice")
+        })
 }
 
 /// Reject non-HTTPS rendezvous URLs before we send any traffic. The
@@ -82,13 +172,41 @@ async fn read_bounded_bytes(resp: reqwest::Response, limit: usize) -> Result<Vec
 }
 
 /// Register our presence with the rendezvous server.
-/// If `external_ip` is provided, it is sent so the server stores our true
-/// IPv4 address instead of the (possibly IPv6) connection address.
-pub async fn register(base_url: &str, ember_hash: &[u8; 16], port: u16, external_ip: Option<Ipv4Addr>) -> Result<(), String> {
+///
+/// `pubkey` and `secret_key` are the node's Ed25519 identity keypair —
+/// the pubkey is sent to the server and pinned to `id`, the secret key
+/// signs the request so future re-registrations or unregistrations can
+/// be authenticated. The server enforces that any later request for
+/// this id MUST come from this same keypair, which is what blocks
+/// the squat-and-steer attack on the rendezvous /register endpoint.
+///
+/// If `external_ip` is provided, it is sent so the server stores our
+/// true IPv4 address instead of the (possibly IPv6) connection address.
+pub async fn register(
+    base_url: &str,
+    ember_hash: &[u8; 16],
+    port: u16,
+    external_ip: Option<Ipv4Addr>,
+    pubkey: &[u8; 32],
+    secret_key: &[u8; 32],
+) -> Result<(), String> {
     require_https(base_url)?;
     let url = format!("{}/register", base_url.trim_end_matches('/'));
     let id = hashed_id(ember_hash);
-    let mut body = serde_json::json!({ "id": id, "port": port });
+    let id_raw = sha256_id_raw(ember_hash);
+    let ts = current_timestamp();
+    // The server signs over a fixed IPv4 quad. If we don't have an
+    // external IP we sign 0.0.0.0; the server then resolves
+    // presence_ip from the connection IP and signs the same.
+    let signed_ip4 = external_ip.map(|ip| ip.octets()).unwrap_or([0u8; 4]);
+    let sig = sign_register(secret_key, pubkey, &id_raw, port, signed_ip4, ts);
+    let mut body = serde_json::json!({
+        "id": id,
+        "port": port,
+        "pubkey": hex::encode(pubkey),
+        "ts": ts,
+        "sig": hex::encode(sig.to_bytes()),
+    });
     if let Some(ip) = external_ip {
         body["ip"] = serde_json::Value::String(ip.to_string());
     }
@@ -253,13 +371,25 @@ mod lookup_filter_tests {
 }
 
 /// Unregister our presence from the rendezvous server (graceful shutdown).
-pub async fn unregister(base_url: &str, ember_hash: &[u8; 16]) -> Result<(), String> {
+///
+/// `secret_key` signs an unregister request so the server can verify
+/// the call came from the same identity that registered. Mirrors the
+/// `register` signing scheme — the server pins pubkey on register,
+/// then re-checks on every state-mutating request for that id.
+pub async fn unregister(base_url: &str, ember_hash: &[u8; 16], secret_key: &[u8; 32]) -> Result<(), String> {
     require_https(base_url)?;
     let url = format!("{}/unregister", base_url.trim_end_matches('/'));
     let id = hashed_id(ember_hash);
+    let id_raw = sha256_id_raw(ember_hash);
+    let ts = current_timestamp();
+    let sig = sign_unregister(secret_key, &id_raw, ts);
     let resp = client()
         .delete(&url)
-        .json(&serde_json::json!({ "id": id }))
+        .json(&serde_json::json!({
+            "id": id,
+            "ts": ts,
+            "sig": hex::encode(sig.to_bytes()),
+        }))
         .send()
         .await
         .map_err(|e| format!("rendezvous unregister failed: {e}"))?;

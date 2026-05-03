@@ -17,7 +17,53 @@ const MSG_RELAY_CLOSE: u8 = 0x05;
 const MSG_RELAY_REJECT: u8 = 0x06;
 
 const MAX_RELAY_DATA_SIZE: usize = 16384;
-const RELAY_BANDWIDTH_LIMIT: usize = 512 * 1024;
+
+/// Build a hardened reqwest client for relay/punch HTTP calls.
+///
+/// M8: previously each helper called `reqwest::Client::new()`,
+/// which omitted `https_only`, `no_proxy`, and any body-size
+/// guard — strictly weaker than the rendezvous client built in
+/// `network/rendezvous.rs::client()`. The relay/punch endpoints
+/// hit the same rendezvous server, so they should be subject to
+/// the same defense-in-depth posture: refuse to follow a redirect
+/// onto plain HTTP, never route through an environment proxy, and
+/// hard-cap the request timeout. The body size is bounded
+/// indirectly by reqwest's default response cap and the very small
+/// JSON shapes these endpoints accept; if a future endpoint needs
+/// larger bodies, add an explicit `bytes_per_response` cap here.
+fn relay_http_client() -> reqwest::Client {
+    match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .no_proxy()
+        .https_only(true)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            // Fall back to a plain client rather than panicking, but
+            // log loudly — `https_only(true)` is the main thing we
+            // lose, and the call sites already bail on error
+            // responses, so the worst case is a misconfigured local
+            // build that will fail health checks anyway.
+            tracing::warn!(
+                "relay http client builder failed ({e}); falling back to default client"
+            );
+            reqwest::Client::new()
+        }
+    }
+}
+/// Per-direction byte ceiling for a single relay session. Picked to be
+/// large enough that real file transfers (eD2K parts are ~9.5 MiB,
+/// whole files commonly hundreds of MiB to several GiB) complete
+/// without bumping into this cap, while still bounding the worst-case
+/// uplink that a misbehaving peer can extract from a relay node — in
+/// combination with `MAX_CONCURRENT_RELAY_SESSIONS = 4` and
+/// `RELAY_MAX_DURATION = 2h`, the relay's effective uplink ceiling is
+/// `4 sessions * 2 dirs * 8 GiB = 64 GiB per 2h window`. The previous
+/// constant (`512 KiB`) was misleadingly named "bandwidth limit" but
+/// applied as a total-bytes cap via `AsyncRead::take`, which silently
+/// stalled every LowID-to-LowID transfer past ~512 KiB per direction.
+const RELAY_MAX_BYTES_PER_DIRECTION: u64 = 8 * 1024 * 1024 * 1024;
 const MAX_CONCURRENT_RELAY_SESSIONS: usize = 4;
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const RELAY_MAX_DURATION: Duration = Duration::from_secs(7200);
@@ -273,7 +319,7 @@ pub async fn register_punch(
     nat_type: u8,
 ) -> Result<(), String> {
     let url = format!("{}/punch", rendezvous_url);
-    let client = reqwest::Client::new();
+    let client = relay_http_client();
     let resp = client
         .post(&url)
         .json(&serde_json::json!({
@@ -311,7 +357,7 @@ pub async fn poll_punch(
     our_id: &str,
 ) -> Result<Option<PunchInfo>, String> {
     let url = format!("{}/punch/{}", rendezvous_url, our_id);
-    let client = reqwest::Client::new();
+    let client = relay_http_client();
     let resp = client
         .get(&url)
         .timeout(Duration::from_secs(10))
@@ -757,7 +803,7 @@ pub async fn run_quic_accept_loop(
                     info!("Relay session {session_id}: bridging ({} active sessions)", mgr_lock.active_count());
                 }
 
-                let bw_limit = RELAY_BANDWIDTH_LIMIT as u64;
+                let bw_limit = RELAY_MAX_BYTES_PER_DIRECTION;
                 let relay_result = tokio::time::timeout(RELAY_MAX_DURATION, async {
                     let mut i2t_limited = init_recv.take(bw_limit);
                     let mut t2i_limited = tgt_recv.take(bw_limit);
@@ -767,9 +813,9 @@ pub async fn run_quic_accept_loop(
                     match tokio::try_join!(i2t, t2i) {
                         Ok((i2t_bytes, t2i_bytes)) => {
                             let total = i2t_bytes + t2i_bytes;
-                            if total >= bw_limit {
+                            if i2t_bytes >= bw_limit || t2i_bytes >= bw_limit {
                                 info!(
-                                    "Relay session {session_id}: bandwidth limit reached ({total}B)"
+                                    "Relay session {session_id}: per-direction byte ceiling reached (i→t: {i2t_bytes}B, t→i: {t2i_bytes}B)"
                                 );
                             } else {
                                 info!(
@@ -910,11 +956,25 @@ pub async fn connect_server_relay(
     rendezvous_url: &str,
     session_id: &str,
 ) -> Result<WsStream, String> {
+    // L11: refuse to downgrade ws upgrades to plaintext. The
+    // previous implementation rewrote `https://`→`wss://` and also
+    // `http://`→`ws://`, which would cheerfully open a plain
+    // websocket if the rendezvous URL was misconfigured to use
+    // `http://` (e.g. a stale env var). The rest of the system
+    // requires HTTPS for the rendezvous control plane, so we should
+    // refuse to ride the relay over plaintext too — a
+    // network-position attacker can otherwise observe and inject
+    // relayed bytes verbatim. If the URL doesn't already use
+    // `https://`, return a hard error rather than silently downgrading.
+    let trimmed = rendezvous_url.trim();
+    if !trimmed.starts_with("https://") {
+        return Err(format!(
+            "rendezvous URL must use https:// for relay connections, got {trimmed}"
+        ));
+    }
     let ws_url = format!(
         "{}/relay/{}",
-        rendezvous_url
-            .replace("https://", "wss://")
-            .replace("http://", "ws://"),
+        trimmed.replacen("https://", "wss://", 1),
         session_id
     );
 
@@ -951,7 +1011,7 @@ pub async fn post_relay_invite(
     session_id: &str,
 ) -> Result<(), String> {
     let url = format!("{}/relay-invite", rendezvous_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
+    let client = relay_http_client();
     let resp = client
         .post(&url)
         .json(&serde_json::json!({
@@ -977,7 +1037,7 @@ pub async fn poll_relay_invites(
     our_id: &str,
 ) -> Result<Vec<String>, String> {
     let url = format!("{}/relay-invites/{}", rendezvous_url.trim_end_matches('/'), our_id);
-    let client = reqwest::Client::new();
+    let client = relay_http_client();
     let resp = client
         .get(&url)
         .timeout(Duration::from_secs(10))

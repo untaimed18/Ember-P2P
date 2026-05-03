@@ -803,15 +803,23 @@ impl Database {
         let records = stmt
             .query_map([], |row| {
                 let pk_blob: Vec<u8> = row.get(0)?;
-                if pk_blob.len() < 32 {
+                // M10: strict 32-byte pub_key. Previously a row with
+                // a >32 byte blob silently truncated to the first 32
+                // bytes, which would alias two distinct Ed25519 keys
+                // onto a single credit account if any non-conformant
+                // row ever appeared. We now reject anything that
+                // isn't exactly 32 bytes; the row is logged + skipped
+                // by the `filter_map` below rather than being merged
+                // into the wrong account.
+                if pk_blob.len() != 32 {
                     return Err(rusqlite::Error::InvalidColumnType(
                         0,
-                        "pub_key too short".into(),
+                        format!("pub_key must be 32 bytes, got {}", pk_blob.len()),
                         rusqlite::types::Type::Blob,
                     ));
                 }
                 let mut pk = [0u8; 32];
-                pk.copy_from_slice(&pk_blob[..32]);
+                pk.copy_from_slice(&pk_blob);
                 Ok((
                     pk,
                     row.get::<_, i64>(1)?.max(0) as u64,
@@ -986,6 +994,58 @@ impl Database {
     pub fn add_friend_request(&self, sender_hash: &str, nickname: &str, sender_ip: &str, sender_port: u16, verified: bool) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
+
+        // M2: cap total inbound `friend_requests` rows. Per-sender
+        // UPSERT below already prevents same-hash flooding, but an
+        // attacker that iterates random ember_hashes from EPX
+        // dumps could otherwise grow this table without bound and
+        // (a) consume disk, (b) hide legitimate requests under a
+        // sea of spoofed ones in the UI list. We pick 100 unique
+        // pending requests as a generous practical ceiling. When
+        // overflowing, evict the oldest **unverified** rows first,
+        // then the oldest verified row only if every row is
+        // verified (which keeps a real request from being
+        // displaced by a flood of unverified noise). A repeat
+        // request from a sender already present is exempt from
+        // the cap — it just refreshes the existing row via the
+        // UPSERT.
+        const MAX_FRIEND_REQUESTS: i64 = 100;
+        let already_present: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM friend_requests WHERE sender_hash = ?1",
+            params![sender_hash],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        if already_present == 0 {
+            let total: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM friend_requests",
+                [],
+                |row| row.get(0),
+            ).unwrap_or(0);
+            if total >= MAX_FRIEND_REQUESTS {
+                let to_evict = (total - MAX_FRIEND_REQUESTS + 1).max(1);
+                let evicted_unverified = conn.execute(
+                    "DELETE FROM friend_requests WHERE sender_hash IN (
+                        SELECT sender_hash FROM friend_requests
+                        WHERE COALESCE(verified, 0) = 0
+                        ORDER BY received_at ASC
+                        LIMIT ?1
+                    )",
+                    params![to_evict],
+                )? as i64;
+                let remaining = to_evict - evicted_unverified;
+                if remaining > 0 {
+                    let _ = conn.execute(
+                        "DELETE FROM friend_requests WHERE sender_hash IN (
+                            SELECT sender_hash FROM friend_requests
+                            ORDER BY received_at ASC
+                            LIMIT ?1
+                        )",
+                        params![remaining],
+                    );
+                }
+            }
+        }
+
         // Refresh behaviour: a repeat request from the same peer
         // can legitimately change any of the fields on the row,
         // including the verification flag (e.g. an older request

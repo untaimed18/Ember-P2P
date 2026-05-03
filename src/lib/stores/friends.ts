@@ -1,13 +1,31 @@
 import { writable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
-import { getFriendRequests, getUnreadMessageCounts, type FriendRequestInfo } from '$lib/api/friends';
+import {
+  getFriendRequests,
+  getUnreadMessageCounts,
+  isFriendDiscoverable,
+  type FriendRequestInfo,
+} from '$lib/api/friends';
 
 export const onlineFriends = writable<Set<string>>(new Set());
 export const unreadCounts = writable<Map<string, number>>(new Map());
 export const friendRequests = writable<FriendRequestInfo[]>([]);
 export const searchingFriends = writable<Set<string>>(new Set());
 export const isDiscoverable = writable(false);
+
+// The friend hash of the chat that's currently open and focused in
+// the UI. Set by `ChatSidebar` when it mounts/unmounts. Used to skip
+// `unreadCounts` increments for messages the user is actively
+// looking at — without this, a chat-message event arriving while the
+// chat is open would still bump the unread badge, leaving phantom
+// counts when the user closes the chat. The store mirrors this
+// outside `unreadCounts` because the chat-message listener fires
+// regardless of which UI surface is mounted.
+export const activeChatHash = writable<string | null>(null);
+
+let activeChatHashSnapshot: string | null = null;
+activeChatHash.subscribe((v) => { activeChatHashSnapshot = v; });
 
 let initialized = false;
 let unlisteners: UnlistenFn[] = [];
@@ -28,8 +46,16 @@ function scheduleFriendRequestRefetch() {
     friendRequestRefetchTimer = null;
     getFriendRequests()
       .then((reqs) => friendRequests.set(reqs))
-      .catch(() => {
-        /* backend may have shut down between schedule and fire */
+      .catch((err) => {
+        // L16: previously a bare comment swallowed every failure
+        // including transient IPC errors that we'd want to know
+        // about during development. The optimistic merge already
+        // wrote a row from the event payload, so the UI isn't
+        // wrong — but a persistent refetch failure means later
+        // mutations from sibling windows won't be picked up. Log
+        // at warn level so a recurring failure shows up in
+        // devtools without spamming the user.
+        console.warn('friendRequestRefetch failed:', err);
       });
   }, 250);
 }
@@ -54,13 +80,18 @@ export async function initFriendsStore() {
     );
     registered.push(
       await listen<{ user_hash: string; direction: string }>('ember:chat-message', (event) => {
-        if (event.payload.direction === 'received') {
-          unreadCounts.update((m) => {
-            const next = new Map(m);
-            next.set(event.payload.user_hash, (next.get(event.payload.user_hash) || 0) + 1);
-            return next;
-          });
-        }
+        if (event.payload.direction !== 'received') return;
+        // If the chat with this friend is open and focused, the
+        // user is reading the message in real time — incrementing
+        // `unreadCounts` would leave a phantom badge until the
+        // chat is closed and reopened. `ChatSidebar` separately
+        // marks the message read on the backend.
+        if (activeChatHashSnapshot === event.payload.user_hash) return;
+        unreadCounts.update((m) => {
+          const next = new Map(m);
+          next.set(event.payload.user_hash, (next.get(event.payload.user_hash) || 0) + 1);
+          return next;
+        });
       }),
     );
     registered.push(
@@ -147,6 +178,18 @@ export async function initFriendsStore() {
     const counts = await getUnreadMessageCounts();
     unreadCounts.set(new Map(counts));
   } catch { /* backend not ready yet */ }
+
+  // M6: previously `isDiscoverable` only flipped when the backend
+  // emitted `ember:friend-discoverable`, which doesn't fire until
+  // the rendezvous reachability check completes. On startup the
+  // Friends page therefore showed "Not Discoverable" for several
+  // seconds even when the user already had discovery enabled in a
+  // prior session. Seed the store from the same backend status the
+  // event would carry, so the UI is correct on first paint.
+  try {
+    const discoverable = await isFriendDiscoverable();
+    isDiscoverable.set(discoverable);
+  } catch { /* backend not ready yet */ }
 }
 
 export function clearUnread(friendHash: string) {
@@ -166,4 +209,5 @@ export function cleanupFriendsStore() {
   friendRequests.set([]);
   searchingFriends.set(new Set());
   isDiscoverable.set(false);
+  activeChatHash.set(null);
 }
