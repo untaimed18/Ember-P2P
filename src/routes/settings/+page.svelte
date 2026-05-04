@@ -13,9 +13,31 @@
   import type { AppSettings, SpamStats } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import { theme, applyTheme, type Theme } from '$lib/stores/theme';
+  import {
+    locales,
+    getLocale,
+    setLocale,
+    languageLabel,
+    type Locale,
+  } from '$lib/i18n';
+  import * as m from '$lib/paraglide/messages';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import SpeedInput from '$lib/components/SpeedInput.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+
+  // Active locale, kept in component state so the radio group has
+  // a reactive `selected` source. Updating this state goes through
+  // `setLocale()` which triggers a full page reload — by the time
+  // the user sees the change, the entire app shell has re-rendered
+  // in the new language and there's no need to thread reactivity
+  // through every translated component.
+  let currentLocale: Locale = $state(getLocale());
+
+  function pickLocale(next: Locale) {
+    if (next === currentLocale) return;
+    currentLocale = next;
+    setLocale(next);
+  }
 
   let settings: AppSettings | null = $state(null);
   let pageContentEl: HTMLDivElement | null = $state(null);
@@ -701,6 +723,36 @@
                 {#if $theme === 'dark'}<span class="swatch-check">&#10003;</span>{/if}
                 <span class="swatch-label">Dark</span>
               </button>
+            </div>
+          </div>
+          <div class="field">
+            <span class="field-label">{m.settings_language_label()}</span>
+            <span class="hint">{m.settings_language_description()}</span>
+            <!--
+              Radio-style locale picker. We render one button per
+              compiled locale (Paraglide exports the canonical list
+              as `locales`) so adding a new language to the project
+              automatically grows the picker — no UI edit needed.
+              Each label uses `languageLabel(locale)` which renders
+              the language name in its OWN language ("Español", not
+              "Spanish") because users recognize their native
+              language faster than a translation of it.
+            -->
+            <div class="behavior-picker" role="radiogroup" aria-label={m.settings_language_label()}>
+              {#each locales as loc (loc)}
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={currentLocale === loc}
+                  class="behavior-card lang-card"
+                  class:selected={currentLocale === loc}
+                  onclick={() => pickLocale(loc)}
+                >
+                  <span class="behavior-title">{languageLabel(loc)}</span>
+                  <span class="behavior-desc">{loc.toUpperCase()}</span>
+                  {#if currentLocale === loc}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
+                </button>
+              {/each}
             </div>
           </div>
           <div class="field">

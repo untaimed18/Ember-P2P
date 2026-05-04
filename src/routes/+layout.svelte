@@ -13,10 +13,19 @@
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
+  import { applyDocumentLang } from '$lib/i18n';
   import { getSettings, hideToTray, quitApp, setCloseBehavior } from '$lib/api/settings';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+
+  // Sync `<html lang>` to the active Paraglide locale on every
+  // mount. Paraglide's strategy chain (localStorage →
+  // preferredLanguage → baseLocale) has already resolved by the
+  // time the layout renders, so this is just a one-shot DOM write.
+  // Locale switches go through `setLocale()` which page-reloads,
+  // re-running this on the fresh document.
+  applyDocumentLang();
 
   let { children } = $props();
   let initialized = $state(false);

@@ -1,8 +1,9 @@
 <script lang="ts">
+  import * as m from '$lib/paraglide/messages';
   let { exiting = false } = $props<{ exiting?: boolean }>();
 </script>
 
-<div class={`splash ${exiting ? 'exit' : ''}`} role="status" aria-live="polite" aria-label="Ember is starting">
+<div class={`splash ${exiting ? 'exit' : ''}`} role="status" aria-live="polite" aria-label={m.splash_aria_starting()}>
   <div class="content">
     <div class="brand">
       <div class="brand-mark" aria-hidden="true">
@@ -17,11 +18,11 @@
       </div>
       <div class="wordmark">
         <h1>EMBER</h1>
-        <p class="subtitle">eMule KAD Network</p>
+        <p class="subtitle">{m.splash_subtitle()}</p>
       </div>
     </div>
 
-    <p class="status">Initializing network services...</p>
+    <p class="status">{m.splash_status_init()}</p>
 
     <div class="progress-track" aria-hidden="true">
       <div class="progress-fill"></div>

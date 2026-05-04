@@ -1,7 +1,13 @@
 <script lang="ts">
+  import * as m from '$lib/paraglide/messages';
   const appVersion = import.meta.env.VITE_APP_VERSION;
-  const description = import.meta.env.VITE_APP_DESCRIPTION;
   const license = import.meta.env.VITE_APP_LICENSE;
+  // Description used to come from the package.json `description`
+  // field (available as VITE_APP_DESCRIPTION). We now route it
+  // through the message catalog so translators can rephrase the
+  // tagline in their own language without rebuilding the package
+  // metadata. The package field stays as the source of truth for
+  // npm/Tauri metadata where the app name appears outside the UI.
 
   let { open = $bindable(false) }: { open?: boolean } = $props();
 
@@ -63,16 +69,16 @@
         </div>
         <div class="about-wordmark">
           <h2 id="about-title-{instanceId}">EMBER</h2>
-          <p class="about-tagline">P2P File Sharing</p>
+          <p class="about-tagline">{m.app_tagline()}</p>
         </div>
       </div>
 
-      <p id="about-desc-{instanceId}" class="about-version">Version {appVersion}</p>
-      <p class="about-description">{description}</p>
-      <p class="about-license">Licensed under {license}.</p>
+      <p id="about-desc-{instanceId}" class="about-version">{m.about_dialog_version({ version: appVersion })}</p>
+      <p class="about-description">{m.about_dialog_description()}</p>
+      <p class="about-license">{m.about_dialog_license({ license })}</p>
 
       <div class="about-actions">
-        <button type="button" class="about-close" onclick={close}>Close</button>
+        <button type="button" class="about-close" onclick={close}>{m.common_close()}</button>
       </div>
     </div>
   </div>

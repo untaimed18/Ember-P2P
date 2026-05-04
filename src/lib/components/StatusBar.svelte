@@ -1,37 +1,65 @@
 <script lang="ts">
   import { networkStats, serverStatus } from '$lib/stores/network';
   import { formatBytes, formatSpeed } from '$lib/utils';
+  import * as m from '$lib/paraglide/messages';
 
   function epxStatus(stats: typeof $networkStats): 'active' | 'idle' | 'inactive' {
     if (stats.status === 'disconnected') return 'inactive';
     return stats.ember_peers > 0 ? 'active' : 'idle';
   }
 
+  // Localized status string for the tri-state network/server dots.
+  // Keep the mapping co-located with the status-bar specifically
+  // (instead of pulling from `network_status_*`) because the
+  // status-bar shows "Connected/Connecting/Disconnected" while
+  // some pages use the Spanish equivalents in different
+  // grammatical positions; the mapping is identical today but may
+  // diverge for accessibility tweaks per surface.
+  function statusLabel(s: string): string {
+    switch (s) {
+      case 'connected': return m.network_status_connected();
+      case 'connecting': return m.network_status_connecting();
+      case 'disconnected': return m.network_status_disconnected();
+      default: return m.network_status_unknown();
+    }
+  }
+
+  // Two-axis plural for the EPX tooltip. English/Spanish both
+  // distinguish singular/plural; we render one of four templates
+  // rather than concatenating fragments so translators control
+  // word order (Spanish often inverts noun-adjective compared to
+  // English, even in technical strings like "1 fuente recibida"
+  // vs "{n} fuentes recibidas").
   function epxTitle(stats: typeof $networkStats): string {
     const status = epxStatus(stats);
-    if (status === 'inactive') return 'EPX: Network offline';
-    if (status === 'idle') return 'EPX: Waiting for Ember peers';
-    return `EPX: ${stats.ember_peers} peer${stats.ember_peers === 1 ? '' : 's'}, ${stats.epx_sources_received} source${stats.epx_sources_received === 1 ? '' : 's'} received`;
+    if (status === 'inactive') return m.statusbar_epx_title_offline();
+    if (status === 'idle') return m.statusbar_epx_title_idle();
+    const p = stats.ember_peers;
+    const s = stats.epx_sources_received;
+    if (p === 1 && s === 1) return m.statusbar_epx_title_active_one_one();
+    if (p === 1) return m.statusbar_epx_title_active_one_other({ sources: s });
+    if (s === 1) return m.statusbar_epx_title_active_other_one({ peers: p });
+    return m.statusbar_epx_title_active_other_other({ peers: p, sources: s });
   }
 </script>
 
 <footer class="statusbar">
   <div class="status-left" role="status" aria-live="polite">
-    <span class="status-label" title="KAD Network: {$networkStats.status}">
-      KAD
-      <span class="dot {$networkStats.status}" aria-label="{$networkStats.status}"></span>
+    <span class="status-label" title={m.statusbar_kad_title({ status: statusLabel($networkStats.status) })}>
+      {m.statusbar_kad_label()}
+      <span class="dot {$networkStats.status}" aria-label={statusLabel($networkStats.status)}></span>
     </span>
-    <span class="status-label" title="ED2K: {$serverStatus}">
-      ED2K
-      <span class="dot {$serverStatus}" aria-label="{$serverStatus}"></span>
+    <span class="status-label" title={m.statusbar_ed2k_title({ status: statusLabel($serverStatus) })}>
+      {m.statusbar_ed2k_label()}
+      <span class="dot {$serverStatus}" aria-label={statusLabel($serverStatus)}></span>
     </span>
     <span class="status-label" title={epxTitle($networkStats)}>
-      EPX
+      {m.statusbar_epx_label()}
       <span class="dot {epxStatus($networkStats)}" aria-label={epxStatus($networkStats)}></span>
     </span>
   </div>
 
-  <div class="status-right" aria-label="Transfer speeds">
+  <div class="status-right" aria-label={m.statusbar_speeds_aria()}>
     <!--
       D7: status bar rate is the total network rate (file payload + protocol
       overhead: server, KAD, source exchange, reasks). The Transfers page
@@ -39,17 +67,17 @@
       numbers legitimately differ, so label the status bar "Network" in the
       tooltip to flag the distinction.
     -->
-    <span class="status-item upload" title="Total network upload (includes protocol overhead)">
+    <span class="status-item upload" title={m.statusbar_upload_title()}>
       <span aria-hidden="true">↑</span>
-      <span class="sr-only">Upload speed:</span>
+      <span class="sr-only">{m.statusbar_upload_sr()}</span>
       {formatSpeed($networkStats.upload_speed)}
     </span>
-    <span class="status-item download" title="Total network download (includes protocol overhead)">
+    <span class="status-item download" title={m.statusbar_download_title()}>
       <span aria-hidden="true">↓</span>
-      <span class="sr-only">Download speed:</span>
+      <span class="sr-only">{m.statusbar_download_sr()}</span>
       {formatSpeed($networkStats.download_speed)}
     </span>
-    <span class="status-item muted" aria-label="Total transferred: {formatBytes($networkStats.total_uploaded)} up, {formatBytes($networkStats.total_downloaded)} down">
+    <span class="status-item muted" aria-label={m.statusbar_total_transferred({ up: formatBytes($networkStats.total_uploaded), down: formatBytes($networkStats.total_downloaded) })}>
       <span aria-hidden="true">↑</span> {formatBytes($networkStats.total_uploaded)} / <span aria-hidden="true">↓</span> {formatBytes($networkStats.total_downloaded)}
     </span>
   </div>

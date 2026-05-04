@@ -1,16 +1,17 @@
 <script lang="ts">
   import { toasts, removeToast } from '$lib/stores/toast';
+  import * as m from '$lib/paraglide/messages';
 </script>
 
 {#if $toasts.length > 0}
-  <div class="toast-container" role="log" aria-live="polite" aria-label="Notifications">
+  <div class="toast-container" role="log" aria-live="polite" aria-label={m.toast_default_title()}>
     {#each $toasts as toast (toast.id)}
       <div class="toast toast-{toast.type}" role="alert">
         <span class="toast-icon">
           {#if toast.type === 'success'}&#10003;{:else if toast.type === 'error'}&#10007;{:else if toast.type === 'warning'}&#9888;{:else}&#8505;{/if}
         </span>
         <span class="toast-msg">{toast.message}</span>
-        <button class="toast-close" onclick={() => removeToast(toast.id)} aria-label="Dismiss">&times;</button>
+        <button class="toast-close" onclick={() => removeToast(toast.id)} aria-label={m.common_dismiss()}>&times;</button>
       </div>
     {/each}
   </div>
