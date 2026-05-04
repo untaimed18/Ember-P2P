@@ -6,6 +6,7 @@
   import StatusBar from '$lib/components/StatusBar.svelte';
   import Toast from '$lib/components/Toast.svelte';
   import CloseAppDialog from '$lib/components/CloseAppDialog.svelte';
+  import ChatDock from '$lib/components/ChatDock.svelte';
 
   import { initNetworkStore, cleanupNetworkStore, startStatsPoll } from '$lib/stores/network';
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
@@ -244,6 +245,14 @@
     <StatusBar />
   </div>
   <Toast />
+  <!--
+    Multi-conversation chat dock. Mounted at the app shell so chats
+    persist across route changes — the user can answer a message from
+    /transfers or /library without losing their place. Internally
+    keyed off the `chatTabs` store, so opening a chat from any page
+    just calls `chatTabs.openChat(hash, name)`.
+  -->
+  <ChatDock />
 </div>
 
 <CloseAppDialog

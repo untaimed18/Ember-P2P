@@ -47,13 +47,15 @@ function armSearchTimer(hash: string) {
 }
 
 // The friend hash of the chat that's currently open and focused in
-// the UI. Set by `ChatSidebar` when it mounts/unmounts. Used to skip
-// `unreadCounts` increments for messages the user is actively
-// looking at — without this, a chat-message event arriving while the
-// chat is open would still bump the unread badge, leaving phantom
-// counts when the user closes the chat. The store mirrors this
-// outside `unreadCounts` because the chat-message listener fires
-// regardless of which UI surface is mounted.
+// the UI. Set by `ChatConversation` when it mounts/unmounts (which
+// in turn is driven by the active tab in the multi-conversation
+// `ChatDock`). Used to skip `unreadCounts` increments for messages
+// the user is actively looking at — without this, a chat-message
+// event arriving while the conversation is open would still bump
+// the unread badge, leaving phantom counts when the user switches
+// tabs or closes the dock. The store mirrors this outside
+// `unreadCounts` because the chat-message listener fires regardless
+// of which UI surface is mounted.
 export const activeChatHash = writable<string | null>(null);
 
 let activeChatHashSnapshot: string | null = null;
@@ -117,8 +119,8 @@ export async function initFriendsStore() {
         // If the chat with this friend is open and focused, the
         // user is reading the message in real time — incrementing
         // `unreadCounts` would leave a phantom badge until the
-        // chat is closed and reopened. `ChatSidebar` separately
-        // marks the message read on the backend.
+        // tab loses focus and is reactivated. `ChatConversation`
+        // separately marks the message read on the backend.
         if (activeChatHashSnapshot === event.payload.user_hash) return;
         unreadCounts.update((m) => {
           const next = new Map(m);

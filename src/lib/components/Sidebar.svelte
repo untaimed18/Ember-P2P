@@ -6,6 +6,7 @@
   import { transfers } from '$lib/stores/transfers';
   import { networkStats } from '$lib/stores/network';
   import { friendRequests } from '$lib/stores/friends';
+  import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
   import { onMount } from 'svelte';
 
   let aboutOpen = $state(false);
@@ -38,6 +39,12 @@
   // page. Uses the same friends store the Friends page consumes, so
   // the badge clears the moment the request is accepted/rejected.
   let pendingFriendRequestCount = $derived($friendRequests.length);
+
+  // Sum of unread chat messages across all friends. The Chats toggle
+  // surfaces this so users can spot new messages from any page —
+  // previously the only signal was per-friend badges on /friends,
+  // which required navigating there to notice activity.
+  let totalUnreadChats = $derived($totalUnread);
 
   type NavItem = {
     href: string;
@@ -118,6 +125,15 @@
       if (isTypingTarget(e.target)) return;
       e.preventDefault();
       toggleCollapsed();
+      return;
+    }
+    // Ctrl/Cmd+/ toggles the chat dock. "/" sits next to ".", which
+    // is intuitive for "open chats" without colliding with any
+    // existing browser/app shortcut and stays out of typing flows.
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key === '/') {
+      if (isTypingTarget(e.target)) return;
+      e.preventDefault();
+      toggleChatDock();
       return;
     }
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
@@ -234,6 +250,30 @@
   </ul>
 
   <div class="sidebar-footer">
+    <button
+      type="button"
+      class="about-btn chats-btn"
+      class:active={$chatDockOpen}
+      onclick={toggleChatDock}
+      title={$chatDockOpen ? 'Close chats (Ctrl+/)' : 'Open chats (Ctrl+/)'}
+      aria-pressed={$chatDockOpen}
+      aria-keyshortcuts="Control+/"
+    >
+      <span class="about-icon" aria-hidden="true">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 5a2 2 0 012-2h10a2 2 0 012 2v7a2 2 0 01-2 2h-5l-4 3v-3H5a2 2 0 01-2-2V5z"/>
+          <line x1="6.5" y1="8" x2="13.5" y2="8"/>
+          <line x1="6.5" y1="10.5" x2="11.5" y2="10.5"/>
+        </svg>
+      </span>
+      <span class="chats-label">Chats</span>
+      {#if totalUnreadChats > 0}
+        <span
+          class="nav-badge nav-badge-attention chats-badge"
+          title={`${totalUnreadChats} unread message${totalUnreadChats === 1 ? '' : 's'}`}
+        >{totalUnreadChats > 99 ? '99+' : totalUnreadChats}</span>
+      {/if}
+    </button>
     <button
       type="button"
       class="about-btn"
@@ -401,6 +441,40 @@
   .about-btn:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: -2px;
+  }
+
+  /*
+   * Active state for the Chats toggle so users see at a glance whether
+   * the dock is currently open. Mirrors the active treatment of nav
+   * items (left accent stripe via ::before is overkill here, just tint
+   * the bg + text).
+   */
+  .chats-btn.active {
+    background: var(--bg-tertiary);
+    color: var(--accent);
+  }
+
+  .chats-btn {
+    position: relative;
+  }
+
+  .chats-badge {
+    margin-left: auto;
+  }
+
+  .sidebar.collapsed .chats-badge {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    margin: 0;
+    min-width: 14px;
+    height: 14px;
+    font-size: 8px;
+    padding: 0 3px;
+  }
+
+  .sidebar.collapsed .chats-label {
+    display: none;
   }
 
   .about-icon {
