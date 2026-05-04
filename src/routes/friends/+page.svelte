@@ -2,8 +2,8 @@
   import { getFriends, addFriend, removeFriend, updateFriendNickname, getMyEmberHash, acceptFriendRequest, rejectFriendRequest, type FriendInfo, type FriendRequestInfo } from '$lib/api/friends';
   import { getNetworkStats, kadRecheckFirewall } from '$lib/api/kad';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
-  import ChatSidebar from '$lib/components/ChatSidebar.svelte';
   import BrowseFriendDialog from '$lib/components/BrowseFriendDialog.svelte';
+  import { openChat as openChatTab, removeChatForFriend, renameTab as renameChatTab } from '$lib/stores/chatTabs';
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import { toastWarning } from '$lib/stores/toast';
@@ -56,10 +56,6 @@
   let isFirewalled = $state(false);
   let recheckingFirewall = $state(false);
   let recheckError: string | null = $state(null);
-
-  let chatOpen = $state(false);
-  let chatFriendHash = $state('');
-  let chatFriendName = $state('');
 
   let browseOpen = $state(false);
   let browseFriendHash = $state('');
@@ -116,14 +112,15 @@
   let offlineFiltered = $derived(filtered.filter(f => !onlineFriends.has(f.user_hash)));
 
   function openChat(f: FriendInfo) {
-    chatFriendHash = f.user_hash;
-    chatFriendName = f.nickname || f.user_hash.slice(0, 8) + '\u2026';
-    chatOpen = true;
+    // Delegate to the global multi-conversation dock. It opens the
+    // dock if not already visible, adds (or focuses) a tab for this
+    // friend, and lets the user keep chatting while navigating to
+    // other pages. `clearUnread` is also called inside
+    // `ChatConversation` on mount, but firing it here too keeps the
+    // friend-card badge from briefly flashing the stale count
+    // between click and tab-mount.
+    openChatTab(f.user_hash, f.nickname || f.user_hash.slice(0, 8) + '\u2026');
     clearUnread(f.user_hash);
-  }
-
-  function closeChat() {
-    chatOpen = false;
   }
 
   function openBrowse(f: FriendInfo) {
@@ -352,6 +349,10 @@
     try {
       await removeFriend(f.user_hash);
       onlineFriendsStore.update(s => { s.delete(f.user_hash); return new Set(s); });
+      // Close any open chat tab for the removed friend; leaving it
+      // open would show a session for someone who is no longer in
+      // the user's friend list and silently fail to send.
+      removeChatForFriend(f.user_hash);
       flash(`Removed ${f.nickname || f.user_hash.slice(0, 8) + '\u2026'}`);
       await loadFriends();
     } catch (e: unknown) {
@@ -374,6 +375,9 @@
       await updateFriendNickname(hash, nick);
       const idx = friends.findIndex((f) => f.user_hash === hash);
       if (idx !== -1) friends[idx] = { ...friends[idx], nickname: nick };
+      // Push the rename through to any open chat tab so the strip
+      // and the conversation header don't keep the old nickname.
+      renameChatTab(hash, nick || hash.slice(0, 8) + '\u2026');
       editingHash = null;
     } catch (e: unknown) {
       error = toErr(e);
@@ -434,13 +438,6 @@
   confirmLabel="Remove"
   danger={true}
   onconfirm={handleRemove}
-/>
-
-<ChatSidebar
-  bind:open={chatOpen}
-  friendHash={chatFriendHash}
-  friendName={chatFriendName}
-  onclose={closeChat}
 />
 
 <BrowseFriendDialog
