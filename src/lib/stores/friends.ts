@@ -136,10 +136,8 @@ export async function initFriendsStore() {
           // for a full DB round-trip on every inbound request. The
           // backend may emit the same logical request twice in quick
           // succession (the upload-side handler in `upload.rs` and
-          // the download-side handler in `mod.rs` can both fire from
-          // a single peer connection), and a peer doing the
-          // `connect_and_send_friend_request` + `open_and_run_friend_session`
-          // double-handshake doubles that again. Without a local
+          // the friend-session loop in `friend_connect.rs` can both
+          // fire from a single peer connection). Without a local
           // dedupe each event triggered a fresh `getFriendRequests`
           // IPC call.
           friendRequests.update((cur) => {
