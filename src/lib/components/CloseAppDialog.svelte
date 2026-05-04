@@ -7,6 +7,7 @@
   // feels native — same dark overlay, same focus trap, same Escape-to-cancel.
   // ConfirmDialog only exposes Confirm / Cancel, so this is a sibling
   // component rather than a reuse.
+  import * as m from '$lib/paraglide/messages';
 
   let {
     open = $bindable(false),
@@ -107,20 +108,19 @@
     onclick={handleOverlayClick}
   >
     <div class="close-dialog" bind:this={dialogEl}>
-      <h3 id="close-title-{instanceId}">Close Ember</h3>
+      <h3 id="close-title-{instanceId}">{m.close_dialog_title()}</h3>
       <p id="close-message-{instanceId}">
-        What would you like Ember to do? Minimizing keeps your downloads,
-        uploads, and friend connections active in the background.
+        {m.close_dialog_message()}
       </p>
       <label class="remember-row">
         <input type="checkbox" bind:checked={remember} />
-        <span>Remember my choice (you can change this in Settings → General)</span>
+        <span>{m.close_dialog_remember()}</span>
       </label>
       <div class="dialog-actions">
-        <button class="ghost" onclick={handleCancel}>Cancel</button>
-        <button class="exit-btn" onclick={handleExit}>Exit Ember</button>
+        <button class="ghost" onclick={handleCancel}>{m.common_cancel()}</button>
+        <button class="exit-btn" onclick={handleExit}>{m.close_dialog_exit()}</button>
         <button bind:this={trayBtn} class="primary" onclick={handleHide}>
-          Minimize to Tray
+          {m.close_dialog_minimize()}
         </button>
       </div>
     </div>

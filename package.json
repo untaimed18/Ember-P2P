@@ -20,6 +20,7 @@
     "circle-flags": "^2.8.2"
   },
   "devDependencies": {
+    "@inlang/paraglide-js": "^2.18.0",
     "@sveltejs/adapter-static": "^3.0.6",
     "@sveltejs/kit": "^2.9.0",
     "@sveltejs/vite-plugin-svelte": "^5.0.0",

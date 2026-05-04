@@ -1,10 +1,16 @@
 <script lang="ts">
+  import * as m from '$lib/paraglide/messages';
+  // Defaults route through the translated catalog so callers that
+  // omit `title`/`confirmLabel`/`cancelLabel` get a localized
+  // dialog. Svelte 5 evaluates destructuring defaults at instance
+  // mount time, so `m.*()` runs against the current locale on
+  // every show — perfectly fine, because dialogs are short-lived.
   let {
     open = $bindable(false),
-    title = 'Confirm',
-    message = 'Are you sure?',
-    confirmLabel = 'Confirm',
-    cancelLabel = 'Cancel',
+    title = m.confirm_default_title(),
+    message = m.confirm_default_message(),
+    confirmLabel = m.confirm_default_button(),
+    cancelLabel = m.common_cancel(),
     danger = false,
     onconfirm,
     oncancel,

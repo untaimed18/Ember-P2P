@@ -3,9 +3,10 @@
   // supports. Opened via ? or F1 (see Sidebar's global handler).
   // Grouped by scope so users can quickly scan to the shortcuts that
   // apply to where they are in the app.
+  import * as m from '$lib/paraglide/messages';
 
-  type Shortcut = { keys: string[]; label: string };
-  type Group = { title: string; shortcuts: Shortcut[] };
+  type Shortcut = { keys: string[]; label: () => string };
+  type Group = { title: () => string; shortcuts: Shortcut[] };
 
   let { open = $bindable(false) }: { open?: boolean } = $props();
 
@@ -21,40 +22,45 @@
     }
   });
 
+  // Group/shortcut labels are stored as thunks so the table re-
+  // renders in the active locale on each open without us needing
+  // to rebuild the array on locale changes (locale changes
+  // trigger a full page reload anyway, but the thunk form is
+  // future-proof if we ever opt out of the reload).
   const groups: Group[] = [
     {
-      title: 'Global',
+      title: () => m.shortcuts_section_global(),
       shortcuts: [
-        { keys: ['?'], label: 'Show this shortcut list' },
-        { keys: ['F1'], label: 'Show this shortcut list' },
-        { keys: ['Ctrl', 'B'], label: 'Collapse or expand the sidebar' },
-        { keys: ['Alt', '1'], label: 'Jump to KAD Network' },
-        { keys: ['Alt', '2'], label: 'Jump to ED2K Servers' },
-        { keys: ['Alt', '3'], label: 'Jump to Search' },
-        { keys: ['Alt', '4'], label: 'Jump to Transfers' },
-        { keys: ['Alt', '5'], label: 'Jump to Library' },
-        { keys: ['Alt', '6'], label: 'Jump to Friends' },
-        { keys: ['Alt', '7'], label: 'Jump to Statistics' },
-        { keys: ['Alt', '8'], label: 'Jump to Security' },
-        { keys: ['Alt', '9'], label: 'Jump to Settings' },
+        { keys: ['?'], label: () => m.shortcuts_show_shortcuts() },
+        { keys: ['F1'], label: () => m.shortcuts_show_shortcuts() },
+        { keys: ['Ctrl', 'B'], label: () => m.shortcuts_toggle_sidebar() },
+        { keys: ['Alt', '1'], label: () => m.shortcuts_jump_kad() },
+        { keys: ['Alt', '2'], label: () => m.shortcuts_jump_servers() },
+        { keys: ['Alt', '3'], label: () => m.shortcuts_jump_search() },
+        { keys: ['Alt', '4'], label: () => m.shortcuts_jump_transfers() },
+        { keys: ['Alt', '5'], label: () => m.shortcuts_jump_library() },
+        { keys: ['Alt', '6'], label: () => m.shortcuts_jump_friends() },
+        { keys: ['Alt', '7'], label: () => m.shortcuts_jump_statistics() },
+        { keys: ['Alt', '8'], label: () => m.shortcuts_jump_security() },
+        { keys: ['Alt', '9'], label: () => m.shortcuts_jump_settings() },
       ],
     },
     {
-      title: 'Dialogs & Modals',
+      title: () => m.shortcuts_section_dialogs(),
       shortcuts: [
-        { keys: ['Esc'], label: 'Close any open dialog or modal' },
-        { keys: ['Ctrl', 'Enter'], label: 'Confirm / submit the modal' },
-        { keys: ['Tab'], label: 'Cycle focus within the modal' },
-        { keys: ['Enter'], label: 'Submit single-field forms (Host / URL)' },
+        { keys: ['Esc'], label: () => m.shortcuts_modal_close() },
+        { keys: ['Ctrl', 'Enter'], label: () => m.shortcuts_modal_confirm() },
+        { keys: ['Tab'], label: () => m.shortcuts_modal_cycle_focus() },
+        { keys: ['Enter'], label: () => m.shortcuts_modal_submit_form() },
       ],
     },
     {
-      title: 'Tables',
+      title: () => m.shortcuts_section_tables(),
       shortcuts: [
-        { keys: ['Click'], label: 'Sort by column' },
-        { keys: ['Shift', 'Click'], label: 'Multi-select contiguous rows (Library)' },
-        { keys: ['Double-click'], label: 'Open file / copy value / auto-size column' },
-        { keys: ['Right-click'], label: 'Open context menu where available' },
+        { keys: ['Click'], label: () => m.shortcuts_table_sort() },
+        { keys: ['Shift', 'Click'], label: () => m.shortcuts_table_multiselect() },
+        { keys: ['Double-click'], label: () => m.shortcuts_table_open() },
+        { keys: ['Right-click'], label: () => m.shortcuts_table_context() },
       ],
     },
   ];
@@ -80,15 +86,15 @@
       bind:this={panelEl}
     >
       <div class="shortcut-header">
-        <h3 id="kbd-shortcut-title">Keyboard Shortcuts</h3>
-        <button class="shortcut-close" aria-label="Close" onclick={() => (open = false)}>&times;</button>
+        <h3 id="kbd-shortcut-title">{m.shortcuts_dialog_title()}</h3>
+        <button class="shortcut-close" aria-label={m.common_close()} onclick={() => (open = false)}>&times;</button>
       </div>
       <div class="shortcut-body">
-        {#each groups as group (group.title)}
+        {#each groups as group, gi (gi)}
           <section class="shortcut-group">
-            <h4>{group.title}</h4>
+            <h4>{group.title()}</h4>
             <dl>
-              {#each group.shortcuts as shortcut, i (group.title + '-' + i)}
+              {#each group.shortcuts as shortcut, i (gi + '-' + i)}
                 <div class="shortcut-row">
                   <dt>
                     {#each shortcut.keys as key, j (j + '-' + key)}
@@ -96,7 +102,7 @@
                       <kbd>{key}</kbd>
                     {/each}
                   </dt>
-                  <dd>{shortcut.label}</dd>
+                  <dd>{shortcut.label()}</dd>
                 </div>
               {/each}
             </dl>
@@ -104,7 +110,7 @@
         {/each}
       </div>
       <div class="shortcut-footer">
-        <span class="shortcut-hint">Press <kbd>Esc</kbd> to close</span>
+        <span class="shortcut-hint">{m.shortcuts_dialog_hint_press()} <kbd>Esc</kbd> {m.shortcuts_dialog_hint_to_close()}</span>
       </div>
     </div>
   </div>
