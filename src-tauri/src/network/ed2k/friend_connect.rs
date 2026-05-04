@@ -14,148 +14,6 @@ use super::messages::*;
 use super::upload::{EmberSessionMap, UploadEvent, UploadEventKind};
 use crate::network::ember::crypto;
 
-/// Lightweight TCP connection that performs Hello/EmuleInfo handshake and sends
-/// an OP_EMBER_FRIEND_REQ, then disconnects. Returns the remote peer's
-/// ember_hash if they respond with their own friend request (mutual confirm).
-pub async fn connect_and_send_friend_request(
-    addr: SocketAddr,
-    our_user_hash: &[u8; 16],
-    our_ember_hash: &[u8; 16],
-    our_nickname: &str,
-    our_client_id: u32,
-    tcp_port: u16,
-    udp_port: u16,
-    obfuscate: bool,
-    ed25519_pubkey: Option<[u8; 32]>,
-    ed25519_secret_key: Option<[u8; 32]>,
-) -> anyhow::Result<Option<[u8; 16]>> {
-    let stream = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        TcpStream::connect(addr),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("TCP connect timeout"))??;
-    super::multi_source::tune_peer_stream(&stream);
-
-    let (raw_r, raw_w) = stream.into_split();
-    let mut reader = tokio::io::BufReader::new(raw_r);
-    let mut writer = tokio::io::BufWriter::new(raw_w);
-
-    let hello_options = HelloOptions {
-        udp_port,
-        kad_port: udp_port,
-        supports_crypt_layer: obfuscate,
-        requests_crypt_layer: obfuscate,
-        requires_crypt_layer: false,
-        supports_direct_udp_callback: false,
-        supports_captcha: false,
-        server_ip: 0,
-        server_port: 0,
-        kad_version: 0x09,
-    };
-    let hello_payload = build_hello_with_buddy_opts(
-        our_user_hash,
-        our_client_id,
-        tcp_port,
-        our_nickname,
-        None,
-        &hello_options,
-    );
-    write_packet(&mut writer, OP_EDONKEYHEADER, OP_HELLO, &hello_payload).await?;
-
-    let (proto, opcode, data) = read_packet_with_timeout(&mut reader, 15)
-        .await
-        .context("waiting for HelloAnswer")?;
-    if proto != OP_EDONKEYHEADER || opcode != OP_HELLOANSWER {
-        anyhow::bail!("expected HelloAnswer, got proto=0x{proto:02X} op=0x{opcode:02X}");
-    }
-    let (_peer_user_hash, mut hello_caps) = parse_hello_answer(&data)
-        .map_err(|e| {
-            tracing::warn!("Failed to parse HelloAnswer from {addr}: {e}");
-            e
-        })?;
-
-    let pk_ref = ed25519_pubkey.as_ref();
-    let emule_payload = build_emule_info(udp_port, false, Some(our_ember_hash), pk_ref);
-    write_packet(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
-
-    let (proto, opcode, payload) = read_packet_with_timeout(&mut reader, 15)
-        .await
-        .context("waiting for EmuleInfo")?;
-
-    if proto == OP_EMULEPROT && (opcode == OP_EMULEINFOANSWER || opcode == OP_EMULEINFO) {
-        merge_caps(&mut hello_caps, parse_emule_info(&payload));
-        if opcode == OP_EMULEINFO {
-            let answer = build_emule_info(udp_port, false, Some(our_ember_hash), pk_ref);
-            write_packet(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &answer).await?;
-        }
-    }
-
-    // Synchronous Ember-Hello round-trip. Without this, `hello_caps.is_ember`
-    // stays false (the public Hello / EmuleInfo no longer signals Ember-ness)
-    // and the bail below would always fire — friend-connect dials would never
-    // reach `OP_EMBER_FRIEND_REQ`. This also populates `hello_caps.ember_pubkey`,
-    // which is the gating condition for the `perform_ember_auth` call below.
-    exchange_ember_hello(
-        &mut reader,
-        &mut writer,
-        our_ember_hash,
-        our_nickname,
-        ed25519_pubkey.as_ref(),
-        &mut hello_caps,
-        addr,
-    )
-    .await?;
-
-    if !hello_caps.is_ember {
-        anyhow::bail!("remote peer is not an Ember client");
-    }
-
-    // Ember auth challenge-response if both sides support it. With
-    // `OP_EMBER_HELLO` exchanged above, `hello_caps.ember_pubkey` is
-    // populated for any peer that advertises one and this branch
-    // actually runs full Ed25519 proof of possession.
-    if let (Some(peer_pk), Some(our_pk), Some(our_sk)) = (hello_caps.ember_pubkey, ed25519_pubkey, ed25519_secret_key) {
-        perform_ember_auth(&mut reader, &mut writer, &our_pk, &our_sk, &peer_pk, hello_caps.ember_hash.as_ref(), addr).await?;
-    }
-
-    info!("Friend-connect handshake with {} complete, sending friend request", addr);
-    write_packet(
-        &mut writer,
-        OP_EMULEPROT,
-        OP_EMBER_FRIEND_REQ,
-        our_nickname.as_bytes(),
-    )
-    .await?;
-
-    // Read packets within a brief window looking for a reciprocal friend
-    // request.  The remote may send EPX or other packets before the friend
-    // request, so we drain up to a few packets instead of reading just one.
-    let mut remote_ember_hash: Option<[u8; 16]> = None;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
-    for _ in 0..5 {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(remaining, read_packet_inner(&mut reader)).await {
-            Ok(Ok((p, o, _pl))) => {
-                if p == OP_EMULEPROT && o == OP_EMBER_FRIEND_REQ {
-                    if let Some(eh) = hello_caps.ember_hash {
-                        info!("Received reciprocal friend request from {} (hash={})", addr, hex::encode(eh));
-                        remote_ember_hash = Some(eh);
-                    }
-                    break;
-                }
-                debug!("Friend-connect to {}: skipping packet proto=0x{p:02X} op=0x{o:02X} while waiting for reciprocal", addr);
-            }
-            _ => break,
-        }
-    }
-
-    Ok(remote_ember_hash)
-}
-
 /// Result from a successfully established friend session: the outbound sender
 /// so the caller can immediately send packets before the loop consumes them.
 pub struct FriendSessionHandle {
@@ -249,10 +107,12 @@ pub async fn open_and_run_friend_session(
         }
     }
 
-    // Synchronous Ember-Hello round-trip. Same rationale as
-    // `connect_and_send_friend_request`: without this, `is_ember`
-    // stays false, the bail below always fires, and friend sessions
-    // can't open at all.
+    // Synchronous Ember-Hello round-trip. Without this,
+    // `hello_caps.is_ember` stays false (the public Hello / EmuleInfo
+    // no longer signals Ember-ness), the bail below always fires,
+    // and friend sessions can't open at all. This also populates
+    // `hello_caps.ember_pubkey`, which gates the `perform_ember_auth`
+    // call below.
     exchange_ember_hello(
         &mut reader,
         &mut writer,

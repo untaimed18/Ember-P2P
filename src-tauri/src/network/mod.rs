@@ -893,97 +893,95 @@ fn spawn_rendezvous_friend_lookup(
             Ok(Some((ip, port))) => {
                 info!("Rendezvous found friend {} at {}:{}", hex::encode(target_hash), ip, port);
                 let addr = std::net::SocketAddr::new(ip.into(), port);
-                match ed2k::friend_connect::connect_and_send_friend_request(
-                    addr, &our_uh, &our_eh, &nick, cid, tcp, udp, obfuscate,
-                    Some(ed25519_pubkey), Some(ed25519_secret_key),
-                ).await {
-                    Ok(Some(remote_eh)) => {
-                        info!("Rendezvous friend connect to {} succeeded, remote={}", addr, hex::encode(remote_eh));
-                        if fh_fc.read().await.contains(&remote_eh) {
-                            // Do NOT auto-flip mutual: even after the inline
-                            // BLAKE3 identity-binding check in
-                            // `verify_ember_hash_binding`, the user still
-                            // needs to positively approve an inbound friend
-                            // request to avoid pre-accept shortcuts. Full
-                            // proof-of-possession runs on accept via
-                            // `friend_connect::perform_ember_auth`.
-                            //
-                            // Only `ember:friend-confirmed` (clears the
-                            // searching spinner) is safe to emit eagerly.
-                            // `ember:friend-online` is intentionally
-                            // deferred until the persistent session is
-                            // up — emitting it optimistically here and
-                            // then rolling back via
-                            // `EmberFriendDisconnected` on failure
-                            // raced with the trailing
-                            // `EmberFriendSearchFailed` cleanup below
-                            // and could leave a freshly-spawned
-                            // reconnect attempt with no
-                            // `outbound_session_tasks` slot
-                            // (`Disconnected` re-inserts the slot when
-                            // it schedules its reconnect, then
-                            // `SearchFailed` clobbers it).
+
+                // Fast path: a persistent session for this peer is
+                // already alive (e.g. an inbound `FriendSeen` path
+                // opened it concurrently, or a previous discovery
+                // round just landed). Emit `friend-confirmed` /
+                // `friend-online` for visibility — both events are
+                // idempotent in the frontend's Set-based handlers
+                // — and don't dial again.
+                if sess_fc.read().await.contains_key(&target_hash) {
+                    let _ = app_fc.emit("ember:friend-confirmed", serde_json::json!({
+                        "user_hash": hex::encode(target_hash),
+                    }));
+                    let _ = app_fc.emit("ember:friend-online", serde_json::json!({
+                        "user_hash": hex::encode(target_hash),
+                    }));
+                } else {
+                    // Single-dial discovery. Earlier this site ran a
+                    // short-lived `connect_and_send_friend_request`
+                    // first, then only opened the persistent
+                    // session if the peer happened to send back a
+                    // reciprocal `OP_EMBER_FRIEND_REQ` on that same
+                    // TCP. That flow silently broke for already-
+                    // mutual friends because the upload-side handler
+                    // for `OP_EMBER_FRIEND_REQ` deliberately does
+                    // nothing on a duplicate ("already mutual —
+                    // ignoring redundant"), so the reciprocal never
+                    // arrived, both peers' transient dials returned
+                    // `Ok(None)`, and neither side ever opened the
+                    // persistent session. The friend's transient
+                    // *inbound* TCP would still grab our
+                    // `ember_sessions` slot during its handshake,
+                    // get torn down 8 s later when the friend's
+                    // transient gave up waiting, and fire a
+                    // spurious `EmberFriendDisconnected` —
+                    // exactly the "shows them online then starts
+                    // searching for them again" loop the user
+                    // reported.
+                    //
+                    // `open_and_run_friend_session` already does the
+                    // full handshake, sends the friend request as
+                    // part of the session start (see
+                    // `friend_connect.rs::open_and_run_friend_session`
+                    // around the `OP_EMBER_FRIEND_REQ` write), and
+                    // atomically reserves the `ember_sessions` slot
+                    // before sending so a racing inbound transient
+                    // dial sees the slot occupied and bows out
+                    // without claiming. Calling it directly skips
+                    // the broken reciprocal-handshake step entirely
+                    // and saves one redundant TCP round-trip per
+                    // discovery.
+                    info!("Opening persistent session to {} after rendezvous friend discovery", addr);
+                    match ed2k::friend_connect::open_and_run_friend_session(
+                        addr, our_uh, our_eh, nick,
+                        cid, tcp, udp, obfuscate, sess_fc, ultx_fc.clone(), fh_fc,
+                        Some(ed25519_pubkey), Some(ed25519_secret_key),
+                    ).await {
+                        Ok(_) => {
+                            // Session is up — only NOW are we sure
+                            // the peer is reachable for chat /
+                            // browse, so this is the correct moment
+                            // to mark them online. `friend-confirmed`
+                            // is emitted alongside to clear the
+                            // searching spinner.
                             let _ = app_fc.emit("ember:friend-confirmed", serde_json::json!({
-                                "user_hash": hex::encode(remote_eh),
+                                "user_hash": hex::encode(target_hash),
                             }));
-                            if sess_fc.read().await.contains_key(&remote_eh) {
-                                // A session for this peer is already
-                                // alive (e.g. an inbound `FriendSeen`
-                                // path opened it concurrently). Emit
-                                // online for visibility — duplicate
-                                // events are idempotent in the
-                                // frontend's Set-based handler.
-                                let _ = app_fc.emit("ember:friend-online", serde_json::json!({
-                                    "user_hash": hex::encode(remote_eh),
-                                }));
-                            } else {
-                                info!("Opening persistent session to {} after rendezvous friend discovery", addr);
-                                match ed2k::friend_connect::open_and_run_friend_session(
-                                    addr, our_uh, our_eh, nick,
-                                    cid, tcp, udp, obfuscate, sess_fc, ultx_fc.clone(), fh_fc,
-                                    Some(ed25519_pubkey), Some(ed25519_secret_key),
-                                ).await {
-                                    Ok(_) => {
-                                        // Session is up — only NOW are
-                                        // we sure the peer is reachable
-                                        // for chat / browse, so this is
-                                        // the correct moment to mark
-                                        // them online.
-                                        let _ = app_fc.emit("ember:friend-online", serde_json::json!({
-                                            "user_hash": hex::encode(remote_eh),
-                                        }));
-                                    }
-                                    Err(e) => {
-                                        info!("Persistent session to {} failed: {e}", addr);
-                                        // No `EmberFriendDisconnected`
-                                        // — we never emitted online for
-                                        // this peer so there's nothing
-                                        // to roll back. The trailing
-                                        // `EmberFriendSearchFailed`
-                                        // below releases the
-                                        // outbound-task slot, and the
-                                        // 5-min auto-retry sweep will
-                                        // pick the friend up again
-                                        // without an immediate
-                                        // dogpiled retry.
-                                    }
-                                }
-                            }
+                            let _ = app_fc.emit("ember:friend-online", serde_json::json!({
+                                "user_hash": hex::encode(target_hash),
+                            }));
                         }
-                    }
-                    Ok(None) => {
-                        info!("Rendezvous friend connect to {} succeeded (no reciprocal)", addr);
-                    }
-                    Err(e) => {
-                        let emsg = format!("{e}");
-                        let reason = if emsg.contains("timeout") { "timeout" }
-                            else if emsg.contains("refused") { "refused" }
-                            else { "error" };
-                        info!("Rendezvous friend connect to {} failed: {e}", addr);
-                        let _ = app_fc.emit("ember:friend-search-failed", serde_json::json!({
-                            "user_hash": hex::encode(target_hash),
-                            "reason": reason,
-                        }));
+                        Err(e) => {
+                            info!("Persistent session to {} failed: {e}", addr);
+                            let emsg = format!("{e}");
+                            let reason = if emsg.contains("timeout") { "timeout" }
+                                else if emsg.contains("refused") { "refused" }
+                                else { "error" };
+                            // No `EmberFriendDisconnected` — we never
+                            // emitted online for this peer so there's
+                            // nothing to roll back. The trailing
+                            // `EmberFriendSearchFailed` below releases
+                            // the outbound-task slot, and the periodic
+                            // auto-retry sweep will pick the friend
+                            // up again without an immediate dogpiled
+                            // retry.
+                            let _ = app_fc.emit("ember:friend-search-failed", serde_json::json!({
+                                "user_hash": hex::encode(target_hash),
+                                "reason": reason,
+                            }));
+                        }
                     }
                 }
             }
@@ -8202,11 +8200,10 @@ pub async fn start_network(
                     }
 
                     // Advertise our TCP listener port. Friend dialers
-                    // call `friend_connect::connect_and_send_friend_request`
-                    // / `open_and_run_friend_session`, both of which
-                    // open a `TcpStream` to whatever (ip, port) the
-                    // rendezvous lookup returns and immediately do the
-                    // Hello / HelloAnswer / EmuleInfo / OP_EMBER_HELLO
+                    // call `friend_connect::open_and_run_friend_session`,
+                    // which opens a `TcpStream` to whatever (ip, port)
+                    // the rendezvous lookup returns and immediately does
+                    // the Hello / HelloAnswer / EmuleInfo / OP_EMBER_HELLO
                     // handshake over TCP. Earlier this site used
                     // `state.quic_port.unwrap_or(settings.tcp_port)`,
                     // which silently broke every node whose QUIC
