@@ -4,6 +4,7 @@
   import { getChatMessages, sendChatMessage, markMessagesRead, type ChatMessage } from '$lib/api/friends';
   import { activeChatHash, clearUnread, onlineFriends } from '$lib/stores/friends';
   import { getDraft, setDraft, clearDraft } from '$lib/stores/chatTabs';
+  import * as m from '$lib/paraglide/messages';
 
   interface Props {
     friendHash: string;
@@ -257,7 +258,7 @@
       // unconditionally.
       clearDraft(friendHash);
     } catch (e: unknown) {
-      sendError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to send';
+      sendError = e instanceof Error ? e.message : typeof e === 'string' ? e : m.chat_failed_to_send();
     } finally {
       sending = false;
     }
@@ -296,22 +297,22 @@
         </svg>
       </div>
       <span class="conv-name">
-        <span class="sr-only">Chat with </span><bdi>{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi>
+        <span class="sr-only">{m.chat_friend_with_prefix()} </span><bdi>{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi>
       </span>
       {#if isOnline}
-        <span class="conv-status verified" title="Live session is cryptographically verified" aria-label="verified online">
+        <span class="conv-status verified" title={m.chat_verified_title()} aria-label={m.chat_verified_aria()}>
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M3 8l3 3 7-7"/>
           </svg>
-          <span>Verified</span>
+          <span>{m.chat_verified_label()}</span>
         </span>
       {:else}
-        <span class="conv-status offline" title="Friend is offline — message will be queued until a verified session is re-established" aria-label="offline, message will queue">
+        <span class="conv-status offline" title={m.chat_offline_title()} aria-label={m.chat_offline_aria()}>
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="8" cy="8" r="6"/>
             <path d="M8 5v3M8 11v.01"/>
           </svg>
-          <span>Offline</span>
+          <span>{m.chat_offline_label()}</span>
         </span>
       {/if}
     </div>
@@ -319,14 +320,14 @@
 
   <div class="conv-messages" bind:this={messagesContainerEl}>
     {#if loading}
-      <div class="conv-loading">Loading messages...</div>
+      <div class="conv-loading">{m.chat_loading_messages()}</div>
     {:else if loadError}
       <div class="conv-load-error" role="alert">
-        <span>Couldn't load messages — {loadError}</span>
-        <button class="conv-load-retry" onclick={retryLoad} type="button">Retry</button>
+        <span>{m.chat_load_error({ error: loadError })}</span>
+        <button class="conv-load-retry" onclick={retryLoad} type="button">{m.common_retry()}</button>
       </div>
     {:else if messages.length === 0}
-      <div class="conv-empty">No messages yet. Say hello!</div>
+      <div class="conv-empty">{m.chat_say_hello()}</div>
     {:else}
       {#if hasMoreHistory}
         <div class="conv-load-older">
@@ -335,9 +336,9 @@
             type="button"
             onclick={loadOlderMessages}
             disabled={loadingOlder}
-            aria-label="Load older messages"
+            aria-label={m.chat_load_older()}
           >
-            {loadingOlder ? 'Loading…' : 'Load older messages'}
+            {loadingOlder ? m.chat_loading_short() : m.chat_load_older()}
           </button>
         </div>
       {/if}
@@ -368,12 +369,12 @@
       bind:value={inputText}
       bind:this={chatInputEl}
       onkeydown={handleKeydown}
-      placeholder="Type a message... (Enter to send, Shift+Enter for newline)"
+      placeholder={m.chat_input_placeholder()}
       maxlength="4096"
       rows="2"
       disabled={sending}
     ></textarea>
-    <button class="conv-send" onclick={handleSend} disabled={!inputText.trim() || sending} title="Send (Enter)" aria-label="Send message">
+    <button class="conv-send" onclick={handleSend} disabled={!inputText.trim() || sending} title={m.chat_send_title_short()} aria-label={m.chat_send_aria()}>
       <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
         <path d="M3 10l14-7-7 14-2-5z"/><line x1="10" y1="17" x2="17" y2="3"/>
       </svg>

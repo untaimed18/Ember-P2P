@@ -7,6 +7,7 @@
   import { networkStats } from '$lib/stores/network';
   import { friendRequests } from '$lib/stores/friends';
   import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
+  import * as m from '$lib/paraglide/messages';
   import { onMount } from 'svelte';
 
   let aboutOpen = $state(false);
@@ -48,7 +49,12 @@
 
   type NavItem = {
     href: string;
-    label: string;
+    /** Function returning the localized label. We keep `label` as a
+     *  thunk (rather than a pre-resolved string) so the array can
+     *  remain a top-level `const` while still picking up locale
+     *  changes — Paraglide message functions read the current
+     *  locale on each call. */
+    label: () => string;
     id: string;
     /** Legacy URLs that should highlight this item (and short-circuit
      *  re-navigation) until the route-level redirect fires. The KAD
@@ -59,15 +65,15 @@
   };
 
   const navItems: NavItem[] = [
-    { href: '/', label: 'KAD Network', id: 'kad', aliases: ['/kad-network'] },
-    { href: '/servers', label: 'ED2K Servers', id: 'servers' },
-    { href: '/search', label: 'Search', id: 'search' },
-    { href: '/transfers', label: 'Transfers', id: 'transfers' },
-    { href: '/library', label: 'Library', id: 'library' },
-    { href: '/friends', label: 'Friends', id: 'friends' },
-    { href: '/statistics', label: 'Statistics', id: 'statistics' },
-    { href: '/security', label: 'Security', id: 'security' },
-    { href: '/settings', label: 'Settings', id: 'settings' },
+    { href: '/', label: () => m.nav_kad_network(), id: 'kad', aliases: ['/kad-network'] },
+    { href: '/servers', label: () => m.nav_ed2k_servers(), id: 'servers' },
+    { href: '/search', label: () => m.nav_search(), id: 'search' },
+    { href: '/transfers', label: () => m.nav_transfers(), id: 'transfers' },
+    { href: '/library', label: () => m.nav_library(), id: 'library' },
+    { href: '/friends', label: () => m.nav_friends(), id: 'friends' },
+    { href: '/statistics', label: () => m.nav_statistics(), id: 'statistics' },
+    { href: '/security', label: () => m.nav_security(), id: 'security' },
+    { href: '/settings', label: () => m.nav_settings(), id: 'settings' },
   ];
 
   function isActive(item: NavItem, pathname: string): boolean {
@@ -150,11 +156,11 @@
   });
 </script>
 
-<nav class="sidebar" class:collapsed={isCollapsed} aria-label="Primary">
+<nav class="sidebar" class:collapsed={isCollapsed} aria-label={m.sidebar_aria_primary()}>
   <div class="sidebar-header">
-    <a href="/" class="logo" onclick={(e) => navigate(e, '/')} title="Go to KAD Network home">
+    <a href="/" class="logo" onclick={(e) => navigate(e, '/')} title={m.sidebar_logo_title()}>
       <span class="logo-text">EMBER</span>
-      <span class="logo-sub">P2P File Sharing</span>
+      <span class="logo-sub">{m.app_tagline()}</span>
     </a>
   </div>
 
@@ -167,7 +173,7 @@
           aria-current={isActive(item, $page.url.pathname) ? 'page' : undefined}
           aria-keyshortcuts={i < 9 ? `Alt+${i + 1}` : undefined}
           onclick={(e: MouseEvent) => navigate(e, item.href)}
-          title={i < 9 ? `${item.label} (Alt+${i + 1})` : item.label}
+          title={i < 9 ? m.sidebar_nav_with_shortcut_title({ label: item.label(), n: i + 1 }) : item.label()}
         >
           <span class="nav-icon" aria-hidden="true">
             {#if item.id === 'kad'}
@@ -231,9 +237,17 @@
               </svg>
             {/if}
           </span>
-          <span class="nav-label">{item.label}</span>
+          <span class="nav-label">{item.label()}</span>
           {#if item.id === 'kad'}
-            <span class="nav-dot {$networkStats.status}" title="{$networkStats.status}"></span>
+            <span
+              class="nav-dot {$networkStats.status}"
+              title={
+                $networkStats.status === 'connected' ? m.network_status_connected() :
+                $networkStats.status === 'connecting' ? m.network_status_connecting() :
+                $networkStats.status === 'disconnected' ? m.network_status_disconnected() :
+                m.network_status_unknown()
+              }
+            ></span>
           {/if}
           {#if item.id === 'transfers' && activeDownloadCount > 0}
             <span class="nav-badge">{activeDownloadCount}</span>
@@ -241,7 +255,9 @@
           {#if item.id === 'friends' && pendingFriendRequestCount > 0}
             <span
               class="nav-badge nav-badge-attention"
-              title="{pendingFriendRequestCount} pending friend request{pendingFriendRequestCount === 1 ? '' : 's'}"
+              title={pendingFriendRequestCount === 1
+                ? m.sidebar_friend_requests_title_one()
+                : m.sidebar_friend_requests_title_other({ count: pendingFriendRequestCount })}
             >{pendingFriendRequestCount}</span>
           {/if}
         </a>
@@ -255,7 +271,7 @@
       class="about-btn chats-btn"
       class:active={$chatDockOpen}
       onclick={toggleChatDock}
-      title={$chatDockOpen ? 'Close chats (Ctrl+/)' : 'Open chats (Ctrl+/)'}
+      title={$chatDockOpen ? m.sidebar_chats_close() : m.sidebar_chats_open()}
       aria-pressed={$chatDockOpen}
       aria-keyshortcuts="Control+/"
     >
@@ -266,11 +282,13 @@
           <line x1="6.5" y1="10.5" x2="11.5" y2="10.5"/>
         </svg>
       </span>
-      <span class="chats-label">Chats</span>
+      <span class="chats-label">{m.sidebar_chats_label()}</span>
       {#if totalUnreadChats > 0}
         <span
           class="nav-badge nav-badge-attention chats-badge"
-          title={`${totalUnreadChats} unread message${totalUnreadChats === 1 ? '' : 's'}`}
+          title={totalUnreadChats === 1
+            ? m.sidebar_chats_unread_title_one()
+            : m.sidebar_chats_unread_title_other({ count: totalUnreadChats })}
         >{totalUnreadChats > 99 ? '99+' : totalUnreadChats}</span>
       {/if}
     </button>
@@ -278,7 +296,7 @@
       type="button"
       class="about-btn"
       onclick={() => (shortcutsOpen = true)}
-      title="Keyboard shortcuts (?)"
+      title={m.sidebar_keyboard_shortcuts_title()}
       aria-keyshortcuts="?"
     >
       <span class="about-icon" aria-hidden="true">
@@ -291,9 +309,9 @@
           <line x1="5" y1="11.5" x2="14" y2="11.5"/>
         </svg>
       </span>
-      <span>Shortcuts</span>
+      <span>{m.sidebar_shortcuts_label()}</span>
     </button>
-    <button type="button" class="about-btn" onclick={() => (aboutOpen = true)} title="About Ember">
+    <button type="button" class="about-btn" onclick={() => (aboutOpen = true)} title={m.sidebar_about_title()}>
       <span class="about-icon" aria-hidden="true">
         <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="10" cy="10" r="7.5"/>
@@ -301,14 +319,14 @@
           <circle cx="10" cy="6" r="1" fill="currentColor" stroke="none"/>
         </svg>
       </span>
-      <span>About</span>
+      <span>{m.sidebar_about()}</span>
     </button>
     <button
       type="button"
       class="about-btn collapse-btn"
       onclick={toggleCollapsed}
-      title={isCollapsed ? "Expand sidebar (Ctrl+B)" : "Collapse sidebar (Ctrl+B)"}
-      aria-label={isCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+      title={isCollapsed ? m.sidebar_expand() : m.sidebar_collapse()}
+      aria-label={isCollapsed ? m.sidebar_expand_aria() : m.sidebar_collapse_aria()}
       aria-keyshortcuts="Control+B"
     >
       <span class="about-icon" aria-hidden="true">
@@ -320,7 +338,7 @@
           {/if}
         </svg>
       </span>
-      <span>{isCollapsed ? 'Expand' : 'Collapse'}</span>
+      <span>{isCollapsed ? m.sidebar_expand_label() : m.sidebar_collapse_label()}</span>
     </button>
   </div>
 

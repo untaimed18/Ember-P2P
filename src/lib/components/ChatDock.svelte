@@ -12,6 +12,7 @@
     cycleTab,
   } from '$lib/stores/chatTabs';
   import { unreadCounts, onlineFriends } from '$lib/stores/friends';
+  import * as m from '$lib/paraglide/messages';
 
   let panelEl: HTMLDivElement | undefined = $state();
   let returnFocusEl: HTMLElement | null = null;
@@ -187,13 +188,13 @@
     class="chat-dock"
     bind:this={panelEl}
     role="complementary"
-    aria-label="Chats"
+    aria-label={m.chat_dock_aria_label()}
     aria-keyshortcuts="Escape Control+/"
     tabindex="-1"
   >
-    <div class="dock-tabs" role="tablist" aria-label="Open chats">
+    <div class="dock-tabs" role="tablist" aria-label={m.chat_dock_tablist_aria()}>
       {#if $chatTabs.length === 0}
-        <div class="dock-empty-tabs">No open chats</div>
+        <div class="dock-empty-tabs">{m.chat_dock_no_open()}</div>
       {:else}
         {#each $chatTabs as tab (tab.hash)}
           <div
@@ -213,15 +214,17 @@
             {#if unreadFor(tab.hash) > 0}
               <span
                 class="dock-tab-unread"
-                aria-label={`${unreadFor(tab.hash)} unread message${unreadFor(tab.hash) === 1 ? '' : 's'}`}
+                aria-label={unreadFor(tab.hash) === 1
+                  ? m.chat_dock_unread_aria_one()
+                  : m.chat_dock_unread_aria_other({ count: unreadFor(tab.hash) })}
               >{unreadFor(tab.hash) > 99 ? '99+' : unreadFor(tab.hash)}</span>
             {/if}
             <button
               type="button"
               class="dock-tab-close"
               tabindex="-1"
-              aria-label={`Close chat with ${tab.name}`}
-              title="Close tab"
+              aria-label={m.chat_dock_close_tab({ name: tab.name })}
+              title={m.chat_dock_close_tab_title()}
               onclick={(e) => { e.stopPropagation(); closeTab(tab.hash); }}
             >
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -234,8 +237,8 @@
       <button
         type="button"
         class="dock-new"
-        title="Start a new chat"
-        aria-label="Start a new chat"
+        title={m.chat_dock_new_chat()}
+        aria-label={m.chat_dock_new_chat()}
         onclick={handleNewChat}
       >
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -246,8 +249,8 @@
       <button
         type="button"
         class="dock-close"
-        title="Close chats (Esc)"
-        aria-label="Close chats"
+        title={m.chat_dock_close_title()}
+        aria-label={m.chat_dock_close_aria()}
         onclick={closeDock}
       >
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -268,9 +271,9 @@
               <line x1="22" y1="32" x2="36" y2="32"/>
             </svg>
           </div>
-          <p class="empty-title">No conversation selected</p>
-          <p class="empty-hint">Start a chat from the Friends page, then it'll show up here as a tab.</p>
-          <button type="button" class="empty-cta" onclick={handleNewChat}>Go to Friends</button>
+          <p class="empty-title">{m.chat_dock_empty_title()}</p>
+          <p class="empty-hint">{m.chat_dock_empty_hint()}</p>
+          <button type="button" class="empty-cta" onclick={handleNewChat}>{m.chat_dock_empty_cta()}</button>
         </div>
       {/if}
     </div>
