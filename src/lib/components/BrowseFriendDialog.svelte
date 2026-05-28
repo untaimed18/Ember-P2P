@@ -3,6 +3,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { browseFriend, type BrowseFileEntry } from '$lib/api/friends';
   import { startDownload } from '$lib/api/transfers';
+  import * as m from '$lib/paraglide/messages';
 
   interface Props {
     open: boolean;
@@ -88,7 +89,7 @@
       });
     } catch (e) {
       console.warn('BrowseFriendDialog: failed to register browse-result listener', e);
-      error = 'Could not listen for browse results. Try re-opening the dialog.';
+      error = m.browse_listener_failed();
       loading = false;
       return false;
     }
@@ -109,7 +110,7 @@
         // errors for that browse are discarded as expected.
         if (currentBrowseGen === 0) return;
         clearTimeout(browseTimeout);
-        error = event.payload.reason || 'Browse failed — friend went offline.';
+        error = event.payload.reason || m.browse_failed_offline();
         loading = false;
         currentBrowseGen = 0;
       });
@@ -118,7 +119,7 @@
       // result-listener succeeded but error-listener failed: still
       // usable for the happy path, but we won't surface backend
       // browse failures. Set a soft warning rather than block.
-      error = 'Browse error notifications unavailable; results may still arrive.';
+      error = m.browse_error_notifications_unavailable();
       // Returning true: the result listener is live and the caller
       // can still request browse. We just won't see backend errors
       // until the next dialog open.
@@ -146,12 +147,12 @@
       browseTimeout = setTimeout(() => {
         if (currentBrowseGen === myGen && loading) {
           loading = false;
-          error = 'Browse request timed out. The friend may be offline.';
+          error = m.browse_request_timed_out();
           currentBrowseGen = 0;
         }
       }, 30_000);
     } catch (e: unknown) {
-      error = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to browse';
+      error = e instanceof Error ? e.message : typeof e === 'string' ? e : m.browse_failed_to_browse();
       loading = false;
       if (currentBrowseGen === myGen) currentBrowseGen = 0;
     }
@@ -175,7 +176,7 @@
       downloadedHashes.add(file.hash);
       downloadedHashes = new Set(downloadedHashes);
     } catch (e: unknown) {
-      downloadError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Download failed';
+      downloadError = e instanceof Error ? e.message : typeof e === 'string' ? e : m.browse_download_failed();
     }
   }
 
@@ -198,8 +199,8 @@
   <!-- svelte-ignore a11y_interactive_supports_focus -->
   <div class="browse-modal" role="dialog" onkeydown={handleKeydown}>
     <div class="browse-header">
-      <h3>Browsing <bdi>{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi></h3>
-      <button class="browse-close" onclick={onclose} title="Close">
+      <h3>{m.browse_title_prefix()} <bdi>{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi></h3>
+      <button class="browse-close" onclick={onclose} title={m.common_close()} aria-label={m.common_close()}>
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
           <line x1="4" y1="4" x2="12" y2="12"/><line x1="12" y1="4" x2="4" y2="12"/>
         </svg>
@@ -208,22 +209,24 @@
 
     <div class="browse-body">
       {#if loading}
-        <div class="browse-status">Requesting file list...</div>
+        <div class="browse-status">{m.browse_requesting()}</div>
       {:else if error}
         <div class="browse-error">{error}</div>
       {:else if files.length === 0}
-        <div class="browse-status">No shared files found.</div>
+        <div class="browse-status">{m.browse_no_files()}</div>
       {:else}
         {#if downloadError}
           <div class="browse-error" style="margin-bottom: 8px">{downloadError}</div>
         {/if}
-        <div class="browse-count">{files.length} file{files.length !== 1 ? 's' : ''} shared</div>
+        <div class="browse-count">
+          {files.length === 1 ? m.browse_count_one() : m.browse_count_other({ count: files.length })}
+        </div>
         <div class="browse-table-wrap">
           <table class="browse-table">
             <thead>
               <tr>
-                <th class="col-name">Name</th>
-                <th class="col-size">Size</th>
+                <th class="col-name">{m.browse_col_name()}</th>
+                <th class="col-size">{m.browse_col_size()}</th>
                 <th class="col-action"></th>
               </tr>
             </thead>
@@ -244,13 +247,13 @@
                   <td class="col-size">{formatSize(file.size)}</td>
                   <td class="col-action">
                     {#if downloadedHashes.has(file.hash)}
-                      <span class="dl-done" title="Queued">
+                      <span class="dl-done" title={m.browse_queued()} aria-label={m.browse_queued()}>
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                           <polyline points="3 8 7 12 13 4"/>
                         </svg>
                       </span>
                     {:else}
-                      <button class="dl-btn" onclick={() => downloadFile(file)} title="Download">
+                      <button class="dl-btn" onclick={() => downloadFile(file)} title={m.browse_download()} aria-label={m.browse_download()}>
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                           <path d="M8 2v9M4 8l4 4 4-4"/><line x1="3" y1="14" x2="13" y2="14"/>
                         </svg>

@@ -8,6 +8,13 @@
   import ToggleSwitch from './ToggleSwitch.svelte';
   import SpeedInput from './SpeedInput.svelte';
   import { updateSettings as saveSettings, downloadNodesDat, downloadIpfilter } from '$lib/api/settings';
+  import * as m from '$lib/paraglide/messages';
+
+  function fmtSpeedShort(bytesPerSec: number): string {
+    return bytesPerSec > 0
+      ? m.wizard_speed_kbps({ kb: Math.round(bytesPerSec / 1024) })
+      : m.wizard_summary_unlimited();
+  }
 
   let {
     settings,
@@ -95,7 +102,7 @@
 
   async function pickFolder() {
     try {
-      const selected = await open({ directory: true, multiple: false, title: 'Choose download folder' });
+      const selected = await open({ directory: true, multiple: false, title: m.wizard_pick_folder_dialog_title() });
       if (selected && typeof selected === 'string') {
         downloadFolder = selected;
       }
@@ -111,11 +118,12 @@
       const result: { recommended_upload_limit: number; recommended_download_limit: number } = await invoke('run_speed_test');
       maxUploadSpeed = result.recommended_upload_limit;
       maxDownloadSpeed = result.recommended_download_limit;
-      const fmtUp = maxUploadSpeed > 0 ? `${Math.round(maxUploadSpeed / 1024)} KB/s` : 'Unlimited';
-      const fmtDl = maxDownloadSpeed > 0 ? `${Math.round(maxDownloadSpeed / 1024)} KB/s` : 'Unlimited';
-      speedTestResult = `Recommended: ${fmtUp} up / ${fmtDl} down`;
+      speedTestResult = m.wizard_speed_test_recommended({
+        up: fmtSpeedShort(maxUploadSpeed),
+        down: fmtSpeedShort(maxDownloadSpeed),
+      });
     } catch {
-      speedTestResult = 'Speed test failed. You can set limits manually.';
+      speedTestResult = m.wizard_speed_test_failed();
     } finally {
       speedTestRunning = false;
     }
@@ -132,8 +140,8 @@
     // Final validation before writing any settings to disk. Prevents an
     // empty-nickname or port=0 config from sneaking past the per-step guard
     // if the user somehow reaches the last step with invalid state.
-    if (!nickname.trim()) { saveError = 'Please enter a nickname.'; step = 2; return; }
-    if (!downloadFolder.trim()) { saveError = 'Please choose a download folder.'; step = 3; return; }
+    if (!nickname.trim()) { saveError = m.wizard_validation_nickname(); step = 2; return; }
+    if (!downloadFolder.trim()) { saveError = m.wizard_validation_folder(); step = 3; return; }
     const tcp = clampInt(tcpPort, 1, 65535, 4662);
     const udp = clampInt(udpPort, 1, 65535, 4672);
     // TCP and UDP on the same port number is allowed: they're different
@@ -209,19 +217,28 @@
     }
   }
 
-  const stepLabels = ['Welcome', 'Identity', 'Storage', 'Network', 'Bandwidth', 'Connection', 'Theme', 'Ready'];
+  const stepLabels: (() => string)[] = [
+    () => m.wizard_step_welcome(),
+    () => m.wizard_step_identity(),
+    () => m.wizard_step_storage(),
+    () => m.wizard_step_network(),
+    () => m.wizard_step_bandwidth(),
+    () => m.wizard_step_connection(),
+    () => m.wizard_step_theme(),
+    () => m.wizard_step_ready(),
+  ];
 </script>
 
 {#if relaunching}
-<div class="wizard-overlay" role="status" aria-label="Restarting">
+<div class="wizard-overlay" role="status" aria-label={m.wizard_restarting_aria()}>
   <div class="relaunch-card">
     <div class="spinner lg"></div>
-    <h2 class="relaunch-title">Restarting Ember</h2>
-    <p class="relaunch-sub">Applying your settings…</p>
+    <h2 class="relaunch-title">{m.wizard_restarting_title()}</h2>
+    <p class="relaunch-sub">{m.wizard_restarting_sub()}</p>
   </div>
 </div>
 {:else}
-<div class="wizard-overlay" role="dialog" aria-modal="true" aria-label="Setup Wizard">
+<div class="wizard-overlay" role="dialog" aria-modal="true" aria-label={m.wizard_aria()}>
   <div class="wizard-card" class:transitioning>
     <!-- Progress -->
     <div class="wizard-progress">
@@ -234,7 +251,7 @@
               {i + 1}
             {/if}
           </div>
-          <span class="dot-label">{label}</span>
+          <span class="dot-label">{label()}</span>
         </div>
         {#if i < stepLabels.length - 1}
           <div class="progress-line" class:filled={i + 1 < step}></div>
@@ -258,12 +275,12 @@
               </svg>
             </div>
             <div>
-              <h2 class="step-title welcome-title">Welcome to Ember</h2>
-              <p class="welcome-subtitle">eMule KAD Network Client</p>
+              <h2 class="step-title welcome-title">{m.wizard_welcome_title()}</h2>
+              <p class="welcome-subtitle">{m.wizard_welcome_subtitle()}</p>
             </div>
           </div>
 
-          <p class="step-desc">Ember is a modern P2P file sharing client built on the eMule network. It is fully compatible with all eMule-family clients (eMule, aMule, eMule Xtreme, etc.).</p>
+          <p class="step-desc">{m.wizard_welcome_desc()}</p>
 
           <div class="info-cards">
             <div class="info-card">
@@ -271,8 +288,8 @@
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10 2v16M2 10h16"/></svg>
               </div>
               <div>
-                <strong>Dual Network</strong>
-                <span>KAD decentralized DHT + eD2K servers for maximum source discovery.</span>
+                <strong>{m.wizard_feature_dual_title()}</strong>
+                <span>{m.wizard_feature_dual_desc()}</span>
               </div>
             </div>
             <div class="info-card">
@@ -280,8 +297,8 @@
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 10l4 4 10-10"/></svg>
               </div>
               <div>
-                <strong>EPX — Ember Peer Exchange</strong>
-                <span>Ember peers share source lists with each other for faster downloads. Non-Ember clients are unaffected.</span>
+                <strong>{m.wizard_feature_epx_title()}</strong>
+                <span>{m.wizard_feature_epx_desc()}</span>
               </div>
             </div>
             <div class="info-card">
@@ -289,73 +306,73 @@
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="5" width="14" height="10" rx="2"/><path d="M7 9h6M7 12h4"/></svg>
               </div>
               <div>
-                <strong>Secure &amp; Private</strong>
-                <span>Protocol obfuscation, IP filtering, and credits-based upload priority.</span>
+                <strong>{m.wizard_feature_secure_title()}</strong>
+                <span>{m.wizard_feature_secure_desc()}</span>
               </div>
             </div>
           </div>
 
-          <p class="step-hint">Let's configure your preferences. You can change any of these later in Settings.</p>
+          <p class="step-hint">{m.wizard_welcome_hint()}</p>
         </div>
 
       {:else if step === 2}
         <div class="step-content">
-          <h2 class="step-title">Choose a Nickname</h2>
-          <p class="step-desc">This is how you appear to other peers on the network. You can use the generated name or pick your own.</p>
+          <h2 class="step-title">{m.wizard_nickname_title()}</h2>
+          <p class="step-desc">{m.wizard_nickname_desc()}</p>
           <div class="field">
-            <label for="nickname">Nickname</label>
-            <input id="nickname" type="text" bind:value={nickname} maxlength="128" class="text-input" placeholder="Enter a nickname" />
+            <label for="nickname">{m.wizard_nickname_label()}</label>
+            <input id="nickname" type="text" bind:value={nickname} maxlength="128" class="text-input" placeholder={m.wizard_nickname_placeholder()} />
           </div>
-          <p class="step-hint">Max 128 characters. Visible to peers you connect with.</p>
+          <p class="step-hint">{m.wizard_nickname_hint()}</p>
         </div>
 
       {:else if step === 3}
         <div class="step-content">
-          <h2 class="step-title">Download Folder</h2>
-          <p class="step-desc">Choose where Ember saves downloaded files. Completed files will appear in a "Downloads" subfolder which is automatically shared.</p>
+          <h2 class="step-title">{m.wizard_folder_title()}</h2>
+          <p class="step-desc">{m.wizard_folder_desc()}</p>
           <div class="field">
-            <label for="dl-folder">Download location</label>
+            <label for="dl-folder">{m.wizard_folder_label()}</label>
             <div class="folder-picker">
               <input id="dl-folder" type="text" bind:value={downloadFolder} class="text-input folder-input" readonly />
-              <button type="button" class="browse-btn" onclick={pickFolder}>Browse</button>
+              <button type="button" class="browse-btn" onclick={pickFolder}>{m.wizard_folder_browse()}</button>
             </div>
           </div>
         </div>
 
       {:else if step === 4}
         <div class="step-content">
-          <h2 class="step-title">Network Ports</h2>
-          <p class="step-desc">Ember needs a TCP port (file transfers) and a UDP port (KAD DHT). The defaults work for most users. If your VPN only forwards a single port number, you can set both fields to the same value — TCP and UDP are independent protocols. Enable UPnP to automatically forward ports on your router.</p>
+          <h2 class="step-title">{m.wizard_ports_title()}</h2>
+          <p class="step-desc">{m.wizard_ports_desc()}</p>
           <div class="fields-row">
             <div class="field">
-              <label for="tcp-port">TCP Port</label>
+              <label for="tcp-port">{m.wizard_ports_tcp()}</label>
               <input id="tcp-port" type="number" bind:value={tcpPort} min="1" max="65535" class="text-input port-input" />
             </div>
             <div class="field">
-              <label for="udp-port">UDP Port</label>
+              <label for="udp-port">{m.wizard_ports_udp()}</label>
               <input id="udp-port" type="number" bind:value={udpPort} min="1" max="65535" class="text-input port-input" />
             </div>
           </div>
           <div class="toggle-row">
-            <ToggleSwitch bind:checked={upnpEnabled} label="Enable UPnP (automatic port forwarding)" />
+            <ToggleSwitch bind:checked={upnpEnabled} label={m.wizard_ports_upnp_label()} />
           </div>
-          <p class="step-hint">If UPnP is off, you may need to manually forward these ports on your router for best performance (HighID).</p>
+          <p class="step-hint">{m.wizard_ports_hint()}</p>
         </div>
 
       {:else if step === 5}
         <div class="step-content">
-          <h2 class="step-title">Bandwidth Limits</h2>
-          <p class="step-desc">Set upload and download speed limits to avoid saturating your connection. Leave unlimited if you have plenty of bandwidth.</p>
+          <h2 class="step-title">{m.wizard_bandwidth_title()}</h2>
+          <p class="step-desc">{m.wizard_bandwidth_desc()}</p>
           <div class="fields-col">
             <div class="field">
-              <SpeedInput bind:value={maxUploadSpeed} label="Upload limit" />
+              <SpeedInput bind:value={maxUploadSpeed} label={m.wizard_bandwidth_upload_label()} />
             </div>
             <div class="field">
-              <SpeedInput bind:value={maxDownloadSpeed} label="Download limit" />
+              <SpeedInput bind:value={maxDownloadSpeed} label={m.wizard_bandwidth_download_label()} />
             </div>
           </div>
           <button type="button" class="speed-test-btn" onclick={runSpeedTest} disabled={speedTestRunning}>
-            {speedTestRunning ? 'Testing...' : 'Run Speed Test'}
+            {speedTestRunning ? m.wizard_speed_test_running() : m.wizard_speed_test_run()}
           </button>
           {#if speedTestResult}
             <p class="speed-result">{speedTestResult}</p>
@@ -364,24 +381,24 @@
 
       {:else if step === 6}
         <div class="step-content">
-          <h2 class="step-title">Auto-Connect</h2>
-          <p class="step-desc">Choose whether to automatically connect to the KAD network when Ember starts.</p>
+          <h2 class="step-title">{m.wizard_connect_title()}</h2>
+          <p class="step-desc">{m.wizard_connect_desc()}</p>
           <div class="connect-options">
             <div class="connect-option">
               <ToggleSwitch bind:checked={autoConnectKad} />
               <div>
-                <strong>KAD Network</strong>
-                <span>Decentralized peer discovery via the Kademlia DHT. Recommended for most users.</span>
+                <strong>{m.wizard_connect_kad_title()}</strong>
+                <span>{m.wizard_connect_kad_desc()}</span>
               </div>
             </div>
           </div>
-          <p class="step-hint">You can enable additional network options like eD2K servers later in Settings.</p>
+          <p class="step-hint">{m.wizard_connect_hint()}</p>
         </div>
 
       {:else if step === 7}
         <div class="step-content">
-          <h2 class="step-title">Theme</h2>
-          <p class="step-desc">Choose your preferred appearance.</p>
+          <h2 class="step-title">{m.wizard_theme_title()}</h2>
+          <p class="step-desc">{m.wizard_theme_desc()}</p>
           <div class="theme-options">
             <button
               type="button"
@@ -397,7 +414,7 @@
                   <div class="tp-row short"></div>
                 </div>
               </div>
-              <span>Dark</span>
+              <span>{m.wizard_theme_dark()}</span>
             </button>
             <button
               type="button"
@@ -413,43 +430,47 @@
                   <div class="tp-row short"></div>
                 </div>
               </div>
-              <span>Light</span>
+              <span>{m.wizard_theme_light()}</span>
             </button>
           </div>
         </div>
 
       {:else if step === 8}
         <div class="step-content">
-          <h2 class="step-title">You're All Set</h2>
-          <p class="step-desc">Here's a summary of your configuration. You can change any of these later in Settings.</p>
+          <h2 class="step-title">{m.wizard_ready_title()}</h2>
+          <p class="step-desc">{m.wizard_ready_desc()}</p>
           <div class="summary">
             <div class="summary-row">
-              <span class="summary-label">Nickname</span>
+              <span class="summary-label">{m.wizard_summary_nickname()}</span>
               <span class="summary-value">{nickname}</span>
             </div>
             <div class="summary-row">
-              <span class="summary-label">Download folder</span>
+              <span class="summary-label">{m.wizard_summary_folder()}</span>
               <span class="summary-value mono">{downloadFolder}</span>
             </div>
             <div class="summary-row">
-              <span class="summary-label">Ports</span>
-              <span class="summary-value">TCP {tcpPort} / UDP {udpPort}{upnpEnabled ? ' (UPnP)' : ''}</span>
+              <span class="summary-label">{m.wizard_summary_ports()}</span>
+              <span class="summary-value">
+                {upnpEnabled
+                  ? m.wizard_summary_ports_value_upnp({ tcp: tcpPort, udp: udpPort })
+                  : m.wizard_summary_ports_value({ tcp: tcpPort, udp: udpPort })}
+              </span>
             </div>
             <div class="summary-row">
-              <span class="summary-label">Upload limit</span>
-              <span class="summary-value">{maxUploadSpeed === 0 ? 'Unlimited' : `${Math.round(maxUploadSpeed / 1024)} KB/s`}</span>
+              <span class="summary-label">{m.wizard_summary_upload_limit()}</span>
+              <span class="summary-value">{maxUploadSpeed === 0 ? m.wizard_summary_unlimited() : m.wizard_speed_kbps({ kb: Math.round(maxUploadSpeed / 1024) })}</span>
             </div>
             <div class="summary-row">
-              <span class="summary-label">Download limit</span>
-              <span class="summary-value">{maxDownloadSpeed === 0 ? 'Unlimited' : `${Math.round(maxDownloadSpeed / 1024)} KB/s`}</span>
+              <span class="summary-label">{m.wizard_summary_download_limit()}</span>
+              <span class="summary-value">{maxDownloadSpeed === 0 ? m.wizard_summary_unlimited() : m.wizard_speed_kbps({ kb: Math.round(maxDownloadSpeed / 1024) })}</span>
             </div>
             <div class="summary-row">
-              <span class="summary-label">Auto-connect KAD</span>
-              <span class="summary-value">{autoConnectKad ? 'Yes' : 'No'}</span>
+              <span class="summary-label">{m.wizard_summary_autoconnect()}</span>
+              <span class="summary-value">{autoConnectKad ? m.common_yes() : m.common_no()}</span>
             </div>
             <div class="summary-row">
-              <span class="summary-label">Theme</span>
-              <span class="summary-value">{selectedTheme === 'dark' ? 'Dark' : 'Light'}</span>
+              <span class="summary-label">{m.wizard_summary_theme()}</span>
+              <span class="summary-value">{selectedTheme === 'dark' ? m.wizard_theme_dark() : m.wizard_theme_light()}</span>
             </div>
           </div>
           {#if saveError}
@@ -458,7 +479,7 @@
 
           {#if downloading || dlNodesStatus !== 'idle' || dlIpStatus !== 'idle'}
             <div class="dl-progress">
-              <p class="dl-heading">Setting up Ember…</p>
+              <p class="dl-heading">{m.wizard_setup_progress_heading()}</p>
               <div class="dl-item">
                 {#if dlNodesStatus === 'pending'}
                   <span class="spinner xs" aria-hidden="true"></span>
@@ -469,8 +490,8 @@
                 {:else}
                   <span class="dl-icon placeholder" aria-hidden="true"></span>
                 {/if}
-                <span>KAD bootstrap nodes (nodes.dat)</span>
-                {#if dlNodesStatus === 'error'}<span class="dl-warn">— skipped, will bootstrap from network</span>{/if}
+                <span>{m.wizard_dl_nodes_label()}</span>
+                {#if dlNodesStatus === 'error'}<span class="dl-warn">{m.wizard_dl_nodes_skipped()}</span>{/if}
               </div>
               <div class="dl-item">
                 {#if dlIpStatus === 'pending'}
@@ -482,8 +503,8 @@
                 {:else}
                   <span class="dl-icon placeholder" aria-hidden="true"></span>
                 {/if}
-                <span>IP filter (ipfilter.dat)</span>
-                {#if dlIpStatus === 'error'}<span class="dl-warn">— skipped, can be downloaded later in Security settings</span>{/if}
+                <span>{m.wizard_dl_ipfilter_label()}</span>
+                {#if dlIpStatus === 'error'}<span class="dl-warn">{m.wizard_dl_ipfilter_skipped()}</span>{/if}
               </div>
             </div>
           {/if}
@@ -494,7 +515,7 @@
     <!-- Footer -->
     <div class="wizard-footer">
       {#if step > 1 && !saving}
-        <button type="button" class="btn-back" onclick={goBack}>Back</button>
+        <button type="button" class="btn-back" onclick={goBack}>{m.common_back()}</button>
       {:else}
         <div></div>
       {/if}
@@ -502,16 +523,16 @@
       <div class="footer-right">
         {#if step < TOTAL_STEPS}
           <button type="button" class="btn-next" onclick={goNext} disabled={!canAdvance}>
-            {step === 1 ? "Get Started" : "Next"}
+            {step === 1 ? m.wizard_get_started() : m.common_next()}
           </button>
         {:else}
           <button type="button" class="btn-finish" onclick={finish} disabled={saving || downloading}>
             {#if saving}
-              <span class="spinner sm"></span> Saving...
+              <span class="spinner sm"></span> {m.wizard_saving()}
             {:else if downloading}
-              <span class="spinner sm"></span> Downloading...
+              <span class="spinner sm"></span> {m.wizard_downloading()}
             {:else}
-              Launch Ember
+              {m.wizard_launch()}
             {/if}
           </button>
         {/if}
