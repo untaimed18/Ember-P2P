@@ -3,6 +3,7 @@
   import { getReputationStats, type ReputationStatsInfo } from '$lib/api/reputation';
   import { formatBytes, formatSpeed as formatRate, formatDurationSecs as formatDuration } from '$lib/utils';
   import { onMount } from 'svelte';
+  import * as m from '$lib/paraglide/messages';
 
   let stats = $state<TransferStats | null>(null);
   let loading = $state(true);
@@ -109,10 +110,10 @@
   let overheadRows = $derived.by<OverheadRow[]>(() => {
     if (!stats) return [];
     const rows: OverheadRow[] = [
-      { key: 'server', label: 'Server', value: stats.overhead_server, cls: 'oh-server' },
-      { key: 'kad', label: 'KAD', value: stats.overhead_kad, cls: 'oh-kad' },
-      { key: 'srcex', label: 'Source Exchange', value: stats.overhead_source_exchange, cls: 'oh-srcex' },
-      { key: 'freq', label: 'File Requests', value: stats.overhead_file_request, cls: 'oh-freq' },
+      { key: 'server', label: m.stats_overhead_server(), value: stats.overhead_server, cls: 'oh-server' },
+      { key: 'kad', label: m.stats_overhead_kad(), value: stats.overhead_kad, cls: 'oh-kad' },
+      { key: 'srcex', label: m.stats_overhead_source_exchange(), value: stats.overhead_source_exchange, cls: 'oh-srcex' },
+      { key: 'freq', label: m.stats_overhead_file_requests(), value: stats.overhead_file_request, cls: 'oh-freq' },
     ];
     return rows.sort((a, b) => b.value - a.value);
   });
@@ -132,28 +133,28 @@
   function formatSessionTime(secs: number): string {
     if (secs <= 0) return '0s';
     const h = Math.floor(secs / 3600);
-    const m = Math.floor((secs % 3600) / 60);
+    const min = Math.floor((secs % 3600) / 60);
     const s = secs % 60;
-    if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
-    if (m > 0) return `${m}m ${String(s).padStart(2, '0')}s`;
+    if (h > 0) return `${h}h ${String(min).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
+    if (min > 0) return `${min}m ${String(s).padStart(2, '0')}s`;
     return `${s}s`;
   }
 </script>
 
 <div class="page-header">
-  <h2>Statistics</h2>
+  <h2>{m.stats_title()}</h2>
 </div>
 
 <div class="page-content">
   {#if loading}
     <div class="empty-state">
       <div class="spinner lg"></div>
-      <p>Loading statistics...</p>
+      <p>{m.stats_loading()}</p>
     </div>
   {:else if error}
     <div class="empty-state">
       <p style="color: var(--danger)">{error}</p>
-      <button onclick={loadStats}>Retry</button>
+      <button onclick={loadStats}>{m.common_retry()}</button>
     </div>
   {:else if stats}
 
@@ -168,7 +169,7 @@
         </div>
         <div class="hero-body">
           <span class="hero-value">{formatRate(stats.session_down_rate)}</span>
-          <span class="hero-label">Download Rate</span>
+          <span class="hero-label">{m.stats_download_rate()}</span>
         </div>
       </div>
       <div class="hero-card">
@@ -180,7 +181,7 @@
         </div>
         <div class="hero-body">
           <span class="hero-value">{formatRate(stats.session_up_rate)}</span>
-          <span class="hero-label">Upload Rate</span>
+          <span class="hero-label">{m.stats_upload_rate()}</span>
         </div>
       </div>
       <div class="hero-card">
@@ -194,7 +195,7 @@
         </div>
         <div class="hero-body">
           <span class="hero-value">{formatSessionTime(sessionTime)}</span>
-          <span class="hero-label">Session Time</span>
+          <span class="hero-label">{m.stats_session_time()}</span>
         </div>
       </div>
       <div class="hero-card">
@@ -208,7 +209,7 @@
         </div>
         <div class="hero-body">
           <span class="hero-value" class:ratio-good={ratio !== null && ratio >= 1} class:ratio-low={ratio !== null && ratio < 1}>{ratioLabel}</span>
-          <span class="hero-label">Upload Ratio</span>
+          <span class="hero-label">{m.stats_upload_ratio()}</span>
         </div>
       </div>
     </div>
@@ -224,16 +225,16 @@
               <line x1="3" y1="13.5" x2="13" y2="13.5"/>
             </svg>
           </span>
-          <h3>Session Downloads</h3>
+          <h3>{m.stats_session_downloads()}</h3>
         </div>
         <div class="transfer-grid">
           <div class="big-stat">
             <span class="big-value down-color">{formatBytes(stats.session_downloaded)}</span>
-            <span class="big-sub">transferred</span>
+            <span class="big-sub">{m.stats_transferred()}</span>
           </div>
           <div class="big-stat">
             <span class="big-value">{stats.session_completed_down}</span>
-            <span class="big-sub">completed</span>
+            <span class="big-sub">{m.stats_completed()}</span>
           </div>
         </div>
       </section>
@@ -247,16 +248,16 @@
               <line x1="3" y1="2.5" x2="13" y2="2.5"/>
             </svg>
           </span>
-          <h3>Session Uploads</h3>
+          <h3>{m.stats_session_uploads()}</h3>
         </div>
         <div class="transfer-grid">
           <div class="big-stat">
             <span class="big-value up-color">{formatBytes(stats.session_uploaded)}</span>
-            <span class="big-sub">transferred</span>
+            <span class="big-sub">{m.stats_transferred()}</span>
           </div>
           <div class="big-stat">
             <span class="big-value">{stats.session_completed_up}</span>
-            <span class="big-sub">completed</span>
+            <span class="big-sub">{m.stats_completed()}</span>
           </div>
         </div>
       </section>
@@ -270,38 +271,38 @@
             <polyline points="3,3 13,3 8,8 13,13 3,13"/>
           </svg>
         </span>
-        <h3>All-Time Totals</h3>
+        <h3>{m.stats_all_time_totals()}</h3>
         {#if stats.stat_last_reset}
           <span
             class="head-aside"
-            title={`Cumulative counters started on ${new Date(stats.stat_last_reset * 1000).toLocaleString()}`}
-          >Since {formatSinceDate(stats.stat_last_reset)}</span>
+            title={m.stats_cumulative_started_on({ when: new Date(stats.stat_last_reset * 1000).toLocaleString() })}
+          >{m.stats_since({ date: formatSinceDate(stats.stat_last_reset) })}</span>
         {/if}
       </div>
       <div class="cum-grid">
         <div class="cum-item">
-          <span class="cum-label">Total Downloaded</span>
+          <span class="cum-label">{m.stats_total_downloaded()}</span>
           <span class="cum-value down-color">{formatBytes(totalDown)}</span>
         </div>
         <div class="cum-item">
-          <span class="cum-label">Total Uploaded</span>
+          <span class="cum-label">{m.stats_total_uploaded()}</span>
           <span class="cum-value up-color">{formatBytes(totalUp)}</span>
         </div>
         <div class="cum-item">
-          <span class="cum-label">Total Connection Time</span>
+          <span class="cum-label">{m.stats_total_connection_time()}</span>
           <span class="cum-value">{formatDuration(cumConnTime)}</span>
         </div>
         <div class="cum-item">
-          <span class="cum-label">Completed Downloads</span>
+          <span class="cum-label">{m.stats_completed_downloads()}</span>
           <!-- cum_ excludes current session (DB snapshot at startup), so addition is intentional -->
           <span class="cum-value">{stats.cum_completed_down + stats.session_completed_down}</span>
         </div>
         <div class="cum-item">
-          <span class="cum-label">Completed Uploads</span>
+          <span class="cum-label">{m.stats_completed_uploads()}</span>
           <span class="cum-value">{stats.cum_completed_up + stats.session_completed_up}</span>
         </div>
         <div class="cum-item">
-          <span class="cum-label">Upload : Download Ratio</span>
+          <span class="cum-label">{m.stats_upload_download_ratio()}</span>
           <span class="cum-value" class:ratio-good={ratio !== null && ratio >= 1} class:ratio-low={ratio !== null && ratio < 1}>{ratioLabel}</span>
         </div>
       </div>
@@ -315,8 +316,8 @@
             <polyline points="9,1.5 4,9 8,9 7,14.5 12,7 8,7"/>
           </svg>
         </span>
-        <h3>Protocol Overhead</h3>
-        <span class="head-aside">{formatBytes(totalOverhead)} total</span>
+        <h3>{m.stats_protocol_overhead()}</h3>
+        <span class="head-aside">{m.stats_overhead_total({ bytes: formatBytes(totalOverhead) })}</span>
       </div>
 
       <div class="overhead-bars">
@@ -330,14 +331,14 @@
           </div>
         {/each}
         {#if totalOverhead === 0}
-          <p class="oh-empty">No overhead recorded yet</p>
+          <p class="oh-empty">{m.stats_no_overhead()}</p>
         {/if}
       </div>
 
       <div class="overhead-session-row">
-        <span class="oh-label">Session Down Overhead</span>
+        <span class="oh-label">{m.stats_session_down_overhead()}</span>
         <span class="oh-value">{formatBytes(stats.session_down_overhead)}</span>
-        <span class="oh-label">Session Up Overhead</span>
+        <span class="oh-label">{m.stats_session_up_overhead()}</span>
         <span class="oh-value">{formatBytes(stats.session_up_overhead)}</span>
       </div>
     </section>
@@ -361,16 +362,16 @@
               <polyline points="5.5,8 7.5,10 10.5,6"/>
             </svg>
           </span>
-          <h3>Peer Reputation</h3>
-          <span class="head-aside">Session tracker</span>
+          <h3>{m.stats_peer_reputation()}</h3>
+          <span class="head-aside">{m.stats_session_tracker()}</span>
         </div>
         <div class="reputation-row">
           <div class="rep-stat">
-            <span class="rep-label">Tracked peers</span>
+            <span class="rep-label">{m.stats_tracked_peers()}</span>
             <span class="rep-value">{repStats.tracked_peers.toLocaleString()}</span>
           </div>
           <div class="rep-stat">
-            <span class="rep-label">Banned peers</span>
+            <span class="rep-label">{m.stats_banned_peers()}</span>
             <span class="rep-value" class:rep-danger={repStats.banned_peers > 0}>
               {repStats.banned_peers.toLocaleString()}
             </span>

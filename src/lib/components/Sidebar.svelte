@@ -80,7 +80,7 @@
   // Rendered as a footer entry rather than mixed into the main nav so
   // it doesn't take an Alt+N keyboard slot away from the user-facing
   // pages and reads visually as "tooling, not a feature page".
-  const devNavItem: NavItem = { href: '/dev/ember', label: 'Ember Dev', id: 'dev-ember' };
+  const devNavItem: NavItem = { href: '/dev/ember', label: () => m.nav_dev_ember(), id: 'dev-ember' };
 
   function isActive(item: NavItem, pathname: string): boolean {
     return pathname === item.href || (item.aliases?.includes(pathname) ?? false);

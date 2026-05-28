@@ -14,6 +14,7 @@
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { onMount, untrack } from 'svelte';
+  import * as m from '$lib/paraglide/messages';
 
   let stats: IpFilterStats | null = $state(null);
   let loading = $state(true);
@@ -160,7 +161,7 @@
   }
 
   function toErrorMsg(e: unknown): string {
-    return e instanceof Error ? e.message : typeof e === 'string' ? e : 'Operation failed';
+    return e instanceof Error ? e.message : typeof e === 'string' ? e : m.error_operation_failed();
   }
 
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
@@ -237,11 +238,11 @@
   async function handleUrlFetch() {
     const trimmed = customUrl.trim();
     if (!trimmed) {
-      error = 'Enter a URL';
+      error = m.security_enter_url();
       return;
     }
     if (!trimmed.toLowerCase().startsWith('https://')) {
-      error = 'URL must start with https://';
+      error = m.security_url_must_be_https();
       return;
     }
     urlFetching = true;
@@ -273,17 +274,17 @@
     const endIp = newEndIp.trim();
     const desc = newDescription.trim();
     if (!startIp || !endIp) {
-      error = 'Both start and end IP are required';
+      error = m.security_both_ips_required();
       return;
     }
     if (!isValidIpv4(startIp) || !isValidIpv4(endIp)) {
-      error = 'Invalid IP address format. Use dotted decimal (e.g. 192.168.1.0)';
+      error = m.security_invalid_ip_format();
       return;
     }
     error = null;
     try {
       await addIpFilterRange(startIp, endIp, desc);
-      flash(`Added range ${startIp} \u2014 ${endIp}`);
+      flash(m.security_added_range({ start: startIp, end: endIp }));
       newStartIp = '';
       newEndIp = '';
       newDescription = '';
@@ -306,7 +307,7 @@
     error = null;
     try {
       await removeIpFilterRange(entry.start_ip, entry.end_ip);
-      flash(`Removed range ${entry.start_ip} \u2014 ${entry.end_ip}`);
+      flash(m.security_removed_range({ start: entry.start_ip, end: entry.end_ip }));
       await loadStats();
     } catch (e: unknown) {
       error = toErrorMsg(e);
@@ -336,13 +337,13 @@
 </script>
 
 <div class="page-header">
-  <h2>Security</h2>
+  <h2>{m.security_title()}</h2>
   <div class="header-actions">
     <button onclick={handleDownload} disabled={downloading}>
-      {downloading ? 'Downloading\u2026' : 'Download IP Filter'}
+      {downloading ? m.security_downloading() : m.security_download_ipfilter()}
     </button>
     <button class="ghost" onclick={handleImport} disabled={importing}>
-      {importing ? 'Importing\u2026' : 'Import File'}
+      {importing ? m.security_importing() : m.security_import_file()}
     </button>
     <!--
       Toggle the custom-URL form. Kept as a collapsible row so the
@@ -356,15 +357,15 @@
       aria-expanded={showUrlForm}
       aria-controls="ipfilter-url-form"
     >
-      {showUrlForm ? 'Cancel URL' : 'From URL\u2026'}
+      {showUrlForm ? m.security_cancel_url() : m.security_from_url()}
     </button>
-    <button class="ghost" onclick={loadStats}>Refresh</button>
+    <button class="ghost" onclick={loadStats}>{m.common_refresh()}</button>
   </div>
 </div>
 
 {#if showUrlForm}
-  <div id="ipfilter-url-form" class="ipfilter-url-form" role="group" aria-label="Fetch ipfilter from URL">
-    <label for="ipfilter-url-input" class="sr-only">IP filter URL</label>
+  <div id="ipfilter-url-form" class="ipfilter-url-form" role="group" aria-label={m.security_fetch_url_aria()}>
+    <label for="ipfilter-url-input" class="sr-only">{m.security_url_label()}</label>
     <input
       id="ipfilter-url-input"
       type="url"
@@ -374,7 +375,7 @@
       onkeydown={(e) => { if (e.key === 'Enter' && !urlFetching) handleUrlFetch(); }}
     />
     <button onclick={handleUrlFetch} disabled={urlFetching || !customUrl.trim()}>
-      {urlFetching ? 'Fetching\u2026' : 'Fetch'}
+      {urlFetching ? m.security_fetching() : m.security_fetch()}
     </button>
   </div>
 {/if}
@@ -383,7 +384,7 @@
   {#if error}
     <div class="banner error-banner">
       <span>{error}</span>
-      <button class="ghost" onclick={() => (error = null)}>Dismiss</button>
+      <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
     </div>
   {/if}
   {#if successMsg}
@@ -393,29 +394,29 @@
   {/if}
 
   {#if loading && !stats}
-    <div class="empty-state"><p>Loading IP filter data&hellip;</p></div>
+    <div class="empty-state"><p>{m.security_loading()}</p></div>
   {:else if stats}
     <!-- Controls bar: toggles + stats inline -->
     <div class="controls-bar">
       <div class="controls-left">
-        <label class="toggle-switch" title="Enable or disable the IP filter">
+        <label class="toggle-switch" title={m.security_toggle_enabled_title()}>
           <input type="checkbox" checked={stats.enabled} onchange={handleToggleEnabled} />
           <span class="switch-track"></span>
-          <span class="switch-label">IP Filter</span>
+          <span class="switch-label">{m.security_ipfilter_label()}</span>
         </label>
-        <label class="toggle-switch" title="Block private and reserved IP ranges (10.x, 172.16.x, 192.168.x, etc.)">
+        <label class="toggle-switch" title={m.security_toggle_private_title()}>
           <input type="checkbox" checked={stats.block_private} onchange={handleTogglePrivate} />
           <span class="switch-track"></span>
-          <span class="switch-label">Block Private IPs</span>
+          <span class="switch-label">{m.security_block_private_label()}</span>
         </label>
         <button class="ghost add-range-btn" onclick={() => (showAddForm = !showAddForm)}>
-          {showAddForm ? 'Cancel' : '+ Add Range'}
+          {showAddForm ? m.common_cancel() : m.security_add_range()}
         </button>
       </div>
       <div class="controls-right">
-        <span class="inline-stat">{stats.range_count.toLocaleString()} ranges</span>
+        <span class="inline-stat">{m.security_ranges_count({ count: stats.range_count.toLocaleString() })}</span>
         <span class="inline-sep">&middot;</span>
-        <span class="inline-stat hits-stat">{stats.total_hits.toLocaleString()} hits</span>
+        <span class="inline-stat hits-stat">{m.security_hits_count({ count: stats.total_hits.toLocaleString() })}</span>
       </div>
     </div>
 
@@ -423,19 +424,19 @@
       <div class="add-form">
         <div class="add-form-inner">
           <label class="add-field">
-            <span class="add-field-label">Start IP</span>
-            <input bind:value={newStartIp} placeholder="e.g. 1.0.0.0" class="ip-input" aria-label="Start IP" />
+            <span class="add-field-label">{m.security_start_ip()}</span>
+            <input bind:value={newStartIp} placeholder={m.security_start_ip_placeholder()} class="ip-input" aria-label={m.security_start_ip()} />
           </label>
           <span class="range-sep" aria-hidden="true">&mdash;</span>
           <label class="add-field">
-            <span class="add-field-label">End IP</span>
-            <input bind:value={newEndIp} placeholder="e.g. 1.0.0.255" class="ip-input" aria-label="End IP" />
+            <span class="add-field-label">{m.security_end_ip()}</span>
+            <input bind:value={newEndIp} placeholder={m.security_end_ip_placeholder()} class="ip-input" aria-label={m.security_end_ip()} />
           </label>
           <label class="add-field add-field-grow">
-            <span class="add-field-label">Description (optional)</span>
-            <input bind:value={newDescription} placeholder="Why is this range blocked?" class="desc-input" aria-label="Description" />
+            <span class="add-field-label">{m.security_description_optional()}</span>
+            <input bind:value={newDescription} placeholder={m.security_description_placeholder()} class="desc-input" aria-label={m.security_description_optional()} />
           </label>
-          <button class="add-form-submit" onclick={handleAddRange}>Add</button>
+          <button class="add-form-submit" onclick={handleAddRange}>{m.common_add()}</button>
         </div>
       </div>
     {/if}
@@ -452,14 +453,16 @@
           type="text"
           class="search-input"
           bind:value={searchQuery}
-          placeholder="Search IP ranges or descriptions&hellip;"
+          placeholder={m.security_search_placeholder()}
         />
         {#if searchQuery}
-          <button class="search-clear" onclick={() => { searchQuery = ''; }} title="Clear search" aria-label="Clear search">&times;</button>
+          <button class="search-clear" onclick={() => { searchQuery = ''; }} title={m.security_clear_search()} aria-label={m.security_clear_search()}>&times;</button>
         {/if}
       </div>
       <span class="result-count">
-        {filteredEntries.length.toLocaleString()} range{filteredEntries.length !== 1 ? 's' : ''}
+        {filteredEntries.length === 1
+          ? m.security_range_count_one()
+          : m.security_range_count_other({ count: filteredEntries.length.toLocaleString() })}
       </span>
     </div>
 
@@ -468,8 +471,8 @@
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="56" height="56" aria-hidden="true">
           <path d="M12 2l7 4v6c0 4.4-3 8.5-7 10-4-1.5-7-5.6-7-10V6l7-4z"></path>
         </svg>
-        <p>No IP ranges loaded</p>
-        <p class="sub">Download or import an ipfilter.dat to get started</p>
+        <p>{m.security_empty_no_ranges()}</p>
+        <p class="sub">{m.security_empty_no_ranges_sub()}</p>
       </div>
     {:else if filteredEntries.length === 0}
       <div class="empty-state">
@@ -477,8 +480,8 @@
           <circle cx="11" cy="11" r="8"></circle>
           <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
         </svg>
-        <p>No matching ranges</p>
-        <p class="sub">Try a different search term</p>
+        <p>{m.security_empty_no_matches()}</p>
+        <p class="sub">{m.security_empty_no_matches_sub()}</p>
       </div>
     {:else}
       <div
@@ -495,7 +498,7 @@
                 aria-sort={ariaSort('range')}
                 onclick={() => toggleSort('range')}
               >
-                <span class="th-content">IP Range{sortArrow('range')}</span>
+                <span class="th-content">{m.security_col_ip_range()}{sortArrow('range')}</span>
               </th>
               <th
                 class="sortable col-desc"
@@ -503,7 +506,7 @@
                 aria-sort={ariaSort('description')}
                 onclick={() => toggleSort('description')}
               >
-                <span class="th-content">Description{sortArrow('description')}</span>
+                <span class="th-content">{m.security_col_description()}{sortArrow('description')}</span>
               </th>
               <th
                 class="sortable col-hits"
@@ -511,7 +514,7 @@
                 aria-sort={ariaSort('hits')}
                 onclick={() => toggleSort('hits')}
               >
-                <span class="th-content">Hits{sortArrow('hits')}</span>
+                <span class="th-content">{m.security_col_hits()}{sortArrow('hits')}</span>
               </th>
               <th class="col-actions"></th>
             </tr>
@@ -544,8 +547,8 @@
                   <button
                     class="ghost danger btn-remove"
                     onclick={() => handleRemoveRange(entry)}
-                    title="Remove this range"
-                    aria-label={`Remove range ${entry.start_ip} to ${entry.end_ip}`}
+                    title={m.security_remove_range_title()}
+                    aria-label={m.security_remove_range_aria({ start: entry.start_ip, end: entry.end_ip })}
                   >&times;</button>
                 </td>
               </tr>
@@ -562,9 +565,11 @@
 
 <ConfirmDialog
   bind:open={confirmRemoveOpen}
-  title="Remove IP Range"
-  message={pendingRemoveEntry ? `Remove the blocked range ${pendingRemoveEntry.start_ip} \u2192 ${pendingRemoveEntry.end_ip}?` : 'Remove this IP range?'}
-  confirmLabel="Remove"
+  title={m.security_confirm_remove_title()}
+  message={pendingRemoveEntry
+    ? m.security_confirm_remove_message({ start: pendingRemoveEntry.start_ip, end: pendingRemoveEntry.end_ip })
+    : m.security_confirm_remove_message_generic()}
+  confirmLabel={m.common_remove()}
   danger={true}
   onconfirm={confirmRemoveRange}
   oncancel={() => { pendingRemoveEntry = null; }}
