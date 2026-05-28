@@ -7,6 +7,7 @@
   import { onMount } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
   import { toastWarning } from '$lib/stores/toast';
+  import * as m from '$lib/paraglide/messages';
   import {
     onlineFriends as onlineFriendsStore,
     unreadCounts as unreadCountsStore,
@@ -139,9 +140,9 @@
     if (!ts) return '';
     const now = Date.now() / 1000;
     const diff = now - ts;
-    if (diff < 60) return 'Just now';
-    if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-    if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+    if (diff < 60) return m.friends_just_now();
+    if (diff < 3600) return m.friends_minutes_ago({ minutes: Math.floor(diff / 60) });
+    if (diff < 86400) return m.friends_hours_ago({ hours: Math.floor(diff / 3600) });
     return new Date(ts * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
   }
 
@@ -163,7 +164,7 @@
     processingRequests = new Set(processingRequests);
     try {
       await acceptFriendRequest(req.sender_hash);
-      flash(`Accepted friend request from ${req.sender_nickname || req.sender_hash.slice(0, 8) + '\u2026'}`);
+      flash(m.friends_accepted_request({ name: req.sender_nickname || req.sender_hash.slice(0, 8) + '\u2026' }));
       await reloadFriendRequests();
       await loadFriends();
     } catch (e: unknown) {
@@ -238,19 +239,19 @@
       let msg: string;
       switch (reason) {
         case 'firewalled':
-          msg = `${name} is behind a firewall. They may need to enable port forwarding, or wait for them to find you.`;
+          msg = m.friends_search_firewalled({ name });
           break;
         case 'not_found':
-          msg = `${name} could not be found on the network. Make sure they're online with Ember.`;
+          msg = m.friends_search_not_found({ name });
           break;
         case 'timeout':
-          msg = `${name} appears to be offline or unreachable.`;
+          msg = m.friends_search_timeout({ name });
           break;
         case 'refused':
-          msg = `${name} went offline.`;
+          msg = m.friends_search_refused({ name });
           break;
         default:
-          msg = `Could not reach ${name}.`;
+          msg = m.friends_search_generic({ name });
       }
       toastWarning(msg);
     }).then(fn => { if (destroyed) fn(); else unlistenFns.push(fn); });
@@ -283,7 +284,7 @@
   }
 
   function toErr(e: unknown): string {
-    return e instanceof Error ? e.message : typeof e === 'string' ? e : 'Operation failed';
+    return e instanceof Error ? e.message : typeof e === 'string' ? e : m.error_operation_failed();
   }
 
   async function loadFriends() {
@@ -311,20 +312,20 @@
     addError = null;
     const hash = newHash.trim();
     const nick = newNickname.trim();
-    if (!hash) { addError = 'User hash is required'; return; }
-    if (!isValidHash(hash)) { addError = 'Must be exactly 32 hex characters'; return; }
+    if (!hash) { addError = m.friends_validation_hash_required(); return; }
+    if (!isValidHash(hash)) { addError = m.friends_validation_hash_format(); return; }
     if (myHash && hash.toLowerCase() === myHash.toLowerCase()) {
-      addError = 'You cannot add yourself as a friend';
+      addError = m.friends_validation_self_add();
       return;
     }
     if (friends.some((f) => f.user_hash.toLowerCase() === hash.toLowerCase())) {
-      addError = 'This user is already in your friend list';
+      addError = m.friends_validation_already_friend();
       return;
     }
     adding = true;
     try {
       await addFriend(hash, nick || undefined);
-      flash(`Added friend ${nick || hash.slice(0, 8) + '\u2026'}`);
+      flash(m.friends_added({ name: nick || hash.slice(0, 8) + '\u2026' }));
       newHash = '';
       newNickname = '';
       showAddForm = false;
@@ -353,7 +354,7 @@
       // open would show a session for someone who is no longer in
       // the user's friend list and silently fail to send.
       removeChatForFriend(f.user_hash);
-      flash(`Removed ${f.nickname || f.user_hash.slice(0, 8) + '\u2026'}`);
+      flash(m.friends_removed({ name: f.nickname || f.user_hash.slice(0, 8) + '\u2026' }));
       await loadFriends();
     } catch (e: unknown) {
       error = toErr(e);
@@ -433,9 +434,9 @@
 
 <ConfirmDialog
   bind:open={confirmRemoveOpen}
-  title="Remove Friend"
-  message={`Remove ${pendingRemove ? (pendingRemove.nickname || pendingRemove.user_hash.slice(0, 8) + '\u2026') : ''} from your friend list? They will lose upload priority.`}
-  confirmLabel="Remove"
+  title={m.friends_confirm_remove_title()}
+  message={m.friends_confirm_remove_message({ name: pendingRemove ? (pendingRemove.nickname || pendingRemove.user_hash.slice(0, 8) + '\u2026') : '' })}
+  confirmLabel={m.common_remove()}
   danger={true}
   onconfirm={handleRemove}
 />
@@ -450,9 +451,9 @@
 />
 
 <div class="page-header">
-  <h2>Friends</h2>
+  <h2>{m.nav_friends()}</h2>
   <div class="header-actions">
-    <button class="ghost" onclick={loadFriends}>Refresh</button>
+    <button class="ghost" onclick={loadFriends}>{m.common_refresh()}</button>
   </div>
 </div>
 
@@ -460,7 +461,7 @@
   {#if error}
     <div class="banner error-banner">
       <span>{error}</span>
-      <button class="ghost" onclick={() => (error = null)}>Dismiss</button>
+      <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
     </div>
   {/if}
   {#if successMsg}
@@ -481,7 +482,7 @@
           </svg>
         </div>
         <div class="my-id-info">
-          <span class="my-id-label">Your Friend ID</span>
+          <span class="my-id-label">{m.friends_your_id_label()}</span>
           <span class="my-id-hash">{myHash}</span>
         </div>
       </div>
@@ -490,13 +491,13 @@
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="3 8 7 12 13 4"/>
           </svg>
-          Copied
+          {m.common_copied()}
         {:else}
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <rect x="5" y="5" width="9" height="9" rx="1.5"/>
             <path d="M3 11V3a1.5 1.5 0 011.5-1.5H11"/>
           </svg>
-          Copy
+          {m.common_copy()}
         {/if}
       </button>
     </div>
@@ -513,7 +514,11 @@
           <path d="M3.05 3.05a11 11 0 000 13.9"/>
           <path d="M16.95 3.05a11 11 0 010 13.9"/>
         </svg>
-        <span>Your Friend ID is <strong>discoverable</strong> &mdash; friends can find you on the network.</span>
+        <span>
+          {m.friends_discoverable_prefix()}
+          <strong>{m.friends_discoverable_emphasis()}</strong>
+          {m.friends_discoverable_suffix()}
+        </span>
       </div>
     </div>
   {/if}
@@ -528,15 +533,15 @@
           <circle cx="10" cy="14" r="0.5" fill="currentColor" stroke="none"/>
         </svg>
         <div class="firewall-text">
-          <strong>You are behind a firewall (LowID).</strong>
-          Friends can find you but won't be able to connect directly. Enable port forwarding or UPnP in your router to fix this.
+          <strong>{m.friends_firewall_title()}</strong>
+          {m.friends_firewall_body()}
         </div>
       </div>
       <button class="firewall-recheck" onclick={handleRecheckFirewall} disabled={recheckingFirewall}>
-        {recheckingFirewall ? 'Checking\u2026' : 'Recheck'}
+        {recheckingFirewall ? m.friends_firewall_checking() : m.friends_firewall_recheck()}
       </button>
       {#if recheckError}
-        <span class="firewall-recheck-error" role="status">Recheck failed: {recheckError}</span>
+        <span class="firewall-recheck-error" role="status">{m.friends_firewall_recheck_failed({ error: recheckError })}</span>
       {/if}
     </div>
   {/if}
@@ -545,7 +550,7 @@
   {#if friendRequests.length > 0}
     <div class="requests-section">
       <div class="requests-header">
-        <span class="requests-title">Friend Requests</span>
+        <span class="requests-title">{m.friends_requests_title()}</span>
         <span class="requests-badge">{friendRequests.length}</span>
       </div>
       <div class="requests-list">
@@ -568,35 +573,22 @@
                   escaping prevents XSS; this closes the
                   bidi-spoofing presentation gap.
                 -->
-                <bdi>{req.sender_nickname || '(unknown)'}</bdi>
+                <bdi>{req.sender_nickname || m.friends_unknown_sender()}</bdi>
                 {#if req.verified}
-                  <!-- "Verified" badge: the peer's identity was
-                       cryptographically confirmed on the session
-                       this request rode in on. On friend-connect
-                       dial sessions that's full proof of possession
-                       (perform_ember_auth signed-nonce round-trip);
-                       on regular upload/download sessions it's the
-                       offline BLAKE3 binding check (peer's pubkey
-                       matches their advertised hash). Either way,
-                       the peer is being internally consistent
-                       about which Ed25519 key backs their Ember
-                       identity — a hash-only spoofer fails this. -->
-                  <span class="request-badge request-badge-verified" title="Peer's Ember identity is cryptographically consistent on the session this request arrived on.">Verified</span>
+                  <!-- "Verified" badge: see commit history for the
+                       cryptographic semantics. -->
+                  <span class="request-badge request-badge-verified" title={m.friends_request_verified_title()}>{m.friends_request_verified()}</span>
                 {:else}
-                  <!-- Unverified: peer didn't advertise an Ed25519
-                       pubkey, the binding check failed, or
-                       (single-source transfer.rs path) the
-                       handshake doesn't yet parse OP_EMBER_HELLO.
-                       Still surfaces for user approval — only
-                       accept from someone you actually know. -->
-                  <span class="request-badge request-badge-unverified" title="Peer did not complete identity verification on this session. Only accept if you know who this is.">Unverified</span>
+                  <!-- Unverified: peer didn't complete identity
+                       verification on this session. -->
+                  <span class="request-badge request-badge-unverified" title={m.friends_request_unverified_title()}>{m.friends_request_unverified()}</span>
                 {/if}
               </span>
               <span class="request-hash" title={req.sender_hash}>{req.sender_hash.slice(0, 8)}&hellip;{req.sender_hash.slice(-6)}</span>
             </div>
             <div class="request-actions">
-              <button class="request-accept" onclick={() => handleAcceptRequest(req)} disabled={processingRequests.has(req.sender_hash)}>Accept</button>
-              <button class="request-reject" onclick={() => handleRejectRequest(req)} disabled={processingRequests.has(req.sender_hash)}>Reject</button>
+              <button class="request-accept" onclick={() => handleAcceptRequest(req)} disabled={processingRequests.has(req.sender_hash)}>{m.friends_accept()}</button>
+              <button class="request-reject" onclick={() => handleRejectRequest(req)} disabled={processingRequests.has(req.sender_hash)}>{m.friends_reject()}</button>
             </div>
           </div>
         {/each}
@@ -611,7 +603,7 @@
         class="ghost add-btn"
         onclick={() => { showAddForm = !showAddForm; addError = null; }}
       >
-        {showAddForm ? 'Cancel' : '+ Add Friend'}
+        {showAddForm ? m.common_cancel() : m.friends_add_friend()}
       </button>
     </div>
     <div class="controls-right">
@@ -626,14 +618,18 @@
             type="text"
             class="search-input"
             bind:value={searchQuery}
-            placeholder="Search&hellip;"
+            placeholder={m.common_search() + '…'}
           />
           {#if searchQuery}
-            <button class="search-clear" onclick={() => { searchQuery = ''; }} title="Clear search" aria-label="Clear search">&times;</button>
+            <button class="search-clear" onclick={() => { searchQuery = ''; }} title={m.friends_clear_search()} aria-label={m.friends_clear_search()}>&times;</button>
           {/if}
         </div>
       {/if}
-      <span class="inline-stat">{onlineFriends.size} online / {friends.length} friend{friends.length !== 1 ? 's' : ''}</span>
+      <span class="inline-stat">
+        {friends.length === 1
+          ? m.friends_online_count_one({ online: onlineFriends.size })
+          : m.friends_online_count_other({ online: onlineFriends.size, total: friends.length })}
+      </span>
     </div>
   </div>
 
@@ -643,7 +639,7 @@
         <input
           type="text"
           bind:value={newHash}
-          placeholder="Friend ID (32 hex characters)"
+          placeholder={m.friends_hash_placeholder()}
           maxlength="32"
           spellcheck="false"
           class="hash-input"
@@ -652,12 +648,12 @@
         <input
           type="text"
           bind:value={newNickname}
-          placeholder="Nickname (optional)"
+          placeholder={m.friends_nickname_placeholder()}
           maxlength="64"
           class="nick-input"
           onkeydown={addFormKeydown}
         />
-        <button onclick={handleAdd} disabled={!newHash.trim() || adding}>{adding ? 'Adding\u2026' : 'Add'}</button>
+        <button onclick={handleAdd} disabled={!newHash.trim() || adding}>{adding ? m.friends_adding() : m.common_add()}</button>
       </div>
       {#if addError}
         <div class="field-error">{addError}</div>
@@ -668,14 +664,16 @@
   {#if searchQuery.trim() && friends.length > 0}
     <div class="result-count-row">
       <span class="result-count">
-        {filtered.length} match{filtered.length !== 1 ? 'es' : ''}
+        {filtered.length === 1
+          ? m.friends_match_count_one()
+          : m.friends_match_count_other({ count: filtered.length })}
       </span>
     </div>
   {/if}
 
   {#if loading && friends.length === 0}
     <div class="empty-state">
-      <p>Loading friends&hellip;</p>
+      <p>{m.friends_loading()}</p>
     </div>
   {:else if friends.length === 0}
     <div class="empty-state">
@@ -689,14 +687,14 @@
           <line x1="33" y1="31" x2="39" y2="31"/>
         </svg>
       </div>
-      <p class="empty-title">No friends yet</p>
-      <p class="empty-sub">Share your Friend ID above so others can add you. Friends get priority upload slots &mdash; they jump to the front of your queue.</p>
-      <button class="empty-action" onclick={() => { showAddForm = true; addError = null; }}>+ Add Friend</button>
+      <p class="empty-title">{m.friends_empty_title()}</p>
+      <p class="empty-sub">{m.friends_empty_sub()}</p>
+      <button class="empty-action" onclick={() => { showAddForm = true; addError = null; }}>{m.friends_add_friend()}</button>
     </div>
   {:else if filtered.length === 0}
     <div class="empty-state">
-      <p class="empty-title">No matches</p>
-      <p class="empty-sub">Try a different search term</p>
+      <p class="empty-title">{m.friends_no_matches()}</p>
+      <p class="empty-sub">{m.friends_no_matches_sub()}</p>
     </div>
   {:else}
     {#snippet friendCard(f: FriendInfo, isOnline: boolean)}
@@ -723,51 +721,38 @@
                 use:autoFocus
               />
             {:else}
-              <button class="nick-btn" onclick={() => startEdit(f)} title="Click to edit nickname">
+              <button class="nick-btn" onclick={() => startEdit(f)} title={m.friends_edit_nickname_title()}>
                 <!-- `<bdi>` isolates the peer-supplied nickname from
-                     the surrounding UI text direction so an embedded
-                     RTL/LTR override character can't reorder
-                     neighbouring elements (Trojan-Source-style
-                     spoofing). Falls back to a non-peer string when
-                     the nickname is empty. -->
-                {#if f.nickname}<bdi>{f.nickname}</bdi>{:else}(no nickname){/if}
+                     the surrounding UI direction. -->
+                {#if f.nickname}<bdi>{f.nickname}</bdi>{:else}{m.friends_no_nickname()}{/if}
               </button>
             {/if}
             <span class="card-status-label">
               {#if searchingFriends.has(f.user_hash)}
-                <!-- Active rendezvous lookup / dial in flight for
-                     this friend. Distinct from the "Waiting for
-                     accept" idle state below — the spinner only
-                     animates while there's real network work
-                     happening, which keeps the UI honest about
-                     whether the app is doing something on the
-                     friend's behalf. -->
-                <span class="status-searching">Searching&hellip;</span>
+                <span class="status-searching">{m.friends_status_searching()}</span>
               {:else if !f.mutual}
-                <!-- We've added this peer but they haven't accepted
-                     our friend request yet (or we haven't seen the
-                     reciprocal request to accept on our side). No
-                     active search is running, so don't show the
-                     spinner — show a static label that reflects the
-                     idle "waiting on user action" state. -->
-                <span class="status-pending">Waiting for accept</span>
+                <span class="status-pending">{m.friends_status_waiting_accept()}</span>
               {:else if presence === 'online'}
-                <span class="status-online">Online</span>
+                <span class="status-online">{m.friends_status_online()}</span>
               {:else if f.last_seen}
-                Last seen {formatLastSeen(f.last_seen)}
+                {m.friends_status_last_seen({ when: formatLastSeen(f.last_seen) })}
               {:else}
-                Added {formatDate(f.added_at)}
+                {m.friends_status_added({ when: formatDate(f.added_at) })}
               {/if}
             </span>
             {#if unreadCounts.get(f.user_hash)}
-              <span class="card-unread-preview">{unreadCounts.get(f.user_hash)} unread message{(unreadCounts.get(f.user_hash) ?? 0) > 1 ? 's' : ''}</span>
+              <span class="card-unread-preview">
+                {(unreadCounts.get(f.user_hash) ?? 0) === 1
+                  ? m.friends_unread_one()
+                  : m.friends_unread_other({ count: unreadCounts.get(f.user_hash) ?? 0 })}
+              </span>
             {/if}
           </div>
           <button
             class="icon-btn copy-hash-btn"
             onclick={() => copyHash(f.user_hash)}
-            title={copiedHash === f.user_hash ? 'Copied!' : 'Copy Friend ID'}
-            aria-label={copiedHash === f.user_hash ? 'Copied Friend ID' : `Copy Friend ID for ${f.nickname || f.user_hash.slice(0, 8)}`}
+            title={copiedHash === f.user_hash ? m.friends_copied_title() : m.friends_copy_id_title()}
+            aria-label={copiedHash === f.user_hash ? m.friends_copied_id_aria() : m.friends_copy_id_aria({ name: f.nickname || f.user_hash.slice(0, 8) })}
           >
             {#if copiedHash === f.user_hash}
               <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -783,8 +768,8 @@
           <button
             class="icon-btn danger remove-btn"
             onclick={() => confirmRemoveFriend(f)}
-            title="Remove friend"
-            aria-label={`Remove friend ${f.nickname || f.user_hash.slice(0, 8)}`}
+            title={m.friends_remove_title()}
+            aria-label={m.friends_remove_aria({ name: f.nickname || f.user_hash.slice(0, 8) })}
           >
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <line x1="4" y1="4" x2="12" y2="12"/>
@@ -799,12 +784,12 @@
             class:has-unread={unreadCounts.get(f.user_hash)}
             onclick={() => openChat(f)}
             disabled={!f.mutual}
-            title={f.mutual ? 'Chat' : 'Waiting for friend to accept'}
+            title={f.mutual ? m.friends_action_chat() : m.friends_action_waiting_accept()}
           >
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <path d="M2 3h12v8H5l-3 3z"/>
             </svg>
-            Chat
+            {m.friends_action_chat()}
             {#if unreadCounts.get(f.user_hash)}
               <span class="unread-badge">{unreadCounts.get(f.user_hash)}</span>
             {/if}
@@ -813,12 +798,16 @@
             class="action-btn browse-action"
             onclick={() => openBrowse(f)}
             disabled={!f.mutual || !isOnline}
-            title={!f.mutual ? 'Waiting for friend to accept' : isOnline ? 'Browse files' : 'Browse (offline)'}
+            title={!f.mutual
+              ? m.friends_action_waiting_accept()
+              : isOnline
+                ? m.friends_action_browse_files()
+                : m.friends_action_browse_offline()}
           >
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <path d="M2 4h5l2 2h5v7H2z"/>
             </svg>
-            Browse
+            {m.friends_action_browse()}
           </button>
         </div>
       </div>
@@ -827,7 +816,7 @@
     {#if onlineFiltered.length > 0}
       <div class="section-divider">
         <span class="section-dot online-dot-label"></span>
-        <span class="section-label">Online &mdash; {onlineFiltered.length}</span>
+        <span class="section-label">{m.friends_section_online({ count: onlineFiltered.length })}</span>
       </div>
       <div class="cards-grid">
         {#each onlineFiltered as f (f.user_hash)}
@@ -839,7 +828,7 @@
     {#if offlineFiltered.length > 0}
       <div class="section-divider" class:mt-section={onlineFiltered.length > 0}>
         <span class="section-dot offline-dot-label"></span>
-        <span class="section-label">Offline &mdash; {offlineFiltered.length}</span>
+        <span class="section-label">{m.friends_section_offline({ count: offlineFiltered.length })}</span>
       </div>
       <div class="cards-grid">
         {#each offlineFiltered as f (f.user_hash)}

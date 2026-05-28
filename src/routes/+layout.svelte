@@ -14,6 +14,7 @@
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { applyDocumentLang } from '$lib/i18n';
+  import * as m from '$lib/paraglide/messages';
   import { getSettings, hideToTray, quitApp, setCloseBehavior } from '$lib/api/settings';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
@@ -181,8 +182,8 @@
           } else {
             console.error('Persistent settings fetch failure; blocking main app entry', settingsError);
             initError = settingsError instanceof Error
-              ? `Could not load app settings: ${settingsError.message}. Please restart the app.`
-              : 'Could not load app settings. Please restart the app.';
+              ? m.layout_settings_load_error_detail({ detail: settingsError.message })
+              : m.layout_settings_load_error();
           }
 
           releaseSplashWhenReady();
@@ -198,7 +199,7 @@
         cleanupTransferStore();
         cleanupSearchStore();
         cleanupFriendsStore();
-        initError = e instanceof Error ? e.message : 'Failed to initialize. Please restart the app.';
+        initError = e instanceof Error ? e.message : m.layout_init_failed();
         initialized = true;
         releaseSplashWhenReady();
       });
@@ -219,7 +220,7 @@
   });
 </script>
 
-<a href="#main-content" class="skip-to-content">Skip to content</a>
+<a href="#main-content" class="skip-to-content">{m.layout_skip_to_content()}</a>
 {#if splashVisible}
   <SplashScreen exiting={splashExiting} />
 {/if}
@@ -240,12 +241,12 @@
       {#if !initialized}
         <div class="init-loading">
           <div class="spinner lg"></div>
-          <p>Starting Ember...</p>
+          <p>{m.layout_starting()}</p>
         </div>
       {:else if initError}
         <div class="init-error">
           <p>{initError}</p>
-          <button onclick={() => location.reload()}>Retry</button>
+          <button onclick={() => location.reload()}>{m.layout_retry()}</button>
         </div>
       {:else}
         {@render children()}

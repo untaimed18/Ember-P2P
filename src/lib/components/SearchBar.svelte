@@ -1,7 +1,9 @@
 <script lang="ts">
+  import * as m from '$lib/paraglide/messages';
+
   let {
     value = $bindable(''),
-    placeholder = 'Search...',
+    placeholder = m.search_bar_placeholder(),
     onsubmit,
     recentKey,
     recentMax = 10,
@@ -149,7 +151,7 @@
         onkeydown={handleKeydown}
         onfocus={handleFocus}
         onblur={handleBlur}
-        aria-label="Search files"
+        aria-label={m.search_bar_aria()}
         role="combobox"
         aria-autocomplete="list"
         aria-expanded={showRecent}
@@ -165,12 +167,12 @@
         onkeydown={handleKeydown}
         onfocus={handleFocus}
         onblur={handleBlur}
-        aria-label="Search files"
+        aria-label={m.search_bar_aria()}
         autocomplete="off"
       />
     {/if}
     {#if value}
-      <button class="clear-btn" onclick={() => (value = '')} aria-label="Clear search">
+      <button class="clear-btn" onclick={() => (value = '')} aria-label={m.search_bar_clear()}>
         <svg viewBox="0 0 14 14" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
           <line x1="3.5" y1="3.5" x2="10.5" y2="10.5"/>
           <line x1="10.5" y1="3.5" x2="3.5" y2="10.5"/>
@@ -180,10 +182,10 @@
   </div>
 
   {#if recentKey && showRecent && recent.length > 0}
-    <div id="search-recent-list" class="recent-dropdown" role="listbox" aria-label="Recent searches">
+    <div id="search-recent-list" class="recent-dropdown" role="listbox" aria-label={m.search_bar_recent_searches()}>
       <div class="recent-header">
-        <span>Recent searches</span>
-        <button type="button" class="recent-clear" onclick={clearRecent}>Clear all</button>
+        <span>{m.search_bar_recent_searches()}</span>
+        <button type="button" class="recent-clear" onclick={clearRecent}>{m.search_bar_clear_all()}</button>
       </div>
       {#each recent as q, i}
         <div
@@ -207,7 +209,7 @@
           <button
             type="button"
             class="recent-remove"
-            aria-label="Remove {q} from recent"
+            aria-label={m.search_bar_remove_recent({ query: q })}
             onmousedown={(e) => { e.preventDefault(); removeRecent(q); }}
           >
             <svg viewBox="0 0 14 14" width="10" height="10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">

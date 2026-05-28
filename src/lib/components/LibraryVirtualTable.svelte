@@ -3,6 +3,7 @@
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { formatSize, formatDateWithYear as formatDate } from '$lib/utils';
   import { onMount, onDestroy, untrack } from 'svelte';
+  import * as m from '$lib/paraglide/messages';
 
   type SortField =
     | 'name'
@@ -19,25 +20,25 @@
 
   type LibraryColumn = {
     key: string;
-    label: string;
+    label: () => string;
     width: number;
     minWidth: number;
     sortField?: SortField;
   };
 
   const ALL_COLUMNS: LibraryColumn[] = [
-    { key: 'name',        label: 'Filename',    width: 280, minWidth: 140, sortField: 'name' },
-    { key: 'size',        label: 'Size',        width: 75,  minWidth: 56,  sortField: 'size' },
-    { key: 'type',        label: 'Type',        width: 70,  minWidth: 56,  sortField: 'extension' },
-    { key: 'priority',    label: 'Priority',    width: 72,  minWidth: 60,  sortField: 'priority' },
-    { key: 'transferred', label: 'Transferred', width: 90,  minWidth: 60,  sortField: 'bytes_transferred' },
-    { key: 'sources',     label: 'Peers',       width: 60,  minWidth: 50,  sortField: 'complete_sources' },
-    { key: 'shared',      label: 'Shared',      width: 80,  minWidth: 60 },
-    { key: 'hash',        label: 'File ID',     width: 120, minWidth: 80,  sortField: 'hash' },
-    { key: 'requests',    label: 'Requests',    width: 70,  minWidth: 50,  sortField: 'requests' },
-    { key: 'accepted',    label: 'Accepted',    width: 70,  minWidth: 50,  sortField: 'accepted' },
-    { key: 'folder',      label: 'Folder',      width: 100, minWidth: 60,  sortField: 'folder' },
-    { key: 'modified',    label: 'Modified',    width: 100, minWidth: 80,  sortField: 'modified_at' },
+    { key: 'name',        label: () => m.library_col_filename(),    width: 280, minWidth: 140, sortField: 'name' },
+    { key: 'size',        label: () => m.library_col_size(),        width: 75,  minWidth: 56,  sortField: 'size' },
+    { key: 'type',        label: () => m.library_col_type(),        width: 70,  minWidth: 56,  sortField: 'extension' },
+    { key: 'priority',    label: () => m.library_col_priority(),    width: 72,  minWidth: 60,  sortField: 'priority' },
+    { key: 'transferred', label: () => m.library_col_transferred(), width: 90,  minWidth: 60,  sortField: 'bytes_transferred' },
+    { key: 'sources',     label: () => m.library_col_peers(),       width: 60,  minWidth: 50,  sortField: 'complete_sources' },
+    { key: 'shared',      label: () => m.library_col_shared(),      width: 80,  minWidth: 60 },
+    { key: 'hash',        label: () => m.library_col_file_id(),     width: 120, minWidth: 80,  sortField: 'hash' },
+    { key: 'requests',    label: () => m.library_col_requests(),    width: 70,  minWidth: 50,  sortField: 'requests' },
+    { key: 'accepted',    label: () => m.library_col_accepted(),    width: 70,  minWidth: 50,  sortField: 'accepted' },
+    { key: 'folder',      label: () => m.library_col_folder(),      width: 100, minWidth: 60,  sortField: 'folder' },
+    { key: 'modified',    label: () => m.library_col_modified(),    width: 100, minWidth: 80,  sortField: 'modified_at' },
   ];
 
   const DEFAULT_HIDDEN = new Set(['hash', 'requests', 'accepted', 'folder']);
@@ -457,8 +458,8 @@
               checked={allChecked}
               indeterminate={someChecked && !allChecked}
               onchange={() => onToggleCheckAll?.()}
-              aria-label="Select all files"
-              title="Select all files"
+              aria-label={m.library_select_all_files()}
+              title={m.library_select_all_files()}
             />
           </th>
         {/if}
@@ -482,13 +483,13 @@
             ondragend={onDragEnd}
           >
             <span class="header-content">
-              {col.label}{col.sortField ? arrow(col.sortField) : ''}
+              {col.label()}{col.sortField ? arrow(col.sortField) : ''}
             </span>
             <button
               type="button"
               class="col-resize-handle"
               tabindex="-1"
-              aria-label="Resize {col.label} column"
+              aria-label={m.library_resize_column({ name: col.label() })}
               onmousedown={(e) => beginResize(e, col.key)}
               onclick={swallowClick}
             ></button>
@@ -523,7 +524,7 @@
                   type="checkbox"
                   checked={checkedPaths.has(file.path)}
                   onclick={(e) => { e.stopPropagation(); onToggleCheck(file.path, e.shiftKey); e.preventDefault(); }}
-                  aria-label="Select {file.name}"
+                  aria-label={m.library_select_file({ name: file.name })}
                 />
               </td>
             {/if}
@@ -537,11 +538,11 @@
               {:else if col.key === 'priority'}
                 <td class="cell-prio prio-{file.priority}">{priorityLabel(file.priority)}</td>
               {:else if col.key === 'hash'}
-                <td class="cell-hash" title={file.hash || 'Hashing...'}>
+                <td class="cell-hash" title={file.hash || m.library_hashing()}>
                   {#if file.hash}
                     {file.hash.substring(0, 16)}&hellip;
                   {:else}
-                    <span class="hashing-label">Hashing&hellip;</span>
+                    <span class="hashing-label">{m.library_hashing()}</span>
                   {/if}
                 </td>
               {:else if col.key === 'requests'}
@@ -559,21 +560,21 @@
               {:else if col.key === 'shared'}
                 <td class="cell-shared">
                   {#if !file.hash}
-                    <span class="hashing-label">Pending</span>
+                    <span class="hashing-label">{m.common_pending()}</span>
                   {:else if file.shared}
-                    <span class="shared-icon shared-yes" title="Shared">&#x2713;</span>
+                    <span class="shared-icon shared-yes" title={m.library_shared()}>&#x2713;</span>
                     {#if file.shared_kad || file.shared_ed2k || file.aich_hash}
                       <span class="shared-badges">
-                        {#if file.shared_kad}<span class="shared-badge kad" title="Published to KAD network">KAD</span>{/if}
-                        {#if file.shared_ed2k}<span class="shared-badge ed2k" title="Published to eD2K servers">eD2K</span>{/if}
-                        {#if file.aich_hash}<span class="shared-badge aich" title="AICH hash available — bad chunks can be identified without re-downloading the whole file">AICH</span>{/if}
+                        {#if file.shared_kad}<span class="shared-badge kad" title={m.library_published_kad()}>KAD</span>{/if}
+                        {#if file.shared_ed2k}<span class="shared-badge ed2k" title={m.library_published_ed2k()}>eD2K</span>{/if}
+                        {#if file.aich_hash}<span class="shared-badge aich" title={m.library_aich_available()}>AICH</span>{/if}
                       </span>
                     {/if}
                   {:else}
-                    <span class="shared-icon shared-no" title="Not shared">&#x2715;</span>
+                    <span class="shared-icon shared-no" title={m.library_not_shared()}>&#x2715;</span>
                     {#if file.aich_hash}
                       <span class="shared-badges">
-                        <span class="shared-badge aich" title="AICH hash available — bad chunks can be identified without re-downloading the whole file">AICH</span>
+                        <span class="shared-badge aich" title={m.library_aich_available()}>AICH</span>
                       </span>
                     {/if}
                   {/if}
@@ -591,14 +592,14 @@
 {#if colMenu}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
   <div class="col-ctx-menu" style="left:{colMenu.x}px;top:{colMenu.y}px;" onclick={(e) => e.stopPropagation()}>
-    <div class="col-ctx-title">Library Columns</div>
+    <div class="col-ctx-title">{m.library_columns_title()}</div>
     {#each orderedColumns.filter(c => c.key !== FIXED_KEY) as col (col.key)}
       <button class="col-ctx-item" onclick={() => toggleVisibility(col.key)}>
-        {colHidden[col.key] ? '\u2610' : '\u2611'} {col.label}
+        {colHidden[col.key] ? '\u2610' : '\u2611'} {col.label()}
       </button>
     {/each}
     <div class="col-ctx-sep"></div>
-    <button class="col-ctx-item" onclick={resetLayout}>Reset Columns</button>
+    <button class="col-ctx-item" onclick={resetLayout}>{m.library_reset_columns()}</button>
   </div>
 {/if}
 

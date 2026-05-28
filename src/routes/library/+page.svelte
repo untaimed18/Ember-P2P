@@ -33,6 +33,7 @@
 
   import { listen } from '@tauri-apps/api/event';
   import LibraryVirtualTable from '$lib/components/LibraryVirtualTable.svelte';
+  import * as m from '$lib/paraglide/messages';
 
   let folders: string[] = $state([]);
   let files: FileInfo[] = $state([]);
@@ -47,9 +48,9 @@
   let hashProgress: { current: number; total: number; file_name: string } | null = $state(null);
   let stoppedByUser = $state(false);
   let fileByPath = $derived.by(() => {
-    const m = new Map<string, FileInfo>();
-    for (const f of files) m.set(f.path, f);
-    return m;
+    const map = new Map<string, FileInfo>();
+    for (const f of files) map.set(f.path, f);
+    return map;
   });
   let selectedFile = $derived(selectedPath ? (fileByPath.get(selectedPath) ?? null) : null);
   let selectedHash = $derived.by(() => selectedFile?.hash || null);
@@ -80,7 +81,7 @@
       collectionLoading = true;
       collectionsOpen = true;
       loadedCollection = await loadCollection(selected as string);
-      toastSuccess(`Loaded collection "${loadedCollection.name}" with ${loadedCollection.files.length} files`);
+      toastSuccess(m.library_collection_loaded({ name: loadedCollection.name, count: loadedCollection.files.length }));
     } catch (e: unknown) {
       toastError(toErr(e));
       loadedCollection = null;
@@ -94,7 +95,7 @@
     downloadingCollection = true;
     try {
       const msg = await downloadCollectionFiles(loadedCollection.files);
-      toastSuccess(msg || `Queued ${loadedCollection.files.length} files for download`);
+      toastSuccess(msg || m.library_queued_files_download({ count: loadedCollection.files.length }));
     } catch (e: unknown) {
       toastError(toErr(e));
     } finally {
@@ -110,7 +111,7 @@
         loadedCollection.files.map((f) => formatEd2kLink(f.name, f.size, f.hash))
       );
       await navigator.clipboard.writeText(links.join('\n'));
-      toastSuccess(`Copied ${links.length} eD2K link${links.length !== 1 ? 's' : ''}`);
+      toastSuccess(links.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: links.length }));
     } catch (e: unknown) {
       toastError(toErr(e));
     } finally {
@@ -139,7 +140,7 @@
       .map((f) => f.hash)
       .filter((h): h is string => !!h);
     if (hashes.length === 0) {
-      toastWarning('Select at least one hashed file to build a collection.');
+      toastWarning(m.library_select_hashed_file());
       return;
     }
     openCreateDialog(hashes);
@@ -183,7 +184,7 @@
       const { save: saveDialog } = await import('@tauri-apps/plugin-dialog');
       const isBinary = newCollFormat === 'binary';
       const ext = isBinary ? 'emulecollection' : 'txt';
-      const filterName = isBinary ? 'eMule Collection' : 'eD2K Links (Text)';
+      const filterName = isBinary ? m.library_emule_collection() : m.library_ed2k_links_text();
       const safeName = sanitizeFilename(newCollName.trim());
       const outputPath = await saveDialog({
         defaultPath: `${safeName}.${ext}`,
@@ -195,7 +196,7 @@
         .filter((f) => selectedFileHashes.has(f.hash))
         .map((f) => ({ name: f.name, size: f.size, hash: f.hash, aich_hash: f.aich_hash }));
       const msg = await createCollection(newCollName.trim(), newCollAuthor.trim(), collFiles, outputPath, isBinary);
-      toastSuccess(msg || `Created collection "${newCollName.trim()}" with ${collFiles.length} files`);
+      toastSuccess(msg || m.library_collection_created({ name: newCollName.trim(), count: collFiles.length }));
       createCollectionOpen = false;
     } catch (e: unknown) {
       toastError(toErr(e));
@@ -237,12 +238,12 @@
     try {
       const { confirm } = await import('@tauri-apps/plugin-dialog');
       const confirmed = await confirm(
-        `Remove ${missingPathSet.size} missing file${missingPathSet.size !== 1 ? 's' : ''} from your library?\n\nThis only affects Ember's index — no files on disk are touched.`,
-        { title: 'Remove Missing Files', kind: 'warning' }
+        missingPathSet.size === 1 ? m.library_confirm_remove_missing_one() : m.library_confirm_remove_missing_other({ count: missingPathSet.size }),
+        { title: m.library_remove_missing_title(), kind: 'warning' }
       );
       if (!confirmed) return;
       const removed = await removeMissingFiles([...missingPathSet]);
-      toastSuccess(`Removed ${removed} missing file${removed !== 1 ? 's' : ''}`);
+      toastSuccess(removed === 1 ? m.library_removed_missing_one() : m.library_removed_missing_other({ count: removed }));
       missingPathSet = new Set();
       showMissingOnly = false;
       await refresh();
@@ -282,7 +283,7 @@
   }
 
   function folderDisplayName(path: string | null): string {
-    if (!path) return 'All folders';
+    if (!path) return m.library_all_folders();
     return path.split(/[\\/]/).filter(Boolean).pop() || path;
   }
 
@@ -348,7 +349,7 @@
   }
 
   function toErr(e: unknown): string {
-    return e instanceof Error ? e.message : typeof e === 'string' ? e : 'Operation failed';
+    return e instanceof Error ? e.message : typeof e === 'string' ? e : m.error_operation_failed();
   }
 
   async function handleAddFolder() {
@@ -372,9 +373,11 @@
       const { confirm } = await import('@tauri-apps/plugin-dialog');
       const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
       const body = stats > 0
-        ? `Remove "${displayName}" from your shared folders?\n\n${stats.toLocaleString()} file${stats !== 1 ? 's' : ''} will be removed from the index. No files on disk are touched.`
-        : `Remove "${displayName}" from your shared folders?\n\nNo files on disk are touched.`;
-      const confirmed = await confirm(body, { title: 'Remove Folder', kind: 'warning' });
+        ? (stats === 1
+            ? m.library_confirm_remove_folder_one({ name: displayName })
+            : m.library_confirm_remove_folder_other({ name: displayName, count: stats.toLocaleString() }))
+        : m.library_confirm_remove_folder_empty({ name: displayName });
+      const confirmed = await confirm(body, { title: m.library_remove_folder_title(), kind: 'warning' });
       if (!confirmed || !mounted) return;
       error = null;
       await removeSharedFolder(path);
@@ -546,7 +549,9 @@
     try {
       const count = await batchSetPriority(targets.map(f => f.path), priority);
       await refresh();
-      toastSuccess(`Set priority to ${priorityLabel(priority)} for ${count} file${count !== 1 ? 's' : ''}`);
+      toastSuccess(count === 1
+        ? m.library_set_priority_one({ priority: priorityLabel(priority) })
+        : m.library_set_priority_other({ priority: priorityLabel(priority), count }));
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -556,7 +561,7 @@
     try {
       const count = await batchShare(targets.map(f => f.path));
       await refresh();
-      toastSuccess(`Shared ${count} file${count !== 1 ? 's' : ''}`);
+      toastSuccess(count === 1 ? m.library_shared_one() : m.library_shared_other({ count }));
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -566,7 +571,7 @@
     try {
       const count = await batchUnshare(targets.map(f => f.path));
       await refresh();
-      toastSuccess(`Unshared ${count} file${count !== 1 ? 's' : ''}`);
+      toastSuccess(count === 1 ? m.library_unshared_one() : m.library_unshared_other({ count }));
     } catch (e: unknown) { error = toErr(e); }
   }
 
@@ -577,8 +582,10 @@
     try {
       const { confirm } = await import('@tauri-apps/plugin-dialog');
       const confirmed = await confirm(
-        `Delete ${targets.length.toLocaleString()} file${targets.length !== 1 ? 's' : ''} (${formatSize(totalBytes)}) from disk?\n\nThis cannot be undone.`,
-        { title: 'Delete Files', kind: 'warning' }
+        targets.length === 1
+          ? m.library_confirm_delete_one({ size: formatSize(totalBytes) })
+          : m.library_confirm_delete_other({ count: targets.length.toLocaleString(), size: formatSize(totalBytes) }),
+        { title: m.library_delete_files_title(), kind: 'warning' }
       );
       if (!confirmed) return;
       let deleted = 0;
@@ -597,7 +604,8 @@
       clearChecked();
       await refresh();
       if (deleted > 0) {
-        toastSuccess(`Deleted ${deleted} file${deleted !== 1 ? 's' : ''}${failures.length ? ` (${failures.length} failed)` : ''}`);
+        const base = deleted === 1 ? m.library_deleted_one() : m.library_deleted_other({ count: deleted });
+        toastSuccess(failures.length ? m.library_deleted_with_failures({ base, failed: failures.length }) : base);
       }
       if (failures.length > 0) {
         toastError(failures[0]);
@@ -613,9 +621,14 @@
       await navigator.clipboard.writeText(links.join('\n'));
       const unsharedCount = targets.filter(f => !f.shared).length;
       if (unsharedCount > 0) {
-        toastWarning(`Copied ${links.length} link${links.length !== 1 ? 's' : ''}, but ${unsharedCount} file${unsharedCount !== 1 ? 's are' : ' is'} not shared.`);
+        toastWarning(m.library_copied_with_unshared({
+          links: links.length,
+          link_label: links.length === 1 ? m.library_link_singular() : m.library_link_plural(),
+          unshared: unsharedCount,
+          unshared_label: unsharedCount === 1 ? m.library_file_is_unshared() : m.library_files_are_unshared(),
+        }));
       } else {
-        toastSuccess(`Copied ${links.length} eD2K link${links.length !== 1 ? 's' : ''}`);
+        toastSuccess(links.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: links.length }));
       }
     } catch (e: unknown) { error = toErr(e); }
   }
@@ -759,12 +772,12 @@
   ]);
   function fileType(ext: string): string {
     const lower = ext.toLowerCase();
-    if (audioExts.has(lower)) return 'Audio';
-    if (videoExts.has(lower)) return 'Video';
-    if (imageExts.has(lower)) return 'Image';
-    if (archiveExts.has(lower)) return 'Archive';
-    if (docExts.has(lower)) return 'Document';
-    if (isoExts.has(lower)) return 'CD/DVD';
+    if (audioExts.has(lower)) return m.library_type_audio();
+    if (videoExts.has(lower)) return m.library_type_video();
+    if (imageExts.has(lower)) return m.library_type_image();
+    if (archiveExts.has(lower)) return m.library_type_archive();
+    if (docExts.has(lower)) return m.library_type_document();
+    if (isoExts.has(lower)) return m.library_type_cd_dvd();
     return ext ? ext.toUpperCase() : '\u2014';
   }
 
@@ -777,12 +790,12 @@
 
   function priorityLabel(p: string): string {
     switch (p) {
-      case 'verylow': return 'Very Low';
-      case 'low': return 'Low';
-      case 'normal': return 'Normal';
-      case 'high': return 'High';
-      case 'release': return 'Release';
-      case 'auto': return 'Auto';
+      case 'verylow': return m.library_priority_verylow();
+      case 'low': return m.library_priority_low();
+      case 'normal': return m.library_priority_normal();
+      case 'high': return m.library_priority_high();
+      case 'release': return m.library_priority_release();
+      case 'auto': return m.library_priority_auto();
       default: return p;
     }
   }
@@ -832,14 +845,14 @@
     const hash = selectedHash;
     if (!hash) return;
     commentSaveState = 'saving';
-    commentSaveMessage = 'Saving...';
+    commentSaveMessage = m.library_saving();
     try {
       await setFileComment(hash, ourRating, ourComment);
       const info = await getFileComments(hash);
       if (selectedHash !== hash) return;
       commentInfo = info;
       commentSaveState = 'saved';
-      commentSaveMessage = 'Saved';
+      commentSaveMessage = m.library_saved();
       commentLastSavedAt = Date.now();
       if (commentSaveTimer) clearTimeout(commentSaveTimer);
       commentSaveTimer = setTimeout(() => {
@@ -850,7 +863,7 @@
       if (selectedHash !== hash) return;
       error = toErr(e);
       commentSaveState = 'error';
-      commentSaveMessage = 'Save failed';
+      commentSaveMessage = m.library_save_failed();
     }
   }
 
@@ -904,13 +917,13 @@
     try {
       const { confirm } = await import('@tauri-apps/plugin-dialog');
       const confirmed = await confirm(
-        `Delete "${f.name}" from disk?\n\nThis cannot be undone.`,
-        { title: 'Delete File', kind: 'warning' }
+        m.library_confirm_delete_single({ name: f.name }),
+        { title: m.library_delete_file_title(), kind: 'warning' }
       );
       if (!confirmed) return;
       await deleteSharedFile(f.path, f.hash || undefined);
       if (selectedPath === f.path) selectedPath = null;
-      toastSuccess(`Deleted "${f.name}"`);
+      toastSuccess(m.library_deleted_named({ name: f.name }));
       await refresh();
     } catch (e: unknown) { error = toErr(e); }
   }
@@ -925,9 +938,14 @@
       await navigator.clipboard.writeText(links.join('\n'));
       const unsharedCount = targets.filter(f => !f.shared).length;
       if (unsharedCount > 0) {
-        toastWarning(`Copied ${links.length} link${links.length !== 1 ? 's' : ''}, but ${unsharedCount} file${unsharedCount !== 1 ? 's are' : ' is'} not shared.`);
+        toastWarning(m.library_copied_with_unshared({
+          links: links.length,
+          link_label: links.length === 1 ? m.library_link_singular() : m.library_link_plural(),
+          unshared: unsharedCount,
+          unshared_label: unsharedCount === 1 ? m.library_file_is_unshared() : m.library_files_are_unshared(),
+        }));
       } else {
-        toastSuccess(`Copied ${links.length} eD2K link${links.length !== 1 ? 's' : ''}`);
+        toastSuccess(links.length === 1 ? m.library_copied_link_one() : m.library_copied_links_other({ count: links.length }));
       }
     } catch (e: unknown) { error = toErr(e); }
   }
@@ -1068,13 +1086,13 @@
         case 'delete': {
           const { confirm } = await import('@tauri-apps/plugin-dialog');
           const confirmed = await confirm(
-            `Delete "${f.name}" from disk?\n\nThis cannot be undone.`,
-            { title: 'Delete File', kind: 'warning' }
+            m.library_confirm_delete_single({ name: f.name }),
+            { title: m.library_delete_file_title(), kind: 'warning' }
           );
           if (!confirmed) break;
           await deleteSharedFile(f.path, f.hash || undefined);
           if (selectedPath === f.path) selectedPath = null;
-          toastSuccess(`Deleted "${f.name}"`);
+          toastSuccess(m.library_deleted_named({ name: f.name }));
           await refresh();
           break;
         }
@@ -1083,9 +1101,9 @@
           const link = await formatEd2kLink(f.name, f.size, f.hash);
           await navigator.clipboard.writeText(link);
           if (!f.shared) {
-            toastWarning('Copied link, but this file is not shared. Other peers won\'t find you as a source until you share it.');
+            toastWarning(m.library_copied_link_unshared_single());
           } else {
-            toastSuccess('Copied eD2K link');
+            toastSuccess(m.library_copied_ed2k_link());
           }
           break;
         }
@@ -1095,9 +1113,9 @@
           if (!f.hash || !f.shared) break;
           await republishFile(f.hash);
           if ($networkStats.status === 'connected') {
-            toastSuccess('Queued republish to KAD');
+            toastSuccess(m.library_queued_republish_kad());
           } else {
-            toastWarning('KAD is not connected — file will be republished once the network comes online.');
+            toastWarning(m.library_kad_not_connected_republish());
           }
           break;
         }
@@ -1111,12 +1129,14 @@
       const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
       const sharedCount = files.filter((f) => f.shared && isPathInFolder(f.path, path)).length;
       if (sharedCount === 0) {
-        toastWarning(`No shared files in "${displayName}"`);
+        toastWarning(m.library_no_shared_files_in({ name: displayName }));
         return;
       }
       const confirmed = await confirm(
-        `Unshare ${sharedCount.toLocaleString()} file${sharedCount !== 1 ? 's' : ''} in "${displayName}"?\n\nOther peers will no longer be able to download these files from you. The folder itself stays in your library.`,
-        { title: 'Unshare Folder', kind: 'warning' }
+        sharedCount === 1
+          ? m.library_confirm_unshare_folder_one({ name: displayName })
+          : m.library_confirm_unshare_folder_other({ count: sharedCount.toLocaleString(), name: displayName }),
+        { title: m.library_unshare_folder_title(), kind: 'warning' }
       );
       if (!confirmed) return;
       await unshareFolder(path);
@@ -1271,9 +1291,8 @@
     if (added > 0) {
       stoppedByUser = false;
       scanning = true;
-      toastSuccess(
-        `Added ${added} folder${added !== 1 ? 's' : ''}${failures.length ? ` (${failures.length} skipped)` : ''}`
-      );
+      const base = added === 1 ? m.library_added_folder_one() : m.library_added_folder_other({ count: added });
+      toastSuccess(failures.length ? m.library_added_with_skipped({ base, skipped: failures.length }) : base);
       if (mounted) await refresh();
     } else if (failures.length > 0) {
       toastWarning(failures[0]);
@@ -1414,18 +1433,18 @@
 <svelte:document onclick={onDocClick} onkeydown={onPageKeyDown} />
 
 <div class="page-header">
-  <h2>Library</h2>
+  <h2>{m.library_title()}</h2>
   <div class="header-actions">
     <button class="ghost" onclick={handleOpenCollection} disabled={collectionLoading}>
       {#if collectionLoading}
-        <span class="spinner-inline" aria-hidden="true"></span> Opening&hellip;
+        <span class="spinner-inline" aria-hidden="true"></span> {m.library_opening()}
       {:else}
-        Open Collection
+        {m.library_open_collection()}
       {/if}
     </button>
-    <button class="ghost" onclick={() => openCreateDialog()}>Create Collection</button>
-    <button onclick={handleReload}>Reload</button>
-    <button onclick={handleAddFolder}>+ Add Folder</button>
+    <button class="ghost" onclick={() => openCreateDialog()}>{m.library_create_collection()}</button>
+    <button onclick={handleReload}>{m.library_reload()}</button>
+    <button onclick={handleAddFolder}>{m.library_add_folder()}</button>
   </div>
 </div>
 
@@ -1440,17 +1459,24 @@
       <input
         type="text"
         class="filter-search"
-        placeholder="Search files by name…  (press / to focus)"
+        placeholder={m.library_search_placeholder()}
         bind:value={searchQuery}
         bind:this={searchInputEl}
       />
       {#if searchQuery}
-        <button class="filter-clear-btn" onclick={() => (searchQuery = '')} title="Clear search">✕</button>
+        <button class="filter-clear-btn" onclick={() => (searchQuery = '')} title={m.search_bar_clear()}>✕</button>
       {/if}
     </div>
     <select class="filter-type" bind:value={typeFilter}>
       {#each typeFilterOptions as opt}
-        <option value={opt}>{opt === 'All' ? 'All Types' : opt}</option>
+        <option value={opt}>{opt === 'All' ? m.library_all_types() : (
+          opt === 'Audio' ? m.library_type_audio() :
+          opt === 'Video' ? m.library_type_video() :
+          opt === 'Image' ? m.library_type_image() :
+          opt === 'Archive' ? m.library_type_archive() :
+          opt === 'Document' ? m.library_type_document() :
+          opt === 'CD/DVD' ? m.library_type_cd_dvd() : opt
+        )}</option>
       {/each}
     </select>
     <button
@@ -1458,37 +1484,37 @@
       class:active={showDuplicatesOnly}
       disabled={duplicateHashes.size === 0}
       onclick={() => (showDuplicatesOnly = !showDuplicatesOnly)}
-      title={duplicateHashes.size === 0 ? 'No duplicates detected' : `Show only files whose hash matches another file (${duplicateFileCount} file${duplicateFileCount !== 1 ? 's' : ''} across ${duplicateHashes.size} hash${duplicateHashes.size !== 1 ? 'es' : ''})`}
+      title={duplicateHashes.size === 0 ? m.library_no_duplicates() : m.library_duplicates_tooltip({ files: duplicateFileCount, hashes: duplicateHashes.size })}
     >
-      {showDuplicatesOnly ? '\u2714' : ' '} Duplicates{duplicateHashes.size > 0 ? ` (${duplicateFileCount})` : ''}
+      {showDuplicatesOnly ? '\u2714' : ' '} {m.library_duplicates()}{duplicateHashes.size > 0 ? ` (${duplicateFileCount})` : ''}
     </button>
     <button
       class="dupes-toggle missing-toggle"
       class:active={showMissingOnly}
       disabled={missingPathSet.size === 0}
       onclick={() => (showMissingOnly = !showMissingOnly)}
-      title={missingPathSet.size === 0 ? 'No indexed files are missing from disk' : `Show only files whose path no longer exists on disk (${missingPathSet.size})`}
+      title={missingPathSet.size === 0 ? m.library_no_missing() : m.library_missing_tooltip({ count: missingPathSet.size })}
     >
-      {showMissingOnly ? '\u2714' : ' '} Missing{missingPathSet.size > 0 ? ` (${missingPathSet.size})` : ''}
+      {showMissingOnly ? '\u2714' : ' '} {m.library_missing()}{missingPathSet.size > 0 ? ` (${missingPathSet.size})` : ''}
     </button>
     {#if showMissingOnly && missingPathSet.size > 0}
       <button
         class="dupes-toggle missing-remove-btn"
         onclick={handleRemoveMissing}
-        title="Remove all missing files from the shared index (does not touch disk)"
-      >Remove Missing</button>
+        title={m.library_remove_missing_tooltip()}
+      >{m.library_remove_missing()}</button>
     {/if}
     {#if hasActiveLibraryFilters}
-      <button class="ghost clear-library-filters" onclick={clearLibraryFilters}>Clear Filters</button>
+      <button class="ghost clear-library-filters" onclick={clearLibraryFilters}>{m.library_clear_filters()}</button>
     {/if}
     <span class="inline-stats">
-      <span class="inline-stat">{files.length.toLocaleString()} files</span>
+      <span class="inline-stat">{m.library_stat_files({ count: files.length.toLocaleString() })}</span>
       <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{libraryFileStats.shared.toLocaleString()} shared</span>
+      <span class="inline-stat">{m.library_stat_shared({ count: libraryFileStats.shared.toLocaleString() })}</span>
       <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{libraryFileStats.hashed.toLocaleString()} hashed</span>
+      <span class="inline-stat">{m.library_stat_hashed({ count: libraryFileStats.hashed.toLocaleString() })}</span>
       <span class="inline-sep">&middot;</span>
-      <span class="inline-stat">{folders.length.toLocaleString()} folders</span>
+      <span class="inline-stat">{m.library_stat_folders({ count: folders.length.toLocaleString() })}</span>
     </span>
   </div>
 </div>
@@ -1499,35 +1525,37 @@
       <button class="collection-toggle" onclick={() => collectionsOpen = !collectionsOpen}>
         <span class="toggle-arrow">{collectionsOpen ? '\u25BC' : '\u25B6'}</span>
         <span class="collection-title">
-          Collection: {loadedCollection?.name ?? 'Loading\u2026'}
+          {m.library_collection_label({ name: loadedCollection?.name ?? m.library_loading_ellipsis() })}
           {#if loadedCollection}
             <span class="collection-meta">
-              by {loadedCollection.author || 'Unknown'} \u2014 {loadedCollection.files.length} file{loadedCollection.files.length !== 1 ? 's' : ''}
+              {loadedCollection.files.length === 1
+                ? m.library_collection_meta_one({ author: loadedCollection.author || m.common_unknown() })
+                : m.library_collection_meta_other({ author: loadedCollection.author || m.common_unknown(), count: loadedCollection.files.length })}
             </span>
           {/if}
         </span>
       </button>
       {#if loadedCollection}
         <button class="coll-action-btn download-all-btn" onclick={handleDownloadAll} disabled={downloadingCollection}>
-          {downloadingCollection ? 'Queueing…' : 'Download All'}
+          {downloadingCollection ? m.library_queueing() : m.library_download_all()}
         </button>
-        <button class="coll-action-btn ghost" onclick={handleCopyCollectionLinks} disabled={copyingCollectionLinks || loadedCollection.files.length === 0} title="Copy all eD2K links to clipboard">
-          {copyingCollectionLinks ? 'Copying…' : 'Copy Links'}
+        <button class="coll-action-btn ghost" onclick={handleCopyCollectionLinks} disabled={copyingCollectionLinks || loadedCollection.files.length === 0} title={m.library_copy_all_links_title()}>
+          {copyingCollectionLinks ? m.library_copying() : m.library_copy_links()}
         </button>
-        <button class="coll-action-btn ghost" onclick={() => { loadedCollection = null; collectionsOpen = false; }}>Close</button>
+        <button class="coll-action-btn ghost" onclick={() => { loadedCollection = null; collectionsOpen = false; }}>{m.common_close()}</button>
       {/if}
     </div>
     {#if collectionsOpen}
       <div class="collection-files">
         {#if collectionLoading}
-          <div class="coll-loading"><span class="scan-spinner"></span> Loading collection&hellip;</div>
+          <div class="coll-loading"><span class="scan-spinner"></span> {m.library_loading_collection()}</div>
         {:else if loadedCollection}
           <table class="compact-table coll-table">
             <thead>
               <tr>
-                <th>Filename</th>
-                <th class="coll-col-size">Size</th>
-                <th class="coll-col-hash">Hash</th>
+                <th>{m.library_col_filename()}</th>
+                <th class="coll-col-size">{m.library_col_size()}</th>
+                <th class="coll-col-hash">{m.library_col_hash()}</th>
               </tr>
             </thead>
             <tbody>
@@ -1559,18 +1587,18 @@
   }}>
     <div class="modal-content create-coll-modal">
       <div class="modal-header">
-        <span class="modal-title">Create Collection</span>
+        <span class="modal-title">{m.library_create_collection()}</span>
         <button class="ghost modal-close" onclick={() => createCollectionOpen = false}>&times;</button>
       </div>
       <div class="modal-body">
         <div class="form-row">
-          <label class="form-label" for="coll-name">Name</label>
+          <label class="form-label" for="coll-name">{m.library_coll_name()}</label>
           <input
             id="coll-name"
             type="text"
             class="form-input"
             bind:value={newCollName}
-            placeholder="My Collection"
+            placeholder={m.library_coll_name_placeholder()}
             onkeydown={(e) => {
               if (e.key === 'Enter' && !!newCollName.trim() && selectedFileHashes.size > 0 && !creatingCollection) {
                 e.preventDefault();
@@ -1580,39 +1608,39 @@
           />
         </div>
         <div class="form-row">
-          <label class="form-label" for="coll-author">Author</label>
-          <input id="coll-author" type="text" class="form-input" bind:value={newCollAuthor} placeholder="Optional" />
+          <label class="form-label" for="coll-author">{m.library_coll_author()}</label>
+          <input id="coll-author" type="text" class="form-input" bind:value={newCollAuthor} placeholder={m.library_coll_optional()} />
         </div>
         <div class="form-row">
-          <span class="form-label">Format</span>
+          <span class="form-label">{m.library_coll_format()}</span>
           <div class="format-toggle">
             <label class="format-option">
               <input type="radio" name="coll-format" value="binary" bind:group={newCollFormat} />
               <span class="format-label">
-                <span class="format-name">Binary (.emulecollection)</span>
-                <span class="format-desc">Standard eMule collection — preserves author and name</span>
+                <span class="format-name">{m.library_coll_format_binary_name()}</span>
+                <span class="format-desc">{m.library_coll_format_binary_desc()}</span>
               </span>
             </label>
             <label class="format-option">
               <input type="radio" name="coll-format" value="text" bind:group={newCollFormat} />
               <span class="format-label">
-                <span class="format-name">Text (.txt)</span>
-                <span class="format-desc">Plain list of eD2K links — works with any client or paste target</span>
+                <span class="format-name">{m.library_coll_format_text_name()}</span>
+                <span class="format-desc">{m.library_coll_format_text_desc()}</span>
               </span>
             </label>
           </div>
         </div>
         <div class="form-row">
-          <span class="form-label">Select Files ({selectedFileHashes.size} of {hashedLibraryFiles.length} selected)</span>
+          <span class="form-label">{m.library_coll_select_files({ selected: selectedFileHashes.size, total: hashedLibraryFiles.length })}</span>
           <button class="ghost select-all-btn" onclick={toggleAllFileSelection}>
-            {allHashedFilesSelected ? 'Deselect All' : 'Select All'}
+            {allHashedFilesSelected ? m.common_deselect_all() : m.common_select_all()}
           </button>
         </div>
         <div class="coll-search-row">
           <input
             type="text"
             class="form-input coll-search-input"
-            placeholder="Search files…"
+            placeholder={m.library_coll_search_placeholder()}
             bind:value={collectionSearch}
           />
         </div>
@@ -1625,19 +1653,19 @@
             </label>
           {/each}
           {#if collectionFilteredFiles.length === 0 && hashedLibraryFiles.length > 0}
-            <div class="coll-pick-empty">No files match "{collectionSearch}"</div>
+            <div class="coll-pick-empty">{m.library_coll_no_matches({ query: collectionSearch })}</div>
           {:else if hashedLibraryFiles.length === 0}
-            <div class="coll-pick-empty">No hashed files available. Add folders and wait for hashing to complete.</div>
+            <div class="coll-pick-empty">{m.library_coll_no_hashed_files()}</div>
           {/if}
         </div>
       </div>
       <div class="modal-footer">
-        <button class="ghost" onclick={() => createCollectionOpen = false}>Cancel</button>
+        <button class="ghost" onclick={() => createCollectionOpen = false}>{m.common_cancel()}</button>
         <button
           disabled={!newCollName.trim() || selectedFileHashes.size === 0 || creatingCollection}
           onclick={handleCreateCollection}
         >
-          {creatingCollection ? 'Creating\u2026' : 'Create'}
+          {creatingCollection ? m.library_creating() : m.common_create()}
         </button>
       </div>
     </div>
@@ -1647,7 +1675,7 @@
 {#if error}
   <div class="error-banner">
     <span>{error}</span>
-    <button class="ghost" onclick={() => error = null}>Dismiss</button>
+    <button class="ghost" onclick={() => error = null}>{m.common_dismiss()}</button>
   </div>
 {/if}
 
@@ -1661,8 +1689,8 @@
           <polyline points="9 14 12 11 15 14"/>
         </svg>
       </div>
-      <div class="dnd-title">Drop folder to share</div>
-      <div class="dnd-sub">Folders will be scanned and added to your library</div>
+      <div class="dnd-title">{m.library_dnd_title()}</div>
+      <div class="dnd-sub">{m.library_dnd_sub()}</div>
     </div>
   </div>
 {/if}
@@ -1670,7 +1698,7 @@
 <div class="shared-layout" class:dragging={sidebarDragging}>
   <!-- Sidebar: folder filter tree -->
   <div class="sidebar" style="width: {sidebarWidth}px; min-width: {sidebarWidth}px;">
-    <div class="sidebar-header">Shared Folders</div>
+    <div class="sidebar-header">{m.library_shared_folders()}</div>
     <div class="folder-tree">
       <div
         class="tree-item"
@@ -1687,7 +1715,7 @@
       >
         <span class="tree-main">
           <span class="tree-icon">◧</span>
-          <span class="tree-folder-name">All Files</span>
+          <span class="tree-folder-name">{m.library_all_files()}</span>
         </span>
         <span class="tree-count">{files.length.toLocaleString()}</span>
       </div>
@@ -1716,12 +1744,12 @@
             <button
               class="tree-btn"
               onclick={(e) => { e.stopPropagation(); handleUnshareFolder(folder); }}
-              title="Unshare all files in this folder"
+              title={m.library_unshare_folder_title()}
             >&#x20E0;</button>
             <button
               class="tree-btn tree-remove"
               onclick={(e) => { e.stopPropagation(); handleRemoveFolder(folder); }}
-              title="Remove folder"
+              title={m.library_remove_folder_btn_title()}
             >&times;</button>
           </span>
         </div>
@@ -1736,49 +1764,49 @@
         onclick={() => (topPanelOpen = !topPanelOpen)}
       >
         <span class="section-arrow">{topPanelOpen ? '\u25BE' : '\u25B8'}</span>
-        <span class="section-title">Top Uploads</span>
+        <span class="section-title">{m.library_top_uploads()}</span>
       </button>
       {#if topPanelOpen}
-        <div class="top-metric-switch" role="tablist" aria-label="Top upload scope">
+        <div class="top-metric-switch" role="tablist" aria-label={m.library_top_upload_scope()}>
           <button
             type="button"
             role="tab"
             aria-selected={topPanelScope === 'alltime'}
             class:active={topPanelScope === 'alltime'}
             onclick={() => (topPanelScope = 'alltime')}
-            title="Cumulative uploads across all sessions"
-          >All time</button>
+            title={m.library_top_alltime_title()}
+          >{m.library_top_alltime()}</button>
           <button
             type="button"
             role="tab"
             aria-selected={topPanelScope === 'session'}
             class:active={topPanelScope === 'session'}
             onclick={() => (topPanelScope = 'session')}
-            title="Uploads since the app was last started"
-          >Session</button>
+            title={m.library_top_session_title()}
+          >{m.library_top_session()}</button>
         </div>
-        <div class="top-metric-switch" role="tablist" aria-label="Top upload metric">
+        <div class="top-metric-switch" role="tablist" aria-label={m.library_top_upload_metric()}>
           <button
             type="button"
             role="tab"
             aria-selected={topPanelMetric === 'bytes'}
             class:active={topPanelMetric === 'bytes'}
             onclick={() => (topPanelMetric = 'bytes')}
-          >By Bytes</button>
+          >{m.library_top_by_bytes()}</button>
           <button
             type="button"
             role="tab"
             aria-selected={topPanelMetric === 'requests'}
             class:active={topPanelMetric === 'requests'}
             onclick={() => (topPanelMetric = 'requests')}
-          >By Uploads</button>
+          >{m.library_top_by_uploads()}</button>
         </div>
         <div class="top-list">
           {#if topFiles.length === 0}
             <div class="top-empty">
               {topPanelScope === 'session'
-                ? 'No uploads yet this session. Activity resets each time Ember starts.'
-                : "No upload activity yet. Files you've shared will appear here once peers start downloading."}
+                ? m.library_top_empty_session()
+                : m.library_top_empty_alltime()}
             </div>
           {:else}
             {#each topFiles as tf, i (tf.path)}
@@ -1800,7 +1828,7 @@
                   <span class="top-value">
                     {topPanelMetric === 'bytes'
                       ? formatSize(val)
-                      : `${val.toLocaleString()} upload${val !== 1 ? 's' : ''}`}
+                      : (val === 1 ? m.library_uploads_one() : m.library_uploads_other({ count: val.toLocaleString() }))}
                   </span>
                 </span>
               </button>
@@ -1826,7 +1854,7 @@
     aria-valuemin={120}
     aria-valuemax={400}
     aria-valuetext={`${sidebarWidth}px`}
-    aria-label="Resize sidebar"
+    aria-label={m.library_resize_sidebar()}
   ></div>
 
   <!-- Main: file list -->
@@ -1836,25 +1864,25 @@
         <span class="scan-spinner"></span>
         <span class="scan-text">
           {#if hashProgress}
-            Hashing file {hashProgress.current} of {hashProgress.total}: {hashProgress.file_name}
+            {m.library_hashing_file({ current: hashProgress.current, total: hashProgress.total, name: hashProgress.file_name })}
           {:else}
-            Scanning files&hellip;
+            {m.library_scanning_files()}
           {/if}
         </span>
-        <button class="scan-btn stop-btn" onclick={handleStopRequest}>Stop</button>
+        <button class="scan-btn stop-btn" onclick={handleStopRequest}>{m.common_stop()}</button>
       </div>
     {/if}
     {#if stopConfirmVisible}
       <div class="confirm-banner">
-        <span class="confirm-text">Stopping will remove incompletely scanned folders from the Library. Continue?</span>
-        <button class="scan-btn resume-btn" onclick={handleStopCancel}>Cancel</button>
-        <button class="scan-btn stop-btn" onclick={handleStopConfirm}>Remove Folder</button>
+        <span class="confirm-text">{m.library_stop_confirm_text()}</span>
+        <button class="scan-btn resume-btn" onclick={handleStopCancel}>{m.common_cancel()}</button>
+        <button class="scan-btn stop-btn" onclick={handleStopConfirm}>{m.library_remove_folder()}</button>
       </div>
     {/if}
     {#if stoppedByUser && !scanning && !stopConfirmVisible}
       <div class="scan-banner resume-banner">
-        <span class="scan-text">Hashing was stopped.</span>
-        <button class="scan-btn resume-btn" onclick={handleResume}>Resume Hashing</button>
+        <span class="scan-text">{m.library_hashing_stopped()}</span>
+        <button class="scan-btn resume-btn" onclick={handleResume}>{m.library_resume_hashing()}</button>
       </div>
     {/if}
     {#if sortedFiles.length === 0 && !scanning && hasActiveLibraryFilters && files.length > 0}
@@ -1865,8 +1893,8 @@
           <line x1="11" y1="8" x2="11" y2="14"></line>
           <line x1="8" y1="11" x2="14" y2="11"></line>
         </svg>
-        <p>No files match your filters</p>
-        <p class="sub"><button class="link-btn" onclick={clearLibraryFilters}>Clear Filters</button></p>
+        <p>{m.library_empty_no_matches()}</p>
+        <p class="sub"><button class="link-btn" onclick={clearLibraryFilters}>{m.library_clear_filters()}</button></p>
       </div>
     {:else if sortedFiles.length === 0 && !scanning}
       <div class="empty-state">
@@ -1875,14 +1903,14 @@
           <line x1="12" y1="13" x2="12" y2="17"></line>
           <line x1="10" y1="15" x2="14" y2="15"></line>
         </svg>
-        <p>No shared files</p>
-        <p class="sub">Add a folder to share files with the network</p>
-        <button class="empty-action" onclick={handleAddFolder}>+ Add Folder</button>
+        <p>{m.library_empty_no_shared()}</p>
+        <p class="sub">{m.library_empty_no_shared_sub()}</p>
+        <button class="empty-action" onclick={handleAddFolder}>{m.library_add_folder()}</button>
       </div>
     {:else if sortedFiles.length === 0 && scanning}
       <div class="empty-state">
         <div class="spinner lg"></div>
-        <p>Waiting for scan results&hellip;</p>
+        <p>{m.library_waiting_scan()}</p>
       </div>
     {:else}
       <LibraryVirtualTable
@@ -1909,33 +1937,33 @@
 
     {#if checkedCount > 0}
       <div class="bulk-action-bar">
-        <span class="bulk-count">{checkedCount} file{checkedCount !== 1 ? 's' : ''} selected</span>
+        <span class="bulk-count">{checkedCount === 1 ? m.library_bulk_count_one() : m.library_bulk_count_other({ count: checkedCount })}</span>
         <div class="bulk-prio-group">
-          <span class="bulk-label">Priority:</span>
+          <span class="bulk-label">{m.library_bulk_priority_label()}</span>
           {#each ['verylow', 'low', 'normal', 'high', 'release', 'auto'] as p}
-            <button class="tb-btn bulk-prio-btn" onclick={() => bulkSetPriority(p as FileInfo['priority'])} title="Set priority to {priorityLabel(p)}">{priorityLabel(p)}</button>
+            <button class="tb-btn bulk-prio-btn" onclick={() => bulkSetPriority(p as FileInfo['priority'])} title={m.library_set_priority_title({ priority: priorityLabel(p) })}>{priorityLabel(p)}</button>
           {/each}
         </div>
-        <button class="tb-btn" onclick={bulkShare} title="Share all selected files">Share</button>
-        <button class="tb-btn" onclick={bulkUnshare} title="Unshare all selected files">Unshare</button>
-        <button class="tb-btn" onclick={bulkCopyLinks} title="Copy eD2K links for selected files">Copy Links</button>
-        <button class="tb-btn" onclick={openCreateDialogFromSelection} title="Create a collection from selected files">New Collection</button>
-        <button class="tb-btn tb-danger" onclick={bulkDelete} title="Delete selected files from disk">Delete</button>
-        <button class="tb-btn" onclick={clearChecked} title="Clear selection">Clear</button>
+        <button class="tb-btn" onclick={bulkShare} title={m.library_bulk_share_title()}>{m.library_bulk_share()}</button>
+        <button class="tb-btn" onclick={bulkUnshare} title={m.library_bulk_unshare_title()}>{m.library_bulk_unshare()}</button>
+        <button class="tb-btn" onclick={bulkCopyLinks} title={m.library_bulk_copy_links_title()}>{m.library_copy_links()}</button>
+        <button class="tb-btn" onclick={openCreateDialogFromSelection} title={m.library_bulk_new_collection_title()}>{m.library_bulk_new_collection()}</button>
+        <button class="tb-btn tb-danger" onclick={bulkDelete} title={m.library_bulk_delete_title()}>{m.common_delete()}</button>
+        <button class="tb-btn" onclick={clearChecked} title={m.library_bulk_clear_title()}>{m.common_clear()}</button>
       </div>
     {/if}
 
     <div class="status-bar">
       {#if hasActiveLibraryFilters && filteredFiles.length !== files.length}
-        <span>Showing {filteredFiles.length.toLocaleString()} of {files.length.toLocaleString()} files</span>
+        <span>{m.library_status_showing({ shown: filteredFiles.length.toLocaleString(), total: files.length.toLocaleString() })}</span>
         <span class="status-sep">&middot;</span>
-        <span>{filteredSharedCount.toLocaleString()} shared in view</span>
+        <span>{m.library_status_shared_in_view({ count: filteredSharedCount.toLocaleString() })}</span>
         <span class="status-sep">&middot;</span>
       {/if}
       <span>{activeFolderLabel}</span>
       {#if selectedFile}
         <span class="status-sep">&middot;</span>
-        <span class="status-selected" title={selectedFile.name}>Selected: {selectedFile.name}</span>
+        <span class="status-selected" title={selectedFile.name}>{m.library_status_selected({ name: selectedFile.name })}</span>
       {/if}
     </div>
   </div>
@@ -1945,106 +1973,101 @@
     <div class="detail-drawer">
       <div class="drawer-header">
         <span class="drawer-title" title={selectedFile.name}>{selectedFile.name}</span>
-        <button class="ghost drawer-close" onclick={() => selectedPath = null} title="Close details">&times;</button>
+        <button class="ghost drawer-close" onclick={() => selectedPath = null} title={m.library_close_details()}>&times;</button>
       </div>
       <div class="drawer-body">
         <div class="details-meta-grid">
-          <span class="meta-label">Path</span>
+          <span class="meta-label">{m.library_meta_path()}</span>
           <span class="meta-value meta-path" title={selectedFile.path}>{selectedFile.path}</span>
-          <span class="meta-label">Size</span>
+          <span class="meta-label">{m.library_col_size()}</span>
           <span class="meta-value">{formatSize(selectedFile.size)}</span>
           {#if selectedFile.modified_at}
-            <span class="meta-label">Modified</span>
+            <span class="meta-label">{m.library_col_modified()}</span>
             <span class="meta-value">{new Date(selectedFile.modified_at * 1000).toLocaleString()}</span>
           {/if}
           {#if selectedFile.hash}
-            <span class="meta-label">Hash</span>
+            <span class="meta-label">{m.library_meta_hash()}</span>
             <span class="meta-value meta-hash">
               <code>{selectedFile.hash}</code>
-              <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) navigator.clipboard.writeText(f.hash).catch(() => {}); }} title="Copy hash">Copy</button>
+              <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) navigator.clipboard.writeText(f.hash).catch(() => {}); }} title={m.library_meta_copy_hash()}>{m.common_copy()}</button>
             </span>
           {/if}
           {#if selectedFile.aich_hash}
-            <span class="meta-label">AICH</span>
+            <span class="meta-label">{m.library_meta_aich()}</span>
             <span class="meta-value meta-hash">
               <code>{selectedFile.aich_hash}</code>
-              <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) navigator.clipboard.writeText(f.aich_hash).catch(() => {}); }} title="Copy AICH hash">Copy</button>
+              <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) navigator.clipboard.writeText(f.aich_hash).catch(() => {}); }} title={m.library_meta_copy_aich()}>{m.common_copy()}</button>
             </span>
           {/if}
-          <span class="meta-label">Shared</span>
+          <span class="meta-label">{m.library_col_shared()}</span>
           <span class="meta-value">
-            {selectedFile.shared ? 'Yes' : 'No'}
+            {selectedFile.shared ? m.common_yes() : m.common_no()}
             {#if selectedFile.hash}
               <span class="meta-badges">
-                {#if selectedFile.shared && selectedFile.shared_kad}<span class="meta-badge" title="Published to KAD network">KAD</span>{/if}
-                {#if selectedFile.shared && selectedFile.shared_ed2k}<span class="meta-badge" title="Published to eD2K servers">eD2K</span>{/if}
-                {#if selectedFile.aich_hash}<span class="meta-badge meta-badge-aich" title="AICH hash available — bad chunks can be identified without re-downloading the whole file">AICH</span>{/if}
+                {#if selectedFile.shared && selectedFile.shared_kad}<span class="meta-badge" title={m.library_published_kad()}>KAD</span>{/if}
+                {#if selectedFile.shared && selectedFile.shared_ed2k}<span class="meta-badge" title={m.library_published_ed2k()}>eD2K</span>{/if}
+                {#if selectedFile.aich_hash}<span class="meta-badge meta-badge-aich" title={m.library_aich_available()}>AICH</span>{/if}
               </span>
             {/if}
           </span>
-          <span class="meta-label">Requests</span>
-          <span class="meta-value">{selectedFile.requests}{selectedFile.alltime_requests ? ` (${selectedFile.alltime_requests} all-time)` : ''}</span>
-          <span class="meta-label">Accepted</span>
-          <span class="meta-value">{selectedFile.accepted}{selectedFile.alltime_accepted ? ` (${selectedFile.alltime_accepted} all-time)` : ''}</span>
-          <span class="meta-label">Transferred</span>
-          <span class="meta-value">{formatSize(selectedFile.bytes_transferred)}{selectedFile.alltime_transferred ? ` (${formatSize(selectedFile.alltime_transferred)} all-time)` : ''}</span>
+          <span class="meta-label">{m.library_col_requests()}</span>
+          <span class="meta-value">{selectedFile.requests}{selectedFile.alltime_requests ? ` (${m.library_meta_alltime({ value: selectedFile.alltime_requests })})` : ''}</span>
+          <span class="meta-label">{m.library_col_accepted()}</span>
+          <span class="meta-value">{selectedFile.accepted}{selectedFile.alltime_accepted ? ` (${m.library_meta_alltime({ value: selectedFile.alltime_accepted })})` : ''}</span>
+          <span class="meta-label">{m.library_col_transferred()}</span>
+          <span class="meta-value">{formatSize(selectedFile.bytes_transferred)}{selectedFile.alltime_transferred ? ` (${m.library_meta_alltime({ value: formatSize(selectedFile.alltime_transferred) })})` : ''}</span>
           {#if selectedFile.complete_sources > 0}
-            <span class="meta-label">Peers</span>
-            <span class="meta-value" title="KAD peers that have acknowledged a source record or known complete copies">
-              {selectedFile.complete_sources.toLocaleString()} with a copy
+            <span class="meta-label">{m.library_col_peers()}</span>
+            <span class="meta-value" title={m.library_meta_peers_title()}>
+              {m.library_meta_peers_count({ count: selectedFile.complete_sources.toLocaleString() })}
             </span>
           {/if}
         </div>
 
         <div class="drawer-actions">
-          <button class="drawer-action-btn" onclick={() => openSharedFile(selectedFile.path)} title="Open this file">
+          <button class="drawer-action-btn" onclick={() => openSharedFile(selectedFile.path)} title={m.library_open_file_title()}>
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
               <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>
               <path d="M6 8.5l2 2 2-2"/>
               <line x1="8" y1="5" x2="8" y2="10.5"/>
             </svg>
-            Open File
+            {m.library_open_file()}
           </button>
-          <button class="drawer-action-btn" onclick={() => openSharedFolder(selectedFile.path)} title="Open containing folder">
+          <button class="drawer-action-btn" onclick={() => openSharedFolder(selectedFile.path)} title={m.library_open_folder_title()}>
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
               <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>
             </svg>
-            Open Folder
+            {m.library_open_folder()}
           </button>
         </div>
 
         {#if selectedHash}
           <div class="drawer-section">
             <div class="drawer-section-header">
-              <span class="drawer-section-title">Comments &amp; Rating</span>
+              <span class="drawer-section-title">{m.library_comments_rating()}</span>
               {#if commentLastSavedAt}
-                <span class="comment-last-saved">Saved {formatSavedTime(commentLastSavedAt)}</span>
+                <span class="comment-last-saved">{m.library_saved_at({ time: formatSavedTime(commentLastSavedAt) })}</span>
               {/if}
             </div>
             {#if commentLoading}
-              <div class="comment-loading">Loading comments&hellip;</div>
+              <div class="comment-loading">{m.library_loading_comments()}</div>
             {:else}
               <div class="comment-our">
                 <div class="comment-rating-row">
-                  <span class="comment-label">Your rating:</span>
+                  <span class="comment-label">{m.library_your_rating()}</span>
                   {#each [1,2,3,4,5] as star}
-                    <button class="star-btn" onclick={() => ourRating = star} title="{star} star{star > 1 ? 's' : ''}">
+                    <button class="star-btn" onclick={() => ourRating = star} title={star === 1 ? m.library_star_one() : m.library_star_other({ count: star })}>
                       {star <= ourRating ? '\u2605' : '\u2606'}
                     </button>
                   {/each}
                   {#if ourRating > 0}
-                    <button class="star-clear" onclick={() => ourRating = 0} title="Clear rating">&times;</button>
+                    <button class="star-clear" onclick={() => ourRating = 0} title={m.library_clear_rating()}>&times;</button>
                   {/if}
                 </div>
                 <div class="comment-input-row">
-                  <!-- textarea so multi-line comments don't collapse
-                       to a single line. Ctrl/Cmd+Enter saves to keep
-                       a quick keyboard path; plain Enter inserts a
-                       newline (matches how every other multi-line
-                       editor in the app behaves). -->
                   <textarea
                     class="comment-input"
-                    placeholder="Add a comment… (Ctrl+Enter to save)"
+                    placeholder={m.library_add_comment_placeholder()}
                     bind:value={ourComment}
                     rows="2"
                     onkeydown={(e) => {
@@ -2055,7 +2078,7 @@
                     }}
                   ></textarea>
                   <button class="comment-save" onclick={handleSaveComment} disabled={commentSaveState === 'saving'}>
-                    {commentSaveState === 'saving' ? 'Saving\u2026' : 'Save'}
+                    {commentSaveState === 'saving' ? m.library_saving() : m.common_save()}
                   </button>
                 </div>
                 {#if commentSaveState !== 'idle'}
@@ -2066,14 +2089,9 @@
               </div>
               {#if commentInfo?.peer_comments?.length}
                 <div class="comment-peers">
-                  <div class="comment-label">Peer comments:</div>
+                  <div class="comment-label">{m.library_peer_comments()}</div>
                   {#each commentInfo.peer_comments as pc, i (i)}
                     <div class="comment-peer-item">
-                      <!-- Both `user_name` and `comment` are
-                           peer-supplied; wrap each in `<bdi>` so an
-                           embedded RTL/LTR override character can't
-                           spoof neighbouring fields like the star
-                           rating or the visible name. -->
                       <span class="comment-peer-name"><bdi>{pc.user_name}</bdi></span>
                       <span class="comment-peer-stars">
                         {#each [1,2,3,4,5] as s}
@@ -2087,7 +2105,7 @@
                   {/each}
                 </div>
               {:else}
-                <div class="comment-empty">No peer comments yet.</div>
+                <div class="comment-empty">{m.library_no_peer_comments()}</div>
               {/if}
             {/if}
           </div>
@@ -2101,9 +2119,9 @@
 {#if ctxMenu}
   {@const fileHashed = !!ctxMenu.file.hash}
   <div bind:this={ctxMenuEl} class="ctx-menu" style="left:{ctxMenu.x}px;top:{ctxMenu.y}px;" role="menu">
-    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_file')}>Open File</button>
-    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_folder')}>Open Folder</button>
-    <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('delete')}>Delete File</button>
+    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_file')}>{m.library_open_file()}</button>
+    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_folder')}>{m.library_open_folder()}</button>
+    <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('delete')}>{m.library_delete_file_title()}</button>
     <div class="ctx-sep"></div>
     {#if fileHashed}
       <div
@@ -2114,21 +2132,21 @@
         onmouseleave={() => ctxPrioritySub = false}
         onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') ctxPrioritySub = true; }}
       >
-        Priority &raquo;
+        {m.library_col_priority()} &raquo;
         {#if ctxPrioritySub}
           <div class="ctx-submenu" class:ctx-submenu-left={ctxSubmenuLeft} class:ctx-submenu-up={ctxSubmenuUp} role="menu">
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'verylow'} onclick={() => ctxAction('priority', 'verylow')}>Very Low</button>
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'low'} onclick={() => ctxAction('priority', 'low')}>Low</button>
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'normal'} onclick={() => ctxAction('priority', 'normal')}>Normal</button>
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'high'} onclick={() => ctxAction('priority', 'high')}>High</button>
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'release'} onclick={() => ctxAction('priority', 'release')}>Release</button>
+            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'verylow'} onclick={() => ctxAction('priority', 'verylow')}>{m.library_priority_verylow()}</button>
+            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'low'} onclick={() => ctxAction('priority', 'low')}>{m.library_priority_low()}</button>
+            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'normal'} onclick={() => ctxAction('priority', 'normal')}>{m.library_priority_normal()}</button>
+            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'high'} onclick={() => ctxAction('priority', 'high')}>{m.library_priority_high()}</button>
+            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'release'} onclick={() => ctxAction('priority', 'release')}>{m.library_priority_release()}</button>
             <div class="ctx-sep"></div>
-            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'auto'} onclick={() => ctxAction('priority', 'auto')}>Auto</button>
+            <button class="ctx-item" role="menuitem" class:ctx-checked={ctxMenu.file.priority === 'auto'} onclick={() => ctxAction('priority', 'auto')}>{m.library_priority_auto()}</button>
           </div>
         {/if}
       </div>
       <div class="ctx-sep"></div>
-      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>Copy eD2K Link</button>
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.servers_copy_ed2k_link()}</button>
       <div class="ctx-sep"></div>
       {#if ctxMenu.file.shared}
         <button
@@ -2136,15 +2154,15 @@
           role="menuitem"
           onclick={() => ctxAction('republish')}
           title={$networkStats.status === 'connected'
-            ? 'Reset publish timers so this file is re-published to the KAD network on the next cycle'
-            : 'KAD is not connected — republish will be deferred until the network comes online'}
-        >Republish to KAD{$networkStats.status !== 'connected' ? ' (offline)' : ''}</button>
-        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>Unshare File</button>
+            ? m.library_republish_title_online()
+            : m.library_republish_title_offline()}
+        >{m.library_republish_kad()}{$networkStats.status !== 'connected' ? m.library_republish_offline_suffix() : ''}</button>
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>{m.library_unshare_file()}</button>
       {:else}
-        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('share')}>Share File</button>
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('share')}>{m.library_share_file()}</button>
       {/if}
     {:else}
-      <button class="ctx-item ctx-disabled" role="menuitem" disabled>Hashing in progress&hellip;</button>
+      <button class="ctx-item ctx-disabled" role="menuitem" disabled>{m.library_hashing_in_progress()}</button>
     {/if}
   </div>
 {/if}

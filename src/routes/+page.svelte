@@ -17,6 +17,7 @@
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import type { KadContact, KadSearchEntry } from '$lib/types';
   import { onMount, untrack } from 'svelte';
+  import * as m from '$lib/paraglide/messages';
 
   let contacts: KadContact[] = $state([]);
   let searches: KadSearchEntry[] = $state([]);
@@ -205,7 +206,7 @@
         await kadConnect();
       }
     } catch (e: unknown) {
-      kadError = toErrMsg(e, 'Connection failed');
+      kadError = toErrMsg(e, m.kad_connection_failed());
       loading = false;
     } finally {
       connectPending = false;
@@ -215,16 +216,11 @@
   async function handleRecheckFirewall() {
     if (rechecking) return;
     rechecking = true;
-    // K28: keep error surfaces consistent. The page-level `kadError`
-    // banner is reserved for things that affect all the data shown on
-    // the page (connect failure, initial data load failure). Transient
-    // errors from button actions (firewall recheck, bootstrap, etc) go
-    // through toasts instead.
     try {
       await kadRecheckFirewall();
-      toastSuccess('Firewall recheck initiated');
+      toastSuccess(m.kad_firewall_recheck_initiated());
     } catch (e: unknown) {
-      toastError(toErrMsg(e, 'Firewall recheck failed'));
+      toastError(toErrMsg(e, m.kad_firewall_recheck_failed()));
     } finally {
       // Leave the button disabled briefly so the user can see the action
       // registered and to match the backend's internal cooldown. Track the
@@ -248,25 +244,25 @@
       if (bootstrapMode === 'ip') {
         const host = bootstrapIpHost.trim();
         const portNum = Number.parseInt(bootstrapIpPort, 10);
-        if (!host) { toastError('Host or IP address is required'); return; }
+        if (!host) { toastError(m.kad_bootstrap_host_required()); return; }
         if (!Number.isFinite(portNum) || portNum < 1 || portNum > 65535) {
-          toastError('Port must be between 1 and 65535');
+          toastError(m.kad_bootstrap_port_range());
           return;
         }
-        const msg = await kadBootstrapIp(host, portNum);
-        toastSuccess(msg || `Bootstrapping from ${host}:${portNum}`);
+        const result = await kadBootstrapIp(host, portNum);
+        toastSuccess(result || m.kad_bootstrap_from_host({ host, port: portNum }));
       } else if (bootstrapMode === 'url') {
         const url = bootstrapUrl.trim();
-        if (!url) { toastError('URL is required'); return; }
+        if (!url) { toastError(m.kad_bootstrap_url_required()); return; }
         if (!/^https:\/\//i.test(url)) {
-          toastError('Only https:// URLs are allowed');
+          toastError(m.kad_bootstrap_url_must_be_https());
           return;
         }
-        const msg = await kadBootstrapUrl(url);
-        toastSuccess(msg || 'Loaded nodes.dat from URL');
+        const result = await kadBootstrapUrl(url);
+        toastSuccess(result || m.kad_bootstrap_loaded_url());
       } else {
         await kadBootstrapClients();
-        toastSuccess('Re-bootstrapping from known contacts');
+        toastSuccess(m.kad_bootstrap_from_known());
       }
       bootstrapOpen = false;
       // Kick an immediate refresh so new contacts show quickly.
@@ -274,7 +270,7 @@
     } catch (e: unknown) {
       // Show the concrete backend error so the user knows whether the
       // URL 404'd, the parse failed, the IP was unreachable, etc.
-      toastError(toErrMsg(e, 'Bootstrap failed'));
+      toastError(toErrMsg(e, m.kad_bootstrap_failed()));
     } finally {
       bootstrapPending = false;
     }
@@ -303,9 +299,9 @@
     try {
       await kadCancelSearch(id);
       searches = searches.filter((s) => s.id !== id);
-      toastSuccess('Search cancelled');
+      toastSuccess(m.kad_search_cancelled());
     } catch (e: unknown) {
-      toastError(toErrMsg(e, 'Failed to cancel search'));
+      toastError(toErrMsg(e, m.kad_failed_to_cancel_search()));
     }
   }
 
@@ -315,36 +311,39 @@
     if (!startedAt) return '—';
     const diff = Math.max(0, Math.floor(Date.now() / 1000) - startedAt);
     if (diff < 60) return `${diff}s`;
-    const m = Math.floor(diff / 60);
-    const s = diff % 60;
-    if (m < 60) return s > 0 ? `${m}m ${s}s` : `${m}m`;
-    const h = Math.floor(m / 60);
-    const mr = m % 60;
-    return `${h}h ${mr}m`;
+    const mins = Math.floor(diff / 60);
+    const secs = diff % 60;
+    if (mins < 60) return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`;
+    const hrs = Math.floor(mins / 60);
+    const mr = mins % 60;
+    return `${hrs}h ${mr}m`;
   }
 
-  async function copyText(text: string, label = 'Copied') {
+  async function copyText(text: string, label?: string) {
     try {
       await navigator.clipboard.writeText(text);
-      toastInfo(`${label}`);
+      toastInfo(label ?? m.common_copied());
     } catch {
-      toastError('Clipboard unavailable');
+      toastError(m.kad_clipboard_unavailable());
     }
   }
 
   function getConnectButtonLabel(): string {
-    if ($networkStats.status === 'connected') return 'Disconnect';
-    if ($networkStats.status === 'connecting') return 'Cancel';
-    return 'Connect';
+    if ($networkStats.status === 'connected') return m.servers_disconnect();
+    if ($networkStats.status === 'connecting') return m.common_cancel();
+    return m.servers_connect();
   }
 
-  const CONTACT_TYPE_NAMES: Record<number, string> = {
-    0: 'Active',
-    1: 'Verified',
-    2: 'Expiring',
-    3: 'New',
-    4: 'Dead',
-  };
+  function contactTypeName(t: number): string {
+    switch (t) {
+      case 0: return m.kad_type_active();
+      case 1: return m.kad_type_verified();
+      case 2: return m.kad_type_expiring();
+      case 3: return m.kad_type_new();
+      case 4: return m.kad_type_dead();
+      default: return m.kad_type_unknown({ type: t });
+    }
+  }
 
   // Single-letter sigils paired with the color so type can be parsed
   // without relying on hue (WCAG "use of color" — color must not be
@@ -358,8 +357,8 @@
   };
 
   function getContactTypeLabel(contact: KadContact): string {
-    if (contact.bootstrap) return 'Bootstrap';
-    const name = CONTACT_TYPE_NAMES[contact.type] || `Type ${contact.type}`;
+    if (contact.bootstrap) return m.kad_type_bootstrap();
+    const name = contactTypeName(contact.type);
     const v = contact.version ? ` v${contact.version}` : '';
     return `${name}${v}`;
   }
@@ -507,26 +506,26 @@
 </script>
 
 <div class="page-header">
-  <h2>KAD Network</h2>
+  <h2>{m.nav_kad_network()}</h2>
   <div class="header-actions">
     <button
       class="ghost"
       onclick={() => openBootstrap('ip')}
       disabled={$networkStats.status === 'disconnected'}
-      title="Bootstrap from a specific node, URL, or known contacts"
+      title={m.kad_bootstrap_title()}
     >
-      Bootstrap&hellip;
+      {m.kad_bootstrap_button()}
     </button>
     <button
       class="ghost"
       onclick={handleRecheckFirewall}
       disabled={!isConnected || rechecking}
-      title={rechecking ? 'Firewall recheck in progress' : 'Run a fresh firewall test via remote KAD peers'}
+      title={rechecking ? m.kad_firewall_in_progress() : m.kad_firewall_recheck_title()}
     >
       {#if rechecking}
-        <span class="spinner-inline" aria-hidden="true"></span> Rechecking&hellip;
+        <span class="spinner-inline" aria-hidden="true"></span> {m.kad_rechecking()}
       {:else}
-        Recheck Firewall
+        {m.kad_recheck_firewall()}
       {/if}
     </button>
     <button
@@ -541,7 +540,7 @@
 {#if kadError}
   <div class="error-banner">
     <span>{kadError}</span>
-    <button class="ghost" onclick={() => { kadError = null; networkError.set(null); }}>Dismiss</button>
+    <button class="ghost" onclick={() => { kadError = null; networkError.set(null); }}>{m.common_dismiss()}</button>
   </div>
 {/if}
 
@@ -551,9 +550,9 @@
     <div class="kad-upper-left">
       <div class="panel-toolbar">
         <span class="toolbar-label">
-          Contacts
+          {m.kad_contacts_label()}
           {#if contactFilter.trim() || contactTypeFilter !== 'all'}
-            ({filteredContacts.length.toLocaleString()} of {contacts.length.toLocaleString()})
+            ({m.kad_contacts_count_filtered({ filtered: filteredContacts.length.toLocaleString(), total: contacts.length.toLocaleString() })})
           {:else}
             ({contacts.length.toLocaleString()})
           {/if}
@@ -561,7 +560,7 @@
         <input
           type="search"
           class="filter-input"
-          placeholder="Filter by ID or distance…"
+          placeholder={m.kad_filter_placeholder()}
           value={contactFilterInput}
           oninput={(e) => {
             contactFilterInput = (e.currentTarget as HTMLInputElement).value;
@@ -573,21 +572,21 @@
             }, 150);
           }}
           disabled={contacts.length === 0}
-          aria-label="Filter contacts by ID or distance"
+          aria-label={m.kad_filter_aria()}
         />
         <select
           class="filter-select"
           bind:value={contactTypeFilter}
           disabled={contacts.length === 0}
-          aria-label="Filter by contact type"
+          aria-label={m.kad_filter_type_aria()}
         >
-          <option value="all">All types</option>
-          <option value="bootstrap">Bootstrap</option>
-          <option value="0">Active</option>
-          <option value="1">Verified</option>
-          <option value="2">Expiring</option>
-          <option value="3">New</option>
-          <option value="4">Dead</option>
+          <option value="all">{m.kad_filter_all_types()}</option>
+          <option value="bootstrap">{m.kad_type_bootstrap()}</option>
+          <option value="0">{m.kad_type_active()}</option>
+          <option value="1">{m.kad_type_verified()}</option>
+          <option value="2">{m.kad_type_expiring()}</option>
+          <option value="3">{m.kad_type_new()}</option>
+          <option value="4">{m.kad_type_dead()}</option>
         </select>
       </div>
 
@@ -599,39 +598,39 @@
         {#if $networkStats.status !== 'connected' && $networkStats.status !== 'connecting'}
           <div class="empty-state compact">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path><line x1="8" y1="12" x2="16" y2="12"></line><line x1="2" y1="2" x2="22" y2="22"></line></svg>
-            <p>Not connected</p>
-            <p class="sub">Press Connect to join the KAD network</p>
-            <button class="empty-action" onclick={handleConnect}>Connect</button>
+            <p>{m.kad_not_connected()}</p>
+            <p class="sub">{m.kad_press_connect()}</p>
+            <button class="empty-action" onclick={handleConnect}>{m.servers_connect()}</button>
           </div>
         {:else if loading}
           <div class="empty-state compact">
             <div class="spinner lg"></div>
-            <p>Loading contacts...</p>
+            <p>{m.kad_loading_contacts()}</p>
           </div>
         {:else if contacts.length === 0}
           <div class="empty-state compact">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
-            <p>No KAD contacts</p>
-            <p class="sub">The routing table is empty. Bootstrap from a known node to join the network.</p>
+            <p>{m.kad_empty_no_contacts()}</p>
+            <p class="sub">{m.kad_empty_no_contacts_sub()}</p>
             <div class="empty-actions">
-              <button class="empty-action" onclick={() => openBootstrap('clients')}>Bootstrap from Clients</button>
-              <button class="empty-action ghost" onclick={() => openBootstrap('url')}>From URL…</button>
-              <button class="empty-action ghost" onclick={() => openBootstrap('ip')}>By IP…</button>
+              <button class="empty-action" onclick={() => openBootstrap('clients')}>{m.kad_bootstrap_from_clients()}</button>
+              <button class="empty-action ghost" onclick={() => openBootstrap('url')}>{m.kad_from_url()}</button>
+              <button class="empty-action ghost" onclick={() => openBootstrap('ip')}>{m.kad_by_ip()}</button>
             </div>
           </div>
         {:else if filteredContacts.length === 0}
           <div class="empty-state compact">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line><line x1="11" y1="8" x2="11" y2="14"></line><line x1="8" y1="11" x2="14" y2="11"></line></svg>
-            <p>No contacts match the filter</p>
-            <p class="sub">Try a shorter prefix or a different type.</p>
-            <button class="empty-action ghost" onclick={() => { contactFilterInput = ''; contactFilter = ''; contactTypeFilter = 'all'; }}>Clear Filters</button>
+            <p>{m.kad_empty_no_matches()}</p>
+            <p class="sub">{m.kad_empty_no_matches_sub()}</p>
+            <button class="empty-action ghost" onclick={() => { contactFilterInput = ''; contactFilter = ''; contactTypeFilter = 'all'; }}>{m.kad_clear_filters()}</button>
           </div>
         {:else}
           <table class="compact-table">
             <thead>
               <tr>
                 <th class="sortable" tabindex="0" role="columnheader" aria-sort={contactSortCol === 'id' ? (contactSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortContacts('id')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortContacts('id'))}>
-                  ID{getSortArrow(contactSortCol, 'id', contactSortAsc)}
+                  {m.kad_col_id()}{getSortArrow(contactSortCol, 'id', contactSortAsc)}
                 </th>
                 <th
                   class="sortable"
@@ -640,12 +639,12 @@
                   aria-sort={contactSortCol === 'type' ? (contactSortAsc ? 'ascending' : 'descending') : 'none'}
                   onclick={() => sortContacts('type')}
                   onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortContacts('type'))}
-                  title={'Contact lifecycle:\n  Active — recently responsive\n  Verified — IP verified by KAD challenge\n  Expiring — nearing timeout, awaiting refresh\n  New — added recently, not yet validated\n  Dead — unresponsive, will be removed\n  Bootstrap — seed node, not counted against routing table'}
+                  title={m.kad_type_lifecycle_help()}
                 >
-                  Type{getSortArrow(contactSortCol, 'type', contactSortAsc)}
+                  {m.kad_col_type()}{getSortArrow(contactSortCol, 'type', contactSortAsc)}
                 </th>
                 <th class="sortable" tabindex="0" role="columnheader" aria-sort={contactSortCol === 'distance' ? (contactSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortContacts('distance')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortContacts('distance'))}>
-                  Distance{getSortArrow(contactSortCol, 'distance', contactSortAsc)}
+                  {m.kad_col_distance()}{getSortArrow(contactSortCol, 'distance', contactSortAsc)}
                 </th>
               </tr>
             </thead>
@@ -657,8 +656,8 @@
                 <tr class="virtual-row" class:row-alt={(virtualContacts.startIdx + i) % 2 === 1}>
                   <td class="contact-id">
                     <!-- svelte-ignore a11y_no_static_element_interactions -->
-                    <span class="cell-content" title={`${contact.id}\nDouble-click to copy`} ondblclick={() => copyText(contact.id, 'Copied contact ID')}>{contact.id}</span>
-                    <button class="ghost copy-btn" aria-label="Copy ID" onclick={() => copyText(contact.id, 'Copied contact ID')} title="Copy ID">
+                    <span class="cell-content" title={m.kad_double_click_to_copy({ value: contact.id })} ondblclick={() => copyText(contact.id, m.kad_copied_contact_id())}>{contact.id}</span>
+                    <button class="ghost copy-btn" aria-label={m.kad_copy_id()} onclick={() => copyText(contact.id, m.kad_copied_contact_id())} title={m.kad_copy_id()}>
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
                     </button>
                   </td>
@@ -670,8 +669,8 @@
                   </td>
                   <td class="distance">
                     <!-- svelte-ignore a11y_no_static_element_interactions -->
-                    <span class="cell-content" title={`${contact.distance}\nDouble-click to copy`} ondblclick={() => copyText(contact.distance, 'Copied distance')}>{contact.distance}</span>
-                    <button class="ghost copy-btn" aria-label="Copy Distance" onclick={() => copyText(contact.distance, 'Copied distance')} title="Copy Distance">
+                    <span class="cell-content" title={m.kad_double_click_to_copy({ value: contact.distance })} ondblclick={() => copyText(contact.distance, m.kad_copied_distance())}>{contact.distance}</span>
+                    <button class="ghost copy-btn" aria-label={m.kad_copy_distance()} onclick={() => copyText(contact.distance, m.kad_copied_distance())} title={m.kad_copy_distance()}>
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
                     </button>
                   </td>
@@ -688,36 +687,41 @@
 
     <div class="kad-upper-right scroll-shadows">
       <div class="stats-panel">
-        <div class="panel-title">Network Status</div>
+        <div class="panel-title">{m.kad_network_status()}</div>
 
-        <!-- Three logical groups: overall connection, peers discovered,
-             reachability. Separators between groups replace the old
-             per-row dashed borders for a calmer, more scannable card. -->
         <div class="stat-group">
           <div class="stat-tile tile-wide">
-            <span class="stat-label">Status</span>
+            <span class="stat-label">{m.kad_stat_status()}</span>
             <span class="badge {$networkStats.status}">
               <span class="badge-glyph" aria-hidden="true">
                 {#if $networkStats.status === 'connected'}&#x2713;{:else if $networkStats.status === 'connecting'}&#x25CB;{:else}&#x2715;{/if}
               </span>
-              {$networkStats.status}
+              {$networkStats.status === 'connected'
+                ? m.kad_status_connected()
+                : $networkStats.status === 'connecting'
+                  ? m.kad_status_connecting()
+                  : m.kad_status_disconnected()}
             </span>
           </div>
           <div class="stat-tile tile-wide">
-            <span class="stat-label">Health</span>
+            <span class="stat-label">{m.kad_stat_health()}</span>
             <span class="stat-value">
-              {$networkStats.stale ? 'Stale' : $networkStats.degraded ? ($networkStats.degraded_reason || 'Degraded') : 'Healthy'}
+              {$networkStats.stale
+                ? m.kad_health_stale()
+                : $networkStats.degraded
+                  ? ($networkStats.degraded_reason || m.kad_health_degraded())
+                  : m.kad_health_healthy()}
             </span>
           </div>
         </div>
 
         <div class="stat-group stat-group-grid">
           <div class="stat-tile">
-            <span class="stat-label">Contacts</span>
+            <span class="stat-label">{m.kad_stat_contacts()}</span>
             <span class="stat-value stat-numeric">{contacts.length.toLocaleString()}</span>
           </div>
           <div class="stat-tile">
-            <span class="stat-label" title="Estimated number of KAD users worldwide, derived from routing-table density">KAD users</span>
+            <span class="stat-label" title={m.kad_stat_kad_users_title()}>{m.kad_stat_kad_users()}</span>
             <span class="stat-value stat-numeric">
               {$networkStats.status === 'disconnected' || !$networkStats.kad_users_estimate
                 ? '—'
@@ -725,38 +729,38 @@
             </span>
           </div>
           <div class="stat-tile">
-            <span class="stat-label" title="Ember-aware peers discovered in this session">Ember peers</span>
+            <span class="stat-label" title={m.kad_stat_ember_peers_title()}>{m.kad_stat_ember_peers()}</span>
             <span class="stat-value stat-numeric">{($networkStats.ember_peers ?? 0).toLocaleString()}</span>
           </div>
           <div class="stat-tile">
-            <span class="stat-label" title="Sources learned via EPX (Ember Peer Exchange)">EPX sources</span>
+            <span class="stat-label" title={m.kad_stat_epx_sources_title()}>{m.kad_stat_epx_sources()}</span>
             <span class="stat-value stat-numeric">{($networkStats.epx_sources_received ?? 0).toLocaleString()}</span>
           </div>
         </div>
 
         <div class="stat-group">
           <div class="stat-tile tile-wide">
-            <span class="stat-label">External IP</span>
-            <span class="stat-value stat-ip">{$networkStats.status === 'disconnected' ? 'Unknown' : ($networkStats.external_ip || 'Detecting…')}</span>
+            <span class="stat-label">{m.kad_stat_external_ip()}</span>
+            <span class="stat-value stat-ip">{$networkStats.status === 'disconnected' ? m.common_unknown() : ($networkStats.external_ip || m.kad_detecting())}</span>
           </div>
           <div class="stat-tile tile-wide">
-            <span class="stat-label">Firewall</span>
+            <span class="stat-label">{m.kad_stat_firewall()}</span>
             {#if $networkStats.status === 'disconnected'}
-              <span class="badge unknown"><span class="badge-glyph" aria-hidden="true">?</span> Unknown</span>
+              <span class="badge unknown"><span class="badge-glyph" aria-hidden="true">?</span> {m.common_unknown()}</span>
             {:else if $networkStats.status === 'connecting'}
-              <span class="badge unknown"><span class="badge-glyph" aria-hidden="true">&#x25CB;</span> Checking…</span>
+              <span class="badge unknown"><span class="badge-glyph" aria-hidden="true">&#x25CB;</span> {m.kad_checking()}</span>
             {:else}
               <span
                 class="badge {$networkStats.firewalled ? 'firewalled' : 'open'}"
                 role="status"
                 aria-label={$networkStats.firewalled
-                  ? 'Firewall status: firewalled. Inbound TCP connections are blocked; KAD operates via UDP callbacks.'
-                  : 'Firewall status: open. Inbound TCP connections succeed; full KAD participation is available.'}
+                  ? m.kad_firewall_aria_firewalled()
+                  : m.kad_firewall_aria_open()}
               >
                 <span class="badge-glyph" aria-hidden="true">
                   {#if $networkStats.firewalled}&#x26A0;{:else}&#x2713;{/if}
                 </span>
-                {$networkStats.firewalled ? 'Firewalled' : 'Open'}
+                {$networkStats.firewalled ? m.kad_firewall_firewalled() : m.kad_firewall_open()}
               </span>
             {/if}
           </div>
@@ -764,33 +768,33 @@
 
         <div class="stat-group stat-group-grid">
           <div class="stat-tile">
-            <span class="stat-label">TCP</span>
-            <span class="stat-value">{$networkStats.tcp_status || 'Unknown'}</span>
+            <span class="stat-label">{m.kad_stat_tcp()}</span>
+            <span class="stat-value">{$networkStats.tcp_status || m.common_unknown()}</span>
           </div>
           <div class="stat-tile">
-            <span class="stat-label">UDP</span>
-            <span class="stat-value">{$networkStats.udp_status || 'Unknown'}</span>
+            <span class="stat-label">{m.kad_stat_udp()}</span>
+            <span class="stat-value">{$networkStats.udp_status || m.common_unknown()}</span>
           </div>
           <div class="stat-tile">
-            <span class="stat-label">UPnP</span>
+            <span class="stat-label">{m.kad_stat_upnp()}</span>
             {#if !upnpEnabled}
               <button
                 type="button"
                 class="stat-link"
                 onclick={() => goto('/settings')}
-                title="UPnP is disabled in Settings — click to open Settings"
-              >Disabled</button>
+                title={m.kad_upnp_disabled_title()}
+              >{m.kad_upnp_disabled()}</button>
             {:else}
-              <span class="stat-value">{$networkStats.upnp_mapped ? 'Mapped' : 'Not Mapped'}</span>
+              <span class="stat-value">{$networkStats.upnp_mapped ? m.kad_upnp_mapped() : m.kad_upnp_not_mapped()}</span>
             {/if}
           </div>
           <div class="stat-tile">
-            <span class="stat-label">Buddy</span>
+            <span class="stat-label">{m.kad_stat_buddy()}</span>
             <span class="stat-value">
-              {!$networkStats.buddy_status || $networkStats.buddy_status === 'none' ? 'None' :
-               $networkStats.buddy_status.startsWith('connected') ? 'Connected' :
-               $networkStats.buddy_status.startsWith('connecting') ? 'Connecting' :
-               $networkStats.buddy_status.startsWith('serving') ? 'Serving' :
+              {!$networkStats.buddy_status || $networkStats.buddy_status === 'none' ? m.kad_buddy_none() :
+               $networkStats.buddy_status.startsWith('connected') ? m.kad_buddy_connected() :
+               $networkStats.buddy_status.startsWith('connecting') ? m.kad_buddy_connecting() :
+               $networkStats.buddy_status.startsWith('serving') ? m.kad_buddy_serving() :
                $networkStats.buddy_status}
             </span>
           </div>
@@ -843,8 +847,8 @@
     >
       <div class="modal-content bootstrap-modal">
         <div class="modal-header">
-          <h3 id="kad-bootstrap-title">Bootstrap KAD</h3>
-          <button class="modal-close" aria-label="Close" onclick={() => (bootstrapOpen = false)}>×</button>
+          <h3 id="kad-bootstrap-title">{m.kad_bootstrap_modal_title()}</h3>
+          <button class="modal-close" aria-label={m.common_close()} onclick={() => (bootstrapOpen = false)}>×</button>
         </div>
         <div class="modal-body">
           <div class="bootstrap-tabs" role="tablist">
@@ -854,40 +858,40 @@
               aria-selected={bootstrapMode === 'ip'}
               class:active={bootstrapMode === 'ip'}
               onclick={() => (bootstrapMode = 'ip')}
-            >By IP / Host</button>
+            >{m.kad_bootstrap_tab_ip()}</button>
             <button
               type="button"
               role="tab"
               aria-selected={bootstrapMode === 'url'}
               class:active={bootstrapMode === 'url'}
               onclick={() => (bootstrapMode = 'url')}
-            >From URL</button>
+            >{m.kad_bootstrap_tab_url()}</button>
             <button
               type="button"
               role="tab"
               aria-selected={bootstrapMode === 'clients'}
               class:active={bootstrapMode === 'clients'}
               onclick={() => (bootstrapMode = 'clients')}
-            >Known Contacts</button>
+            >{m.kad_bootstrap_tab_clients()}</button>
           </div>
 
           {#if bootstrapMode === 'ip'}
-            <p class="bootstrap-hint">Send a bootstrap request to a single KAD node. Use the node's public IP or hostname and its KAD (UDP) port.</p>
+            <p class="bootstrap-hint">{m.kad_bootstrap_hint_ip()}</p>
             <div class="form-row">
-              <label class="form-label" for="kad-bs-host">Host / IP</label>
+              <label class="form-label" for="kad-bs-host">{m.kad_bootstrap_host_label()}</label>
               <input
                 id="kad-bs-host"
                 type="text"
                 class="form-input"
                 bind:value={bootstrapIpHost}
                 bind:this={bootstrapHostInput}
-                placeholder="kad.example.com or 203.0.113.42"
+                placeholder={m.kad_bootstrap_host_placeholder()}
                 autocomplete="off"
                 onkeydown={(e) => { if (e.key === 'Enter' && !bootstrapPending && bootstrapIpHost.trim()) { e.preventDefault(); void handleBootstrap(); } }}
               />
             </div>
             <div class="form-row">
-              <label class="form-label" for="kad-bs-port">Port</label>
+              <label class="form-label" for="kad-bs-port">{m.servers_port()}</label>
               <input
                 id="kad-bs-port"
                 type="number"
@@ -899,9 +903,13 @@
               />
             </div>
           {:else if bootstrapMode === 'url'}
-            <p class="bootstrap-hint">Fetch a <code>nodes.dat</code> file from a URL and bootstrap from its contents. URLs are validated against SSRF rules before fetch.</p>
+            <p class="bootstrap-hint">
+              {m.kad_bootstrap_hint_url_prefix()}
+              <code>nodes.dat</code>
+              {m.kad_bootstrap_hint_url_suffix()}
+            </p>
             <div class="form-row">
-              <label class="form-label" for="kad-bs-url">URL</label>
+              <label class="form-label" for="kad-bs-url">{m.servers_url_label()}</label>
               <input
                 id="kad-bs-url"
                 type="url"
@@ -914,11 +922,11 @@
               />
             </div>
           {:else}
-            <p class="bootstrap-hint">Re-bootstrap by re-pinging KAD contacts currently in this session's routing table. Useful when the network looks idle but some verified peers are still cached from earlier activity. Won't help on a completely fresh start — use IP or URL bootstrap first.</p>
+            <p class="bootstrap-hint">{m.kad_bootstrap_hint_clients()}</p>
           {/if}
         </div>
         <div class="modal-footer">
-          <button class="ghost" onclick={() => (bootstrapOpen = false)} disabled={bootstrapPending}>Cancel</button>
+          <button class="ghost" onclick={() => (bootstrapOpen = false)} disabled={bootstrapPending}>{m.common_cancel()}</button>
           <button
             class="primary"
             onclick={handleBootstrap}
@@ -927,9 +935,9 @@
               || (bootstrapMode === 'url' && !bootstrapUrl.trim())}
           >
             {#if bootstrapPending}
-              <span class="spinner-inline" aria-hidden="true"></span> Working&hellip;
+              <span class="spinner-inline" aria-hidden="true"></span> {m.kad_working()}
             {:else}
-              Bootstrap
+              {m.kad_bootstrap_action()}
             {/if}
           </button>
         </div>
@@ -945,21 +953,21 @@
           <circle cx="8" cy="8" r="6.5"/><line x1="8" y1="4.5" x2="8" y2="11.5"/><line x1="4.5" y1="8" x2="11.5" y2="8"/>
         </svg>
       </span>
-      <span>Searches ({searches.length})</span>
+      <span>{m.kad_searches_section({ count: searches.length })}</span>
     </div>
     <div class="panel-content scrollable scroll-shadows">
       {#if $networkStats.status !== 'connected' && $networkStats.status !== 'connecting'}
         <div class="empty-state compact">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path><line x1="8" y1="12" x2="16" y2="12"></line><line x1="2" y1="2" x2="22" y2="22"></line></svg>
-          <p>Not connected</p>
-          <p class="sub">Connect to the KAD network to see active searches</p>
-          <button class="empty-action" onclick={handleConnect}>Connect</button>
+          <p>{m.kad_not_connected()}</p>
+          <p class="sub">{m.kad_searches_empty_disconnected_sub()}</p>
+          <button class="empty-action" onclick={handleConnect}>{m.servers_connect()}</button>
         </div>
       {:else if searches.length === 0}
         <div class="empty-state compact">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="48" height="48"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
-          <p>No active KAD searches</p>
-          <p class="sub">Searches will appear here when initiated from the Search page</p>
+          <p>{m.kad_searches_empty_title()}</p>
+          <p class="sub">{m.kad_searches_empty_sub()}</p>
         </div>
       {:else}
         <table class="compact-table">
@@ -969,30 +977,30 @@
                 #{getSortArrow(searchSortCol, 'id', searchSortAsc)}
               </th>
               <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'target' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('target')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('target'))}>
-                Key{getSortArrow(searchSortCol, 'target', searchSortAsc)}
+                {m.kad_search_col_key()}{getSortArrow(searchSortCol, 'target', searchSortAsc)}
               </th>
               <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'type' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('type')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('type'))}>
-                Type{getSortArrow(searchSortCol, 'type', searchSortAsc)}
+                {m.kad_search_col_type()}{getSortArrow(searchSortCol, 'type', searchSortAsc)}
               </th>
               <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'name' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('name')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('name'))}>
-                Name{getSortArrow(searchSortCol, 'name', searchSortAsc)}
+                {m.kad_search_col_name()}{getSortArrow(searchSortCol, 'name', searchSortAsc)}
               </th>
               <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'status' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('status')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('status'))}>
-                Status{getSortArrow(searchSortCol, 'status', searchSortAsc)}
+                {m.kad_search_col_status()}{getSortArrow(searchSortCol, 'status', searchSortAsc)}
               </th>
               <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'load' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('load')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('load'))}>
-                Load{getSortArrow(searchSortCol, 'load', searchSortAsc)}
+                {m.kad_search_col_load()}{getSortArrow(searchSortCol, 'load', searchSortAsc)}
               </th>
               <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'packets_sent' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('packets_sent')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('packets_sent'))}>
-                Packets{getSortArrow(searchSortCol, 'packets_sent', searchSortAsc)}
+                {m.kad_search_col_packets()}{getSortArrow(searchSortCol, 'packets_sent', searchSortAsc)}
               </th>
               <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'responses' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('responses')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('responses'))}>
-                Responses{getSortArrow(searchSortCol, 'responses', searchSortAsc)}
+                {m.kad_search_col_responses()}{getSortArrow(searchSortCol, 'responses', searchSortAsc)}
               </th>
               <th class="sortable" tabindex="0" role="columnheader" aria-sort={searchSortCol === 'started_at' ? (searchSortAsc ? 'ascending' : 'descending') : 'none'} onclick={() => sortSearches('started_at')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches('started_at'))}>
-                Age{getSortArrow(searchSortCol, 'started_at', searchSortAsc)}
+                {m.kad_search_col_age()}{getSortArrow(searchSortCol, 'started_at', searchSortAsc)}
               </th>
-              <th aria-label="Actions"></th>
+              <th aria-label={m.servers_col_actions()}></th>
             </tr>
           </thead>
           <tbody>
@@ -1004,7 +1012,7 @@
                 <td>{search.name || '—'}</td>
                 <td>
                   <span class="badge {search.status}">
-                    {search.status === 'active' ? 'Active' : 'Stopping'}
+                    {search.status === 'active' ? m.kad_search_status_active() : m.kad_search_status_stopping()}
                   </span>
                 </td>
                 <td>{search.load} ({search.load_response}/{search.load_total})</td>
@@ -1015,8 +1023,8 @@
                   {#if search.status === 'active'}
                     <button
                       class="ghost cancel-btn"
-                      title="Cancel this search"
-                      aria-label={`Cancel search ${search.id}`}
+                      title={m.kad_search_cancel_title()}
+                      aria-label={m.kad_search_cancel_aria({ id: search.id })}
                       onclick={() => handleCancelSearch(search.id)}
                     >
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="15" y1="9" x2="9" y2="15"></line><line x1="9" y1="9" x2="15" y2="15"></line></svg>

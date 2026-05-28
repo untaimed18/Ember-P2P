@@ -1,4 +1,6 @@
 <script lang="ts">
+  import * as m from '$lib/paraglide/messages';
+
   type Unit = 'B/s' | 'KB/s' | 'MB/s';
 
   const multipliers: Record<Unit, number> = {
@@ -93,7 +95,7 @@
       class="unlimited-display"
       role="button"
       tabindex="0"
-      aria-label="Unlimited — activate to set a limit"
+      aria-label={m.speed_input_unlimited_aria()}
       onclick={toggleUnlimited}
       onkeydown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
@@ -102,8 +104,8 @@
         }
       }}
     >
-      <span class="unlimited-text">Unlimited</span>
-      <span class="unlimited-hint">Click to set a limit</span>
+      <span class="unlimited-text">{m.speed_input_unlimited()}</span>
+      <span class="unlimited-hint">{m.speed_input_click_to_set_limit()}</span>
     </div>
   {:else}
     <input
@@ -115,12 +117,12 @@
       class="speed-number"
       placeholder="0"
     />
-    <select value={unit} onchange={handleUnitChange} class="speed-unit">
+    <select value={unit} onchange={handleUnitChange} class="speed-unit" aria-label={m.speed_input_unit_label()}>
       <option value="B/s">B/s</option>
       <option value="KB/s">KB/s</option>
       <option value="MB/s">MB/s</option>
     </select>
-    <button type="button" class="unlimited-btn" onclick={toggleUnlimited} title="Set unlimited">
+    <button type="button" class="unlimited-btn" onclick={toggleUnlimited} title={m.speed_input_set_unlimited()} aria-label={m.speed_input_set_unlimited()}>
       &infin;
     </button>
   {/if}
