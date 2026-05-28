@@ -171,7 +171,7 @@
     } catch (e: unknown) {
       if (gen !== loadGen) return;
       if (messages.length === 0) {
-        loadError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to load messages';
+        loadError = e instanceof Error ? e.message : typeof e === 'string' ? e : m.chat_failed_to_load();
       }
     } finally {
       if (gen === loadGen) loading = false;

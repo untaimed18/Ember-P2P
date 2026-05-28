@@ -25,6 +25,7 @@
   import type { SearchResult, SpamExplanation } from '$lib/types';
   import { formatSize, formatSpeed } from '$lib/utils';
   import { addToast } from '$lib/stores/toast';
+  import * as m from '$lib/paraglide/messages';
 
   const searchTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
 
@@ -129,6 +130,9 @@
   let lastCheckedKey = $state<string | null>(null);
   let bulkDownloadPending = $state(false);
   let bulkDownloadMessage = $state('');
+  // Track failure flag separately so the CSS class doesn't depend on
+  // substring matching against the (now localized) status text.
+  let bulkDownloadHasFailures = $state(false);
   let checkedCount = $derived(checkedKeys.size);
   let spamExplainCache = $state<Record<string, SpamExplanation>>({});
   const SPAM_CACHE_MAX = 500;
@@ -160,15 +164,15 @@
   let spamExplainErrors = $state<Record<string, string>>({});
   let spamTooltipKey = $state<string | null>(null);
   const FILE_TYPES = [
-    { value: '', label: 'Any' },
-    { value: 'Audio', label: 'Audio' },
-    { value: 'Video', label: 'Video' },
-    { value: 'Image', label: 'Image' },
-    { value: 'Pro', label: 'Program' },
-    { value: 'Doc', label: 'Document' },
-    { value: 'Arc', label: 'Archive' },
-    { value: 'Iso', label: 'CD-Image' },
-    { value: 'EmuleCollection', label: 'Collection' },
+    { value: '', get label() { return m.search_filetype_any(); } },
+    { value: 'Audio', get label() { return m.library_type_audio(); } },
+    { value: 'Video', get label() { return m.library_type_video(); } },
+    { value: 'Image', get label() { return m.library_type_image(); } },
+    { value: 'Pro', get label() { return m.search_filetype_program(); } },
+    { value: 'Doc', get label() { return m.library_type_document(); } },
+    { value: 'Arc', get label() { return m.library_type_archive(); } },
+    { value: 'Iso', get label() { return m.search_filetype_cd_image(); } },
+    { value: 'EmuleCollection', get label() { return m.search_filetype_collection(); } },
   ];
 
   const SIZE_UNITS = [
@@ -207,14 +211,14 @@
   let filterDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let showAdvancedFilters = $state(false);
 
-  const FILTER_COLUMNS: { value: FilterColumn; label: string }[] = [
-    { value: 'name', label: 'Name' },
-    { value: 'type', label: 'Type' },
-    { value: 'size', label: 'Size' },
-    { value: 'sources', label: 'Sources' },
-    { value: 'origin', label: 'Source' },
-    { value: 'hash', label: 'Hash' },
-    { value: 'all', label: 'All Fields' },
+  const FILTER_COLUMNS: { value: FilterColumn; readonly label: string }[] = [
+    { value: 'name', get label() { return m.search_col_name(); } },
+    { value: 'type', get label() { return m.search_col_type(); } },
+    { value: 'size', get label() { return m.search_col_size(); } },
+    { value: 'sources', get label() { return m.search_col_sources(); } },
+    { value: 'origin', get label() { return m.search_col_source(); } },
+    { value: 'hash', get label() { return m.search_col_hash(); } },
+    { value: 'all', get label() { return m.search_col_all_fields(); } },
   ];
 
   let destroyed = false;
@@ -453,13 +457,13 @@
     if (searchResultsList.some(hasServerOrigin)) return null;
     const srvConnected = $serverStatus === 'connected';
     if (method === 'server') {
-      if (!srvConnected) return 'Not connected to an eD2K server. Connect to a server or use Global/KAD search.';
+      if (!srvConnected) return m.search_hint_not_connected();
       return searchResultsList.length === 0
-        ? 'The connected server returned no results. Some eD2K servers only support source lookups and do not respond to keyword searches. Try Global or KAD search instead.'
-        : 'The connected server did not return results for this query. The results shown are from other sources. Some eD2K servers only support source lookups.';
+        ? m.search_hint_server_empty_only()
+        : m.search_hint_server_empty_mixed();
     }
     if (searchResultsList.length > 0 && srvConnected) {
-      return 'The connected eD2K server did not return results. Some servers only support source lookups. Results shown are from KAD/UDP sources.';
+      return m.search_hint_server_empty_global();
     }
     return null;
   });
@@ -485,7 +489,7 @@
     try {
       const results = await Promise.race([
         searchFiles(tabQuery, 'server', retryRequestId, activeTab.fileType || undefined, activeTab.filters),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Server retry timed out after 60 seconds')), 60_000)),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error(m.search_retry_timeout())), 60_000)),
       ]);
       if (results && results.length > 0) {
         searchTabs.update((tabs) => tabs.map((t) => (
@@ -493,12 +497,12 @@
             ? { ...t, results: mergeSearchResults(t.results, results) }
             : t
         )));
-        addToast('success', `Server returned ${results.length} result${results.length !== 1 ? 's' : ''}`);
+        addToast('success', results.length === 1 ? m.search_server_returned_one() : m.search_server_returned_other({ count: results.length }));
       } else {
-        addToast('info', 'Server returned no results on retry');
+        addToast('info', m.search_server_no_results_retry());
       }
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Retry failed';
+      const msg = e instanceof Error ? e.message : m.search_retry_failed();
       addToast('error', msg);
     } finally {
       clearRetryRequestId(tabId);
@@ -530,18 +534,18 @@
 
   function dlBadgeLabel(t: Transfer): string {
     switch (t.status) {
-      case 'searching': return 'Searching';
-      case 'queued': return 'Queued';
+      case 'searching': return m.search_dl_searching();
+      case 'queued': return m.transfer_status_queued();
       case 'active': return `${Math.round(t.progress)}%`;
-      case 'paused': return 'Paused';
-      case 'stopped': return 'Stopped';
-      case 'verifying': return 'Verifying';
-      case 'completing': return 'Completing';
-      case 'completed': return 'Downloaded';
-      case 'failed': return 'Failed';
-      case 'hashing': return 'Hashing';
-      case 'insufficient': return 'No Space';
-      case 'noneneeded': return 'No Parts';
+      case 'paused': return m.transfer_status_paused();
+      case 'stopped': return m.transfer_status_stopped();
+      case 'verifying': return m.transfer_status_verifying();
+      case 'completing': return m.transfer_status_completing();
+      case 'completed': return m.search_dl_downloaded();
+      case 'failed': return m.transfer_status_failed();
+      case 'hashing': return m.transfer_status_hashing();
+      case 'insufficient': return m.transfer_status_insufficient();
+      case 'noneneeded': return m.transfer_status_noneneeded();
       default: return t.status;
     }
   }
@@ -714,11 +718,13 @@
       return;
     }
     pendingConfirm = { kind: 'close-tab', tab };
-    confirmTitle = tab.isSearching ? 'Stop and close tab?' : 'Close tab?';
+    confirmTitle = tab.isSearching ? m.search_confirm_stop_close() : m.search_confirm_close_tab();
     const preview = tab.query.length > 60 ? `${tab.query.slice(0, 59)}…` : tab.query;
     confirmMessage = tab.isSearching
-      ? `"${preview}" is still searching. Stop it and close the tab?`
-      : `Close "${preview}" and discard ${tab.results.length} result${tab.results.length !== 1 ? 's' : ''}?`;
+      ? m.search_confirm_stop_message({ preview })
+      : (tab.results.length === 1
+          ? m.search_confirm_close_message_one({ preview })
+          : m.search_confirm_close_message_other({ preview, count: tab.results.length }));
     confirmOpen = true;
   }
 
@@ -780,7 +786,7 @@
               ...tab,
               isSearching: false,
               progress: null,
-              error: `Search timed out after ${secs} seconds. Try a more specific query or increase Search timeout in Settings.`,
+              error: m.search_timeout_error({ secs }),
             };
           });
         }, secs * 1000),
@@ -819,7 +825,7 @@
     } catch (e: unknown) {
       clearSearchTimeoutForRequest(requestId);
       if (!get(searchTabs).some((t) => t.requestId === requestId)) return;
-      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Search failed';
+      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : m.search_failed();
       console.error('Search failed:', e);
       patchSearchTabByRequestId(requestId, (tab) => ({
         ...tab,
@@ -898,7 +904,7 @@
         setSpamCache(key, explain);
       } catch (e: unknown) {
         if (requestId === notesRequestId && selectedResult?.file.hash === fileHash) {
-          spamExplainError = e instanceof Error ? e.message : 'Failed to evaluate spam score';
+          spamExplainError = e instanceof Error ? e.message : m.search_failed_evaluate_spam();
         }
       } finally {
         if (requestId === notesRequestId && selectedResult?.file.hash === fileHash) {
@@ -927,7 +933,7 @@
       );
       setSpamCache(key, explain);
     } catch (e: unknown) {
-      spamExplainErrors[key] = e instanceof Error ? e.message : 'Failed to explain spam score';
+      spamExplainErrors[key] = e instanceof Error ? e.message : m.search_failed_explain_spam();
     } finally {
       spamExplainPending[key] = false;
     }
@@ -955,7 +961,7 @@
       noteRating = 0;
       safeTimeout(() => publishMessage = '', 3000);
     } catch (e: unknown) {
-      publishMessage = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Publish failed';
+      publishMessage = e instanceof Error ? e.message : typeof e === 'string' ? e : m.search_publish_failed();
       publishSuccess = false;
       safeTimeout(() => publishMessage = '', 5000);
     } finally {
@@ -1014,12 +1020,12 @@
     );
 
     if (networkAddresses.length === 0 && result.result_origin?.includes('Local')) {
-      addToast('info', 'This file is already in your library');
+      addToast('info', m.search_already_in_library());
       return;
     }
 
     if (networkAddresses.length === 0 && !result.file.hash) {
-      addToast('error', 'No sources available for this file');
+      addToast('error', m.search_no_sources());
       return;
     }
 
@@ -1044,10 +1050,10 @@
         peerPort,
         extraSources
       );
-      addToast('success', res.already_queued ? 'Already in queue' : 'Download queued');
+      addToast('success', res.already_queued ? m.search_already_in_queue() : m.search_download_queued());
     } catch (e: unknown) {
       console.error('Download failed:', e);
-      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Download failed';
+      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : m.browse_download_failed();
       addToast('error', msg);
     } finally {
       downloadPending[key] = false;
@@ -1062,11 +1068,11 @@
     try {
       const info = await parseEd2kLink(link);
       const res = await startDownload(info.hash, info.name, info.size, '', 0);
-      ed2kSuccess = res.already_queued ? `Already queued: ${info.name}` : `Queued: ${info.name}`;
+      ed2kSuccess = res.already_queued ? m.search_already_queued_name({ name: info.name }) : m.search_queued_name({ name: info.name });
       ed2kInput = '';
       safeTimeout(() => (ed2kSuccess = ''), 5000);
     } catch (e: unknown) {
-      ed2kError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Invalid eD2K link';
+      ed2kError = e instanceof Error ? e.message : typeof e === 'string' ? e : m.search_invalid_ed2k();
       safeTimeout(() => (ed2kError = ''), 5000);
     }
   }
@@ -1111,7 +1117,7 @@
       spamExplainPending[key] = false;
     } catch (e) {
       console.error('Failed to mark spam:', e);
-      addToast('error', 'Failed to mark as spam');
+      addToast('error', m.search_failed_mark_spam());
     }
     contextMenu = null;
   }
@@ -1133,7 +1139,7 @@
       spamExplainPending[key] = false;
     } catch (e) {
       console.error('Failed to unmark spam:', e);
-      addToast('error', 'Failed to unmark spam');
+      addToast('error', m.search_failed_unmark_spam());
     }
     contextMenu = null;
   }
@@ -1155,10 +1161,10 @@
       downloadHistoryMap = Object.fromEntries(
         Object.entries(downloadHistoryMap).filter(([k]) => k !== hash),
       );
-      addToast('success', 'Removed from download history');
+      addToast('success', m.search_removed_from_history());
     } catch (e) {
       console.error('Failed to remove from history:', e);
-      addToast('error', 'Failed to remove from history');
+      addToast('error', m.search_failed_remove_history());
     }
     contextMenu = null;
   }
@@ -1167,8 +1173,10 @@
     const tab = activeTab;
     if (!tab || tab.results.length === 0) return;
     pendingConfirm = { kind: 'clear-results' };
-    confirmTitle = 'Clear all results?';
-    confirmMessage = `Discard ${tab.results.length} result${tab.results.length !== 1 ? 's' : ''} in this tab? The search itself stays open so you can run it again.`;
+    confirmTitle = m.search_confirm_clear_title();
+    confirmMessage = tab.results.length === 1
+      ? m.search_confirm_clear_message_one()
+      : m.search_confirm_clear_message_other({ count: tab.results.length });
     confirmOpen = true;
   }
 
@@ -1248,6 +1256,7 @@
     if (bulkDownloadPending || checkedKeys.size === 0) return;
     bulkDownloadPending = true;
     bulkDownloadMessage = '';
+    bulkDownloadHasFailures = false;
     const toDownload = filteredResults.filter((r) => checkedKeys.has(resultKey(r)));
 
     let queued = 0;
@@ -1271,7 +1280,7 @@
         }
         if (networkAddrs.length === 0 && !result.file.hash) {
           failed++;
-          failures.push(`${result.file.name}: no sources`);
+          failures.push(m.search_bulk_no_sources({ name: result.file.name }));
           continue;
         }
         try {
@@ -1294,7 +1303,7 @@
           queued++;
         } catch (e) {
           failed++;
-          const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'download failed';
+          const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : m.search_bulk_download_failed();
           failures.push(`${result.file.name}: ${msg}`);
         }
       }
@@ -1311,24 +1320,29 @@
     }
 
     const parts: string[] = [];
-    if (queued > 0) parts.push(`Queued ${queued}`);
-    if (skippedLocal > 0) parts.push(`${skippedLocal} already in library`);
-    if (failed > 0) parts.push(`${failed} failed`);
+    if (queued > 0) parts.push(m.search_bulk_queued({ count: queued }));
+    if (skippedLocal > 0) parts.push(m.search_bulk_already_in_library({ count: skippedLocal }));
+    if (failed > 0) parts.push(m.search_bulk_failed({ count: failed }));
     bulkDownloadMessage = parts.join(', ');
+    bulkDownloadHasFailures = failed > 0;
     safeTimeout(() => {
       bulkDownloadMessage = '';
+      bulkDownloadHasFailures = false;
     }, 3000);
 
-    // Surface a single summary toast plus the first few failure reasons so
-    // large-batch failures don't silently disappear into an inline string.
     if (queued > 0 && failed === 0) {
-      addToast('success', `Queued ${queued} file${queued !== 1 ? 's' : ''}${skippedLocal > 0 ? ` (${skippedLocal} already in library)` : ''}`);
+      const base = queued === 1 ? m.search_bulk_queued_one() : m.search_bulk_queued_other({ count: queued });
+      addToast('success', skippedLocal > 0 ? m.search_bulk_queued_with_local({ base, local: skippedLocal }) : base);
     } else if (failed > 0) {
       const head = failures.slice(0, 3).join(' · ');
-      const more = failures.length > 3 ? ` (+${failures.length - 3} more)` : '';
-      addToast('error', `${failed} failed${queued > 0 ? `, ${queued} queued` : ''}${head ? `: ${head}${more}` : ''}`);
+      const more = failures.length > 3 ? m.search_bulk_more({ count: failures.length - 3 }) : '';
+      addToast('error', m.search_bulk_failed_summary({
+        failed,
+        queued_part: queued > 0 ? m.search_bulk_failed_queued_suffix({ count: queued }) : '',
+        head: head ? `: ${head}${more}` : '',
+      }));
     } else if (skippedLocal > 0) {
-      addToast('info', `${skippedLocal} already in library`);
+      addToast('info', m.search_bulk_already_in_library({ count: skippedLocal }));
     }
   }
 
@@ -1367,35 +1381,35 @@
 }} />
 
 <div class="page-header">
-  <h2>Search</h2>
+  <h2>{m.search_title()}</h2>
 </div>
 
 <div class="search-area">
   <SearchBar
     bind:value={barQuery}
-    placeholder="Search files across the network..."
+    placeholder={m.search_query_placeholder()}
     onsubmit={handleSearch}
     recentKey="search-recent-queries-v1"
   />
-  <select class="type-select" bind:value={searchMethod} title="Search method">
-    <option value="global">Global</option>
-    <option value="kad">KAD Only</option>
-    <option value="server">Server Only</option>
+  <select class="type-select" bind:value={searchMethod} title={m.search_method_title()}>
+    <option value="global">{m.search_method_global()}</option>
+    <option value="kad">{m.search_method_kad_only()}</option>
+    <option value="server">{m.search_method_server_only()}</option>
   </select>
-  <select class="type-select" bind:value={searchFileType} title="Filter by file type">
+  <select class="type-select" bind:value={searchFileType} title={m.search_filter_by_filetype()}>
     {#each FILE_TYPES as ft}
       <option value={ft.value}>{ft.label}</option>
     {/each}
   </select>
   {#if activeTab?.isSearching}
-    <button class="stop-btn" onclick={stopSearch}>Stop</button>
+    <button class="stop-btn" onclick={stopSearch}>{m.common_stop()}</button>
   {:else}
-    <button onclick={() => handleSearch(barQuery)}>Search</button>
+    <button onclick={() => handleSearch(barQuery)}>{m.search_title()}</button>
   {/if}
 </div>
 
 {#if $searchTabs.length > 0}
-  <div class="search-tabs" role="tablist" aria-label="Search sessions">
+  <div class="search-tabs" role="tablist" aria-label={m.search_sessions_aria()}>
     {#each $searchTabs as tab (tab.id)}
       <div class="search-tab" class:active={tab.id === $activeSearchTabId} title={tab.query}>
         <button
@@ -1409,9 +1423,9 @@
           tabindex={tab.id === $activeSearchTabId ? 0 : -1}
         >
           <span class="search-tab-label">{shortenTabLabel(tab.query)}</span>
-          <span class="search-tab-meta" aria-label={tab.isSearching ? 'Search in progress' : `${tab.results.length} results`}>
+          <span class="search-tab-meta" aria-label={tab.isSearching ? m.search_in_progress_aria() : m.search_results_aria({ count: tab.results.length })}>
             {#if tab.isSearching}
-              Searching
+              {m.search_searching_label()}
             {:else}
               {tab.results.length}
             {/if}
@@ -1424,8 +1438,8 @@
           type="button"
           class="search-tab-close"
           onclick={() => requestCloseSearchTab(tab)}
-          title="Close tab"
-          aria-label="Close search tab"
+          title={m.search_close_tab()}
+          aria-label={m.search_close_tab_aria()}
         >
           <svg viewBox="0 0 14 14" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
             <line x1="3.5" y1="3.5" x2="10.5" y2="10.5"/>
@@ -1440,12 +1454,12 @@
 <div class="ed2k-bar">
   <input
     type="text"
-    placeholder="Paste ed2k://|file|... link to download"
+    placeholder={m.search_ed2k_placeholder()}
     bind:value={ed2kInput}
     onkeydown={(e) => { if (e.key === 'Enter') handleEd2kLink(); }}
-    aria-label="ed2k link input"
+    aria-label={m.search_ed2k_aria()}
   />
-  <button onclick={handleEd2kLink} disabled={!ed2kInput.trim()}>Add Link</button>
+  <button onclick={handleEd2kLink} disabled={!ed2kInput.trim()}>{m.search_add_link()}</button>
   {#if ed2kSuccess}
     <span class="ed2k-success">{ed2kSuccess}</span>
   {/if}
@@ -1457,18 +1471,18 @@
 <div class="filter-bar">
   <div class="filter-primary-row">
     <div class="filter-group filter-text-group">
-      <label for="filter-text">Filter Results</label>
+      <label for="filter-text">{m.search_filter_results()}</label>
       <div class="filter-text-wrap">
         <input
           id="filter-text"
           type="text"
-          placeholder="Type to filter results (supports: rock -live)"
+          placeholder={m.search_filter_text_placeholder()}
           bind:value={filterTextInput}
           oninput={onFilterTextInput}
           class="filter-text-input"
         />
         {#if filterTextInput}
-          <button class="filter-text-clear" onclick={clearFilterText} title="Clear filter text" aria-label="Clear filter text">
+          <button class="filter-text-clear" onclick={clearFilterText} title={m.search_clear_filter_text()} aria-label={m.search_clear_filter_text()}>
             <svg viewBox="0 0 14 14" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
               <line x1="3.5" y1="3.5" x2="10.5" y2="10.5"/>
               <line x1="10.5" y1="3.5" x2="3.5" y2="10.5"/>
@@ -1479,7 +1493,7 @@
     </div>
 
     <div class="filter-group">
-      <label for="filter-type">Type</label>
+      <label for="filter-type">{m.search_col_type()}</label>
       <select id="filter-type" bind:value={filterType}>
         {#each FILE_TYPES as ft}
           <option value={ft.value}>{ft.label}</option>
@@ -1487,10 +1501,10 @@
       </select>
     </div>
 
-    <div class="filter-toggles" role="group" aria-label="Result visibility filters">
+    <div class="filter-toggles" role="group" aria-label={m.search_visibility_filters_aria()}>
       <label class="filter-toggle">
         <input type="checkbox" bind:checked={hideSpam} />
-        <span>Hide spam</span>
+        <span>{m.search_hide_spam()}</span>
         {#if spamHiddenCount > 0}
           <span class="filter-count">({spamHiddenCount})</span>
         {/if}
@@ -1498,7 +1512,7 @@
           <button
             type="button"
             class="filter-help-icon"
-            aria-label="Explain spam hiding"
+            aria-label={m.search_explain_spam_hiding()}
             onmouseenter={() => (showSpamHelp = true)}
             onmouseleave={() => (showSpamHelp = false)}
             onfocus={() => (showSpamHelp = true)}
@@ -1514,13 +1528,13 @@
           {#if showSpamHelp}
             <div class="filter-help-popover" role="tooltip">
               {#if spamHiddenCount > 0}
-                {spamHiddenCount} spam results are currently hidden.
+                {m.search_spam_hidden_count({ count: spamHiddenCount })}
               {:else}
-                No spam results are currently hidden.
+                {m.search_spam_hidden_none()}
               {/if}
               <br />
-              A result is hidden when marked spam manually, or when its spam score is at least
-              <strong>{spamThreshold}</strong> in the <strong>{spamProfile}</strong> profile.
+              {m.search_spam_help_prefix()}
+              <strong>{spamThreshold}</strong> {m.search_spam_help_in()} <strong>{spamProfile}</strong> {m.search_spam_help_suffix()}
             </div>
           {/if}
         </span>
@@ -1528,19 +1542,19 @@
     </div>
 
     <button class="ghost advanced-toggle" onclick={() => (showAdvancedFilters = !showAdvancedFilters)}>
-      {showAdvancedFilters ? 'Hide Advanced' : `Advanced Filters${advancedFilterCount > 0 ? ` (${advancedFilterCount})` : ''}`}
+      {showAdvancedFilters ? m.search_hide_advanced() : (advancedFilterCount > 0 ? m.search_advanced_filters_count({ count: advancedFilterCount }) : m.search_advanced_filters())}
     </button>
 
     {#if hasActiveFilters}
-      <button class="ghost clear-filters" onclick={clearFilters}>Clear Filters</button>
+      <button class="ghost clear-filters" onclick={clearFilters}>{m.library_clear_filters()}</button>
     {/if}
   </div>
 
   {#if showAdvancedFilters}
     <div class="filter-advanced-row">
       <div class="filter-group">
-        <label for="filter-column">Filter Column</label>
-        <select id="filter-column" bind:value={filterColumn} class="column-select" aria-label="Filter column">
+        <label for="filter-column">{m.search_filter_column()}</label>
+        <select id="filter-column" bind:value={filterColumn} class="column-select" aria-label={m.search_filter_column()}>
           {#each FILTER_COLUMNS as col}
             <option value={col.value}>{col.label}</option>
           {/each}
@@ -1548,7 +1562,7 @@
       </div>
 
       <div class="filter-group">
-        <label for="filter-min-size">Min Size</label>
+        <label for="filter-min-size">{m.search_min_size()}</label>
         <div class="size-input">
           <input
             id="filter-min-size"
@@ -1567,7 +1581,7 @@
       </div>
 
       <div class="filter-group">
-        <label for="filter-max-size">Max Size</label>
+        <label for="filter-max-size">{m.search_max_size()}</label>
         <div class="size-input">
           <input
             id="filter-max-size"
@@ -1586,18 +1600,18 @@
       </div>
 
       <div class="filter-group">
-        <label for="filter-ext">Extension</label>
+        <label for="filter-ext">{m.search_extension()}</label>
         <input
           id="filter-ext"
           type="text"
-          placeholder="e.g. mp3"
+          placeholder={m.search_ext_placeholder()}
           bind:value={filterExtension}
           class="ext-input"
         />
       </div>
 
       <div class="filter-group">
-        <label for="filter-sources">Min Sources</label>
+        <label for="filter-sources">{m.search_min_sources()}</label>
         <input
           id="filter-sources"
           type="number"
@@ -1611,23 +1625,23 @@
     </div>
   {/if}
 
-  <p class="filter-help">Tip: use space-separated terms, and prefix with <code>-</code> to exclude words.</p>
+  <p class="filter-help">{m.search_filter_help_prefix()} <code>-</code> {m.search_filter_help_suffix()}</p>
 </div>
 
 <div class="page-content">
   {#if $networkStats.status === 'disconnected'}
     <div class="search-readiness-hint" role="status">
-      Network is disconnected. Connect KAD or a server in Peers for better search results.
+      {m.search_network_disconnected_hint()}
     </div>
   {:else if $networkStats.degraded && $networkStats.degraded_reason}
     <div class="search-readiness-hint search-readiness-muted" role="status">
-      {$networkStats.degraded_reason}. Results may be limited until the network is fully ready.
+      {m.search_network_degraded_hint({ reason: $networkStats.degraded_reason })}
     </div>
   {/if}
   {#if activeTab?.error}
     <div class="search-error-banner">
-      <span>Search failed: {activeTab.error}</span>
-      <button class="ghost" onclick={dismissTabError}>Dismiss</button>
+      <span>{m.search_failed_with({ error: activeTab.error })}</span>
+      <button class="ghost" onclick={dismissTabError}>{m.common_dismiss()}</button>
     </div>
   {/if}
   {#if serverNoResultsHint}
@@ -1635,11 +1649,11 @@
       <span>{serverNoResultsHint}</span>
       <div class="server-hint-actions">
         {#if serverRetryAllowed}
-          <button class="server-retry-btn" onclick={retryServerSearch}>Retry Server</button>
+          <button class="server-retry-btn" onclick={retryServerSearch}>{m.search_retry_server()}</button>
         {:else if serverRetryPending}
-          <button class="server-retry-btn" disabled>Retrying...</button>
+          <button class="server-retry-btn" disabled>{m.search_retrying()}</button>
         {/if}
-        <button class="ghost" onclick={() => { if (activeTab?.id) { const next = new Set(serverHintDismissedTabs); next.add(activeTab.id); serverHintDismissedTabs = next; } }}>Dismiss</button>
+        <button class="ghost" onclick={() => { if (activeTab?.id) { const next = new Set(serverHintDismissedTabs); next.add(activeTab.id); serverHintDismissedTabs = next; } }}>{m.common_dismiss()}</button>
       </div>
     </div>
   {/if}
@@ -1651,17 +1665,17 @@
           <line x1="30" y1="30" x2="41" y2="41"/>
         </svg>
       </div>
-      <p>Search for files across the P2P network</p>
-      <p class="hint">Enter a query and press Enter or click Search — each search opens in its own tab</p>
+      <p>{m.search_empty_title()}</p>
+      <p class="hint">{m.search_empty_hint()}</p>
     </div>
   {:else if activeTab?.isSearching && searchResultsList.length === 0}
     <div class="empty-state">
-      <p>Searching the network...</p>
+      <p>{m.search_searching_network()}</p>
       {#if activeTab.progress}
         <p class="search-detail">
-          Contacted {activeTab.progress.nodes_contacted} nodes
+          {m.search_contacted_nodes({ count: activeTab.progress.nodes_contacted })}
           {#if activeTab.progress.results_so_far > 0}
-            &middot; {activeTab.progress.results_so_far} results found
+            &middot; {m.search_results_so_far({ count: activeTab.progress.results_so_far })}
           {/if}
           &middot; {activeTab.progress.phase}
         </p>
@@ -1675,34 +1689,34 @@
           <line x1="30" y1="30" x2="41" y2="41"/>
         </svg>
       </div>
-      <p>No results for this search</p>
-      <p class="hint">Try another query or different keywords</p>
+      <p>{m.search_no_results()}</p>
+      <p class="hint">{m.search_no_results_hint()}</p>
     </div>
   {:else}
     <div class="results-info">
       <span>
         {#if activeTab?.isSearching}
-          <span class="searching-indicator">Searching...</span>
+          <span class="searching-indicator">{m.search_searching_indicator()}</span>
         {/if}
         {#if filteredResults.length > 0}
-          Showing {filteredResults.length} result{filteredResults.length === 1 ? '' : 's'}{#if resultsHidden > 0} (filtered from {searchResultsList.length}){/if}
+          {filteredResults.length === 1 ? m.search_showing_one() : m.search_showing_other({ count: filteredResults.length })}{#if resultsHidden > 0} {m.search_filtered_from({ total: searchResultsList.length })}{/if}
         {:else if searchResultsList.length > 0}
-          0 of {searchResultsList.length} result{searchResultsList.length === 1 ? '' : 's'} match {hasActiveFilters ? 'filters' : 'visibility rules'}
+          {searchResultsList.length === 1 ? m.search_zero_of_one({ what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() }) : m.search_zero_of_other({ count: searchResultsList.length, what: hasActiveFilters ? m.search_filters_word() : m.search_visibility_rules_word() })}
         {:else}
-          0 results
+          {m.search_zero_results()}
         {/if}
       </span>
-      <button class="ghost clear-results-btn" onclick={requestClearResults}>Clear Results</button>
+      <button class="ghost clear-results-btn" onclick={requestClearResults}>{m.search_clear_results()}</button>
     </div>
     {#if checkedCount > 0}
-      <div class="bulk-actions" role="toolbar" aria-label="Bulk actions">
-        <span class="bulk-count">{checkedCount} selected</span>
+      <div class="bulk-actions" role="toolbar" aria-label={m.search_bulk_actions_aria()}>
+        <span class="bulk-count">{m.search_bulk_selected({ count: checkedCount })}</span>
         <button class="bulk-download-btn" onclick={downloadChecked} disabled={bulkDownloadPending}>
-          {bulkDownloadPending ? 'Downloading...' : `Download ${checkedCount} file${checkedCount !== 1 ? 's' : ''}`}
+          {bulkDownloadPending ? m.search_downloading_ellipsis() : (checkedCount === 1 ? m.search_bulk_download_one() : m.search_bulk_download_other({ count: checkedCount }))}
         </button>
-        <button class="ghost bulk-clear-btn" onclick={clearChecked} title="Clear selection">Clear Selection</button>
+        <button class="ghost bulk-clear-btn" onclick={clearChecked} title={m.search_clear_selection_title()}>{m.search_clear_selection()}</button>
         {#if bulkDownloadMessage}
-          <span class={bulkDownloadMessage.includes('failed') ? 'error-msg' : 'success-msg'}>{bulkDownloadMessage}</span>
+          <span class={bulkDownloadHasFailures ? 'error-msg' : 'success-msg'}>{bulkDownloadMessage}</span>
         {/if}
       </div>
     {/if}
@@ -1715,30 +1729,30 @@
               checked={allFilteredChecked}
               indeterminate={someFilteredChecked && !allFilteredChecked}
               onchange={toggleCheckAll}
-              aria-label="Select all results"
-              title="Select all results"
+              aria-label={m.search_select_all_results()}
+              title={m.search_select_all_results()}
             />
           </th>
           <th class="sortable col-name" role="columnheader" aria-sort={sortField === 'name' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('name')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('name'))}>
-            Name{sortIndicator('name')}
+            {m.search_col_name()}{sortIndicator('name')}
           </th>
           <th class="sortable col-size" role="columnheader" aria-sort={sortField === 'size' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('size')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('size'))}>
-            Size{sortIndicator('size')}
+            {m.search_col_size()}{sortIndicator('size')}
           </th>
           <th class="sortable col-type" role="columnheader" aria-sort={sortField === 'type' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('type')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('type'))}>
-            Type{sortIndicator('type')}
+            {m.search_col_type()}{sortIndicator('type')}
           </th>
           <th class="sortable col-origin" role="columnheader" aria-sort={sortField === 'origin' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('origin')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('origin'))}>
-            Source{sortIndicator('origin')}
+            {m.search_col_source()}{sortIndicator('origin')}
           </th>
           <th class="sortable col-sources" role="columnheader" aria-sort={sortField === 'sources' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'} tabindex="0" onclick={() => toggleSort('sources')} onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggleSort('sources'))}>
-            Sources{sortIndicator('sources')}
+            {m.search_col_sources()}{sortIndicator('sources')}
           </th>
-          <th class="col-history">History</th>
-          <th class="col-action" aria-label="Actions"></th>
+          <th class="col-history">{m.search_th_history()}</th>
+          <th class="col-action" aria-label={m.search_th_actions_aria()}></th>
         </tr>
       </thead>
-      <tbody title="Double-click a row to download. Right-click for more options. Shift+click checkboxes to select a range.">
+      <tbody title={m.search_double_click_hint()}>
         {#each filteredResults as result, idx (resultKey(result))}
           {@const rKey = resultKey(result)}
           {@const dlTransfer = getDownloadTransfer(result)}
@@ -1757,7 +1771,7 @@
                 type="checkbox"
                 checked={checkedKeys.has(rKey)}
                 onclick={(e) => { e.stopPropagation(); toggleCheck(rKey, idx, e.shiftKey); }}
-                aria-label="Select {result.clean_name || result.file.name}"
+                aria-label={m.search_select_result({ name: result.clean_name || result.file.name })}
               />
             </td>
             <td class="col-name" title={result.file.name}>
@@ -1773,25 +1787,24 @@
                     <button
                       class="spam-flag-btn"
                       type="button"
-                      aria-label="Show spam reason"
+                      aria-label={m.search_show_spam_reason()}
                       onclick={() => openSpamTooltip(result)}
                       onfocus={() => openSpamTooltip(result)}
                       onmouseenter={() => openSpamTooltip(result)}
                       onmouseleave={closeSpamTooltip}
                       onblur={closeSpamTooltip}
                     >
-                      Spam
+                      {m.search_spam_label()}
                     </button>
                     {#if spamTooltipKey === resultKey(result)}
                       <div class="spam-tooltip" role="tooltip">
                         {#if spamExplainPending[resultKey(result)]}
-                          <div class="spam-tooltip-title">Evaluating spam signals...</div>
+                          <div class="spam-tooltip-title">{m.search_spam_evaluating()}</div>
                         {:else if spamExplainErrors[resultKey(result)]}
                           <div class="spam-tooltip-title">{spamExplainErrors[resultKey(result)]}</div>
                         {:else if spamExplainCache[resultKey(result)]}
                           <div class="spam-tooltip-title">
-                            Score {spamExplainCache[resultKey(result)].score}/{spamExplainCache[resultKey(result)].threshold}
-                            ({spamExplainCache[resultKey(result)].profile})
+                            {m.search_spam_score({ score: spamExplainCache[resultKey(result)].score, threshold: spamExplainCache[resultKey(result)].threshold, profile: spamExplainCache[resultKey(result)].profile })}
                           </div>
                           <ul>
                             {#each spamExplainCache[resultKey(result)].reasons.slice(0, 4) as reason}
@@ -1815,11 +1828,11 @@
             </td>
             <td class="col-history">
               {#if result.result_origin?.includes('Local')}
-                <span class="history-badge in-library" title="This file is in your library">In Library</span>
+                <span class="history-badge in-library" title={m.search_history_in_library_title()}>{m.search_history_in_library()}</span>
               {:else if downloadHistoryMap[result.file.hash] === 'completed'}
-                <span class="history-badge history-completed" title="Previously downloaded">Downloaded</span>
+                <span class="history-badge history-completed" title={m.search_history_downloaded_title()}>{m.search_history_downloaded()}</span>
               {:else if downloadHistoryMap[result.file.hash] === 'cancelled'}
-                <span class="history-badge history-cancelled" title="Previously cancelled">Cancelled</span>
+                <span class="history-badge history-cancelled" title={m.search_history_cancelled_title()}>{m.search_history_cancelled()}</span>
               {/if}
             </td>
             <td class="col-action">
@@ -1833,8 +1846,8 @@
                   class="row-dl-btn"
                   type="button"
                   disabled
-                  title="Already in your library"
-                  aria-label="Already in library: {result.clean_name || result.file.name}"
+                  title={m.search_action_already_in_library_title()}
+                  aria-label={m.search_action_already_in_library_aria({ name: result.clean_name || result.file.name })}
                 >
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <polyline points="3,8 7,12 13,4"/>
@@ -1845,8 +1858,8 @@
                   class="row-dl-btn"
                   type="button"
                   disabled
-                  title="Already downloading"
-                  aria-label="Already downloading: {result.clean_name || result.file.name}"
+                  title={m.search_action_already_downloading_title()}
+                  aria-label={m.search_action_already_downloading_aria({ name: result.clean_name || result.file.name })}
                 >
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <circle cx="8" cy="8" r="6.5"/>
@@ -1860,8 +1873,8 @@
                   type="button"
                   onclick={(e) => { e.stopPropagation(); download(result); }}
                   disabled={downloadPending[rKey]}
-                  title="Download"
-                  aria-label="Download {result.clean_name || result.file.name}"
+                  title={m.search_action_download_title()}
+                  aria-label={m.search_action_download_aria({ name: result.clean_name || result.file.name })}
                 >
                   {#if downloadPending[rKey]}
                     <span class="row-dl-spinner" aria-hidden="true"></span>
@@ -1881,8 +1894,8 @@
     </table>
     {#if filteredResults.length === 0 && searchResultsList.length > 0}
       <div class="empty-state">
-        <p>No results match the current filters</p>
-        <button class="ghost" onclick={clearFilters}>Clear Filters</button>
+        <p>{m.search_no_results_filters()}</p>
+        <button class="ghost" onclick={clearFilters}>{m.library_clear_filters()}</button>
       </div>
     {/if}
 
@@ -1890,34 +1903,28 @@
       <button
         type="button"
         class="context-menu-backdrop"
-        aria-label="Close context menu"
+        aria-label={m.search_close_context_menu()}
         onclick={closeContextMenu}
         oncontextmenu={(e) => { e.preventDefault(); closeContextMenu(); }}
       ></button>
       <div class="context-menu" role="menu" style="left: {contextMenu.x}px; top: {contextMenu.y}px;">
         {#if contextMenu.result.is_spam}
-          <button role="menuitem" onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}>Mark as Not Spam</button>
+          <button role="menuitem" onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}>{m.search_mark_not_spam()}</button>
         {:else}
-          <button role="menuitem" onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}>Mark as Spam</button>
+          <button role="menuitem" onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}>{m.search_mark_spam()}</button>
         {/if}
-        <button role="menuitem" onclick={() => { if (contextMenu) download(contextMenu.result); closeContextMenu(); }}>Download</button>
+        <button role="menuitem" onclick={() => { if (contextMenu) download(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_download()}</button>
         {#if checkedCount > 1}
-          <button role="menuitem" onclick={() => { downloadChecked(); closeContextMenu(); }}>Download {checkedCount} Selected</button>
+          <button role="menuitem" onclick={() => { downloadChecked(); closeContextMenu(); }}>{m.search_ctx_download_selected({ count: checkedCount })}</button>
         {/if}
-        <button role="menuitem" onclick={() => { if (contextMenu) showFileDetails(contextMenu.result); closeContextMenu(); }}>Details</button>
-        <!--
-          Only surface "Remove from history" when the row has a known
-          history entry. Without the guard the menu item would be a no-op
-          on most rows and mislead users into thinking they'd cleared
-          something when the backend had nothing matching.
-        -->
+        <button role="menuitem" onclick={() => { if (contextMenu) showFileDetails(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_details()}</button>
         {#if downloadHistoryMap[contextMenu.result.file.hash]}
           <button
             role="menuitem"
             onclick={() => { if (contextMenu) handleRemoveFromHistory(contextMenu.result); }}
-            title="Forget this file's download history entry so it stops being labelled as {downloadHistoryMap[contextMenu.result.file.hash]}"
+            title={m.search_remove_from_history_title({ status: downloadHistoryMap[contextMenu.result.file.hash] })}
           >
-            Remove from history ({downloadHistoryMap[contextMenu.result.file.hash]})
+            {m.search_remove_from_history({ status: downloadHistoryMap[contextMenu.result.file.hash] })}
           </button>
         {/if}
       </div>
@@ -1925,8 +1932,8 @@
     {#if selectedResult}
       <div class="file-details-panel scroll-shadows">
         <div class="panel-header">
-          <h3>File Details</h3>
-          <button class="ghost panel-close" aria-label="Close file details" onclick={() => { selectedResultKey = null; notesRequestId += 1; loadingNotes = false; spamExplainLoading = false; spamExplainError = null; }}>
+          <h3>{m.search_file_details()}</h3>
+          <button class="ghost panel-close" aria-label={m.search_close_details_aria()} onclick={() => { selectedResultKey = null; notesRequestId += 1; loadingNotes = false; spamExplainLoading = false; spamExplainError = null; }}>
             <svg viewBox="0 0 14 14" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
               <line x1="3.5" y1="3.5" x2="10.5" y2="10.5"/>
               <line x1="10.5" y1="3.5" x2="3.5" y2="10.5"/>
@@ -1934,20 +1941,20 @@
           </button>
         </div>
         <div class="panel-body">
-          <div class="detail-row"><strong>Name:</strong> {selectedResult.file.name}</div>
-          <div class="detail-row"><strong>Size:</strong> {formatSize(selectedResult.file.size)}</div>
-          <div class="detail-row"><strong>Hash:</strong> <code>{selectedResult.file.hash}</code></div>
-          <div class="detail-row"><strong>Sources:</strong> {selectedResult.availability}</div>
+          <div class="detail-row"><strong>{m.search_detail_name()}</strong> {selectedResult.file.name}</div>
+          <div class="detail-row"><strong>{m.search_detail_size()}</strong> {formatSize(selectedResult.file.size)}</div>
+          <div class="detail-row"><strong>{m.search_detail_hash()}</strong> <code>{selectedResult.file.hash}</code></div>
+          <div class="detail-row"><strong>{m.search_detail_sources()}</strong> {selectedResult.availability}</div>
           <div class="detail-row">
-            <strong>Spam score:</strong>
+            <strong>{m.search_detail_spam_score()}</strong>
             {#if spamExplainLoading}
-              Evaluating...
+              {m.search_evaluating()}
             {:else if selectedSpam}
               {selectedSpam.score}/{selectedSpam.threshold}
               {#if selectedSpam.is_spam}
-                <span class="spam-chip">Flagged ({selectedSpam.profile})</span>
+                <span class="spam-chip">{m.search_spam_flagged({ profile: selectedSpam.profile })}</span>
               {:else}
-                <span class="ham-chip">Not flagged ({selectedSpam.profile})</span>
+                <span class="ham-chip">{m.search_spam_not_flagged({ profile: selectedSpam.profile })}</span>
               {/if}
             {:else}
               {selectedResult.spam_rating}
@@ -1957,7 +1964,7 @@
             <div class="detail-row"><span class="error-msg">{spamExplainError}</span></div>
           {:else if selectedSpam}
             <div class="detail-row">
-              <strong>Spam signals:</strong>
+              <strong>{m.search_spam_signals()}</strong>
               <ul class="spam-reasons">
                 {#each selectedSpam.reasons as reason}
                   <li>{reason}</li>
@@ -1966,46 +1973,40 @@
             </div>
           {/if}
           {#if selectedResult.result_origin}
-            <div class="detail-row"><strong>Hit origin:</strong> {selectedResult.result_origin}</div>
+            <div class="detail-row"><strong>{m.search_hit_origin()}</strong> {selectedResult.result_origin}</div>
           {/if}
           {#if selectedDlTransfer}
             <div class="detail-section-dl">
-              <h4>Download Status</h4>
+              <h4>{m.search_download_status()}</h4>
               <div class="detail-row">
-                <strong>Status:</strong>
+                <strong>{m.search_status_label()}</strong>
                 <span class="dl-status-badge {dlBadgeClass(selectedDlTransfer)}">{dlBadgeLabel(selectedDlTransfer)}</span>
               </div>
               {#if selectedDlTransfer.status === 'active' || selectedDlTransfer.progress > 0}
-                <div class="detail-row"><strong>Progress:</strong> {selectedDlTransfer.progress.toFixed(1)}% ({formatSize(selectedDlTransfer.transferred)} / {formatSize(selectedDlTransfer.total_size)})</div>
+                <div class="detail-row"><strong>{m.search_progress_label()}</strong> {m.search_progress_value({ percent: selectedDlTransfer.progress.toFixed(1), transferred: formatSize(selectedDlTransfer.transferred), total: formatSize(selectedDlTransfer.total_size) })}</div>
               {/if}
-              <!--
-                D35: show speed for active rows even when `speed === 0`
-                (brief scheduling gaps) so the panel matches the behaviour
-                of the transfers page EWMA-backed cells. Falls back to
-                "—" so the user can see speed is intentionally zero.
-              -->
               {#if selectedDlTransfer.status === 'active' || selectedDlTransfer.speed > 0}
-                <div class="detail-row"><strong>Speed:</strong> {selectedDlTransfer.speed > 0 ? formatSpeed(selectedDlTransfer.speed) : '—'}</div>
+                <div class="detail-row"><strong>{m.search_speed_label()}</strong> {selectedDlTransfer.speed > 0 ? formatSpeed(selectedDlTransfer.speed) : '—'}</div>
               {/if}
               {#if selectedDlTransfer.sources > 0}
-                <div class="detail-row"><strong>Sources:</strong> {selectedDlTransfer.active_sources || 0} active / {selectedDlTransfer.sources} total</div>
+                <div class="detail-row"><strong>{m.search_sources_label()}</strong> {m.search_sources_value({ active: selectedDlTransfer.active_sources || 0, total: selectedDlTransfer.sources })}</div>
               {/if}
               {#if selectedDlTransfer.failure_reason}
-                <div class="detail-row"><strong>Error:</strong> <span class="error-msg">{selectedDlTransfer.failure_reason}</span></div>
+                <div class="detail-row"><strong>{m.search_error_label()}</strong> <span class="error-msg">{selectedDlTransfer.failure_reason}</span></div>
               {/if}
             </div>
           {/if}
 
-          <h4>Notes & Comments</h4>
+          <h4>{m.search_notes_comments()}</h4>
           {#if loadingNotes}
-            <p class="hint">Loading notes...</p>
+            <p class="hint">{m.search_loading_notes()}</p>
           {:else if notes.length === 0}
-            <p class="hint">No notes found for this file</p>
+            <p class="hint">{m.search_no_notes()}</p>
           {:else}
             <div class="notes-list">
               {#each notes as note}
                 <div class="note-item">
-                  <span class="note-peer">{note.peer_name || 'Anonymous'}</span>
+                  <span class="note-peer">{note.peer_name || m.search_note_anonymous()}</span>
                   {#if note.rating}
                     {@const r = Math.round(Math.max(0, Math.min(5, note.rating ?? 0)))}
                     <span class="note-rating">{'★'.repeat(r)}{'☆'.repeat(5 - r)}</span>
@@ -2019,13 +2020,13 @@
           {/if}
           
           <div class="publish-note">
-            <h4>Add Note</h4>
+            <h4>{m.search_add_note()}</h4>
             <div class="note-form">
-              <label for="note-rating">Rating (0-5)</label>
+              <label for="note-rating">{m.search_rating_label()}</label>
               <input id="note-rating" type="number" min="0" max="5" bind:value={noteRating} />
-              <label for="note-comment">Comment</label>
-              <input id="note-comment" type="text" bind:value={noteComment} placeholder="Optional comment..." />
-              <button onclick={handlePublishNote} disabled={publishingNote}>{publishingNote ? 'Publishing...' : 'Publish Note'}</button>
+              <label for="note-comment">{m.search_comment_label()}</label>
+              <input id="note-comment" type="text" bind:value={noteComment} placeholder={m.search_comment_placeholder()} />
+              <button onclick={handlePublishNote} disabled={publishingNote}>{publishingNote ? m.search_publishing() : m.search_publish_note()}</button>
               {#if publishMessage}
                 <span class={publishSuccess ? 'success-msg' : 'error-msg'}>{publishMessage}</span>
               {/if}
@@ -2041,8 +2042,8 @@
   bind:open={confirmOpen}
   title={confirmTitle}
   message={confirmMessage}
-  confirmLabel={pendingConfirm?.kind === 'close-tab' ? 'Close Tab' : 'Clear'}
-  cancelLabel="Keep"
+  confirmLabel={pendingConfirm?.kind === 'close-tab' ? m.search_confirm_close_tab_btn() : m.search_confirm_clear_btn()}
+  cancelLabel={m.search_confirm_keep()}
   danger={true}
   onconfirm={handleConfirm}
   oncancel={handleConfirmCancel}

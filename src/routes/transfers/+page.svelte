@@ -23,6 +23,7 @@
   import { listen } from '@tauri-apps/api/event';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import type { Transfer, SourceInfo, UploadQueueClient, KnownClient } from '$lib/types';
+  import * as m from '$lib/paraglide/messages';
 
   function countryFlagSrc(code: string | undefined): string | null {
     if (!code || code.length !== 2) return null;
@@ -41,8 +42,8 @@
   }
 
   function netOriginLabel(origin: string | undefined): string {
-    if (origin === 'kad') return 'KAD Network';
-    if (origin === 'ed2k') return 'eD2K Server';
+    if (origin === 'kad') return m.transfers_kad_network();
+    if (origin === 'ed2k') return m.transfers_ed2k_server();
     return '';
   }
 
@@ -51,9 +52,11 @@
   let showAdvancedDlCols = $state(true);
 
   type TableKey = 'downloads' | 'uploads' | 'queue' | 'known' | 'clients';
+  // Columns expose `label` as a getter so the value is re-evaluated on each
+  // locale switch without forcing every consumer to call a function.
   type TransferColumn<TSort extends string = string> = {
     key: string;
-    label: string;
+    readonly label: string;
     width: number;
     minWidth: number;
     className: string;
@@ -61,20 +64,20 @@
   };
 
   const DOWNLOAD_COLUMNS: TransferColumn<DlSortField>[] = [
-    { key: 'file_name', label: 'File Name', width: 260, minWidth: 140, className: 'col-dl-name', sortField: 'file_name' },
-    { key: 'total_size', label: 'Size', width: 65, minWidth: 56, className: 'col-dl-size', sortField: 'total_size' },
-    { key: 'transferred', label: 'Transferred', width: 65, minWidth: 56, className: 'col-dl-size', sortField: 'transferred' },
-    { key: 'completed_size', label: 'Completed', width: 65, minWidth: 56, className: 'col-dl-size', sortField: 'completed_size' },
-    { key: 'speed', label: 'Speed', width: 65, minWidth: 56, className: 'col-dl-speed', sortField: 'speed' },
-    { key: 'progress', label: 'Progress', width: 170, minWidth: 96, className: 'col-dl-progress', sortField: 'progress' },
-    { key: 'sources', label: 'Sources', width: 60, minWidth: 56, className: 'col-dl-sources', sortField: 'sources' },
-    { key: 'priority', label: 'Priority', width: 60, minWidth: 60, className: 'col-dl-prio', sortField: 'priority' },
-    { key: 'status', label: 'Status', width: 70, minWidth: 80, className: 'col-dl-status', sortField: 'status' },
-    { key: 'remaining', label: 'Remaining', width: 110, minWidth: 88, className: 'col-dl-remain', sortField: 'remaining' },
-    { key: 'last_seen_complete', label: 'Last Seen Complete', width: 150, minWidth: 110, className: 'col-dl-lastseen', sortField: 'last_seen_complete' },
-    { key: 'last_received', label: 'Last Reception', width: 120, minWidth: 100, className: 'col-dl-lastrx', sortField: 'last_received' },
-    { key: 'category', label: 'Category', width: 100, minWidth: 88, className: 'col-dl-cat', sortField: 'category' },
-    { key: 'started_at', label: 'Added On', width: 120, minWidth: 96, className: 'col-dl-date', sortField: 'started_at' },
+    { key: 'file_name', get label() { return m.transfers_col_file_name(); }, width: 260, minWidth: 140, className: 'col-dl-name', sortField: 'file_name' },
+    { key: 'total_size', get label() { return m.transfers_col_size(); }, width: 65, minWidth: 56, className: 'col-dl-size', sortField: 'total_size' },
+    { key: 'transferred', get label() { return m.transfers_col_transferred(); }, width: 65, minWidth: 56, className: 'col-dl-size', sortField: 'transferred' },
+    { key: 'completed_size', get label() { return m.transfers_col_completed(); }, width: 65, minWidth: 56, className: 'col-dl-size', sortField: 'completed_size' },
+    { key: 'speed', get label() { return m.transfers_col_speed(); }, width: 65, minWidth: 56, className: 'col-dl-speed', sortField: 'speed' },
+    { key: 'progress', get label() { return m.transfers_col_progress(); }, width: 170, minWidth: 96, className: 'col-dl-progress', sortField: 'progress' },
+    { key: 'sources', get label() { return m.transfers_col_sources(); }, width: 60, minWidth: 56, className: 'col-dl-sources', sortField: 'sources' },
+    { key: 'priority', get label() { return m.transfers_col_priority(); }, width: 60, minWidth: 60, className: 'col-dl-prio', sortField: 'priority' },
+    { key: 'status', get label() { return m.transfers_col_status(); }, width: 70, minWidth: 80, className: 'col-dl-status', sortField: 'status' },
+    { key: 'remaining', get label() { return m.transfers_col_remaining(); }, width: 110, minWidth: 88, className: 'col-dl-remain', sortField: 'remaining' },
+    { key: 'last_seen_complete', get label() { return m.transfers_col_last_seen_complete(); }, width: 150, minWidth: 110, className: 'col-dl-lastseen', sortField: 'last_seen_complete' },
+    { key: 'last_received', get label() { return m.transfers_col_last_reception(); }, width: 120, minWidth: 100, className: 'col-dl-lastrx', sortField: 'last_received' },
+    { key: 'category', get label() { return m.transfers_col_category(); }, width: 100, minWidth: 88, className: 'col-dl-cat', sortField: 'category' },
+    { key: 'started_at', get label() { return m.transfers_col_added_on(); }, width: 120, minWidth: 96, className: 'col-dl-date', sortField: 'started_at' },
   ];
   const DOWNLOAD_COMPACT_COLUMN_KEYS = new Set([
     'file_name',
@@ -93,15 +96,15 @@
     .map((column) => column.key);
   const UPLOAD_COLUMNS: TransferColumn<UlSortField>[] = [
     { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-ul-flag' },
-    { key: 'peer_name', label: 'User Name', width: 150, minWidth: 120, className: 'col-ul-client', sortField: 'peer_name' },
-    { key: 'file_name', label: 'File', width: 220, minWidth: 140, className: 'col-ul-name', sortField: 'file_name' },
-    { key: 'client_software', label: 'Software', width: 100, minWidth: 80, className: 'col-ul-sw', sortField: 'client_software' },
-    { key: 'speed', label: 'Speed', width: 70, minWidth: 56, className: 'col-ul-speed', sortField: 'speed' },
-    { key: 'transferred', label: 'Transferred', width: 80, minWidth: 56, className: 'col-ul-size', sortField: 'transferred' },
-    { key: 'total_size', label: 'Size', width: 70, minWidth: 56, className: 'col-ul-total' },
-    { key: 'upload_time', label: 'Upload Time', width: 80, minWidth: 72, className: 'col-ul-uptime', sortField: 'upload_time' },
-    { key: 'status', label: 'Status', width: 100, minWidth: 84, className: 'col-ul-status', sortField: 'status' },
-    { key: 'up_status', label: 'Up Status', width: 170, minWidth: 120, className: 'col-ul-bar' },
+    { key: 'peer_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-ul-client', sortField: 'peer_name' },
+    { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 220, minWidth: 140, className: 'col-ul-name', sortField: 'file_name' },
+    { key: 'client_software', get label() { return m.transfers_col_software(); }, width: 100, minWidth: 80, className: 'col-ul-sw', sortField: 'client_software' },
+    { key: 'speed', get label() { return m.transfers_col_speed(); }, width: 70, minWidth: 56, className: 'col-ul-speed', sortField: 'speed' },
+    { key: 'transferred', get label() { return m.transfers_col_transferred(); }, width: 80, minWidth: 56, className: 'col-ul-size', sortField: 'transferred' },
+    { key: 'total_size', get label() { return m.transfers_col_size(); }, width: 70, minWidth: 56, className: 'col-ul-total' },
+    { key: 'upload_time', get label() { return m.transfers_col_upload_time(); }, width: 80, minWidth: 72, className: 'col-ul-uptime', sortField: 'upload_time' },
+    { key: 'status', get label() { return m.transfers_col_status(); }, width: 100, minWidth: 84, className: 'col-ul-status', sortField: 'status' },
+    { key: 'up_status', get label() { return m.transfers_col_up_status(); }, width: 170, minWidth: 120, className: 'col-ul-bar' },
   ];
   // QUEUE_COLUMNS schema is for `UploadQueueClient` rows (the real
   // upload-server queue snapshot), NOT the legacy `Transfer` rows it
@@ -111,13 +114,13 @@
   // new column set.
   const QUEUE_COLUMNS: TransferColumn[] = [
     { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-q-flag' },
-    { key: 'user_name', label: 'User Name', width: 150, minWidth: 120, className: 'col-q-client' },
-    { key: 'file_name', label: 'File', width: 260, minWidth: 160, className: 'col-q-file' },
-    { key: 'wait_time', label: 'Wait Time', width: 90, minWidth: 72, className: 'col-q-wait' },
-    { key: 'queue_rank', label: 'Rank', width: 60, minWidth: 50, className: 'col-q-rank' },
-    { key: 'credit_ratio', label: 'Score', width: 64, minWidth: 56, className: 'col-q-score' },
-    { key: 'transfer_history', label: 'Up / Down', width: 130, minWidth: 110, className: 'col-q-hist' },
-    { key: 'ident_state', label: 'Identification', width: 110, minWidth: 96, className: 'col-q-ident' },
+    { key: 'user_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-q-client' },
+    { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 260, minWidth: 160, className: 'col-q-file' },
+    { key: 'wait_time', get label() { return m.transfers_col_wait_time(); }, width: 90, minWidth: 72, className: 'col-q-wait' },
+    { key: 'queue_rank', get label() { return m.transfers_col_rank(); }, width: 60, minWidth: 50, className: 'col-q-rank' },
+    { key: 'credit_ratio', get label() { return m.transfers_col_score(); }, width: 64, minWidth: 56, className: 'col-q-score' },
+    { key: 'transfer_history', get label() { return m.transfers_col_up_down(); }, width: 130, minWidth: 110, className: 'col-q-hist' },
+    { key: 'ident_state', get label() { return m.transfers_col_identification(); }, width: 110, minWidth: 96, className: 'col-q-ident' },
   ];
   // KNOWN_COLUMNS schema mirrors `KnownClient`: lifetime SecIdent records
   // sourced from clients.met. Independent of which peers are connected,
@@ -127,24 +130,24 @@
   // `KnSortField` type and `toggleKnSort` below).
   const KNOWN_COLUMNS: TransferColumn<KnSortField>[] = [
     { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-k-flag' },
-    { key: 'user_hash', label: 'User Hash', width: 200, minWidth: 140, className: 'col-k-hash', sortField: 'user_hash' },
-    { key: 'last_known_ip', label: 'Last IP', width: 130, minWidth: 110, className: 'col-k-ip', sortField: 'last_known_ip' },
-    { key: 'uploaded', label: 'Uploaded To', width: 100, minWidth: 80, className: 'col-k-up', sortField: 'uploaded' },
-    { key: 'downloaded', label: 'Downloaded From', width: 110, minWidth: 88, className: 'col-k-down', sortField: 'downloaded' },
-    { key: 'credit_ratio', label: 'Score', width: 64, minWidth: 56, className: 'col-k-score', sortField: 'credit_ratio' },
-    { key: 'reputation', label: 'Trust', width: 100, minWidth: 80, className: 'col-k-rep' },
-    { key: 'ident_state', label: 'Identification', width: 110, minWidth: 96, className: 'col-k-ident', sortField: 'ident_state' },
-    { key: 'last_seen', label: 'Last Seen', width: 140, minWidth: 110, className: 'col-k-seen', sortField: 'last_seen' },
+    { key: 'user_hash', get label() { return m.transfers_col_user_hash(); }, width: 200, minWidth: 140, className: 'col-k-hash', sortField: 'user_hash' },
+    { key: 'last_known_ip', get label() { return m.transfers_col_last_ip(); }, width: 130, minWidth: 110, className: 'col-k-ip', sortField: 'last_known_ip' },
+    { key: 'uploaded', get label() { return m.transfers_col_uploaded_to(); }, width: 100, minWidth: 80, className: 'col-k-up', sortField: 'uploaded' },
+    { key: 'downloaded', get label() { return m.transfers_col_downloaded_from(); }, width: 110, minWidth: 88, className: 'col-k-down', sortField: 'downloaded' },
+    { key: 'credit_ratio', get label() { return m.transfers_col_score(); }, width: 64, minWidth: 56, className: 'col-k-score', sortField: 'credit_ratio' },
+    { key: 'reputation', get label() { return m.transfers_col_trust(); }, width: 100, minWidth: 80, className: 'col-k-rep' },
+    { key: 'ident_state', get label() { return m.transfers_col_identification(); }, width: 110, minWidth: 96, className: 'col-k-ident', sortField: 'ident_state' },
+    { key: 'last_seen', get label() { return m.transfers_col_last_seen(); }, width: 140, minWidth: 110, className: 'col-k-seen', sortField: 'last_seen' },
   ];
   const CLIENT_COLUMNS: TransferColumn[] = [
-    { key: 'peer_name', label: 'User Name', width: 150, minWidth: 120, className: 'col-c-client' },
+    { key: 'peer_name', get label() { return m.transfers_col_user_name(); }, width: 150, minWidth: 120, className: 'col-c-client' },
     { key: 'country', label: '', width: 48, minWidth: 40, className: 'col-c-flag' },
-    { key: 'client_software', label: 'Client Software', width: 100, minWidth: 96, className: 'col-c-soft' },
-    { key: 'file_name', label: 'File', width: 260, minWidth: 160, className: 'col-c-file' },
-    { key: 'speed', label: 'Download Speed', width: 65, minWidth: 65, className: 'col-c-speed' },
-    { key: 'downloaded', label: 'Downloaded', width: 65, minWidth: 65, className: 'col-c-down' },
-    { key: 'parts', label: 'Parts', width: 60, minWidth: 50, className: 'col-c-parts' },
-    { key: 'status', label: 'Status', width: 100, minWidth: 88, className: 'col-c-status' },
+    { key: 'client_software', get label() { return m.transfers_col_client_software(); }, width: 100, minWidth: 96, className: 'col-c-soft' },
+    { key: 'file_name', get label() { return m.transfers_col_file(); }, width: 260, minWidth: 160, className: 'col-c-file' },
+    { key: 'speed', get label() { return m.transfers_col_download_speed(); }, width: 65, minWidth: 65, className: 'col-c-speed' },
+    { key: 'downloaded', get label() { return m.transfers_col_downloaded(); }, width: 65, minWidth: 65, className: 'col-c-down' },
+    { key: 'parts', get label() { return m.transfers_col_parts(); }, width: 60, minWidth: 50, className: 'col-c-parts' },
+    { key: 'status', get label() { return m.transfers_col_status(); }, width: 100, minWidth: 88, className: 'col-c-status' },
   ];
   const TABLE_COLUMNS: Record<TableKey, TransferColumn[]> = {
     downloads: DOWNLOAD_COLUMNS,
@@ -296,17 +299,18 @@
     const searchUnsubs: (() => void)[] = [];
     listen<{ transfer_id: string; kind: string; count?: number }>('transfer:source-search', (event) => {
       const d = event.payload;
+      const count = d.count ?? 0;
       let msg: string;
       switch (d.kind) {
-        case 'server_query': msg = 'Queried server...'; break;
-        case 'server_found': msg = `Server: ${d.count} source${d.count !== 1 ? 's' : ''} found`; break;
-        case 'server_empty': msg = 'Server: 0 sources'; break;
-        case 'udp_found': msg = `UDP: ${d.count} source${d.count !== 1 ? 's' : ''} found`; break;
-        case 'udp_empty': msg = 'UDP: 0 sources'; break;
-        case 'kad_search': msg = 'Searching KAD...'; break;
-        case 'kad_found': msg = `KAD: ${d.count} source${d.count !== 1 ? 's' : ''} found`; break;
-        case 'kad_indirect': msg = `KAD: ${d.count} indirect source${d.count !== 1 ? 's' : ''} (callback)`; break;
-        case 'kad_empty': msg = 'KAD: 0 sources'; break;
+        case 'server_query': msg = m.transfers_src_server_query(); break;
+        case 'server_found': msg = count === 1 ? m.transfers_src_server_found_one() : m.transfers_src_server_found_other({ count }); break;
+        case 'server_empty': msg = m.transfers_src_server_empty(); break;
+        case 'udp_found': msg = count === 1 ? m.transfers_src_udp_found_one() : m.transfers_src_udp_found_other({ count }); break;
+        case 'udp_empty': msg = m.transfers_src_udp_empty(); break;
+        case 'kad_search': msg = m.transfers_src_kad_search(); break;
+        case 'kad_found': msg = count === 1 ? m.transfers_src_kad_found_one() : m.transfers_src_kad_found_other({ count }); break;
+        case 'kad_indirect': msg = count === 1 ? m.transfers_src_kad_indirect_one() : m.transfers_src_kad_indirect_other({ count }); break;
+        case 'kad_empty': msg = m.transfers_src_kad_empty(); break;
         default: msg = d.kind; break;
       }
       searchStatus.set(d.transfer_id, msg);
@@ -315,7 +319,7 @@
 
     listen<{ transfer_id: string; source: string; kind: string }>('transfer:source-failed', (event) => {
       const d = event.payload;
-      const label = d.kind === 'permanent' ? 'rejected' : d.kind === 'timeout' ? 'timed out' : 'failed';
+      const label = d.kind === 'permanent' ? m.transfers_src_rejected() : d.kind === 'timeout' ? m.transfers_src_timed_out() : m.transfers_src_failed();
       searchStatus.set(d.transfer_id, `${d.source} ${label}`);
       searchStatus = new Map(searchStatus);
     }).then((u) => { if (mounted) searchUnsubs.push(u); else u(); }).catch((e) => { console.error('Failed to subscribe to transfer:source-failed:', e); });
@@ -425,7 +429,7 @@
         if (expandedSources === preFetchSources) {
           expandedSources = [];
         }
-        sourceLoadError = 'Failed to load sources';
+        sourceLoadError = m.transfers_failed_load_sources();
       }
     }
     if (expandedTransferId === t.id && requestId === sourceDetailRequestId) {
@@ -435,13 +439,13 @@
 
   function sourceStatusLabel(s: SourceInfo): string {
     switch (s.status) {
-      case 'connecting': return 'Connecting';
-      case 'queued': return s.queue_rank != null && s.queue_rank > 0 ? `QR: ${s.queue_rank}` : 'Queued';
-      case 'queue_full': return 'Queue Full';
-      case 'no_needed_parts': return 'No Needed Parts';
-      case 'transferring': return 'Transferring';
-      case 'completed': return 'Done';
-      case 'failed': return 'Failed';
+      case 'connecting': return m.transfers_src_connecting();
+      case 'queued': return s.queue_rank != null && s.queue_rank > 0 ? m.transfers_src_queue_rank({ rank: s.queue_rank }) : m.transfers_src_queued();
+      case 'queue_full': return m.transfers_src_queue_full();
+      case 'no_needed_parts': return m.transfers_src_no_needed_parts();
+      case 'transferring': return m.transfers_src_transferring();
+      case 'completed': return m.transfers_src_done();
+      case 'failed': return m.transfers_src_status_failed();
       default: return s.status;
     }
   }
@@ -488,7 +492,7 @@
   }
 
   function toErrorMsg(e: unknown): string {
-    return e instanceof Error ? e.message : typeof e === 'string' ? e : 'Operation failed';
+    return e instanceof Error ? e.message : typeof e === 'string' ? e : m.transfers_operation_failed();
   }
 
   // --- Downloads ---
@@ -1241,39 +1245,39 @@
 
   // --- eMule-style status labels ---
   function failureBadgeLabel(t: Transfer): string {
-    if (t.failure_kind === 'download_timeout') return 'Timeout';
-    if (t.failure_kind === 'permanent') return 'Permanent Error';
-    if (t.failure_stage === 'queue_wait') return 'Queue Wait';
-    if (t.failure_stage === 'tcp_connect') return 'Connect Error';
+    if (t.failure_kind === 'download_timeout') return m.transfers_failure_timeout();
+    if (t.failure_kind === 'permanent') return m.transfers_failure_permanent_error();
+    if (t.failure_stage === 'queue_wait') return m.transfers_failure_queue_wait();
+    if (t.failure_stage === 'tcp_connect') return m.transfers_failure_connect_error();
     if (t.failure_reason) return t.failure_reason;
-    return 'Error';
+    return m.transfers_failure_generic();
   }
 
   function dlStatusLabel(t: Transfer): string {
     switch (t.status) {
       case 'active':
-        if (t.health === 'stalled') return 'Stalled';
-        if (t.health === 'degraded') return 'Downloading (Idle)';
-        return 'Downloading';
+        if (t.health === 'stalled') return m.transfers_dl_status_stalled();
+        if (t.health === 'degraded') return m.transfers_dl_status_downloading_idle();
+        return m.transfers_dl_status_downloading();
       case 'searching': {
-        if (t.health === 'degraded' && t.health_reason) return 'Searching (Delayed)';
-        if (t.sources > 0) return `Searching (${t.sources} src)`;
+        if (t.health === 'degraded' && t.health_reason) return m.transfers_dl_status_searching_delayed();
+        if (t.sources > 0) return m.transfers_dl_status_searching_with_sources({ count: t.sources });
         const connected = $networkStats.status === 'connected' || $networkStats.status === 'connecting';
-        return connected ? 'Searching' : 'Waiting';
+        return connected ? m.transfers_dl_status_searching() : m.transfers_dl_status_waiting();
       }
       case 'queued':
-        if (t.sources === 0) return 'Searching';
-        if (t.queue_rank != null && t.queue_rank > 0) return `Queued (QR: ${t.queue_rank})`;
-        return 'Queued';
-      case 'paused': return 'Paused';
-      case 'stopped': return 'Stopped';
-      case 'verifying': return 'Verifying';
-      case 'completing': return 'Completing';
-      case 'completed': return 'Complete';
+        if (t.sources === 0) return m.transfers_dl_status_searching();
+        if (t.queue_rank != null && t.queue_rank > 0) return m.transfers_dl_status_queued_rank({ rank: t.queue_rank });
+        return m.transfer_status_queued();
+      case 'paused': return m.transfer_status_paused();
+      case 'stopped': return m.transfer_status_stopped();
+      case 'verifying': return m.transfer_status_verifying();
+      case 'completing': return m.transfer_status_completing();
+      case 'completed': return m.transfers_dl_status_complete();
       case 'failed': return failureBadgeLabel(t);
-      case 'hashing': return 'Hashing';
-      case 'insufficient': return 'Insufficient Disk';
-      case 'noneneeded': return 'No Needed Parts';
+      case 'hashing': return m.transfer_status_hashing();
+      case 'insufficient': return m.transfers_dl_status_insufficient_disk();
+      case 'noneneeded': return m.transfers_dl_status_no_needed_parts();
       default: return t.status;
     }
   }
@@ -1302,19 +1306,19 @@
   function ulStatusLabel(t: Transfer): string {
     switch (t.status) {
       case 'active':
-        if (t.total_size > 0 && t.transferred >= t.total_size) return 'Complete';
-        return 'Transferring';
-      case 'completed': return 'Complete';
+        if (t.total_size > 0 && t.transferred >= t.total_size) return m.transfers_dl_status_complete();
+        return m.transfers_ul_status_transferring();
+      case 'completed': return m.transfers_dl_status_complete();
       case 'failed': {
         const reason = (t.failure_reason || '').toLowerCase();
         // Map common failure messages to short, human labels so the
         // Completed / Failed section doesn't just say "Error" for every row.
-        if (reason.includes('timeout') || reason.includes('timed out')) return 'Timeout';
-        if (reason.includes('refused')) return 'Refused';
-        if (reason.includes('reset') || reason.includes('eof')) return 'Disconnected';
-        if (reason.includes('cancel')) return 'Cancelled';
-        if (reason.includes('hash') && reason.includes('mismatch')) return 'Bad data';
-        return 'Error';
+        if (reason.includes('timeout') || reason.includes('timed out')) return m.transfers_failure_timeout();
+        if (reason.includes('refused')) return m.transfers_ul_failure_refused();
+        if (reason.includes('reset') || reason.includes('eof')) return m.transfers_ul_failure_disconnected();
+        if (reason.includes('cancel')) return m.transfers_ul_failure_cancelled();
+        if (reason.includes('hash') && reason.includes('mismatch')) return m.transfers_ul_failure_bad_data();
+        return m.transfers_failure_generic();
       }
       default: return t.status;
     }
@@ -1401,31 +1405,31 @@
           const text = await navigator.clipboard.readText();
           const trimmed = text.trim();
           if (trimmed.length > MAX_PASTE_LEN) {
-            transferError = `Clipboard text is too long (${trimmed.length} chars, max ${MAX_PASTE_LEN}) — eD2K links are typically under 1 KiB`;
+            transferError = m.transfers_clipboard_too_long({ length: trimmed.length, max: MAX_PASTE_LEN });
             break;
           }
           if (trimmed.toLowerCase().startsWith('ed2k://')) {
             const info = await parseEd2kLink(trimmed);
             const res = await startDownload(info.hash, info.name, info.size, '', 0);
             showInfo(res.already_queued
-              ? `Already in download list: ${info.name}`
-              : `Queued from clipboard: ${info.name}`);
+              ? m.transfers_already_in_list({ name: info.name })
+              : m.transfers_queued_from_clipboard({ name: info.name }));
           } else {
-            transferError = 'Clipboard does not contain an ed2k:// link';
+            transferError = m.transfers_clipboard_not_ed2k();
           }
           break;
         }
         case 'set_category': if (extra !== undefined) await setTransferCategory(t.id, extra === 'None' ? '' : extra); break;
         case 'add_friend': {
-          if (!t.user_hash) { transferError = 'No user hash available for this peer'; break; }
+          if (!t.user_hash) { transferError = m.transfers_no_user_hash(); break; }
           await addFriend(t.user_hash, t.peer_name || undefined);
-          showInfo(`Added ${t.peer_name || t.user_hash.slice(0, 8) + '\u2026'} as friend`);
+          showInfo(m.transfers_added_friend({ name: t.peer_name || t.user_hash.slice(0, 8) + '\u2026' }));
           break;
         }
         case 'ban_user': {
-          if (!t.user_hash) { transferError = 'No user hash available for this peer'; break; }
+          if (!t.user_hash) { transferError = m.transfers_no_user_hash(); break; }
           await banPeer(t.user_hash);
-          showInfo(`Banned ${t.peer_name || t.user_hash.slice(0, 8) + '\u2026'}`);
+          showInfo(m.transfers_banned_user({ name: t.peer_name || t.user_hash.slice(0, 8) + '\u2026' }));
           break;
         }
       }
@@ -1458,18 +1462,18 @@
     try {
       const text = (await navigator.clipboard.readText()).trim();
       if (text.length > MAX_PASTE_LEN) {
-        transferError = `Clipboard text is too long (${text.length} chars, max ${MAX_PASTE_LEN}) — eD2K links are typically under 1 KiB`;
+        transferError = m.transfers_clipboard_too_long({ length: text.length, max: MAX_PASTE_LEN });
         return;
       }
       if (!text.toLowerCase().startsWith('ed2k://')) {
-        transferError = 'Clipboard does not contain an ed2k:// link';
+        transferError = m.transfers_clipboard_not_ed2k();
         return;
       }
       const info = await parseEd2kLink(text);
       const res = await startDownload(info.hash, info.name, info.size, '', 0);
       showInfo(res.already_queued
-        ? `Already in download list: ${info.name}`
-        : `Queued from clipboard: ${info.name}`);
+        ? m.transfers_already_in_list({ name: info.name })
+        : m.transfers_queued_from_clipboard({ name: info.name }));
     } catch (e: unknown) {
       transferError = toErrorMsg(e);
     } finally {
@@ -1494,13 +1498,22 @@
    *  user knows which rows in a batch didn't get the action applied. */
   function summarizeBatchResult(label: string, total: number, failed: { id: string; name: string; error: string }[]) {
     if (failed.length === 0) {
-      showInfo(`${label} ${total} transfer${total === 1 ? '' : 's'}`);
+      showInfo(total === 1
+        ? m.transfers_batch_done_one({ label })
+        : m.transfers_batch_done_other({ label, count: total }));
       return;
     }
     const firstName = failed[0].name || failed[0].id.slice(0, 8);
     const rest = failed.length - 1;
-    const restSuffix = rest > 0 ? ` (+${rest} more)` : '';
-    transferError = `${label} ${total - failed.length} of ${total} transfers — failed: ${firstName}${restSuffix}: ${failed[0].error}`;
+    const restSuffix = rest > 0 ? m.transfers_batch_failed_more({ count: rest }) : '';
+    transferError = m.transfers_batch_failed({
+      label,
+      success: total - failed.length,
+      total,
+      name: firstName,
+      rest: restSuffix,
+      error: failed[0].error,
+    });
   }
 
   /** Run a per-id action in a bounded-concurrency loop so one bad id
@@ -1525,17 +1538,17 @@
 
   async function handleBatchPauseDownloads() {
     const ids = transfersForBatchAction().filter((t) => canPause(t)).map((t) => t.id);
-    await runBatchPerId(ids, (id) => pauseTransfer(id), 'Paused');
+    await runBatchPerId(ids, (id) => pauseTransfer(id), m.transfers_batch_label_paused());
   }
 
   async function handleBatchResumeDownloads() {
     const ids = transfersForBatchAction().filter((t) => canResume(t)).map((t) => t.id);
-    await runBatchPerId(ids, (id) => resumeTransfer(id), 'Resumed');
+    await runBatchPerId(ids, (id) => resumeTransfer(id), m.transfers_batch_label_resumed());
   }
 
   async function handleBatchStopDownloads() {
     const ids = transfersForBatchAction().filter((t) => canStop(t)).map((t) => t.id);
-    await runBatchPerId(ids, (id) => stopTransfer(id), 'Stopped');
+    await runBatchPerId(ids, (id) => stopTransfer(id), m.transfers_batch_label_stopped());
   }
 
   let confirmBatchCancel = $state({ open: false, ids: [] as string[], count: 0 });
@@ -1825,11 +1838,11 @@
 
   function getColumnMenuTitle(table: TableKey): string {
     switch (table) {
-      case 'downloads': return 'Download Columns';
-      case 'uploads': return 'Upload Columns';
-      case 'queue': return 'Queued Columns';
-      case 'known': return 'Known Clients Columns';
-      case 'clients': return 'Client Columns';
+      case 'downloads': return m.transfers_column_menu_downloads();
+      case 'uploads': return m.transfers_column_menu_uploads();
+      case 'queue': return m.transfers_column_menu_queue();
+      case 'known': return m.transfers_column_menu_known();
+      case 'clients': return m.transfers_column_menu_clients();
     }
   }
 
@@ -2021,13 +2034,43 @@
 
   function priorityTooltip(priority: string): string {
     switch (priority) {
-      case 'high': return 'High: downloaded before normal and low priority files';
-      case 'normal': return 'Normal: default download priority';
-      case 'low': return 'Low: downloaded after high and normal priority files';
-      case 'verylow': return 'Very Low: downloaded only when no higher priority files are waiting';
-      case 'auto': return 'Auto: priority adjusted automatically based on file size and availability';
-      case 'release': return 'Release: highest priority, downloaded before all other files';
+      case 'high': return m.transfers_priority_tooltip_high();
+      case 'normal': return m.transfers_priority_tooltip_normal();
+      case 'low': return m.transfers_priority_tooltip_low();
+      case 'verylow': return m.transfers_priority_tooltip_verylow();
+      case 'auto': return m.transfers_priority_tooltip_auto();
+      case 'release': return m.transfers_priority_tooltip_release();
       default: return priority;
+    }
+  }
+
+  /** Localized label for a transfer priority value (capitalised form used
+   *  in the download row priority badge). */
+  function priorityLabel(priority: string): string {
+    switch (priority) {
+      case 'verylow': return m.library_priority_verylow();
+      case 'low': return m.library_priority_low();
+      case 'normal': return m.library_priority_normal();
+      case 'high': return m.library_priority_high();
+      case 'auto': return m.library_priority_auto();
+      case 'release': return m.library_priority_release();
+      default: return priority.charAt(0).toUpperCase() + priority.slice(1);
+    }
+  }
+
+  /** Localized label for a category dropdown option. The internal value
+   *  (`'None'`, `'Audio'`, …) is preserved as the API contract; only the
+   *  user-visible label is translated. */
+  function categoryLabel(cat: string): string {
+    switch (cat) {
+      case 'None': return m.transfers_cat_none();
+      case 'Audio': return m.transfers_cat_audio();
+      case 'Video': return m.transfers_cat_video();
+      case 'Image': return m.transfers_cat_image();
+      case 'Archive': return m.transfers_cat_archive();
+      case 'Document': return m.transfers_cat_document();
+      case 'Program': return m.transfers_cat_program();
+      default: return cat;
     }
   }
 
@@ -2039,37 +2082,43 @@
         // tooltip "Actively downloading").
         if (t.health === 'stalled') {
           return t.health_reason
-            ? `Stalled — no data received recently. ${t.health_reason}`
-            : 'Stalled — no data received recently';
+            ? m.transfers_dl_tooltip_stalled_reason({ reason: t.health_reason })
+            : m.transfers_dl_tooltip_stalled_base();
         }
         if (t.health === 'degraded') {
           return t.health_reason
-            ? `Downloading slowly or idle. ${t.health_reason}`
-            : 'Downloading slowly or idle';
+            ? m.transfers_dl_tooltip_degraded_reason({ reason: t.health_reason })
+            : m.transfers_dl_tooltip_degraded_base();
         }
         return t.health_reason
-          ? `Actively downloading data from sources. ${t.health_reason}`
-          : 'Actively downloading data from sources';
+          ? m.transfers_dl_tooltip_active_reason({ reason: t.health_reason })
+          : m.transfers_dl_tooltip_active_base();
       }
       case 'searching': {
         const conn = $networkStats.status === 'connected' || $networkStats.status === 'connecting';
-        const base = conn ? 'Searching for sources on the network' : 'Waiting to connect before searching';
-        return t.health_reason ? `${base}. ${t.health_reason}` : base;
+        const base = conn
+          ? m.transfers_dl_tooltip_searching_base()
+          : m.transfers_dl_tooltip_searching_disconnected_base();
+        return t.health_reason
+          ? m.transfers_dl_tooltip_searching_reason({ base, reason: t.health_reason })
+          : base;
       }
       case 'queued':
-        if (t.sources === 0) return 'No sources found yet, searching the network';
+        if (t.sources === 0) return m.transfers_dl_tooltip_queued_no_sources();
         return t.health_reason
-          ? `Waiting in a remote client's upload queue. ${t.health_reason}`
-          : 'Waiting in a remote client\'s upload queue';
-      case 'paused': return 'Download paused by user';
-      case 'stopped': return 'Download stopped by user';
-      case 'verifying': return 'Verifying downloaded data integrity';
-      case 'completing': return 'Moving completed file to destination';
-      case 'completed': return 'Download finished successfully';
-      case 'failed': return t.failure_reason ? `Download failed: ${t.failure_reason}` : 'Download failed';
-      case 'hashing': return 'Computing file hash for verification';
-      case 'insufficient': return 'Insufficient disk space to continue download';
-      case 'noneneeded': return 'No sources have parts needed to complete the file';
+          ? m.transfers_dl_tooltip_queued_reason({ reason: t.health_reason })
+          : m.transfers_dl_tooltip_queued_base();
+      case 'paused': return m.transfers_dl_tooltip_paused();
+      case 'stopped': return m.transfers_dl_tooltip_stopped();
+      case 'verifying': return m.transfers_dl_tooltip_verifying();
+      case 'completing': return m.transfers_dl_tooltip_completing();
+      case 'completed': return m.transfers_dl_tooltip_completed();
+      case 'failed': return t.failure_reason
+        ? m.transfers_dl_tooltip_failed_reason({ reason: t.failure_reason })
+        : m.transfers_dl_tooltip_failed();
+      case 'hashing': return m.transfers_dl_tooltip_hashing();
+      case 'insufficient': return m.transfers_dl_tooltip_insufficient();
+      case 'noneneeded': return m.transfers_dl_tooltip_noneneeded();
       default: return t.status;
     }
   }
@@ -2077,30 +2126,32 @@
   function ulStatusTooltip(t: Transfer): string {
     switch (t.status) {
       case 'active':
-        if (t.total_size > 0 && t.transferred >= t.total_size) return 'Upload to this client completed';
-        return 'Actively uploading data to this client';
-      case 'completed': return 'Upload to this client completed';
+        if (t.total_size > 0 && t.transferred >= t.total_size) return m.transfers_ul_tooltip_completed();
+        return m.transfers_ul_tooltip_active();
+      case 'completed': return m.transfers_ul_tooltip_completed();
       case 'failed': {
         // Prefer the backend-supplied reason over a generic "failed" so the
         // user can understand why an upload dropped out (timeout, refused,
         // peer reset, hash mismatch, etc.).
         const reason = t.failure_reason?.trim();
-        return reason ? `Upload failed: ${reason}` : 'Upload to this client failed';
+        return reason
+          ? m.transfers_ul_tooltip_failed_reason({ reason })
+          : m.transfers_ul_tooltip_failed();
       }
       default: return t.status;
     }
   }
 
   function sourcesTooltip(t: Transfer): string {
-    if (!t.sources) return 'No sources found';
+    if (!t.sources) return m.transfers_sources_tooltip_none();
     const parts: string[] = [];
-    parts.push(`${t.active_sources || 0} active`);
-    parts.push(`${t.queued_sources || 0} queued`);
-    parts.push(`${t.sources} total`);
-    if (t.ember_sources > 0) parts.push(`${t.ember_sources} via Ember`);
-    if (t.a4af_sources > 0) parts.push(`${t.a4af_sources} A4AF (asked for another file)`);
-    if (t.max_sources > 0) parts.push(`max ${t.max_sources}`);
-    return `Sources: ${parts.join(', ')}. Format: active/total+a4af [max]`;
+    parts.push(m.transfers_sources_tooltip_active({ count: t.active_sources || 0 }));
+    parts.push(m.transfers_sources_tooltip_queued({ count: t.queued_sources || 0 }));
+    parts.push(m.transfers_sources_tooltip_total({ count: t.sources }));
+    if (t.ember_sources > 0) parts.push(m.transfers_sources_tooltip_ember({ count: t.ember_sources }));
+    if (t.a4af_sources > 0) parts.push(m.transfers_sources_tooltip_a4af({ count: t.a4af_sources }));
+    if (t.max_sources > 0) parts.push(m.transfers_sources_tooltip_max({ count: t.max_sources }));
+    return m.transfers_sources_tooltip_full({ parts: parts.join(', ') });
   }
 
   let dlColCount = $derived(visibleDownloadColumns.length + 1);
@@ -2251,13 +2302,13 @@
 }} />
 
 <div class="page-header">
-  <h2>Transfers</h2>
+  <h2>{m.transfers_title()}</h2>
   <div class="header-actions">
     <button
       class="ghost paste-link-btn"
       onclick={handlePasteLinkFromHeader}
       disabled={pasteLinkBusy}
-      title="Read an ed2k:// link from the clipboard and start downloading"
+      title={m.transfers_paste_link_title()}
     >
       <span class="paste-link-icon" aria-hidden="true">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -2267,7 +2318,7 @@
           <line x1="6.5" y1="10" x2="9.5" y2="10"/>
         </svg>
       </span>
-      {pasteLinkBusy ? 'Pasting…' : 'Paste eD2K Link'}
+      {pasteLinkBusy ? m.transfers_pasting() : m.transfers_paste_link()}
     </button>
   </div>
 </div>
@@ -2275,13 +2326,13 @@
 {#if transferError}
   <div class="error-banner">
     <span>{transferError}</span>
-    <button class="ghost" onclick={() => transferError = null}>Dismiss</button>
+    <button class="ghost" onclick={() => transferError = null}>{m.common_dismiss()}</button>
   </div>
 {/if}
 {#if transferInfo}
   <div class="info-banner" role="status">
     <span>{transferInfo}</span>
-    <button class="ghost" onclick={() => (transferInfo = null)}>Dismiss</button>
+    <button class="ghost" onclick={() => (transferInfo = null)}>{m.common_dismiss()}</button>
   </div>
 {/if}
 
@@ -2294,31 +2345,31 @@
         The StatusBar shows the network rate (includes protocol overhead),
         which is expected to be higher. Tooltip clarifies the distinction.
       -->
-      <span class="overview-chip" title="Active download payload rate (status bar shows total network rate)"><span class="overview-label">DL</span> {formatSpeed(totalDownloadRate)}</span>
-      <span class="overview-chip" title="Active upload payload rate (status bar shows total network rate)"><span class="overview-label">UL</span> {formatSpeed(totalUploadRate)}</span>
-      <span class="overview-chip"><span class="overview-label">Active</span> {transferringDownloads}</span>
-      <span class="overview-chip"><span class="overview-label">Sources</span> {activeConnectedSources}/{totalKnownSources}</span>
-      <label class="filter-wrap" aria-label="Filter transfers">
-        <span class="filter-label">Filter</span>
+      <span class="overview-chip" title={m.transfers_overview_dl_title()}><span class="overview-label">{m.transfers_overview_label_dl()}</span> {formatSpeed(totalDownloadRate)}</span>
+      <span class="overview-chip" title={m.transfers_overview_ul_title()}><span class="overview-label">{m.transfers_overview_label_ul()}</span> {formatSpeed(totalUploadRate)}</span>
+      <span class="overview-chip"><span class="overview-label">{m.transfers_overview_label_active()}</span> {transferringDownloads}</span>
+      <span class="overview-chip"><span class="overview-label">{m.transfers_overview_label_sources()}</span> {activeConnectedSources}/{totalKnownSources}</span>
+      <label class="filter-wrap" aria-label={m.transfers_filter_aria()}>
+        <span class="filter-label">{m.transfers_filter_label()}</span>
         <input
           class="filter-input"
           type="text"
-          placeholder="name, hash, category, peer..."
+          placeholder={m.transfers_filter_placeholder()}
           bind:value={transferFilter}
         />
       </label>
     </div>
     <div class="pane-toolbar">
-      <span class="pane-title">{filteredActiveDownloads.length}/{activeDownloads.length} downloading</span>
+      <span class="pane-title">{m.transfers_downloading_count({ shown: filteredActiveDownloads.length, total: activeDownloads.length })}</span>
       <div class="toolbar-actions">
-        <button class="tb-btn tb-toggle" onclick={toggleAdvancedDlCols} title="Toggle between full and compact columns">
-          {showAdvancedDlCols ? 'Compact' : 'Full'}
+        <button class="tb-btn tb-toggle" onclick={toggleAdvancedDlCols} title={m.transfers_toggle_cols_title()}>
+          {showAdvancedDlCols ? m.transfers_toggle_compact() : m.transfers_toggle_full()}
         </button>
         <span class="toolbar-sep"></span>
-        <button class="tb-btn" onclick={handlePauseAll} title="Pause All">Pause All</button>
-        <button class="tb-btn" onclick={handleResumeAll} title="Resume All">Resume All</button>
+        <button class="tb-btn" onclick={handlePauseAll} title={m.transfers_pause_all()}>{m.transfers_pause_all()}</button>
+        <button class="tb-btn" onclick={handleResumeAll} title={m.transfers_resume_all()}>{m.transfers_resume_all()}</button>
         {#if hasCompletedDl}
-          <button class="tb-btn" onclick={() => confirmClearCompleted = true} title="Clear Completed">Clear Completed</button>
+          <button class="tb-btn" onclick={() => confirmClearCompleted = true} title={m.transfers_clear_completed()}>{m.transfers_clear_completed()}</button>
         {/if}
       </div>
     </div>
@@ -2342,8 +2393,8 @@
                 checked={allActiveDlChecked}
                 indeterminate={someActiveDlChecked && !allActiveDlChecked}
                 onchange={toggleDlCheckAll}
-                aria-label="Select all downloads"
-                title="Select all downloads"
+                aria-label={m.transfers_select_all_aria()}
+                title={m.transfers_select_all_aria()}
               />
             </th>
             {#each visibleDownloadColumns as column (column.key)}
@@ -2372,7 +2423,7 @@
                   type="button"
                   class="col-resize-handle"
                   tabindex="-1"
-                  aria-label={`Resize ${column.label} column`}
+                  aria-label={m.transfers_resize_column({ name: column.label })}
                   onmousedown={(e) => beginColumnResize(e, 'downloads', column.key)}
                   ondblclick={(e) => autoSizeColumn(e, 'downloads', column.key)}
                   onclick={swallowResizeClick}
@@ -2396,7 +2447,7 @@
                   type="checkbox"
                   checked={selectedDlIdSet.has(t.id)}
                   onclick={(e) => { e.stopPropagation(); toggleDlCheck(t, e.shiftKey); }}
-                  aria-label="Select {t.file_name}"
+                  aria-label={m.transfers_select_row({ name: t.file_name })}
                 />
               </td>
               {#each visibleDownloadColumns as column (column.key)}
@@ -2431,7 +2482,7 @@
                   <td class="num-cell" title={sourcesTooltip(t)}>{sourcesLabel(t)}</td>
                 {:else if column.key === 'priority'}
                   <td class="prio-cell">
-                    <span class="prio-badge prio-{t.priority}" title={priorityTooltip(t.priority)}>{t.priority.charAt(0).toUpperCase() + t.priority.slice(1)}</span>
+                    <span class="prio-badge prio-{t.priority}" title={priorityTooltip(t.priority)}>{priorityLabel(t.priority)}</span>
                   </td>
                 {:else if column.key === 'status'}
                   <td class="status-cell">
@@ -2461,14 +2512,14 @@
             {#if expandedTransferId === t.id}
               {#if loadingSources}
                 <tr class="source-child-row">
-                  <td class="source-child-cell" colspan={dlColCount}><span class="source-indent">Loading sources...</span></td>
+                  <td class="source-child-cell" colspan={dlColCount}><span class="source-indent">{m.transfers_loading_sources()}</span></td>
                 </tr>
               {:else if sourceLoadError}
                 <tr class="source-child-row">
                   <td class="source-child-cell" colspan={dlColCount}>
                     <span class="source-indent">
                       {sourceLoadError}
-                      <button class="source-inline-btn" onclick={() => toggleSourceDetail(t)}>Retry</button>
+                      <button class="source-inline-btn" onclick={() => toggleSourceDetail(t)}>{m.common_retry()}</button>
                     </span>
                   </td>
                 </tr>
@@ -2476,8 +2527,12 @@
                 <tr class="source-child-row">
                   <td class="source-child-cell" colspan={dlColCount}>
                     <span class="source-indent">
-                      {t.sources > 0 ? `Connecting to ${t.sources} source${t.sources !== 1 ? 's' : ''}...` : 'No source details yet.'}
-                      <button class="source-inline-btn" onclick={() => findSources(t.file_hash, t.total_size).catch(() => {})}>Find Sources</button>
+                      {t.sources > 0
+                        ? (t.sources === 1
+                          ? m.transfers_connecting_sources_one()
+                          : m.transfers_connecting_sources_other({ count: t.sources }))
+                        : m.transfers_no_source_details()}
+                      <button class="source-inline-btn" onclick={() => findSources(t.file_hash, t.total_size).catch(() => {})}>{m.transfers_find_sources()}</button>
                     </span>
                   </td>
                 </tr>
@@ -2491,12 +2546,12 @@
                 <tr class="source-child-row source-summary-row">
                   <td class="source-child-cell" colspan={dlColCount}>
                     <span class="source-summary">
-                      <strong>{visibleSources.length}</strong> source{visibleSources.length !== 1 ? 's' : ''}
-                      {#if xferCount > 0}<span class="ss-chip ss-xfer">{xferCount} transferring</span>{/if}
-                      {#if queuedCount > 0}<span class="ss-chip ss-queued">{queuedCount} queued</span>{/if}
-                      {#if connectCount > 0}<span class="ss-chip ss-connect">{connectCount} connecting</span>{/if}
-                      {#if otherCount > 0}<span class="ss-chip ss-other">{otherCount} other</span>{/if}
-                      {#if failedCount > 0}<span class="ss-chip ss-failed">{failedCount} failed</span>{/if}
+                      <strong>{visibleSources.length}</strong> {visibleSources.length === 1 ? m.transfers_known_peers_one() : m.transfers_known_peers_other()}
+                      {#if xferCount > 0}<span class="ss-chip ss-xfer">{m.transfers_chip_transferring({ count: xferCount })}</span>{/if}
+                      {#if queuedCount > 0}<span class="ss-chip ss-queued">{m.transfers_chip_queued({ count: queuedCount })}</span>{/if}
+                      {#if connectCount > 0}<span class="ss-chip ss-connect">{m.transfers_chip_connecting({ count: connectCount })}</span>{/if}
+                      {#if otherCount > 0}<span class="ss-chip ss-other">{m.transfers_chip_other({ count: otherCount })}</span>{/if}
+                      {#if failedCount > 0}<span class="ss-chip ss-failed">{m.transfers_chip_failed({ count: failedCount })}</span>{/if}
                     </span>
                   </td>
                 </tr>
@@ -2507,12 +2562,12 @@
                         <span class="source-status-dot src-dot-{src.status}" title={src.status}></span>
                         {#if netOriginSrc(src.source_origin)}<span class="source-net-origin" title={netOriginLabel(src.source_origin)}><img src={netOriginSrc(src.source_origin)} alt={src.source_origin ?? ''} class="net-origin-img" /></span>{/if}
                         <span class="source-flag" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</span>
-                        <span class="source-client" title={src.peer_name || src.client_software || 'Unknown Client'}>{src.peer_name || src.client_software || 'Unknown Client'}</span>
+                        <span class="source-client" title={src.peer_name || src.client_software || m.transfers_unknown_client()}>{src.peer_name || src.client_software || m.transfers_unknown_client()}</span>
                         <span class="source-sep"></span>
                         <span class="source-addr" title="{src.ip}:{src.port}">{src.ip}:{src.port}</span>
                         <span class="source-state src-st-{src.status}">{sourceStatusLabel(src)}</span>
                         {#if src.available_parts != null && src.total_parts != null && src.total_parts > 0}
-                          <span class="source-tag" title="Parts available from this source">{src.available_parts}/{src.total_parts} parts</span>
+                          <span class="source-tag" title={m.transfers_parts_title()}>{m.transfers_parts({ have: src.available_parts, total: src.total_parts })}</span>
                         {/if}
                         {#if src.speed > 0}
                           <span class="source-tag source-tag-accent">{formatSpeed(src.speed)}</span>
@@ -2527,7 +2582,7 @@
                 {#if failedCount > 0}
                   <tr class="source-child-row src-failed-summary">
                     <td class="source-child-cell" colspan={dlColCount}>
-                      <span class="source-indent source-failed-note">{failedCount} failed source{failedCount !== 1 ? 's' : ''} hidden</span>
+                      <span class="source-indent source-failed-note">{failedCount === 1 ? m.transfers_failed_sources_hidden_one() : m.transfers_failed_sources_hidden_other({ count: failedCount })}</span>
                     </td>
                   </tr>
                 {/if}
@@ -2539,7 +2594,7 @@
               <td colspan={dlColCount}>
                 <button class="divider-toggle" onclick={() => completedCollapsed = !completedCollapsed}>
                   <span class="divider-chevron" class:collapsed={completedCollapsed}>{completedCollapsed ? '\u25B6' : '\u25BC'}</span>
-                  COMPLETED / FAILED ({filteredCompletedDownloads.length})
+                  {m.transfers_completed_failed_section({ count: filteredCompletedDownloads.length })}
                 </button>
               </td>
             </tr>
@@ -2571,7 +2626,7 @@
                     <td class="prio-cell">{'\u2014'}</td>
                   {:else if column.key === 'status'}
                     <td class="status-cell">
-                      <span class="status-label st-{t.status}" title={dlStatusTooltip(t)} aria-label={`Status: ${dlStatusLabel(t)}. ${dlStatusTooltip(t)}`}>{dlStatusLabel(t)}</span>
+                      <span class="status-label st-{t.status}" title={dlStatusTooltip(t)} aria-label={m.transfers_status_label_aria({ label: dlStatusLabel(t), tooltip: dlStatusTooltip(t) })}>{dlStatusLabel(t)}</span>
                       <!--
                         L10: surface failure_kind / failure_stage in the
                         tooltip so the user can distinguish transient from
@@ -2607,8 +2662,8 @@
                   <polyline points="7 10 12 15 17 10"></polyline>
                   <line x1="12" y1="15" x2="12" y2="3"></line>
                 </svg>
-                <p class="empty-cell-title">No downloads yet</p>
-                <p class="empty-cell-sub"><a href="/search">Start a search</a> to find files on the network.</p>
+                <p class="empty-cell-title">{m.transfers_empty_no_downloads()}</p>
+                <p class="empty-cell-sub"><a href="/search">{m.transfers_empty_start_search_prefix()}</a>{m.transfers_empty_start_search_suffix()}</p>
               </div>
             </td></tr>
           {:else if filteredActiveDownloads.length === 0 && filteredCompletedDownloads.length === 0}
@@ -2618,7 +2673,7 @@
                   <circle cx="11" cy="11" r="8"></circle>
                   <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                 </svg>
-                <p class="empty-cell-title">No transfers match this filter</p>
+                <p class="empty-cell-title">{m.transfers_empty_no_matches()}</p>
               </div>
             </td></tr>
           {/if}
@@ -2628,14 +2683,14 @@
     {#if selectedDownloadCount > 1}
       <div class="selection-footer">
         <div class="selection-meta">
-          <strong>{selectedDownloadCount} downloads selected</strong>
+          <strong>{m.transfers_selected_count({ count: selectedDownloadCount })}</strong>
         </div>
         <div class="selection-actions">
-          <button class="tb-btn" onclick={handleBatchPauseDownloads} title="Pause all selected downloads">Pause</button>
-          <button class="tb-btn" onclick={handleBatchResumeDownloads} title="Resume all selected downloads">Resume</button>
-          <button class="tb-btn" onclick={handleBatchStopDownloads} title="Stop all selected downloads">Stop</button>
-          <button class="tb-btn danger-outline" onclick={handleBatchCancelDownloads} title="Cancel and remove all selected downloads">Cancel</button>
-          <button class="tb-btn" onclick={clearDlSelection} title="Clear selection">Clear</button>
+          <button class="tb-btn" onclick={handleBatchPauseDownloads} title={m.transfers_batch_pause_title()}>{m.common_pause()}</button>
+          <button class="tb-btn" onclick={handleBatchResumeDownloads} title={m.transfers_batch_resume_title()}>{m.common_resume()}</button>
+          <button class="tb-btn" onclick={handleBatchStopDownloads} title={m.transfers_batch_stop_title()}>{m.common_stop()}</button>
+          <button class="tb-btn danger-outline" onclick={handleBatchCancelDownloads} title={m.transfers_batch_cancel_title()}>{m.common_cancel()}</button>
+          <button class="tb-btn" onclick={clearDlSelection} title={m.transfers_batch_clear_title()}>{m.common_clear()}</button>
         </div>
       </div>
     {:else if selectedTransfer}
@@ -2644,19 +2699,19 @@
           <strong>{selectedTransfer.file_name}</strong>
           <span>{formatSize(selectedTransfer.transferred)} / {formatSize(selectedTransfer.total_size)}</span>
           <span>{dlStatusLabel(selectedTransfer)}</span>
-          <span>{sourcesLabel(selectedTransfer)} src{#if selectedTransfer.ember_sources > 0} ({selectedTransfer.ember_sources} EPX){/if}</span>
+          <span>{sourcesLabel(selectedTransfer)} {m.transfers_src_suffix()}{#if selectedTransfer.ember_sources > 0} {m.transfers_epx_count({ count: selectedTransfer.ember_sources })}{/if}</span>
         </div>
         <div class="selection-actions">
-          <button class="tb-btn" disabled={!canPause(selectedTransfer)} onclick={() => runSelectedAction('pause')}>Pause</button>
-          <button class="tb-btn" disabled={!canResume(selectedTransfer)} onclick={() => runSelectedAction('resume')}>Resume</button>
-          <button class="tb-btn" disabled={!canStop(selectedTransfer)} onclick={() => runSelectedAction('stop')}>Stop</button>
-          <button class="tb-btn" onclick={() => runSelectedAction('sources')}>Find Sources</button>
-          <button class="tb-btn" onclick={() => runSelectedAction('preview')}>Preview</button>
+          <button class="tb-btn" disabled={!canPause(selectedTransfer)} onclick={() => runSelectedAction('pause')}>{m.common_pause()}</button>
+          <button class="tb-btn" disabled={!canResume(selectedTransfer)} onclick={() => runSelectedAction('resume')}>{m.common_resume()}</button>
+          <button class="tb-btn" disabled={!canStop(selectedTransfer)} onclick={() => runSelectedAction('stop')}>{m.common_stop()}</button>
+          <button class="tb-btn" onclick={() => runSelectedAction('sources')}>{m.transfers_find_sources()}</button>
+          <button class="tb-btn" onclick={() => runSelectedAction('preview')}>{m.transfers_preview()}</button>
         </div>
       </div>
     {:else}
       <div class="selection-footer selection-footer-idle">
-        <span class="selection-idle-hint">Click to select &middot; Shift+click for range &middot; Ctrl/Cmd+click to toggle &middot; Double-click for sources</span>
+        <span class="selection-idle-hint">{m.transfers_selection_hint()}</span>
       </div>
     {/if}
   </div>
@@ -2668,7 +2723,7 @@
     class:dragging
     onmousedown={onSplitterDown}
     onkeydown={onSplitterKeydown}
-    aria-label="Resize transfer panes"
+    aria-label={m.transfers_resize_panes_aria()}
   ></button>
 
   <!-- BOTTOM PANE: Uploading / Queued / Known Clients / Download Clients
@@ -2689,7 +2744,7 @@
       <div
         class="bottom-tabs"
         role="tablist"
-        aria-label="Bottom pane view"
+        aria-label={m.transfers_bottom_pane_aria()}
         tabindex="-1"
         onkeydown={(e) => {
           const order: typeof bottomView[] = ['uploading', 'queued', 'known_clients', 'download_clients'];
@@ -2718,7 +2773,7 @@
           aria-controls="bottom-pane-content"
           tabindex={bottomView === 'uploading' ? 0 : -1}
           onclick={() => bottomView = 'uploading'}
-        >Uploading ({filteredActiveUploads.length})</button>
+        >{m.transfers_tab_uploading({ count: filteredActiveUploads.length })}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'queued'}
@@ -2727,8 +2782,8 @@
           aria-controls="bottom-pane-content"
           tabindex={bottomView === 'queued' ? 0 : -1}
           onclick={() => bottomView = 'queued'}
-          title="Peers waiting in our upload queue"
-        >Queued{uploadQueueLoaded ? ` (${uploadQueueClients.length})` : ''}</button>
+          title={m.transfers_tab_queued_title()}
+        >{uploadQueueLoaded ? m.transfers_tab_queued_count({ count: uploadQueueClients.length }) : m.transfers_tab_queued()}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'known_clients'}
@@ -2737,8 +2792,8 @@
           aria-controls="bottom-pane-content"
           tabindex={bottomView === 'known_clients' ? 0 : -1}
           onclick={() => bottomView = 'known_clients'}
-          title="Every peer with a SecIdent credit record (lifetime)"
-        >Known Clients{knownClientsLoaded ? ` (${knownClients.length})` : ''}</button>
+          title={m.transfers_tab_known_title()}
+        >{knownClientsLoaded ? m.transfers_tab_known_count({ count: knownClients.length }) : m.transfers_tab_known()}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'download_clients'}
@@ -2747,7 +2802,7 @@
           aria-controls="bottom-pane-content"
           tabindex={bottomView === 'download_clients' ? 0 : -1}
           onclick={() => bottomView = 'download_clients'}
-        >Download Clients</button>
+        >{m.transfers_tab_download_clients()}</button>
       </div>
     </div>
     <div
@@ -2755,10 +2810,10 @@
       id="bottom-pane-content"
       role="tabpanel"
       aria-label={
-        bottomView === 'uploading' ? 'Uploading'
-        : bottomView === 'queued' ? 'Queued'
-        : bottomView === 'known_clients' ? 'Known Clients'
-        : 'Download Clients'
+        bottomView === 'uploading' ? m.transfers_tab_uploading_label()
+        : bottomView === 'queued' ? m.transfers_tab_queued()
+        : bottomView === 'known_clients' ? m.transfers_tab_known()
+        : m.transfers_tab_download_clients()
       }
     >
       {#if bottomView === 'uploading'}
@@ -2801,7 +2856,7 @@
                     type="button"
                     class="col-resize-handle"
                     tabindex="-1"
-                    aria-label={`Resize ${column.label} column`}
+                    aria-label={m.transfers_resize_column({ name: column.label })}
                     onmousedown={(e) => beginColumnResize(e, 'uploads', column.key)}
                     ondblclick={(e) => autoSizeColumn(e, 'uploads', column.key)}
                     onclick={swallowResizeClick}
@@ -2885,8 +2940,8 @@
                     <polyline points="17 8 12 3 7 8"></polyline>
                     <line x1="12" y1="3" x2="12" y2="15"></line>
                   </svg>
-                  <p class="empty-cell-title">No active uploads</p>
-                  <p class="empty-cell-sub">Shared files will appear here when peers request them.</p>
+                  <p class="empty-cell-title">{m.transfers_empty_no_uploads()}</p>
+                  <p class="empty-cell-sub">{m.transfers_empty_no_uploads_sub()}</p>
                 </div>
               </td></tr>
             {:else if filteredActiveUploads.length === 0}
@@ -2896,7 +2951,7 @@
                     <circle cx="11" cy="11" r="8"></circle>
                     <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                   </svg>
-                  <p class="empty-cell-title">No uploads match this filter</p>
+                  <p class="empty-cell-title">{m.transfers_empty_no_upload_matches()}</p>
                 </div>
               </td></tr>
             {/if}
@@ -2939,7 +2994,7 @@
                     type="button"
                     class="col-resize-handle"
                     tabindex="-1"
-                    aria-label={`Resize ${column.label} column`}
+                    aria-label={m.transfers_resize_column({ name: column.label })}
                     onmousedown={(e) => beginColumnResize(e, 'queue', column.key)}
                     ondblclick={(e) => autoSizeColumn(e, 'queue', column.key)}
                     onclick={swallowResizeClick}
@@ -2962,11 +3017,11 @@
                   {:else if column.key === 'wait_time'}
                     <td class="num-cell">{formatDuration(q.wait_seconds * 1000)}</td>
                   {:else if column.key === 'queue_rank'}
-                    <td class="num-cell" title={q.queue_rank == null ? 'Disconnected — waiting for callback' : ''}>{q.queue_rank == null ? '?' : q.queue_rank}</td>
+                    <td class="num-cell" title={q.queue_rank == null ? m.transfers_queue_disconnected_title() : ''}>{q.queue_rank == null ? '?' : q.queue_rank}</td>
                   {:else if column.key === 'credit_ratio'}
-                    <td class="num-cell" title={`Credit ratio (1.0 = no history, 10.0 = max)`}>{q.credit_ratio.toFixed(2)}</td>
+                    <td class="num-cell" title={m.transfers_queue_credit_title()}>{q.credit_ratio.toFixed(2)}</td>
                   {:else if column.key === 'transfer_history'}
-                    <td class="num-cell" title={`We've uploaded ${formatSize(q.uploaded)} to and downloaded ${formatSize(q.downloaded)} from this peer`}>
+                    <td class="num-cell" title={m.transfers_queue_transfer_history_title({ up: formatSize(q.uploaded), down: formatSize(q.downloaded) })}>
                       {formatSize(q.uploaded)} / {formatSize(q.downloaded)}
                     </td>
                   {:else if column.key === 'ident_state'}
@@ -2983,13 +3038,13 @@
                       <circle cx="12" cy="12" r="10"></circle>
                       <polyline points="12 6 12 12 16 14"></polyline>
                     </svg>
-                    <p class="empty-cell-title">No peers waiting</p>
-                    <p class="empty-cell-sub">The upload queue is empty.</p>
+                    <p class="empty-cell-title">{m.transfers_empty_no_queue()}</p>
+                    <p class="empty-cell-sub">{m.transfers_empty_no_queue_sub()}</p>
                   </div>
                 {:else}
                   <div class="empty-cell-body">
                     <div class="spinner"></div>
-                    <p class="empty-cell-sub">Loading…</p>
+                    <p class="empty-cell-sub">{m.transfers_loading_short()}</p>
                   </div>
                 {/if}
               </td></tr>
@@ -3011,7 +3066,7 @@
           country code, and friend nickname (when applicable);
           totals reflect the full ledger, not the filtered view.
         -->
-        <div class="known-toolbar" role="group" aria-label="Known Clients filters">
+        <div class="known-toolbar" role="group" aria-label={m.transfers_known_filter_aria()}>
           <label class="known-search">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
               <circle cx="7" cy="7" r="4.5"/>
@@ -3020,14 +3075,14 @@
             <input
               type="text"
               bind:value={knownFilter}
-              placeholder="Filter by hash, IP, country, or friend nickname"
-              aria-label="Filter known clients"
+              placeholder={m.transfers_known_filter_placeholder()}
+              aria-label={m.transfers_known_input_aria()}
             />
             {#if knownFilter}
               <button
                 type="button"
                 class="known-search-clear"
-                aria-label="Clear filter"
+                aria-label={m.transfers_known_clear_filter()}
                 onclick={() => (knownFilter = '')}
               >&times;</button>
             {/if}
@@ -3036,23 +3091,23 @@
             <div class="known-stats" aria-live="polite">
               <span class="known-stat">
                 <strong>{knownStats.total}</strong>
-                {knownStats.total === 1 ? 'peer' : 'peers'}
+                {knownStats.total === 1 ? m.transfers_known_peers_one() : m.transfers_known_peers_other()}
               </span>
               {#if knownStats.friends > 0}
-                <span class="known-stat known-stat-friends" title="Peers in this list that you have added as friends">
+                <span class="known-stat known-stat-friends" title={m.transfers_known_friends_title()}>
                   <strong>{knownStats.friends}</strong>
-                  {knownStats.friends === 1 ? 'friend' : 'friends'}
+                  {knownStats.friends === 1 ? m.transfers_known_friends_one() : m.transfers_known_friends_other()}
                 </span>
               {/if}
-              <span class="known-stat" title="Lifetime bytes uploaded to all known peers (drives our credit on their side)">
+              <span class="known-stat" title={m.transfers_known_total_up_title()}>
                 &uarr; <strong>{formatSize(knownStats.totalUp)}</strong>
               </span>
-              <span class="known-stat" title="Lifetime bytes downloaded from all known peers">
+              <span class="known-stat" title={m.transfers_known_total_down_title()}>
                 &darr; <strong>{formatSize(knownStats.totalDown)}</strong>
               </span>
               {#if knownFilter && filteredKnownClients.length !== knownStats.total}
                 <span class="known-stat known-stat-match" aria-live="polite">
-                  showing <strong>{filteredKnownClients.length}</strong>
+                  {m.transfers_known_showing_label()} <strong>{filteredKnownClients.length}</strong>
                 </span>
               {/if}
             </div>
@@ -3096,7 +3151,7 @@
                     type="button"
                     class="col-resize-handle"
                     tabindex="-1"
-                    aria-label={`Resize ${column.label} column`}
+                    aria-label={m.transfers_resize_column({ name: column.label })}
                     onmousedown={(e) => beginColumnResize(e, 'known', column.key)}
                     ondblclick={(e) => autoSizeColumn(e, 'known', column.key)}
                     onclick={swallowResizeClick}
@@ -3122,7 +3177,7 @@
                          friend marker (small filled dot) sits before the
                          hash so the eye picks out friends without having to
                          scan the IP / country columns first. -->
-                    <td class="client-cell mono known-hash-cell" title={knownCopiedHash === kc.user_hash ? 'Copied!' : (friendNick ? `${friendNick} — click to copy ${kc.user_hash}` : `Click to copy ${kc.user_hash}`)}>
+                    <td class="client-cell mono known-hash-cell" title={knownCopiedHash === kc.user_hash ? m.transfers_known_copied_title() : (friendNick ? m.transfers_known_friend_copy_title({ nick: friendNick, hash: kc.user_hash }) : m.transfers_known_copy_title({ hash: kc.user_hash }))}>
                       <button
                         type="button"
                         class="known-hash-btn"
@@ -3130,7 +3185,7 @@
                         onclick={() => copyKnownHash(kc.user_hash)}
                       >
                         {#if isFriend}
-                          <span class="known-friend-dot" aria-label="Friend" title={friendNick ? `Friend: ${friendNick}` : 'Friend'}></span>
+                          <span class="known-friend-dot" aria-label={m.transfers_known_friend()} title={friendNick ? m.transfers_known_friend_named({ nick: friendNick }) : m.transfers_known_friend()}></span>
                         {/if}
                         {#if friendNick}
                           <span class="known-hash-nick">{friendNick}</span>
@@ -3139,18 +3194,18 @@
                           <span class="known-hash-hex">{kc.user_hash.slice(0, 16) + '\u2026'}</span>
                         {/if}
                         {#if knownCopiedHash === kc.user_hash}
-                          <span class="known-hash-copied" aria-live="polite">Copied</span>
+                          <span class="known-hash-copied" aria-live="polite">{m.transfers_known_copied_inline()}</span>
                         {/if}
                       </button>
                     </td>
                   {:else if column.key === 'last_known_ip'}
-                    <td class="client-cell" title={kc.last_known_ip ?? 'Never identified'}>{kc.last_known_ip ?? '\u2014'}</td>
+                    <td class="client-cell" title={kc.last_known_ip ?? m.transfers_known_never_identified()}>{kc.last_known_ip ?? '\u2014'}</td>
                   {:else if column.key === 'uploaded'}
-                    <td class="num-cell" title={`Lifetime bytes we've uploaded to this peer`}>{kc.uploaded > 0 ? formatSize(kc.uploaded) : '\u2014'}</td>
+                    <td class="num-cell" title={m.transfers_known_uploaded_title()}>{kc.uploaded > 0 ? formatSize(kc.uploaded) : '\u2014'}</td>
                   {:else if column.key === 'downloaded'}
-                    <td class="num-cell" title={`Lifetime bytes we've downloaded from this peer`}>{kc.downloaded > 0 ? formatSize(kc.downloaded) : '\u2014'}</td>
+                    <td class="num-cell" title={m.transfers_known_downloaded_title()}>{kc.downloaded > 0 ? formatSize(kc.downloaded) : '\u2014'}</td>
                   {:else if column.key === 'credit_ratio'}
-                    <td class="num-cell" title={!kc.has_public_key ? 'No public key cached — credit floor at 1.0' : `Credit ratio (1.0 = baseline, higher means we owe upload to them)`}>{kc.credit_ratio.toFixed(2)}</td>
+                    <td class="num-cell" title={!kc.has_public_key ? m.transfers_known_no_pubkey_title() : m.transfers_known_credit_title()}>{kc.credit_ratio.toFixed(2)}</td>
                   {:else if column.key === 'reputation'}
                     {@const rep = reputationMap[kc.user_hash]}
                     {@const label = labelForReputation(rep)}
@@ -3158,16 +3213,18 @@
                       <span
                         class="rep-badge rep-badge-{label}"
                         title={rep
-                          ? `score=${rep.score}, successful=${rep.successful_transfers}, failed=${rep.failed_transfers}${rep.is_banned ? ' (currently banned by the tracker)' : ''}`
+                          ? (rep.is_banned
+                            ? m.transfers_known_rep_title_banned({ score: rep.score, successful: rep.successful_transfers, failed: rep.failed_transfers })
+                            : m.transfers_known_rep_title({ score: rep.score, successful: rep.successful_transfers, failed: rep.failed_transfers }))
                           : rep === null
-                            ? 'No reputation record yet — the tracker has not observed this peer on an active session.'
-                            : 'Fetching reputation…'}
+                            ? m.transfers_known_rep_no_record()
+                            : m.transfers_known_rep_fetching()}
                       >
                         {label === 'unknown' ? '—' : label}
                       </span>
                     </td>
                   {:else if column.key === 'ident_state'}
-                    <td class="status-cell"><span class="status-label ident-{kc.ident_state.toLowerCase()}" title={!kc.has_public_key ? 'No public key cached' : `eD2K identification state: ${kc.ident_state}`}>{kc.ident_state}</span></td>
+                    <td class="status-cell"><span class="status-label ident-{kc.ident_state.toLowerCase()}" title={!kc.has_public_key ? m.transfers_known_no_pubkey() : m.transfers_known_ident_title({ state: kc.ident_state })}>{kc.ident_state}</span></td>
                   {:else if column.key === 'last_seen'}
                     <!-- Show relative time ("3d ago") so users can scan
                          freshness at a glance, but keep the absolute date
@@ -3176,7 +3233,7 @@
                          double-multiply landed every row in year ~56,000
                          which the year-less label hid; the absolute
                          tooltip now also serves as a regression check. -->
-                    <td class="date-cell" title={kc.last_seen > 0 ? formatDateWithYear(kc.last_seen) : 'Never seen'}>{kc.last_seen > 0 ? formatRelativeTime(kc.last_seen) : '\u2014'}</td>
+                    <td class="date-cell" title={kc.last_seen > 0 ? formatDateWithYear(kc.last_seen) : m.transfers_known_never_seen()}>{kc.last_seen > 0 ? formatRelativeTime(kc.last_seen) : '\u2014'}</td>
                   {/if}
                 {/each}
               </tr>
@@ -3186,7 +3243,7 @@
                 {#if !knownClientsLoaded}
                   <div class="empty-cell-body">
                     <div class="spinner"></div>
-                    <p class="empty-cell-sub">Loading…</p>
+                    <p class="empty-cell-sub">{m.transfers_loading_short()}</p>
                   </div>
                 {:else if knownClients.length === 0}
                   <div class="empty-cell-body">
@@ -3194,8 +3251,8 @@
                       <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
                       <circle cx="12" cy="7" r="4"></circle>
                     </svg>
-                    <p class="empty-cell-title">No credit records yet</p>
-                    <p class="empty-cell-sub">Records appear after peers verify their identity with us.</p>
+                    <p class="empty-cell-title">{m.transfers_empty_no_credit()}</p>
+                    <p class="empty-cell-sub">{m.transfers_empty_no_credit_sub()}</p>
                   </div>
                 {:else}
                   <div class="empty-cell-body">
@@ -3203,9 +3260,9 @@
                       <circle cx="11" cy="11" r="7"/>
                       <line x1="16" y1="16" x2="20" y2="20"/>
                     </svg>
-                    <p class="empty-cell-title">No matches</p>
-                    <p class="empty-cell-sub">Nothing in this ledger matches "{knownFilter}".</p>
-                    <button class="empty-cell-action" type="button" onclick={() => (knownFilter = '')}>Clear filter</button>
+                    <p class="empty-cell-title">{m.transfers_known_no_matches()}</p>
+                    <p class="empty-cell-sub">{m.transfers_known_no_matches_sub({ query: knownFilter })}</p>
+                    <button class="empty-cell-action" type="button" onclick={() => (knownFilter = '')}>{m.transfers_known_clear_filter()}</button>
                   </div>
                 {/if}
               </td></tr>
@@ -3245,7 +3302,7 @@
                     type="button"
                     class="col-resize-handle"
                     tabindex="-1"
-                    aria-label={`Resize ${column.label} column`}
+                    aria-label={m.transfers_resize_column({ name: column.label })}
                     onmousedown={(e) => beginColumnResize(e, 'clients', column.key)}
                     ondblclick={(e) => autoSizeColumn(e, 'clients', column.key)}
                     onclick={swallowResizeClick}
@@ -3287,8 +3344,8 @@
                       <circle cx="12" cy="12" r="10"></circle>
                       <line x1="4.93" y1="4.93" x2="19.07" y2="19.07"></line>
                     </svg>
-                    <p class="empty-cell-title">All sources failed</p>
-                    <p class="empty-cell-sub">Sources will reappear once the download contacts a peer.</p>
+                    <p class="empty-cell-title">{m.transfers_empty_all_sources_failed()}</p>
+                    <p class="empty-cell-sub">{m.transfers_empty_all_sources_failed_sub()}</p>
                   </div>
                 </td></tr>
               {/if}
@@ -3296,7 +3353,7 @@
               <tr class="empty-row"><td colspan={clientColCount} class="empty-cell">
                 <div class="empty-cell-body">
                   <div class="spinner"></div>
-                  <p class="empty-cell-sub">Loading sources…</p>
+                  <p class="empty-cell-sub">{m.transfers_loading_sources_dots()}</p>
                 </div>
               </td></tr>
             {:else if selectedDownloadIds.length > 1}
@@ -3308,8 +3365,8 @@
                     <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
                     <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
                   </svg>
-                  <p class="empty-cell-title">Multiple downloads selected</p>
-                  <p class="empty-cell-sub">Select a single download above to view its source clients.</p>
+                  <p class="empty-cell-title">{m.transfers_empty_multiple_selected()}</p>
+                  <p class="empty-cell-sub">{m.transfers_empty_multiple_selected_sub()}</p>
                 </div>
               </td></tr>
             {:else if activeDownloads.length === 0}
@@ -3321,8 +3378,8 @@
                     <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
                     <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
                   </svg>
-                  <p class="empty-cell-title">No active downloads</p>
-                  <p class="empty-cell-sub">Source clients will appear here once a download is running.</p>
+                  <p class="empty-cell-title">{m.transfers_empty_no_active_dl()}</p>
+                  <p class="empty-cell-sub">{m.transfers_empty_no_active_dl_sub()}</p>
                 </div>
               </td></tr>
             {:else}
@@ -3334,8 +3391,8 @@
                     <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
                     <path d="M21 21v-2a4 4 0 0 0-3-3.87"></path>
                   </svg>
-                  <p class="empty-cell-title">Select a download</p>
-                  <p class="empty-cell-sub">Click a download above to see its source clients.</p>
+                  <p class="empty-cell-title">{m.transfers_empty_select_dl()}</p>
+                  <p class="empty-cell-sub">{m.transfers_empty_select_dl_sub()}</p>
                 </div>
               </td></tr>
             {/if}
@@ -3357,7 +3414,7 @@
       </button>
     {/each}
     <div class="ctx-sep"></div>
-    <button class="ctx-item" onclick={() => resetColumnLayout(menu.table)}>Reset Columns</button>
+    <button class="ctx-item" onclick={() => resetColumnLayout(menu.table)}>{m.transfers_reset_columns()}</button>
   </div>
 {/if}
 
@@ -3367,45 +3424,45 @@
   <div class="context-menu" style="left: {ctxMenu.x}px; top: {ctxMenu.y}px;" onclick={(e) => e.stopPropagation()}>
     {#if ctxMenu.section === 'active'}
       {#if canPause(ctxTransfer)}
-        <button class="ctx-item" onclick={() => ctxAction('pause')}>Pause</button>
+        <button class="ctx-item" onclick={() => ctxAction('pause')}>{m.common_pause()}</button>
       {/if}
       {#if canStop(ctxTransfer)}
-        <button class="ctx-item" onclick={() => ctxAction('stop')}>Stop</button>
+        <button class="ctx-item" onclick={() => ctxAction('stop')}>{m.common_stop()}</button>
       {/if}
       {#if canResume(ctxTransfer)}
-        <button class="ctx-item" onclick={() => ctxAction('resume')}>Resume</button>
+        <button class="ctx-item" onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
       {/if}
-      <button class="ctx-item danger" onclick={() => ctxAction('cancel')}>Cancel</button>
+      <button class="ctx-item danger" onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
       <div class="ctx-sep"></div>
-      <button class="ctx-item" onclick={() => ctxAction('preview')}>Preview</button>
+      <button class="ctx-item" onclick={() => ctxAction('preview')}>{m.transfers_preview()}</button>
       <button class="ctx-item" onclick={() => ctxAction('toggle_preview_prio')}>
-        {ctxTransfer.preview_priority ? '✓ ' : ''}Preview Priority
+        {ctxTransfer.preview_priority ? '✓ ' : ''}{m.transfers_ctx_preview_priority()}
       </button>
       {#if isArchive(ctxTransfer)}
         <button class="ctx-item" disabled={recoveringIds.has(ctxTransfer.id)} onclick={() => ctxAction('recover_archive')}>
-          {recoveringIds.has(ctxTransfer.id) ? 'Recovering…' : 'Recover Archive'}
+          {recoveringIds.has(ctxTransfer.id) ? m.transfers_ctx_recovering() : m.transfers_ctx_recover_archive()}
         </button>
       {/if}
-      <button class="ctx-item" onclick={() => ctxAction('open_location')}>Open File Location</button>
+      <button class="ctx-item" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
       <div class="ctx-sep"></div>
       <div class="ctx-submenu-wrap">
         <button class="ctx-item has-sub" onclick={() => ctxPrioritySub = !ctxPrioritySub}>
-          Priority ▶
+          {m.transfers_ctx_priority()} ▶
         </button>
         {#if ctxPrioritySub}
           <div class="ctx-submenu">
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'verylow'} onclick={() => ctxAction('priority', 'verylow')}>Very Low</button>
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'low'} onclick={() => ctxAction('priority', 'low')}>Low</button>
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'normal'} onclick={() => ctxAction('priority', 'normal')}>Normal</button>
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'high'} onclick={() => ctxAction('priority', 'high')}>High</button>
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'auto'} onclick={() => ctxAction('priority', 'auto')}>Auto</button>
-            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'release'} onclick={() => ctxAction('priority', 'release')}>Release</button>
+            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'verylow'} onclick={() => ctxAction('priority', 'verylow')}>{m.library_priority_verylow()}</button>
+            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'low'} onclick={() => ctxAction('priority', 'low')}>{m.library_priority_low()}</button>
+            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'normal'} onclick={() => ctxAction('priority', 'normal')}>{m.library_priority_normal()}</button>
+            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'high'} onclick={() => ctxAction('priority', 'high')}>{m.library_priority_high()}</button>
+            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'auto'} onclick={() => ctxAction('priority', 'auto')}>{m.library_priority_auto()}</button>
+            <button class="ctx-item" class:ctx-active={ctxTransfer.priority === 'release'} onclick={() => ctxAction('priority', 'release')}>{m.library_priority_release()}</button>
           </div>
         {/if}
       </div>
       <div class="ctx-submenu-wrap">
         <button class="ctx-item has-sub" onclick={() => ctxCategorySub = !ctxCategorySub}>
-          Category ▶
+          {m.transfers_ctx_category()} ▶
         </button>
         {#if ctxCategorySub}
           <div class="ctx-submenu">
@@ -3414,17 +3471,17 @@
                 class="ctx-item"
                 class:ctx-active={(cat === 'None' && !ctxTransfer.category) || ctxTransfer.category === cat}
                 onclick={() => ctxAction('set_category', cat)}
-              >{cat}</button>
+              >{categoryLabel(cat)}</button>
             {/each}
           </div>
         {/if}
       </div>
       <div class="ctx-sep"></div>
-      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy eD2K Link</button>
-      <button class="ctx-item" onclick={() => ctxAction('paste_link')}>Paste eD2K Link</button>
-      <button class="ctx-item" onclick={() => ctxAction('find_sources')}>Find More Sources</button>
+      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
+      <button class="ctx-item" onclick={() => ctxAction('paste_link')}>{m.transfers_ctx_paste_link()}</button>
+      <button class="ctx-item" onclick={() => ctxAction('find_sources')}>{m.transfers_find_more_sources()}</button>
       <div class="ctx-sep"></div>
-      <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>Clear Completed</button>
+      <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
     {:else if ctxMenu.section === 'completed'}
       <!--
         D26: also offer Open File for failed downloads that have produced a
@@ -3432,24 +3489,24 @@
         `open_file` command returns an error that surfaces via transferError.
       -->
       {#if ctxTransfer.status === 'completed' || ctxTransfer.status === 'failed'}
-        <button class="ctx-item" onclick={() => ctxAction('open')}>Open File</button>
+        <button class="ctx-item" onclick={() => ctxAction('open')}>{m.transfers_ctx_open_file()}</button>
       {/if}
-      <button class="ctx-item" onclick={() => ctxAction('open_location')}>Open File Location</button>
+      <button class="ctx-item" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
       <div class="ctx-sep"></div>
-      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy eD2K Link</button>
+      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
       <div class="ctx-sep"></div>
-      <button class="ctx-item danger" onclick={() => ctxAction('remove')}>Remove from List</button>
-      <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>Clear Completed</button>
+      <button class="ctx-item danger" onclick={() => ctxAction('remove')}>{m.transfers_ctx_remove_from_list()}</button>
+      <button class="ctx-item" onclick={() => ctxAction('clear_completed')}>{m.transfers_clear_completed()}</button>
     {:else}
       <!-- Upload context menu -->
       {#if ctxTransfer.user_hash && ctxTransfer.client_software?.startsWith('Ember')}
-        <button class="ctx-item" onclick={() => ctxAction('add_friend')}>Add as Friend</button>
+        <button class="ctx-item" onclick={() => ctxAction('add_friend')}>{m.transfers_ctx_add_friend()}</button>
         <div class="ctx-sep"></div>
       {/if}
-      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>Copy eD2K Link</button>
+      <button class="ctx-item" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
       {#if ctxTransfer.user_hash}
         <div class="ctx-sep"></div>
-        <button class="ctx-item danger" onclick={() => ctxAction('ban_user')}>Ban User</button>
+        <button class="ctx-item danger" onclick={() => ctxAction('ban_user')}>{m.transfers_ctx_ban_user()}</button>
       {/if}
     {/if}
   </div>
@@ -3457,33 +3514,33 @@
 
 <ConfirmDialog
   bind:open={confirmCancel.open}
-  title="Cancel Download"
-  message="Cancel download of &quot;{confirmCancel.name}&quot;? The partial file will be deleted."
-  confirmLabel="Cancel Download"
+  title={m.transfers_confirm_cancel_title()}
+  message={m.transfers_confirm_cancel_message({ name: confirmCancel.name })}
+  confirmLabel={m.transfers_confirm_cancel_label()}
   danger={true}
   onconfirm={async () => { try { await cancelTransfer(confirmCancel.id); speedHistory.delete(confirmCancel.id); transfers.update((list) => list.filter((x) => x.id !== confirmCancel.id)); } catch (e: unknown) { transferError = toErrorMsg(e); } }}
 />
 
 <ConfirmDialog
   bind:open={confirmClearCompleted}
-  title="Clear Completed"
-  message="Remove all completed transfers from the list?"
-  confirmLabel="Clear"
+  title={m.transfers_clear_completed()}
+  message={m.transfers_confirm_clear_completed_msg()}
+  confirmLabel={m.common_clear()}
   onconfirm={async () => { try { await clearCompleted(); transfers.update((list) => { const remaining = list.filter((x) => !(x.direction === 'download' && x.status === 'completed')); const removedIds = new Set(list.filter((x) => x.direction === 'download' && x.status === 'completed').map((x) => x.id)); for (const id of removedIds) speedHistory.delete(id); return remaining; }); } catch (e: unknown) { transferError = toErrorMsg(e); } }}
 />
 
 <!-- D27: recover-archive confirm + async feedback -->
 <ConfirmDialog
   bind:open={confirmRecover.open}
-  title="Recover Archive"
-  message="Rebuild a salvage copy of &quot;{confirmRecover.name}&quot; from the downloaded parts? This can take a minute or two for large files. The original .part file is not modified."
-  confirmLabel="Recover"
+  title={m.transfers_confirm_recover_title()}
+  message={m.transfers_confirm_recover_message({ name: confirmRecover.name })}
+  confirmLabel={m.transfers_confirm_recover_label()}
   onconfirm={async () => {
     const id = confirmRecover.id;
     const next = new Set(recoveringIds); next.add(id); recoveringIds = next;
     try {
       const path = await recoverArchive(id);
-      showInfo(`Archive recovered: ${path}`);
+      showInfo(m.transfers_archive_recovered({ path }));
     } catch (e: unknown) {
       transferError = toErrorMsg(e);
     } finally {
@@ -3494,9 +3551,9 @@
 
 <ConfirmDialog
   bind:open={confirmBatchCancel.open}
-  title="Cancel Downloads"
-  message="Cancel {confirmBatchCancel.count} {confirmBatchCancel.count === 1 ? 'download' : 'downloads'} and delete partial data?"
-  confirmLabel="Cancel Downloads"
+  title={m.transfers_confirm_batch_cancel_title()}
+  message={confirmBatchCancel.count === 1 ? m.transfers_confirm_batch_cancel_one() : m.transfers_confirm_batch_cancel_other({ count: confirmBatchCancel.count })}
+  confirmLabel={m.transfers_confirm_batch_cancel_label()}
   danger={true}
   onconfirm={async () => {
     const ids = confirmBatchCancel.ids; const idSet = new Set(ids);

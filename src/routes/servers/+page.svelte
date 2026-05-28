@@ -12,6 +12,7 @@
   import type { ServerInfo } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import { listen } from '@tauri-apps/api/event';
+  import * as m from '$lib/paraglide/messages';
 
   let servers: ServerInfo[] = $state([]);
   let connectedServer: ServerInfo | null = $state(null);
@@ -180,7 +181,7 @@
         hadFailure = true;
       }
       if (hadFailure) {
-        error = 'Failed to refresh server state';
+        error = m.servers_refresh_failed();
       } else {
         error = null;
       }
@@ -197,7 +198,7 @@
   }
 
   function toErrorMsg(e: unknown): string {
-    return e instanceof Error ? e.message : typeof e === 'string' ? e : 'Operation failed';
+    return e instanceof Error ? e.message : typeof e === 'string' ? e : m.error_operation_failed();
   }
 
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
@@ -217,20 +218,20 @@
     if (!target) return;
     if (connecting) return;
     if (connectedServer?.ip === target.ip && connectedServer?.port === target.port) {
-      flash(`Already connected to ${target.name || target.ip}:${target.port}`);
+      flash(m.servers_already_connected({ name: target.name || target.ip, port: target.port }));
       return;
     }
     connecting = true;
     error = null;
     try {
       if (connectedServer && (connectedServer.ip !== target.ip || connectedServer.port !== target.port)) {
-        log(`Switching from ${connectedServer.ip}:${connectedServer.port} to ${target.ip}:${target.port}...`);
+        log(m.servers_log_switching({ from_ip: connectedServer.ip, from_port: connectedServer.port, to_ip: target.ip, to_port: target.port }));
       }
       await connectToServer(target.ip, target.port);
     } catch (e: unknown) {
       const msg = toErrorMsg(e);
       error = msg;
-      log(`Connection failed: ${msg}`);
+      log(m.servers_log_connection_failed({ error: msg }));
     } finally {
       connecting = false;
     }
@@ -265,11 +266,11 @@
     const name = newName.trim();
 
     if (!ip) {
-      error = 'Server IP/address is required';
+      error = m.servers_validation_ip_required();
       return;
     }
     if (isNaN(portNum) || portNum < 1 || portNum > 65535) {
-      error = 'Port must be a number between 1 and 65535';
+      error = m.servers_validation_port_range();
       return;
     }
     const port = portNum;
@@ -324,10 +325,10 @@
     selectedServer = null;
     selectedServers = new Set();
     lastClickedKey = null;
-    const msg = `Removed ${removed} server${removed !== 1 ? 's' : ''}`;
+    const msg = removed === 1 ? m.servers_removed_one() : m.servers_removed_other({ count: removed });
     log(msg);
     if (failedCount > 0) {
-      error = `${msg}, ${failedCount} failed to remove`;
+      error = m.servers_removed_with_failures({ message: msg, failed: failedCount });
     } else {
       flash(msg);
     }
@@ -337,11 +338,11 @@
   async function handleUpdateServerMet() {
     const url = serverMetUrl.trim();
     if (!url || !url.includes('://')) {
-      error = 'Please enter a valid server.met URL';
+      error = m.servers_validation_met_url();
       return;
     }
     error = null;
-    log(`Downloading server.met from ${url}...`);
+    log(m.servers_log_downloading_met({ url }));
     try {
       const result = await downloadServerMet(url);
       flash(result);
@@ -350,7 +351,7 @@
     } catch (e: unknown) {
       const msg = toErrorMsg(e);
       error = msg;
-      log(`Failed: ${msg}`);
+      log(m.servers_log_failed({ error: msg }));
     }
   }
 
@@ -426,9 +427,9 @@
     } else if (action === 'remove') {
       await handleRemoveSelected();
     } else if (action === 'copy_ip' && target) {
-      try { await navigator.clipboard.writeText(`${target.ip}:${target.port}`); flash('Copied to clipboard'); } catch {}
+      try { await navigator.clipboard.writeText(`${target.ip}:${target.port}`); flash(m.servers_copied_clipboard()); } catch {}
     } else if (action === 'copy_ed2k' && target) {
-      try { await navigator.clipboard.writeText(`ed2k://|server|${target.ip}|${target.port}|/`); flash('eD2K link copied'); } catch {}
+      try { await navigator.clipboard.writeText(`ed2k://|server|${target.ip}|${target.port}|/`); flash(m.servers_copied_ed2k()); } catch {}
     }
   }
 
@@ -442,8 +443,9 @@
     selectedServers = new Set();
     selectedServer = null;
     lastClickedKey = null;
-    log(`Removed ${count} server${count !== 1 ? 's' : ''}`);
-    flash(`Removed ${count} server${count !== 1 ? 's' : ''}`);
+    const removedMsg = count === 1 ? m.servers_removed_one() : m.servers_removed_other({ count });
+    log(removedMsg);
+    flash(removedMsg);
     await refresh();
   }
 
@@ -527,7 +529,7 @@
 
   async function handleManualRefresh() {
     await refresh();
-    if (!error) flash('Server list refreshed');
+    if (!error) flash(m.servers_list_refreshed());
   }
 
   $effect(() => {
@@ -552,18 +554,18 @@
 }} />
 
 <div class="page-header">
-  <h2>ED2K Servers</h2>
+  <h2>{m.nav_ed2k_servers()}</h2>
   <div class="header-actions">
-    <button class="ghost" onclick={handleManualRefresh} disabled={loading}>Refresh</button>
+    <button class="ghost" onclick={handleManualRefresh} disabled={loading}>{m.common_refresh()}</button>
     {#if selectionCount > 1}
-      <button class="danger" onclick={handleRemoveSelected}>Remove {selectionCount} Servers</button>
+      <button class="danger" onclick={handleRemoveSelected}>{m.servers_remove_selected_count({ count: selectionCount })}</button>
     {/if}
     {#if connectedServer || connecting}
-      <button class="danger" onclick={handleDisconnect}>{connecting && !connectedServer ? 'Cancel' : 'Disconnect'}</button>
+      <button class="danger" onclick={handleDisconnect}>{connecting && !connectedServer ? m.common_cancel() : m.servers_disconnect()}</button>
     {:else if selectedServer}
-      <button onclick={() => handleConnect()}>Connect</button>
+      <button onclick={() => handleConnect()}>{m.servers_connect()}</button>
     {:else}
-      <button disabled>Connect</button>
+      <button disabled>{m.servers_connect()}</button>
     {/if}
   </div>
 </div>
@@ -572,7 +574,7 @@
   {#if error}
     <div class="banner error-banner">
       <span>{error}</span>
-      <button class="ghost" onclick={() => (error = null)}>Dismiss</button>
+      <button class="ghost" onclick={() => (error = null)}>{m.common_dismiss()}</button>
     </div>
   {/if}
   {#if successMsg}
@@ -583,24 +585,24 @@
 
   <div class="stats-row">
     <div class="stat-card">
-      <div class="label">Servers In List</div>
+      <div class="label">{m.servers_stat_in_list()}</div>
       <div class="value">{servers.length.toLocaleString()}</div>
     </div>
     <div class="stat-card">
-      <div class="label">Connected</div>
-      <div class="value">{connectedServer ? 'Yes' : connecting ? '...' : 'No'}</div>
+      <div class="label">{m.servers_stat_connected()}</div>
+      <div class="value">{connectedServer ? m.common_yes() : connecting ? '...' : m.common_no()}</div>
       {#if connectedServer}
         <div class="sub">{connectedServer.name || `${connectedServer.ip}:${connectedServer.port}`}</div>
       {/if}
     </div>
     <div class="stat-card">
-      <div class="label">Selected</div>
+      <div class="label">{m.servers_stat_selected()}</div>
       <div class="value">{selectionCount.toLocaleString()}</div>
     </div>
     <div class="stat-card">
-      <div class="label">High Failure</div>
+      <div class="label">{m.servers_stat_high_failure()}</div>
       <div class="value">{failedServerCount.toLocaleString()}</div>
-      <div class="sub">Users {formatCount(totalListedUsers)} · Files {formatCount(totalListedFiles)}</div>
+      <div class="sub">{m.servers_stat_users_files({ users: formatCount(totalListedUsers), files: formatCount(totalListedFiles) })}</div>
     </div>
   </div>
 
@@ -610,7 +612,7 @@
     <div class="server-list-area">
       <div class="panel-toolbar">
         <span class="toolbar-label">
-          Server List
+          {m.servers_panel_server_list()}
           <span class="toolbar-count">
             ({filteredServers.length}{serverFilter.trim() ? ` / ${servers.length}` : ''})
           </span>
@@ -621,14 +623,14 @@
               type="text"
               class="server-filter-input"
               bind:value={serverFilter}
-              placeholder="Filter name, IP, description..."
-              aria-label="Filter servers"
+              placeholder={m.servers_filter_placeholder()}
+              aria-label={m.servers_filter_aria()}
             />
             {#if serverFilter}
-              <button class="ghost btn-sm filter-clear" onclick={() => (serverFilter = '')} title="Clear filter">✕</button>
+              <button class="ghost btn-sm filter-clear" onclick={() => (serverFilter = '')} title={m.servers_filter_clear()} aria-label={m.servers_filter_clear()}>✕</button>
             {/if}
           </div>
-          <button class="ghost btn-sm" onclick={handleRemoveAll} disabled={servers.length === 0}>Remove All</button>
+          <button class="ghost btn-sm" onclick={handleRemoveAll} disabled={servers.length === 0}>{m.servers_remove_all()}</button>
         </div>
       </div>
 
@@ -636,7 +638,7 @@
         {#if loading && servers.length === 0}
           <div class="empty-state compact">
             <div class="spinner lg"></div>
-            <p>Loading server list...</p>
+            <p>{m.servers_loading()}</p>
           </div>
         {:else if servers.length === 0}
           <div class="empty-state compact">
@@ -648,8 +650,8 @@
               <line x1="10" y1="6.5" x2="16" y2="6.5"></line>
               <line x1="10" y1="17.5" x2="16" y2="17.5"></line>
             </svg>
-            <p>No servers in list</p>
-            <p class="sub">Add a server using the form on the right, or download a server.met file</p>
+            <p>{m.servers_empty_no_servers()}</p>
+            <p class="sub">{m.servers_empty_no_servers_sub()}</p>
           </div>
         {:else if filteredServers.length === 0}
           <div class="empty-state compact">
@@ -659,35 +661,35 @@
               <line x1="11" y1="8" x2="11" y2="14"></line>
               <line x1="8" y1="11" x2="14" y2="11"></line>
             </svg>
-            <p>No servers match this filter</p>
-            <p class="sub">Try a different search term or clear the filter.</p>
+            <p>{m.servers_empty_no_matches()}</p>
+            <p class="sub">{m.servers_empty_no_matches_sub()}</p>
           </div>
         {:else}
           <table class="server-table">
             <thead>
               <tr>
                 <th class="sortable" tabindex="0" role="columnheader" aria-sort={ariaSortValue('name')} onclick={() => toggleSort('name')} onkeydown={(e) => sortOnKey(e, () => toggleSort('name'))}>
-                  Server Name{sortIndicator('name')}
+                  {m.servers_col_name()}{sortIndicator('name')}
                 </th>
                 <th class="sortable" tabindex="0" role="columnheader" aria-sort={ariaSortValue('ip')} onclick={() => toggleSort('ip')} onkeydown={(e) => sortOnKey(e, () => toggleSort('ip'))}>
-                  IP : Port{sortIndicator('ip')}
+                  {m.servers_col_ip()}{sortIndicator('ip')}
                 </th>
                 <th class="sortable" tabindex="0" role="columnheader" aria-sort={ariaSortValue('description')} onclick={() => toggleSort('description')} onkeydown={(e) => sortOnKey(e, () => toggleSort('description'))}>
-                  Description{sortIndicator('description')}
+                  {m.servers_col_description()}{sortIndicator('description')}
                 </th>
                 <th class="sortable num" tabindex="0" role="columnheader" aria-sort={ariaSortValue('users')} onclick={() => toggleSort('users')} onkeydown={(e) => sortOnKey(e, () => toggleSort('users'))}>
-                  Users{sortIndicator('users')}
+                  {m.servers_col_users()}{sortIndicator('users')}
                 </th>
                 <th class="sortable num" tabindex="0" role="columnheader" aria-sort={ariaSortValue('files')} onclick={() => toggleSort('files')} onkeydown={(e) => sortOnKey(e, () => toggleSort('files'))}>
-                  Files{sortIndicator('files')}
+                  {m.servers_col_files()}{sortIndicator('files')}
                 </th>
                 <th class="sortable num" tabindex="0" role="columnheader" aria-sort={ariaSortValue('failed')} onclick={() => toggleSort('failed')} onkeydown={(e) => sortOnKey(e, () => toggleSort('failed'))}>
-                  Failed{sortIndicator('failed')}
+                  {m.servers_col_failed()}{sortIndicator('failed')}
                 </th>
                 <th class="sortable" tabindex="0" role="columnheader" aria-sort={ariaSortValue('static')} onclick={() => toggleSort('static')} onkeydown={(e) => sortOnKey(e, () => toggleSort('static'))}>
-                  Static{sortIndicator('static')}
+                  {m.servers_col_static()}{sortIndicator('static')}
                 </th>
-                <th>Actions</th>
+                <th>{m.servers_col_actions()}</th>
               </tr>
             </thead>
             <tbody>
@@ -702,7 +704,7 @@
                 >
                   <td class="name-cell">
                     <span class="server-icon" class:connected-icon={isConnected(server)}>S</span>
-                    {server.name || '(unnamed)'}
+                    {server.name || m.servers_unnamed()}
                   </td>
                   <td class="ip-cell">{server.ip} : {server.port}</td>
                   <td class="desc-cell" title={server.description}>{server.description || '—'}</td>
@@ -711,9 +713,9 @@
                   <td class="num" class:fail-warn={server.fail_count > 0}>
                     {server.fail_count > 0 ? server.fail_count : '—'}
                   </td>
-                  <td>{server.is_static ? 'Yes' : '—'}</td>
+                  <td>{server.is_static ? m.common_yes() : '—'}</td>
                   <td>
-                    <button class="ghost danger btn-sm" onclick={(e: MouseEvent) => { e.stopPropagation(); handleRemoveServer(server); }} title="Remove">✕</button>
+                    <button class="ghost danger btn-sm" onclick={(e: MouseEvent) => { e.stopPropagation(); handleRemoveServer(server); }} title={m.common_remove()} aria-label={m.common_remove()}>✕</button>
                   </td>
                 </tr>
               {/each}
@@ -727,10 +729,10 @@
     <div class="server-side-panel">
       <!-- Add Server -->
       <div class="side-section">
-        <div class="side-title">New Server</div>
+        <div class="side-title">{m.servers_new_server()}</div>
         <div class="form-stack">
           <div class="form-field">
-            <label for="server-ip">IP / Address</label>
+            <label for="server-ip">{m.servers_ip_address()}</label>
             <input
               id="server-ip"
               type="text"
@@ -741,7 +743,7 @@
           </div>
           <div class="form-row">
             <div class="form-field flex-1">
-              <label for="server-port">Port</label>
+              <label for="server-port">{m.servers_port()}</label>
               <input
                 id="server-port"
                 type="text"
@@ -752,26 +754,26 @@
               />
             </div>
             <div class="form-field flex-2">
-              <label for="server-name">Name</label>
+              <label for="server-name">{m.servers_name_label()}</label>
               <input
                 id="server-name"
                 type="text"
                 bind:value={newName}
-                placeholder="(optional)"
+                placeholder={m.servers_name_placeholder()}
                 onkeydown={handleKeydownAdd}
               />
             </div>
           </div>
-          <button class="add-btn" onclick={handleAddServer}>Add Server</button>
+          <button class="add-btn" onclick={handleAddServer}>{m.servers_add_server()}</button>
         </div>
       </div>
 
       <!-- Update server.met -->
       <div class="side-section">
-        <div class="side-title">Update server.met</div>
+        <div class="side-title">{m.servers_update_met_title()}</div>
         <div class="form-stack">
           <div class="form-field">
-            <label for="met-url">URL</label>
+            <label for="met-url">{m.servers_url_label()}</label>
             <input
               id="met-url"
               type="text"
@@ -780,65 +782,65 @@
               onkeydown={handleKeydownMet}
             />
           </div>
-          <button class="add-btn" onclick={handleUpdateServerMet}>Update</button>
+          <button class="add-btn" onclick={handleUpdateServerMet}>{m.servers_update()}</button>
         </div>
       </div>
 
       <!-- My Info / Connected Server -->
       <div class="side-section info-section">
-        <div class="side-title">My Info</div>
+        <div class="side-title">{m.servers_my_info_title()}</div>
         <div class="info-rows">
           {#if connectedServer}
             <div class="info-row">
-              <span class="info-label">Status</span>
-              <span class="badge connected">Connected</span>
+              <span class="info-label">{m.servers_info_status()}</span>
+              <span class="badge connected">{m.servers_status_connected()}</span>
             </div>
             <div class="info-row">
-              <span class="info-label">Server</span>
+              <span class="info-label">{m.servers_info_server()}</span>
               <span class="info-value">{connectedServer.name || connectedServer.ip}</span>
             </div>
             <div class="info-row">
-              <span class="info-label">Address</span>
+              <span class="info-label">{m.servers_info_address()}</span>
               <span class="info-value mono">{connectedServer.ip}:{connectedServer.port}</span>
             </div>
             <div class="info-row">
-              <span class="info-label">eD2K ID</span>
+              <span class="info-label">{m.servers_info_ed2k_id()}</span>
               <span class="info-value">
                 {#if connectedServer.client_id}
                   <span class="mono">{connectedServer.client_id}</span>
                   {#if connectedServer.is_low_id}
-                    <span class="badge lowid">LowID</span>
+                    <span class="badge lowid">{m.servers_lowid()}</span>
                   {:else}
-                    <span class="badge highid">HighID</span>
+                    <span class="badge highid">{m.servers_highid()}</span>
                   {/if}
                 {:else}
-                  <span class="muted">Pending...</span>
+                  <span class="muted">{m.servers_pending()}</span>
                 {/if}
               </span>
             </div>
             <div class="info-row">
-              <span class="info-label">Users</span>
+              <span class="info-label">{m.servers_col_users()}</span>
               <span class="info-value">{connectedServer.user_count.toLocaleString()}</span>
             </div>
             <div class="info-row">
-              <span class="info-label">Files</span>
+              <span class="info-label">{m.servers_col_files()}</span>
               <span class="info-value">{connectedServer.file_count.toLocaleString()}</span>
             </div>
           {:else if connecting}
             <div class="info-row">
-              <span class="info-label">Status</span>
-              <span class="badge connecting"><span class="connect-spinner"></span> Connecting</span>
+              <span class="info-label">{m.servers_info_status()}</span>
+              <span class="badge connecting"><span class="connect-spinner"></span> {m.servers_status_connecting()}</span>
             </div>
             <div class="info-row muted">
-              <span>Establishing connection...</span>
+              <span>{m.servers_establishing()}</span>
             </div>
           {:else}
             <div class="info-row">
-              <span class="info-label">Status</span>
-              <span class="badge disconnected">Disconnected</span>
+              <span class="info-label">{m.servers_info_status()}</span>
+              <span class="badge disconnected">{m.servers_status_disconnected()}</span>
             </div>
             <div class="info-row muted">
-              <span>Not connected to any eD2K server</span>
+              <span>{m.servers_not_connected()}</span>
             </div>
           {/if}
         </div>
@@ -849,12 +851,12 @@
   <!-- Bottom: Server log messages -->
   <div class="server-lower">
     <div class="log-toolbar">
-      <span class="toolbar-label">Server Log</span>
-      <button class="ghost btn-sm" onclick={() => (logMessages = [])}>Clear</button>
+      <span class="toolbar-label">{m.servers_log_title()}</span>
+      <button class="ghost btn-sm" onclick={() => (logMessages = [])}>{m.common_clear()}</button>
     </div>
     <div class="log-area" bind:this={logArea}>
       {#if logMessages.length === 0}
-        <span class="log-placeholder">Server messages will appear here...</span>
+        <span class="log-placeholder">{m.servers_log_placeholder()}</span>
       {:else}
         {#each logMessages as msg (msg)}
           <div class="log-line">{msg}</div>
@@ -868,25 +870,27 @@
 {#if ctxMenu}
   <div class="context-menu" style="left: {ctxMenu.x}px; top: {ctxMenu.y}px;">
     {#if !isConnected(ctxMenu.server)}
-      <button class="ctx-item" onclick={() => ctxAction('connect')}>Connect</button>
+      <button class="ctx-item" onclick={() => ctxAction('connect')}>{m.servers_connect()}</button>
     {:else}
-      <button class="ctx-item" onclick={() => ctxAction('disconnect')}>Disconnect</button>
+      <button class="ctx-item" onclick={() => ctxAction('disconnect')}>{m.servers_disconnect()}</button>
     {/if}
     <div class="ctx-sep"></div>
     <button class="ctx-item danger" onclick={() => ctxAction('remove')}>
-      {selectionCount > 1 ? `Remove ${selectionCount} Servers` : 'Remove Server'}
+      {selectionCount > 1
+        ? m.servers_remove_selected_count({ count: selectionCount })
+        : m.servers_remove_server()}
     </button>
     <div class="ctx-sep"></div>
-    <button class="ctx-item" onclick={() => ctxAction('copy_ip')}>Copy IP:Port</button>
-    <button class="ctx-item" onclick={() => ctxAction('copy_ed2k')}>Copy eD2K Link</button>
+    <button class="ctx-item" onclick={() => ctxAction('copy_ip')}>{m.servers_copy_ip_port()}</button>
+    <button class="ctx-item" onclick={() => ctxAction('copy_ed2k')}>{m.servers_copy_ed2k_link()}</button>
   </div>
 {/if}
 
 <ConfirmDialog
   bind:open={confirmRemoveAll}
-  title="Remove All Servers"
-  message="Remove all {servers.length} servers from the list? This cannot be undone."
-  confirmLabel="Remove All"
+  title={m.servers_confirm_remove_all_title()}
+  message={m.servers_confirm_remove_all_message({ count: servers.length })}
+  confirmLabel={m.servers_remove_all()}
   danger={true}
   onconfirm={doRemoveAll}
 />

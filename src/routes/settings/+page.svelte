@@ -18,6 +18,9 @@
     getLocale,
     setLocale,
     languageLabel,
+    hasExplicitLocale,
+    useSystemLocale,
+    systemLocale,
     type Locale,
   } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
@@ -32,11 +35,24 @@
   // in the new language and there's no need to thread reactivity
   // through every translated component.
   let currentLocale: Locale = $state(getLocale());
+  // Whether the active locale is being followed from the OS (no
+  // explicit choice in localStorage) vs. picked by the user. Drives
+  // which radio in the picker shows as selected: the "System" entry
+  // is selected iff there's no explicit choice, even though Paraglide
+  // has already resolved that to a concrete locale underneath.
+  let followingSystem = $state(!hasExplicitLocale());
+  const systemPreviewLocale: Locale = systemLocale();
 
   function pickLocale(next: Locale) {
-    if (next === currentLocale) return;
+    if (!followingSystem && next === currentLocale) return;
     currentLocale = next;
+    followingSystem = false;
     setLocale(next);
+  }
+
+  function pickSystemLocale() {
+    if (followingSystem) return;
+    useSystemLocale();
   }
 
   let settings: AppSettings | null = $state(null);
@@ -66,11 +82,14 @@
   async function handleClearHistory(status: string) {
     try {
       await clearDownloadHistory(status);
-      const label = status === 'all' ? 'All download history' : status === 'completed' ? 'Completed history' : 'Cancelled history';
-      historyClearMsg = `${label} cleared.`;
+      historyClearMsg = status === 'all'
+        ? m.settings_history_cleared_all()
+        : status === 'completed'
+          ? m.settings_history_cleared_completed()
+          : m.settings_history_cleared_cancelled();
       trackedTimeout(() => { historyClearMsg = null; }, 3000);
     } catch (e) {
-      historyClearMsg = `Failed: ${e instanceof Error ? e.message : e}`;
+      historyClearMsg = m.settings_history_clear_failed({ error: e instanceof Error ? e.message : String(e) });
     }
   }
 
@@ -85,7 +104,7 @@
     try {
       speedResult = await invoke('run_speed_test');
     } catch (e: unknown) {
-      speedError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Speed test failed';
+      speedError = e instanceof Error ? e.message : typeof e === 'string' ? e : m.settings_speed_test_failed();
     } finally {
       speedTesting = false;
     }
@@ -112,15 +131,27 @@
   type SettingsSection = 'general' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'search';
   let activeSection: SettingsSection = $state('general');
 
-  const sections: Array<{ id: SettingsSection; label: string }> = [
-    { id: 'general', label: 'General' },
-    { id: 'downloads', label: 'Downloads' },
-    { id: 'bandwidth', label: 'Bandwidth' },
-    { id: 'network', label: 'Network' },
-    { id: 'security', label: 'Security' },
-    { id: 'friends', label: 'Friends' },
-    { id: 'search', label: 'Search' },
+  const sections: SettingsSection[] = [
+    'general',
+    'downloads',
+    'bandwidth',
+    'network',
+    'security',
+    'friends',
+    'search',
   ];
+
+  function sectionLabel(id: SettingsSection): string {
+    switch (id) {
+      case 'general': return m.settings_section_general();
+      case 'downloads': return m.settings_section_downloads();
+      case 'bandwidth': return m.settings_section_bandwidth();
+      case 'network': return m.settings_section_network();
+      case 'security': return m.settings_section_security();
+      case 'friends': return m.settings_section_friends();
+      case 'search': return m.settings_section_search();
+    }
+  }
 
   let hasUnsavedChanges = $derived(settings ? JSON.stringify(settings) !== originalSettings : false);
 
@@ -139,7 +170,7 @@
         settings = s;
         originalSettings = JSON.stringify(s);
       })
-      .catch((e) => { loadError = e instanceof Error ? e.message : 'Failed to load settings'; });
+      .catch((e) => { loadError = e instanceof Error ? e.message : m.settings_load_failed(); });
 
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
       if (hasUnsavedChanges) e.preventDefault();
@@ -195,10 +226,10 @@
    *  Returns null on success or an error message. Mutates `s` in place. */
   function validateSettings(s: AppSettings): string | null {
     if (!s.nickname.trim()) {
-      return 'Nickname cannot be empty.';
+      return m.settings_validation_nickname_empty();
     }
     if (!s.download_folder.trim()) {
-      return 'Download folder cannot be empty.';
+      return m.settings_validation_folder_empty();
     }
     s.tcp_port = clampInt(s.tcp_port, 1, 65535, 4662);
     s.udp_port = clampInt(s.udp_port, 1, 65535, 4672);
@@ -263,15 +294,29 @@
       const udpChanged =
         previousUdpPort !== undefined && previousUdpPort !== settings.udp_port;
       if (tcpChanged || udpChanged) {
-        const parts: string[] = [];
-        if (tcpChanged) parts.push(`TCP port (${previousTcpPort} → ${settings.tcp_port})`);
-        if (udpChanged) parts.push(`UDP port (${previousUdpPort} → ${settings.udp_port})`);
-        pendingRestartReason = parts.join(' and ');
+        if (tcpChanged && udpChanged) {
+          pendingRestartReason = m.settings_restart_reason_both({
+            tcp_from: String(previousTcpPort),
+            tcp_to: String(settings.tcp_port),
+            udp_from: String(previousUdpPort),
+            udp_to: String(settings.udp_port),
+          });
+        } else if (tcpChanged) {
+          pendingRestartReason = m.settings_restart_reason_tcp_only({
+            from: String(previousTcpPort),
+            to: String(settings.tcp_port),
+          });
+        } else {
+          pendingRestartReason = m.settings_restart_reason_udp_only({
+            from: String(previousUdpPort),
+            to: String(settings.udp_port),
+          });
+        }
         showRestartPrompt = true;
       }
     } catch (e) {
       console.error('Failed to save:', e);
-      showSaveMsg(e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to save settings', true, 5000);
+      showSaveMsg(e instanceof Error ? e.message : typeof e === 'string' ? e : m.settings_save_failed(), true, 5000);
     } finally {
       saving = false;
     }
@@ -296,7 +341,7 @@
     } catch (e) {
       restarting = false;
       showSaveMsg(
-        `Restart failed: ${e instanceof Error ? e.message : String(e)}. Please close and reopen Ember manually for the new ports to take effect.`,
+        m.settings_restart_failed({ error: e instanceof Error ? e.message : String(e) }),
         true,
         10000,
       );
@@ -306,7 +351,7 @@
   function dismissRestartPrompt() {
     showRestartPrompt = false;
     showSaveMsg(
-      'Settings saved. The new port(s) will take effect the next time you launch Ember.',
+      m.settings_restart_deferred(),
       true,
       6000,
     );
@@ -316,7 +361,7 @@
     if (!settings || !originalSettings) return;
     try {
       settings = JSON.parse(originalSettings) as AppSettings;
-      showSaveMsg('Changes reverted', false, 2000);
+      showSaveMsg(m.settings_changes_reverted(), false, 2000);
     } catch (e) {
       // `originalSettings` should always be valid JSON we serialized
       // ourselves, but a storage glitch or an upstream bug elsewhere
@@ -324,7 +369,7 @@
       // disk rather than crashing the Revert button.
       console.error('resetChanges: originalSettings parse failed', e);
       showSaveMsg(
-        'Could not revert in-memory snapshot; reloading from disk',
+        m.settings_revert_failed(),
         true,
         3000,
       );
@@ -334,7 +379,7 @@
           originalSettings = JSON.stringify(s);
         })
         .catch((err) => {
-          showSaveMsg(`Reload failed: ${err}`, true, 4000);
+          showSaveMsg(m.settings_reload_failed({ error: String(err) }), true, 4000);
         });
     }
   }
@@ -345,7 +390,7 @@
     try {
       spamStats = await getSpamStats();
     } catch (e: unknown) {
-      spamStatsError = e instanceof Error ? e.message : 'Failed to load spam stats';
+      spamStatsError = e instanceof Error ? e.message : m.settings_spam_load_failed();
     } finally {
       spamStatsLoading = false;
     }
@@ -367,9 +412,9 @@
     try {
       await resetSpamFilter();
       await refreshSpamStats();
-      showSaveMsg('Spam filter learning data reset.', false, 3000);
+      showSaveMsg(m.settings_spam_reset_success(), false, 3000);
     } catch (e: unknown) {
-      showSaveMsg(e instanceof Error ? e.message : 'Failed to reset spam filter data', true, 5000);
+      showSaveMsg(e instanceof Error ? e.message : m.settings_spam_reset_failed(), true, 5000);
     } finally {
       spamResetting = false;
     }
@@ -389,8 +434,8 @@
       // denied permission or a missing dialog plugin looked silent to
       // the user.
       console.error('Folder pick failed:', e);
-      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Failed to open folder picker';
-      showSaveMsg(`Folder picker: ${msg}`, true, 5000);
+      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : m.settings_folder_picker_generic_error();
+      showSaveMsg(m.settings_folder_picker_failed({ error: msg }), true, 5000);
     }
   }
 
@@ -402,7 +447,7 @@
       filterResult = await downloadIpfilter();
       trackedTimeout(() => (filterResult = null), 5000);
     } catch (e: unknown) {
-      filterError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Download failed';
+      filterError = e instanceof Error ? e.message : typeof e === 'string' ? e : m.settings_download_failed();
       trackedTimeout(() => (filterError = null), 5000);
     } finally {
       downloadingFilter = false;
@@ -430,7 +475,7 @@
     } catch (e: unknown) {
       antileechMessage = {
         kind: 'err',
-        text: `Failed to load anti-leech filter: ${e instanceof Error ? e.message : String(e)}`,
+        text: m.settings_antileech_load_failed({ error: e instanceof Error ? e.message : String(e) }),
       };
     }
   }
@@ -451,21 +496,28 @@
       antileechDraft = result.snapshot.patterns.join('\n');
       antileechCompileErrors = result.compile_errors;
       if (result.compile_errors.length > 0) {
+        const savedCount = result.snapshot.pattern_count;
+        const rejected = String(result.compile_errors.length);
         antileechMessage = {
           kind: 'warn',
-          text: `Saved ${result.snapshot.pattern_count} pattern(s); ${result.compile_errors.length} rejected — see below.`,
+          text: savedCount === 1
+            ? m.settings_antileech_saved_rejected_one({ rejected })
+            : m.settings_antileech_saved_rejected_other({ count: savedCount, rejected }),
         };
       } else {
+        const savedCount = result.snapshot.pattern_count;
         antileechMessage = {
           kind: 'ok',
-          text: `Saved ${result.snapshot.pattern_count} pattern(s).`,
+          text: savedCount === 1
+            ? m.settings_antileech_saved_one()
+            : m.settings_antileech_saved_other({ count: savedCount }),
         };
         trackedTimeout(() => (antileechMessage = null), 4000);
       }
     } catch (e: unknown) {
       antileechMessage = {
         kind: 'err',
-        text: `Save failed: ${e instanceof Error ? e.message : String(e)}`,
+        text: m.settings_antileech_save_failed({ error: e instanceof Error ? e.message : String(e) }),
       };
     } finally {
       antileechSaving = false;
@@ -482,7 +534,7 @@
         antileechSnapshot = snap;
       }
     } catch (e: unknown) {
-      const text = `Toggle failed: ${e instanceof Error ? e.message : String(e)}`;
+      const text = m.settings_antileech_toggle_failed({ error: e instanceof Error ? e.message : String(e) });
       antileechMessage = {
         kind: 'err',
         text,
@@ -503,13 +555,15 @@
       antileechDraft = snap.patterns.join('\n');
       antileechMessage = {
         kind: 'ok',
-        text: `Restored ${snap.pattern_count} default pattern(s).`,
+        text: snap.pattern_count === 1
+          ? m.settings_antileech_restored_one()
+          : m.settings_antileech_restored_other({ count: snap.pattern_count }),
       };
       trackedTimeout(() => (antileechMessage = null), 4000);
     } catch (e: unknown) {
       antileechMessage = {
         kind: 'err',
-        text: `Reset failed: ${e instanceof Error ? e.message : String(e)}`,
+        text: m.settings_antileech_reset_failed({ error: e instanceof Error ? e.message : String(e) }),
       };
     } finally {
       antileechSaving = false;
@@ -550,7 +604,7 @@
       nodesResult = await downloadNodesDat();
       trackedTimeout(() => (nodesResult = null), 5000);
     } catch (e: unknown) {
-      nodesError = e instanceof Error ? e.message : typeof e === 'string' ? e : 'Download failed';
+      nodesError = e instanceof Error ? e.message : typeof e === 'string' ? e : m.settings_download_failed();
       trackedTimeout(() => (nodesError = null), 5000);
     } finally {
       downloadingNodes = false;
@@ -580,22 +634,22 @@
 </script>
 
 <div class="page-header sticky-header">
-  <h2>Settings</h2>
+  <h2>{m.settings_title()}</h2>
   <div class="header-actions">
     {#if saveMessage}
       <span class="toast" class:warning={saveIsWarning}>{saveMessage}</span>
     {/if}
     {#if hasUnsavedChanges}
-      <span class="unsaved-indicator">Unsaved changes</span>
+      <span class="unsaved-indicator">{m.settings_unsaved_changes()}</span>
     {/if}
     <button class="ghost" onclick={resetChanges} disabled={!hasUnsavedChanges || !settings}>
-      Discard
+      {m.settings_discard()}
     </button>
     <button class="save-btn" onclick={handleSave} disabled={saving || !settings}>
       {#if saving}
-        <span class="spinner"></span> Saving...
+        <span class="spinner"></span> {m.settings_saving()}
       {:else}
-        Save Changes
+        {m.settings_save_changes()}
       {/if}
     </button>
   </div>
@@ -605,45 +659,45 @@
   {#if loadError}
     <div class="empty-state">
       <p style="color: var(--danger)">{loadError}</p>
-      <button onclick={() => { loadError = null; location.reload(); }}>Retry</button>
+      <button onclick={() => { loadError = null; location.reload(); }}>{m.layout_retry()}</button>
     </div>
   {:else if !settings}
     <div class="empty-state">
       <div class="spinner lg"></div>
-      <p>Loading settings...</p>
+      <p>{m.settings_loading()}</p>
     </div>
   {:else}
     <div class="settings-layout">
-      <aside class="settings-nav" aria-label="Settings sections">
-        <div class="settings-nav-title">Settings</div>
+      <aside class="settings-nav" aria-label={m.settings_nav_aria()}>
+        <div class="settings-nav-title">{m.settings_title()}</div>
         {#each sections as section}
           <button
             class="settings-nav-item"
-            class:active={activeSection === section.id}
-            aria-current={activeSection === section.id ? 'page' : undefined}
-            onclick={() => activeSection = section.id}
+            class:active={activeSection === section}
+            aria-current={activeSection === section ? 'page' : undefined}
+            onclick={() => activeSection = section}
           >
             <span class="settings-nav-icon" aria-hidden="true">
-              {#if section.id === 'general'}
+              {#if section === 'general'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <line x1="3" y1="5.5" x2="17" y2="5.5"/>
                   <line x1="3" y1="10" x2="17" y2="10"/>
                   <line x1="3" y1="14.5" x2="17" y2="14.5"/>
                 </svg>
-              {:else if section.id === 'downloads'}
+              {:else if section === 'downloads'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <line x1="10" y1="3" x2="10" y2="13"/>
                   <polyline points="6,9.5 10,13.5 14,9.5"/>
                   <line x1="4" y1="17" x2="16" y2="17"/>
                 </svg>
-              {:else if section.id === 'bandwidth'}
+              {:else if section === 'bandwidth'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <line x1="7" y1="3" x2="7" y2="17"/>
                   <polyline points="3.5,6.5 7,3 10.5,6.5"/>
                   <line x1="13" y1="3" x2="13" y2="17"/>
                   <polyline points="9.5,13.5 13,17 16.5,13.5"/>
                 </svg>
-              {:else if section.id === 'network'}
+              {:else if section === 'network'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <circle cx="10" cy="4" r="2"/>
                   <circle cx="4" cy="15" r="2"/>
@@ -652,26 +706,26 @@
                   <line x1="10" y1="6" x2="15" y2="13"/>
                   <line x1="6" y1="15" x2="14" y2="15"/>
                 </svg>
-              {:else if section.id === 'security'}
+              {:else if section === 'security'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M10 2L3 6v4c0 4.4 3 8.5 7 10 4-1.5 7-5.6 7-10V6l-7-4z"/>
                   <polyline points="7,10 9.5,12.5 13.5,7.5"/>
                 </svg>
-              {:else if section.id === 'friends'}
+              {:else if section === 'friends'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <circle cx="7" cy="6" r="3"/>
                   <circle cx="14" cy="7" r="2.5"/>
                   <path d="M1 17c0-3.3 2.7-6 6-6s6 2.7 6 6"/>
                   <path d="M13 11.5c2.5 0 4.5 2 4.5 4.5"/>
                 </svg>
-              {:else if section.id === 'search'}
+              {:else if section === 'search'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <circle cx="8.5" cy="8.5" r="5.5"/>
                   <line x1="12.5" y1="12.5" x2="17" y2="17"/>
                 </svg>
               {/if}
             </span>
-            <span>{section.label}</span>
+            <span>{sectionLabel(section)}</span>
           </button>
         {/each}
       </aside>
@@ -683,19 +737,19 @@
         <div class="card-header">
           <span class="card-icon">&#9775;</span>
           <div>
-            <h3>General</h3>
-            <p class="card-desc">Theme and identity</p>
+            <h3>{m.settings_section_general()}</h3>
+            <p class="card-desc">{m.settings_general_desc()}</p>
           </div>
         </div>
         <div class="card-body">
           <div class="field">
-            <span class="field-label">Theme</span>
+            <span class="field-label">{m.settings_theme_label()}</span>
             <div class="theme-picker">
               <button
                 class="theme-swatch"
                 class:selected={$theme === 'light'}
                 onclick={() => setTheme('light')}
-                aria-label="Light theme"
+                aria-label={m.settings_theme_light_aria()}
               >
                 <div class="swatch-preview light-swatch">
                   <div class="swatch-sidebar"></div>
@@ -705,13 +759,13 @@
                   </div>
                 </div>
                 {#if $theme === 'light'}<span class="swatch-check">&#10003;</span>{/if}
-                <span class="swatch-label">Light</span>
+                <span class="swatch-label">{m.settings_theme_light()}</span>
               </button>
               <button
                 class="theme-swatch"
                 class:selected={$theme === 'dark'}
                 onclick={() => setTheme('dark')}
-                aria-label="Dark theme"
+                aria-label={m.settings_theme_dark_aria()}
               >
                 <div class="swatch-preview dark-swatch">
                   <div class="swatch-sidebar"></div>
@@ -721,7 +775,7 @@
                   </div>
                 </div>
                 {#if $theme === 'dark'}<span class="swatch-check">&#10003;</span>{/if}
-                <span class="swatch-label">Dark</span>
+                <span class="swatch-label">{m.settings_theme_dark()}</span>
               </button>
             </div>
           </div>
@@ -739,34 +793,53 @@
               language faster than a translation of it.
             -->
             <div class="behavior-picker" role="radiogroup" aria-label={m.settings_language_label()}>
+              <!--
+                "System" radio: clears the explicit localStorage
+                choice and reloads, letting Paraglide's strategy
+                chain fall through to navigator.language / baseLocale.
+                Without this entry, a user who tried Spanish once
+                would be stuck on Spanish even if their OS locale
+                changed — there'd be no way back to "just follow the
+                OS" short of clearing localStorage by hand.
+              -->
+              <button
+                type="button"
+                role="radio"
+                aria-checked={followingSystem}
+                class="behavior-card lang-card"
+                class:selected={followingSystem}
+                onclick={pickSystemLocale}
+              >
+                <span class="behavior-title">{m.settings_language_system()}</span>
+                <span class="behavior-desc">{languageLabel(systemPreviewLocale)}</span>
+                {#if followingSystem}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
+              </button>
               {#each locales as loc (loc)}
                 <button
                   type="button"
                   role="radio"
-                  aria-checked={currentLocale === loc}
+                  aria-checked={!followingSystem && currentLocale === loc}
                   class="behavior-card lang-card"
-                  class:selected={currentLocale === loc}
+                  class:selected={!followingSystem && currentLocale === loc}
                   onclick={() => pickLocale(loc)}
                 >
                   <span class="behavior-title">{languageLabel(loc)}</span>
                   <span class="behavior-desc">{loc.toUpperCase()}</span>
-                  {#if currentLocale === loc}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
+                  {#if !followingSystem && currentLocale === loc}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
                 </button>
               {/each}
             </div>
           </div>
           <div class="field">
-            <label for="nickname">Nickname</label>
-            <input id="nickname" bind:value={settings.nickname} placeholder="Your display name" />
+            <label for="nickname">{m.settings_nickname_label()}</label>
+            <input id="nickname" bind:value={settings.nickname} placeholder={m.settings_nickname_placeholder()} />
           </div>
           <div class="field">
-            <span class="field-label">When closing the window</span>
+            <span class="field-label">{m.settings_close_behavior_label()}</span>
             <span class="hint">
-              Choose what happens when you click the title-bar X. The system
-              tray icon stays available either way so you can reopen Ember
-              from there.
+              {m.settings_close_behavior_hint()}
             </span>
-            <div class="behavior-picker" role="radiogroup" aria-label="When closing the window">
+            <div class="behavior-picker" role="radiogroup" aria-label={m.settings_close_behavior_label()}>
               <button
                 type="button"
                 role="radio"
@@ -782,8 +855,8 @@
                     <circle cx="12" cy="14" r="0.6" fill="currentColor"/>
                   </svg>
                 </span>
-                <span class="behavior-title">Ask each time</span>
-                <span class="behavior-desc">Show a dialog with both options</span>
+                <span class="behavior-title">{m.settings_close_behavior_ask()}</span>
+                <span class="behavior-desc">{m.settings_close_behavior_ask_desc()}</span>
                 {#if settings.close_to_tray_behavior === 'ask'}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
               </button>
 
@@ -803,8 +876,8 @@
                     <line x1="3.5" y1="19" x2="20.5" y2="19"/>
                   </svg>
                 </span>
-                <span class="behavior-title">Minimize to tray</span>
-                <span class="behavior-desc">Keep running in the background</span>
+                <span class="behavior-title">{m.settings_close_behavior_tray()}</span>
+                <span class="behavior-desc">{m.settings_close_behavior_tray_desc()}</span>
                 {#if settings.close_to_tray_behavior === 'tray'}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
               </button>
 
@@ -823,8 +896,8 @@
                     <polyline points="7.5,8.5 4,12 7.5,15.5"/>
                   </svg>
                 </span>
-                <span class="behavior-title">Exit Ember</span>
-                <span class="behavior-desc">Quit the app fully each time</span>
+                <span class="behavior-title">{m.settings_close_behavior_exit()}</span>
+                <span class="behavior-desc">{m.settings_close_behavior_exit_desc()}</span>
                 {#if settings.close_to_tray_behavior === 'exit'}<span class="behavior-check" aria-hidden="true">&#10003;</span>{/if}
               </button>
             </div>
@@ -837,67 +910,67 @@
         <div class="card-header">
           <span class="card-icon">&#8615;</span>
           <div>
-            <h3>Downloads</h3>
-            <p class="card-desc">Storage and concurrency</p>
+            <h3>{m.settings_section_downloads()}</h3>
+            <p class="card-desc">{m.settings_downloads_desc()}</p>
           </div>
         </div>
         <div class="card-body">
           <div class="field">
-            <label for="download-folder">Download Folder</label>
+            <label for="download-folder">{m.settings_download_folder_label()}</label>
             <div class="folder-input">
               <input id="download-folder" value={settings.download_folder} readonly />
-              <button class="folder-btn" onclick={pickDownloadFolder}>Browse</button>
+              <button class="folder-btn" onclick={pickDownloadFolder}>{m.settings_browse()}</button>
             </div>
-            <span class="field-hint">Completed files: {settings.download_folder}/Downloads &nbsp;&bull;&nbsp; Part files: {settings.download_folder}/Temp</span>
+            <span class="field-hint">{m.settings_folder_layout_hint({ folder: settings.download_folder })}</span>
           </div>
           <div class="field-row">
             <div class="field half">
-              <label for="max-concurrent">Max Downloads</label>
+              <label for="max-concurrent">{m.settings_max_downloads()}</label>
               <input id="max-concurrent" type="number" min="1" max="50" bind:value={settings.max_concurrent_downloads} />
             </div>
             <div class="field half">
-              <label for="max-uploads">Max Uploads</label>
+              <label for="max-uploads">{m.settings_max_uploads()}</label>
               <input id="max-uploads" type="number" min="1" max="50" bind:value={settings.max_concurrent_uploads} />
             </div>
           </div>
 
           <div class="field">
-            <label for="max-dl-gib">Max File Size (GiB)</label>
+            <label for="max-dl-gib">{m.settings_max_file_size_label()}</label>
             <input id="max-dl-gib" type="number" min="1" max="16384" bind:value={settings.max_download_file_size_gib} />
-            <span class="hint">Reject downloads larger than this (default 4096 GiB)</span>
+            <span class="hint">{m.settings_max_file_size_hint()}</span>
           </div>
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Add Downloads Paused</span>
-              <span class="hint">New downloads start paused until manually resumed.</span>
+              <span class="toggle-title">{m.settings_add_paused()}</span>
+              <span class="hint">{m.settings_add_paused_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.add_downloads_paused} ariaLabel="Add Downloads Paused" />
+            <ToggleSwitch bind:checked={settings.add_downloads_paused} ariaLabel={m.settings_add_paused()} />
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Auto-Remove Completed</span>
-              <span class="hint">Automatically remove finished downloads from the transfer list.</span>
+              <span class="toggle-title">{m.settings_auto_remove()}</span>
+              <span class="hint">{m.settings_auto_remove_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.remove_finished_downloads} ariaLabel="Auto-Remove Completed" />
+            <ToggleSwitch bind:checked={settings.remove_finished_downloads} ariaLabel={m.settings_auto_remove()} />
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Skip Compress Video</span>
-              <span class="hint">Don't compress AVI/MKV/MP4 during uploads (already compressed).</span>
+              <span class="toggle-title">{m.settings_skip_compress_video()}</span>
+              <span class="hint">{m.settings_skip_compress_video_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.skip_compress_video} ariaLabel="Skip Compress Video" />
+            <ToggleSwitch bind:checked={settings.skip_compress_video} ariaLabel={m.settings_skip_compress_video()} />
           </div>
 
           <div class="field">
-            <span class="toggle-title">Download History</span>
+            <span class="toggle-title">{m.settings_download_history()}</span>
             <span class="field-hint">
-              Ember remembers previously downloaded and cancelled files and shows them in search results, so you can avoid re-downloading the same content.
+              {m.settings_download_history_hint()}
             </span>
             <div class="btn-row" style="margin-top: 6px; gap: 8px;">
-              <button class="ghost" onclick={() => handleClearHistory('completed')}>Clear Completed</button>
-              <button class="ghost" onclick={() => handleClearHistory('cancelled')}>Clear Cancelled</button>
-              <button class="ghost" onclick={() => handleClearHistory('all')}>Clear All History</button>
+              <button class="ghost" onclick={() => handleClearHistory('completed')}>{m.settings_clear_completed()}</button>
+              <button class="ghost" onclick={() => handleClearHistory('cancelled')}>{m.settings_clear_cancelled()}</button>
+              <button class="ghost" onclick={() => handleClearHistory('all')}>{m.settings_clear_all_history()}</button>
             </div>
             {#if historyClearMsg}
               <span class="hint" style="margin-top: 4px;">{historyClearMsg}</span>
@@ -911,56 +984,56 @@
         <div class="card-header">
           <span class="card-icon">&#x1F50D;</span>
           <div>
-            <h3>Search</h3>
-            <p class="card-desc">Search filters and cleanup</p>
+            <h3>{m.settings_section_search()}</h3>
+            <p class="card-desc">{m.settings_search_desc()}</p>
           </div>
         </div>
         <div class="card-body">
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Search Spam Filter</span>
-              <span class="hint">Score search results against known spam patterns (eMule-compatible).</span>
+              <span class="toggle-title">{m.settings_spam_filter()}</span>
+              <span class="hint">{m.settings_spam_filter_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.spam_filter_enabled} ariaLabel="Search Spam Filter" />
+            <ToggleSwitch bind:checked={settings.spam_filter_enabled} ariaLabel={m.settings_spam_filter()} />
           </div>
           <div class="field">
-            <label for="spam-filter-profile">Spam filter profile</label>
-            <span class="hint">Relaxed shows only high-confidence spam. Balanced is recommended for most users. Aggressive hides more suspicious results.</span>
+            <label for="spam-filter-profile">{m.settings_spam_profile_label()}</label>
+            <span class="hint">{m.settings_spam_profile_hint()}</span>
             <select
               id="spam-filter-profile"
               bind:value={settings.spam_filter_profile}
               disabled={!settings.spam_filter_enabled}
             >
-              <option value="relaxed">Relaxed (minimal filtering)</option>
-              <option value="balanced">Balanced (recommended)</option>
-              <option value="aggressive">Aggressive (stronger filtering)</option>
+              <option value="relaxed">{m.settings_spam_profile_relaxed()}</option>
+              <option value="balanced">{m.settings_spam_profile_balanced()}</option>
+              <option value="aggressive">{m.settings_spam_profile_aggressive()}</option>
             </select>
           </div>
           <div class="field">
-            <span class="field-label">Learned spam database</span>
-            <span class="hint">Local training data used by the spam filter.</span>
+            <span class="field-label">{m.settings_spam_db_label()}</span>
+            <span class="hint">{m.settings_spam_db_hint()}</span>
             {#if spamStatsLoading}
-              <span class="hint">Loading spam stats...</span>
+              <span class="hint">{m.settings_spam_loading()}</span>
             {:else if spamStatsError}
               <span class="hint" style="color: var(--danger)">{spamStatsError}</span>
             {:else if spamStats}
               <div class="spam-stats-grid">
-                <div class="spam-stat"><span>Spam hashes</span><strong>{spamStats.spam_hashes}</strong></div>
-                <div class="spam-stat"><span>Not-spam hashes</span><strong>{spamStats.not_spam_hashes}</strong></div>
-                <div class="spam-stat"><span>Spam names</span><strong>{spamStats.spam_filenames}</strong></div>
-                <div class="spam-stat"><span>Spam source IPs</span><strong>{spamStats.spam_source_ips}</strong></div>
+                <div class="spam-stat"><span>{m.settings_spam_stat_hashes()}</span><strong>{spamStats.spam_hashes}</strong></div>
+                <div class="spam-stat"><span>{m.settings_spam_stat_not_spam_hashes()}</span><strong>{spamStats.not_spam_hashes}</strong></div>
+                <div class="spam-stat"><span>{m.settings_spam_stat_names()}</span><strong>{spamStats.spam_filenames}</strong></div>
+                <div class="spam-stat"><span>{m.settings_spam_stat_source_ips()}</span><strong>{spamStats.spam_source_ips}</strong></div>
               </div>
             {/if}
             <div class="action-row" style="margin-top:8px;">
-              <button class="action-btn" onclick={refreshSpamStats} disabled={spamStatsLoading || spamResetting}>Refresh stats</button>
+              <button class="action-btn" onclick={refreshSpamStats} disabled={spamStatsLoading || spamResetting}>{m.settings_refresh_stats()}</button>
               <button class="danger" onclick={handleResetSpamData} disabled={spamResetting}>
-                {spamResetting ? 'Resetting...' : 'Reset learned spam data'}
+                {spamResetting ? m.settings_resetting() : m.settings_reset_spam_data()}
               </button>
             </div>
           </div>
           <div class="field">
-            <label for="search-timeout-secs">Search timeout (seconds)</label>
-            <span class="hint">How long to wait for global search, source lookup, and file notes (30–600).</span>
+            <label for="search-timeout-secs">{m.settings_search_timeout_label()}</label>
+            <span class="hint">{m.settings_search_timeout_hint()}</span>
             <input
               id="search-timeout-secs"
               type="number"
@@ -971,9 +1044,9 @@
             />
           </div>
           <div class="field">
-            <label for="filename-cleanups">Filename Cleanup Strings</label>
-            <span class="hint">Pipe-separated substrings stripped from filenames in search and library views (e.g. <code>http|www.|.com|.de|.org|.net</code>). Leave empty to disable cleanup.</span>
-            <input id="filename-cleanups" type="text" bind:value={settings.filename_cleanups} placeholder="http|www.|.com|.de|.org|.net" />
+            <label for="filename-cleanups">{m.settings_filename_cleanups_label()}</label>
+            <span class="hint">{m.settings_filename_cleanups_hint_prefix()} <code>{m.settings_filename_cleanups_placeholder()}</code>{m.settings_filename_cleanups_hint_suffix()}</span>
+            <input id="filename-cleanups" type="text" bind:value={settings.filename_cleanups} placeholder={m.settings_filename_cleanups_placeholder()} />
           </div>
         </div>
       </section>
@@ -983,47 +1056,47 @@
         <div class="card-header">
           <span class="card-icon">&#8693;</span>
           <div>
-            <h3>Bandwidth</h3>
-            <p class="card-desc">Upload and download speed limits</p>
+            <h3>{m.settings_section_bandwidth()}</h3>
+            <p class="card-desc">{m.settings_bandwidth_desc()}</p>
           </div>
         </div>
         <div class="card-body">
           <div class="field">
-            <SpeedInput label="Max Upload Speed" bind:value={settings.max_upload_speed} />
+            <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} />
           </div>
           <div class="field">
-            <SpeedInput label="Max Download Speed" bind:value={settings.max_download_speed} />
+            <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} />
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Upload Speed Sense (USS)</span>
-              <span class="hint">Automatically adjusts upload speed based on network latency to prevent congestion. Requires an upload speed limit to be set.</span>
+              <span class="toggle-title">{m.settings_uss_label()}</span>
+              <span class="hint">{m.settings_uss_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.uss_enabled} ariaLabel="Upload Speed Sense (USS)" />
+            <ToggleSwitch bind:checked={settings.uss_enabled} ariaLabel={m.settings_uss_label()} />
           </div>
           <div class="field speed-test-section">
             <div class="speed-test-header">
-              <span class="toggle-title">Speed Test</span>
+              <span class="toggle-title">{m.settings_speed_test_label()}</span>
               <button class="speed-test-btn" onclick={runSpeedTest} disabled={speedTesting}>
-                {speedTesting ? 'Testing...' : 'Run Speed Test'}
+                {speedTesting ? m.settings_speed_testing() : m.settings_run_speed_test()}
               </button>
             </div>
-            <span class="hint">Measures your connection speed and calculates recommended limits. Upload is set to 80% of measured speed to keep your connection stable.</span>
+            <span class="hint">{m.settings_speed_test_hint()}</span>
             {#if speedResult}
               <div class="speed-results">
                 <div class="speed-row">
-                  <span>Download:</span>
+                  <span>{m.settings_speed_download()}</span>
                   <span class="speed-value">{formatSpeed(speedResult.download_speed)}</span>
                 </div>
                 <div class="speed-row">
-                  <span>Upload:</span>
+                  <span>{m.settings_speed_upload()}</span>
                   <span class="speed-value">{formatSpeed(speedResult.upload_speed)}</span>
                 </div>
                 <div class="speed-row recommended">
-                  <span>Recommended upload limit:</span>
+                  <span>{m.settings_speed_recommended_upload()}</span>
                   <span class="speed-value">{formatSpeed(speedResult.recommended_upload_limit)}</span>
                 </div>
-                <button class="apply-btn" onclick={applyRecommended}>Apply Recommended</button>
+                <button class="apply-btn" onclick={applyRecommended}>{m.settings_apply_recommended()}</button>
               </div>
             {/if}
             {#if speedError}
@@ -1038,63 +1111,63 @@
         <div class="card-header">
           <span class="card-icon">&#8942;</span>
           <div>
-            <h3>Network</h3>
-            <p class="card-desc">Ports, UPnP, and connection startup</p>
+            <h3>{m.settings_section_network()}</h3>
+            <p class="card-desc">{m.settings_network_desc()}</p>
           </div>
         </div>
         <div class="card-body">
           <div class="field-row">
             <div class="field half">
               <label for="tcp-port">
-                TCP Port
-                <span class="restart-badge">Restart</span>
+                {m.settings_tcp_port()}
+                <span class="restart-badge">{m.settings_restart_badge()}</span>
               </label>
               <input id="tcp-port" type="number" min="1" max="65535" bind:value={settings.tcp_port} />
-              <span class="hint">File transfers (default 4662)</span>
+              <span class="hint">{m.settings_tcp_port_hint()}</span>
             </div>
             <div class="field half">
               <label for="udp-port">
-                UDP Port
-                <span class="restart-badge">Restart</span>
+                {m.settings_udp_port()}
+                <span class="restart-badge">{m.settings_restart_badge()}</span>
               </label>
               <input id="udp-port" type="number" min="1" max="65535" bind:value={settings.udp_port} />
-              <span class="hint">KAD DHT (default 4672). May match the TCP port if your VPN only forwards a single port.</span>
+              <span class="hint">{m.settings_udp_port_hint()}</span>
             </div>
           </div>
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">UPnP Port Mapping <span class="restart-badge">Restart</span></span>
-              <span class="hint">Auto-configure router ports. Disable for manual forwarding.</span>
+              <span class="toggle-title">{m.settings_upnp_label()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
+              <span class="hint">{m.settings_upnp_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.upnp_enabled} ariaLabel="UPnP Port Mapping" />
+            <ToggleSwitch bind:checked={settings.upnp_enabled} ariaLabel={m.settings_upnp_label()} />
           </div>
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Auto-Connect KAD <span class="restart-badge">Restart</span></span>
-              <span class="hint">Automatically bootstrap KAD on startup. When off, press Connect to start.</span>
+              <span class="toggle-title">{m.settings_auto_connect_kad()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
+              <span class="hint">{m.settings_auto_connect_kad_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.auto_connect_kad} ariaLabel="Auto-Connect KAD" />
+            <ToggleSwitch bind:checked={settings.auto_connect_kad} ariaLabel={m.settings_auto_connect_kad()} />
           </div>
 
           <div class="field nested">
             <div class="action-row">
               <button class="action-btn" onclick={handleDownloadNodes} disabled={downloadingNodes}>
-                {downloadingNodes ? 'Downloading...' : 'Download nodes.dat'}
+                {downloadingNodes ? m.settings_downloading() : m.settings_download_nodes_btn()}
               </button>
               {#if nodesResult}<span class="feedback success">{nodesResult}</span>{/if}
               {#if nodesError}<span class="feedback error">{nodesError}</span>{/if}
             </div>
-            <span class="hint">Fetch the latest KAD bootstrap nodes from emule-security.org. Useful if KAD can't connect.</span>
+            <span class="hint">{m.settings_nodes_hint()}</span>
           </div>
 
           <div class="divider"></div>
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Auto-Connect Server <span class="restart-badge">Restart</span></span>
-              <span class="hint">Automatically connect to an eD2K server on startup.</span>
+              <span class="toggle-title">{m.settings_auto_connect_server()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
+              <span class="hint">{m.settings_auto_connect_server_hint()}</span>
             </div>
             <ToggleSwitch bind:checked={settings.auto_connect_server} />
           </div>
@@ -1109,26 +1182,26 @@
           -->
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Update server list when connecting</span>
-              <span class="hint">Ask each eD2K server you connect to for its known peer servers and merge them into your list.</span>
+              <span class="toggle-title">{m.settings_update_servers_label()}</span>
+              <span class="hint">{m.settings_update_servers_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.add_servers_from_server} ariaLabel="Update server list when connecting to a server" />
+            <ToggleSwitch bind:checked={settings.add_servers_from_server} ariaLabel={m.settings_update_servers_aria()} />
           </div>
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Update server list from clients</span>
-              <span class="hint">Accept new servers advertised by other eD2K clients during peer connections. Off if you prefer a curated list.</span>
+              <span class="toggle-title">{m.settings_update_servers_clients_label()}</span>
+              <span class="hint">{m.settings_update_servers_clients_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.add_servers_from_clients} ariaLabel="Update server list from clients" />
+            <ToggleSwitch bind:checked={settings.add_servers_from_clients} ariaLabel={m.settings_update_servers_clients_label()} />
           </div>
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Filter servers by IP</span>
-              <span class="hint">Apply your IP filter to newly discovered servers as well as peers.</span>
+              <span class="toggle-title">{m.settings_filter_servers_label()}</span>
+              <span class="hint">{m.settings_filter_servers_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.filter_servers_by_ip} ariaLabel="Filter servers by IP" />
+            <ToggleSwitch bind:checked={settings.filter_servers_by_ip} ariaLabel={m.settings_filter_servers_label()} />
           </div>
 
         </div>
@@ -1139,33 +1212,33 @@
         <div class="card-header">
           <span class="card-icon">&#128737;</span>
           <div>
-            <h3>Security</h3>
-            <p class="card-desc">Obfuscation and IP filtering</p>
+            <h3>{m.settings_section_security()}</h3>
+            <p class="card-desc">{m.settings_security_desc()}</p>
           </div>
         </div>
         <div class="card-body">
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Protocol Obfuscation <span class="restart-badge">Restart</span></span>
-              <span class="hint">Encrypt KAD UDP traffic with RC4. Compatible with eMule.</span>
+              <span class="toggle-title">{m.settings_obfuscation_label()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
+              <span class="hint">{m.settings_obfuscation_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.obfuscation_enabled} ariaLabel="Protocol Obfuscation" />
+            <ToggleSwitch bind:checked={settings.obfuscation_enabled} ariaLabel={m.settings_obfuscation_label()} />
           </div>
 
           <div class="divider"></div>
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">IP Filter <span class="restart-badge">Restart</span></span>
-              <span class="hint">Block known-bad IP ranges via ipfilter.dat</span>
+              <span class="toggle-title">{m.settings_ip_filter_label()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
+              <span class="hint">{m.settings_ip_filter_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.ip_filter_enabled} ariaLabel="IP Filter" />
+            <ToggleSwitch bind:checked={settings.ip_filter_enabled} ariaLabel={m.settings_ip_filter_label()} />
           </div>
           {#if settings.ip_filter_enabled}
             <div class="field nested">
               <div class="action-row">
                 <button class="action-btn" onclick={handleDownloadFilter} disabled={downloadingFilter}>
-                  {downloadingFilter ? 'Downloading...' : 'Download ipfilter.dat'}
+                  {downloadingFilter ? m.settings_downloading() : m.settings_download_ipfilter_btn()}
                 </button>
                 {#if filterResult}<span class="feedback success">{filterResult}</span>{/if}
                 {#if filterError}<span class="feedback error">{filterError}</span>{/if}
@@ -1175,38 +1248,38 @@
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Filter Incoming Connections <span class="restart-badge">Restart</span></span>
-              <span class="hint">Apply IP filter to incoming peer connections. VPN users may need to disable this since VPN IPs often appear in filter lists.</span>
+              <span class="toggle-title">{m.settings_filter_incoming_label()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
+              <span class="hint">{m.settings_filter_incoming_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.filter_incoming_connections} ariaLabel="Filter Incoming Connections" />
+            <ToggleSwitch bind:checked={settings.filter_incoming_connections} ariaLabel={m.settings_filter_incoming_label()} />
           </div>
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Block Private IPs <span class="restart-badge">Restart</span></span>
-              <span class="hint">Reject 10.x, 192.168.x, etc. from the routing table.</span>
+              <span class="toggle-title">{m.settings_block_private_label()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
+              <span class="hint">{m.settings_block_private_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.block_private_ips} ariaLabel="Block Private IPs" />
+            <ToggleSwitch bind:checked={settings.block_private_ips} ariaLabel={m.settings_block_private_label()} />
           </div>
 
           <div class="divider"></div>
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Anti-Leech Filter</span>
+              <span class="toggle-title">{m.settings_antileech_label()}</span>
               <span class="hint">
-                Reject incoming peer connections from known leech clients.
+                {m.settings_antileech_hint()}
               </span>
             </div>
-            <ToggleSwitch bind:checked={settings.antileech_enabled} ariaLabel="Anti-Leech Filter" />
+            <ToggleSwitch bind:checked={settings.antileech_enabled} ariaLabel={m.settings_antileech_label()} />
           </div>
           {#if settings.antileech_enabled}
             <div class="field nested antileech-block">
               {#if !antileechLoaded}
-                <div class="hint">Loading patterns...</div>
+                <div class="hint">{m.settings_antileech_loading()}</div>
               {:else}
                 <label for="antileech-textarea" class="antileech-label">
-                  Patterns - one regex per line. <code>#</code> starts a comment.
+                  {m.settings_antileech_patterns_prefix()} <code>#</code> {m.settings_antileech_patterns_suffix()}
                 </label>
                 <textarea
                   id="antileech-textarea"
@@ -1214,18 +1287,18 @@
                   bind:value={antileechDraft}
                   rows="10"
                   spellcheck="false"
-                  placeholder={`# Examples:\nVeryCD\nMagicMule\n^eMule 0\\.[0-2]\\d`}
+                  placeholder={m.settings_antileech_placeholder()}
                 ></textarea>
                 <div class="antileech-actions">
                   <button class="action-btn" onclick={handleSaveAntileech} disabled={antileechSaving}>
-                    {antileechSaving ? 'Saving...' : 'Save patterns'}
+                    {antileechSaving ? m.settings_saving() : m.settings_antileech_save_btn()}
                   </button>
                   <button class="action-btn ghost" onclick={handleResetAntileech} disabled={antileechSaving}>
-                    Restore defaults
+                    {m.settings_antileech_restore_btn()}
                   </button>
                   {#if antileechSnapshot}
                     <span class="hint antileech-path" title={antileechSnapshot.file_path}>
-                      File: {antileechSnapshot.file_path}
+                      {m.settings_antileech_file_label({ path: antileechSnapshot.file_path })}
                     </span>
                   {/if}
                 </div>
@@ -1236,7 +1309,7 @@
                 {/if}
                 {#if antileechCompileErrors.length > 0}
                   <div class="antileech-errors">
-                    <div class="antileech-errors-title">Patterns rejected by the regex compiler:</div>
+                    <div class="antileech-errors-title">{m.settings_antileech_errors_title()}</div>
                     <ul>
                       {#each antileechCompileErrors as [pattern, error]}
                         <li><code>{pattern}</code> - {error}</li>
@@ -1256,55 +1329,55 @@
         <div class="card-header">
           <span class="card-icon">&#128101;</span>
           <div>
-            <h3>Friends</h3>
-            <p class="card-desc">Privacy and friend feature controls</p>
+            <h3>{m.settings_section_friends()}</h3>
+            <p class="card-desc">{m.settings_friends_desc()}</p>
           </div>
         </div>
         <div class="card-body">
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Require Approval for Friend Requests</span>
-              <span class="hint">Always show incoming friend requests on the Friends page for explicit accept. When off, requests from peers you already added as a friend auto-confirm. Requests carry a Verified badge when the peer's Ember identity is cryptographically consistent — proof-of-possession on friend-connect dial-back sessions, identity-binding check on regular file-transfer sessions. Even with a Verified badge, only accept requests from people you recognise.</span>
+              <span class="toggle-title">{m.settings_friend_require_approval()}</span>
+              <span class="hint">{m.settings_friend_require_approval_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_require_approval} ariaLabel="Require Approval for Friend Requests" />
+            <ToggleSwitch bind:checked={settings.friend_require_approval} ariaLabel={m.settings_friend_require_approval()} />
           </div>
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Online Notifications</span>
-              <span class="hint">Show a toast when a friend comes online.</span>
+              <span class="toggle-title">{m.settings_friend_online_notif()}</span>
+              <span class="hint">{m.settings_friend_online_notif_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_online_notifications} ariaLabel="Online Notifications" />
+            <ToggleSwitch bind:checked={settings.friend_online_notifications} ariaLabel={m.settings_friend_online_notif()} />
           </div>
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Disable Friend Chat</span>
-              <span class="hint">Ignore incoming chat messages from friends. You won't be able to send messages either.</span>
+              <span class="toggle-title">{m.settings_friend_chat_disabled()}</span>
+              <span class="hint">{m.settings_friend_chat_disabled_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_chat_disabled} ariaLabel="Disable Friend Chat" />
+            <ToggleSwitch bind:checked={settings.friend_chat_disabled} ariaLabel={m.settings_friend_chat_disabled()} />
           </div>
 
           <div class="field toggle-row">
             <div class="toggle-info">
-              <span class="toggle-title">Disable Friend Browse</span>
-              <span class="hint">Don't respond to browse-shares requests from friends. Your shared file list stays private.</span>
+              <span class="toggle-title">{m.settings_friend_browse_disabled()}</span>
+              <span class="hint">{m.settings_friend_browse_disabled_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_browse_disabled} ariaLabel="Disable Friend Browse" />
+            <ToggleSwitch bind:checked={settings.friend_browse_disabled} ariaLabel={m.settings_friend_browse_disabled()} />
           </div>
 
           <div class="field toggle-row">
             <div>
-              <span class="toggle-title">Encrypt Friend Sessions</span>
-              <span class="hint">Wrap friend connections with RC4 obfuscation to prevent casual packet inspection.</span>
+              <span class="toggle-title">{m.settings_friend_session_encryption()}</span>
+              <span class="hint">{m.settings_friend_session_encryption_hint()}</span>
             </div>
-            <ToggleSwitch bind:checked={settings.friend_session_encryption} ariaLabel="Encrypt Friend Sessions" />
+            <ToggleSwitch bind:checked={settings.friend_session_encryption} ariaLabel={m.settings_friend_session_encryption()} />
           </div>
 
           <div class="field">
-            <label for="max-friends">Maximum Friends</label>
+            <label for="max-friends">{m.settings_max_friends_label()}</label>
             <input id="max-friends" type="number" min="1" max="500" bind:value={settings.max_friends} />
-            <span class="hint">Limit the total number of friends you can add (1–500, default 200).</span>
+            <span class="hint">{m.settings_max_friends_hint()}</span>
           </div>
 
         </div>
@@ -1324,19 +1397,19 @@
 -->
 <ConfirmDialog
   bind:open={showRestartPrompt}
-  title="Restart Ember to apply port change?"
-  message={`You changed your ${pendingRestartReason}. Ember binds the listening sockets when the app starts, so the new port(s) won't take effect until the app is restarted. Restart now?`}
-  confirmLabel="Restart now"
-  cancelLabel="Later"
+  title={m.settings_restart_dialog_title()}
+  message={m.settings_restart_dialog_message({ reason: pendingRestartReason })}
+  confirmLabel={m.settings_restart_now()}
+  cancelLabel={m.settings_restart_later()}
   onconfirm={performRestart}
   oncancel={dismissRestartPrompt}
 />
 
 <ConfirmDialog
   bind:open={spamResetConfirmOpen}
-  title="Reset learned spam data?"
-  message="Clear all learned spam filter data — hashes, filenames, and source IPs. The filter will start from scratch and re-learn from your actions. This cannot be undone."
-  confirmLabel="Reset"
+  title={m.settings_spam_reset_dialog_title()}
+  message={m.settings_spam_reset_dialog_message()}
+  confirmLabel={m.settings_spam_reset_confirm()}
   danger={true}
   onconfirm={confirmResetSpamData}
 />
@@ -1347,11 +1420,11 @@
   the visual transition feels the same in both places.
 -->
 {#if restarting}
-  <div class="restart-overlay" role="status" aria-label="Restarting Ember">
+  <div class="restart-overlay" role="status" aria-label={m.settings_restarting_aria()}>
     <div class="restart-card">
       <div class="restart-spinner"></div>
-      <h2 class="restart-title">Restarting Ember</h2>
-      <p class="restart-sub">Applying your new port settings…</p>
+      <h2 class="restart-title">{m.settings_restarting_title()}</h2>
+      <p class="restart-sub">{m.settings_restarting_sub()}</p>
     </div>
   </div>
 {/if}
