@@ -503,7 +503,7 @@
         addToast('info', m.search_server_no_results_retry());
       }
     } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : m.search_retry_failed();
+      const msg = translateError(e, m.search_retry_failed());
       addToast('error', msg);
     } finally {
       clearRetryRequestId(tabId);
@@ -655,6 +655,28 @@
       clearTimeout(t);
       searchTimeouts.delete(requestId);
     }
+  }
+
+  // Grace period after the backend confirms a search finished (the
+  // `search_files` invoke resolved) during which we still expect the
+  // `search-complete` event to flip `isSearching` off. If that event is
+  // ever dropped on the IPC bridge the spinner would spin forever, so this
+  // fallback clears it — but only when no retry phase is still running
+  // (the retry path owns the spinner until its own completion).
+  const SEARCH_COMPLETE_GRACE_MS = 5000;
+
+  function armSearchCompletionFallback(requestId: number) {
+    clearSearchTimeoutForRequest(requestId);
+    searchTimeouts.set(
+      requestId,
+      setTimeout(() => {
+        searchTimeouts.delete(requestId);
+        patchSearchTabByRequestId(requestId, (tab) => {
+          if (!tab.isSearching || tab.retryRequestId != null) return tab;
+          return { ...tab, isSearching: false, progress: null };
+        });
+      }, SEARCH_COMPLETE_GRACE_MS),
+    );
   }
 
   function shortenTabLabel(s: string, max = 28): string {
@@ -811,8 +833,10 @@
 
     try {
       const results = await searchPromise;
-      // Search succeeded — cancel the watchdog so it doesn't fire later and
-      // call cancelSearch() against a request the backend has already closed.
+      // Search succeeded — cancel the long timeout watchdog so it doesn't
+      // fire later and call cancelSearch() against a request the backend has
+      // already closed, then arm a short completion fallback so a dropped
+      // `search-complete` event can't leave the spinner stuck forever.
       clearSearchTimeoutForRequest(requestId);
       if (!get(searchTabs).some((t) => t.requestId === requestId)) {
         return;
@@ -823,6 +847,7 @@
           results: mergeSearchResults(tab.results, results),
         }));
       }
+      armSearchCompletionFallback(requestId);
     } catch (e: unknown) {
       clearSearchTimeoutForRequest(requestId);
       if (!get(searchTabs).some((t) => t.requestId === requestId)) return;
@@ -905,7 +930,7 @@
         setSpamCache(key, explain);
       } catch (e: unknown) {
         if (requestId === notesRequestId && selectedResult?.file.hash === fileHash) {
-          spamExplainError = e instanceof Error ? e.message : m.search_failed_evaluate_spam();
+          spamExplainError = translateError(e, m.search_failed_evaluate_spam());
         }
       } finally {
         if (requestId === notesRequestId && selectedResult?.file.hash === fileHash) {
@@ -934,7 +959,7 @@
       );
       setSpamCache(key, explain);
     } catch (e: unknown) {
-      spamExplainErrors[key] = e instanceof Error ? e.message : m.search_failed_explain_spam();
+      spamExplainErrors[key] = translateError(e, m.search_failed_explain_spam());
     } finally {
       spamExplainPending[key] = false;
     }

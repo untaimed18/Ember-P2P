@@ -90,7 +90,7 @@
           : m.settings_history_cleared_cancelled();
       trackedTimeout(() => { historyClearMsg = null; }, 3000);
     } catch (e) {
-      historyClearMsg = m.settings_history_clear_failed({ error: e instanceof Error ? e.message : String(e) });
+      historyClearMsg = m.settings_history_clear_failed({ error: translateError(e) });
     }
   }
 
@@ -171,7 +171,7 @@
         settings = s;
         originalSettings = JSON.stringify(s);
       })
-      .catch((e) => { loadError = e instanceof Error ? e.message : m.settings_load_failed(); });
+      .catch((e) => { loadError = translateError(e, m.settings_load_failed()); });
 
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
       if (hasUnsavedChanges) e.preventDefault();
@@ -342,7 +342,7 @@
     } catch (e) {
       restarting = false;
       showSaveMsg(
-        m.settings_restart_failed({ error: e instanceof Error ? e.message : String(e) }),
+        m.settings_restart_failed({ error: translateError(e) }),
         true,
         10000,
       );
@@ -380,7 +380,7 @@
           originalSettings = JSON.stringify(s);
         })
         .catch((err) => {
-          showSaveMsg(m.settings_reload_failed({ error: String(err) }), true, 4000);
+          showSaveMsg(m.settings_reload_failed({ error: translateError(err) }), true, 4000);
         });
     }
   }
@@ -391,7 +391,7 @@
     try {
       spamStats = await getSpamStats();
     } catch (e: unknown) {
-      spamStatsError = e instanceof Error ? e.message : m.settings_spam_load_failed();
+      spamStatsError = translateError(e, m.settings_spam_load_failed());
     } finally {
       spamStatsLoading = false;
     }
@@ -415,7 +415,7 @@
       await refreshSpamStats();
       showSaveMsg(m.settings_spam_reset_success(), false, 3000);
     } catch (e: unknown) {
-      showSaveMsg(e instanceof Error ? e.message : m.settings_spam_reset_failed(), true, 5000);
+      showSaveMsg(translateError(e, m.settings_spam_reset_failed()), true, 5000);
     } finally {
       spamResetting = false;
     }
@@ -476,7 +476,7 @@
     } catch (e: unknown) {
       antileechMessage = {
         kind: 'err',
-        text: m.settings_antileech_load_failed({ error: e instanceof Error ? e.message : String(e) }),
+        text: m.settings_antileech_load_failed({ error: translateError(e) }),
       };
     }
   }
@@ -518,7 +518,7 @@
     } catch (e: unknown) {
       antileechMessage = {
         kind: 'err',
-        text: m.settings_antileech_save_failed({ error: e instanceof Error ? e.message : String(e) }),
+        text: m.settings_antileech_save_failed({ error: translateError(e) }),
       };
     } finally {
       antileechSaving = false;
@@ -535,7 +535,7 @@
         antileechSnapshot = snap;
       }
     } catch (e: unknown) {
-      const text = m.settings_antileech_toggle_failed({ error: e instanceof Error ? e.message : String(e) });
+      const text = m.settings_antileech_toggle_failed({ error: translateError(e) });
       antileechMessage = {
         kind: 'err',
         text,
@@ -564,7 +564,7 @@
     } catch (e: unknown) {
       antileechMessage = {
         kind: 'err',
-        text: m.settings_antileech_reset_failed({ error: e instanceof Error ? e.message : String(e) }),
+        text: m.settings_antileech_reset_failed({ error: translateError(e) }),
       };
     } finally {
       antileechSaving = false;

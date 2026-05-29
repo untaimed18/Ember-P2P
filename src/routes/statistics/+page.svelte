@@ -4,6 +4,7 @@
   import { formatBytes, formatSpeed as formatRate, formatDurationSecs as formatDuration } from '$lib/utils';
   import { onMount } from 'svelte';
   import * as m from '$lib/paraglide/messages';
+  import { translateError } from '$lib/i18n';
 
   let stats = $state<TransferStats | null>(null);
   let loading = $state(true);
@@ -19,6 +20,8 @@
   // misleading when the backend is briefly unreachable).
   let repStats = $state<ReputationStatsInfo | null>(null);
 
+  let statsTimeoutId: ReturnType<typeof setTimeout> | undefined;
+
   async function loadStats() {
     if (refreshBusy || unmounted) return;
     refreshBusy = true;
@@ -31,7 +34,9 @@
       const [result, repResult] = await Promise.all([
         Promise.race([
           getStatistics(),
-          new Promise<TransferStats>((_, reject) => setTimeout(() => reject(new Error('timeout')), 4000)),
+          new Promise<TransferStats>((_, reject) => {
+            statsTimeoutId = setTimeout(() => reject(new Error('timeout')), 4000);
+          }),
         ]),
         getReputationStats().catch(() => null as ReputationStatsInfo | null),
       ]);
@@ -41,8 +46,14 @@
       error = null;
     } catch (e) {
       if (unmounted) return;
-      error = e instanceof Error ? e.message : String(e);
+      error = translateError(e, m.error_operation_failed());
     } finally {
+      // Clear the race watchdog so the loser timer doesn't linger until
+      // it fires (otherwise each poll leaves an orphan timeout pending).
+      if (statsTimeoutId) {
+        clearTimeout(statsTimeoutId);
+        statsTimeoutId = undefined;
+      }
       if (!unmounted) loading = false;
       refreshBusy = false;
     }

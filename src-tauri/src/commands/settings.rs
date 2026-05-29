@@ -270,14 +270,8 @@ pub async fn download_nodes_dat(
 ) -> Result<String, String> {
     info!("Downloading nodes.dat from {NODES_DAT_URL}");
 
-    let (validated_url, host, resolved_addrs) = crate::security::validate_fetch_url(NODES_DAT_URL).await
-        .map_err(|e| coded_ctx("settings_url_validation_failed", "URL validation failed", e))?;
-    let client = crate::security::build_pinned_client(&host, &resolved_addrs)
-        .map_err(|e| coded_ctx("settings_http_client_failed", "Failed to build HTTP client", e))?;
-
     const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-    let response = client.get(&validated_url).send()
-        .await
+    let response = crate::security::fetch_pinned_get(NODES_DAT_URL).await
         .map_err(|e| coded_ctx("settings_http_request_failed", "HTTP request failed", e))?
         .error_for_status()
         .map_err(|e| coded_ctx("settings_http_error", "HTTP error", e))?;
@@ -378,14 +372,8 @@ pub async fn download_ipfilter(
 ) -> Result<String, String> {
     info!("Downloading ipfilter.dat from {IPFILTER_URL}");
 
-    let (validated_url, host, resolved_addrs) = crate::security::validate_fetch_url(IPFILTER_URL).await
-        .map_err(|e| coded_ctx("settings_url_validation_failed", "URL validation failed", e))?;
-    let client = crate::security::build_pinned_client(&host, &resolved_addrs)
-        .map_err(|e| coded_ctx("settings_http_client_failed", "Failed to build HTTP client", e))?;
-
     const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
-    let response = client.get(&validated_url).send()
-        .await
+    let response = crate::security::fetch_pinned_get(IPFILTER_URL).await
         .map_err(|e| coded_ctx("settings_http_request_failed", "HTTP request failed", e))?
         .error_for_status()
         .map_err(|e| coded_ctx("settings_http_error", "HTTP error", e))?;

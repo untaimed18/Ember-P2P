@@ -101,12 +101,12 @@ async fn delete_file_with_retry(
             }
         }
     }
-    Err(format!(
-        "Failed to delete {}: {}",
-        path.display(),
+    Err(coded_ctx(
+        "sharing_delete_failed",
+        format!("Failed to delete {}", path.display()),
         last_error
             .map(|e| e.to_string())
-            .unwrap_or_else(|| "unknown error".to_string())
+            .unwrap_or_else(|| "unknown error".to_string()),
     ))
 }
 
@@ -136,7 +136,7 @@ pub async fn add_shared_folder(
     path: String,
 ) -> Result<(), String> {
     if path.len() > MAX_PATH_LEN {
-        return Err(format!("Folder path exceeds {MAX_PATH_LEN} bytes"));
+        return Err(coded_ctx("sharing_folder_path_too_long", format!("Folder path exceeds {MAX_PATH_LEN} bytes"), MAX_PATH_LEN));
     }
     let p = std::path::Path::new(&path);
     if !p.exists() || !p.is_dir() {
@@ -410,7 +410,7 @@ pub async fn remove_shared_folder(
     path: String,
 ) -> Result<(), String> {
     if path.len() > MAX_PATH_LEN {
-        return Err(format!("Folder path exceeds {MAX_PATH_LEN} bytes"));
+        return Err(coded_ctx("sharing_folder_path_too_long", format!("Folder path exceeds {MAX_PATH_LEN} bytes"), MAX_PATH_LEN));
     }
     // Earlier this fell back to the raw `path` string when canonicalize
     // failed. That made the unshare operation silently incomplete: the
@@ -423,7 +423,7 @@ pub async fn remove_shared_folder(
     let canonical_path = std::path::Path::new(&path)
         .canonicalize()
         .map(|p| p.to_string_lossy().to_string())
-        .map_err(|e| format!("Invalid folder path '{path}': {e}"))?;
+        .map_err(|e| coded_ctx("sharing_invalid_folder_path", format!("Invalid folder path '{path}'"), e))?;
     // `add_shared_folder` stores the *canonical* form in
     // `shared_folders` and `upload_shared_folders`; the cancel-flag
     // map is also keyed by canonical paths. Comparing against the
@@ -572,8 +572,10 @@ pub async fn batch_set_priority(
     priority: String,
 ) -> Result<u32, String> {
     if file_paths.len() > MAX_BATCH_IDS {
-        return Err(format!(
-            "Too many file_paths in one batch (max {MAX_BATCH_IDS})"
+        return Err(coded_ctx(
+            "sharing_batch_too_large",
+            format!("Too many file_paths in one batch (max {MAX_BATCH_IDS})"),
+            MAX_BATCH_IDS,
         ));
     }
     let valid = ["verylow", "low", "normal", "high", "release", "auto"];
@@ -630,8 +632,10 @@ pub async fn batch_share(
     file_paths: Vec<String>,
 ) -> Result<u32, String> {
     if file_paths.len() > MAX_BATCH_IDS {
-        return Err(format!(
-            "Too many file_paths in one batch (max {MAX_BATCH_IDS})"
+        return Err(coded_ctx(
+            "sharing_batch_too_large",
+            format!("Too many file_paths in one batch (max {MAX_BATCH_IDS})"),
+            MAX_BATCH_IDS,
         ));
     }
     let count = {
@@ -662,8 +666,10 @@ pub async fn batch_unshare(
     file_paths: Vec<String>,
 ) -> Result<u32, String> {
     if file_paths.len() > MAX_BATCH_IDS {
-        return Err(format!(
-            "Too many file_paths in one batch (max {MAX_BATCH_IDS})"
+        return Err(coded_ctx(
+            "sharing_batch_too_large",
+            format!("Too many file_paths in one batch (max {MAX_BATCH_IDS})"),
+            MAX_BATCH_IDS,
         ));
     }
     let count = {
@@ -1190,7 +1196,7 @@ pub async fn open_shared_file(
     file_path: String,
 ) -> Result<(), String> {
     if file_path.len() > MAX_PATH_LEN {
-        return Err(format!("File path exceeds {MAX_PATH_LEN} bytes"));
+        return Err(coded_ctx("sharing_file_path_too_long", format!("File path exceeds {MAX_PATH_LEN} bytes"), MAX_PATH_LEN));
     }
     let allowed_dirs = {
         let config = state.config.read().await;
@@ -1222,7 +1228,7 @@ pub async fn open_shared_folder(
     file_path: String,
 ) -> Result<(), String> {
     if file_path.len() > MAX_PATH_LEN {
-        return Err(format!("File path exceeds {MAX_PATH_LEN} bytes"));
+        return Err(coded_ctx("sharing_file_path_too_long", format!("File path exceeds {MAX_PATH_LEN} bytes"), MAX_PATH_LEN));
     }
     let allowed_dirs = {
         let config = state.config.read().await;

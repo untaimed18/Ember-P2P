@@ -71,6 +71,17 @@ fn emit_server_log(app: &tauri::AppHandle, message: &str) {
     let _ = app.emit("server-log", serde_json::json!({ "message": message }));
 }
 
+/// Extract a human-readable message from a `catch_unwind` panic payload.
+fn describe_panic(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 #[derive(Debug, Default)]
 struct ActiveSourceInjectionStats {
     matched_transfers: usize,
@@ -1588,8 +1599,6 @@ pub enum NetworkCommand {
     },
     KadBootstrapUrl {
         url: String,
-        host: String,
-        resolved_addrs: Vec<std::net::SocketAddr>,
         tx: oneshot::Sender<Result<String, String>>,
     },
     KadBootstrapClients {
@@ -9988,8 +9997,13 @@ pub async fn start_network(
                         }
                         let source_count = ready_sources.len() as u32;
                         {
-                            let sm = source_manager.read().await;
+                            // Canonical lock order: transfer_manager before
+                            // source_manager. Every other nested hold in the
+                            // network loop acquires the transfer lock first;
+                            // this site is kept consistent so the two locks can
+                            // never be taken in opposing orders (deadlock-safe).
                             let mut mgr = transfer_manager.write().await;
+                            let sm = source_manager.read().await;
                             mgr.update_status(tid, TransferStatus::Active);
                             mgr.update_sources(tid, source_count, 0, 0);
                             for (ip_s, port) in &ready_sources {
@@ -13862,14 +13876,7 @@ pub async fn start_network(
     }).catch_unwind().await;
 
     if let Err(panic_info) = loop_panic {
-        let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-            format!("Network event loop panicked: {s}")
-        } else if let Some(s) = panic_info.downcast_ref::<String>() {
-            format!("Network event loop panicked: {s}")
-        } else {
-            "Network event loop panicked (unknown payload)".to_string()
-        };
-        error!("{msg}");
+        error!("Network event loop panicked: {}", describe_panic(&*panic_info));
         let _ = app_handle.emit("network-error", serde_json::json!({
             "message": "Internal error in network task. The application may need to be restarted.",
         }));
@@ -14487,7 +14494,30 @@ async fn write_ed2k_packet_simple(
 /// state-machine work lives in `EmberTransport::dispatch_incoming`
 /// so it can be exercised by `cargo test` over loopback UDP without
 /// constructing a `NetworkState`.
+/// Panic-isolating wrapper around [`handle_ember_native_udp_inner`]. A panic
+/// while processing one packet must never tear down the whole network event
+/// loop (which would be a remote DoS), so we catch it, log it, and let the
+/// loop continue with the next event.
 async fn handle_ember_native_udp(
+    socket: &UdpSocket,
+    data: &[u8],
+    from: SocketAddr,
+    state: &mut NetworkState,
+) {
+    if let Err(p) = std::panic::AssertUnwindSafe(handle_ember_native_udp_inner(
+        socket, data, from, state,
+    ))
+    .catch_unwind()
+    .await
+    {
+        error!(
+            "Ember UDP handler panicked (recovered, network loop continues): {}",
+            describe_panic(&*p)
+        );
+    }
+}
+
+async fn handle_ember_native_udp_inner(
     socket: &UdpSocket,
     data: &[u8],
     from: SocketAddr,
@@ -14534,7 +14564,48 @@ async fn handle_ember_native_udp(
     }
 }
 
+/// Panic-isolating wrapper around [`handle_udp_packet_inner`]. Untrusted
+/// network packets are the prime adversarial surface, so a panic here must be
+/// contained rather than allowed to kill the network event loop.
+#[allow(clippy::too_many_arguments)]
 async fn handle_udp_packet(
+    socket: &UdpSocket,
+    data: &[u8],
+    from: SocketAddr,
+    state: &mut NetworkState,
+    app_handle: &tauri::AppHandle,
+    local_index: &Arc<RwLock<LocalIndex>>,
+    settings: &AppSettings,
+    db: &Arc<Database>,
+    active_port_tests: &Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, mpsc::Sender<()>>>>,
+    upload_queue: &ed2k::upload::UploadQueueRef,
+    credit_manager: &Arc<RwLock<CreditManager>>,
+) {
+    if let Err(p) = std::panic::AssertUnwindSafe(handle_udp_packet_inner(
+        socket,
+        data,
+        from,
+        state,
+        app_handle,
+        local_index,
+        settings,
+        db,
+        active_port_tests,
+        upload_queue,
+        credit_manager,
+    ))
+    .catch_unwind()
+    .await
+    {
+        error!(
+            "UDP packet handler panicked (recovered, network loop continues): {}",
+            describe_panic(&*p)
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_udp_packet_inner(
     socket: &UdpSocket,
     data: &[u8],
     from: SocketAddr,
@@ -15353,7 +15424,12 @@ async fn handle_udp_packet(
                 }
             }
 
-            // Persist peer to database
+            // Persist peer to database. This runs in the per-packet hot path
+            // on the single-threaded network loop, so push the synchronous
+            // SQLite write onto the blocking pool instead of stalling packet
+            // processing on disk I/O. The write is an idempotent upsert and
+            // already best-effort (errors were only logged), so fire-and-forget
+            // semantics are unchanged.
             let peer_info = PeerInfo {
                 id: hex::encode(sender_id.0),
                 addresses: vec![format!("{}:{}", ip, tcp_port)],
@@ -15362,9 +15438,12 @@ async fn handle_udp_packet(
                 files_shared: 0,
                 banned: false,
             };
-            if let Err(e) = db.save_peer(&peer_info) {
-                debug!("Failed to persist peer: {e}");
-            }
+            let db_for_peer = db.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = db_for_peer.save_peer(&peer_info) {
+                    debug!("Failed to persist peer: {e}");
+                }
+            });
         }
 
         KadMessage::HelloResAck { sender_id, tags: _ } => {
@@ -16490,7 +16569,82 @@ async fn handle_udp_packet(
     }
 }
 
+/// Panic-isolating wrapper around [`handle_command_inner`]. Frontend/IPC
+/// commands drive nearly every operation; a panic in one handler must not
+/// permanently freeze networking, so it is caught and the loop carries on.
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
+    socket: &UdpSocket,
+    cmd: NetworkCommand,
+    state: &mut NetworkState,
+    local_index: &Arc<RwLock<LocalIndex>>,
+    settings: &AppSettings,
+    dl_event_tx: &mpsc::Sender<DownloadEvent>,
+    bandwidth_limiter: &Arc<BandwidthLimiter>,
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    transfer_manager: &Arc<RwLock<TransferManager>>,
+    source_manager: &Arc<RwLock<SourceManager>>,
+    credit_manager: &Arc<RwLock<CreditManager>>,
+    stats_manager: &mut StatsManager,
+    known_files: &mut KnownFileList,
+    _server_udp: &ServerUdpSocket,
+    firewall_probe_ips: &upload_server::FirewallProbeSet,
+    shared_banned_ips: &upload_server::SharedBannedIps,
+    shared_banned_hashes: &upload_server::SharedBannedHashes,
+    shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
+    shared_ember_payload: &ember::SharedEmberPayload,
+    ember_payload_generation: &ember::EmberPayloadGeneration,
+    geoip: &crate::geoip::GeoIpReader,
+    friend_hashes: &crate::app_state::SharedFriendHashes,
+    ember_hash: [u8; 16],
+    ul_event_tx: &mpsc::Sender<upload_server::UploadEvent>,
+    ed25519_pubkey: [u8; 32],
+    ed25519_secret_key: [u8; 32],
+    upload_queue: &ed2k::upload::UploadQueueRef,
+) {
+    if let Err(p) = std::panic::AssertUnwindSafe(handle_command_inner(
+        socket,
+        cmd,
+        state,
+        local_index,
+        settings,
+        dl_event_tx,
+        bandwidth_limiter,
+        db,
+        app_handle,
+        transfer_manager,
+        source_manager,
+        credit_manager,
+        stats_manager,
+        known_files,
+        _server_udp,
+        firewall_probe_ips,
+        shared_banned_ips,
+        shared_banned_hashes,
+        shared_server_addr,
+        shared_ember_payload,
+        ember_payload_generation,
+        geoip,
+        friend_hashes,
+        ember_hash,
+        ul_event_tx,
+        ed25519_pubkey,
+        ed25519_secret_key,
+        upload_queue,
+    ))
+    .catch_unwind()
+    .await
+    {
+        error!(
+            "Network command handler panicked (recovered, network loop continues): {}",
+            describe_panic(&*p)
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_command_inner(
     socket: &UdpSocket,
     cmd: NetworkCommand,
     state: &mut NetworkState,
@@ -18050,18 +18204,20 @@ async fn handle_command(
             let _ = tx.send(outcome);
         }
 
-        NetworkCommand::KadBootstrapUrl { url, host, resolved_addrs, tx } => {
+        NetworkCommand::KadBootstrapUrl { url, tx } => {
             info!("KAD bootstrap from URL: {url}");
             const MAX_NODES_BYTES: usize = 10 * 1024 * 1024;
+            // `fetch_pinned_get` re-validates the URL and every redirect hop
+            // against the private-IP rules, so a malicious redirect can't
+            // pivot the bootstrap fetch onto an internal host.
             let outcome: Result<String, String> =
-                match crate::security::build_pinned_client(&host, &resolved_addrs) {
-                    Ok(client) => match client.get(&url).send().await {
+                match crate::security::fetch_pinned_get(&url).await {
                         Ok(resp) => {
                             if !resp.status().is_success() {
                                 Err(format!(
                                     "HTTP {} from {}",
                                     resp.status().as_u16(),
-                                    host
+                                    url
                                 ))
                             } else {
                                 let download_result: Result<Vec<u8>, String> = {
@@ -18156,9 +18312,7 @@ async fn handle_command(
                                 }
                             }
                         }
-                        Err(e) => Err(format!("Failed to reach {host}: {e}")),
-                    },
-                    Err(e) => Err(format!("Failed to build HTTP client for {url}: {e}")),
+                    Err(e) => Err(format!("KAD bootstrap fetch failed: {e}")),
                 };
             if let Err(ref e) = outcome {
                 warn!("KAD bootstrap from {url} failed: {e}");

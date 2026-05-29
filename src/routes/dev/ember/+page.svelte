@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { getEmberDiagnostics, emberPingPeer } from '$lib/api/ember';
   import { getSettings } from '$lib/api/settings';
+  import { translateError } from '$lib/i18n';
   import type { EmberDiagnostics, EmberPingResult } from '$lib/types';
 
   /**
@@ -46,7 +47,7 @@
       diag = await getEmberDiagnostics();
       diagError = null;
     } catch (e) {
-      diagError = e instanceof Error ? e.message : String(e);
+      diagError = translateError(e);
     } finally {
       inFlightDiag = false;
     }
@@ -77,7 +78,7 @@
     } catch (e) {
       pingResult = {
         success: false,
-        error: e instanceof Error ? e.message : String(e),
+        error: translateError(e),
       };
     } finally {
       pinging = false;
