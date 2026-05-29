@@ -1,4 +1,5 @@
 use crate::app_state::AppState;
+use crate::commands::errors::{coded, coded_ctx};
 use crate::network::NetworkCommand;
 use crate::types::ServerInfo;
 use tracing::info;
@@ -6,17 +7,17 @@ use tracing::info;
 async fn resolve_server_host(input: &str, port: u16) -> Result<String, String> {
     if let Ok(ip) = input.parse::<std::net::Ipv4Addr>() {
         if crate::security::is_special_use_v4(ip) {
-            return Err("Cannot connect to private/loopback addresses".into());
+            return Err(coded("server_private_addr", "Cannot connect to private/loopback addresses"));
         }
         return Ok(input.to_string());
     }
     let addr = tokio::net::lookup_host((input, port))
         .await
-        .map_err(|_| "Failed to resolve server address".to_string())?
+        .map_err(|_| coded("server_resolve_failed", "Failed to resolve server address"))?
         .find(|addr| addr.is_ipv4())
-        .ok_or_else(|| "No IPv4 address found for the given hostname".to_string())?;
+        .ok_or_else(|| coded("server_no_ipv4", "No IPv4 address found for the given hostname"))?;
     if crate::security::is_private_ip(addr.ip()) {
-        return Err("Server hostname resolves to a private/loopback address".into());
+        return Err(coded("server_resolves_private", "Server hostname resolves to a private/loopback address"));
     }
     Ok(addr.ip().to_string())
 }
@@ -28,17 +29,17 @@ pub async fn connect_to_server(
     port: u16,
 ) -> Result<String, String> {
     if ip.is_empty() {
-        return Err("Server IP is required".into());
+        return Err(coded("server_ip_required", "Server IP is required"));
     }
     if port == 0 {
-        return Err("Port must be greater than 0".into());
+        return Err(coded("server_port_invalid", "Port must be greater than 0"));
     }
     let resolved_ip = resolve_server_host(&ip, port).await?;
 
     state
         .network_tx
         .try_send(NetworkCommand::ConnectToServer { ip: resolved_ip.clone(), port })
-        .map_err(|e| format!("Network busy: {e}"))?;
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
     Ok(format!("Connecting to ed2k server {resolved_ip}:{port}..."))
 }
@@ -50,7 +51,7 @@ pub async fn disconnect_server(
     state
         .network_tx
         .try_send(NetworkCommand::DisconnectServer)
-        .map_err(|e| format!("Network busy: {e}"))?;
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
     Ok("Disconnected from ed2k server".into())
 }
@@ -63,10 +64,10 @@ pub async fn add_server(
     name: String,
 ) -> Result<String, String> {
     if ip.is_empty() {
-        return Err("Server IP is required".into());
+        return Err(coded("server_ip_required", "Server IP is required"));
     }
     if port == 0 {
-        return Err("Port must be greater than 0".into());
+        return Err(coded("server_port_invalid", "Port must be greater than 0"));
     }
     let resolved_ip = resolve_server_host(&ip, port).await?;
     let label_name = if name.trim().is_empty() {
@@ -79,9 +80,9 @@ pub async fn add_server(
     state
         .network_tx
         .try_send(NetworkCommand::AddServer { ip: resolved_ip, port, name: label_name, tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    rx.await.map_err(|_| "Failed to add server".to_string())?
+    rx.await.map_err(|_| coded("server_add_failed", "Failed to add server"))?
 }
 
 #[tauri::command]
@@ -91,7 +92,7 @@ pub async fn remove_server(
     port: u16,
 ) -> Result<String, String> {
     if ip.is_empty() {
-        return Err("Server IP is required".into());
+        return Err(coded("server_ip_required", "Server IP is required"));
     }
 
     let resolved_ip = resolve_server_host(&ip, port).await?;
@@ -100,9 +101,9 @@ pub async fn remove_server(
     state
         .network_tx
         .try_send(NetworkCommand::RemoveServer { ip: resolved_ip, port, tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    rx.await.map_err(|_| "Failed to remove server".to_string())?
+    rx.await.map_err(|_| coded("server_remove_failed", "Failed to remove server"))?
 }
 
 #[tauri::command]
@@ -113,8 +114,8 @@ pub async fn get_server_list(
     state
         .network_tx
         .try_send(NetworkCommand::GetServerListSnapshot { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    rx.await.map_err(|_| "Failed to get server list".to_string())
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    rx.await.map_err(|_| coded("server_list_failed", "Failed to get server list"))
 }
 
 #[tauri::command]
@@ -125,8 +126,8 @@ pub async fn get_connected_server(
     state
         .network_tx
         .try_send(NetworkCommand::GetConnectedServerSnapshot { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    rx.await.map_err(|_| "Failed to get connected server".to_string())
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    rx.await.map_err(|_| coded("server_connected_failed", "Failed to get connected server"))
 }
 
 #[tauri::command]
@@ -139,17 +140,17 @@ pub async fn download_server_met(
     info!("Downloading server.met");
 
     let client = crate::security::build_pinned_client(&host, &resolved_addrs)
-        .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
+        .map_err(|e| coded_ctx("http_client_failed", "Failed to build HTTP client", e))?;
 
     const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
     let response = client.get(&validated_url).send()
         .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?
+        .map_err(|e| coded_ctx("http_request_failed", "HTTP request failed", e))?
         .error_for_status()
-        .map_err(|e| format!("HTTP error: {e}"))?;
+        .map_err(|e| coded_ctx("http_error", "HTTP error", e))?;
     if let Some(cl) = response.content_length() {
         if cl > MAX_RESPONSE_BYTES as u64 {
-            return Err("Response too large (Content-Length exceeds limit)".into());
+            return Err(coded("response_too_large", "Response too large (Content-Length exceeds limit)"));
         }
     }
 
@@ -158,10 +159,10 @@ pub async fn download_server_met(
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| format!("Failed to read response: {e}"))?;
+            let chunk = chunk.map_err(|e| coded_ctx("response_read_failed", "Failed to read response", e))?;
             body.extend_from_slice(&chunk);
             if body.len() > MAX_RESPONSE_BYTES {
-                return Err("Response too large".into());
+                return Err(coded("response_too_large", "Response too large"));
             }
         }
         body
@@ -174,7 +175,7 @@ pub async fn download_server_met(
         let mut limited = decoder.take(MAX_DECOMPRESSED);
         let mut decompressed = Vec::new();
         limited.read_to_end(&mut decompressed)
-            .map_err(|e| format!("Failed to decompress gzip: {e}"))?;
+            .map_err(|e| coded_ctx("gzip_decompress_failed", "Failed to decompress gzip", e))?;
         decompressed
     } else {
         bytes.to_vec()
@@ -184,10 +185,10 @@ pub async fn download_server_met(
     state
         .network_tx
         .try_send(NetworkCommand::MergeServerMet { data, tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    let stats = rx.await.map_err(|_| "Failed to merge servers".to_string())?
-        .map_err(|e| format!("Failed to parse server.met: {e}"))?;
+    let stats = rx.await.map_err(|_| coded("server_merge_failed", "Failed to merge servers"))?
+        .map_err(|e| coded_ctx("server_met_parse_failed", "Failed to parse server.met", e))?;
 
     let msg = format!(
         "Downloaded server.met: {} added, {} updated, {} filtered",

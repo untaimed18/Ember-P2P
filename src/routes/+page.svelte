@@ -18,6 +18,7 @@
   import type { KadContact, KadSearchEntry } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
+  import { translateError } from '$lib/i18n';
 
   let contacts: KadContact[] = $state([]);
   let searches: KadSearchEntry[] = $state([]);
@@ -188,7 +189,7 @@
   }
 
   function toErrMsg(e: unknown, fallback: string): string {
-    return e instanceof Error ? e.message : typeof e === 'string' ? e : fallback;
+    return translateError(e, fallback);
   }
 
   async function handleConnect() {

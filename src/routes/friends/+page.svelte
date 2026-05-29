@@ -8,6 +8,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { toastWarning } from '$lib/stores/toast';
   import * as m from '$lib/paraglide/messages';
+  import { translateError } from '$lib/i18n';
   import {
     onlineFriends as onlineFriendsStore,
     unreadCounts as unreadCountsStore,
@@ -284,7 +285,7 @@
   }
 
   function toErr(e: unknown): string {
-    return e instanceof Error ? e.message : typeof e === 'string' ? e : m.error_operation_failed();
+    return translateError(e, m.error_operation_failed());
   }
 
   async function loadFriends() {

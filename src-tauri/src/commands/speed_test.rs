@@ -1,5 +1,6 @@
 use serde::Serialize;
 use tracing::info;
+use crate::commands::errors::coded_ctx;
 
 const DOWNLOAD_TEST_URL: &str = "https://speed.cloudflare.com/__down?bytes=5000000";
 const UPLOAD_TEST_URL: &str = "https://speed.cloudflare.com/__up";
@@ -20,7 +21,7 @@ pub async fn run_speed_test() -> Result<SpeedTestResult, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+        .map_err(|e| coded_ctx("http_client_failed", "Failed to build HTTP client", e))?;
 
     let dl_client = client.clone();
     let dl_fut = async move {
@@ -30,12 +31,12 @@ pub async fn run_speed_test() -> Result<SpeedTestResult, String> {
             .get(DOWNLOAD_TEST_URL)
             .send()
             .await
-            .map_err(|e| format!("Download test failed: {e}"))?;
+            .map_err(|e| coded_ctx("speed_download_test_failed", "Download test failed", e))?;
 
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| format!("Download test read failed: {e}"))?;
+            .map_err(|e| coded_ctx("speed_download_read_failed", "Download test read failed", e))?;
 
         let elapsed = start.elapsed().as_secs_f64();
         let actual_bytes = bytes.len() as u64;
@@ -62,7 +63,7 @@ pub async fn run_speed_test() -> Result<SpeedTestResult, String> {
             .body(payload)
             .send()
             .await
-            .map_err(|e| format!("Upload test failed: {e}"))?;
+            .map_err(|e| coded_ctx("speed_upload_test_failed", "Upload test failed", e))?;
 
         let elapsed = start.elapsed().as_secs_f64();
         let speed = if elapsed > 0.0 {

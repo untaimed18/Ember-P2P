@@ -5,6 +5,7 @@
   import { activeChatHash, clearUnread, onlineFriends } from '$lib/stores/friends';
   import { getDraft, setDraft, clearDraft } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
+  import { translateError } from '$lib/i18n';
 
   interface Props {
     friendHash: string;
@@ -171,7 +172,7 @@
     } catch (e: unknown) {
       if (gen !== loadGen) return;
       if (messages.length === 0) {
-        loadError = e instanceof Error ? e.message : typeof e === 'string' ? e : m.chat_failed_to_load();
+        loadError = translateError(e, m.chat_failed_to_load());
       }
     } finally {
       if (gen === loadGen) loading = false;
@@ -258,7 +259,7 @@
       // unconditionally.
       clearDraft(friendHash);
     } catch (e: unknown) {
-      sendError = e instanceof Error ? e.message : typeof e === 'string' ? e : m.chat_failed_to_send();
+      sendError = translateError(e, m.chat_failed_to_send());
     } finally {
       sending = false;
     }

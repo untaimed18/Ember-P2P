@@ -25,6 +25,7 @@ impl Drop for ScanGuard {
 static RELOAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 use crate::app_state::AppState;
+use crate::commands::errors::{coded, coded_ctx};
 use crate::network::NetworkCommand;
 use crate::search::index::LocalIndex;
 use crate::sharing::indexer::FileIndexer;
@@ -139,9 +140,9 @@ pub async fn add_shared_folder(
     }
     let p = std::path::Path::new(&path);
     if !p.exists() || !p.is_dir() {
-        return Err("Path does not exist or is not a directory".into());
+        return Err(coded("sharing_path_not_dir", "Path does not exist or is not a directory"));
     }
-    let canonical = p.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
+    let canonical = p.canonicalize().map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
     let blocked_segments: &[&str] = &[
         "windows", "program files", "program files (x86)",
         "programdata", ".ssh", ".gnupg",
@@ -152,7 +153,7 @@ pub async fn add_shared_folder(
         if let std::path::Component::Normal(seg) = component {
             let seg_lower = seg.to_string_lossy().to_lowercase();
             if blocked_segments.contains(&seg_lower.as_str()) {
-                return Err(format!("Cannot share system directory: {}", canonical.display()));
+                return Err(coded_ctx("sharing_cannot_share_system_dir", "Cannot share system directory", canonical.display()));
             }
             if seg_lower == "appdata" {
                 let rest: String = canonical.components()
@@ -168,7 +169,7 @@ pub async fn add_shared_folder(
                     .collect::<Vec<_>>()
                     .join("/");
                 if rest.starts_with("local/temp") || rest.starts_with("local\\temp") {
-                    return Err(format!("Cannot share system directory: {}", canonical.display()));
+                    return Err(coded_ctx("sharing_cannot_share_system_dir", "Cannot share system directory", canonical.display()));
                 }
             }
         }
@@ -179,7 +180,7 @@ pub async fn add_shared_folder(
         let mut config = state.config.write().await;
         if !config.settings.shared_folders.contains(&canonical_str) {
             config.settings.shared_folders.push(canonical_str.clone());
-            Some(config.prepare_save().map_err(|e| format!("Config save error: {e}"))?)
+            Some(config.prepare_save().map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?)
         } else {
             None
         }
@@ -197,7 +198,7 @@ pub async fn add_shared_folder(
     if let Some((data, tmp, final_path)) = save_data {
         tokio::task::spawn_blocking(move || {
             crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
-        }).await.map_err(|e| format!("Config save error: {e}"))?.map_err(|e| format!("Config save error: {e}"))?;
+        }).await.map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?.map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
     }
 
     // Start watching the new folder (and anything else currently shared).
@@ -454,7 +455,7 @@ pub async fn remove_shared_folder(
     let save_data = {
         let mut config = state.config.write().await;
         config.settings.shared_folders.retain(|f| !paths_equal_ignore_case(f, &canonical_path));
-        config.prepare_save().map_err(|e| format!("Config save error: {e}"))?
+        config.prepare_save().map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
     };
     {
         let mut live = state.upload_shared_folders.write().await;
@@ -464,7 +465,7 @@ pub async fn remove_shared_folder(
         let (data, tmp, final_path) = save_data;
         tokio::task::spawn_blocking(move || {
             crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
-        }).await.map_err(|e| format!("Config save error: {e}"))?.map_err(|e| format!("Config save error: {e}"))?;
+        }).await.map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?.map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
     }
 
     {
@@ -529,12 +530,12 @@ pub async fn set_file_priority(
 ) -> Result<(), String> {
     let valid = ["verylow", "low", "normal", "high", "release", "auto"];
     if !valid.contains(&priority.as_str()) {
-        return Err(format!("Invalid priority: {priority}"));
+        return Err(coded_ctx("sharing_invalid_priority", "Invalid priority", &priority));
     }
     let file_hash = {
         let mut index = state.local_index.write().await;
         if !index.set_file_priority_by_path(&file_path, &priority) {
-            return Err("File not found".to_string());
+            return Err(coded("sharing_file_not_found", "File not found"));
         }
         index.get_by_path(&file_path).map(|f| f.hash.clone())
     };
@@ -577,7 +578,7 @@ pub async fn batch_set_priority(
     }
     let valid = ["verylow", "low", "normal", "high", "release", "auto"];
     if !valid.contains(&priority.as_str()) {
-        return Err(format!("Invalid priority: {priority}"));
+        return Err(coded_ctx("sharing_invalid_priority", "Invalid priority", &priority));
     }
     let (count, hashes) = {
         let mut index = state.local_index.write().await;
@@ -1040,22 +1041,22 @@ pub async fn delete_shared_file(
         move || -> Result<std::path::PathBuf, String> {
             let path = std::path::Path::new(&file_path);
             if !path.exists() {
-                return Err("File does not exist".to_string());
+                return Err(coded("sharing_file_not_exist", "File does not exist"));
             }
             if !path.is_file() {
-                return Err("Path is not a file".to_string());
+                return Err(coded("sharing_path_not_file", "Path is not a file"));
             }
             let canonical = path
                 .canonicalize()
-                .map_err(|e| format!("Invalid path: {e}"))?;
+                .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
             if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-                return Err("File is not within a shared or download folder".to_string());
+                return Err(coded("sharing_file_not_in_shared", "File is not within a shared or download folder"));
             }
             Ok(canonical)
         }
     })
     .await
-    .map_err(|e| format!("Task failed: {e}"))??;
+    .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))??;
 
     delete_file_with_retry(&canonical, 6, 250).await?;
 
@@ -1107,7 +1108,7 @@ pub async fn scan_missing_files(
         missing
     })
     .await
-    .map_err(|e| format!("Scan task failed: {e}"))?;
+    .map_err(|e| coded_ctx("sharing_scan_task_failed", "Scan task failed", e))?;
     Ok(missing)
 }
 
@@ -1132,7 +1133,7 @@ pub async fn remove_missing_files(
             .collect::<Vec<_>>()
     })
     .await
-    .map_err(|e| format!("Scan task failed: {e}"))?;
+    .map_err(|e| coded_ctx("sharing_scan_task_failed", "Scan task failed", e))?;
 
     let mut removed = 0u32;
     {
@@ -1164,7 +1165,7 @@ pub async fn republish_file(
 ) -> Result<(), String> {
     let cleaned = file_hash.trim().to_lowercase();
     if cleaned.len() != 32 || hex::decode(&cleaned).is_err() {
-        return Err("Invalid file hash (expected 32-char hex MD4)".into());
+        return Err(coded("sharing_invalid_file_hash", "Invalid file hash (expected 32-char hex MD4)"));
     }
     let file_exists = {
         let index = state.local_index.read().await;
@@ -1174,12 +1175,12 @@ pub async fn republish_file(
             .any(|f| !f.hash.is_empty() && f.hash.eq_ignore_ascii_case(&cleaned))
     };
     if !file_exists {
-        return Err("File not found in shared index".into());
+        return Err(coded("sharing_file_not_in_index", "File not found in shared index"));
     }
     state
         .network_tx
         .try_send(NetworkCommand::RepublishFile { file_hash_hex: cleaned })
-        .map_err(|e| format!("Network busy: {e}"))?;
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     Ok(())
 }
 
@@ -1199,20 +1200,20 @@ pub async fn open_shared_file(
     tokio::task::spawn_blocking(move || {
         let path = std::path::Path::new(&file_path);
         if !path.exists() {
-            return Err("File does not exist".to_string());
+            return Err(coded("sharing_file_not_exist", "File does not exist"));
         }
-        let canonical = path.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
+        let canonical = path.canonicalize().map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
         if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-            return Err("File is not within a shared or download folder".to_string());
+            return Err(coded("sharing_file_not_in_shared", "File is not within a shared or download folder"));
         }
         if crate::security::is_dangerous_extension(&canonical.to_string_lossy()) {
-            return Err("Cannot open potentially dangerous file types".to_string());
+            return Err(coded("sharing_dangerous_file", "Cannot open potentially dangerous file types"));
         }
-        opener::open(&canonical).map_err(|e| format!("Failed to open file: {e}"))?;
+        opener::open(&canonical).map_err(|e| coded_ctx("sharing_open_file_failed", "Failed to open file", e))?;
         Ok(())
     })
     .await
-    .map_err(|e| format!("Task failed: {e}"))?
+    .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?
 }
 
 #[tauri::command]
@@ -1232,16 +1233,16 @@ pub async fn open_shared_folder(
         let path = std::path::Path::new(&file_path);
         let folder = path.parent().unwrap_or(path);
         if !folder.exists() {
-            return Err("Folder does not exist".to_string());
+            return Err(coded("sharing_folder_not_exist", "Folder does not exist"));
         }
-        let canonical = folder.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
+        let canonical = folder.canonicalize().map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
         if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
-            return Err("Folder is not within a shared or download directory".to_string());
+            return Err(coded("sharing_folder_not_in_shared", "Folder is not within a shared or download directory"));
         }
-        opener::open(&canonical).map_err(|e| format!("Failed to open folder: {e}"))?;
+        opener::open(&canonical).map_err(|e| coded_ctx("sharing_open_folder_failed", "Failed to open folder", e))?;
         Ok(())
     })
     .await
-    .map_err(|e| format!("Task failed: {e}"))?
+    .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?
 }
 
