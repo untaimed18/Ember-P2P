@@ -59,6 +59,17 @@ impl KnownFileList {
         if !path.exists() {
             return list;
         }
+        // known.met is app-managed, but a corrupt or maliciously-swapped file
+        // shouldn't be slurped wholesale. 50k records (the parse cap) is only
+        // a few MB, so this ceiling is very generous while still bounding the
+        // worst-case allocation.
+        const MAX_KNOWN_MET_BYTES: u64 = 256 * 1024 * 1024;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > MAX_KNOWN_MET_BYTES {
+                warn!("known.met too large ({} bytes), refusing to load", meta.len());
+                return list;
+            }
+        }
         match std::fs::read(path) {
             Ok(data) => {
                 if let Err(e) = list.parse_known_met(&data) {

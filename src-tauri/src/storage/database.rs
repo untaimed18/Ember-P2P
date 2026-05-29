@@ -1179,6 +1179,21 @@ impl Database {
     }
 
     pub fn insert_chat_message(&self, friend_hash: &str, direction: &str, message: &str) -> anyhow::Result<i64> {
+        // Cap stored message length. Incoming chat text comes straight off
+        // the wire from a peer, so bound it here (on a char boundary, so we
+        // never split a multi-byte sequence) to stop a hostile friend from
+        // bloating the DB with a single huge message. 4 KiB matches the
+        // comment-length ceiling used elsewhere.
+        const MAX_CHAT_MESSAGE_LEN: usize = 4096;
+        let message: &str = if message.len() > MAX_CHAT_MESSAGE_LEN {
+            let mut end = MAX_CHAT_MESSAGE_LEN;
+            while end > 0 && !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            &message[..end]
+        } else {
+            message
+        };
         // Per-friend retention cap. The frontend chat sidebar paginates
         // the most-recent messages, so storing more than this provides
         // no UX benefit while letting `chat_messages` grow without
@@ -1272,6 +1287,20 @@ impl Database {
         file_size: u64,
         status: &str,
     ) -> anyhow::Result<()> {
+        // Bound the stored file name (on a char boundary). Names originate
+        // from peer-supplied metadata, so a hostile source could otherwise
+        // persist an oversized string. eD2K names don't exceed ~255 bytes in
+        // practice; 1 KiB is generous headroom.
+        const MAX_HISTORY_NAME_LEN: usize = 1024;
+        let file_name: &str = if file_name.len() > MAX_HISTORY_NAME_LEN {
+            let mut end = MAX_HISTORY_NAME_LEN;
+            while end > 0 && !file_name.is_char_boundary(end) {
+                end -= 1;
+            }
+            &file_name[..end]
+        } else {
+            file_name
+        };
         let conn = self.conn.lock();
         let now = chrono::Utc::now().timestamp();
         conn.execute(

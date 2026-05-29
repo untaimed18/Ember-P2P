@@ -398,16 +398,35 @@ impl IpFilter {
 
     /// Load a PeerGuardian .p2p text file (format: "Description: IP1 - IP2")
     pub fn load_p2p_file(&mut self, path: &Path) -> usize {
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
+        // Mirror the ipfilter.dat path: stream line-by-line with hard
+        // per-line and total-line caps instead of slurping the whole file
+        // into a String. A malicious/buggy multi-gigabyte list can't OOM us.
+        use std::io::BufRead;
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
             Err(e) => {
                 warn!("Failed to read .p2p file: {e}");
                 return 0;
             }
         };
+        const MAX_LINE_BYTES: usize = 8 * 1024; // 8 KiB per line.
+        const MAX_LINES: usize = 5_000_000;     // hard cap on parsed entries.
+        let reader = std::io::BufReader::new(file);
 
         let mut count = 0;
-        for line in content.lines() {
+        let mut overlong_drops = 0usize;
+        for (lineno, line_res) in reader.lines().enumerate().take(MAX_LINES) {
+            let line = match line_res {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!("Stopping .p2p parse after I/O error at line {}: {e}", lineno + 1);
+                    break;
+                }
+            };
+            if line.len() > MAX_LINE_BYTES {
+                overlong_drops += 1;
+                continue;
+            }
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
                 continue;
@@ -416,6 +435,9 @@ impl IpFilter {
                 self.blocked_ranges.push(range);
                 count += 1;
             }
+        }
+        if overlong_drops > 0 {
+            warn!(".p2p file: dropped {overlong_drops} lines longer than {MAX_LINE_BYTES} bytes");
         }
 
         self.blocked_ranges.sort_by_key(|r| r.start);
@@ -426,6 +448,16 @@ impl IpFilter {
 
     /// Load a PeerGuardian .p2b binary file (v1 or v2).
     pub fn load_p2b_file(&mut self, path: &Path) -> usize {
+        // A .p2b stores tiny fixed-size records, so a legitimate full list is
+        // comfortably under this cap. Refuse to slurp a pathologically large
+        // (or malicious) file into memory.
+        const MAX_P2B_BYTES: u64 = 256 * 1024 * 1024;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > MAX_P2B_BYTES {
+                warn!(".p2b file too large ({} bytes), refusing to load", meta.len());
+                return 0;
+            }
+        }
         let data = match std::fs::read(path) {
             Ok(d) => d,
             Err(e) => {

@@ -9,6 +9,7 @@
   import SpeedInput from './SpeedInput.svelte';
   import { updateSettings as saveSettings, downloadNodesDat, downloadIpfilter } from '$lib/api/settings';
   import * as m from '$lib/paraglide/messages';
+  import { translateError } from '$lib/i18n';
 
   function fmtSpeedShort(bytesPerSec: number): string {
     return bytesPerSec > 0
@@ -173,7 +174,7 @@
     try {
       await saveSettings(partial);
     } catch (e) {
-      saveError = e instanceof Error ? e.message : String(e);
+      saveError = translateError(e, m.settings_save_failed());
       saving = false;
       return;
     }
@@ -203,7 +204,7 @@
     } catch (e) {
       // If this second save fails the wizard will show again — annoying but
       // safe. Surface the error.
-      saveError = e instanceof Error ? e.message : String(e);
+      saveError = translateError(e, m.settings_save_failed());
       return;
     }
 

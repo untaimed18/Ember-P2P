@@ -257,15 +257,17 @@ pub async fn validate_fetch_url(url: &str) -> Result<(String, String, Vec<std::n
 
 /// Build a reqwest client that pins DNS to pre-validated addresses,
 /// preventing TOCTOU DNS rebinding attacks.
+///
+/// Auto-redirects are DISABLED on purpose. reqwest's `resolve` map only
+/// pins the *original* host, so its built-in redirect follower would
+/// resolve any redirect target host through normal DNS — letting a
+/// malicious `Location: https://169.254.169.254/…` (or an internal
+/// hostname) sail straight past the private-IP checks in
+/// [`validate_fetch_url`]. Callers must follow redirects via
+/// [`fetch_pinned_get`], which re-validates every hop.
 pub fn build_pinned_client(host: &str, addrs: &[std::net::SocketAddr]) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
-        // K35: restrict redirects so a malicious bootstrap URL can't
-        // re-point to an internal host we never resolved (the
-        // `resolve`-map above only pins the *original* host). 3 hops is
-        // enough for legit hosting platforms (GitLab Pages, Cloudflare,
-        // etc.) while making a redirect-to-localhost or
-        // redirect-to-metadata-service attack impossible.
-        .redirect(reqwest::redirect::Policy::limited(3))
+        .redirect(reqwest::redirect::Policy::none())
         // Hard per-request ceiling. Bootstrap downloads should be small
         // and fast; anything over a minute is already failing.
         .timeout(std::time::Duration::from_secs(60))
@@ -274,6 +276,53 @@ pub fn build_pinned_client(host: &str, addrs: &[std::net::SocketAddr]) -> Result
         builder = builder.resolve(host, *addr);
     }
     builder.build().map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+/// Maximum number of HTTP redirects [`fetch_pinned_get`] will follow before
+/// giving up. Generous enough for real hosting platforms (e.g. a
+/// `releases/download` → CDN hop) without enabling redirect loops.
+const MAX_FETCH_REDIRECTS: usize = 5;
+
+/// GET a URL with full SSRF protection across redirects.
+///
+/// Every hop — the initial URL and each `Location` target — is run through
+/// [`validate_fetch_url`] (https-only, no userinfo, DNS resolved, private/
+/// loopback/link-local addresses rejected) and fetched through a freshly
+/// DNS-pinned client. This closes the redirect-bypass hole that a single
+/// up-front validation + auto-following client would leave open.
+///
+/// Returns the final non-redirect [`reqwest::Response`]; the caller is
+/// responsible for status checks (`error_for_status`) and body/size limits.
+pub async fn fetch_pinned_get(initial_url: &str) -> Result<reqwest::Response, String> {
+    let mut current = initial_url.to_string();
+    for _ in 0..=MAX_FETCH_REDIRECTS {
+        let (validated_url, host, resolved_addrs) = validate_fetch_url(&current).await?;
+        let client = build_pinned_client(&host, &resolved_addrs)?;
+        let resp = client
+            .get(&validated_url)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {e}"))?;
+
+        if resp.status().is_redirection() {
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| "Redirect response had no usable Location header".to_string())?;
+            // Resolve relative redirects against the URL we just fetched.
+            let base = reqwest::Url::parse(&validated_url)
+                .map_err(|e| format!("Could not parse request URL: {e}"))?;
+            let next = base
+                .join(location)
+                .map_err(|e| format!("Invalid redirect target: {e}"))?;
+            current = next.to_string();
+            continue;
+        }
+
+        return Ok(resp);
+    }
+    Err(format!("Too many redirects (more than {MAX_FETCH_REDIRECTS})"))
 }
 
 /// Check whether a canonical path is within one of the allowed directories.
