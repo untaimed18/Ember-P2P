@@ -6895,7 +6895,7 @@ pub async fn start_network(
                                 );
                                 {
                                     let mut mgr = transfer_manager.write().await;
-                                    mgr.update_sources(&transfer_id, indirect_count as u32, 0, 0);
+                                    mgr.update_source_total(&transfer_id, indirect_count as u32);
                                     // Skip rows when the peer IP is already
                                     // represented — either by an existing
                                     // placeholder from a prior search cycle
@@ -7001,8 +7001,6 @@ pub async fn start_network(
                                     "id": &transfer_id,
                                     "status": "searching",
                                     "sources": indirect_count,
-                                    "active_sources": 0,
-                                    "queued_sources": 0,
                                 }));
                                 state.pending_downloads.insert(transfer_id, pending);
                             } else {
@@ -7039,8 +7037,7 @@ pub async fn start_network(
                                 // significantly lower than eMule's for
                                 // the same file.
                                 let visible_total = (total_found as u32).saturating_add(type6_count as u32);
-                                let source_count = visible_total.max(sm_known);
-                                {
+                                    let source_count = visible_total.max(sm_known);
                                     let mut mgr = transfer_manager.write().await;
                                     mgr.update_status(&transfer_id, TransferStatus::Active);
                                     mgr.update_sources(&transfer_id, source_count, 0, 0);
@@ -7215,7 +7212,6 @@ pub async fn start_network(
                                             now_ts,
                                         );
                                     }
-                                }
                                 let peer_desc = sources.iter()
                                     .map(|(ip, port)| format!("{ip}:{port}"))
                                     .collect::<Vec<_>>()
@@ -7426,28 +7422,23 @@ pub async fn start_network(
                                     let visible_total = (total_found as u32).saturating_add(type6_count as u32);
                                     let source_count = visible_total.max(sm_known);
                                     let mut mgr = transfer_manager.write().await;
-                                    mgr.update_sources(&transfer_id, source_count, 0, 0);
-                                    // Push the new count to the UI.
-                                    // `mgr.update_sources` alone only
-                                    // mutates backend state — without an
-                                    // explicit `transfer-sources` emit the
-                                    // frontend's Sources column stays on
-                                    // whatever value was last broadcast
-                                    // (typically the initial direct-only
-                                    // server count, e.g. 3-4) even after
-                                    // we've discovered 7+ callback peers
-                                    // and a type-6. That mismatch is the
-                                    // "column says 4 but detail list shows
-                                    // 8" UI bug.
-                                    let _ = app_handle.emit(
-                                        "transfer-sources",
-                                        &crate::types::TransferSourcesPayload {
-                                            id: &transfer_id,
-                                            sources: source_count,
-                                            active_sources: 0,
-                                            queued_sources: 0,
-                                        },
-                                    );
+                                    mgr.update_source_total(&transfer_id, source_count);
+                                    // Push the new count to the UI without
+                                    // zeroing live active/queued counters
+                                    // the multi-source worker maintains.
+                                    if let Some((sources, active_sources, queued_sources)) =
+                                        mgr.source_counts(&transfer_id)
+                                    {
+                                        let _ = app_handle.emit(
+                                            "transfer-sources",
+                                            &crate::types::TransferSourcesPayload {
+                                                id: &transfer_id,
+                                                sources,
+                                                active_sources,
+                                                queued_sources,
+                                            },
+                                        );
+                                    }
                                     // Populate UI source-detail rows for
                                     // callback and type-6 sources so the
                                     // transfer's Sources tab reflects
@@ -19511,19 +19502,27 @@ async fn handle_download_event(
             active,
             queued,
         } => {
-            {
+            let payload = {
                 let mut mgr = transfer_manager.write().await;
-                mgr.update_sources(&transfer_id, total, active, queued);
-            }
-            let _ = app_handle.emit(
-                "transfer-sources",
-                &crate::types::TransferSourcesPayload {
-                    id: &transfer_id,
-                    sources: total,
-                    active_sources: active,
-                    queued_sources: queued,
-                },
-            );
+                mgr.update_source_live(&transfer_id, active, queued);
+                mgr.update_source_total(&transfer_id, total);
+                mgr.source_counts(&transfer_id)
+                    .map(|(sources, active_sources, queued_sources)| {
+                        crate::types::TransferSourcesPayload {
+                            id: transfer_id.as_str(),
+                            sources,
+                            active_sources,
+                            queued_sources,
+                        }
+                    })
+                    .unwrap_or(crate::types::TransferSourcesPayload {
+                        id: transfer_id.as_str(),
+                        sources: total,
+                        active_sources: active,
+                        queued_sources: queued,
+                    })
+            };
+            let _ = app_handle.emit("transfer-sources", &payload);
         }
         DownloadEvent::SourceDetail {
             transfer_id,
