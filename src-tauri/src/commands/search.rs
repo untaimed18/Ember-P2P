@@ -28,6 +28,46 @@ const MAX_MARK_SPAM_KEYWORDS: usize = 32;
 /// Maximum keyword length in a `mark_spam` payload.
 const MAX_MARK_SPAM_KEYWORD_LEN: usize = 256;
 
+/// Shared input bounds for the spam IPC payloads (`mark_spam` and
+/// `explain_spam_result`). Both accept attacker-influenceable strings from
+/// the renderer, so they must reject oversized inputs identically before
+/// constructing a `SearchResult` / touching the spam filter.
+fn validate_spam_payload(
+    file_name: &str,
+    source_addresses: &[String],
+    search_keywords: &[String],
+) -> Result<(), String> {
+    if file_name.len() > MAX_MARK_SPAM_FILENAME {
+        return Err(coded_ctx(
+            "search_spam_filename_too_long",
+            format!("file_name exceeds {MAX_MARK_SPAM_FILENAME} bytes"),
+            MAX_MARK_SPAM_FILENAME,
+        ));
+    }
+    if source_addresses.len() > MAX_MARK_SPAM_SOURCES {
+        return Err(coded_ctx(
+            "search_spam_too_many_sources",
+            format!("Too many source_addresses (max {MAX_MARK_SPAM_SOURCES})"),
+            MAX_MARK_SPAM_SOURCES,
+        ));
+    }
+    if search_keywords.len() > MAX_MARK_SPAM_KEYWORDS {
+        return Err(coded_ctx(
+            "search_spam_too_many_keywords",
+            format!("Too many search_keywords (max {MAX_MARK_SPAM_KEYWORDS})"),
+            MAX_MARK_SPAM_KEYWORDS,
+        ));
+    }
+    if search_keywords.iter().any(|k| k.len() > MAX_MARK_SPAM_KEYWORD_LEN) {
+        return Err(coded_ctx(
+            "search_spam_keyword_too_long",
+            format!("a search_keyword exceeds {MAX_MARK_SPAM_KEYWORD_LEN} bytes"),
+            MAX_MARK_SPAM_KEYWORD_LEN,
+        ));
+    }
+    Ok(())
+}
+
 fn parse_exact_file_hash(file_hash: &str) -> Result<[u8; 16], String> {
     if file_hash.len() != 32 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(coded("search_invalid_file_hash_hex", "Invalid file hash: expected 32 hex characters"));
@@ -105,9 +145,10 @@ pub async fn search_files(
     min_availability: Option<u32>,
 ) -> Result<Vec<SearchResult>, String> {
     if query.len() > MAX_SEARCH_QUERY_LEN {
-        return Err(format!(
-            "Search query exceeds {MAX_SEARCH_QUERY_LEN} bytes ({}); shorten it",
-            query.len()
+        return Err(coded_ctx(
+            "search_query_too_long",
+            format!("Search query exceeds {MAX_SEARCH_QUERY_LEN} bytes; shorten it"),
+            MAX_SEARCH_QUERY_LEN,
         ));
     }
     let (tx, rx) = oneshot::channel();
@@ -162,7 +203,7 @@ pub async fn search_files(
             let _ = state
                 .network_tx
                 .try_send(NetworkCommand::CancelSearch { request_id });
-            return Err(format!("Search timed out after {timeout_secs}s"));
+            return Err(coded_ctx("search_timed_out", format!("Search timed out after {timeout_secs}s"), timeout_secs));
         }
     };
 
@@ -348,27 +389,7 @@ pub async fn mark_spam(
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err(coded("search_invalid_file_hash", "Invalid file hash"));
     }
-    if file_name.len() > MAX_MARK_SPAM_FILENAME {
-        return Err(format!(
-            "file_name exceeds {MAX_MARK_SPAM_FILENAME} bytes"
-        ));
-    }
-    if source_addresses.len() > MAX_MARK_SPAM_SOURCES {
-        return Err(format!(
-            "Too many source_addresses (max {MAX_MARK_SPAM_SOURCES})"
-        ));
-    }
-    if search_keywords.len() > MAX_MARK_SPAM_KEYWORDS {
-        return Err(format!(
-            "Too many search_keywords (max {MAX_MARK_SPAM_KEYWORDS})"
-        ));
-    }
-    if let Some(too_long) = search_keywords.iter().find(|k| k.len() > MAX_MARK_SPAM_KEYWORD_LEN) {
-        return Err(format!(
-            "search_keyword '{}' exceeds {MAX_MARK_SPAM_KEYWORD_LEN} bytes",
-            &too_long.chars().take(32).collect::<String>(),
-        ));
-    }
+    validate_spam_payload(&file_name, &source_addresses, &search_keywords)?;
     let result = SearchResult {
         file: crate::types::FileInfo {
             id: file_hash.clone(),
@@ -486,6 +507,7 @@ pub async fn explain_spam_result(
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err(coded("search_invalid_file_hash", "Invalid file hash"));
     }
+    validate_spam_payload(&file_name, &source_addresses, &search_keywords)?;
     let result = SearchResult {
         file: crate::types::FileInfo {
             id: file_hash.clone(),
@@ -559,10 +581,10 @@ pub async fn get_download_history(
     // caller pushing a million-element vector.
     const MAX_HISTORY_BATCH: usize = 5_000;
     if hashes.len() > MAX_HISTORY_BATCH {
-        return Err(format!(
-            "Too many hashes in one batch ({} > {} max) — chunk the request",
-            hashes.len(),
-            MAX_HISTORY_BATCH
+        return Err(coded_ctx(
+            "search_history_batch_too_large",
+            format!("Too many hashes in one batch (max {MAX_HISTORY_BATCH}) — chunk the request"),
+            MAX_HISTORY_BATCH,
         ));
     }
     let db = state.db.clone();

@@ -319,7 +319,19 @@ impl SpamFilter {
 
         let stripped = name_without_keywords(name, search_keywords);
         if stripped.len() >= MIN_SIMILAR_NAME_LEN && stripped.len() <= MAX_LEVENSHTEIN_LEN {
+            // `strsim::normalized_levenshtein` works on chars, so prefilter on
+            // char counts. Similarity is bounded by 1 - |Δlen| / max(len): the
+            // lowest scoring threshold below is 0.70, so any candidate whose
+            // length differs by ≥30% can't score and we skip the O(n·m) DP.
+            let stripped_chars = stripped.chars().count();
             for similar in &self.db.spam_similar_names {
+                let similar_chars = similar.chars().count();
+                let max_chars = stripped_chars.max(similar_chars);
+                if max_chars == 0
+                    || (stripped_chars.abs_diff(similar_chars) as f64) / (max_chars as f64) >= 0.30
+                {
+                    continue;
+                }
                 let sim = normalized_levenshtein(&stripped, similar);
                 if sim > 0.95 {
                     score += SPAM_SIMILARNAME_HIT;

@@ -573,10 +573,13 @@ export function startTransferPoll() {
     if (!pollPumpOnNextVisible && Date.now() - lastEventUpdate < 2000) return;
     pollPumpOnNextVisible = false;
     busy = true;
+    let pollTimeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const all = await Promise.race([
         getTransfers(),
-        new Promise<never>((_, reject) => setTimeout(() => reject('timeout'), 4000)),
+        new Promise<never>((_, reject) => {
+          pollTimeout = setTimeout(() => reject('timeout'), 4000);
+        }),
       ]);
       transfers.update((current) => {
         const now = Date.now();
@@ -622,6 +625,8 @@ export function startTransferPoll() {
     } catch {
       // Ignore timeouts and errors
     } finally {
+      // Clear the race watchdog so the loser timer doesn't linger.
+      if (pollTimeout) clearTimeout(pollTimeout);
       busy = false;
     }
   };

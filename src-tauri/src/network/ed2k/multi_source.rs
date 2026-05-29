@@ -1882,7 +1882,14 @@ impl MultiSourceDownload {
             // when it receives `OP_QUEUERANKING`). Doing this at
             // round boundary avoids holding the mutex while we work.
             {
-                let mut queued = peers_that_queued.lock().unwrap();
+                // Recover the inner set if the mutex was poisoned by a panic
+                // in a worker task — the contained data is still consistent
+                // (only HashSet inserts happen under this lock) and dropping
+                // the whole download over an unrelated panic would be worse
+                // than continuing. The other lock sites likewise tolerate it.
+                let mut queued = peers_that_queued
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 for key in queued.drain() {
                     if let Some(entry) = source_dial_history.get_mut(&key) {
                         entry.1 = CooldownKind::Queued;

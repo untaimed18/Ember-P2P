@@ -199,7 +199,7 @@
     try {
       await kadRecheckFirewall();
     } catch (e) {
-      recheckError = e instanceof Error ? e.message : String(e);
+      recheckError = translateError(e, m.error_operation_failed());
     }
     clearTimeout(recheckTimer);
     recheckTimer = setTimeout(() => { recheckingFirewall = false; }, 5000);

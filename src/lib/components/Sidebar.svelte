@@ -286,7 +286,7 @@
           <line x1="11" y1="4" x2="9" y2="16"/>
         </svg>
       </span>
-      <span>{devNavItem.label}</span>
+      <span>{devNavItem.label()}</span>
     </a>
     <button
       type="button"

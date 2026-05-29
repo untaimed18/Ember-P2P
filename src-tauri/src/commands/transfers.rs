@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use tauri::Emitter;
 
 use crate::app_state::AppState;
-use crate::commands::errors::{coded, coded_ctx};
+use crate::commands::errors::{await_reply, coded, coded_ctx, CMD_REPLY_TIMEOUT};
 use crate::network::NetworkCommand;
 use crate::sharing::manager::TransferControl;
 use crate::types::*;
@@ -440,11 +440,29 @@ pub async fn start_download(
     })
 }
 
+/// Upper bound on how many transfer IDs a single batch command will act on.
+/// The UI can only ever select what's on screen, so this is generous; it
+/// exists purely to stop a buggy or hostile caller from handing us an
+/// unbounded list that would tie up the transfer manager lock in a long loop.
+const MAX_BATCH_TRANSFER_IDS: usize = 10_000;
+
+fn check_batch_size(transfer_ids: &[String]) -> Result<(), String> {
+    if transfer_ids.len() > MAX_BATCH_TRANSFER_IDS {
+        return Err(coded_ctx(
+            "transfers_batch_too_large",
+            "Too many transfers in a single request",
+            transfer_ids.len(),
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn pause_transfers_batch(
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
+    check_batch_size(&transfer_ids)?;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
     for transfer_id in &transfer_ids {
         let (status, promoted) = {
@@ -481,6 +499,7 @@ pub async fn resume_transfers_batch(
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
+    check_batch_size(&transfer_ids)?;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
     let mut restart_ids: Vec<String> = Vec::new();
     for transfer_id in transfer_ids {
@@ -529,6 +548,7 @@ pub async fn stop_transfers_batch(
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
+    check_batch_size(&transfer_ids)?;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
     for transfer_id in transfer_ids {
         let promoted = {
@@ -560,6 +580,7 @@ pub async fn cancel_transfers_batch(
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
+    check_batch_size(&transfer_ids)?;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
     for transfer_id in transfer_ids {
         let (promoted, cancelled_info) = {
@@ -588,7 +609,7 @@ pub async fn cancel_transfers_batch(
                 cleanup_ack: Some(ack_tx),
             })
             .await;
-        let _ = ack_rx.await;
+        let _ = tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await;
 
         let dl_folder = {
             let config = state.config.read().await;
@@ -877,7 +898,7 @@ pub async fn cancel_transfer(
             config.settings.download_folder.clone()
         },
     );
-    let _ = ack_rx.await;
+    let _ = tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await;
     cleanup_partial_files(&dl_folder, &transfer_id).await;
 
     {
@@ -919,7 +940,7 @@ pub async fn remove_transfer(
             config.settings.download_folder.clone()
         },
     );
-    let _ = ack_rx.await;
+    let _ = tokio::time::timeout(CMD_REPLY_TIMEOUT, ack_rx).await;
     let db = state.db.clone();
     let tid = transfer_id.clone();
     tokio::join!(
@@ -951,7 +972,7 @@ pub async fn get_upload_queue(
         .network_tx
         .try_send(NetworkCommand::GetUploadQueueSnapshot { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("transfers_upload_queue_failed", "Failed to get upload queue"))
+    await_reply(rx, "transfers_upload_queue_failed", "Failed to get upload queue").await
 }
 
 /// Snapshot of every persisted SecIdent credit record. Backs the
@@ -966,7 +987,7 @@ pub async fn get_known_clients(
         .network_tx
         .try_send(NetworkCommand::GetKnownClientsSnapshot { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("transfers_known_clients_failed", "Failed to get known clients"))
+    await_reply(rx, "transfers_known_clients_failed", "Failed to get known clients").await
 }
 
 #[tauri::command]

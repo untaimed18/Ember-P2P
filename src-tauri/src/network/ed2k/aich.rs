@@ -365,9 +365,19 @@ impl AICHRecoveryHashSet {
     /// left=2*parent, right=2*parent+1).  This is the format that stock eMule,
     /// aMule, and all known mods expect in `OP_AICHANSWER`.
     pub fn create_part_recovery_data(&self, part_index: usize, _part_size: usize) -> Vec<u8> {
-        let start_block = part_index * BLOCKS_PER_FULL_PART;
+        let start_block = part_index.saturating_mul(BLOCKS_PER_FULL_PART);
+        // `part_index` can originate from an untrusted peer's OP_AICHREQUEST
+        // (a raw u16 off the wire), so it may point past the end of the leaf
+        // table. Clamp `start_block` to the table length before slicing —
+        // otherwise `start_block > end_block` panics the upload task. An
+        // out-of-range part simply has no recovery data, so emit the empty
+        // (count=0/count=0) envelope.
         let end_block = (start_block + BLOCKS_PER_FULL_PART).min(self.leaf_hashes.len());
-        let part_leaves = &self.leaf_hashes[start_block..end_block];
+        let part_leaves = if start_block >= self.leaf_hashes.len() {
+            &[][..]
+        } else {
+            &self.leaf_hashes[start_block..end_block]
+        };
 
         if part_leaves.is_empty() {
             let mut data = Vec::with_capacity(4);

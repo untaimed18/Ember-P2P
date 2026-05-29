@@ -6,7 +6,7 @@ use tracing::info;
 use zip::ZipArchive;
 
 use crate::app_state::AppState;
-use crate::commands::errors::{coded, coded_ctx};
+use crate::commands::errors::{await_reply, coded, coded_ctx};
 use crate::network::kad::ip_filter::IpFilterStats;
 use crate::network::NetworkCommand;
 
@@ -55,18 +55,26 @@ fn extract_ipfilter_from_zip(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
         coded("security_archive_no_usable_ipfilter", "Archive does not contain a usable ipfilter.dat/.dat/.txt/.p2p file")
     })?;
 
-    let mut entry = archive
+    let entry = archive
         .by_index(selected_idx)
         .map_err(|e| coded_ctx("security_failed_to_read_selected_archive_entry", "Failed to read selected archive entry", e))?;
+    // Reject early on the declared size, but never *trust* it: `entry.size()`
+    // is central-directory metadata an attacker fully controls, and the
+    // deflate reader decompresses until the compressed stream ends rather
+    // than stopping at the declared length. So cap the *actual* decompressed
+    // stream with `take` — a zip bomb that understates its size can't grow
+    // the buffer past the limit and exhaust memory.
     if entry.size() > MAX_RESPONSE_BYTES as u64 {
         return Err(coded("security_extracted_ipfilter_too_large", "Extracted ipfilter.dat is too large"));
     }
 
-    let mut extracted = Vec::with_capacity(entry.size() as usize);
+    let cap = MAX_RESPONSE_BYTES as u64;
+    let mut extracted = Vec::new();
     entry
+        .take(cap + 1)
         .read_to_end(&mut extracted)
         .map_err(|e| coded_ctx("security_failed_to_extract_ipfilter", "Failed to extract ipfilter.dat", e))?;
-    if extracted.len() > MAX_RESPONSE_BYTES {
+    if extracted.len() as u64 > cap {
         return Err(coded("security_extracted_ipfilter_too_large", "Extracted ipfilter.dat is too large"));
     }
     Ok(extracted)
@@ -190,13 +198,7 @@ pub async fn download_and_load_ipfilter(
 ) -> Result<String, String> {
     info!("Downloading ipfilter.zip from {DEFAULT_IPFILTER_ARCHIVE_URL}");
 
-    let (validated_url, host, resolved_addrs) = crate::security::validate_fetch_url(DEFAULT_IPFILTER_ARCHIVE_URL).await
-        .map_err(|e| coded_ctx("security_url_validation_failed", "URL validation failed", e))?;
-    let client = crate::security::build_pinned_client(&host, &resolved_addrs)
-        .map_err(|e| coded_ctx("security_failed_to_build_http_client", "Failed to build HTTP client", e))?;
-
-    let response = client.get(&validated_url).send()
-        .await
+    let response = crate::security::fetch_pinned_get(DEFAULT_IPFILTER_ARCHIVE_URL).await
         .map_err(|e| coded_ctx("security_http_request_failed", "HTTP request failed", e))?
         .error_for_status()
         .map_err(|e| coded_ctx("security_http_error", "HTTP error", e))?;
@@ -297,17 +299,10 @@ pub async fn update_ipfilter_from_url(
     state: tauri::State<'_, AppState>,
     url: String,
 ) -> Result<String, String> {
-    let (validated_url, host, resolved_addrs) = crate::security::validate_fetch_url(&url).await?;
-
-    info!("Updating IP filter from URL: {validated_url}");
-
-    let client = crate::security::build_pinned_client(&host, &resolved_addrs)
-        .map_err(|e| coded_ctx("security_failed_to_build_http_client", "Failed to build HTTP client", e))?;
+    info!("Updating IP filter from a user-supplied URL");
 
     const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
-    let response = client
-        .get(&validated_url)
-        .send()
+    let response = crate::security::fetch_pinned_get(&url)
         .await
         .map_err(|e| coded_ctx("security_http_request_failed", "HTTP request failed", e))?
         .error_for_status()
@@ -541,7 +536,7 @@ pub async fn get_antileech_patterns(
         .network_tx
         .try_send(NetworkCommand::GetAntiLeechSnapshot { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("security_failed_to_read_antileech", "Failed to read anti-leech filter"))
+    await_reply(rx, "security_failed_to_read_antileech", "Failed to read anti-leech filter").await
 }
 
 /// Replace the entire pattern list, persist to disk, and recompile.
@@ -558,7 +553,7 @@ pub async fn set_antileech_patterns(
         .network_tx
         .try_send(NetworkCommand::SetAntiLeechPatterns { patterns, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("security_failed_to_update_antileech", "Failed to update anti-leech filter"))?
+    await_reply(rx, "security_failed_to_update_antileech", "Failed to update anti-leech filter").await?
 }
 
 /// Toggle the filter on or off without touching the pattern list.
@@ -574,7 +569,7 @@ pub async fn set_antileech_enabled(
         .network_tx
         .try_send(NetworkCommand::SetAntiLeechEnabled { enabled, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("security_failed_to_toggle_antileech", "Failed to toggle anti-leech filter"))??;
+    await_reply(rx, "security_failed_to_toggle_antileech", "Failed to toggle anti-leech filter").await??;
 
     // Persist the toggle to the config file so a restart preserves it.
     // Done after the network task confirms the flip so a failure mid-
@@ -610,5 +605,5 @@ pub async fn reset_antileech_to_defaults(
         .network_tx
         .try_send(NetworkCommand::ResetAntiLeechToDefaults { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("security_failed_to_reset_antileech", "Failed to reset anti-leech filter"))?
+    await_reply(rx, "security_failed_to_reset_antileech", "Failed to reset anti-leech filter").await?
 }
