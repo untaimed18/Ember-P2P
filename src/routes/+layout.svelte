@@ -13,7 +13,7 @@
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
-  import { applyDocumentLang } from '$lib/i18n';
+  import { applyDocumentLang, translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
   import { getSettings, hideToTray, quitApp, setCloseBehavior } from '$lib/api/settings';
   import type { AppSettings } from '$lib/types';
@@ -199,7 +199,7 @@
         cleanupTransferStore();
         cleanupSearchStore();
         cleanupFriendsStore();
-        initError = e instanceof Error ? e.message : m.layout_init_failed();
+        initError = translateError(e, m.layout_init_failed());
         initialized = true;
         releaseSplashWhenReady();
       });

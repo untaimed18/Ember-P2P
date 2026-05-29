@@ -64,10 +64,10 @@ pub async fn create_collection(
     // loader will enforce the same cap on read-back.
     const MAX_COLLECTION_FILES: usize = 100_000;
     if files.len() > MAX_COLLECTION_FILES {
-        return Err(format!(
-            "Collection too large ({} files > {} max)",
-            files.len(),
-            MAX_COLLECTION_FILES
+        return Err(coded_ctx(
+            "collections_too_large",
+            format!("Collection too large (max {MAX_COLLECTION_FILES} files)"),
+            MAX_COLLECTION_FILES,
         ));
     }
     let collection = Collection {

@@ -256,10 +256,13 @@ export function startStatsPoll() {
     }
     if (!statsPumpOnNextVisible && Date.now() - lastEventUpdate < 5500) return;
     statsPumpOnNextVisible = false;
+    let pollTimeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const stats = await Promise.race([
         getNetworkStats(),
-        new Promise<never>((_, reject) => setTimeout(() => reject('timeout'), 4000)),
+        new Promise<never>((_, reject) => {
+          pollTimeout = setTimeout(() => reject('timeout'), 4000);
+        }),
       ]);
       lastPollOkAt = Date.now();
       lastNetworkUpdate = lastPollOkAt;
@@ -285,6 +288,9 @@ export function startStatsPoll() {
       });
     } catch {
       networkStats.update((current) => withDerivedNetworkState(current));
+    } finally {
+      // Clear the race watchdog so the loser timer doesn't linger.
+      if (pollTimeout) clearTimeout(pollTimeout);
     }
   }, 3000);
 

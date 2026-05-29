@@ -1,5 +1,5 @@
 use crate::app_state::AppState;
-use crate::commands::errors::{coded, coded_ctx};
+use crate::commands::errors::{await_reply, coded, coded_ctx};
 use crate::network::NetworkCommand;
 use crate::types::ServerInfo;
 use tracing::info;
@@ -82,7 +82,7 @@ pub async fn add_server(
         .try_send(NetworkCommand::AddServer { ip: resolved_ip, port, name: label_name, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    rx.await.map_err(|_| coded("server_add_failed", "Failed to add server"))?
+    await_reply(rx, "server_add_failed", "Failed to add server").await?
 }
 
 #[tauri::command]
@@ -103,7 +103,7 @@ pub async fn remove_server(
         .try_send(NetworkCommand::RemoveServer { ip: resolved_ip, port, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    rx.await.map_err(|_| coded("server_remove_failed", "Failed to remove server"))?
+    await_reply(rx, "server_remove_failed", "Failed to remove server").await?
 }
 
 #[tauri::command]
@@ -115,7 +115,7 @@ pub async fn get_server_list(
         .network_tx
         .try_send(NetworkCommand::GetServerListSnapshot { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("server_list_failed", "Failed to get server list"))
+    await_reply(rx, "server_list_failed", "Failed to get server list").await
 }
 
 #[tauri::command]
@@ -127,7 +127,7 @@ pub async fn get_connected_server(
         .network_tx
         .try_send(NetworkCommand::GetConnectedServerSnapshot { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("server_connected_failed", "Failed to get connected server"))
+    await_reply(rx, "server_connected_failed", "Failed to get connected server").await
 }
 
 #[tauri::command]
@@ -135,16 +135,10 @@ pub async fn download_server_met(
     state: tauri::State<'_, AppState>,
     url: String,
 ) -> Result<String, String> {
-    let (validated_url, host, resolved_addrs) = crate::security::validate_fetch_url(&url).await?;
-
     info!("Downloading server.met");
 
-    let client = crate::security::build_pinned_client(&host, &resolved_addrs)
-        .map_err(|e| coded_ctx("http_client_failed", "Failed to build HTTP client", e))?;
-
     const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-    let response = client.get(&validated_url).send()
-        .await
+    let response = crate::security::fetch_pinned_get(&url).await
         .map_err(|e| coded_ctx("http_request_failed", "HTTP request failed", e))?
         .error_for_status()
         .map_err(|e| coded_ctx("http_error", "HTTP error", e))?;
@@ -187,7 +181,7 @@ pub async fn download_server_met(
         .try_send(NetworkCommand::MergeServerMet { data, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    let stats = rx.await.map_err(|_| coded("server_merge_failed", "Failed to merge servers"))?
+    let stats = await_reply(rx, "server_merge_failed", "Failed to merge servers").await?
         .map_err(|e| coded_ctx("server_met_parse_failed", "Failed to parse server.met", e))?;
 
     let msg = format!(

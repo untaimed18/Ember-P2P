@@ -5,7 +5,7 @@ use crate::network::{NetworkCommand, PeerReputationInfo, ReputationStatsInfo};
 use crate::storage::identity::NodeIdentity;
 use crate::types::*;
 use crate::types::EmberDiagnostics;
-use crate::commands::errors::{coded, coded_ctx};
+use crate::commands::errors::{await_reply, coded, coded_ctx};
 
 /// Result returned by the `ember_ping_peer` harness command — either
 /// the round-trip time of the matching `Pong` or the reason the
@@ -102,7 +102,7 @@ pub async fn add_friend(
     let our_ember_hash = {
         let data_dir = crate::storage::paths::resolve_data_dir();
         let id = tokio::task::spawn_blocking(move || NodeIdentity::load_or_create(&data_dir))
-            .await.map_err(|e| coded_ctx("peers_task_error", "Task error", e))?.map_err(|e| format!("{e}"))?;
+            .await.map_err(|e| coded_ctx("peers_task_error", "Task error", e))?.map_err(|e| coded_ctx("peers_identity_load_failed", "Failed to load identity", e))?;
         hex::encode(id.ember_hash)
     };
     if canonical == our_ember_hash {
@@ -114,20 +114,26 @@ pub async fn add_friend(
         config.settings.max_friends
     };
 
-    {
+    let newly_inserted = {
         let mut friends = state.friend_hashes.write().await;
         if friends.len() as u32 >= max_friends && !friends.contains(&hash) {
             return Err(coded_ctx("peers_friend_limit_reached", format!("Friend limit reached ({max_friends}). Increase the limit in Settings > Friends."), max_friends));
         }
-        friends.insert(hash);
-    }
+        // `insert` returns false if the hash was already present (e.g. a
+        // re-add / nickname update). Track that so a DB failure only rolls
+        // back an entry we actually added — never evicts a pre-existing
+        // friend from the in-memory set.
+        friends.insert(hash)
+    };
 
     let db = state.db.clone();
     let db_hash = canonical.clone();
     let db_nick = nick.clone();
     let db_result = tokio::task::spawn_blocking(move || db.add_friend(&db_hash, &db_nick)).await;
     if let Err(e) = db_result.as_ref().map_err(|e| e.to_string()).and_then(|r| r.as_ref().map_err(|e| e.to_string())) {
-        state.friend_hashes.write().await.remove(&hash);
+        if newly_inserted {
+            state.friend_hashes.write().await.remove(&hash);
+        }
         return Err(coded_ctx("peers_failed_save_friend", "Failed to save friend", e));
     }
 
@@ -290,7 +296,7 @@ pub async fn send_chat_message(
         message: cleaned,
         tx,
     }).await.map_err(|_| coded("peers_network_unavailable", "Network unavailable"))?;
-    rx.await.map_err(|_| coded("peers_no_response", "No response"))?
+    await_reply(rx, "peers_no_response", "No response").await?
 }
 
 #[tauri::command]
@@ -368,7 +374,7 @@ pub async fn accept_friend_request(
     let our_ember_hash = {
         let data_dir = crate::storage::paths::resolve_data_dir();
         let id = tokio::task::spawn_blocking(move || NodeIdentity::load_or_create(&data_dir))
-            .await.map_err(|e| coded_ctx("peers_task_error", "Task error", e))?.map_err(|e| format!("{e}"))?;
+            .await.map_err(|e| coded_ctx("peers_task_error", "Task error", e))?.map_err(|e| coded_ctx("peers_identity_load_failed", "Failed to load identity", e))?;
         hex::encode(id.ember_hash)
     };
     if canonical == our_ember_hash {
@@ -380,13 +386,15 @@ pub async fn accept_friend_request(
         config.settings.max_friends
     };
 
-    {
+    let newly_inserted = {
         let mut friends = state.friend_hashes.write().await;
         if friends.len() as u32 >= max_friends && !friends.contains(&hash) {
             return Err(coded_ctx("peers_friend_limit_reached", format!("Friend limit reached ({max_friends}). Increase the limit in Settings > Friends."), max_friends));
         }
-        friends.insert(hash);
-    }
+        // Only roll back below if we actually added a new entry, so a DB
+        // failure can't evict a friend who was already in the set.
+        friends.insert(hash)
+    };
 
     // Atomic DB write: nickname pull from the matching friend_request
     // row, INSERT/UPDATE friend with `mutual = 1` and the address
@@ -401,11 +409,15 @@ pub async fn accept_friend_request(
     let request_addr = match db_result {
         Ok(Ok(addr)) => addr,
         Ok(Err(e)) => {
-            state.friend_hashes.write().await.remove(&hash);
+            if newly_inserted {
+                state.friend_hashes.write().await.remove(&hash);
+            }
             return Err(coded_ctx("peers_failed_accept_friend_request", "Failed to accept friend request", e));
         }
         Err(e) => {
-            state.friend_hashes.write().await.remove(&hash);
+            if newly_inserted {
+                state.friend_hashes.write().await.remove(&hash);
+            }
             return Err(coded_ctx("peers_task_error", "Task error", e));
         }
     };
@@ -469,7 +481,7 @@ pub async fn is_friend_discoverable(
     let (tx, rx) = tokio::sync::oneshot::channel();
     state.network_tx.try_send(NetworkCommand::IsFriendDiscoverable { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("peers_no_response", "No response"))
+    await_reply(rx, "peers_no_response", "No response").await
 }
 
 #[tauri::command]
@@ -484,7 +496,7 @@ pub async fn retry_friend_search(
         ember_hash: hash,
         tx,
     }).await.map_err(|_| coded("peers_network_unavailable", "Network unavailable"))?;
-    rx.await.map_err(|_| coded("peers_no_response", "No response"))?
+    await_reply(rx, "peers_no_response", "No response").await?
 }
 
 #[tauri::command]
@@ -499,7 +511,7 @@ pub async fn browse_friend(
         ember_hash: hash,
         tx,
     }).await.map_err(|_| coded("peers_network_unavailable", "Network unavailable"))?;
-    rx.await.map_err(|_| coded("peers_no_response", "No response"))?
+    await_reply(rx, "peers_no_response", "No response").await?
 }
 
 async fn resolve_kad_host(input: &str, port: u16) -> Result<String, String> {
@@ -529,7 +541,7 @@ pub async fn get_peers(
         .network_tx
         .try_send(NetworkCommand::GetPeersSnapshot { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("peers_failed_get_peers", "Failed to get peers"))
+    await_reply(rx, "peers_failed_get_peers", "Failed to get peers").await
 }
 
 #[tauri::command]
@@ -541,7 +553,7 @@ pub async fn get_network_stats(
         .network_tx
         .try_send(NetworkCommand::GetNetworkStatsSnapshot { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("peers_failed_get_network_stats", "Failed to get network stats"))
+    await_reply(rx, "peers_failed_get_network_stats", "Failed to get network stats").await
 }
 
 #[tauri::command]
@@ -650,8 +662,7 @@ pub async fn kad_bootstrap_ip(
             tx,
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await
-        .map_err(|_| coded("peers_bootstrap_worker_dropped", "Bootstrap worker dropped the request"))?
+    await_reply(rx, "peers_bootstrap_worker_dropped", "Bootstrap worker dropped the request").await?
 }
 
 #[tauri::command]
@@ -659,7 +670,13 @@ pub async fn kad_bootstrap_url(
     state: tauri::State<'_, AppState>,
     url: String,
 ) -> Result<String, String> {
-    let (validated_url, host, resolved_addrs) = crate::security::validate_fetch_url(&url).await?;
+    // Validate up front so an obviously-bad URL (non-https, private address,
+    // unresolvable host) fails fast with a clear error before we enqueue. The
+    // network task re-validates this URL and every redirect hop via
+    // `fetch_pinned_get`, so this is purely an early-rejection convenience.
+    let (validated_url, _host, _resolved_addrs) = crate::security::validate_fetch_url(&url)
+        .await
+        .map_err(|e| coded_ctx("peers_bootstrap_url_invalid", "Invalid bootstrap URL", e))?;
 
     // K0: same oneshot pattern as kad_bootstrap_ip — this is what lets the
     // UI show "Loaded N contacts" on success and a useful error on failure
@@ -669,11 +686,13 @@ pub async fn kad_bootstrap_url(
         .network_tx
         .try_send(NetworkCommand::KadBootstrapUrl {
             url: validated_url,
-            host,
-            resolved_addrs,
             tx,
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    // No CMD_REPLY_TIMEOUT wrapper here, unlike the other commands: the
+    // handler performs the actual HTTP download (bounded by the pinned
+    // client's own 60s request timeout), which legitimately runs longer
+    // than the short snapshot/enqueue replies elsewhere.
     rx.await
         .map_err(|_| coded("peers_bootstrap_worker_dropped", "Bootstrap worker dropped the request"))?
 }
@@ -687,8 +706,7 @@ pub async fn kad_bootstrap_clients(
         .network_tx
         .try_send(NetworkCommand::KadBootstrapClients { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await
-        .map_err(|_| coded("peers_failed_bootstrap_contacts", "Failed to bootstrap from contacts"))?
+    await_reply(rx, "peers_failed_bootstrap_contacts", "Failed to bootstrap from contacts").await?
         .map(|_| ())
 }
 
@@ -701,8 +719,7 @@ pub async fn kad_recheck_firewall(
         .network_tx
         .try_send(NetworkCommand::RecheckFirewall { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await
-        .map_err(|_| coded("peers_failed_start_firewall_recheck", "Failed to start firewall recheck"))?
+    await_reply(rx, "peers_failed_start_firewall_recheck", "Failed to start firewall recheck").await?
         .map(|_| ())
 }
 
@@ -715,7 +732,7 @@ pub async fn get_kad_contacts(
         .network_tx
         .try_send(NetworkCommand::GetKadContactsSnapshot { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("peers_failed_get_kad_contacts", "Failed to get KAD contacts"))
+    await_reply(rx, "peers_failed_get_kad_contacts", "Failed to get KAD contacts").await
 }
 
 #[tauri::command]
@@ -727,7 +744,7 @@ pub async fn get_kad_searches(
         .network_tx
         .try_send(NetworkCommand::GetKadSearchesSnapshot { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("peers_failed_get_kad_searches", "Failed to get KAD searches"))
+    await_reply(rx, "peers_failed_get_kad_searches", "Failed to get KAD searches").await
 }
 
 /// User-initiated cancellation for an active KAD search. Accepts the
@@ -763,7 +780,7 @@ pub async fn get_peer_reputation(
     let (tx, rx) = tokio::sync::oneshot::channel();
     state.network_tx.try_send(NetworkCommand::GetPeerReputation { user_hash: hash, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("peers_no_response", "No response"))
+    await_reply(rx, "peers_no_response", "No response").await
 }
 
 /// Aggregate reputation-tracker stats for the security / statistics
@@ -775,7 +792,7 @@ pub async fn get_reputation_stats(
     let (tx, rx) = tokio::sync::oneshot::channel();
     state.network_tx.try_send(NetworkCommand::GetReputationStats { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("peers_no_response", "No response"))
+    await_reply(rx, "peers_no_response", "No response").await
 }
 
 /// Developer / harness-facing diagnostic counters for the Ember mesh:
@@ -789,7 +806,7 @@ pub async fn get_ember_diagnostics(
     let (tx, rx) = tokio::sync::oneshot::channel();
     state.network_tx.try_send(NetworkCommand::GetEmberDiagnostics { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    rx.await.map_err(|_| coded("peers_no_response", "No response"))
+    await_reply(rx, "peers_no_response", "No response").await
 }
 
 /// Send an Ember-native `Ping` to a peer over the Noise transport and
@@ -863,7 +880,7 @@ pub async fn ember_ping_peer(
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    let scheduled = match rx.await.map_err(|_| coded("peers_no_response_from_network", "No response from network"))? {
+    let scheduled = match await_reply(rx, "peers_no_response_from_network", "No response from network").await? {
         Ok(p) => p,
         Err(e) => {
             return Ok(EmberPingResult {

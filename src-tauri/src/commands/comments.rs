@@ -1,5 +1,5 @@
 use crate::app_state::AppState;
-use crate::commands::errors::{coded, coded_ctx};
+use crate::commands::errors::{await_reply, coded, coded_ctx};
 use crate::network::NetworkCommand;
 use crate::network::ed2k::comments::FileCommentInfo;
 
@@ -44,5 +44,5 @@ pub async fn get_file_comments(
         .try_send(NetworkCommand::GetFileComments { file_hash, tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    rx.await.map_err(|_| coded("comments_get_failed", "Failed to get comments"))
+    await_reply(rx, "comments_get_failed", "Failed to get comments").await
 }
