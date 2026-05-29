@@ -1294,7 +1294,7 @@
       return current > 0 ? `${current}` : '\u2014';
     }
     let label: string;
-    if (active > 0 && current !== t.sources) {
+    if (current > 0 && current !== t.sources) {
       label = `${current}/${t.sources}`;
     } else {
       label = `${t.sources}`;

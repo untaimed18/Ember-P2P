@@ -395,9 +395,18 @@ export async function initTransferStore() {
             if (peer_id) {
               updated.peer_id = peer_id;
             }
-            if (sources !== undefined) updated.sources = sources;
-            if (active_sources !== undefined) updated.active_sources = active_sources;
-            if (queued_sources !== undefined) updated.queued_sources = queued_sources;
+            if (sources !== undefined) updated.sources = Math.max(sources, t.sources);
+            if (active_sources !== undefined || queued_sources !== undefined) {
+              const nextActive = active_sources ?? t.active_sources ?? 0;
+              const nextQueued = queued_sources ?? t.queued_sources ?? 0;
+              const liveIncoming = nextActive + nextQueued;
+              const liveCurrent = (t.active_sources || 0) + (t.queued_sources || 0);
+              const statusChanged = narrowed != null && t.status !== narrowed;
+              if (liveIncoming > 0 || liveCurrent === 0 || statusChanged) {
+                if (active_sources !== undefined) updated.active_sources = active_sources;
+                if (queued_sources !== undefined) updated.queued_sources = queued_sources;
+              }
+            }
             if (failure_reason !== undefined) updated.failure_reason = failure_reason;
             else if (error !== undefined) updated.failure_reason = error;
             if (failure_kind !== undefined) updated.failure_kind = failure_kind;
@@ -465,7 +474,18 @@ export async function initTransferStore() {
         transfers.update((list) =>
           list.map((t) => {
             if (t.id !== id) return t;
-            return { ...t, sources, active_sources, queued_sources };
+            const prevLive = (t.active_sources || 0) + (t.queued_sources || 0);
+            const newLive = active_sources + queued_sources;
+            // Discovery refreshes often send an updated total with 0/0
+            // live counts; don't stomp live counters the multi-source
+            // worker is still reporting.
+            const preserveLive = newLive === 0 && prevLive > 0;
+            return {
+              ...t,
+              sources: Math.max(sources, t.sources),
+              active_sources: preserveLive ? t.active_sources : active_sources,
+              queued_sources: preserveLive ? t.queued_sources : queued_sources,
+            };
           })
         );
       },
@@ -508,6 +528,9 @@ export async function initTransferStore() {
             failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
             failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
             failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
+            sources: Math.max(apiItem.sources ?? 0, eventItem.sources ?? 0),
+            active_sources: Math.max(apiItem.active_sources ?? 0, eventItem.active_sources ?? 0),
+            queued_sources: Math.max(apiItem.queued_sources ?? 0, eventItem.queued_sources ?? 0),
           };
         }
         return apiItem;
@@ -635,6 +658,9 @@ export function startTransferPoll() {
               failure_reason: eventItem.failure_reason ?? apiItem.failure_reason,
               failure_kind: eventItem.failure_kind ?? apiItem.failure_kind,
               failure_stage: eventItem.failure_stage ?? apiItem.failure_stage,
+              sources: Math.max(apiItem.sources ?? 0, eventItem.sources ?? 0),
+              active_sources: Math.max(apiItem.active_sources ?? 0, eventItem.active_sources ?? 0),
+              queued_sources: Math.max(apiItem.queued_sources ?? 0, eventItem.queued_sources ?? 0),
             };
           });
         const terminalStatuses: Transfer['status'][] = ['completed', 'failed', 'stopped'];
