@@ -448,15 +448,34 @@ impl TransferManager {
     }
 
     pub fn update_sources(&mut self, id: &str, total: u32, active: u32, queued: u32) {
-        if let Some(transfer) = self.active.get_mut(id) {
-            transfer.sources = total;
-            transfer.active_sources = active;
-            transfer.queued_sources = queued;
-        } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
+        if let Some(transfer) = self.get_transfer_mut(id) {
             transfer.sources = total;
             transfer.active_sources = active;
             transfer.queued_sources = queued;
         }
+    }
+
+    /// Bump the known-source total without touching live active/queued
+    /// counters. Used by KAD/server discovery while a download is already
+    /// running so we don't zero out the live counts the multi-source worker
+    /// is actively maintaining.
+    pub fn update_source_total(&mut self, id: &str, total: u32) {
+        if let Some(transfer) = self.get_transfer_mut(id) {
+            transfer.sources = transfer.sources.max(total);
+        }
+    }
+
+    /// Update only the live active/queued counters reported by the
+    /// multi-source download worker.
+    pub fn update_source_live(&mut self, id: &str, active: u32, queued: u32) {
+        if let Some(transfer) = self.get_transfer_mut(id) {
+            transfer.active_sources = active;
+            transfer.queued_sources = queued;
+        }
+    }
+
+    pub fn source_counts(&self, id: &str) -> Option<(u32, u32, u32)> {
+        self.get_transfer(id).map(|t| (t.sources, t.active_sources, t.queued_sources))
     }
 
     /// Update or insert a per-source detail entry for a transfer.
