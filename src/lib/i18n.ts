@@ -121,30 +121,118 @@ export function languageLabel(locale: Locale): string {
 }
 
 /**
- * Map a Tauri command error string (or any backend error) onto a
- * translated message. The Rust side increasingly returns stable
- * error CODES rather than free-form English (`"FriendNotFound"`,
- * `"InvalidHash"`, etc.) so we can localize them client-side
- * without round-tripping through every `format!` site in the
- * backend.
+ * Coded-error envelope emitted by the Rust command layer
+ * (`src-tauri/src/commands/errors.rs`). The `__coded` sentinel
+ * disambiguates our envelopes from arbitrary error strings that
+ * merely happen to be valid JSON.
+ */
+type CodedError = {
+  __coded: true;
+  code: string;
+  /** English fallback, used when the UI has no key for `code`. */
+  message: string;
+  /** Optional dynamic detail (e.g. an underlying error's text). */
+  context?: string;
+};
+
+function parseCodedError(raw: string): CodedError | null {
+  // Cheap guard before attempting a JSON parse — the vast majority
+  // of error strings are plain text and shouldn't pay parse cost.
+  if (raw.length < 2 || raw[0] !== '{' || !raw.includes('"__coded"')) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      (parsed as { __coded?: unknown }).__coded === true &&
+      typeof (parsed as { code?: unknown }).code === 'string' &&
+      typeof (parsed as { message?: unknown }).message === 'string'
+    ) {
+      return parsed as CodedError;
+    }
+  } catch {
+    // Not JSON after all — fall through to plain-string handling.
+  }
+  return null;
+}
+
+/**
+ * Resolve a backend error `code` to its translated message by
+ * looking up the `error_<code>` Paraglide message at runtime.
  *
- * Falls back to the original message when no mapping exists, so
- * adding new error codes is a non-breaking change — old callers
- * keep showing the raw string until a key is registered here.
+ * The command layer emits ~250 distinct codes (see
+ * `src-tauri/src/commands/errors.rs`); a hand-maintained switch
+ * would be pure boilerplate that drifts out of sync. Paraglide
+ * compiles each message to a named export, so the namespace object
+ * doubles as a `Record<string, MessageFn>` we can index dynamically.
+ *
+ * Codes that carry dynamic detail interpolate it via the message's
+ * `{detail}` placeholder; codes without detail ignore the argument.
+ * Returns `undefined` when no `error_<code>` key exists, letting the
+ * caller fall back to the envelope's embedded English `message` —
+ * so a newer backend never yields a blank error on an older UI.
+ */
+type MessageFn = (inputs?: Record<string, unknown>, options?: unknown) => string;
+const messageFns = m as unknown as Record<string, MessageFn | undefined>;
+
+function translateCode(code: string, context: string | undefined): string | undefined {
+  const fn = messageFns[`error_${code}`];
+  if (typeof fn !== 'function') return undefined;
+  return context !== undefined ? fn({ detail: context }) : fn();
+}
+
+/**
+ * Map a Tauri command error onto a translated message.
+ *
+ * Three tiers, in priority order:
+ *  1. A coded envelope from `commands::errors` — decode `code`,
+ *     interpolate `context`, fall back to the envelope's English
+ *     `message` for an unregistered code.
+ *  2. A legacy bare code string (`"FriendNotFound"`, etc.) emitted
+ *     by older friend/KAD command paths.
+ *  3. Any other string — shown verbatim (foreign/underlying errors).
+ *
+ * Adding new error codes is always non-breaking: an unmapped code
+ * degrades to its embedded English message rather than disappearing.
  */
 export function translateErrorCode(input: unknown): string {
+  return translateError(input);
+}
+
+/**
+ * Like {@link translateErrorCode}, but lets the caller supply the
+ * message shown when the error carries no usable string (e.g. a
+ * thrown non-Error value). Call sites that previously had their own
+ * `e instanceof Error ? e.message : … : m.something()` ternary pass
+ * their domain-specific fallback here so coded backend errors are
+ * still decoded while the bespoke fallback is preserved.
+ */
+export function translateError(input: unknown, fallback?: string): string {
   const raw = input instanceof Error
     ? input.message
     : typeof input === 'string'
     ? input
     : '';
-  if (!raw) return m.error_unknown();
+  if (!raw) return fallback ?? m.error_unknown();
 
-  // Stable backend codes. The Rust side should emit these as the
+  // Tier 1: structured coded envelope.
+  const coded = parseCodedError(raw);
+  if (coded) {
+    const translated = translateCode(coded.code, coded.context);
+    if (translated !== undefined) return translated;
+    // Unregistered code (e.g. newer backend, older UI): show the
+    // embedded English framing and append any dynamic detail so we
+    // never drop information the user might need.
+    const base = coded.message || m.error_unknown();
+    return coded.context ? `${base}: ${coded.context}` : base;
+  }
+
+  // Tier 2: legacy bare codes. The Rust side emits these as the
   // exact error message (no surrounding text) to match. Any
   // additional context (e.g. an offending hash) belongs in a
-  // separate field on the command's error type, not concatenated
-  // into the code.
+  // separate field, not concatenated into the code.
   switch (raw) {
     case 'FriendNotFound':
       return m.error_friend_not_found();
@@ -161,6 +249,7 @@ export function translateErrorCode(input: unknown): string {
     case 'SelfAdd':
       return m.error_self_add();
     default:
+      // Tier 3: unknown plain string — surface as-is.
       return raw;
   }
 }

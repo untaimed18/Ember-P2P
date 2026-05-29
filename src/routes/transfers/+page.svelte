@@ -24,6 +24,7 @@
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import type { Transfer, SourceInfo, UploadQueueClient, KnownClient } from '$lib/types';
   import * as m from '$lib/paraglide/messages';
+  import { translateError } from '$lib/i18n';
 
   function countryFlagSrc(code: string | undefined): string | null {
     if (!code || code.length !== 2) return null;
@@ -492,7 +493,7 @@
   }
 
   function toErrorMsg(e: unknown): string {
-    return e instanceof Error ? e.message : typeof e === 'string' ? e : m.transfers_operation_failed();
+    return translateError(e, m.transfers_operation_failed());
   }
 
   // --- Downloads ---

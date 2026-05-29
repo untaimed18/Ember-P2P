@@ -4,6 +4,7 @@
   import { browseFriend, type BrowseFileEntry } from '$lib/api/friends';
   import { startDownload } from '$lib/api/transfers';
   import * as m from '$lib/paraglide/messages';
+  import { translateError } from '$lib/i18n';
 
   interface Props {
     open: boolean;
@@ -152,7 +153,7 @@
         }
       }, 30_000);
     } catch (e: unknown) {
-      error = e instanceof Error ? e.message : typeof e === 'string' ? e : m.browse_failed_to_browse();
+      error = translateError(e, m.browse_failed_to_browse());
       loading = false;
       if (currentBrowseGen === myGen) currentBrowseGen = 0;
     }
@@ -176,7 +177,7 @@
       downloadedHashes.add(file.hash);
       downloadedHashes = new Set(downloadedHashes);
     } catch (e: unknown) {
-      downloadError = e instanceof Error ? e.message : typeof e === 'string' ? e : m.browse_download_failed();
+      downloadError = translateError(e, m.browse_download_failed());
     }
   }
 

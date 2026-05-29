@@ -34,6 +34,7 @@
   import { listen } from '@tauri-apps/api/event';
   import LibraryVirtualTable from '$lib/components/LibraryVirtualTable.svelte';
   import * as m from '$lib/paraglide/messages';
+  import { translateError } from '$lib/i18n';
 
   let folders: string[] = $state([]);
   let files: FileInfo[] = $state([]);
@@ -349,7 +350,7 @@
   }
 
   function toErr(e: unknown): string {
-    return e instanceof Error ? e.message : typeof e === 'string' ? e : m.error_operation_failed();
+    return translateError(e, m.error_operation_failed());
   }
 
   async function handleAddFolder() {

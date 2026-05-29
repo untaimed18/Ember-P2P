@@ -15,6 +15,7 @@
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { onMount, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
+  import { translateError } from '$lib/i18n';
 
   let stats: IpFilterStats | null = $state(null);
   let loading = $state(true);
@@ -161,7 +162,7 @@
   }
 
   function toErrorMsg(e: unknown): string {
-    return e instanceof Error ? e.message : typeof e === 'string' ? e : m.error_operation_failed();
+    return translateError(e, m.error_operation_failed());
   }
 
   let flashTimer: ReturnType<typeof setTimeout> | undefined;
