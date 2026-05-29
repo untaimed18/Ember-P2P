@@ -94,6 +94,16 @@ const PROGRESS_SKIP_STATUSES: ReadonlySet<Transfer['status']> = new Set<Transfer
   'noneneeded',
 ]);
 
+/** Mirror `TransferManager::update_status`: entering these states clears
+ *  runtime health on the backend, but `transfer-status` events often omit
+ *  `health`, leaving the UI stuck on a stale `degraded` bar colour. */
+const HEALTH_RESET_STATUSES: ReadonlySet<Transfer['status']> = new Set<Transfer['status']>([
+  'active',
+  'verifying',
+  'completing',
+  'completed',
+]);
+
 interface TransferEventPayload {
   id: string;
   error?: string;
@@ -206,6 +216,8 @@ function flushProgress() {
       const rawTransferred = existing.direction === 'upload' ? (p.uploaded ?? p.downloaded ?? 0) : (p.downloaded ?? 0);
       const transferred = Math.max(rawTransferred, existing.transferred || 0);
       const completedSize = Math.max(transferred, existing.completed_size || 0);
+      const bytesMoved = transferred > (existing.transferred || 0);
+      const clearStaleHealth = bytesMoved || existing.health === 'stalled';
       list[idx] = {
         ...existing,
         transferred,
@@ -213,9 +225,9 @@ function flushProgress() {
         progress: Math.max(p.progress, existing.progress || 0),
         speed: p.speed,
         status: existing.status === 'searching' || existing.status === 'queued' ? existing.status : 'active',
-        health: existing.health === 'stalled' ? 'healthy' : existing.health,
-        health_reason: existing.health === 'stalled' ? undefined : existing.health_reason,
-        stalled_since: existing.health === 'stalled' ? undefined : existing.stalled_since,
+        health: clearStaleHealth ? 'healthy' : existing.health,
+        health_reason: clearStaleHealth ? undefined : existing.health_reason,
+        stalled_since: clearStaleHealth ? undefined : existing.stalled_since,
         ...(p.upload_time != null ? { upload_time: p.upload_time } : {}),
       };
       changed = true;
@@ -393,6 +405,19 @@ export async function initTransferStore() {
             if (health !== undefined) updated.health = health;
             if (health_reason !== undefined) updated.health_reason = health_reason;
             if (stalled_since !== undefined) updated.stalled_since = stalled_since;
+            // Backend clears runtime health on these transitions but usually
+            // omits `health` from the event — drop stale `degraded` so the
+            // progress bar returns to accent blue when downloading resumes.
+            if (
+              narrowed &&
+              HEALTH_RESET_STATUSES.has(narrowed) &&
+              health === undefined &&
+              t.status !== narrowed
+            ) {
+              updated.health = 'healthy';
+              updated.health_reason = undefined;
+              updated.stalled_since = undefined;
+            }
             return updated;
           })
         );
