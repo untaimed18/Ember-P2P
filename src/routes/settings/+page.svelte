@@ -21,6 +21,7 @@
     hasExplicitLocale,
     useSystemLocale,
     systemLocale,
+    translateError,
     type Locale,
   } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
@@ -104,7 +105,7 @@
     try {
       speedResult = await invoke('run_speed_test');
     } catch (e: unknown) {
-      speedError = e instanceof Error ? e.message : typeof e === 'string' ? e : m.settings_speed_test_failed();
+      speedError = translateError(e, m.settings_speed_test_failed());
     } finally {
       speedTesting = false;
     }
@@ -316,7 +317,7 @@
       }
     } catch (e) {
       console.error('Failed to save:', e);
-      showSaveMsg(e instanceof Error ? e.message : typeof e === 'string' ? e : m.settings_save_failed(), true, 5000);
+      showSaveMsg(translateError(e, m.settings_save_failed()), true, 5000);
     } finally {
       saving = false;
     }
@@ -434,7 +435,7 @@
       // denied permission or a missing dialog plugin looked silent to
       // the user.
       console.error('Folder pick failed:', e);
-      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : m.settings_folder_picker_generic_error();
+      const msg = translateError(e, m.settings_folder_picker_generic_error());
       showSaveMsg(m.settings_folder_picker_failed({ error: msg }), true, 5000);
     }
   }
@@ -447,7 +448,7 @@
       filterResult = await downloadIpfilter();
       trackedTimeout(() => (filterResult = null), 5000);
     } catch (e: unknown) {
-      filterError = e instanceof Error ? e.message : typeof e === 'string' ? e : m.settings_download_failed();
+      filterError = translateError(e, m.settings_download_failed());
       trackedTimeout(() => (filterError = null), 5000);
     } finally {
       downloadingFilter = false;
@@ -604,7 +605,7 @@
       nodesResult = await downloadNodesDat();
       trackedTimeout(() => (nodesResult = null), 5000);
     } catch (e: unknown) {
-      nodesError = e instanceof Error ? e.message : typeof e === 'string' ? e : m.settings_download_failed();
+      nodesError = translateError(e, m.settings_download_failed());
       trackedTimeout(() => (nodesError = null), 5000);
     } finally {
       downloadingNodes = false;

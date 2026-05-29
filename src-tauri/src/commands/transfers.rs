@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use tauri::Emitter;
 
 use crate::app_state::AppState;
+use crate::commands::errors::{coded, coded_ctx};
 use crate::network::NetworkCommand;
 use crate::sharing::manager::TransferControl;
 use crate::types::*;
@@ -264,13 +265,13 @@ pub async fn start_download(
     let file_name = crate::security::sanitize_filename(&file_name);
 
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
-        return Err("Invalid file hash".into());
+        return Err(coded("transfers_invalid_file_hash", "Invalid file hash"));
     }
 
     if !peer_ip.is_empty() {
         peer_ip
             .parse::<std::net::IpAddr>()
-            .map_err(|_| "Invalid peer IP")?;
+            .map_err(|_| coded("transfers_invalid_peer_ip", "Invalid peer IP"))?;
     }
 
     // Parse + cheap-validate extra sources at the IPC boundary. Anything
@@ -317,10 +318,10 @@ pub async fn start_download(
             let cap_bytes = (cap_gib as u64).saturating_mul(1024 * 1024 * 1024);
             if file_size > cap_bytes {
                 let gib = (file_size as f64) / (1024.0 * 1024.0 * 1024.0);
-                return Err(format!(
+                return Err(coded("transfers_file_size_exceeds_max", format!(
                     "File size {:.2} GiB exceeds your configured maximum of {} GiB — raise Max Download Size in Settings > Downloads to enqueue this file.",
                     gib, cap_gib
-                ));
+                )));
             }
         }
     }
@@ -431,7 +432,7 @@ pub async fn start_download(
             control,
         })
         .await
-        .map_err(|e| format!("Failed to start download: {e}"))?;
+        .map_err(|e| coded_ctx("transfers_start_download_failed", "Failed to start download", e))?;
 
     Ok(StartDownloadResponse {
         transfer_id,
@@ -663,7 +664,7 @@ pub async fn stop_transfer(
 /// that a stale in-memory status never misdirects the user.
 fn resolve_transfer_reveal_path(transfer: &Transfer, download_folder: &str) -> Result<PathBuf, String> {
     if transfer.direction != TransferDirection::Download {
-        return Err("Not a download".into());
+        return Err(coded("transfers_not_a_download", "Not a download"));
     }
     let root = PathBuf::from(download_folder);
     let completed_dir = root.join("Downloads");
@@ -677,17 +678,17 @@ fn resolve_transfer_reveal_path(transfer: &Transfer, download_folder: &str) -> R
     } else if part_path.is_file() {
         (part_path, temp_dir)
     } else {
-        return Err("File not found on disk".into());
+        return Err(coded("transfers_file_not_found", "File not found on disk"));
     };
 
     let canonical = candidate
         .canonicalize()
-        .map_err(|e| format!("Invalid path: {e}"))?;
+        .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid path", e))?;
     let canonical_base = base_dir
         .canonicalize()
-        .map_err(|e| format!("Invalid base: {e}"))?;
+        .map_err(|e| coded_ctx("transfers_invalid_base", "Invalid base", e))?;
     if !canonical.starts_with(&canonical_base) {
-        return Err("File path escapes download directory".into());
+        return Err(coded("transfers_path_escapes_dir", "File path escapes download directory"));
     }
     Ok(canonical)
 }
@@ -700,9 +701,9 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     // characters into the raw command line below.
     let path_str = path
         .to_str()
-        .ok_or_else(|| "Path contains non-UTF8 characters".to_string())?;
+        .ok_or_else(|| coded("transfers_path_non_utf8", "Path contains non-UTF8 characters"))?;
     if path_str.contains('"') || path_str.contains('\0') {
-        return Err("Path contains unsupported characters".to_string());
+        return Err(coded("transfers_path_unsupported_chars", "Path contains unsupported characters"));
     }
     // explorer.exe doesn't understand \\?\-prefixed long paths — strip it so
     // the /select, argument resolves against the user-visible namespace.
@@ -711,24 +712,24 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     std::process::Command::new("explorer")
         .raw_arg(raw)
         .spawn()
-        .map_err(|e| format!("Failed to open File Explorer: {e}"))?;
+        .map_err(|e| coded_ctx("transfers_open_explorer_failed", "Failed to open File Explorer", e))?;
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
-    let path_str = path.to_str().ok_or("Invalid path encoding")?;
+    let path_str = path.to_str().ok_or_else(|| coded("transfers_invalid_path_encoding", "Invalid path encoding"))?;
     std::process::Command::new("open")
         .args(["-R", path_str])
         .spawn()
-        .map_err(|e| format!("Failed to reveal in Finder: {e}"))?;
+        .map_err(|e| coded_ctx("transfers_reveal_finder_failed", "Failed to reveal in Finder", e))?;
     Ok(())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     use std::process::Command;
-    let path_str = path.to_str().ok_or("Invalid path encoding")?;
+    let path_str = path.to_str().ok_or_else(|| coded("transfers_invalid_path_encoding", "Invalid path encoding"))?;
     for cmd in ["nautilus", "dolphin", "nemo"] {
         if Command::new(cmd)
             .args(["--select", path_str])
@@ -740,10 +741,10 @@ fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
     }
     if let Some(parent) = path.parent() {
         opener::open(parent.to_string_lossy().as_ref())
-            .map_err(|e| format!("Failed to open folder: {e}"))?;
+            .map_err(|e| coded_ctx("transfers_open_folder_failed", "Failed to open folder", e))?;
         return Ok(());
     }
-    Err("Could not open file location".into())
+    Err(coded("transfers_open_location_failed", "Could not open file location"))
 }
 
 #[tauri::command]
@@ -758,11 +759,11 @@ pub async fn open_transfer_file_location(
         );
         (mgr.get_transfer(&transfer_id).cloned(), cfg.settings.download_folder.clone())
     };
-    let transfer = transfer.ok_or("Transfer not found")?;
+    let transfer = transfer.ok_or_else(|| coded("transfers_transfer_not_found", "Transfer not found"))?;
     let path = resolve_transfer_reveal_path(&transfer, &dl_folder)?;
     tokio::task::spawn_blocking(move || reveal_in_file_manager(&path))
         .await
-        .map_err(|e| format!("Reveal task failed: {e}"))??;
+        .map_err(|e| coded_ctx("transfers_reveal_task_failed", "Reveal task failed", e))??;
     Ok(())
 }
 
@@ -778,25 +779,25 @@ pub async fn open_file(
         );
         (mgr.get_transfer(&transfer_id).cloned(), cfg.settings.download_folder.clone())
     };
-    let transfer = transfer.ok_or("Transfer not found")?;
+    let transfer = transfer.ok_or_else(|| coded("transfers_transfer_not_found", "Transfer not found"))?;
     let safe_name = crate::security::sanitize_filename(&transfer.file_name);
     if crate::security::is_dangerous_extension(&safe_name) {
-        return Err("Cannot open potentially dangerous file types. Please use a dedicated application.".into());
+        return Err(coded("transfers_dangerous_file_type", "Cannot open potentially dangerous file types. Please use a dedicated application."));
     }
     let download_dir = std::path::PathBuf::from(&dl_folder)
         .join("Downloads");
     let file_path = download_dir.join(&safe_name);
     tokio::task::spawn_blocking(move || {
         if !file_path.exists() {
-            return Err("Download has not finished yet".to_string());
+            return Err(coded("transfers_download_not_finished", "Download has not finished yet"));
         }
-        let canonical = file_path.canonicalize().map_err(|e| format!("Invalid path: {e}"))?;
-        let canonical_base = download_dir.canonicalize().map_err(|e| format!("Invalid base: {e}"))?;
+        let canonical = file_path.canonicalize().map_err(|e| coded_ctx("transfers_invalid_path", "Invalid path", e))?;
+        let canonical_base = download_dir.canonicalize().map_err(|e| coded_ctx("transfers_invalid_base", "Invalid base", e))?;
         if !canonical.starts_with(&canonical_base) {
-            return Err("File path escapes download directory".to_string());
+            return Err(coded("transfers_path_escapes_dir", "File path escapes download directory"));
         }
-        opener::open(&canonical).map_err(|e| format!("Failed to open file: {e}"))
-    }).await.map_err(|e| format!("Open task failed: {e}"))??;
+        opener::open(&canonical).map_err(|e| coded_ctx("transfers_open_file_failed", "Failed to open file", e))
+    }).await.map_err(|e| coded_ctx("transfers_open_task_failed", "Open task failed", e))??;
     Ok(())
 }
 
@@ -949,8 +950,8 @@ pub async fn get_upload_queue(
     state
         .network_tx
         .try_send(NetworkCommand::GetUploadQueueSnapshot { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    rx.await.map_err(|_| "Failed to get upload queue".to_string())
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    rx.await.map_err(|_| coded("transfers_upload_queue_failed", "Failed to get upload queue"))
 }
 
 /// Snapshot of every persisted SecIdent credit record. Backs the
@@ -964,8 +965,8 @@ pub async fn get_known_clients(
     state
         .network_tx
         .try_send(NetworkCommand::GetKnownClientsSnapshot { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    rx.await.map_err(|_| "Failed to get known clients".to_string())
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    rx.await.map_err(|_| coded("transfers_known_clients_failed", "Failed to get known clients"))
 }
 
 #[tauri::command]
@@ -976,7 +977,7 @@ pub async fn set_transfer_priority(
 ) -> Result<(), String> {
     let valid = ["verylow", "low", "normal", "high", "release", "auto"];
     if !valid.contains(&priority.as_str()) {
-        return Err(format!("Invalid priority: {priority}. Must be one of: {valid:?}"));
+        return Err(coded_ctx("transfers_invalid_priority", format!("Invalid priority: {priority}. Must be one of: {valid:?}"), priority));
     }
     {
         let mut manager = state.transfer_manager.write().await;
@@ -996,7 +997,7 @@ pub async fn set_transfer_category(
     category: String,
 ) -> Result<(), String> {
     if category.len() > 256 {
-        return Err("Category name too long (max 256 bytes)".into());
+        return Err(coded("transfers_category_too_long", "Category name too long (max 256 bytes)"));
     }
     {
         let mut manager = state.transfer_manager.write().await;
@@ -1205,10 +1206,10 @@ pub async fn recover_archive(
             .map(|t| (t.file_name.clone(), t.total_size, t.id.clone()));
         (t, cfg.settings.download_folder.clone())
     };
-    let (file_name, file_size, transfer_id_clone) = transfer_info.ok_or("Transfer not found")?;
+    let (file_name, file_size, transfer_id_clone) = transfer_info.ok_or_else(|| coded("transfers_transfer_not_found", "Transfer not found"))?;
 
     if !crate::network::ed2k::archive_recovery::is_recoverable_archive(&file_name) {
-        return Err("File is not a supported archive format (ZIP, RAR, ACE)".into());
+        return Err(coded("transfers_not_supported_archive", "File is not a supported archive format (ZIP, RAR, ACE)"));
     }
 
     let part_path = std::path::PathBuf::from(&dl_folder)
@@ -1216,17 +1217,17 @@ pub async fn recover_archive(
         .join(format!("{transfer_id_clone}.part"));
 
     if !part_path.exists() {
-        return Err("Part file not found — download may not have started".into());
+        return Err(coded("transfers_part_file_not_found", "Part file not found — download may not have started"));
     }
 
     let pp = part_path.clone();
     let filled_ranges = tokio::task::spawn_blocking(move || {
         let tracker = crate::network::ed2k::part_tracker::PartTracker::new(file_size, &pp);
         tracker.filled_ranges()
-    }).await.map_err(|e| format!("PartTracker task failed: {e}"))?;
+    }).await.map_err(|e| coded_ctx("transfers_part_tracker_task_failed", "PartTracker task failed", e))?;
 
     if filled_ranges.is_empty() {
-        return Err("No completed parts available for recovery".into());
+        return Err(coded("transfers_no_parts_for_recovery", "No completed parts available for recovery"));
     }
 
     let fname = file_name.clone();
@@ -1234,8 +1235,8 @@ pub async fn recover_archive(
         crate::network::ed2k::archive_recovery::recover_archive(&part_path, &fname, &filled_ranges)
     })
     .await
-    .map_err(|e| format!("Recovery task failed: {e}"))?
-    .map_err(|e| format!("Recovery failed: {e}"))?;
+    .map_err(|e| coded_ctx("transfers_recovery_task_failed", "Recovery task failed", e))?
+    .map_err(|e| coded_ctx("transfers_recovery_failed", "Recovery failed", e))?;
 
     Ok(result.to_string_lossy().to_string())
 }

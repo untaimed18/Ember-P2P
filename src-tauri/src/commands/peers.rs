@@ -5,6 +5,7 @@ use crate::network::{NetworkCommand, PeerReputationInfo, ReputationStatsInfo};
 use crate::storage::identity::NodeIdentity;
 use crate::types::*;
 use crate::types::EmberDiagnostics;
+use crate::commands::errors::{coded, coded_ctx};
 
 /// Result returned by the `ember_ping_peer` harness command — either
 /// the round-trip time of the matching `Pong` or the reason the
@@ -37,9 +38,9 @@ const MAX_FRIEND_NICKNAME_LEN: usize = 64;
 
 fn parse_user_hash(hex_str: &str) -> Result<[u8; 16], String> {
     if hex_str.len() != 32 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("User hash must be 32 hex characters (16 bytes)".into());
+        return Err(coded("peers_user_hash_invalid", "User hash must be 32 hex characters (16 bytes)"));
     }
-    let bytes = hex::decode(hex_str).map_err(|_| "Invalid hex string".to_string())?;
+    let bytes = hex::decode(hex_str).map_err(|_| coded("peers_invalid_hex_string", "Invalid hex string"))?;
     let mut hash = [0u8; 16];
     hash.copy_from_slice(&bytes);
     Ok(hash)
@@ -91,19 +92,21 @@ pub async fn add_friend(
     // default rather than the literal string "Anonymous".
     let nick = if nick == "Anonymous" { String::new() } else { nick };
     if nick.len() > MAX_FRIEND_NICKNAME_LEN {
-        return Err(format!(
-            "Nickname too long (max {MAX_FRIEND_NICKNAME_LEN} bytes)"
+        return Err(coded_ctx(
+            "peers_nickname_too_long",
+            format!("Nickname too long (max {MAX_FRIEND_NICKNAME_LEN} bytes)"),
+            MAX_FRIEND_NICKNAME_LEN,
         ));
     }
 
     let our_ember_hash = {
         let data_dir = crate::storage::paths::resolve_data_dir();
         let id = tokio::task::spawn_blocking(move || NodeIdentity::load_or_create(&data_dir))
-            .await.map_err(|e| format!("Task error: {e}"))?.map_err(|e| format!("{e}"))?;
+            .await.map_err(|e| coded_ctx("peers_task_error", "Task error", e))?.map_err(|e| format!("{e}"))?;
         hex::encode(id.ember_hash)
     };
     if canonical == our_ember_hash {
-        return Err("You cannot add yourself as a friend".into());
+        return Err(coded("peers_cannot_add_self", "You cannot add yourself as a friend"));
     }
 
     let max_friends = {
@@ -114,7 +117,7 @@ pub async fn add_friend(
     {
         let mut friends = state.friend_hashes.write().await;
         if friends.len() as u32 >= max_friends && !friends.contains(&hash) {
-            return Err(format!("Friend limit reached ({max_friends}). Increase the limit in Settings > Friends."));
+            return Err(coded_ctx("peers_friend_limit_reached", format!("Friend limit reached ({max_friends}). Increase the limit in Settings > Friends."), max_friends));
         }
         friends.insert(hash);
     }
@@ -125,7 +128,7 @@ pub async fn add_friend(
     let db_result = tokio::task::spawn_blocking(move || db.add_friend(&db_hash, &db_nick)).await;
     if let Err(e) = db_result.as_ref().map_err(|e| e.to_string()).and_then(|r| r.as_ref().map_err(|e| e.to_string())) {
         state.friend_hashes.write().await.remove(&hash);
-        return Err(format!("Failed to save friend: {e}"));
+        return Err(coded_ctx("peers_failed_save_friend", "Failed to save friend", e));
     }
 
     // Friend is already persisted to the DB above; the network task
@@ -157,8 +160,8 @@ pub async fn remove_friend(
     let db_hash = canonical;
     tokio::task::spawn_blocking(move || db.remove_friend(&db_hash))
         .await
-        .map_err(|e| format!("Task error: {e}"))?
-        .map_err(|e| format!("Failed to remove friend: {e}"))?;
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_remove_friend", "Failed to remove friend", e))?;
 
     let mut friends = state.friend_hashes.write().await;
     friends.remove(&hash);
@@ -189,8 +192,10 @@ pub async fn update_friend_nickname(
         cleaned
     };
     if cleaned.len() > MAX_FRIEND_NICKNAME_LEN {
-        return Err(format!(
-            "Nickname too long (max {MAX_FRIEND_NICKNAME_LEN} bytes)"
+        return Err(coded_ctx(
+            "peers_nickname_too_long",
+            format!("Nickname too long (max {MAX_FRIEND_NICKNAME_LEN} bytes)"),
+            MAX_FRIEND_NICKNAME_LEN,
         ));
     }
     let canonical = user_hash_hex.to_lowercase();
@@ -201,8 +206,8 @@ pub async fn update_friend_nickname(
     let db_nick = cleaned;
     let updated = tokio::task::spawn_blocking(move || db.update_friend_nickname(&db_hash, &db_nick))
         .await
-        .map_err(|e| format!("Task error: {e}"))?
-        .map_err(|e| format!("Failed to update friend: {e}"))?;
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_update_friend", "Failed to update friend", e))?;
     // Returning Err for "no matching row" rather than the previous
     // silent success: the UI used to accept the result and write the
     // typed nickname into local state, then `loadFriends()` would
@@ -211,7 +216,7 @@ pub async fn update_friend_nickname(
     // contract problem — the friend may have been removed from
     // another window while the user was editing.
     if !updated {
-        return Err("Friend no longer exists".into());
+        return Err(coded("peers_friend_no_longer_exists", "Friend no longer exists"));
     }
     Ok(())
 }
@@ -223,8 +228,8 @@ pub async fn get_friends(
     let db = state.db.clone();
     let rows = tokio::task::spawn_blocking(move || db.get_friends_full())
         .await
-        .map_err(|e| format!("Task error: {e}"))?
-        .map_err(|e| format!("Failed to load friends: {e}"))?;
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_load_friends", "Failed to load friends", e))?;
 
     Ok(rows.into_iter().map(|(user_hash, nickname, added_at, last_ip, last_port, last_seen, mutual)| FriendInfo {
         user_hash,
@@ -242,8 +247,8 @@ pub async fn get_my_ember_hash(_app: tauri::AppHandle) -> Result<String, String>
     let data_dir = crate::storage::paths::resolve_data_dir();
     let identity = tokio::task::spawn_blocking(move || NodeIdentity::load_or_create(&data_dir))
         .await
-        .map_err(|e| format!("Task error: {e}"))?
-        .map_err(|e| format!("Failed to load identity: {e}"))?;
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_load_identity", "Failed to load identity", e))?;
     Ok(hex::encode(identity.ember_hash))
 }
 
@@ -263,7 +268,7 @@ pub async fn send_chat_message(
     message: String,
 ) -> Result<(), String> {
     if message.is_empty() || message.len() > 4096 {
-        return Err("Message must be between 1 and 4096 bytes".into());
+        return Err(coded("peers_message_size_invalid", "Message must be between 1 and 4096 bytes"));
     }
     // L20: strip control / bidi-override / zero-width / variation
     // selector code points from outbound chat. Inbound chat is
@@ -275,7 +280,7 @@ pub async fn send_chat_message(
     // never store the spoofing primitive.
     let cleaned = crate::security::sanitize_chat_text(&message);
     if cleaned.trim().is_empty() {
-        return Err("Message is empty after sanitisation".into());
+        return Err(coded("peers_message_empty_after_sanitisation", "Message is empty after sanitisation"));
     }
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
@@ -284,8 +289,8 @@ pub async fn send_chat_message(
         ember_hash: hash,
         message: cleaned,
         tx,
-    }).await.map_err(|_| "Network unavailable".to_string())?;
-    rx.await.map_err(|_| "No response".to_string())?
+    }).await.map_err(|_| coded("peers_network_unavailable", "Network unavailable"))?;
+    rx.await.map_err(|_| coded("peers_no_response", "No response"))?
 }
 
 #[tauri::command]
@@ -301,8 +306,8 @@ pub async fn get_chat_messages(
     let lim = limit.unwrap_or(50).clamp(1, 200);
     let rows = tokio::task::spawn_blocking(move || db.get_chat_messages(&friend_hash, lim, before_id))
         .await
-        .map_err(|e| format!("Task error: {e}"))?
-        .map_err(|e| format!("Failed to load messages: {e}"))?;
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_load_messages", "Failed to load messages", e))?;
     Ok(rows.into_iter().map(|(id, direction, message, timestamp, read)| ChatMessageInfo {
         id, direction, message, timestamp, read,
     }).collect())
@@ -318,8 +323,8 @@ pub async fn mark_messages_read(
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.mark_messages_read(&friend_hash))
         .await
-        .map_err(|e| format!("Task error: {e}"))?
-        .map_err(|e| format!("Failed to mark messages read: {e}"))?;
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_mark_messages_read", "Failed to mark messages read", e))?;
     Ok(())
 }
 
@@ -330,8 +335,8 @@ pub async fn get_unread_message_counts(
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.unread_message_counts())
         .await
-        .map_err(|e| format!("Task error: {e}"))?
-        .map_err(|e| format!("Failed to get unread counts: {e}"))
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_get_unread_counts", "Failed to get unread counts", e))
 }
 
 #[tauri::command]
@@ -341,8 +346,8 @@ pub async fn get_friend_requests(
     let db = state.db.clone();
     let rows = tokio::task::spawn_blocking(move || db.get_friend_requests())
         .await
-        .map_err(|e| format!("Task error: {e}"))?
-        .map_err(|e| format!("Failed to load friend requests: {e}"))?;
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_load_friend_requests", "Failed to load friend requests", e))?;
 
     Ok(rows.into_iter().map(|(sender_hash, sender_nickname, received_at, _ip, _port, verified)| FriendRequestInfo {
         sender_hash,
@@ -363,11 +368,11 @@ pub async fn accept_friend_request(
     let our_ember_hash = {
         let data_dir = crate::storage::paths::resolve_data_dir();
         let id = tokio::task::spawn_blocking(move || NodeIdentity::load_or_create(&data_dir))
-            .await.map_err(|e| format!("Task error: {e}"))?.map_err(|e| format!("{e}"))?;
+            .await.map_err(|e| coded_ctx("peers_task_error", "Task error", e))?.map_err(|e| format!("{e}"))?;
         hex::encode(id.ember_hash)
     };
     if canonical == our_ember_hash {
-        return Err("You cannot add yourself as a friend".into());
+        return Err(coded("peers_cannot_add_self", "You cannot add yourself as a friend"));
     }
 
     let max_friends = {
@@ -378,7 +383,7 @@ pub async fn accept_friend_request(
     {
         let mut friends = state.friend_hashes.write().await;
         if friends.len() as u32 >= max_friends && !friends.contains(&hash) {
-            return Err(format!("Friend limit reached ({max_friends}). Increase the limit in Settings > Friends."));
+            return Err(coded_ctx("peers_friend_limit_reached", format!("Friend limit reached ({max_friends}). Increase the limit in Settings > Friends."), max_friends));
         }
         friends.insert(hash);
     }
@@ -397,11 +402,11 @@ pub async fn accept_friend_request(
         Ok(Ok(addr)) => addr,
         Ok(Err(e)) => {
             state.friend_hashes.write().await.remove(&hash);
-            return Err(format!("Failed to accept friend request: {e}"));
+            return Err(coded_ctx("peers_failed_accept_friend_request", "Failed to accept friend request", e));
         }
         Err(e) => {
             state.friend_hashes.write().await.remove(&hash);
-            return Err(format!("Task error: {e}"));
+            return Err(coded_ctx("peers_task_error", "Task error", e));
         }
     };
 
@@ -453,8 +458,8 @@ pub async fn reject_friend_request(
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.remove_friend_request(&canonical))
         .await
-        .map_err(|e| format!("Task error: {e}"))?
-        .map_err(|e| format!("Failed to reject friend request: {e}"))
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_reject_friend_request", "Failed to reject friend request", e))
 }
 
 #[tauri::command]
@@ -463,8 +468,8 @@ pub async fn is_friend_discoverable(
 ) -> Result<bool, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state.network_tx.try_send(NetworkCommand::IsFriendDiscoverable { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    rx.await.map_err(|_| "No response".to_string())
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    rx.await.map_err(|_| coded("peers_no_response", "No response"))
 }
 
 #[tauri::command]
@@ -478,8 +483,8 @@ pub async fn retry_friend_search(
     state.network_tx.send(NetworkCommand::RetryFriendSearch {
         ember_hash: hash,
         tx,
-    }).await.map_err(|_| "Network unavailable".to_string())?;
-    rx.await.map_err(|_| "No response".to_string())?
+    }).await.map_err(|_| coded("peers_network_unavailable", "Network unavailable"))?;
+    rx.await.map_err(|_| coded("peers_no_response", "No response"))?
 }
 
 #[tauri::command]
@@ -493,24 +498,24 @@ pub async fn browse_friend(
     state.network_tx.send(NetworkCommand::BrowseFriend {
         ember_hash: hash,
         tx,
-    }).await.map_err(|_| "Network unavailable".to_string())?;
-    rx.await.map_err(|_| "No response".to_string())?
+    }).await.map_err(|_| coded("peers_network_unavailable", "Network unavailable"))?;
+    rx.await.map_err(|_| coded("peers_no_response", "No response"))?
 }
 
 async fn resolve_kad_host(input: &str, port: u16) -> Result<String, String> {
     if let Ok(ip) = input.parse::<std::net::Ipv4Addr>() {
         if crate::security::is_special_use_v4(ip) {
-            return Err("Cannot connect to private/loopback addresses".into());
+            return Err(coded("peers_cannot_connect_private", "Cannot connect to private/loopback addresses"));
         }
         return Ok(input.to_string());
     }
     let addr = tokio::net::lookup_host((input, port))
         .await
-        .map_err(|_| "Failed to resolve host address".to_string())?
+        .map_err(|_| coded("peers_failed_resolve_host", "Failed to resolve host address"))?
         .find(|addr| addr.is_ipv4())
-        .ok_or_else(|| format!("No IPv4 address found for {input}:{port}"))?;
+        .ok_or_else(|| coded_ctx("peers_no_ipv4_address", format!("No IPv4 address found for {input}:{port}"), format!("{input}:{port}")))?;
     if crate::security::is_private_ip(addr.ip()) {
-        return Err("Hostname resolves to a private/loopback address".into());
+        return Err(coded("peers_hostname_resolves_private", "Hostname resolves to a private/loopback address"));
     }
     Ok(addr.ip().to_string())
 }
@@ -523,8 +528,8 @@ pub async fn get_peers(
     state
         .network_tx
         .try_send(NetworkCommand::GetPeersSnapshot { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    rx.await.map_err(|_| "Failed to get peers".to_string())
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    rx.await.map_err(|_| coded("peers_failed_get_peers", "Failed to get peers"))
 }
 
 #[tauri::command]
@@ -535,8 +540,8 @@ pub async fn get_network_stats(
     state
         .network_tx
         .try_send(NetworkCommand::GetNetworkStatsSnapshot { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    rx.await.map_err(|_| "Failed to get network stats".to_string())
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    rx.await.map_err(|_| coded("peers_failed_get_network_stats", "Failed to get network stats"))
 }
 
 #[tauri::command]
@@ -545,15 +550,15 @@ pub async fn ban_peer(
     peer_id: String,
 ) -> Result<(), String> {
     if peer_id.len() != 32 || !peer_id.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("Invalid peer ID (expected 32 hex characters)".into());
+        return Err(coded("peers_invalid_peer_id", "Invalid peer ID (expected 32 hex characters)"));
     }
 
     let db = state.db.clone();
     let pid = peer_id.clone();
     tokio::task::spawn_blocking(move || db.ban_peer(&pid))
         .await
-        .map_err(|e| format!("Task error: {e}"))?
-        .map_err(|e| format!("Failed to ban peer: {e}"))?;
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_ban_peer", "Failed to ban peer", e))?;
 
     // Ban is already persisted to the DB above; the network task only
     // needs the peer ID to drop any active connections. If the channel
@@ -574,15 +579,15 @@ pub async fn unban_peer(
     peer_id: String,
 ) -> Result<(), String> {
     if peer_id.len() != 32 || !peer_id.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("Invalid peer ID (expected 32 hex characters)".into());
+        return Err(coded("peers_invalid_peer_id", "Invalid peer ID (expected 32 hex characters)"));
     }
 
     let db = state.db.clone();
     let pid = peer_id.clone();
     tokio::task::spawn_blocking(move || db.unban_peer(&pid))
         .await
-        .map_err(|e| format!("Task error: {e}"))?
-        .map_err(|e| format!("Failed to unban peer: {e}"))?;
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("peers_failed_unban_peer", "Failed to unban peer", e))?;
 
     // Unban is already persisted to the DB above; the network task
     // notification only refreshes the in-memory banned-IPs cache. If
@@ -604,7 +609,7 @@ pub async fn kad_connect(
     state
         .network_tx
         .try_send(NetworkCommand::KadConnect)
-        .map_err(|e| format!("Network busy: {e}"))?;
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     Ok(())
 }
 
@@ -615,7 +620,7 @@ pub async fn kad_disconnect(
     state
         .network_tx
         .try_send(NetworkCommand::KadDisconnect)
-        .map_err(|e| format!("Network busy: {e}"))?;
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     Ok(())
 }
 
@@ -626,10 +631,10 @@ pub async fn kad_bootstrap_ip(
     port: u16,
 ) -> Result<String, String> {
     if ip.is_empty() {
-        return Err("IP address is required".into());
+        return Err(coded("peers_ip_required", "IP address is required"));
     }
     if port == 0 {
-        return Err("Port must be greater than 0".into());
+        return Err(coded("peers_port_must_be_positive", "Port must be greater than 0"));
     }
     let resolved_ip = resolve_kad_host(&ip, port).await?;
 
@@ -644,9 +649,9 @@ pub async fn kad_bootstrap_ip(
             port,
             tx,
         })
-        .map_err(|e| format!("Network busy: {e}"))?;
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     rx.await
-        .map_err(|_| "Bootstrap worker dropped the request".to_string())?
+        .map_err(|_| coded("peers_bootstrap_worker_dropped", "Bootstrap worker dropped the request"))?
 }
 
 #[tauri::command]
@@ -668,9 +673,9 @@ pub async fn kad_bootstrap_url(
             resolved_addrs,
             tx,
         })
-        .map_err(|e| format!("Network busy: {e}"))?;
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     rx.await
-        .map_err(|_| "Bootstrap worker dropped the request".to_string())?
+        .map_err(|_| coded("peers_bootstrap_worker_dropped", "Bootstrap worker dropped the request"))?
 }
 
 #[tauri::command]
@@ -681,9 +686,9 @@ pub async fn kad_bootstrap_clients(
     state
         .network_tx
         .try_send(NetworkCommand::KadBootstrapClients { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     rx.await
-        .map_err(|_| "Failed to bootstrap from contacts".to_string())?
+        .map_err(|_| coded("peers_failed_bootstrap_contacts", "Failed to bootstrap from contacts"))?
         .map(|_| ())
 }
 
@@ -695,9 +700,9 @@ pub async fn kad_recheck_firewall(
     state
         .network_tx
         .try_send(NetworkCommand::RecheckFirewall { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     rx.await
-        .map_err(|_| "Failed to start firewall recheck".to_string())?
+        .map_err(|_| coded("peers_failed_start_firewall_recheck", "Failed to start firewall recheck"))?
         .map(|_| ())
 }
 
@@ -709,8 +714,8 @@ pub async fn get_kad_contacts(
     state
         .network_tx
         .try_send(NetworkCommand::GetKadContactsSnapshot { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    rx.await.map_err(|_| "Failed to get KAD contacts".to_string())
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    rx.await.map_err(|_| coded("peers_failed_get_kad_contacts", "Failed to get KAD contacts"))
 }
 
 #[tauri::command]
@@ -721,8 +726,8 @@ pub async fn get_kad_searches(
     state
         .network_tx
         .try_send(NetworkCommand::GetKadSearchesSnapshot { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    rx.await.map_err(|_| "Failed to get KAD searches".to_string())
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    rx.await.map_err(|_| coded("peers_failed_get_kad_searches", "Failed to get KAD searches"))
 }
 
 /// User-initiated cancellation for an active KAD search. Accepts the
@@ -737,11 +742,11 @@ pub async fn kad_cancel_search(
 ) -> Result<(), String> {
     let parsed: u64 = id
         .parse()
-        .map_err(|_| "Invalid search id".to_string())?;
+        .map_err(|_| coded("peers_invalid_search_id", "Invalid search id"))?;
     state
         .network_tx
         .try_send(NetworkCommand::CancelKadSearch { id: parsed })
-        .map_err(|e| format!("Network busy: {e}"))?;
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     Ok(())
 }
 
@@ -757,8 +762,8 @@ pub async fn get_peer_reputation(
     let hash = parse_user_hash(&user_hash_hex.to_lowercase())?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     state.network_tx.try_send(NetworkCommand::GetPeerReputation { user_hash: hash, tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    rx.await.map_err(|_| "No response".to_string())
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    rx.await.map_err(|_| coded("peers_no_response", "No response"))
 }
 
 /// Aggregate reputation-tracker stats for the security / statistics
@@ -769,8 +774,8 @@ pub async fn get_reputation_stats(
 ) -> Result<ReputationStatsInfo, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state.network_tx.try_send(NetworkCommand::GetReputationStats { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    rx.await.map_err(|_| "No response".to_string())
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    rx.await.map_err(|_| coded("peers_no_response", "No response"))
 }
 
 /// Developer / harness-facing diagnostic counters for the Ember mesh:
@@ -783,8 +788,8 @@ pub async fn get_ember_diagnostics(
 ) -> Result<EmberDiagnostics, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state.network_tx.try_send(NetworkCommand::GetEmberDiagnostics { tx })
-        .map_err(|e| format!("Network busy: {e}"))?;
-    rx.await.map_err(|_| "No response".to_string())
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    rx.await.map_err(|_| coded("peers_no_response", "No response"))
 }
 
 /// Send an Ember-native `Ping` to a peer over the Noise transport and
@@ -816,12 +821,12 @@ pub async fn ember_ping_peer(
         .clamp(MIN_EMBER_PING_TIMEOUT_MS, MAX_EMBER_PING_TIMEOUT_MS);
 
     if peer_port == 0 {
-        return Err("peer_port must be > 0".into());
+        return Err(coded("peers_peer_port_must_be_positive", "peer_port must be > 0"));
     }
 
     let ip: IpAddr = peer_ip
         .parse()
-        .map_err(|e| format!("Invalid peer_ip '{peer_ip}': {e}"))?;
+        .map_err(|e| coded_ctx("peers_invalid_peer_ip", format!("Invalid peer_ip '{peer_ip}'"), e))?;
     let addr = SocketAddr::new(ip, peer_port);
 
     // Treat both an absent field and an empty string as "look it up
@@ -833,11 +838,12 @@ pub async fn ember_ping_peer(
     let peer_pubkey: Option<[u8; 32]> = match peer_pubkey_hex.as_deref() {
         Some(s) if !s.is_empty() => {
             let bytes = hex::decode(s)
-                .map_err(|e| format!("peer_pubkey_hex is not valid hex: {e}"))?;
+                .map_err(|e| coded_ctx("peers_pubkey_invalid_hex", "peer_pubkey_hex is not valid hex", e))?;
             if bytes.len() != 32 {
-                return Err(format!(
-                    "peer_pubkey_hex must decode to 32 bytes, got {}",
-                    bytes.len()
+                return Err(coded_ctx(
+                    "peers_pubkey_wrong_length",
+                    format!("peer_pubkey_hex must decode to 32 bytes, got {}", bytes.len()),
+                    bytes.len(),
                 ));
             }
             let mut k = [0u8; 32];
@@ -855,9 +861,9 @@ pub async fn ember_ping_peer(
             peer_pubkey,
             tx,
         })
-        .map_err(|e| format!("Network busy: {e}"))?;
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    let scheduled = match rx.await.map_err(|_| "No response from network".to_string())? {
+    let scheduled = match rx.await.map_err(|_| coded("peers_no_response_from_network", "No response from network"))? {
         Ok(p) => p,
         Err(e) => {
             return Ok(EmberPingResult {
