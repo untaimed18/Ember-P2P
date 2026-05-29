@@ -26,6 +26,7 @@
   import { formatSize, formatSpeed } from '$lib/utils';
   import { addToast } from '$lib/stores/toast';
   import * as m from '$lib/paraglide/messages';
+  import { translateError } from '$lib/i18n';
 
   const searchTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
 
@@ -825,7 +826,7 @@
     } catch (e: unknown) {
       clearSearchTimeoutForRequest(requestId);
       if (!get(searchTabs).some((t) => t.requestId === requestId)) return;
-      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : m.search_failed();
+      const msg = translateError(e, m.search_failed());
       console.error('Search failed:', e);
       patchSearchTabByRequestId(requestId, (tab) => ({
         ...tab,
@@ -961,7 +962,7 @@
       noteRating = 0;
       safeTimeout(() => publishMessage = '', 3000);
     } catch (e: unknown) {
-      publishMessage = e instanceof Error ? e.message : typeof e === 'string' ? e : m.search_publish_failed();
+      publishMessage = translateError(e, m.search_publish_failed());
       publishSuccess = false;
       safeTimeout(() => publishMessage = '', 5000);
     } finally {
@@ -1053,7 +1054,7 @@
       addToast('success', res.already_queued ? m.search_already_in_queue() : m.search_download_queued());
     } catch (e: unknown) {
       console.error('Download failed:', e);
-      const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : m.browse_download_failed();
+      const msg = translateError(e, m.browse_download_failed());
       addToast('error', msg);
     } finally {
       downloadPending[key] = false;
@@ -1072,7 +1073,7 @@
       ed2kInput = '';
       safeTimeout(() => (ed2kSuccess = ''), 5000);
     } catch (e: unknown) {
-      ed2kError = e instanceof Error ? e.message : typeof e === 'string' ? e : m.search_invalid_ed2k();
+      ed2kError = translateError(e, m.search_invalid_ed2k());
       safeTimeout(() => (ed2kError = ''), 5000);
     }
   }
@@ -1303,7 +1304,7 @@
           queued++;
         } catch (e) {
           failed++;
-          const msg = e instanceof Error ? e.message : typeof e === 'string' ? e : m.search_bulk_download_failed();
+          const msg = translateError(e, m.search_bulk_download_failed());
           failures.push(`${result.file.name}: ${msg}`);
         }
       }
