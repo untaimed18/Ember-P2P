@@ -1082,8 +1082,6 @@
   "transfers_paste_link_title": "Read an ed2k:// link from the clipboard and start downloading",
   "transfers_paste_link": "Paste eD2K Link",
   "transfers_pasting": "Pasting…",
-  "transfers_kad_network": "KAD Network",
-  "transfers_ed2k_server": "ED2K Server",
 
   "transfers_col_file_name": "File Name",
   "transfers_col_size": "Size",

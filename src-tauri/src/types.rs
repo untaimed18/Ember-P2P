@@ -229,8 +229,6 @@ pub struct SourceInfo {
     pub total_parts: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub country_code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -503,9 +503,6 @@ impl TransferManager {
             if source.country_code.is_some() {
                 existing.country_code = source.country_code;
             }
-            if source.source_origin.is_some() {
-                existing.source_origin = source.source_origin;
-            }
         } else {
             const MAX_SOURCES_PER_TRANSFER: usize = 500;
             if sources.len() >= MAX_SOURCES_PER_TRANSFER {
