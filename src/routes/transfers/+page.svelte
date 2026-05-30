@@ -36,18 +36,6 @@
     return `/flags/${lower}.svg`;
   }
 
-  function netOriginSrc(origin: string | undefined): string | null {
-    if (origin === 'kad') return '/net-kad.svg';
-    if (origin === 'ed2k') return '/net-ed2k.svg';
-    return null;
-  }
-
-  function netOriginLabel(origin: string | undefined): string {
-    if (origin === 'kad') return m.transfers_kad_network();
-    if (origin === 'ed2k') return m.transfers_ed2k_server();
-    return '';
-  }
-
   let sourceUnlisten: UnlistenFn | null = null;
   let searchUnlisten: UnlistenFn | null = null;
   let showAdvancedDlCols = $state(true);
@@ -2561,7 +2549,6 @@
                     <td class="source-child-cell" colspan={dlColCount}>
                       <span class="source-fields">
                         <span class="source-status-dot src-dot-{src.status}" title={src.status}></span>
-                        {#if netOriginSrc(src.source_origin)}<span class="source-net-origin" title={netOriginLabel(src.source_origin)}><img src={netOriginSrc(src.source_origin)} alt={src.source_origin ?? ''} class="net-origin-img" /></span>{/if}
                         <span class="source-flag" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</span>
                         <span class="source-client" title={src.peer_name || src.client_software || m.transfers_unknown_client()}>{src.peer_name || src.client_software || m.transfers_unknown_client()}</span>
                         <span class="source-sep"></span>
@@ -3321,7 +3308,7 @@
                     {#if column.key === 'peer_name'}
                       <td class="client-cell" title={src.peer_name || src.ip}>{src.peer_name || src.ip}</td>
                     {:else if column.key === 'country'}
-                      <td class="flag-cell" title={src.country_code ?? ''}>{#if netOriginSrc(src.source_origin)}<img src={netOriginSrc(src.source_origin)} alt={src.source_origin ?? ''} class="net-origin-img" title={netOriginLabel(src.source_origin)} />{/if}{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</td>
+                      <td class="flag-cell" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</td>
                     {:else if column.key === 'client_software'}
                       <td title={src.client_software}>{src.client_software || '\u2014'}</td>
                     {:else if column.key === 'file_name'}
@@ -4544,22 +4531,6 @@
     object-fit: cover;
     vertical-align: middle;
   }
-  .source-net-origin {
-    line-height: 1;
-    width: 18px;
-    text-align: center;
-    flex-shrink: 0;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .net-origin-img {
-    width: 16px;
-    height: 16px;
-    border-radius: 50%;
-    object-fit: cover;
-    vertical-align: middle;
-  }
   .source-client {
     color: var(--text-primary);
     font-weight: 600;
@@ -4651,9 +4622,6 @@
     line-height: 1;
     padding: 2px 0 !important;
     white-space: nowrap;
-  }
-  .flag-cell .net-origin-img {
-    margin-right: 2px;
   }
   .source-summary-row td {
     background: color-mix(in srgb, var(--bg-secondary) 85%, var(--bg-primary)) !important;
