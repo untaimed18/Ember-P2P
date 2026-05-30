@@ -6926,7 +6926,6 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(cb_src.ip)),
-                                                source_origin: Some("kad".into()),
                                             },
                                         );
                                         // Fresh row → fresh timestamp, always.
@@ -6959,7 +6958,6 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(dc_src.ip)),
-                                                source_origin: Some("kad".into()),
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -6987,7 +6985,6 @@ pub async fn start_network(
                                                     available_parts: None,
                                                     total_parts: None,
                                                     country_code: crate::geoip::lookup_country(&geoip, std::net::IpAddr::V4(ls.ip)),
-                                                    source_origin: Some("kad".into()),
                                                 },
                                             );
                                             state.callback_row_pending_since.insert(
@@ -7058,7 +7055,6 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
-                                                source_origin: Some("kad".into()),
                                             },
                                         );
                                     }
@@ -7123,7 +7119,6 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
-                                                source_origin: Some("kad".into()),
                                             },
                                         );
                                         // Fresh row → fresh timestamp, always.
@@ -7159,7 +7154,6 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
-                                                source_origin: Some("kad".into()),
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -7204,7 +7198,6 @@ pub async fn start_network(
                                                 country_code: crate::geoip::lookup_country(
                                                     &geoip, std::net::IpAddr::V4(ls.ip),
                                                 ),
-                                                source_origin: Some("kad".into()),
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -7480,7 +7473,6 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
-                                                source_origin: Some("kad".into()),
                                             },
                                         );
                                         // Fresh row → fresh timestamp, always.
@@ -7516,7 +7508,6 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: cc,
-                                                source_origin: Some("kad".into()),
                                             },
                                         );
                                         state.callback_row_pending_since.insert(
@@ -8712,7 +8703,6 @@ pub async fn start_network(
                                                 available_parts: None,
                                                 total_parts: None,
                                                 country_code: None,
-                                                source_origin: src.source_origin.clone(),
                                             },
                                         );
                                         let _ = app_handle.emit(
@@ -9994,15 +9984,11 @@ pub async fn start_network(
                             // this site is kept consistent so the two locks can
                             // never be taken in opposing orders (deadlock-safe).
                             let mut mgr = transfer_manager.write().await;
-                            let sm = source_manager.read().await;
                             mgr.update_status(tid, TransferStatus::Active);
                             mgr.update_sources(tid, source_count, 0, 0);
                             for (ip_s, port) in &ready_sources {
                                 let cc = ip_s.parse::<std::net::IpAddr>().ok()
                                     .and_then(|ip| crate::geoip::lookup_country(&geoip, ip));
-                                let origin = ip_s.parse::<Ipv4Addr>().ok()
-                                    .and_then(|v4| sm.get_source_origin(&hash_bytes, v4, *port))
-                                    .map(|s| s.to_string());
                                 mgr.update_source_detail(
                                     tid,
                                     crate::types::SourceInfo {
@@ -10017,7 +10003,6 @@ pub async fn start_network(
                                         available_parts: None,
                                         total_parts: None,
                                         country_code: cc,
-                                        source_origin: origin,
                                     },
                                 );
                             }
@@ -10121,18 +10106,13 @@ pub async fn start_network(
                                 continue;
                             }
                         };
-                        let (sm_sources, sm_origins): (Vec<(Ipv4Addr, u16)>, Vec<Option<&str>>) = {
+                        let sm_sources = {
                             let sm = source_manager.read().await;
-                            let srcs = sm.get_sources(&hash_bytes);
-                            let origins: Vec<Option<&str>> = srcs.iter()
-                                .map(|(ip, port)| sm.get_source_origin(&hash_bytes, *ip, *port))
-                                .collect();
-                            (srcs, origins)
+                            sm.get_sources(&hash_bytes)
                         };
-                        let live_sources: Vec<(String, u16, Option<String>)> = sm_sources.into_iter()
-                            .zip(sm_origins)
-                            .filter(|((ip, port), _)| !state.dead_sources.is_dead_source_for_file(&hash_bytes, u32::from(*ip), *port))
-                            .map(|((ip, port), origin)| (ip.to_string(), port, origin.map(|s| s.to_string())))
+                        let live_sources: Vec<(String, u16)> = sm_sources.into_iter()
+                            .filter(|(ip, port)| !state.dead_sources.is_dead_source_for_file(&hash_bytes, u32::from(*ip), *port))
+                            .map(|(ip, port)| (ip.to_string(), port))
                             .collect();
                         if live_sources.is_empty() {
                             state.pending_downloads.insert(tid.clone(), pending);
@@ -10149,7 +10129,7 @@ pub async fn start_network(
                             let mut mgr = transfer_manager.write().await;
                             mgr.update_status(tid, TransferStatus::Active);
                             mgr.update_sources(tid, source_count, 0, 0);
-                            for (ip_s, port, origin) in &live_sources {
+                            for (ip_s, port) in &live_sources {
                                 let cc = ip_s.parse::<std::net::IpAddr>().ok()
                                     .and_then(|ip| crate::geoip::lookup_country(&geoip, ip));
                                 mgr.update_source_detail(
@@ -10166,7 +10146,6 @@ pub async fn start_network(
                                         available_parts: None,
                                         total_parts: None,
                                         country_code: cc,
-                                        source_origin: origin.clone(),
                                     },
                                 );
                             }
@@ -10187,7 +10166,7 @@ pub async fn start_network(
                                 let sm = source_manager.read().await;
                                 sm.get_udp_sources(&hash_bytes)
                             };
-                            for (ip_s, port, _) in &live_sources {
+                            for (ip_s, port) in &live_sources {
                                 if let Ok(v4) = ip_s.parse::<Ipv4Addr>() {
                                     let udp_port = udp_sources
                                         .iter()
@@ -10202,7 +10181,7 @@ pub async fn start_network(
                         }
                         {
                             let mut sm = source_manager.write().await;
-                            for (ip, port, _) in &live_sources {
+                            for (ip, port) in &live_sources {
                                 if let Ok(v4) = ip.parse::<Ipv4Addr>() {
                                     sm.register_source(hash_bytes, v4, *port);
                                 }
@@ -10211,7 +10190,7 @@ pub async fn start_network(
                         let download_sources: Vec<DownloadSource> = {
                             let sm = source_manager.read().await;
                             live_sources.iter()
-                                .map(|(ip, port, _)| {
+                                .map(|(ip, port)| {
                                     let uh = ip.parse::<Ipv4Addr>().ok()
                                         .and_then(|v4| sm.get_user_hash(&hash_bytes, v4, *port));
                                     let co = ip.parse::<Ipv4Addr>().ok()
@@ -11141,7 +11120,6 @@ pub async fn start_network(
                                                             available_parts: None,
                                                             total_parts: None,
                                                             country_code: cc,
-                                                            source_origin: Some("ed2k".into()),
                                                         },
                                                     );
                                                 }
@@ -11811,7 +11789,6 @@ pub async fn start_network(
                                                             available_parts: None,
                                                             total_parts: None,
                                                             country_code: cc.clone(),
-                                                            source_origin: Some("ed2k".into()),
                                                         },
                                                     );
                                                 }
@@ -19593,7 +19570,6 @@ async fn handle_download_event(
                         available_parts,
                         total_parts,
                         country_code: country_code.clone(),
-                        source_origin: None,
                     },
                 );
                 removed

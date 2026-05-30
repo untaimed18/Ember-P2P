@@ -739,16 +739,6 @@ impl SourceManager {
             .unwrap_or_default()
     }
 
-    /// Return the network origin for a source: `Some("ed2k")` if the source
-    /// was received from an eD2K server (server_ip set), `None` otherwise.
-    pub fn get_source_origin(&self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) -> Option<&'static str> {
-        self.sources.get(file_hash).and_then(|entries| {
-            entries.iter()
-                .find(|e| e.ip == ip && e.tcp_port == port)
-                .and_then(|e| if e.server_ip != 0 { Some("ed2k") } else { None })
-        })
-    }
-
     /// Look up a stored user hash for a specific source by IP:port.
     pub fn get_user_hash(&self, file_hash: &[u8; 16], ip: Ipv4Addr, port: u16) -> Option<[u8; 16]> {
         self.sources.get(file_hash).and_then(|entries| {
