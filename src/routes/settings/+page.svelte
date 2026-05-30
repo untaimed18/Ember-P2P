@@ -906,7 +906,7 @@
         </div>
       </section>
 
-      <!-- Downloads -->
+      <!-- Transfers -->
       <section class="card" class:hidden={activeSection !== 'downloads'}>
         <div class="card-header">
           <span class="card-icon">&#8615;</span>
