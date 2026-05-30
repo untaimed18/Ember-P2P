@@ -39,10 +39,11 @@
         { keys: ['Alt', '3'], label: () => m.shortcuts_jump_search() },
         { keys: ['Alt', '4'], label: () => m.shortcuts_jump_transfers() },
         { keys: ['Alt', '5'], label: () => m.shortcuts_jump_library() },
-        { keys: ['Alt', '6'], label: () => m.shortcuts_jump_friends() },
-        { keys: ['Alt', '7'], label: () => m.shortcuts_jump_statistics() },
-        { keys: ['Alt', '8'], label: () => m.shortcuts_jump_security() },
-        { keys: ['Alt', '9'], label: () => m.shortcuts_jump_settings() },
+        // Hidden until developer decides to introduce the feature.
+        // { keys: ['Alt', '6'], label: () => m.shortcuts_jump_friends() },
+        { keys: ['Alt', '6'], label: () => m.shortcuts_jump_statistics() },
+        { keys: ['Alt', '7'], label: () => m.shortcuts_jump_security() },
+        { keys: ['Alt', '8'], label: () => m.shortcuts_jump_settings() },
       ],
     },
     {

@@ -5,8 +5,9 @@
   import KeyboardShortcutsDialog from '$lib/components/KeyboardShortcutsDialog.svelte';
   import { transfers } from '$lib/stores/transfers';
   import { networkStats } from '$lib/stores/network';
-  import { friendRequests } from '$lib/stores/friends';
-  import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
+  // Hidden until developer decides to introduce the feature.
+  // import { friendRequests } from '$lib/stores/friends';
+  // import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
   import { onMount } from 'svelte';
 
@@ -35,17 +36,9 @@
     $transfers.filter(t => t.direction === 'download' && t.status !== 'completed' && t.status !== 'failed').length
   );
 
-  // Pending incoming friend-request count. Mirrors the transfers badge
-  // pattern so users notice new requests without leaving the current
-  // page. Uses the same friends store the Friends page consumes, so
-  // the badge clears the moment the request is accepted/rejected.
-  let pendingFriendRequestCount = $derived($friendRequests.length);
-
-  // Sum of unread chat messages across all friends. The Chats toggle
-  // surfaces this so users can spot new messages from any page —
-  // previously the only signal was per-friend badges on /friends,
-  // which required navigating there to notice activity.
-  let totalUnreadChats = $derived($totalUnread);
+  // Hidden until developer decides to introduce the feature.
+  // let pendingFriendRequestCount = $derived($friendRequests.length);
+  // let totalUnreadChats = $derived($totalUnread);
 
   type NavItem = {
     href: string;
@@ -70,7 +63,8 @@
     { href: '/search', label: () => m.nav_search(), id: 'search' },
     { href: '/transfers', label: () => m.nav_transfers(), id: 'transfers' },
     { href: '/library', label: () => m.nav_library(), id: 'library' },
-    { href: '/friends', label: () => m.nav_friends(), id: 'friends' },
+    // Hidden until developer decides to introduce the feature.
+    // { href: '/friends', label: () => m.nav_friends(), id: 'friends' },
     { href: '/statistics', label: () => m.nav_statistics(), id: 'statistics' },
     { href: '/security', label: () => m.nav_security(), id: 'security' },
     { href: '/settings', label: () => m.nav_settings(), id: 'settings' },
@@ -133,15 +127,13 @@
       toggleCollapsed();
       return;
     }
-    // Ctrl/Cmd+/ toggles the chat dock. "/" sits next to ".", which
-    // is intuitive for "open chats" without colliding with any
-    // existing browser/app shortcut and stays out of typing flows.
-    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key === '/') {
-      if (isTypingTarget(e.target)) return;
-      e.preventDefault();
-      toggleChatDock();
-      return;
-    }
+    // Hidden until developer decides to introduce the feature.
+    // if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key === '/') {
+    //   if (isTypingTarget(e.target)) return;
+    //   e.preventDefault();
+    //   toggleChatDock();
+    //   return;
+    // }
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     if (isTypingTarget(e.target)) return;
     const n = Number.parseInt(e.key, 10);
@@ -252,6 +244,7 @@
           {#if item.id === 'transfers' && activeDownloadCount > 0}
             <span class="nav-badge">{activeDownloadCount}</span>
           {/if}
+          <!-- Hidden until developer decides to introduce the feature.
           {#if item.id === 'friends' && pendingFriendRequestCount > 0}
             <span
               class="nav-badge nav-badge-attention"
@@ -260,12 +253,14 @@
                 : m.sidebar_friend_requests_title_other({ count: pendingFriendRequestCount })}
             >{pendingFriendRequestCount}</span>
           {/if}
+          -->
         </a>
       </li>
     {/each}
   </ul>
 
   <div class="sidebar-footer">
+    <!-- Hidden until developer decides to introduce the feature.
     <button
       type="button"
       class="about-btn chats-btn"
@@ -292,6 +287,7 @@
         >{totalUnreadChats > 99 ? '99+' : totalUnreadChats}</span>
       {/if}
     </button>
+    -->
     <button
       type="button"
       class="about-btn"
