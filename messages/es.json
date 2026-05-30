@@ -1082,8 +1082,6 @@
   "transfers_paste_link_title": "Lee un enlace ed2k:// del portapapeles e inicia la descarga",
   "transfers_paste_link": "Pegar enlace eD2K",
   "transfers_pasting": "Pegando…",
-  "transfers_kad_network": "Red KAD",
-  "transfers_ed2k_server": "Servidor ED2K",
 
   "transfers_col_file_name": "Nombre de archivo",
   "transfers_col_size": "Tamaño",
