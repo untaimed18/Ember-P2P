@@ -135,9 +135,12 @@ pub fn encrypt_send_server(payload: &[u8], base_key: u32) -> Vec<u8> {
     let mut plain_enc = Vec::with_capacity(5 + CRYPT_HEADER_PADDING + payload.len());
     plain_enc.extend_from_slice(&MAGICVALUE_UDP_SYNC_SERVER.to_le_bytes());
     plain_enc.push(CRYPT_HEADER_PADDING as u8);
+    // Currently unreachable (CRYPT_HEADER_PADDING is 0) but kept for parity
+    // with eMule's reference layout — if the constant is ever bumped this
+    // block lights up automatically. `absurd_extreme_comparisons` would
+    // otherwise reject the `> 0` check against a `usize` minimum.
+    #[allow(clippy::absurd_extreme_comparisons)]
     if CRYPT_HEADER_PADDING > 0 {
-        // Random padding bytes. Currently unreachable (CRYPT_HEADER_PADDING
-        // is 0), but kept for parity with the reference layout.
         let mut pad = vec![0u8; CRYPT_HEADER_PADDING];
         rng.fill_bytes(&mut pad);
         plain_enc.extend_from_slice(&pad);
