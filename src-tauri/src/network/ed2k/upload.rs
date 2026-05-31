@@ -25,9 +25,11 @@ use crate::types::TransferDirection;
 
 pub type EmberSessionMap = Arc<RwLock<HashMap<[u8; 16], tokio::sync::mpsc::Sender<Vec<u8>>>>>;
 
+use super::dead_sources::PENDING_KAD_CALLBACK_SECS;
 use super::messages::*;
 use crate::network::kad::buddy::PendingBuddySet;
 use crate::network::kad::ip_filter::SharedIpFilter;
+use crate::network::kad::types::cuint128_swap;
 
 struct UploadSlotGuard {
     active_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -106,13 +108,46 @@ pub struct KadCallbackParts {
     pub writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     /// True if EmuleInfo exchange was already done (obfuscated connections).
     pub emule_info_done: bool,
+    /// Capabilities parsed from the peer's Hello so the adopting downloader
+    /// formats its file request the way the peer expects (notably the
+    /// extended-requests version that gates the OP_REQUESTFILENAME part
+    /// bitmap — omitting it makes the peer short-read and FIN).
+    pub peer_caps: PeerCapabilities,
 }
 
-/// Shared set of IPs we're expecting KAD callback connections from.
-/// Maps source IP -> pending callback expectations. The upload handler checks
-/// connecting peers against this to detect KAD callback responses.
-/// Server LowID callbacks are detected separately via the source manager.
-pub type PendingKadCallbacks = Arc<tokio::sync::Mutex<HashMap<std::net::Ipv4Addr, Vec<([u8; 16], Option<[u8; 16]>, i64)>>>>;
+/// How eMule keys a firewalled KAD callback source before the peer connects.
+/// Type 3/5 publishes buddy IP in `TAG_SERVERIP` but usually omits
+/// `TAG_SOURCEIP`, so the publisher's ED2K user hash is the stable identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PendingKadCallbackKey {
+    SourceIp(std::net::Ipv4Addr),
+    SourceUserHash([u8; 16]),
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingKadCallbackEntry {
+    pub file_hash: [u8; 16],
+    /// `TAG_SOURCEPORT` from the KAD publish (used for disambiguation).
+    pub expected_tcp_port: u16,
+    pub registered_at: i64,
+}
+
+/// Pending inbound KAD callbacks. Type 3/5 sources are keyed by user hash;
+/// type 6 / direct-callback sources with a real `TAG_SOURCEIP` use IP.
+pub type PendingKadCallbacks =
+    Arc<tokio::sync::Mutex<HashMap<PendingKadCallbackKey, Vec<PendingKadCallbackEntry>>>>;
+
+/// UI / placeholder row key for a KAD callback source before connect-back.
+pub fn kad_callback_display_key(ip: std::net::Ipv4Addr, user_hash: Option<[u8; 16]>) -> String {
+    if ip.is_unspecified() {
+        user_hash
+            .filter(|h| *h != [0u8; 16])
+            .map(|h| format!("uh:{}", hex::encode(h)))
+            .unwrap_or_else(|| "0.0.0.0".to_string())
+    } else {
+        ip.to_string()
+    }
+}
 
 pub struct UdpFirewallCheckRequest {
     pub peer_ip: Ipv4Addr,
@@ -1680,6 +1715,46 @@ impl UploadHandler {
                     &hello_options,
                 );
                 write_packet_async(&mut wr, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_payload).await?;
+
+                // Mirror eMule's ListenSocket::ProcessPacket OP_HELLO path
+                // (ListenSocket.cpp:273): after responding with OP_HELLOANSWER,
+                // send our OP_EMULEINFOANSWER so the peer gets a complete
+                // eMule handshake before we hand off to multi_source.
+                //
+                // Without this packet, the peer's CUpDownClient sees only
+                // OP_HELLOANSWER from us — its `m_byInfopacketsReceived`
+                // still flips to IP_BOTH via the eMule tags embedded in
+                // our HelloAnswer (`ProcessHelloTypePacket` bIsMule
+                // branch, BaseClient.cpp:661-664), so the SecIdent state
+                // machine *does* start — but many eMule mods and a
+                // surprising number of legitimate clients (anti-leecher
+                // heuristics in NeoMule/MorphXT/etc., plus older aMule
+                // 2.3.x builds that the log shows are common on this
+                // network) treat the absence of an explicit
+                // OP_EMULEINFO/OP_EMULEINFOANSWER round trip as a
+                // half-baked handshake. They accept the TCP connection,
+                // ACK our HelloAnswer, then silently FIN as soon as we
+                // send OP_REQUESTFILENAME — the exact symptom we hit in
+                // production for every KAD-callback source:
+                //
+                //   `stage:file_status_wait (round 0, got_filename=false,
+                //    early_accept=false): unexpected end of file`
+                //
+                // The obfuscated path above (line ~1602) already sends
+                // OP_EMULEINFOANSWER unconditionally for the same
+                // reason. KAD-callback sources connect back in
+                // plaintext by default (the firewalled peer doesn't
+                // know our user hash until they parse our HelloAnswer,
+                // so eMule's `Connect()` falls through to
+                // `SetConnectionEncryption(false, NULL, false)`), which
+                // is why this regression only ever bit callback flows.
+                let emule_payload = build_emule_info(
+                    self.udp_port,
+                    self.obfuscation_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                    Some(&self.ember_hash),
+                    None,
+                );
+                write_packet_async(&mut wr, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_payload).await?;
                 (rd, wr, hd, puh)
             }
         };
@@ -1734,31 +1809,83 @@ impl UploadHandler {
 
         // Check if this is a KAD callback connection (firewalled source connecting back)
         if let std::net::IpAddr::V4(peer_v4) = peer_addr.ip() {
+            let peer_hello_port = if hello_data.len() >= 23 {
+                u16::from_le_bytes([hello_data[21], hello_data[22]])
+            } else {
+                0
+            };
             let callback_file = {
                 let mut cbs = self.pending_kad_callbacks.lock().await;
                 let now = chrono::Utc::now().timestamp();
-                cbs.retain(|_, entries| {
-                    entries.retain(|(_, _, ts)| now - *ts < 120);
-                    !entries.is_empty()
-                });
-                if let Some(entries) = cbs.get_mut(&peer_v4) {
-                    let match_idx = entries.iter().position(|(_, user_hash, _)| {
-                        user_hash.map(|h| h == peer_user_hash).unwrap_or(false)
-                    }).or_else(|| (entries.len() == 1).then_some(0));
-                    if let Some(idx) = match_idx {
-                        let (file_hash, _user_hash, ts) = entries.remove(idx);
-                        if entries.is_empty() {
-                            cbs.remove(&peer_v4);
-                        }
-                        Some((file_hash, ts))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+                for entries in cbs.values_mut() {
+                    entries.retain(|e| now - e.registered_at < PENDING_KAD_CALLBACK_SECS);
                 }
+                cbs.retain(|_, v| !v.is_empty());
+
+                let mut lookup_keys: Vec<PendingKadCallbackKey> = Vec::new();
+                if peer_user_hash != [0u8; 16] {
+                    lookup_keys.push(PendingKadCallbackKey::SourceUserHash(peer_user_hash));
+                    let swapped = cuint128_swap(&peer_user_hash);
+                    if swapped != peer_user_hash {
+                        lookup_keys.push(PendingKadCallbackKey::SourceUserHash(swapped));
+                    }
+                }
+                if !peer_v4.is_unspecified() {
+                    lookup_keys.push(PendingKadCallbackKey::SourceIp(peer_v4));
+                }
+
+                let mut matched: Option<[u8; 16]> = None;
+                'outer: for key in lookup_keys {
+                    let Some(entries) = cbs.get_mut(&key) else {
+                        continue;
+                    };
+                    let match_idx = if matches!(key, PendingKadCallbackKey::SourceUserHash(_)) {
+                        // eMule's WAITCALLBACKKAD client is matched by user hash; the
+                        // TCP port in the callback Hello is not reliable enough to gate it.
+                        (!entries.is_empty()).then_some(0)
+                    } else {
+                        entries.iter().position(|e| {
+                            peer_hello_port == 0 || e.expected_tcp_port == 0
+                                || e.expected_tcp_port == peer_hello_port
+                        })
+                    };
+                    if let Some(idx) = match_idx {
+                        let entry = entries.remove(idx);
+                        if entries.is_empty() {
+                            cbs.remove(&key);
+                        }
+                        matched = Some(entry.file_hash);
+                        break 'outer;
+                    }
+                }
+
+                if matched.is_none() && !cbs.is_empty() {
+                    // Diagnostic: an inbound connection arrived while we were
+                    // expecting callbacks but it matched none of them. Dump
+                    // the peer identity next to the pending keys so we can see
+                    // whether a firewalled source actually connected back and
+                    // we simply failed to recognise it (hash/port mismatch)
+                    // vs. the buddy never relaying at all.
+                    let pending_summary: Vec<String> = cbs
+                        .keys()
+                        .map(|k| match k {
+                            PendingKadCallbackKey::SourceIp(ip) => format!("ip={ip}"),
+                            PendingKadCallbackKey::SourceUserHash(h) => {
+                                format!("uh={}", hex::encode(h))
+                            }
+                        })
+                        .collect();
+                    info!(
+                        "Inbound conn from {peer_addr} (user={}, hello_port={peer_hello_port}) \
+                         did NOT match any of {} pending KAD callback(s): [{}]",
+                        hex::encode(peer_user_hash),
+                        cbs.len(),
+                        pending_summary.join(", "),
+                    );
+                }
+                matched
             };
-            if let Some((file_hash, _ts)) = callback_file {
+            if let Some(file_hash) = callback_file {
                 info!("Recognized KAD callback connection from {peer_addr} for file {}", hex::encode(file_hash));
                 let (dyn_reader, dyn_writer, emule_done): (Box<dyn tokio::io::AsyncRead + Unpin + Send>, Box<dyn tokio::io::AsyncWrite + Unpin + Send>, bool) = match (reader, writer) {
                     (StreamReader::Plain(r), StreamWriter::Plain(w)) => (Box::new(r), Box::new(w), false),
@@ -1776,6 +1903,7 @@ impl UploadHandler {
                     reader: dyn_reader,
                     writer: dyn_writer,
                     emule_info_done: emule_done,
+                    peer_caps: hello_caps.clone(),
                 };
                 let _ = self.kad_callback_tx.send(parts).await;
                 return Ok(());
@@ -1845,6 +1973,7 @@ impl UploadHandler {
                         reader: dyn_reader,
                         writer: dyn_writer,
                         emule_info_done: emule_done,
+                        peer_caps: hello_caps.clone(),
                     };
                     let _ = self.kad_callback_tx.send(parts).await;
                     return Ok(());

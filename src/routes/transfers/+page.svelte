@@ -268,7 +268,7 @@
           const s = expandedSources[idx];
           const updated: SourceInfo = { ...s, status, queue_rank: d.queue_rank, speed: d.speed, transferred: d.transferred, client_software: d.client_software || s.client_software, peer_name: d.peer_name || s.peer_name, available_parts: d.available_parts ?? s.available_parts, total_parts: d.total_parts ?? s.total_parts, country_code: d.country_code ?? s.country_code };
           expandedSources[idx] = updated;
-          expandedSources = expandedSources;
+          expandedSources = [...expandedSources];
         }
       } else if (!isDead) {
         // L16: cap the expanded list so a transfer with hundreds of
@@ -304,7 +304,26 @@
       }
       searchStatus.set(d.transfer_id, msg);
       searchStatus = new Map(searchStatus);
+      if (
+        d.transfer_id === expandedTransferId &&
+        count > 0 &&
+        (d.kind === 'server_found' || d.kind === 'udp_found' || d.kind === 'kad_found' || d.kind === 'kad_indirect')
+      ) {
+        refreshExpandedSourceDetails(d.transfer_id);
+      }
     }).then((u) => { if (mounted) searchUnsubs.push(u); else u(); }).catch((e) => { console.error('Failed to subscribe to transfer:source-search:', e); });
+
+    // Reliable post-write refresh: the backend emits this AFTER it has
+    // finished writing all KAD/server placeholder rows for a completed
+    // source search. (The `transfer:source-search` event above fires
+    // too early — before the callback sends and row writes — so a
+    // refresh keyed off it races and reads stale state.)
+    listen<{ transfer_id: string }>('transfer:sources-updated', (event) => {
+      const d = event.payload;
+      if (d.transfer_id === expandedTransferId) {
+        refreshExpandedSourceDetails(d.transfer_id);
+      }
+    }).then((u) => { if (mounted) searchUnsubs.push(u); else u(); }).catch((e) => { console.error('Failed to subscribe to transfer:sources-updated:', e); });
 
     listen<{ transfer_id: string; source: string; kind: string }>('transfer:source-failed', (event) => {
       const d = event.payload;
@@ -426,9 +445,28 @@
     }
   }
 
+  async function refreshExpandedSourceDetails(transferId: string) {
+    const requestId = sourceDetailRequestId;
+    try {
+      const sources = await getTransferSources(transferId);
+      if (expandedTransferId !== transferId || requestId !== sourceDetailRequestId) return;
+
+      // Backend source-search handlers may update TransferManager without
+      // emitting per-row events. Merge a fresh snapshot so an already-open
+      // drawer shows newly discovered sources without requiring collapse/expand.
+      const byKey = new Map<string, SourceInfo>();
+      for (const s of sources) byKey.set(`${s.ip}:${s.port}`, s);
+      for (const s of expandedSources) byKey.set(`${s.ip}:${s.port}`, s);
+      expandedSources = Array.from(byKey.values());
+    } catch {
+      // Keep the live event-fed rows if this opportunistic refresh fails.
+    }
+  }
+
   function sourceStatusLabel(s: SourceInfo): string {
     switch (s.status) {
       case 'connecting': return m.transfers_src_connecting();
+      case 'wait_callback': return m.transfers_src_wait_callback();
       case 'queued': return s.queue_rank != null && s.queue_rank > 0 ? m.transfers_src_queue_rank({ rank: s.queue_rank }) : m.transfers_src_queued();
       case 'queue_full': return m.transfers_src_queue_full();
       case 'no_needed_parts': return m.transfers_src_no_needed_parts();
@@ -2530,14 +2568,16 @@
                 {@const failedCount = expandedSources.length - visibleSources.length}
                 {@const xferCount = visibleSources.filter(s => s.status === 'transferring').length}
                 {@const queuedCount = visibleSources.filter(s => s.status === 'queued').length}
+                {@const waitCallbackCount = visibleSources.filter(s => s.status === 'wait_callback').length}
                 {@const connectCount = visibleSources.filter(s => s.status === 'connecting').length}
-                {@const otherCount = visibleSources.length - xferCount - queuedCount - connectCount}
+                {@const otherCount = visibleSources.length - xferCount - queuedCount - connectCount - waitCallbackCount}
                 <tr class="source-child-row source-summary-row">
                   <td class="source-child-cell" colspan={dlColCount}>
                     <span class="source-summary">
                       <strong>{visibleSources.length}</strong> {visibleSources.length === 1 ? m.transfers_known_peers_one() : m.transfers_known_peers_other()}
                       {#if xferCount > 0}<span class="ss-chip ss-xfer">{m.transfers_chip_transferring({ count: xferCount })}</span>{/if}
                       {#if queuedCount > 0}<span class="ss-chip ss-queued">{m.transfers_chip_queued({ count: queuedCount })}</span>{/if}
+                      {#if waitCallbackCount > 0}<span class="ss-chip ss-wait-callback">{m.transfers_chip_wait_callback({ count: waitCallbackCount })}</span>{/if}
                       {#if connectCount > 0}<span class="ss-chip ss-connect">{m.transfers_chip_connecting({ count: connectCount })}</span>{/if}
                       {#if otherCount > 0}<span class="ss-chip ss-other">{m.transfers_chip_other({ count: otherCount })}</span>{/if}
                       {#if failedCount > 0}<span class="ss-chip ss-failed">{m.transfers_chip_failed({ count: failedCount })}</span>{/if}
@@ -4509,6 +4549,7 @@
     background: var(--text-muted);
   }
   .src-dot-connecting { background: var(--warning); box-shadow: 0 0 3px var(--warning); }
+  .src-dot-wait_callback { background: #c9a227; box-shadow: 0 0 3px #c9a227; }
   .src-dot-queued { background: #e09830; box-shadow: 0 0 3px #e09830; }
   .src-dot-queue_full { background: var(--text-muted); }
   .src-dot-no_needed_parts { background: var(--text-muted); }
@@ -4590,6 +4631,10 @@
     color: var(--warning);
     background: color-mix(in srgb, var(--warning) 10%, transparent);
   }
+  .src-st-wait_callback {
+    color: #c9a227;
+    background: color-mix(in srgb, #c9a227 12%, transparent);
+  }
   .src-st-queued {
     color: #e09830;
     background: color-mix(in srgb, #e09830 12%, transparent);
@@ -4647,6 +4692,7 @@
   .ss-xfer { color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
   .ss-queued { color: #e09830; background: color-mix(in srgb, #e09830 10%, transparent); }
   .ss-connect { color: var(--warning); background: color-mix(in srgb, var(--warning) 10%, transparent); }
+  .ss-wait-callback { color: #c9a227; background: color-mix(in srgb, #c9a227 12%, transparent); }
   .ss-other { color: var(--text-muted); background: color-mix(in srgb, var(--text-muted) 8%, transparent); }
   .ss-failed { color: var(--danger, #e74c3c); background: color-mix(in srgb, var(--danger, #e74c3c) 8%, transparent); }
 </style>

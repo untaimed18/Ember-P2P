@@ -116,9 +116,30 @@ fn spawn_save_snapshot(snap: super::part_tracker::SaveSnapshot) {
 }
 
 /// Maximum simultaneous source connections per download.
-/// eMule typically has ~10 active connections per file.
-const MAX_CONCURRENT_SOURCES: usize = 10;
+///
+/// This permit count gates connecting + queued + transferring sources (the
+/// permit is held for the whole `download_parts_from_source` lifetime). Raised
+/// from 10 so live sources aren't starved while slots are tied up dialing
+/// dead/slow peers — eMule keeps a much larger connection pool per file.
+const MAX_CONCURRENT_SOURCES: usize = 20;
 const SOURCE_INJECTION_WAIT_SECS: u64 = 10;
+
+/// Max *silence* tolerated on a single handshake-phase packet read
+/// (hello / emule-info / file-status / hashset). The timer resets whenever a
+/// packet arrives, so a responsive peer is never cut off. Kept far below the
+/// 100s in-transfer no-data timeout (`DOWNLOADTIMEOUT_SECS`): a peer that
+/// accepts TCP then stalls the handshake would otherwise pin one of only
+/// `MAX_CONCURRENT_SOURCES` connection slots for the full transfer timeout,
+/// starving queued live sources. eMule likewise uses a short establishment
+/// timeout and re-asks slow peers on a later cycle rather than holding the
+/// socket open.
+const HANDSHAKE_READ_TIMEOUT_SECS: u64 = 20;
+
+/// Timeout for the outbound TCP connect to a peer. A peer we can't reach in
+/// this window is treated as dead for this attempt and re-asked later. The OS
+/// SYN-retransmit timeout on Windows is ~21s, so this mostly just trims the
+/// tail for half-reachable hosts and bounds the obf→plain retry cost.
+const PEER_CONNECT_TIMEOUT_SECS: u64 = 15;
 
 /// A TCP stream + identity that has already been established by another
 /// part of the system (typically the upload listener after recognising
@@ -137,6 +158,19 @@ pub struct EstablishedStream {
     pub writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
     pub peer_user_hash: [u8; 16],
     pub emule_info_done: bool,
+    /// Capabilities parsed from the peer's Hello (and EmuleInfo, when the
+    /// upload listener already exchanged it). Threaded through so the adopt
+    /// path formats its file request exactly the way the peer expects.
+    /// Crucially this carries the peer's `extended_requests_ver`: eMule's
+    /// uploader reads the part-status block appended to OP_REQUESTFILENAME
+    /// based on the requester's advertised version (UploadClient.cpp
+    /// `ProcessExtendedInfo`). We always advertise a modern version in the
+    /// HelloAnswer the listener sent, so if we omit that block (which the
+    /// old `PeerCapabilities::default()` did, ext_ver=0) the peer does a
+    /// short read on an empty buffer, throws, and FINs — the
+    /// `stage:file_status_wait (round 0) unexpected end of file` we saw for
+    /// every adopted callback source.
+    pub peer_caps: crate::network::ed2k::messages::PeerCapabilities,
 }
 
 /// Pairing of an established peer stream with the synthesised
@@ -174,6 +208,34 @@ pub(crate) fn tune_peer_stream(stream: &tokio::net::TcpStream) {
     let _ = stream.set_nodelay(true);
     let sref = socket2::SockRef::from(stream);
     let _ = sref.set_recv_buffer_size(PEER_RECV_BUFFER_BYTES);
+}
+
+/// Whether an error represents the remote peer dropping the connection
+/// (reset/aborted/FIN) rather than a timeout or protocol error. Used to
+/// decide whether a cleartext handshake is worth retrying with obfuscation:
+/// many modern eMule clients silently RST a plain connection (`os error
+/// 10054` on Windows) when they want obfuscation, or FIN it (unexpected EOF).
+fn is_connection_reset(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            match io_err.kind() {
+                std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::BrokenPipe => return true,
+                _ => {}
+            }
+        }
+        let s = cause.to_string();
+        if s.contains("forcibly closed")
+            || s.contains("10054")
+            || s.contains("reset by peer")
+            || s.contains("unexpected end of file")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1203,6 +1265,19 @@ impl MultiSourceDownload {
         // receiver had gone out of scope.
         let mut post_phase_new_source_rx: Option<mpsc::Receiver<DownloadSource>> = None;
 
+        // Same rescue for the established-stream (KAD/server callback) channel.
+        // Previously `new_established_rx` was a local INSIDE the
+        // initial-injection-wait block below, so it was dropped the moment we
+        // proceeded to retry rounds. Because we only send the KAD `CallbackReq`
+        // as retry rounds begin, the firewalled peer almost always connects
+        // back AFTER that point — landing on a CLOSED established channel in
+        // `network/mod.rs`, which then discarded the live stream (and, worse,
+        // tore down the transfer's injection senders). That is the concrete
+        // cause of sources sitting in "Waiting for callback" forever while
+        // eMule, on the same network, adopts them and transfers. Hoisting the
+        // receiver here lets the retry phase keep adopting callbacks.
+        let mut post_phase_new_established_rx: Option<mpsc::Receiver<EstablishedSource>> = None;
+
         if let Some(mut new_source_rx) = self.new_source_rx.take() {
             // Established-stream injection channel — populated by the
             // KAD/server callback path in `network/mod.rs` when a
@@ -1706,6 +1781,10 @@ impl MultiSourceDownload {
             if injection_channel_open {
                 post_phase_new_source_rx = Some(new_source_rx);
             }
+            // Hand the established-stream channel back to the outer scope too so
+            // the retry-rounds loop can keep adopting inbound KAD/server
+            // callbacks (it's `None` here only if the channel already closed).
+            post_phase_new_established_rx = new_established_rx;
         } else {
             let all_parts_done = {
                 let t = tracker.read().await;
@@ -1812,6 +1891,37 @@ impl MultiSourceDownload {
         };
         let mut last_round_end: Option<std::time::Instant> = None;
         let mut retry_round: u32 = 0;
+
+        // Inbound KAD/server callback streams that arrive during retry rounds
+        // are adopted as detached tasks against the shared tracker/part file
+        // (exactly like the active-phase established arm). They report progress
+        // through this dedicated aggregator because the phase-1 `progress_tx`
+        // aggregator was already awaited above and is closed by now.
+        let mut adopted_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        let mut pending_established: Vec<EstablishedSource> = Vec::new();
+        let (adopt_progress_tx, mut adopt_progress_rx) = mpsc::channel::<(usize, i64)>(256);
+        let adopt_agg = {
+            let adopt_tracker = tracker.clone();
+            let adopt_etx = event_tx.clone();
+            let adopt_tid = self.transfer_id.clone();
+            let adopt_fs = self.file_size;
+            tokio::spawn(async move {
+                while adopt_progress_rx.recv().await.is_some() {
+                    let capped = {
+                        let t = adopt_tracker.read().await;
+                        t.completed_bytes().min(adopt_fs)
+                    };
+                    let _ = adopt_etx
+                        .send(DownloadEvent::Progress {
+                            transfer_id: adopt_tid.clone(),
+                            downloaded: capped,
+                            total: adopt_fs,
+                        })
+                        .await;
+                }
+            })
+        };
+
         while retry_round < max_retry_rounds {
             check_control(&self.control).await?;
 
@@ -1870,6 +1980,187 @@ impl MultiSourceDownload {
                         }
                     }
                 }
+            }
+
+            // Drain + adopt any inbound callback streams (from cooldown-sleep
+            // wakeups buffered into `pending_established`, plus anything sitting
+            // in the channel right now). Each live stream is handed straight to
+            // `download_parts_from_source` with `Some(stream)` so it adopts the
+            // already-handshaked connection instead of dialing the firewalled
+            // peer back (which can never succeed). This is the retry-phase
+            // counterpart to the active-phase established-stream select arm.
+            if let Some(rx) = post_phase_new_established_rx.as_mut() {
+                loop {
+                    match rx.try_recv() {
+                        Ok(es) => pending_established.push(es),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            post_phase_new_established_rx = None;
+                            break;
+                        }
+                    }
+                }
+            }
+            for es in std::mem::take(&mut pending_established) {
+                let source = es.source;
+                let stream = es.stream;
+
+                // Assign a part exactly like the active-phase arm: pick the
+                // best needed part this peer can serve. If none is assignable
+                // (everything already complete / in-progress in endgame) the
+                // live stream is dropped — only one task can read a socket.
+                let parts = {
+                    let cs = chunk_selector.read().await;
+                    let t = tracker.read().await;
+                    let completed = t.completed_parts().to_vec();
+                    let in_prog = t.in_progress.clone();
+                    let endgame_prefer = t.remaining_count() <= 3 && t.part_count > 1;
+                    let gap_bytes = t.part_gap_bytes_vec();
+                    let avail = if source.available_parts.is_empty() {
+                        vec![true; t.part_count]
+                    } else {
+                        source.available_parts.clone()
+                    };
+                    let pp = self.control.is_preview_priority();
+                    let active: Vec<usize> = in_prog.iter().enumerate()
+                        .filter(|(_, &ip)| ip).map(|(i, _)| i).collect();
+                    if let Some(p) = cs.select_part(
+                        &completed, &in_prog, &avail, &active, &gap_bytes, pp, endgame_prefer,
+                    ) {
+                        vec![p]
+                    } else {
+                        Vec::new()
+                    }
+                };
+                if parts.is_empty() {
+                    debug!(
+                        "Adopted callback {}:{} has no assignable parts; dropping stream",
+                        source.peer_ip, source.peer_port,
+                    );
+                    drop(stream);
+                    continue;
+                }
+
+                let src_idx = next_src_idx;
+                next_src_idx += 1;
+                let new_total = total_sources.fetch_add(1, Ordering::Relaxed) + 1;
+                let _ = event_tx
+                    .send(DownloadEvent::SourcesUpdate {
+                        transfer_id: self.transfer_id.clone(),
+                        total: new_total,
+                        active: active_count.load(Ordering::Relaxed),
+                        queued: queued_count.load(Ordering::Relaxed),
+                    })
+                    .await;
+                if !source.available_parts.is_empty() {
+                    let mut cs = chunk_selector.write().await;
+                    for (i, &has) in source.available_parts.iter().enumerate() {
+                        if i < cs.part_frequency.len() && has {
+                            cs.part_frequency[i] = cs.part_frequency[i].saturating_add(1);
+                        }
+                    }
+                    cs.total_sources = cs.total_sources.saturating_add(1);
+                }
+                info!(
+                    "Retry round {}: adopting inbound callback stream {}:{} (idx {src_idx})",
+                    retry_round + 1, source.peer_ip, source.peer_port,
+                );
+
+                let src = source.clone();
+                let trk = tracker.clone();
+                let pp = part_path.clone();
+                let fh = self.file_hash;
+                let fs = self.file_size;
+                let uh = self.user_hash;
+                let nn = self.nickname.clone();
+                let tp = self.tcp_port;
+                let up = self.udp_port;
+                let bw = self.bandwidth_limiter.clone();
+                let a_progress_tx = adopt_progress_tx.clone();
+                let ph = part_hashes.clone();
+                let aich_m = shared_aich_master.clone();
+                let sa = active_count.clone();
+                let sq = queued_count.clone();
+                let sm = self.source_manager.clone();
+                let cm = self.credit_manager.clone();
+                let cmt = self.comment_manager.clone();
+                let cs = chunk_selector.clone();
+                let avail = source.available_parts.clone();
+                let etx = event_tx.clone();
+                let tid = self.transfer_id.clone();
+                let bi = self.shared_buddy_info.clone();
+                let ctrl = self.control.clone();
+                let sem = conn_semaphore.clone();
+                let fail_etx = event_tx.clone();
+                let fail_tid = self.transfer_id.clone();
+                let fail_ip = source.peer_ip.clone();
+                let fail_port = source.peer_port;
+                let obf_enabled = self.obfuscation_enabled;
+                let hello_server = self.server_addr;
+                let a_ember_hash = self.ember_hash;
+                let a_ember_pubkey = self.ed25519_public_key;
+                let a_ember_secret = self.ed25519_secret_key;
+                let a_nick = self.nickname.clone();
+                let a_qw = queue_wait_secs;
+                let a_shared_out = shared_part_file.clone();
+                let a_epx = self.ember_payload.clone();
+                let a_epx_gen = self.ember_payload_generation.clone();
+                let a_aich_p = self.aich_pending.clone();
+                let a_ipf = self.ip_filter.clone();
+                let a_ban = self.banned_ips.clone();
+                let a_ext = self.external_ip;
+                let a_geo = self.geoip.clone();
+                let a_fh = self.friend_hashes.clone();
+                let a_sx_oh = self.sx_overhead.clone();
+                let a_missing_parts = peers_missing_parts.clone();
+                adopted_handles.push(tokio::spawn(async move {
+                    let _permit = match sem.acquire().await {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    let freq_avail = avail.clone();
+                    let result = download_parts_from_source(
+                        src_idx, &src, &parts, trk, &pp, &fh, fs, &uh, &nn,
+                        tp, up, bw, a_progress_tx, ph, aich_m, sa, sq, sm, cm,
+                        cmt, Some(cs.clone()), avail, Some(etx), tid, bi, ctrl,
+                        obf_enabled, hello_server, a_qw,
+                        Some(a_shared_out), a_epx, a_epx_gen,
+                        a_aich_p,
+                        a_ipf, a_ban, a_ext,
+                        a_geo, a_fh,
+                        a_ember_hash,
+                        a_ember_pubkey,
+                        a_ember_secret,
+                        a_nick,
+                        a_sx_oh,
+                        Some(stream),
+                        a_missing_parts,
+                    ).await;
+                    if !freq_avail.is_empty() {
+                        let mut csel = cs.write().await;
+                        csel.remove_source(&freq_avail);
+                    }
+                    if let Err(e) = &result {
+                        if !super::transfer::is_queue_detached_error(&e.to_string()) {
+                            warn!("Adopted callback source {} ({}) failed: {e:#}", src_idx, fail_ip);
+                            let _ = fail_etx.send(DownloadEvent::SourceDetail {
+                                transfer_id: fail_tid,
+                                ip: fail_ip,
+                                port: fail_port,
+                                status: "failed".to_string(),
+                                queue_rank: None,
+                                speed: 0,
+                                transferred: 0,
+                                client_software: String::new(),
+                                peer_name: String::new(),
+                                failure_kind: Some(super::transfer::classify_error(&e.to_string())),
+                                available_parts: None,
+                                total_parts: None,
+                                country_code: None,
+                            }).await;
+                        }
+                    }
+                }));
             }
 
             let all_sources: Vec<DownloadSource> = self.sources.iter()
@@ -2053,30 +2344,62 @@ impl MultiSourceDownload {
                             wait.as_secs_f64(),
                             slice.as_secs_f64(),
                         );
-                        if let Some(rx) = post_phase_new_source_rx.as_mut() {
-                            tokio::select! {
-                                biased;
-                                _ = tokio::time::sleep(slice) => {}
-                                new_src = rx.recv() => {
-                                    match new_src {
-                                        Some(source) => {
-                                            info!(
-                                                "Cooldown sleep on round {}/{} woken early by injected source {}:{}",
-                                                retry_round + 1,
-                                                max_retry_rounds,
-                                                source.peer_ip,
-                                                source.peer_port,
-                                            );
-                                            injected_sources.push(source);
-                                        }
-                                        None => {
-                                            post_phase_new_source_rx = None;
-                                        }
+                        // Wake early on EITHER a freshly-discovered source
+                        // (metadata) OR an inbound callback stream — the latter
+                        // is the firewalled-peer connect-back we requested at
+                        // the start of retry rounds and must adopt promptly
+                        // (buffering it long risks the peer timing the socket
+                        // out). The `std::future::pending` sentinels keep each
+                        // arm inert when its channel is already closed.
+                        tokio::select! {
+                            biased;
+                            _ = tokio::time::sleep(slice) => {}
+                            new_src = async {
+                                match post_phase_new_source_rx.as_mut() {
+                                    Some(rx) => rx.recv().await,
+                                    None => std::future::pending().await,
+                                }
+                            } => {
+                                match new_src {
+                                    Some(source) => {
+                                        info!(
+                                            "Cooldown sleep on round {}/{} woken early by injected source {}:{}",
+                                            retry_round + 1,
+                                            max_retry_rounds,
+                                            source.peer_ip,
+                                            source.peer_port,
+                                        );
+                                        injected_sources.push(source);
+                                    }
+                                    None => {
+                                        post_phase_new_source_rx = None;
                                     }
                                 }
                             }
-                        } else {
-                            tokio::time::sleep(slice).await;
+                            new_est = async {
+                                match post_phase_new_established_rx.as_mut() {
+                                    Some(rx) => rx.recv().await,
+                                    None => std::future::pending().await,
+                                }
+                            } => {
+                                match new_est {
+                                    Some(es) => {
+                                        info!(
+                                            "Cooldown sleep on round {}/{} woken early by inbound callback stream {}:{}",
+                                            retry_round + 1,
+                                            max_retry_rounds,
+                                            es.source.peer_ip,
+                                            es.source.peer_port,
+                                        );
+                                        // Adopted at the top of the next
+                                        // iteration's established drain.
+                                        pending_established.push(es);
+                                    }
+                                    None => {
+                                        post_phase_new_established_rx = None;
+                                    }
+                                }
+                            }
                         }
                         // Loop back without incrementing retry_round so
                         // a cooldown-only round doesn't burn the budget.
@@ -2309,6 +2632,28 @@ impl MultiSourceDownload {
             // top of the next iteration can decide whether to sleep.
             last_round_end = Some(std::time::Instant::now());
         }
+
+        // Retry budget exhausted: let any in-flight adopted callback downloads
+        // finish (they may be actively transferring), then shut down the
+        // adoption aggregator. Any callback stream still merely buffered can't
+        // be started now — the worker is about to exit — so it's dropped.
+        for es in pending_established.drain(..) {
+            drop(es);
+        }
+        drop(adopt_progress_tx);
+        let adopted_all_done = {
+            let t = tracker.read().await;
+            t.all_complete()
+        };
+        if adopted_all_done {
+            for h in &adopted_handles {
+                h.abort();
+            }
+        }
+        for h in adopted_handles.drain(..) {
+            let _ = h.await;
+        }
+        let _ = adopt_agg.await;
 
         // eMule-style: remaining incomplete parts are handled through normal
         // retry rounds above. Endgame: tighter request pipelining and (when ≤3
@@ -2763,97 +3108,41 @@ async fn download_parts_from_source(
         reader = es.reader;
         writer = es.writer;
         peer_user_hash = es.peer_user_hash;
-        let mut caps = PeerCapabilities::default();
-        caps.secure_ident_level = 3;
-        caps.supports_secure_ident = true;
-        hello_caps = caps;
-        peer_supports_large_files = false;
-        peer_supports_multipacket = false;
-        peer_supports_ext_multipacket = false;
-        peer_supports_file_ident = false;
-        peer_extended_requests_ver = 0;
-        peer_supports_source_ex2 = false;
-        peer_source_exchange_ver = 1;
-        peer_secure_ident_level = 3;
-        peer_supports_aich = false;
-        peer_ember_hash = None;
-    } else {
-        let stream = match tokio::time::timeout(
-            std::time::Duration::from_secs(40),
-            TcpStream::connect(addr),
-        )
-        .await
-        {
-            Ok(Ok(s)) => { tune_peer_stream(&s); s },
-            Ok(Err(e)) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout {e}")),
-            Err(_) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout timeout")),
-        };
-
-        // Register this source with the source manager
-        if let Some(sm) = &source_mgr {
-            if let std::net::IpAddr::V4(v4) = addr.ip() {
-                let mut sm = sm.write().await;
-                sm.register_source(*file_hash, v4, addr.port());
-            }
+        // Adopt the capabilities the upload listener parsed from the peer's
+        // Hello (and EmuleInfo, for obfuscated callbacks). This is what eMule
+        // does after ProcessHelloPacket on an incoming connection: it formats
+        // the file request from the *peer's* advertised capabilities, not from
+        // an assumed baseline. The previous code hardcoded everything to a
+        // minimal set with `extended_requests_ver = 0` and `secure_ident = 3`.
+        // That combination is exactly what stranded every adopted callback:
+        //   - ext_ver=0 made us omit the OP_REQUESTFILENAME part-status block,
+        //     but the HelloAnswer we already sent advertises a modern version,
+        //     so the peer's `ProcessExtendedInfo` short-read on the missing
+        //     block, threw, and FIN'd us (`stage:file_status_wait round 0
+        //     unexpected end of file`).
+        //   - secure_ident=3 made us volunteer a SecIdent challenge to peers
+        //     that never negotiated one.
+        // Using the real parsed caps fixes the wire-format mismatch and only
+        // engages SecIdent when the peer actually advertised it.
+        let caps = es.peer_caps;
+        peer_supports_large_files = caps.supports_large_files;
+        peer_supports_multipacket = caps.supports_multi_packet;
+        peer_supports_ext_multipacket = caps.ext_multi_packet;
+        peer_supports_file_ident = caps.supports_file_ident;
+        peer_extended_requests_ver = caps.extended_requests_ver;
+        peer_supports_source_ex2 = caps.supports_source_ex2;
+        peer_source_exchange_ver = caps.source_exchange_ver.max(1);
+        peer_secure_ident_level = caps.secure_ident_level;
+        peer_supports_aich = caps.supports_aich;
+        peer_ember_hash = caps.ember_hash;
+        src_client_software = client_software_from_caps(&caps);
+        if !caps.peer_name.is_empty() {
+            src_peer_name = caps.peer_name.clone();
         }
-
-        // eMule BaseClient.cpp: only enable encryption when peer requests (bit 1)
-        // or requires (bit 2) it. Merely supporting (bit 0) is not enough unless
-        // we have a "prefer crypt" setting. Matching eMule's conservative default
-        // avoids unnecessary obfuscation attempts that add latency and may fail.
-        let peer_opts = source.peer_connect_options.unwrap_or(0);
-        let should_try_obf = source.peer_user_hash.is_some()
-            && (peer_opts & 0x06) != 0;
-        let mut conn_is_obf = false;
-        let (r0, w0): (DynRead, DynWrite) = if let Some(peer_hash) = source.peer_user_hash.filter(|_| should_try_obf) {
-            debug!("Source {} has known peer hash metadata", _src_idx);
-            let (raw_r, raw_w) = stream.into_split();
-            let mut buf_r = tokio::io::BufReader::new(raw_r);
-            let mut buf_w = tokio::io::BufWriter::new(raw_w);
-            match tcp_obfuscation::negotiate_outgoing(&mut buf_r, &mut buf_w, &peer_hash).await {
-                Ok((recv_key, send_key)) => {
-                    conn_is_obf = true;
-                    (
-                        Box::new(tokio::io::BufReader::new(Rc4Reader::new(buf_r, recv_key))),
-                        Box::new(tokio::io::BufWriter::new(Rc4Writer::new(buf_w, send_key))),
-                    )
-                }
-                Err(e) => {
-                    if peer_opts & 0x04 != 0 {
-                        return Err(anyhow::anyhow!(
-                            "stage:tcp_obfuscation peer requires crypt and obfuscation failed: {e}"
-                        ));
-                    }
-                    debug!("Outgoing obfuscation failed for source {}: {e}; reconnecting plain", _src_idx);
-                    let plain_stream = match tokio::time::timeout(
-                        std::time::Duration::from_secs(40),
-                        TcpStream::connect(addr),
-                    )
-                    .await
-                    {
-                        Ok(Ok(s)) => { tune_peer_stream(&s); s },
-                        Ok(Err(err)) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout {err}")),
-                        Err(_) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout timeout")),
-                    };
-                    let (r, w) = plain_stream.into_split();
-                    (
-                        Box::new(tokio::io::BufReader::new(r)),
-                        Box::new(tokio::io::BufWriter::new(w)),
-                    )
-                }
-            }
-        } else {
-            let (raw_r, raw_w) = stream.into_split();
-            (
-                Box::new(tokio::io::BufReader::new(raw_r)),
-                Box::new(tokio::io::BufWriter::new(raw_w)),
-            )
-        };
-        connection_is_obfuscated = conn_is_obf;
-        reader = r0;
-        writer = w0;
-
-        // Hello handshake (include buddy tags if we have a buddy)
+        hello_caps = caps;
+    } else {
+        // Build the Hello payload once; it's identical across attempts.
+        // (Include buddy tags if we have a buddy.)
         let buddy = match &buddy_info {
             Some(bi) => bi.read().await.clone(),
             None => None,
@@ -2883,14 +3172,203 @@ async fn download_parts_from_source(
             buddy,
             &hello_options,
         );
-        write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_HELLO, &hello_payload).await?;
 
-        let (h_proto, h_opcode, hello_ans_data) = read_packet_timeout_ms(&mut *reader)
-            .await
-            .context("stage:hello_wait")?;
-        if h_proto != OP_EDONKEYHEADER || h_opcode != OP_HELLOANSWER {
-            anyhow::bail!("source {}: expected HelloAnswer, got proto=0x{h_proto:02X} op=0x{h_opcode:02X}", _src_idx);
+        // eMule BaseClient.cpp: enable encryption up-front when the peer
+        // requests (bit 1) or requires (bit 2) it. Merely supporting (bit 0)
+        // is not enough for the first attempt — but if a *cleartext* Hello is
+        // reset/dropped by a crypt-capable peer (bit 0 set) and we know its
+        // user hash (required to derive the RC4 key), eMule re-tries the same
+        // peer with obfuscation. We mirror that with one bounded retry: many
+        // modern clients silently RST plain handshakes (`os error 10054`).
+        // eMule tracks client identity by IP across files (`clientlist`), so a
+        // user hash learned for this peer on another file (KAD answer-ID, source
+        // exchange, or a prior handshake) lets us obfuscate even when the server
+        // omitted the 0x80 hash for this source. Fall back to that cache.
+        let mut peer_hash_opt = source.peer_user_hash;
+        let mut peer_opts = source.peer_connect_options.unwrap_or(0);
+        if peer_hash_opt.is_none() || peer_opts == 0 {
+            if let (Some(sm), std::net::IpAddr::V4(v4)) = (source_mgr.as_ref(), addr.ip()) {
+                let sm = sm.read().await;
+                if peer_hash_opt.is_none() {
+                    peer_hash_opt = sm.get_user_hash_by_addr(v4, addr.port());
+                }
+                if peer_opts == 0 {
+                    peer_opts = sm.get_connect_options_by_addr(v4, addr.port()).unwrap_or(0);
+                }
+            }
         }
+
+        // eMule Connect() (BaseClient.cpp:1481): obfuscate up-front when we know
+        // the peer's hash, the peer advertises crypt support (bit 0x01), and we
+        // have crypt enabled (our prefs request/prefer it, satisfying
+        // `RequestsCryptLayer() || IsCryptLayerPreferred()`). Require/request
+        // bits imply support via eMule's hello masking. Crypt-*required* peers
+        // RST a plaintext hello (`os error 10054`), so obfuscating here is what
+        // unblocks the common server-HighID-source case.
+        let prefer_obf =
+            peer_hash_opt.is_some() && obfuscation_enabled && (peer_opts & 0x07) != 0;
+        if peer_hash_opt.is_none() && (peer_opts & 0x07) != 0 {
+            info!(
+                "Source {} ({}) advertises crypt (opts=0x{:02X}) but no user hash known — connecting plaintext; crypt-required peers will reset us (10054)",
+                _src_idx, addr, peer_opts
+            );
+        } else if prefer_obf {
+            info!(
+                "Source {} ({}) will connect obfuscated up-front (opts=0x{:02X}, hash known)",
+                _src_idx, addr, peer_opts
+            );
+        }
+
+        let mut attempt: u8 = 0;
+        let mut force_obf = false;
+        let mut force_plain = false;
+        let mut obf_retry_used = false;
+        let mut plain_retry_used = false;
+        let (conn_is_obf, r0, w0, hello_ans_data) = loop {
+            let stream = match tokio::time::timeout(
+                std::time::Duration::from_secs(PEER_CONNECT_TIMEOUT_SECS),
+                TcpStream::connect(addr),
+            )
+            .await
+            {
+                Ok(Ok(s)) => { tune_peer_stream(&s); s },
+                Ok(Err(e)) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout {e}")),
+                Err(_) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout timeout")),
+            };
+
+            // Register this source with the source manager (idempotent).
+            if let Some(sm) = &source_mgr {
+                if let std::net::IpAddr::V4(v4) = addr.ip() {
+                    let mut sm = sm.write().await;
+                    sm.register_source(*file_hash, v4, addr.port());
+                }
+            }
+
+            let mut conn_is_obf = false;
+            let (mut rr, mut ww): (DynRead, DynWrite) = if (prefer_obf || force_obf)
+                && !force_plain
+                && peer_hash_opt.is_some()
+            {
+                let peer_hash = peer_hash_opt.unwrap();
+                debug!("Source {} attempting obfuscated handshake (attempt {})", _src_idx, attempt);
+                let (raw_r, raw_w) = stream.into_split();
+                let mut buf_r = tokio::io::BufReader::new(raw_r);
+                let mut buf_w = tokio::io::BufWriter::new(raw_w);
+                match tcp_obfuscation::negotiate_outgoing(&mut buf_r, &mut buf_w, &peer_hash).await {
+                    Ok((recv_key, send_key)) => {
+                        conn_is_obf = true;
+                        (
+                            Box::new(tokio::io::BufReader::new(Rc4Reader::new(buf_r, recv_key))),
+                            Box::new(tokio::io::BufWriter::new(Rc4Writer::new(buf_w, send_key))),
+                        )
+                    }
+                    Err(e) => {
+                        if peer_opts & 0x04 != 0 {
+                            return Err(anyhow::anyhow!(
+                                "stage:tcp_obfuscation peer requires crypt and obfuscation failed: {e}"
+                            ));
+                        }
+                        debug!("Outgoing obfuscation failed for source {}: {e}; reconnecting plain", _src_idx);
+                        let plain_stream = match tokio::time::timeout(
+                            std::time::Duration::from_secs(PEER_CONNECT_TIMEOUT_SECS),
+                            TcpStream::connect(addr),
+                        )
+                        .await
+                        {
+                            Ok(Ok(s)) => { tune_peer_stream(&s); s },
+                            Ok(Err(err)) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout {err}")),
+                            Err(_) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout timeout")),
+                        };
+                        let (r, w) = plain_stream.into_split();
+                        (
+                            Box::new(tokio::io::BufReader::new(r)),
+                            Box::new(tokio::io::BufWriter::new(w)),
+                        )
+                    }
+                }
+            } else {
+                let (raw_r, raw_w) = stream.into_split();
+                (
+                    Box::new(tokio::io::BufReader::new(raw_r)),
+                    Box::new(tokio::io::BufWriter::new(raw_w)),
+                )
+            };
+
+            // A cleartext Hello dropped by a crypt-capable peer is the signal
+            // to retry obfuscated; an obfuscated Hello dropped by a peer whose
+            // stored crypt options have gone stale (and that doesn't *require*
+            // crypt, bit 0x04) is the signal to retry plain. eMule re-derives
+            // encryption from stored options on each connect and drops on
+            // mismatch; we mirror that by trying each direction at most once so
+            // a stale `sources.met` crypt flag can't strand an otherwise
+            // reachable HighID source on `os error 10054`.
+            // `attempt == 0` caps the whole sequence at two connections total:
+            // one initial dial + at most one cross-direction retry. Without it
+            // an obf-first source could go obf→plain→obf (three attempts), and
+            // with the trimmed handshake/connect timeouts that third attempt is
+            // pure wasted latency on a slot other live sources are waiting for.
+            let retry_obf_eligible = !conn_is_obf
+                && !obf_retry_used
+                && attempt == 0
+                && peer_hash_opt.is_some()
+                && (peer_opts & 0x07) != 0;
+            let retry_plain_eligible = conn_is_obf
+                && !plain_retry_used
+                && attempt == 0
+                && (peer_opts & 0x04) == 0;
+
+            if let Err(e) = write_packet_async_ms(&mut *ww, OP_EDONKEYHEADER, OP_HELLO, &hello_payload).await {
+                let e = anyhow::Error::new(e).context("stage:hello_wait");
+                if retry_obf_eligible && is_connection_reset(&e) {
+                    debug!("Source {}: plain Hello send reset; retrying with obfuscation", _src_idx);
+                    obf_retry_used = true;
+                    force_obf = true;
+                    force_plain = false;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+                if retry_plain_eligible && is_connection_reset(&e) {
+                    debug!("Source {}: obfuscated Hello send reset; retrying plain", _src_idx);
+                    plain_retry_used = true;
+                    force_plain = true;
+                    force_obf = false;
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+                return Err(e);
+            }
+
+            match read_packet_timeout_ms(&mut *rr).await.context("stage:hello_wait") {
+                Ok((h_proto, h_opcode, data)) => {
+                    if h_proto != OP_EDONKEYHEADER || h_opcode != OP_HELLOANSWER {
+                        anyhow::bail!("source {}: expected HelloAnswer, got proto=0x{h_proto:02X} op=0x{h_opcode:02X}", _src_idx);
+                    }
+                    break (conn_is_obf, rr, ww, data);
+                }
+                Err(e) => {
+                    if retry_obf_eligible && is_connection_reset(&e) {
+                        debug!("Source {}: plain Hello reset at hello_wait; retrying with obfuscation", _src_idx);
+                        obf_retry_used = true;
+                        force_obf = true;
+                        force_plain = false;
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                    if retry_plain_eligible && is_connection_reset(&e) {
+                        debug!("Source {}: obfuscated Hello reset at hello_wait; retrying plain", _src_idx);
+                        plain_retry_used = true;
+                        force_plain = true;
+                        force_obf = false;
+                        attempt = attempt.saturating_add(1);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        };
+        connection_is_obfuscated = conn_is_obf;
+        reader = r0;
+        writer = w0;
         let (puh, hcaps) = parse_hello_answer(&hello_ans_data)
             .map_err(|e| {
                 tracing::warn!("Source {}: failed to parse HelloAnswer: {e}", _src_idx);
@@ -2943,7 +3421,15 @@ async fn download_parts_from_source(
                     if !hello_caps.peer_name.is_empty() {
                         src_peer_name = hello_caps.peer_name.clone();
                     }
-                    if peer_udp > 0 {
+                    // Always remember the peer's user hash once we've learned
+                    // it from the handshake — eMule keeps client identity in its
+                    // `clientlist` so it can obfuscate future connections to the
+                    // same peer (and reuse the hash cross-file via
+                    // `get_user_hash_by_addr`). Previously this was gated on the
+                    // peer advertising a UDP port, which silently dropped hashes
+                    // for peers that didn't, leaving us unable to obfuscate them
+                    // later.
+                    if peer_user_hash != [0u8; 16] {
                         if let Some(sm) = &source_mgr {
                             let mut sm = sm.write().await;
                             if let std::net::IpAddr::V4(v4) = addr.ip() {
@@ -3049,6 +3535,23 @@ async fn download_parts_from_source(
     // waiting for the peer's CHALLENGE / RESPONSE. Those captured packets
     // are drained via `auth_deferred` below, and we need enough iterations
     // to actually replay them before file-status-wait kicks in.
+    //
+    // Timeout strategy: the first iteration waits a short 500 ms — most
+    // peers either have SecIdent / EmuleInfo follow-ups already in the
+    // TCP receive buffer (zero-RTT) or won't send any pre-file-request
+    // traffic at all (modern eMule: HelloAnswer flips
+    // `m_byInfopacketsReceived` to IP_BOTH via the embedded eMule tags,
+    // so the peer's `InfoPacketsReceived()` fires its SecIdent state
+    // packet within a few milliseconds, then goes idle waiting for our
+    // file request). Once we've actually drained a packet we extend the
+    // window to 3 s for the next read, since in-flight SecIdent /
+    // PublicKey / Signature sequences typically arrive back-to-back and
+    // we don't want to break the loop mid-handshake. This shaves ~3 s
+    // off every adopted KAD-callback source (previously sat in this
+    // loop until the full 3 s timeout fired before sending
+    // OP_REQUESTFILENAME) while keeping the original "drain everything"
+    // semantics intact for the slower / chattier peers.
+    let mut read_timeout_ms: u64 = 500;
     for _ in 0..12 {
         let (proto, opcode, payload) = if let Some(pkt) = deferred_packet.take() {
             pkt
@@ -3061,12 +3564,15 @@ async fn download_parts_from_source(
             pkt
         } else {
             match tokio::time::timeout(
-                std::time::Duration::from_secs(3),
+                std::time::Duration::from_millis(read_timeout_ms),
                 read_packet_async_ms(&mut *reader),
             )
             .await
             {
-                Ok(Ok(pkt)) => pkt,
+                Ok(Ok(pkt)) => {
+                    read_timeout_ms = 3000;
+                    pkt
+                }
                 _ => break,
             }
         };
@@ -4689,7 +5195,7 @@ async fn download_parts_from_source(
         let mut pipeline_giveup_for_part: bool = false;
         let mut consecutive_bad_blocks: u32 = 0;
         const MAX_CONSECUTIVE_BAD_BLOCKS: u32 = 5;
-        let data_loop_start = std::time::Instant::now();
+        let mut data_loop_start = std::time::Instant::now();
         let mut got_any_data = false;
         // eMule uses DOWNLOADTIMEOUT (100s) as a single timeout for both initial
         // and mid-transfer stalls.  We use 60s for the initial wait as a
@@ -4697,6 +5203,15 @@ async fn download_parts_from_source(
         // enough time to start sending while still cutting off truly dead peers
         // faster than eMule's full 100s.
         const INITIAL_DATA_TIMEOUT_SECS: u64 = 60;
+        // When a peer grants the upload slot but then sends no data, eMule
+        // keeps the connection and re-issues its block requests
+        // (SendBlockRequests) rather than abandoning the slot — the uploader
+        // has often re-queued us internally and will start sending shortly.
+        // We mirror that: re-assert the outstanding part request up to
+        // `MAX_NO_DATA_REASSERTS` times, extending patience toward the
+        // configured queue-wait budget, before finally disconnecting.
+        let mut no_data_reasserts: u32 = 0;
+        const MAX_NO_DATA_REASSERTS: u32 = 5;
         let mut last_epx_resend = std::time::Instant::now();
         // Use the generation we sent at handshake time as the resend
         // baseline so any rebuild that happened during file-status / queue
@@ -4939,14 +5454,51 @@ async fn download_parts_from_source(
                     return Err(e.into());
                 },
                 Err(()) => {
-                    let _ = write_packet_async_ms(
-                        &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
-                    ).await;
                     if !got_any_data {
-                        warn!("Source {} ({}) accepted transfer but sent no data in {}s — disconnecting",
-                            _src_idx, addr, INITIAL_DATA_TIMEOUT_SECS);
-                        anyhow::bail!("peer accepted transfer but sent no data in {}s", INITIAL_DATA_TIMEOUT_SECS);
+                        // Peer accepted the slot but hasn't begun sending.
+                        // Stay connected and re-assert our block request like
+                        // eMule, as long as we're within the per-source patience
+                        // budget (bounded by the configured queue-wait time and
+                        // a hard re-assert cap).
+                        if no_data_reasserts < MAX_NO_DATA_REASSERTS
+                            && receive_loop_started.elapsed().as_secs() < queue_wait_secs
+                            && !all_blocks.is_empty()
+                        {
+                            no_data_reasserts += 1;
+                            warn!(
+                                "Source {} ({}) accepted upload but sent no data in {}s — re-asserting part {} request (attempt {}/{}), staying connected like eMule",
+                                _src_idx, addr, INITIAL_DATA_TIMEOUT_SECS, part_idx,
+                                no_data_reasserts, MAX_NO_DATA_REASSERTS,
+                            );
+                            emit_source!("queued", None, 0u64);
+                            // Re-send the part requests we already had
+                            // outstanding for this part (indices 0..sent_idx).
+                            // Re-sending already-requested ranges is safe: the
+                            // gap tracker ignores bytes for gaps already filled.
+                            for i in 0..sent_idx {
+                                let batch = &batches[i];
+                                let (req_payload, req_proto, req_op) = if needs_i64 {
+                                    (build_request_parts_i64(file_hash, batch), OP_EMULEPROT, OP_REQUESTPARTS_I64)
+                                } else {
+                                    (build_request_parts(file_hash, batch), OP_EDONKEYHEADER, OP_REQUESTPARTS)
+                                };
+                                if write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await.is_err() {
+                                    anyhow::bail!("stage:data_wait connection lost while re-asserting request");
+                                }
+                            }
+                            data_loop_start = std::time::Instant::now();
+                            continue;
+                        }
+                        let _ = write_packet_async_ms(
+                            &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
+                        ).await;
+                        warn!("Source {} ({}) accepted transfer but sent no data after {} re-assert(s) — disconnecting",
+                            _src_idx, addr, no_data_reasserts);
+                        anyhow::bail!("peer accepted transfer but sent no data after {} re-assert(s)", no_data_reasserts);
                     } else {
+                        let _ = write_packet_async_ms(
+                            &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
+                        ).await;
                         anyhow::bail!("stage:data_wait download timeout: no data for {}s", super::dead_sources::DOWNLOADTIMEOUT_SECS);
                     }
                 }
@@ -6563,11 +7115,15 @@ async fn wait_for_aich_recovery_answer_ms<R: AsyncReadExt + Unpin + ?Sized>(
     None
 }
 
+/// Read a single packet during the handshake/setup phase, bounded by
+/// [`HANDSHAKE_READ_TIMEOUT_SECS`] of silence. All call sites are pre-transfer
+/// (hello / emule-info / file-status / hashset); the in-transfer no-data check
+/// uses the longer `DOWNLOADTIMEOUT_SECS` separately.
 async fn read_packet_timeout_ms<R: AsyncReadExt + Unpin + ?Sized>(
     reader: &mut R,
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
     tokio::time::timeout(
-        std::time::Duration::from_secs(super::dead_sources::DOWNLOADTIMEOUT_SECS as u64),
+        std::time::Duration::from_secs(HANDSHAKE_READ_TIMEOUT_SECS),
         read_packet_async_ms(reader),
     )
     .await
