@@ -528,6 +528,16 @@ impl TransferManager {
         self.source_details.get(transfer_id).cloned().unwrap_or_default()
     }
 
+    fn is_callback_placeholder_row(s: &crate::types::SourceInfo) -> bool {
+        matches!(
+            s.status,
+            crate::types::SourceStatus::Connecting | crate::types::SourceStatus::WaitCallback
+        ) && matches!(
+            s.client_software.as_str(),
+            "KAD Callback" | "KAD Direct Callback" | "Low ID (Server Relay)"
+        )
+    }
+
     /// True if `transfer_id` has any source-detail row for `peer_ip`,
     /// regardless of port or status. Used by the KAD-search-completion
     /// path to skip re-adding a "KAD Callback" placeholder when the
@@ -601,10 +611,7 @@ impl TransferManager {
             rows.retain(|s| {
                 let is_expired_placeholder = s.ip == peer_ip
                     && s.port == peer_port
-                    && s.status == crate::types::SourceStatus::Connecting
-                    && (s.client_software == "KAD Callback"
-                        || s.client_software == "KAD Direct Callback"
-                        || s.client_software == "Low ID (Server Relay)");
+                    && Self::is_callback_placeholder_row(s);
                 if is_expired_placeholder {
                     removed = true;
                     false
@@ -626,10 +633,7 @@ impl TransferManager {
         if let Some(rows) = self.source_details.get_mut(transfer_id) {
             rows.retain(|s| {
                 let is_placeholder = s.ip == peer_ip
-                    && s.status == crate::types::SourceStatus::Connecting
-                    && (s.client_software == "KAD Callback"
-                        || s.client_software == "KAD Direct Callback"
-                        || s.client_software == "Low ID (Server Relay)")
+                    && Self::is_callback_placeholder_row(s)
                     && Some(s.port) != except_port;
                 if is_placeholder {
                     removed.push((s.ip.clone(), s.port));

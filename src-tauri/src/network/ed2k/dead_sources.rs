@@ -14,6 +14,22 @@ const BLOCKTIME_PER_FILE_SECS: i64 = 2700;
 const BLOCKTIME_TRANSIENT_SECS: i64 = 600;
 /// eMule: FILEREASKTIME — minimum time between file re-asks (29 minutes)
 pub const FILEREASKTIME_SECS: i64 = 1740;
+/// How long the upload listener remembers an expected inbound KAD callback.
+/// Matches [`FILEREASKTIME_SECS`] so a slow buddy relay is not dropped while
+/// we are still within the normal reask window.
+pub const PENDING_KAD_CALLBACK_SECS: i64 = FILEREASKTIME_SECS;
+/// How often to re-send a KAD `CallbackReq` for a firewalled source that has
+/// not connected back yet.
+///
+/// eMule does NOT wait a full `FILEREASKTIME` between callback attempts — a
+/// firewalled source that fails to connect back is re-attempted on the next
+/// connection cycle, and eMule's UDP packet tracker (`PacketTracking.cpp`)
+/// permits one `KADEMLIA_CALLBACK_REQ` per buddy per minute. Re-asking once
+/// per ~29 minutes (the old behaviour, inherited from `FILEREASKTIME_SECS`)
+/// meant a single lost UDP packet or a momentarily-unavailable buddy left the
+/// source stuck on "Waiting for callback" for the rest of the session. 90s
+/// stays safely inside eMule's per-minute budget while retrying promptly.
+pub const KAD_CALLBACK_REASK_SECS: i64 = 90;
 /// eMule: SOURCECLIENTREASKS — normal source re-ask interval (40 minutes)
 pub const SOURCECLIENTREASKS_SECS: i64 = 2400;
 /// eMule: DOWNLOADTIMEOUT — no data timeout (100 seconds)

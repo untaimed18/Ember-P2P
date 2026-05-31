@@ -891,6 +891,7 @@ pub async fn run_quic_accept_loop(
                     reader: Box::new(init_recv),
                     writer: Box::new(init_send),
                     emule_info_done: false,
+                    peer_caps: Default::default(),
                 };
                 let _ = cb_tx.send(parts).await;
 
@@ -915,6 +916,7 @@ pub async fn run_quic_accept_loop(
                     reader: Box::new(chained),
                     writer: Box::new(init_send),
                     emule_info_done: false,
+                    peer_caps: Default::default(),
                 };
                 let _ = cb_tx.send(parts).await;
             }

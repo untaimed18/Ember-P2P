@@ -230,6 +230,16 @@ impl FileIdentifier {
 }
 
 /// Optional buddy info to include in Hello/HelloAnswer tags.
+///
+/// `buddy_ip` must be in eMule's "LSB-first host integer" convention — i.e.
+/// the same format as Winsock `sin_addr.s_addr` on a little-endian host, and
+/// the same as `m_dwUserIP` / `GetIP()` inside eMule. For dotted-quad
+/// `a.b.c.d` this is `u32::from_le_bytes([a, b, c, d])` (= `0xddccbbaa`),
+/// **not** `u32::from(Ipv4Addr)` (= `0xaabbccdd`). The Hello tag `0xFC`
+/// (`CT_EMULE_BUDDYIP`) is then LE-encoded on the wire so the bytes come out
+/// in dotted-quad order `[a, b, c, d]`, which is what eMule reads back via
+/// `m_nBuddyIP = temptag.GetInt()` with no `htonl`. See `BaseClient.cpp`
+/// `SendHelloTypePacket` / `ProcessHelloTypePacket` for the reference.
 #[derive(Clone)]
 pub struct BuddyInfo {
     pub buddy_ip: u32,

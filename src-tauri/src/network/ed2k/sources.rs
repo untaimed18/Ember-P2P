@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use super::dead_sources::{FILEREASKTIME_SECS, SOURCECLIENTREASKS_SECS as SOURCECLIENTREASKS_I64};
+use super::dead_sources::{FILEREASKTIME_SECS, KAD_CALLBACK_REASK_SECS, SOURCECLIENTREASKS_SECS as SOURCECLIENTREASKS_I64};
 use super::messages::build_answer_sources1_versioned;
 use super::transfer::is_filtered_source_ip;
 
@@ -61,6 +61,14 @@ pub struct DownloadSourceEntry {
     pub state_changed: Instant,
     /// Number of consecutive failures without a successful data transfer.
     pub fail_count: u32,
+    /// KAD callback buddy IP (`TAG_SERVERIP` on type-3/5 source publishes).
+    pub callback_buddy_ip: Option<Ipv4Addr>,
+    /// KAD callback buddy UDP port (`TAG_SERVERPORT`).
+    pub callback_buddy_port: Option<u16>,
+    /// KAD callback verification token (`TAG_BUDDYHASH` = NOT LowID peer KAD id).
+    pub callback_buddy_hash: Option<[u8; 16]>,
+    /// Publisher's ED2K user hash from the KAD source record.
+    pub source_user_hash: Option<[u8; 16]>,
 }
 
 impl DownloadSourceEntry {
@@ -74,7 +82,29 @@ impl DownloadSourceEntry {
             last_asked: now,
             state_changed: now,
             fail_count: 0,
+            callback_buddy_ip: None,
+            callback_buddy_port: None,
+            callback_buddy_hash: None,
+            source_user_hash: None,
         }
+    }
+
+    /// Shift `last_asked` so [`Self::time_until_reask`] returns 0 immediately.
+    fn arm_callback_reask(&mut self) {
+        self.last_asked = Instant::now()
+            .checked_sub(Duration::from_secs(FILEREASKTIME_SECS as u64 + 1))
+            .unwrap_or_else(Instant::now);
+    }
+
+    /// Whether a KAD `CallbackReq` should be (re)sent for this firewalled
+    /// source. Uses the short [`KAD_CALLBACK_REASK_SECS`] cadence rather than
+    /// the ~29-minute `FILEREASKTIME` used by [`Self::time_until_reask`] for
+    /// other states, so a lost callback is retried promptly. Gated on having
+    /// buddy info so we never spin on a source we can't actually call back.
+    pub fn kad_callback_reask_due(&self) -> bool {
+        matches!(self.state, DownloadSourceState::WaitCallbackKad)
+            && self.callback_buddy_ip.is_some()
+            && self.last_asked.elapsed().as_secs() >= KAD_CALLBACK_REASK_SECS as u64
     }
 
     /// D10: maximum wall time a source is allowed to sit in `Connecting`
@@ -162,17 +192,68 @@ impl PerFileSourceList {
     }
 
     pub fn add_source_full(&mut self, ip: Ipv4Addr, tcp_port: u16, udp_port: u16) -> bool {
+        self.add_source_with_identity(ip, tcp_port, udp_port, None)
+    }
+
+    /// Register a KAD callback source. Firewalled type 3/5 publishes omit
+    /// `TAG_SOURCEIP`, so deduplicate by publisher user hash when present —
+    /// then fall back to IP:port so the same peer reported by both KAD and
+    /// the connected server (KAD with hash, server without) doesn't get
+    /// double-inserted as two separate rows.
+    pub fn add_source_with_identity(
+        &mut self,
+        ip: Ipv4Addr,
+        tcp_port: u16,
+        udp_port: u16,
+        user_hash: Option<[u8; 16]>,
+    ) -> bool {
         if self.sources.len() >= MAX_SOURCES_PER_FILE {
             return false;
         }
-        if let Some(existing) = self.sources.iter_mut().find(|s| s.ip == ip && s.tcp_port == tcp_port) {
-            if udp_port > 0 {
-                existing.udp_port = udp_port;
+        let uh_opt = user_hash.filter(|h| *h != [0u8; 16]);
+
+        // Dedup by user hash first (catches type 3/5 publishes that omit
+        // TAG_SOURCEIP — user hash is the only stable identity).
+        if let Some(uh) = uh_opt {
+            if let Some(existing) = self
+                .sources
+                .iter_mut()
+                .find(|s| s.source_user_hash == Some(uh))
+            {
+                if udp_port > 0 {
+                    existing.udp_port = udp_port;
+                }
+                if !ip.is_unspecified() && existing.ip.is_unspecified() {
+                    existing.ip = ip;
+                    existing.tcp_port = tcp_port;
+                }
+                return false;
             }
-            return false;
         }
+
+        // Dedup by IP:port (only meaningful when IP is specified). Backfills
+        // `source_user_hash` if we previously learned the peer without one.
+        if !ip.is_unspecified() {
+            if let Some(existing) = self
+                .sources
+                .iter_mut()
+                .find(|s| s.ip == ip && s.tcp_port == tcp_port)
+            {
+                if udp_port > 0 {
+                    existing.udp_port = udp_port;
+                }
+                if let Some(uh) = uh_opt {
+                    if existing.source_user_hash.is_none() {
+                        existing.source_user_hash = Some(uh);
+                    }
+                }
+                return false;
+            }
+        }
+
         let mut entry = DownloadSourceEntry::new(ip, tcp_port);
         entry.udp_port = udp_port;
+        entry.source_user_hash = uh_opt;
         self.sources.push(entry);
         true
     }
@@ -236,6 +317,60 @@ impl PerFileSourceList {
         if let Some(s) = self.find_mut(ip, port) {
             s.state = DownloadSourceState::WaitCallbackKad;
             s.state_changed = Instant::now();
+        }
+    }
+
+    /// Record KAD callback buddy metadata and transition to `WaitCallbackKad`.
+    /// When `is_new`, arms an immediate first `CallbackReq`; rediscoveries only
+    /// update buddy fields without resetting the reask timer.
+    pub fn set_kad_callback_buddy(
+        &mut self,
+        ip: Ipv4Addr,
+        port: u16,
+        buddy_ip: Ipv4Addr,
+        buddy_port: u16,
+        buddy_hash: [u8; 16],
+        source_user_hash: Option<[u8; 16]>,
+        is_new: bool,
+    ) {
+        let target_idx = if ip.is_unspecified() {
+            source_user_hash.and_then(|uh| {
+                self.sources
+                    .iter()
+                    .position(|s| s.source_user_hash == Some(uh))
+            })
+        } else {
+            self.sources
+                .iter()
+                .position(|s| s.ip == ip && s.tcp_port == port)
+        };
+        if let Some(idx) = target_idx {
+            let s = &mut self.sources[idx];
+            s.callback_buddy_ip = Some(buddy_ip);
+            s.callback_buddy_port = Some(buddy_port);
+            s.callback_buddy_hash = Some(buddy_hash);
+            if source_user_hash.is_some() {
+                s.source_user_hash = source_user_hash;
+            }
+            s.state = DownloadSourceState::WaitCallbackKad;
+            s.state_changed = Instant::now();
+            if is_new {
+                s.arm_callback_reask();
+            }
+        }
+    }
+
+    /// Whether a KAD callback `CallbackReq` should be sent now.
+    pub fn callback_reask_due(&self, ip: Ipv4Addr, port: u16) -> bool {
+        self.find(ip, port)
+            .map(|s| s.kad_callback_reask_due())
+            .unwrap_or(false)
+    }
+
+    /// Bump the reask timer after a successful `CallbackReq` send.
+    pub fn mark_callback_requested(&mut self, ip: Ipv4Addr, port: u16) {
+        if let Some(s) = self.find_mut(ip, port) {
+            s.last_asked = Instant::now();
         }
     }
 
@@ -390,6 +525,10 @@ impl PerFileSourceList {
                 s.state_changed = std::time::Instant::now();
             }
         }
+    }
+
+    fn find(&self, ip: Ipv4Addr, port: u16) -> Option<&DownloadSourceEntry> {
+        self.sources.iter().find(|s| s.ip == ip && s.tcp_port == port)
     }
 
     fn find_mut(&mut self, ip: Ipv4Addr, port: u16) -> Option<&mut DownloadSourceEntry> {
@@ -756,6 +895,186 @@ impl SourceManager {
         })
     }
 
+    /// Look up a stored user hash for a peer by IP:port across ALL tracked
+    /// files. eMule keys client identity globally (`clientlist`), so a hash
+    /// learned for one file (via the KAD answer-ID, source exchange, or a prior
+    /// handshake) can enable TCP obfuscation for the same peer on a different
+    /// file — even when the eD2K server omitted the 0x80 user hash for that
+    /// source. Without this, crypt-required server HighID sources stay
+    /// plaintext and get reset (`os error 10054`).
+    pub fn get_user_hash_by_addr(&self, ip: Ipv4Addr, port: u16) -> Option<[u8; 16]> {
+        for entries in self.sources.values() {
+            if let Some(e) = entries
+                .iter()
+                .find(|e| e.ip == ip && e.tcp_port == port && e.user_hash != [0u8; 16])
+            {
+                return Some(e.user_hash);
+            }
+        }
+        None
+    }
+
+    /// Look up stored connect/crypt options for a peer by IP:port across ALL
+    /// tracked files (see [`get_user_hash_by_addr`]).
+    pub fn get_connect_options_by_addr(&self, ip: Ipv4Addr, port: u16) -> Option<u8> {
+        for entries in self.sources.values() {
+            if let Some(e) = entries
+                .iter()
+                .find(|e| e.ip == ip && e.tcp_port == port && e.connect_options != 0)
+            {
+                return Some(e.connect_options);
+            }
+        }
+        None
+    }
+
+    /// Persist the source cache to disk (eMule keeps source identities in its
+    /// `clientlist`/part.met so it can obfuscate connections to crypt-required
+    /// peers immediately after a restart instead of getting reset until it
+    /// re-learns each hash). We only persist sources that carry a user hash —
+    /// those are the ones that unlock obfuscation — newest first, capped per
+    /// file. Returns the number of sources written.
+    ///
+    /// Wire format (`sources.met`): `b"ESRC"` magic, version `1`, then
+    /// `u32` file count, and per file a 16-byte hash, `u16` source count and a
+    /// fixed 43-byte record per source (4 ip + 2 tcp + 2 udp + 4 server ip +
+    /// 2 server port + 16 user hash + 1 options + 4 client id + 8 last_seen).
+    pub fn save_to_disk(&self, path: &std::path::Path) -> std::io::Result<usize> {
+        const PERSIST_PER_FILE: usize = 200;
+        let now = chrono::Utc::now().timestamp();
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"ESRC");
+        buf.push(1u8);
+
+        let mut file_records: Vec<(&[u8; 16], Vec<&SourceEntry>)> = Vec::new();
+        for (fh, entries) in &self.sources {
+            let mut keep: Vec<&SourceEntry> = entries
+                .iter()
+                .filter(|e| {
+                    e.user_hash != [0u8; 16]
+                        && now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS * 6
+                })
+                .collect();
+            if keep.is_empty() {
+                continue;
+            }
+            keep.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+            keep.truncate(PERSIST_PER_FILE);
+            file_records.push((fh, keep));
+        }
+
+        buf.extend_from_slice(&(file_records.len() as u32).to_le_bytes());
+        let mut total = 0usize;
+        for (fh, entries) in &file_records {
+            buf.extend_from_slice(*fh);
+            buf.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+            for e in entries {
+                buf.extend_from_slice(&e.ip.octets());
+                buf.extend_from_slice(&e.tcp_port.to_le_bytes());
+                buf.extend_from_slice(&e.udp_port.to_le_bytes());
+                buf.extend_from_slice(&e.server_ip.to_le_bytes());
+                buf.extend_from_slice(&e.server_port.to_le_bytes());
+                buf.extend_from_slice(&e.user_hash);
+                buf.push(e.connect_options);
+                buf.extend_from_slice(&e.client_id.to_le_bytes());
+                buf.extend_from_slice(&e.last_seen.to_le_bytes());
+                total += 1;
+            }
+        }
+
+        let tmp = path.with_extension("met.tmp");
+        std::fs::write(&tmp, &buf)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(total)
+    }
+
+    /// Load the source cache written by [`save_to_disk`], merging the entries
+    /// into the in-memory map. Entries already present (same file + IP:port)
+    /// are not overwritten; only their hash/options are filled in if missing.
+    /// Returns the number of sources loaded.
+    pub fn load_from_disk(&mut self, path: &std::path::Path) -> std::io::Result<usize> {
+        let data = std::fs::read(path)?;
+        if data.len() < 9 || &data[0..4] != b"ESRC" || data[4] != 1 {
+            return Ok(0);
+        }
+        let mut pos = 5usize;
+        let read_u16 = |d: &[u8], p: usize| u16::from_le_bytes([d[p], d[p + 1]]);
+        let read_u32 = |d: &[u8], p: usize| u32::from_le_bytes([d[p], d[p + 1], d[p + 2], d[p + 3]]);
+        let read_i64 = |d: &[u8], p: usize| {
+            i64::from_le_bytes([
+                d[p], d[p + 1], d[p + 2], d[p + 3], d[p + 4], d[p + 5], d[p + 6], d[p + 7],
+            ])
+        };
+
+        if pos + 4 > data.len() {
+            return Ok(0);
+        }
+        let file_count = read_u32(&data, pos);
+        pos += 4;
+        let mut loaded = 0usize;
+        for _ in 0..file_count {
+            if pos + 18 > data.len() {
+                break;
+            }
+            let mut fh = [0u8; 16];
+            fh.copy_from_slice(&data[pos..pos + 16]);
+            pos += 16;
+            let src_count = read_u16(&data, pos);
+            pos += 2;
+            let entries = self.sources.entry(fh).or_default();
+            for _ in 0..src_count {
+                // record = 4+2+2+4+2+16+1+4+8 = 43 bytes
+                if pos + 43 > data.len() {
+                    pos = data.len();
+                    break;
+                }
+                let ip = Ipv4Addr::new(data[pos], data[pos + 1], data[pos + 2], data[pos + 3]);
+                let tcp_port = read_u16(&data, pos + 4);
+                let udp_port = read_u16(&data, pos + 6);
+                let server_ip = read_u32(&data, pos + 8);
+                let server_port = read_u16(&data, pos + 12);
+                let mut user_hash = [0u8; 16];
+                user_hash.copy_from_slice(&data[pos + 14..pos + 30]);
+                let connect_options = data[pos + 30];
+                let client_id = read_u32(&data, pos + 31);
+                let last_seen = read_i64(&data, pos + 35);
+                pos += 43;
+
+                if let Some(existing) = entries
+                    .iter_mut()
+                    .find(|e| e.ip == ip && e.tcp_port == tcp_port)
+                {
+                    if existing.user_hash == [0u8; 16] && user_hash != [0u8; 16] {
+                        existing.user_hash = user_hash;
+                    }
+                    if existing.connect_options == 0 {
+                        existing.connect_options = connect_options;
+                    }
+                    continue;
+                }
+                if entries.len() >= self.max_per_file {
+                    continue;
+                }
+                entries.push(SourceEntry {
+                    ip,
+                    tcp_port,
+                    udp_port,
+                    server_ip,
+                    server_port,
+                    last_seen,
+                    user_hash,
+                    connect_options,
+                    client_id,
+                    last_asked: 0,
+                    last_sx_sent: 0,
+                    last_callback_at: 0,
+                });
+                loaded += 1;
+            }
+        }
+        Ok(loaded)
+    }
+
     /// Register a LowID source (behind NAT, needs server callback to reach).
     pub fn register_lowid_source(
         &mut self,
@@ -1077,5 +1396,26 @@ mod tests {
 
         assert_eq!(pfs.sources.len(), 1);
         assert_eq!(pfs.sources[0].ip, keep_ip);
+    }
+
+    #[test]
+    fn kad_callback_reask_is_immediate_for_new_sources() {
+        let hash = [0x44; 16];
+        let ip = Ipv4Addr::new(5, 5, 5, 5);
+        let buddy = Ipv4Addr::new(6, 6, 6, 6);
+        let mut pfs = PerFileSourceList::new(hash);
+        assert!(pfs.add_source_full(ip, 4662, 0));
+        pfs.set_kad_callback_buddy(
+            ip,
+            4662,
+            buddy,
+            4672,
+            [0xAA; 16],
+            Some([0xBB; 16]),
+            true,
+        );
+        assert!(pfs.callback_reask_due(ip, 4662));
+        pfs.mark_callback_requested(ip, 4662);
+        assert!(!pfs.callback_reask_due(ip, 4662));
     }
 }

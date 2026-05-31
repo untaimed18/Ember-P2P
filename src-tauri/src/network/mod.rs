@@ -598,15 +598,121 @@ fn drain_active_source_overflow(
     drained
 }
 
-/// How long a "KAD Callback" / "KAD Direct Callback" / "Low ID (Server Relay)"
-/// placeholder row is allowed to sit in `Connecting` state before the
-/// `source_retry_timer` sweep removes it. KAD source searches re-run every
-/// ~30-60s for active downloads, so 180s gives each peer roughly 3-6 chances
-/// to call back before we consider their buddy unreachable and clear the
-/// stale row. If the peer is still in subsequent KAD search results, a fresh
-/// placeholder is re-inserted immediately — producing a visible
-/// "still trying" rhythm rather than a row that sits forever in `Connecting`.
-const KAD_CALLBACK_PLACEHOLDER_TIMEOUT_SECS: i64 = 180;
+/// How long a callback placeholder row stays visible before the periodic
+/// sweep removes it. Matches eMule's [`FILEREASKTIME`](crate::network::ed2k::dead_sources::FILEREASKTIME_SECS)
+/// cadence — the row is refreshed whenever we re-send `CallbackReq`.
+const KAD_CALLBACK_PLACEHOLDER_TIMEOUT_SECS: i64 =
+    crate::network::ed2k::dead_sources::PENDING_KAD_CALLBACK_SECS;
+
+/// Per-file flood-safe interval for re-asking the connected eD2K server for
+/// sources when a download is *starved* (no source currently transferring).
+/// eMule keeps pulling the server's evolving source list for a starved file;
+/// a fresh download's first source set is often dead, and waiting the full
+/// 4-minute batch interval (`server_tcp_source_timer`) leaves it idle. 45s is
+/// frequent enough to recover quickly while staying well clear of server
+/// source-request flood limits (Lugdunum tolerates well under this rate).
+const STARVED_SERVER_REASK_SECS: i64 = 45;
+
+async fn register_or_refresh_pending_kad_callback(
+    pending: &upload_server::PendingKadCallbacks,
+    source_ip: Ipv4Addr,
+    source_tcp_port: u16,
+    file_hash: [u8; 16],
+    user_hash: Option<[u8; 16]>,
+) {
+    // eMule matches a firewalled peer's callback connect-back primarily by its
+    // ED2K *user hash* (ListenSocket OP_CALLBACK → AttachToAlreadyKnown →
+    // CUpDownClient::Compare on the user hash), not by IP. The TAG_SOURCEIP a
+    // firewalled peer publishes to the DHT is frequently its pre-NAT / stale
+    // address, so its actual TCP connect-back arrives from a *different* egress
+    // IP. Keying the pending callback only by the published IP (our old
+    // behaviour) meant the inbound Hello — which carries the correct, stable
+    // user hash but the "wrong" IP — never matched, so the source sat in
+    // WaitCallback forever while the peer was in fact already knocking.
+    //
+    // Register under BOTH identities: the user hash (authoritative, matches
+    // eMule) and the published IP (fast path when it happens to be accurate).
+    // The inbound matcher in `upload.rs` already probes both key kinds.
+    let mut keys: Vec<upload_server::PendingKadCallbackKey> = Vec::new();
+    if let Some(h) = user_hash.filter(|h| *h != [0u8; 16]) {
+        keys.push(upload_server::PendingKadCallbackKey::SourceUserHash(h));
+    }
+    if !source_ip.is_unspecified() {
+        keys.push(upload_server::PendingKadCallbackKey::SourceIp(source_ip));
+    }
+    if keys.is_empty() {
+        warn!(
+            "Skipping pending KAD callback for {}: no TAG_SOURCEIP and no publisher user hash",
+            hex::encode(file_hash),
+        );
+        return;
+    }
+    let key_desc = keys
+        .iter()
+        .map(|k| match k {
+            upload_server::PendingKadCallbackKey::SourceIp(ip) => format!("ip={ip}"),
+            upload_server::PendingKadCallbackKey::SourceUserHash(h) => {
+                format!("uh={}", hex::encode(h))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    info!(
+        "Registered pending KAD callback for file {} expecting connect-back from [{}] (tcp_port={})",
+        hex::encode(file_hash),
+        key_desc,
+        source_tcp_port,
+    );
+    let now = chrono::Utc::now().timestamp();
+    let mut cbs = pending.lock().await;
+    for key in keys {
+        let entries = cbs.entry(key).or_default();
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.file_hash == file_hash && e.expected_tcp_port == source_tcp_port)
+        {
+            entry.registered_at = now;
+        } else if let Some(entry) = entries.iter_mut().find(|e| e.file_hash == file_hash) {
+            entry.expected_tcp_port = source_tcp_port;
+            entry.registered_at = now;
+        } else {
+            entries.push(upload_server::PendingKadCallbackEntry {
+                file_hash,
+                expected_tcp_port: source_tcp_port,
+                registered_at: now,
+            });
+        }
+    }
+}
+
+async fn send_kad_callback_req(
+    udp_socket: &UdpSocket,
+    state: &NetworkState,
+    buddy_ip: Ipv4Addr,
+    buddy_port_raw: u16,
+    buddy_hash: KadId,
+    file_hash: [u8; 16],
+) -> bool {
+    let buddy_port_alt = buddy_port_raw.saturating_add(3);
+    let callback_req = KadMessage::CallbackReq {
+        buddy_id: buddy_hash,
+        // eMule writes `CUInt128(reqfile->GetFileHash())` here, i.e. the
+        // MD4 hash in KAD/CUInt128 byte order, not raw ed2k hash order.
+        file_id: md4_bytes_to_kad_id(&file_hash),
+        tcp_port: state.tcp_port,
+    };
+    let Ok(packet) = kad::messages::encode_packet(&callback_req) else {
+        return false;
+    };
+    let buddy_addr_raw = SocketAddr::new(buddy_ip.into(), buddy_port_raw);
+    let buddy_addr_alt = SocketAddr::new(buddy_ip.into(), buddy_port_alt);
+    // eMule BaseClient.cpp TryToConnect sends CallbackReq unencrypted
+    // (`SendPacket(..., false, NULL, true, 0)`). Encrypting here breaks
+    // delivery to buddies that expect a plain KADEMLIA_CALLBACK_REQ.
+    let _ = udp_socket.send_to(&packet, buddy_addr_raw).await;
+    let _ = udp_socket.send_to(&packet, buddy_addr_alt).await;
+    true
+}
 
 fn pending_download_retry_interval(search_count: u32) -> i64 {
     match search_count {
@@ -2056,6 +2162,14 @@ struct NetworkState {
     udp_source_queue: VecDeque<(Vec<u8>, std::net::SocketAddr)>,
     /// Round-robin cursor for TCP OP_GETSOURCES batching across downloads.
     server_tcp_getsources_cursor: usize,
+    /// Per-file (hash hex) timestamp of the last *starved* fast re-ask of the
+    /// connected server for sources. eMule keeps pulling the connected
+    /// server's (growing) source list for a download that has no working
+    /// sources; our normal batch is every 4 min, far too slow to recover
+    /// when the initial source set is dead. This map throttles the fast
+    /// re-ask to a flood-safe per-file interval (see
+    /// `STARVED_SERVER_REASK_SECS`).
+    starved_server_reask_at: std::collections::HashMap<String, i64>,
     /// Round-robin cursor for fair KAD search slot distribution across downloads.
     kad_source_search_cursor: usize,
     /// Dead source tracking (prevents reconnecting to failing sources)
@@ -2186,22 +2300,7 @@ struct NetworkState {
     antileech: crate::security::antileech::SharedAntiLeechFilter,
     /// Mapping of ed2k file hash → AICH root hash for EPX payload
     aich_root_map: HashMap<[u8; 16], [u8; 20]>,
-    /// Tracks KAD callback attempts per (buddy_hash, file_hash) to avoid
-    /// repeatedly contacting non-responsive buddies.
-    /// Value is (attempt_count, first_attempt_timestamp) — resets after 10 minutes.
-    callback_buddy_attempts: HashMap<([u8; 16], [u8; 16]), (u32, i64)>,
-    /// When each "KAD Callback" / "KAD Direct Callback" / "Low ID (Server Relay)"
-    /// placeholder row was inserted into a transfer's source-detail list.
-    /// Key: `(transfer_id, peer_ip, peer_port)`. Value: insertion epoch (seconds).
-    ///
-    /// Placeholders are seeded optimistically when KAD source searches return
-    /// type-4 / type-5 / type-6 sources. Many of those callbacks never arrive
-    /// because the listed buddy no longer has the LowID peer connected, so the
-    /// row would otherwise sit in `Connecting` state forever. The
-    /// `source_retry_timer` tick sweeps this map and removes rows older than
-    /// `KAD_CALLBACK_PLACEHOLDER_TIMEOUT_SECS`; the next KAD search cycle
-    /// re-inserts them if the peer still appears in results, producing a
-    /// visible "we're retrying" rhythm rather than a stuck list.
+    /// When each callback placeholder row was inserted (epoch seconds).
     callback_row_pending_since: HashMap<(String, String, u16), i64>,
     /// Semaphore limiting concurrent outgoing TCP connections for firewall checks
     firewall_connect_semaphore: Arc<tokio::sync::Semaphore>,
@@ -3735,6 +3834,7 @@ pub async fn start_network(
         server_addr: None,
         udp_source_queue: VecDeque::new(),
         server_tcp_getsources_cursor: 0,
+        starved_server_reask_at: std::collections::HashMap::new(),
         kad_source_search_cursor: 0,
         dead_sources: DeadSourceList::new(),
         corruption_blackbox: CorruptionBlackBox::new(),
@@ -3786,7 +3886,6 @@ pub async fn start_network(
         ember_diagnostics: EmberDiagnostics::default(),
         antileech: shared_antileech.clone(),
         aich_root_map: HashMap::new(),
-        callback_buddy_attempts: HashMap::new(),
         callback_row_pending_since: HashMap::new(),
         firewall_connect_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
         firewall_req_cooldown: HashMap::new(),
@@ -3963,11 +4062,24 @@ pub async fn start_network(
     let (kad_callback_tx, mut kad_callback_rx) = mpsc::channel::<upload_server::KadCallbackParts>(256);
     let (udp_fw_check_tx, mut udp_fw_check_rx) = mpsc::channel::<upload_server::UdpFirewallCheckRequest>(16);
     let pending_kad_callbacks: upload_server::PendingKadCallbacks =
-        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     let source_manager: Arc<RwLock<SourceManager>> = {
         let mut sm = SourceManager::new();
         sm.set_max_per_file(settings.max_sources_per_file);
+        // Reload the eMule-style persistent source cache so we hold peer user
+        // hashes from previous sessions and can obfuscate connections to
+        // crypt-required sources immediately, instead of getting reset (10054)
+        // until we re-learn each hash via KAD/source-exchange.
+        let sources_met = data_dir.join("sources.met");
+        match sm.load_from_disk(&sources_met) {
+            Ok(0) => {}
+            Ok(n) => info!("Loaded {n} cached sources (with user hashes) from sources.met"),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                warn!("Failed to load sources.met: {e}");
+            }
+            Err(_) => {}
+        }
         Arc::new(RwLock::new(sm))
     };
 
@@ -6505,6 +6617,11 @@ pub async fn start_network(
                             }
                         }
                     } else if let Some((transfer_id, search_file_hash)) = state.download_source_searches.remove(&sid) {
+                        // `transfer_id` gets moved into `pending_downloads`
+                        // in several of the branches below; keep an owned
+                        // copy so we can fire a single post-write UI refresh
+                        // signal at the end regardless of which branch ran.
+                        let refresh_transfer_id = transfer_id.clone();
                         let kad_sources = if let Some(search) = state.search_manager.get(&sid) {
                             let all = extract_kad_sources(&search.results);
                             // Same cache update as the pending_source_searches branch:
@@ -6693,83 +6810,29 @@ pub async fn start_network(
                                         }
                                     };
 
-                                    let cb_key = (buddy_hash.0, fh);
-                                    const MAX_CALLBACK_ATTEMPTS_PER_BUDDY: u32 = 3;
-                                    const CALLBACK_ATTEMPT_RESET_SECS: i64 = 600; // 10 minutes
-                                    let now_ts = chrono::Utc::now().timestamp();
-                                    let attempts = match state.callback_buddy_attempts.get(&cb_key) {
-                                        Some(&(count, first_ts)) if now_ts - first_ts < CALLBACK_ATTEMPT_RESET_SECS => count,
-                                        Some(_) => {
-                                            state.callback_buddy_attempts.remove(&cb_key);
-                                            0
-                                        }
-                                        None => 0,
-                                    };
-                                    if attempts >= MAX_CALLBACK_ATTEMPTS_PER_BUDDY {
-                                        debug!(
-                                            "Skipping CallbackReq to buddy {} for file {} (already {} attempts)",
-                                            hex::encode(buddy_hash.0), hex::encode(fh), attempts
-                                        );
-                                        continue;
-                                    }
-
-                                    let buddy_addr_raw = SocketAddr::new(buddy_ip.into(), buddy_port_raw);
-                                    let buddy_addr_alt = SocketAddr::new(buddy_ip.into(), buddy_port_alt);
-                                    let file_id = KadId(fh);
-                                    let callback_req = KadMessage::CallbackReq {
-                                        buddy_id: buddy_hash,
-                                        file_id,
-                                        tcp_port: state.tcp_port,
-                                    };
-                                    // We intentionally do NOT try to obfuscate this packet — it
-                                    // matches eMule's direct-to-buddy fast path, which has an
-                                    // explicit `// FIXME: We don't know which kad version the
-                                    // buddy has, so we need to send unencrypted` at
-                                    // `BaseClient.cpp:1450`. The buddy's IP/port came from
-                                    // someone else's KAD source record and isn't something
-                                    // we've talked to directly, so we have no cross-checked
-                                    // version or UDP key to key an encryption with.
-                                    // `send_kad_packet`'s obfuscation path guards on finding a
-                                    // contact at `target_id`; passing `buddy_hash` here (the
-                                    // `NOT(LowID_peer_kad_id)` verification token that rides
-                                    // in the packet body) never matches a routing entry, so
-                                    // both sends go out plain. That's the intended behaviour.
-                                    if let Ok(packet) = kad::messages::encode_packet(&callback_req) {
-                                        // Fire both ports (see `buddy_port_raw`
-                                        // comment above for rationale). The
-                                        // second send is typically to a port
-                                        // with no listener and silently fails
-                                        // at the OS layer — zero protocol
-                                        // impact but costs nothing to try.
-                                        let _ = send_kad_packet(
-                                            &udp_socket, &packet, buddy_addr_raw, &state, &buddy_hash,
-                                        ).await;
-                                        let _ = send_kad_packet(
-                                            &udp_socket, &packet, buddy_addr_alt, &state, &buddy_hash,
-                                        ).await;
-                                        let entry = state.callback_buddy_attempts.entry(cb_key).or_insert((0, now_ts));
-                                        entry.0 += 1;
-                                        info!(
-                                            "Sent KAD CallbackReq to buddy {} at {}/{} for file {} (attempt {})",
-                                            buddy_hash, buddy_addr_raw, buddy_port_alt, hex::encode(fh), attempts + 1
-                                        );
-                                    }
-
-                                    // Track source state in per-file list
                                     {
                                         let pfs = state.per_file_sources
                                             .entry(transfer_id.clone())
                                             .or_insert_with(|| ed2k::sources::PerFileSourceList::new(fh));
-                                        if pfs.add_source_full(cb_src.ip, cb_src.tcp_port, 0) {
+                                        let is_new = pfs.add_source_with_identity(
+                                            cb_src.ip,
+                                            cb_src.tcp_port,
+                                            0,
+                                            cb_src.source_user_hash,
+                                        );
+                                        if is_new {
                                             state.ember_payload_dirty = true;
                                         }
+                                        pfs.set_kad_callback_buddy(
+                                            cb_src.ip,
+                                            cb_src.tcp_port,
+                                            buddy_ip,
+                                            buddy_port_raw,
+                                            buddy_hash.0,
+                                            cb_src.source_user_hash,
+                                            is_new,
+                                        );
                                         if state.firewalled || state.low_id {
-                                            // Try broker only for peers that have advertised
-                                            // Ember capability. `cb_src.is_ember_capable` was
-                                            // set by `extract_kad_sources` when this entry
-                                            // came back from the KAD search — see the parse
-                                            // site in this file and the publish site in
-                                            // `kad/publish.rs::build_source_publish`.
                                             let broker_started = if !cb_src.is_ember_capable {
                                                 debug!(
                                                     "Skipping LowID-to-LowID broker for {}:{} — \
@@ -6791,17 +6854,45 @@ pub async fn start_network(
                                             } else {
                                                 pfs.set_low_to_low(cb_src.ip, cb_src.tcp_port);
                                             }
-                                        } else {
-                                            pfs.set_wait_callback_kad(cb_src.ip, cb_src.tcp_port);
                                         }
                                     }
 
-                                    // Register expected callback so upload handler recognizes it
-                                    let now = chrono::Utc::now().timestamp();
-                                    let mut cbs = pending_kad_callbacks.lock().await;
-                                    cbs.entry(cb_src.ip)
-                                        .or_default()
-                                        .push((fh, cb_src.source_user_hash, now));
+                                    let should_send = state
+                                        .per_file_sources
+                                        .get(&transfer_id)
+                                        .map(|pfs| pfs.callback_reask_due(cb_src.ip, cb_src.tcp_port))
+                                        .unwrap_or(false);
+                                    if !should_send {
+                                        continue;
+                                    }
+
+                                    let buddy_addr_raw = SocketAddr::new(buddy_ip.into(), buddy_port_raw);
+                                    if send_kad_callback_req(
+                                        &udp_socket,
+                                        &state,
+                                        buddy_ip,
+                                        buddy_port_raw,
+                                        buddy_hash,
+                                        fh,
+                                    ).await {
+                                        if let Some(pfs) = state.per_file_sources.get_mut(&transfer_id) {
+                                            pfs.mark_callback_requested(cb_src.ip, cb_src.tcp_port);
+                                        }
+                                        register_or_refresh_pending_kad_callback(
+                                            &pending_kad_callbacks,
+                                            cb_src.ip,
+                                            cb_src.tcp_port,
+                                            fh,
+                                            cb_src.source_user_hash,
+                                        ).await;
+                                        info!(
+                                            "Sent KAD CallbackReq to buddy {} at {}/{} for file {}",
+                                            buddy_hash,
+                                            buddy_addr_raw,
+                                            buddy_port_alt,
+                                            hex::encode(fh),
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -6814,13 +6905,52 @@ pub async fn start_network(
                                 pkt.extend_from_slice(&state.tcp_port.to_le_bytes());
                                 pkt.extend_from_slice(&state.user_hash);
                                 pkt.push(build_kad_connect_options(&state) & 0x07);
-                                let _ = udp_socket.send_to(&pkt, addr).await;
+                                // Match eMule: when the peer advertises crypt support and we
+                                // have crypt enabled, obfuscate OP_DIRECTCALLBACKREQ with the
+                                // ED2K client UDP layer keyed on the source's user hash and our
+                                // public IP. Many modern clients silently drop a plain
+                                // direct-callback request. Falls back to plaintext if we lack
+                                // the source's user hash or our own external IP (the receiver
+                                // would otherwise derive a non-matching key).
+                                let obf_pkt = if state.obfuscation_enabled
+                                    && (ds.connect_options & 0x01) != 0
+                                {
+                                    match (ds.source_user_hash, state.external_ip) {
+                                        (Some(uh), Some(eip)) => Some(
+                                            kad::obfuscation::encrypt_client_ed2k_packet(
+                                                &pkt,
+                                                &uh,
+                                                eip.octets(),
+                                            ),
+                                        ),
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                };
+                                match &obf_pkt {
+                                    Some(enc) => {
+                                        let _ = udp_socket.send_to(enc, addr).await;
+                                    }
+                                    None => {
+                                        let _ = udp_socket.send_to(&pkt, addr).await;
+                                    }
+                                }
+                                info!(
+                                    "Sent OP_DIRECTCALLBACKREQ to type-6 source {}:{} (tcp_port={}, obfuscated={})",
+                                    ds.ip,
+                                    ds.udp_port,
+                                    ds.tcp_port,
+                                    obf_pkt.is_some(),
+                                );
                                 if let Some(fh) = resolved_file_hash {
-                                    let now = chrono::Utc::now().timestamp();
-                                    let mut cbs = pending_kad_callbacks.lock().await;
-                                    cbs.entry(ds.ip)
-                                        .or_default()
-                                        .push((fh, ds.source_user_hash, now));
+                                    register_or_refresh_pending_kad_callback(
+                                        &pending_kad_callbacks,
+                                        ds.ip,
+                                        ds.tcp_port,
+                                        fh,
+                                        ds.source_user_hash,
+                                    ).await;
                                 }
                             }
                         }
@@ -6908,7 +7038,10 @@ pub async fn start_network(
                                     // queued or transferring.
                                     let now_ts = chrono::Utc::now().timestamp();
                                     for cb_src in &callback_sources {
-                                        let ip_s = cb_src.ip.to_string();
+                                        let ip_s = upload_server::kad_callback_display_key(
+                                            cb_src.ip,
+                                            cb_src.source_user_hash,
+                                        );
                                         if mgr.has_source_detail_for_ip(&transfer_id, &ip_s) {
                                             continue;
                                         }
@@ -6917,7 +7050,7 @@ pub async fn start_network(
                                             crate::types::SourceInfo {
                                                 ip: ip_s.clone(),
                                                 port: cb_src.tcp_port,
-                                                status: crate::types::SourceStatus::Connecting,
+                                                status: crate::types::SourceStatus::WaitCallback,
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
@@ -6949,7 +7082,7 @@ pub async fn start_network(
                                             crate::types::SourceInfo {
                                                 ip: ip_s.clone(),
                                                 port: dc_src.tcp_port,
-                                                status: crate::types::SourceStatus::Connecting,
+                                                status: crate::types::SourceStatus::WaitCallback,
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
@@ -6976,7 +7109,7 @@ pub async fn start_network(
                                                 crate::types::SourceInfo {
                                                     ip: ip_str.clone(),
                                                     port: ls.ed2k_server_port,
-                                                    status: crate::types::SourceStatus::Connecting,
+                                                    status: crate::types::SourceStatus::WaitCallback,
                                                     queue_rank: None,
                                                     speed: 0,
                                                     transferred: 0,
@@ -7098,7 +7231,10 @@ pub async fn start_network(
                                     // duplicate-row the same peer.
                                     let now_ts = chrono::Utc::now().timestamp();
                                     for cb_src in &callback_sources {
-                                        let ip_s = cb_src.ip.to_string();
+                                        let ip_s = upload_server::kad_callback_display_key(
+                                            cb_src.ip,
+                                            cb_src.source_user_hash,
+                                        );
                                         if mgr.has_source_detail_for_ip(&transfer_id, &ip_s) {
                                             continue;
                                         }
@@ -7110,7 +7246,7 @@ pub async fn start_network(
                                             crate::types::SourceInfo {
                                                 ip: ip_s.clone(),
                                                 port: cb_src.tcp_port,
-                                                status: crate::types::SourceStatus::Connecting,
+                                                status: crate::types::SourceStatus::WaitCallback,
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
@@ -7145,7 +7281,7 @@ pub async fn start_network(
                                             crate::types::SourceInfo {
                                                 ip: ip_s.clone(),
                                                 port: dc_src.tcp_port,
-                                                status: crate::types::SourceStatus::Connecting,
+                                                status: crate::types::SourceStatus::WaitCallback,
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
@@ -7187,7 +7323,7 @@ pub async fn start_network(
                                             crate::types::SourceInfo {
                                                 ip: ip_str.clone(),
                                                 port: ls.ed2k_server_port,
-                                                status: crate::types::SourceStatus::Connecting,
+                                                status: crate::types::SourceStatus::WaitCallback,
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
@@ -7452,7 +7588,10 @@ pub async fn start_network(
                                     // branches above).
                                     let now_ts = chrono::Utc::now().timestamp();
                                     for cb_src in &callback_sources {
-                                        let ip_s = cb_src.ip.to_string();
+                                        let ip_s = upload_server::kad_callback_display_key(
+                                            cb_src.ip,
+                                            cb_src.source_user_hash,
+                                        );
                                         if mgr.has_source_detail_for_ip(&transfer_id, &ip_s) {
                                             continue;
                                         }
@@ -7464,7 +7603,7 @@ pub async fn start_network(
                                             crate::types::SourceInfo {
                                                 ip: ip_s.clone(),
                                                 port: cb_src.tcp_port,
-                                                status: crate::types::SourceStatus::Connecting,
+                                                status: crate::types::SourceStatus::WaitCallback,
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
@@ -7499,7 +7638,7 @@ pub async fn start_network(
                                             crate::types::SourceInfo {
                                                 ip: ip_s.clone(),
                                                 port: dc_src.tcp_port,
-                                                status: crate::types::SourceStatus::Connecting,
+                                                status: crate::types::SourceStatus::WaitCallback,
                                                 queue_rank: None,
                                                 speed: 0,
                                                 transferred: 0,
@@ -7518,6 +7657,21 @@ pub async fn start_network(
                                 }
                             }
                         }
+                        // All placeholder/source rows for this transfer have
+                        // now been written to the TransferManager. Unlike the
+                        // live multi-source worker rows, these writes don't
+                        // each emit a `transfer-source-detail` event, so an
+                        // open drawer wouldn't see them until the user
+                        // collapsed and re-expanded it (which re-fetches via
+                        // `getTransferSources`). The `transfer:source-search`
+                        // event fires too early — before the ~1s of callback
+                        // sends and row writes above — so a refresh keyed off
+                        // it races and reads stale state. Emit a dedicated
+                        // post-write signal the UI can refresh on reliably.
+                        let _ = app_handle.emit(
+                            "transfer:sources-updated",
+                            serde_json::json!({ "transfer_id": refresh_transfer_id }),
+                        );
                     } else if let Some(tx) = state.pending_notes_searches.remove(&sid) {
                         let results = if let Some(search) = state.search_manager.get(&sid) {
                             info!(
@@ -8387,6 +8541,7 @@ pub async fn start_network(
                                                         reader: Box::new(reader),
                                                         writer: Box::new(writer),
                                                         emule_info_done: false,
+                                                        peer_caps: Default::default(),
                                                     };
                                                     let _ = cb_tx.send(parts).await;
                                                 }
@@ -8660,83 +8815,15 @@ pub async fn start_network(
                 }
                 state.dht_store.cleanup_expired();
 
-                // Prune stale pending KAD callbacks (older than 2 minutes)
-                // and mark the corresponding source details as Failed so the
-                // UI no longer shows them stuck in "Connecting".
+                // Drop expired inbound-callback expectations. UI placeholders
+                // are managed separately by `source_retry_timer`.
                 {
                     let now = chrono::Utc::now().timestamp();
-                    let mut expired_ips: Vec<std::net::Ipv4Addr> = Vec::new();
                     let mut cbs = pending_kad_callbacks.lock().await;
-                    for (ip, entries) in cbs.iter_mut() {
-                        let before = entries.len();
-                        entries.retain(|&(_, _, ts)| now - ts < 120);
-                        if entries.len() < before {
-                            expired_ips.push(*ip);
-                        }
+                    for entries in cbs.values_mut() {
+                        entries.retain(|e| now - e.registered_at < ed2k::dead_sources::PENDING_KAD_CALLBACK_SECS);
                     }
                     cbs.retain(|_, v| !v.is_empty());
-                    drop(cbs);
-
-                    if !expired_ips.is_empty() {
-                        let mut mgr = transfer_manager.write().await;
-                        for ip in &expired_ips {
-                            let ip_str = ip.to_string();
-                            for tid in state.pending_downloads.keys() {
-                                let sources = mgr.get_source_details(tid);
-                                for src in &sources {
-                                    if src.ip == ip_str
-                                        && src.status == crate::types::SourceStatus::Connecting
-                                        && (src.client_software == "KAD Callback"
-                                            || src.client_software == "KAD Direct Callback")
-                                    {
-                                        mgr.update_source_detail(
-                                            tid,
-                                            crate::types::SourceInfo {
-                                                ip: ip_str.clone(),
-                                                port: src.port,
-                                                status: crate::types::SourceStatus::Failed,
-                                                queue_rank: None,
-                                                speed: 0,
-                                                transferred: 0,
-                                                client_software: src.client_software.clone(),
-                                                peer_name: String::new(),
-                                                available_parts: None,
-                                                total_parts: None,
-                                                country_code: None,
-                                            },
-                                        );
-                                        let _ = app_handle.emit(
-                                            "transfer-source-detail",
-                                            // Normalized to the full 12-field shape other emit
-                                            // sites use so the frontend source-detail listener
-                                            // sees a consistent payload whether it arrives here
-                                            // (permanent-failed source, dropped via failure ring)
-                                            // or on one of the other terminal paths. Missing
-                                            // fields get explicit `null`/`0` defaults so a
-                                            // future refactor that ever switches this emit away
-                                            // from `status="failed"` (the status the frontend
-                                            // filters out) won't leave `undefined` showing up
-                                            // in the UI's `SourceInfo.speed` / `.transferred`.
-                                            serde_json::json!({
-                                                "transfer_id": tid,
-                                                "ip": ip_str,
-                                                "port": src.port,
-                                                "status": "failed",
-                                                "queue_rank": null,
-                                                "speed": 0,
-                                                "transferred": 0,
-                                                "client_software": src.client_software,
-                                                "peer_name": "",
-                                                "available_parts": null,
-                                                "total_parts": null,
-                                                "country_code": null,
-                                            }),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
                 }
 
                 // Prune stale outbound session tasks (older than 10 minutes)
@@ -8832,20 +8919,7 @@ pub async fn start_network(
                     }
                 }
 
-                // Prune callback buddy attempts for files no longer pending or active
-                {
-                    let mut live_hashes: HashSet<[u8; 16]> = state.pending_downloads.values()
-                        .filter_map(|pd| hex::decode(&pd.file_hash).ok())
-                        .filter(|b| b.len() == 16)
-                        .map(|b| { let mut a = [0u8; 16]; a.copy_from_slice(&b); a })
-                        .collect();
-                    for pfs in state.per_file_sources.values() {
-                        live_hashes.insert(pfs.file_hash);
-                    }
-                    state.callback_buddy_attempts.retain(|&(_, fh), _| live_hashes.contains(&fh));
-                }
-
-                // Prune expired sources (older than 1 hour)
+                // Prune stale outbound session tasks (older than 10 minutes)
                 {
                     let mut sm = source_manager.write().await;
                     sm.cleanup_expired();
@@ -9214,6 +9288,7 @@ pub async fn start_network(
                                     reader: conn.reader,
                                     writer: conn.writer,
                                     emule_info_done: true,
+                                    peer_caps: Default::default(),
                                 };
                                 let key = format!("{}:{}:{}", conn.transfer_id, conn.source_ip, conn.source_port);
                                 // `try_send` rather than `send().await`: the
@@ -9798,6 +9873,85 @@ pub async fn start_network(
                     }
                 }
 
+                // eMule-style: re-send KAD CallbackReq on the short callback
+                // cadence (KAD_CALLBACK_REASK_SECS) for sources still in
+                // WaitCallbackKad state that haven't connected back yet.
+                if kad_available {
+                    struct KadCallbackReaskJob {
+                        transfer_id: String,
+                        file_hash: [u8; 16],
+                        src_ip: Ipv4Addr,
+                        src_port: u16,
+                        buddy_ip: Ipv4Addr,
+                        buddy_port: u16,
+                        buddy_hash: KadId,
+                        user_hash: Option<[u8; 16]>,
+                    }
+                    let mut reask_jobs: Vec<KadCallbackReaskJob> = Vec::new();
+                    for (tid, pfs) in &state.per_file_sources {
+                        let is_live = state.pending_downloads.contains_key(tid)
+                            || state.active_source_senders.contains_key(tid);
+                        if !is_live {
+                            continue;
+                        }
+                        for src in &pfs.sources {
+                            if !src.kad_callback_reask_due() {
+                                continue;
+                            }
+                            let (Some(buddy_ip), Some(buddy_port), Some(buddy_hash)) = (
+                                src.callback_buddy_ip,
+                                src.callback_buddy_port,
+                                src.callback_buddy_hash,
+                            ) else {
+                                continue;
+                            };
+                            reask_jobs.push(KadCallbackReaskJob {
+                                transfer_id: tid.clone(),
+                                file_hash: pfs.file_hash,
+                                src_ip: src.ip,
+                                src_port: src.tcp_port,
+                                buddy_ip,
+                                buddy_port,
+                                buddy_hash: KadId(buddy_hash),
+                                user_hash: src.source_user_hash,
+                            });
+                        }
+                    }
+                    for job in reask_jobs {
+                        if send_kad_callback_req(
+                            &udp_socket,
+                            &state,
+                            job.buddy_ip,
+                            job.buddy_port,
+                            job.buddy_hash,
+                            job.file_hash,
+                        ).await {
+                            if let Some(pfs) = state.per_file_sources.get_mut(&job.transfer_id) {
+                                pfs.mark_callback_requested(job.src_ip, job.src_port);
+                            }
+                            register_or_refresh_pending_kad_callback(
+                                &pending_kad_callbacks,
+                                job.src_ip,
+                                job.src_port,
+                                job.file_hash,
+                                job.user_hash,
+                            ).await;
+                            let ip_s = upload_server::kad_callback_display_key(job.src_ip, job.user_hash);
+                            state.callback_row_pending_since.insert(
+                                (job.transfer_id.clone(), ip_s, job.src_port),
+                                now,
+                            );
+                            info!(
+                                "Re-sent KAD CallbackReq to buddy {} for source {}:{} file {}",
+                                job.buddy_hash,
+                                job.src_ip,
+                                job.src_port,
+                                hex::encode(job.file_hash),
+                            );
+                        }
+                    }
+                }
+
                 // Always process cancellations even when offline.
                 {
                     let to_cancel: Vec<String> = state.pending_downloads.iter()
@@ -10263,6 +10417,109 @@ pub async fn start_network(
                         state.download_handles.insert(dl_tid2, handle);
                     }
                 }
+
+                // Warm-started downloads (resumed this tick from persisted /
+                // SourceManager sources) were just removed from
+                // `pending_downloads`, so they skip the aggressive *initial*
+                // discovery burst that the pending-retry loop below performs
+                // (immediate KAD source search + server OP_GETSOURCES). Without
+                // this, a resumed download is stuck with only its stale on-disk
+                // source set: it never surfaces fresh server sources or new KAD
+                // callback sources, and only crawls along on the slow active
+                // cadence. eMule always (re)asks the server and KAD for a
+                // file's sources when the download starts, regardless of any
+                // cached sources — replicate that one-shot kick here.
+                {
+                    let mut warm_started: Vec<String> = started_from_persistent.clone();
+                    for tid in &started_from_sm {
+                        if !warm_started.contains(tid) {
+                            warm_started.push(tid.clone());
+                        }
+                    }
+                    if !warm_started.is_empty() {
+                        let targets: Vec<(String, [u8; 16], u64)> = {
+                            let mgr = transfer_manager.read().await;
+                            warm_started
+                                .iter()
+                                .filter_map(|tid| {
+                                    let t = mgr.get_transfer(tid)?;
+                                    let raw = hex::decode(&t.file_hash).ok()?;
+                                    if raw.len() != 16 {
+                                        return None;
+                                    }
+                                    let mut fh = [0u8; 16];
+                                    fh.copy_from_slice(&raw[..16]);
+                                    Some((tid.clone(), fh, t.total_size))
+                                })
+                                .collect()
+                        };
+                        for (tid, fh, file_size) in &targets {
+                            // Immediate KAD source search. Seed
+                            // `active_kad_search_state` so the active-download
+                            // KAD loop later in this tick doesn't double-fire.
+                            if kad_available {
+                                let kad_hash = md4_bytes_to_kad_id(fh);
+                                let closest = state
+                                    .routing_table
+                                    .find_closest_prefer_verified(&kad_hash, SEARCH_INITIAL_CONTACTS);
+                                if !closest.is_empty() {
+                                    let sid = state.search_manager.start_search(
+                                        kad_hash,
+                                        SearchType::FindSource { file_size: *file_size },
+                                        closest,
+                                    );
+                                    if sid != SearchId(0) {
+                                        state
+                                            .download_source_searches
+                                            .insert(sid, (tid.clone(), *fh));
+                                        let entry = state
+                                            .active_kad_search_state
+                                            .entry(tid.clone())
+                                            .or_insert((0, 0));
+                                        entry.0 = now;
+                                        entry.1 += 1;
+                                        debug!(
+                                            "Warm-start: kicked off initial KAD source search for resumed download {}",
+                                            tid
+                                        );
+                                    }
+                                }
+                            }
+                            // Immediate UDP OP_GETSOURCES to known servers.
+                            let packets = build_all_getsources_packets(&state, fh, *file_size);
+                            if !packets.is_empty() {
+                                let room = MAX_UDP_SOURCE_QUEUE
+                                    .saturating_sub(state.udp_source_queue.len());
+                                state.udp_source_queue.extend(packets.into_iter().take(room));
+                            }
+                        }
+                        // Immediate TCP OP_GETSOURCES over the connected server.
+                        if !state.low_id
+                            && state.server_connected
+                            && state.server_connection.is_some()
+                        {
+                            if let Some(conn) = state.server_connection.as_mut() {
+                                for (tid, fh, file_size) in &targets {
+                                    if let Ok(bytes) = conn.send_get_sources(fh, *file_size).await {
+                                        if bytes > 0 {
+                                            stats_manager.add_overhead(
+                                                crate::storage::statistics::OverheadCategory::SourceExchange,
+                                                crate::storage::statistics::OverheadDirection::Upload,
+                                                bytes,
+                                            );
+                                            info!(
+                                                "Warm-start: sent OP_GETSOURCES to server for resumed download {} ({})",
+                                                tid,
+                                                hex::encode(fh),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let mut to_retry: Vec<String> = to_retry.into_iter()
                     .filter(|(tid, _)| !started_from_sm.contains(tid) && !started_from_persistent.contains(tid))
                     .map(|(tid, _)| tid)
@@ -10533,6 +10790,73 @@ pub async fn start_network(
                                 entry.1 += 1;
                                 debug!("Started KAD source search for active download {} (attempt {})", tid, entry.1);
                             }
+                        }
+                    }
+                }
+
+                // Starved-download fast server re-ask. eMule keeps pulling the
+                // connected server's (growing) source list for a file that has
+                // no working sources; our 4-minute TCP batch is far too slow to
+                // recover when the initial source set is dead (e.g. all HighID
+                // sources reset, all KAD callbacks unanswered). For ACTIVE
+                // downloads with zero throughput we re-ask the connected server
+                // for that file's sources on a flood-safe per-file cadence
+                // (STARVED_SERVER_REASK_SECS). This is the path that surfaces
+                // the LowID server sources eMule reaches via OP_CALLBACKREQUEST.
+                if !state.low_id && state.server_connected && state.server_connection.is_some() {
+                    const MAX_STARVED_REASK_PER_TICK: usize = 10;
+                    let starved: Vec<(String, [u8; 16], u64)> = {
+                        let mgr = transfer_manager.read().await;
+                        let mut out = Vec::new();
+                        for tid in state.active_source_senders.keys() {
+                            // Pending downloads are already re-asked aggressively
+                            // by the loop above; only handle started transfers.
+                            if state.pending_downloads.contains_key(tid) { continue; }
+                            let last = state.starved_server_reask_at.get(tid).copied().unwrap_or(0);
+                            if now.saturating_sub(last) < STARVED_SERVER_REASK_SECS { continue; }
+                            if let Some(transfer) = mgr.get_transfer(tid) {
+                                // Starved == no bytes currently flowing.
+                                if transfer.speed > 0 { continue; }
+                                if let Ok(raw) = hex::decode(&transfer.file_hash) {
+                                    if raw.len() == 16 {
+                                        let mut fh = [0u8; 16];
+                                        fh.copy_from_slice(&raw[..16]);
+                                        out.push((tid.clone(), fh, transfer.total_size));
+                                    }
+                                }
+                            }
+                            if out.len() >= MAX_STARVED_REASK_PER_TICK { break; }
+                        }
+                        out
+                    };
+                    if !starved.is_empty() {
+                        if let Some(conn) = state.server_connection.as_mut() {
+                            for (tid, fh, file_size) in &starved {
+                                if let Ok(bytes) = conn.send_get_sources(fh, *file_size).await {
+                                    if bytes > 0 {
+                                        stats_manager.add_overhead(
+                                            crate::storage::statistics::OverheadCategory::SourceExchange,
+                                            crate::storage::statistics::OverheadDirection::Upload,
+                                            bytes,
+                                        );
+                                        info!(
+                                            "Starved re-ask: sent OP_GETSOURCES to server for active download {} ({})",
+                                            tid,
+                                            hex::encode(fh),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        for (tid, _, _) in &starved {
+                            state.starved_server_reask_at.insert(tid.clone(), now);
+                        }
+                        // Bound the cooldown map: drop entries for downloads no
+                        // longer active so a long session can't accumulate them.
+                        if state.starved_server_reask_at.len() > 256 {
+                            let active: std::collections::HashSet<String> =
+                                state.active_source_senders.keys().cloned().collect();
+                            state.starved_server_reask_at.retain(|k, _| active.contains(k));
                         }
                     }
                 }
@@ -12520,8 +12844,24 @@ pub async fn start_network(
                             buddy_id, buddy_ip, buddy_port,
                             writer, reader_handle,
                         );
+                        // `CT_EMULE_BUDDYIP` (Hello tag 0xFC) follows the same
+                        // wire convention as KAD `TAG_SERVERIP`: eMule sends
+                        // `GetBuddy()->GetIP()` (raw `m_dwUserIP` = Winsock
+                        // `sin_addr.s_addr` on LE = "LSB-first host integer"),
+                        // and the receiver stores `m_nBuddyIP = temptag.GetInt()`
+                        // with no `htonl`. For dotted-quad `a.b.c.d` we need
+                        // the wire bytes to be `[a,b,c,d]`, which — because
+                        // Uint32 tags LE-encode — means the integer must be
+                        // `0xddccbbaa` = `u32::from_le_bytes([a,b,c,d])`.
+                        // `u32::from(Ipv4Addr)` returns big-endian (`0xaabbccdd`)
+                        // and would publish every buddy IP byte-reversed (the
+                        // same class of bug we fixed for KAD `TAG_SERVERIP`).
+                        // See `network/mod.rs::update_publish_manager` for the
+                        // KAD-side counterpart and `BaseClient.cpp:955-961` /
+                        // `BaseClient.cpp:441-458` in `emulesource` for the
+                        // eMule send/receive code we're matching.
                         *state.shared_buddy_info.write().await = Some(ed2k::messages::BuddyInfo {
-                            buddy_ip: u32::from(buddy_ip),
+                            buddy_ip: u32::from_le_bytes(buddy_ip.octets()),
                             buddy_port,
                         });
                         info!("Buddy connected: {} at {}:{}", buddy_id, buddy_ip, buddy_port);
@@ -12565,14 +12905,13 @@ pub async fn start_network(
             cb_conn = kad_callback_rx.recv() => {
                 if let Some(parts) = cb_conn {
                     let hash_hex = hex::encode(parts.file_hash);
-                    let matching_tid = state.pending_downloads.iter()
-                        .find(|(_, pd)| pd.file_hash == hash_hex)
-                        .map(|(tid, _)| tid.clone());
-
-                    if let Some(tid) = matching_tid {
-                        if let Some(pd) = state.pending_downloads.remove(&tid) {
+                    let active_parts: Option<upload_server::KadCallbackParts> =
+                        if let Some(tid) = state.pending_downloads.iter()
+                            .find(|(_, pd)| pd.file_hash == hash_hex)
+                            .map(|(tid, _)| tid.clone())
+                        {
+                            if let Some(pd) = state.pending_downloads.remove(&tid) {
                             let source_addr = SocketAddr::new(parts.peer_ip.into(), parts.peer_port);
-                            state.callback_buddy_attempts.retain(|&(_, fh), _| fh != parts.file_hash);
                             info!("Starting callback download {tid} from {source_addr}");
                             let download = Ed2kDownload {
                                 transfer_id: pd.transfer_id.clone(),
@@ -12651,9 +12990,22 @@ pub async fn start_network(
                             // failed entries, so this does NOT inflate
                             // the "N failed sources hidden" counter).
                             let peer_ip_str = parts.peer_ip.to_string();
+                            let uh_key = if parts.peer_user_hash != [0u8; 16] {
+                                Some(upload_server::kad_callback_display_key(
+                                    Ipv4Addr::UNSPECIFIED,
+                                    Some(parts.peer_user_hash),
+                                ))
+                            } else {
+                                None
+                            };
                             let removed = {
                                 let mut mgr = transfer_manager.write().await;
-                                mgr.remove_callback_placeholders_for_ip(&tid3, &peer_ip_str)
+                                let mut removed =
+                                    mgr.remove_callback_placeholders_for_ip(&tid3, &peer_ip_str);
+                                if let Some(key) = uh_key {
+                                    removed.extend(mgr.remove_callback_placeholders_for_ip(&tid3, &key));
+                                }
+                                removed
                             };
                             for (ip, port) in removed {
                                 state.callback_row_pending_since
@@ -12676,10 +13028,17 @@ pub async fn start_network(
                                     }),
                                 );
                             }
+                            None
+                        } else {
+                            Some(parts)
                         }
                     } else {
-                        // Download already active — the LowID peer
-                        // connected *back* to us (server-relay or KAD
+                        Some(parts)
+                    };
+
+                    if let Some(parts) = active_parts {
+                        // Download already active (or not in pending_downloads)
+                        // — the LowID peer connected *back* to us (server-relay or KAD
                         // callback). Hand the live, post-handshake
                         // stream to the running multi-source worker
                         // so it adopts the connection rather than
@@ -12701,6 +13060,7 @@ pub async fn start_network(
                         let cb_peer_user_hash = parts.peer_user_hash;
                         let cb_file_hash = parts.file_hash;
                         let cb_emule_info_done = parts.emule_info_done;
+                        let cb_peer_caps = parts.peer_caps.clone();
 
                         // Apply the same reputation gate that
                         // `inject_source_into_active_transfers` uses
@@ -12780,6 +13140,7 @@ pub async fn start_network(
                             writer: parts.writer,
                             peer_user_hash: cb_peer_user_hash,
                             emule_info_done: cb_emule_info_done,
+                            peer_caps: cb_peer_caps,
                         });
                         let mut closed_senders: Vec<String> = Vec::new();
                         for tid in &matching_tids {
@@ -12812,9 +13173,24 @@ pub async fn start_network(
                                         // keeps a single row per peer
                                         // in the UI.
                                         let peer_ip_str = cb_peer_ip.to_string();
+                                        let uh_key = if cb_peer_user_hash != [0u8; 16] {
+                                            Some(upload_server::kad_callback_display_key(
+                                                Ipv4Addr::UNSPECIFIED,
+                                                Some(cb_peer_user_hash),
+                                            ))
+                                        } else {
+                                            None
+                                        };
                                         let removed = {
                                             let mut mgr = transfer_manager.write().await;
-                                            mgr.remove_callback_placeholders_for_ip(tid, &peer_ip_str)
+                                            let mut removed =
+                                                mgr.remove_callback_placeholders_for_ip(tid, &peer_ip_str);
+                                            if let Some(key) = uh_key {
+                                                removed.extend(
+                                                    mgr.remove_callback_placeholders_for_ip(tid, &key),
+                                                );
+                                            }
+                                            removed
                                         };
                                         for (ip, port) in removed {
                                             state.callback_row_pending_since
@@ -13968,6 +14344,18 @@ pub async fn start_network(
         info!("Reputation data saved on shutdown ({} peers tracked)", state.reputation.tracked_count());
     }
 
+    // Persist the source cache (peer user hashes + crypt options) so the next
+    // session can obfuscate connections to the same crypt-required peers
+    // immediately, mirroring eMule's persisted source identities.
+    {
+        let sources_met = state.data_dir.join("sources.met");
+        let sm = source_manager.read().await;
+        match sm.save_to_disk(&sources_met) {
+            Ok(n) => info!("Saved {n} cached sources (with user hashes) to sources.met"),
+            Err(e) => error!("Failed to save sources.met on shutdown: {e}"),
+        }
+    }
+
     let server_met_path = state.data_dir.join("server.met");
     let _ = state.server_list.save_server_met(&server_met_path);
 
@@ -14216,7 +14604,21 @@ fn update_publish_manager_state(state: &mut NetworkState) {
     if let Some(buddy) = state.buddy_manager.buddy_id().cloned() {
         state.publish_manager.buddy_id = Some(buddy);
         if let Some((ip, tcp_port)) = state.buddy_manager.buddy_addr() {
-            state.publish_manager.buddy_ip = u32::from_be_bytes(ip.octets());
+            // TAG_SERVERIP uses eMule's "LSB-first" host-integer convention:
+            // the eMule receiver does `dwBuddyIP = cTag.GetInt()` with NO
+            // `htonl` (unlike TAG_SOURCEIP, which IS htonl'd in
+            // DownloadQueue::KademliaSearchFile). For an IP whose dotted-quad
+            // octets are `[a,b,c,d]`, eMule expects the wire-decoded uint32
+            // to equal `0xddccbbaa` so that `ipstr()` (which prints LSB-first)
+            // displays `a.b.c.d`. Our Uint32 tag is LE-encoded on the wire, so
+            // the byte sequence `[a,b,c,d]` corresponds to `from_le_bytes`,
+            // NOT `from_be_bytes`. Using `from_be_bytes` here would publish
+            // every buddy IP byte-reversed — turning a real residential
+            // 88.147.30.21 into the unroutable 21.30.147.88 — so any peer
+            // trying to call us back via our buddy would dial a dead address.
+            // The parse side (`extract_kad_sources` for TAG_SERVERIP) mirrors
+            // this with `.to_le_bytes()`; the two must stay in sync.
+            state.publish_manager.buddy_ip = u32::from_le_bytes(ip.octets());
             let buddy_udp = state.routing_table.get_contact(&buddy)
                 .map(|c| c.udp_port)
                 .unwrap_or_else(|| tcp_port.saturating_add(3));
@@ -16505,22 +16907,21 @@ async fn handle_udp_packet_inner(
 
         KadMessage::CallbackReq { buddy_id, file_id, tcp_port: peer_tcp_port } => {
             debug!("CallbackReq from {from}: buddy_id={buddy_id}, file_id={file_id}");
-            if let Some(serving_id) = state.buddy_manager.serving_for().cloned() {
-                if serving_id != buddy_id {
-                    debug!("Rejecting CallbackReq: buddy_id mismatch (expected {serving_id}, got {buddy_id})");
+            // eMule Process_KADEMLIA_CALLBACK_REQ relays whenever we have a
+            // serving buddy client; it does not verify the check token
+            // (see the JOHNTODO in eMule's source).
+            if state.buddy_manager.is_serving() {
+                let client_ip = match from.ip() {
+                    std::net::IpAddr::V4(v4) => v4,
+                    _ => return,
+                };
+                let relayed = state.buddy_manager.send_callback_relay(
+                    &buddy_id, client_ip, peer_tcp_port, file_id.0,
+                ).await;
+                if relayed {
+                    debug!("Callback relayed via OP_CALLBACK to buddy");
                 } else {
-                    let client_ip = match from.ip() {
-                        std::net::IpAddr::V4(v4) => v4,
-                        _ => return,
-                    };
-                    let relayed = state.buddy_manager.send_callback_relay(
-                        &serving_id, client_ip, peer_tcp_port, file_id.0,
-                    ).await;
-                    if relayed {
-                        debug!("Callback relayed via OP_CALLBACK to buddy");
-                    } else {
-                        warn!("Failed to relay callback to buddy");
-                    }
+                    warn!("Failed to relay callback to buddy");
                 }
             }
         }
@@ -19518,6 +19919,7 @@ async fn handle_download_event(
         } => {
             let source_status = match status.as_str() {
                 "connecting" => crate::types::SourceStatus::Connecting,
+                "wait_callback" => crate::types::SourceStatus::WaitCallback,
                 "queued" => crate::types::SourceStatus::Queued,
                 "queue_full" => crate::types::SourceStatus::QueueFull,
                 "no_needed_parts" => crate::types::SourceStatus::NoNeededParts,
@@ -20519,7 +20921,21 @@ fn extract_kad_sources(
                 // to direct candidate handling for interoperability with mixed clients.
                 if server_ip != 0 && server_port != 0 {
                     let source_addr = Ipv4Addr::from(ip.to_be_bytes());
-                    let b_ip = Ipv4Addr::from(server_ip.to_be_bytes());
+                    // CRITICAL byte-order asymmetry (eMule DownloadQueue.cpp
+                    // CDownloadQueue::KademliaSearchFile): the source IP and the
+                    // buddy IP arrive in *opposite* byte orders even though both
+                    // tags decode identically off the wire. eMule applies
+                    // `htonl()` to the source IP (`ED2Kip = htonl(ip)`) but feeds
+                    // the buddy IP to `SetBuddyIP(dwBuddyIP)` / the callback
+                    // `SendPacket` RAW (already network order). So the source
+                    // needs the big-endian transform (`to_be_bytes`) while the
+                    // buddy must use little-endian (`to_le_bytes`). Using
+                    // `to_be_bytes` here byte-reversed every buddy address —
+                    // turning real residential buddies (e.g. 88.147.30.21) into
+                    // unroutable DoD ranges (21.30.147.88), so every
+                    // KADEMLIA_CALLBACK_REQ was fired into the void and no
+                    // firewalled source ever connected back.
+                    let b_ip = Ipv4Addr::from(server_ip.to_le_bytes());
                     let b_hash = buddy_hash.map(KadId);
                     if !sources.iter().any(|s: &KadSource| s.buddy_ip == Some(b_ip) && s.buddy_port == Some(server_port)) {
                         sources.push(KadSource {

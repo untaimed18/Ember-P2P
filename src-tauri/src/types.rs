@@ -235,6 +235,7 @@ pub struct SourceInfo {
 #[serde(rename_all = "snake_case")]
 pub enum SourceStatus {
     Connecting,
+    WaitCallback,
     Queued,
     QueueFull,
     NoNeededParts,

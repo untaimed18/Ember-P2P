@@ -11,6 +11,10 @@ use digest::Digest;
 
 const MAGICVALUE_UDP_SYNC_CLIENT: u32 = 0x395F2EC1;
 
+/// eMule's `MAGICVALUE_UDP` (decimal 91) mixed into the ED2K client-to-client
+/// UDP obfuscation key. See `EncryptedDatagramSocket.cpp::EncryptSendClient`.
+const MAGICVALUE_UDP: u8 = 91;
+
 const VALID_INNER_HEADERS: [u8; 7] = [
     0xE3, // OP_EDONKEYHEADER / OP_EDONKEYPROT
     0xC5, // OP_EMULEPROT
@@ -218,6 +222,78 @@ pub fn encrypt_kad_packet(
     result.extend_from_slice(&random_key_part.to_le_bytes());
     result.extend_from_slice(&encrypted);
     result
+}
+
+/// Encrypt an ED2K **client-to-client** UDP packet (e.g. `OP_DIRECTCALLBACKREQ`)
+/// using eMule's client UDP obfuscation. This is distinct from KAD obfuscation:
+/// it carries **no** receiver/sender verify keys and is keyed on the *target*
+/// client's ED2K user hash plus *our* public IP (mirrors
+/// `EncryptedDatagramSocket.cpp::EncryptSendClient` with `bKad == false`).
+///
+/// Key = `MD5(target_user_hash[16] + our_public_ip[4] + 91 + random_key_part[2])`.
+///
+/// Wire layout (padding length is always 0, matching eMule's
+/// `CRYPT_HEADER_PADDING == 0`):
+/// `semi_random[1] | random_key_part[2 LE] | RC4( magic[4 LE] | pad_len(0)[1] | packet )`
+///
+/// * `packet` is the raw plain packet starting with its protocol byte
+///   (`0xC5` = `OP_EMULEPROT`), then the opcode and payload — exactly what would
+///   otherwise go on the wire unobfuscated.
+/// * `target_user_hash` is the receiving client's 16-byte ED2K user hash.
+/// * `our_public_ip` is our external IPv4 address in octet order (`a.b.c.d`),
+///   i.e. `Ipv4Addr::octets()`. The receiver derives the same key from the
+///   source IP of our datagram, so these must match.
+pub fn encrypt_client_ed2k_packet(
+    packet: &[u8],
+    target_user_hash: &[u8; 16],
+    our_public_ip: [u8; 4],
+) -> Vec<u8> {
+    use rand::rngs::OsRng;
+    use rand::RngCore;
+    let mut rng = OsRng;
+
+    let random_key_part: u16 = (rng.next_u32() & 0xFFFF) as u16;
+
+    // Sendkey: MD5(UserHashTarget[16] + OurPublicIP[4] + MAGICVALUE_UDP[1] + RandomKeyPart[2])
+    let mut key_data = [0u8; 23];
+    key_data[..16].copy_from_slice(target_user_hash);
+    key_data[16..20].copy_from_slice(&our_public_ip);
+    key_data[20] = MAGICVALUE_UDP;
+    key_data[21..23].copy_from_slice(&random_key_part.to_le_bytes());
+    let md5_hash = md5::Md5::digest(key_data);
+
+    let mut rc4 = Rc4State::new(&md5_hash);
+
+    // Encrypted region: magic(4) + padding-length(1, always 0) + payload.
+    let mut plaintext = Vec::with_capacity(4 + 1 + packet.len());
+    plaintext.extend_from_slice(&MAGICVALUE_UDP_SYNC_CLIENT.to_le_bytes());
+    plaintext.push(0u8); // CRYPT_HEADER_PADDING == 0
+    plaintext.extend_from_slice(packet);
+
+    let mut encrypted = vec![0u8; plaintext.len()];
+    rc4.process(&plaintext, &mut encrypted);
+
+    // First (unencrypted) byte must have the ED2K marker bit (bit 0) set and
+    // must not collide with any real protocol header byte, otherwise the
+    // receiver treats the datagram as plaintext and never attempts to decrypt.
+    let semi_random = {
+        let mut result = None;
+        for _ in 0..256 {
+            let b: u8 = ((rng.next_u32() & 0xFF) as u8) | 0x01;
+            if !VALID_INNER_HEADERS.contains(&b) {
+                result = Some(b);
+                break;
+            }
+        }
+        // 0x4D = 'M', odd, and not a protocol header byte — safe fallback.
+        result.unwrap_or(0x4D)
+    };
+
+    let mut out = Vec::with_capacity(3 + encrypted.len());
+    out.push(semi_random);
+    out.extend_from_slice(&random_key_part.to_le_bytes());
+    out.extend_from_slice(&encrypted);
+    out
 }
 
 fn try_decrypt_with_key(
