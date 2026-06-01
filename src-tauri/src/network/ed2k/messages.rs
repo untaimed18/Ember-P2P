@@ -161,6 +161,26 @@ pub fn source_exchange_id_to_ipv4(version: u8, source_id: u32) -> std::net::Ipv4
     }
 }
 
+/// Recover eMule's "hybrid" (host-order) source ID from a wire ID, undoing the
+/// per-version byte order.
+///
+/// eMule sends the ID byte-swapped (`htonl`) for source-exchange versions < 3
+/// and verbatim for v >= 3 (see `CPartFile::CreateSrcInfoPacket`). On receive
+/// it reconstructs the hybrid value and classifies the source with
+/// `IsLowID(hybrid)` (`hybrid < 0x0100_0000`). Using the *raw* little-endian
+/// value for that test mis-classifies v1/v2 LowID peers as HighID (their
+/// swapped ID is large), which then derives a bogus `0.x.x.x` address and
+/// drops them. This helper mirrors eMule so the LowID test — and the
+/// server-assigned client ID we use for callbacks — are correct on every
+/// version.
+pub fn source_exchange_hybrid_id(version: u8, source_id: u32) -> u32 {
+    if version < 3 {
+        source_id.swap_bytes()
+    } else {
+        source_id
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Ed2kTagValue {
     String(String),
@@ -1467,10 +1487,14 @@ pub fn build_answer_sources1_versioned(
     resp.extend_from_slice(file_hash);
     resp.extend_from_slice(&(sources.len() as u16).to_le_bytes());
     for src in sources {
+        // eMule "hybrid" ID: LowID client id for firewalled sources, else the
+        // host-order IP. Byte-swapped for versions < 3 (CreateSrcInfoPacket's
+        // htonl), verbatim for v >= 3.
+        let id_value = super::sources::sx_answer_source_id(src);
         if version < 3 {
-            resp.extend_from_slice(&src.ip.octets());
+            resp.extend_from_slice(&id_value.to_be_bytes());
         } else {
-            resp.extend_from_slice(&u32::from(src.ip).to_le_bytes());
+            resp.extend_from_slice(&id_value.to_le_bytes());
         }
         resp.extend_from_slice(&src.tcp_port.to_le_bytes());
         resp.extend_from_slice(&src.server_ip.to_le_bytes());
@@ -1838,6 +1862,39 @@ pub fn parse_file_status(payload: &[u8]) -> io::Result<([u8; 16], Vec<bool>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sx_hybrid_id_roundtrip_lowid_and_highid() {
+        // HighID: the host-order IP must survive encode->wire->decode on every
+        // SX version, and reconstruct the same IPv4.
+        let ip = std::net::Ipv4Addr::new(1, 2, 3, 4);
+        let host = u32::from(ip);
+
+        // v1/v2 are sent byte-swapped (CreateSrcInfoPacket's htonl == to_be on
+        // a LE host); the receiver reads the wire u32 little-endian.
+        let read_v1 = u32::from_le_bytes(host.to_be_bytes());
+        assert_eq!(source_exchange_hybrid_id(1, read_v1), host);
+        assert_eq!(source_exchange_id_to_ipv4(1, read_v1), ip);
+
+        // v3+ are sent verbatim (little-endian on the wire).
+        let read_v3 = u32::from_le_bytes(host.to_le_bytes());
+        assert_eq!(source_exchange_hybrid_id(3, read_v3), host);
+        assert_eq!(source_exchange_id_to_ipv4(3, read_v3), ip);
+
+        // LowID: a small server-assigned client id must still classify as
+        // LowID after the round trip on every version. Before the fix, the
+        // v1/v2 raw value (byte-swapped, hence large) was misread as a HighID.
+        let lowid: u32 = 0x00AB_CDEF;
+        assert!(lowid < 16_777_216);
+
+        let lo_v1 = u32::from_le_bytes(lowid.to_be_bytes());
+        assert_eq!(source_exchange_hybrid_id(1, lo_v1), lowid);
+        assert!(source_exchange_hybrid_id(1, lo_v1) < 16_777_216);
+
+        let lo_v4 = u32::from_le_bytes(lowid.to_le_bytes());
+        assert_eq!(source_exchange_hybrid_id(4, lo_v4), lowid);
+        assert!(source_exchange_hybrid_id(4, lo_v4) < 16_777_216);
+    }
 
     #[test]
     fn file_identifier_roundtrip_preserves_optional_fields() {

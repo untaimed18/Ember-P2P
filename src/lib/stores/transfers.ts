@@ -309,20 +309,22 @@ export async function initTransferStore() {
           // D30: never flip a row already in a terminal state (e.g. late
           // `transfer-complete` after a `transfer-failed`).
           if (isTerminal(t.status) && t.status !== 'completed') return t;
-          // Preserve the actual byte counters. A `transfer-complete` from
-          // the uploader side means "this upload *session* ended
-          // successfully from our POV" (peer said OP_END_OF_DOWNLOAD, or
-          // the session rotated out at SESSIONMAXTRANS, or we hit the
-          // queue-preempt path) — it does NOT mean we pushed the entire
-          // file. eMule sessions routinely top out well short of
-          // `total_size`. The old snap to `transferred: t.total_size,
-          // completed_size: t.total_size, progress: 100` produced
-          // "586 MB / 586 MB Complete" rows for sessions that only
-          // served a couple hundred megabytes before the peer
-          // disconnected, hiding real transfer problems behind a
-          // misleading success line. Trust whatever `transferred` the
-          // backend last reported via `transfer-progress`.
-          return { ...t, status: 'completed' as const, speed: 0 };
+          // This branch is downloads only — uploads returned above. A
+          // download emits `transfer-complete` only once the whole file is
+          // present and hash-verified, so the row is by definition 100%.
+          // Snap the bar/counters to full: the rate-limited `transfer-progress`
+          // ticks can leave the last reported value a few percent short, which
+          // showed up as e.g. "98% Complete" rows. (Uploads are deliberately
+          // NOT snapped — an upload session routinely ends well short of
+          // `total_size`, but that path never reaches here.)
+          return {
+            ...t,
+            status: 'completed' as const,
+            speed: 0,
+            progress: 100,
+            transferred: t.total_size,
+            completed_size: t.total_size,
+          };
         });
       });
     });
