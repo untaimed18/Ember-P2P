@@ -5772,7 +5772,12 @@ async fn download_parts_from_source(
                                 // so the periodic source-asking sweep can
                                 // dispatch the callback when we're connected
                                 // to the matching server.
-                                if entry.source_id < 16_777_216 {
+                                // Normalize to eMule's hybrid (host-order) ID
+                                // before classifying. For SX versions < 3 the
+                                // wire ID is byte-swapped, so a raw `< 16M`
+                                // test would mis-read a LowID as a HighID.
+                                let hybrid_id = source_exchange_hybrid_id(version, entry.source_id);
+                                if hybrid_id < 16_777_216 {
                                     if entry.server_ip == 0 || entry.server_port == 0 {
                                         // Without a server reference we have
                                         // no way to reach this peer — drop
@@ -5783,7 +5788,7 @@ async fn download_parts_from_source(
                                     if let Some(sm) = &source_mgr {
                                         let mut sm = sm.write().await;
                                         sm.register_lowid_source(
-                                            *file_hash, entry.source_id, entry.tcp_port,
+                                            *file_hash, hybrid_id, entry.tcp_port,
                                             entry.server_ip, entry.server_port, uh, co,
                                         );
                                     }
@@ -5846,14 +5851,15 @@ async fn download_parts_from_source(
                                 // request a callback later instead of
                                 // silently dropping every LowID peer the
                                 // upstream client knew about.
-                                if entry.source_id < 16_777_216 {
+                                let hybrid_id = source_exchange_hybrid_id(version, entry.source_id);
+                                if hybrid_id < 16_777_216 {
                                     if entry.server_ip == 0 || entry.server_port == 0 {
                                         continue;
                                     }
                                     if let Some(sm) = &source_mgr {
                                         let mut sm = sm.write().await;
                                         sm.register_lowid_source(
-                                            *file_hash, entry.source_id, entry.tcp_port,
+                                            *file_hash, hybrid_id, entry.tcp_port,
                                             entry.server_ip, entry.server_port, uh, co,
                                         );
                                     }
@@ -7144,16 +7150,22 @@ async fn read_packet_async_ms<R: AsyncReadExt + Unpin + ?Sized>(
     }
     let opcode = reader.read_u8().await?;
     let payload_len = length - 1;
-    // Grow the buffer with bytes that actually arrive rather than trusting the
-    // declared length up front. A peer that announces a near-10 MiB packet but
-    // then stalls can otherwise pin a full ~10 MiB allocation per connection.
+    // Grow the buffer on the heap with bytes that actually arrive rather than
+    // trusting the declared length up front. A peer that announces a near-10
+    // MiB packet but then stalls can otherwise pin a full ~10 MiB allocation
+    // per connection. We grow in bounded steps directly into the Vec instead
+    // of via a large stack array: this read is awaited deep inside the
+    // multi-source download future, and a 64 KiB stack buffer there bloats
+    // that (already huge) future's poll frame enough to overflow the worker
+    // stack in debug builds.
     let mut payload = Vec::new();
     let mut remaining = payload_len;
-    let mut chunk = [0u8; 65536];
+    const READ_STEP: usize = 65536;
     while remaining > 0 {
-        let want = remaining.min(chunk.len());
-        reader.read_exact(&mut chunk[..want]).await?;
-        payload.extend_from_slice(&chunk[..want]);
+        let want = remaining.min(READ_STEP);
+        let start = payload.len();
+        payload.resize(start + want, 0);
+        reader.read_exact(&mut payload[start..start + want]).await?;
         remaining -= want;
     }
     if protocol == OP_PACKEDPROT {

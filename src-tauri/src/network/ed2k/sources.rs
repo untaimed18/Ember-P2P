@@ -14,6 +14,36 @@ const MAX_TRACKED_FILES: usize = 500;
 /// eMule: minimum gap between TCP connection attempts to the same source (20 min)
 const MIN_TCP_RECONNECT_SECS: i64 = 1200;
 
+/// Whether a stored source may be forwarded in an OP_ANSWERSOURCES(2) reply.
+///
+/// Matches eMule's `CreateSrcInfoPacket`: HighID sources are gated on a valid,
+/// non-filtered IP that isn't the requester; LowID (firewalled) sources are
+/// forwarded too — eMule includes them so the receiver can reach them via a
+/// server callback — but only when they carry a usable server reference (their
+/// own IP is unknown, so the IP-based filters don't apply to them).
+pub(crate) fn sx_answer_source_eligible(e: &SourceEntry, exclude_ip: Ipv4Addr, now: i64) -> bool {
+    if now.saturating_sub(e.last_seen) >= SOURCE_EXPIRY_SECS {
+        return false;
+    }
+    if e.client_id != 0 {
+        e.server_ip != 0 && e.server_port != 0
+    } else {
+        e.ip != exclude_ip && !is_filtered_source_ip(&e.ip)
+    }
+}
+
+/// The eMule "hybrid" (host-order) source ID to advertise for a source: the
+/// LowID server-assigned client id for firewalled sources, otherwise the
+/// host-order IP. Callers byte-swap this for SX versions < 3 (matching
+/// `CreateSrcInfoPacket`'s `htonl`) and send it verbatim for v >= 3.
+pub(crate) fn sx_answer_source_id(src: &SourceEntry) -> u32 {
+    if src.client_id != 0 {
+        src.client_id
+    } else {
+        u32::from(src.ip)
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Per-file download source list  (eMule CPartFile::srclist equivalent)
@@ -702,12 +732,7 @@ impl SourceManager {
             .map(|entries| {
                 entries
                     .iter()
-                    .filter(|e| {
-                        e.ip != exclude_ip
-                            && e.client_id == 0
-                            && !is_filtered_source_ip(&e.ip)
-                            && now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
-                    })
+                    .filter(|e| sx_answer_source_eligible(e, exclude_ip, now))
                     .collect()
             })
             .unwrap_or_default();
@@ -724,10 +749,11 @@ impl SourceManager {
         resp.extend_from_slice(file_hash);
         resp.extend_from_slice(&(sources.len() as u16).to_le_bytes());
         for src in &sources {
+            let id_value = sx_answer_source_id(src);
             if version >= 3 {
-                resp.extend_from_slice(&u32::from(src.ip).to_le_bytes());
+                resp.extend_from_slice(&id_value.to_le_bytes());
             } else {
-                resp.extend_from_slice(&src.ip.octets());
+                resp.extend_from_slice(&id_value.to_be_bytes());
             }
             resp.extend_from_slice(&src.tcp_port.to_le_bytes());
             resp.extend_from_slice(&src.server_ip.to_le_bytes());
@@ -758,12 +784,7 @@ impl SourceManager {
             .map(|entries| {
                 entries
                     .iter()
-                    .filter(|e| {
-                        e.ip != exclude_ip
-                            && e.client_id == 0
-                            && !is_filtered_source_ip(&e.ip)
-                            && now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS
-                    })
+                    .filter(|e| sx_answer_source_eligible(e, exclude_ip, now))
                     .cloned()
                     .collect()
             })
