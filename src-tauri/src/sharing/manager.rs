@@ -384,6 +384,12 @@ impl TransferManager {
         if let Some(mut transfer) = transfer {
             transfer.status = TransferStatus::Completed;
             transfer.progress = 100.0;
+            // Snap the byte counter to the full size as well. A download only
+            // reaches Completed after every part is hash-verified, so the
+            // terminal row is by definition the whole file; without this a
+            // coalesced/late final progress tick could leave `transferred`
+            // (and the UI's "x / total") short even though progress is 100%.
+            transfer.transferred = transfer.total_size;
             transfer.speed = 0;
             Self::clear_failure_context(&mut transfer);
             Self::clear_runtime_health(&mut transfer);
