@@ -3549,7 +3549,7 @@ pub(crate) async fn maybe_send_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     let Some(state) = cm.secident_request_state(&peer_user_hash, peer_ip_u32, peer_secident_level) else {
         return Ok(None);
     };
-    let challenge = rand::random::<u32>().wrapping_add(1);
+    let challenge = rand::RngCore::next_u32(&mut rand::rngs::OsRng).wrapping_add(1);
     let mut secident_payload = Vec::with_capacity(5);
     secident_payload.push(state);
     secident_payload.extend_from_slice(&challenge.to_le_bytes());
@@ -3709,9 +3709,17 @@ async fn read_packet_async<R: AsyncReadExt + Unpin + ?Sized>(
     }
     let opcode = reader.read_u8().await?;
     let payload_len = length - 1;
-    let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 {
-        reader.read_exact(&mut payload).await?;
+    // Grow the buffer with bytes that actually arrive rather than trusting the
+    // declared length up front. A peer that announces a near-10 MiB packet but
+    // then stalls can otherwise pin a full ~10 MiB allocation per connection.
+    let mut payload = Vec::new();
+    let mut remaining = payload_len;
+    let mut chunk = [0u8; 65536];
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        reader.read_exact(&mut chunk[..want]).await?;
+        payload.extend_from_slice(&chunk[..want]);
+        remaining -= want;
     }
     if protocol == OP_PACKEDPROT {
         let mut decoder = ZlibDecoder::new(&payload[..]);

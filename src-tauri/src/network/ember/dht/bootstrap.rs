@@ -170,8 +170,12 @@ pub async fn fetch_bootstrap_nodes(
     rendezvous_url: &str,
 ) -> Result<Vec<BootstrapNode>, String> {
     let url = format!("{}/bootstrap", rendezvous_url.trim_end_matches('/'));
+    // https_only mirrors the rendezvous client: refuse to send the bootstrap
+    // request in cleartext (or follow an http redirect), so a tampered/mistyped
+    // rendezvous URL can't downgrade the connection.
     let client = reqwest::Client::builder()
         .timeout(BOOTSTRAP_TIMEOUT)
+        .https_only(true)
         .no_proxy()
         .build()
         .map_err(|e| format!("HTTP client error: {e}"))?;

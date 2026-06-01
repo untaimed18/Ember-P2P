@@ -521,7 +521,12 @@ impl Database {
                 let transferred_val = row.get::<_, i64>(10)?.max(0) as u64;
                 Ok(Transfer {
                     id: row.get(0)?,
-                    file_name: row.get(1)?,
+                    // Defense-in-depth: re-sanitize the persisted name on
+                    // restore so a tampered DB row can't reintroduce path
+                    // separators/traversal/reserved names into the path that
+                    // gets built from it at finalize. Idempotent for names
+                    // that were already sanitized when first written.
+                    file_name: crate::security::sanitize_filename(&row.get::<_, String>(1)?),
                     file_hash: row.get(2)?,
                     peer_id: row.get(3)?,
                     peer_name: row.get(4)?,

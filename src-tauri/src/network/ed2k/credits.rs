@@ -283,7 +283,18 @@ impl CreditManager {
     /// eMule persists this in cryptkey.dat; we use a data_dir file.
     pub fn load_or_create_keypair(&mut self, data_dir: &std::path::Path) {
         let key_path = data_dir.join("cryptkey.dat");
-        if let Ok(data) = std::fs::read(&key_path) {
+        if let Ok(raw) = std::fs::read(&key_path) {
+            let was_protected = crate::storage::secret_store::is_protected(&raw);
+            // Unwrap DPAPI at-rest protection; legacy plaintext passes through
+            // unchanged. A decrypt failure (e.g. file copied from another user)
+            // falls through to regeneration, same as a corrupt file.
+            let data = match crate::storage::secret_store::unprotect(&raw) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("cryptkey.dat could not be decrypted ({e}); regenerating keypair");
+                    Vec::new()
+                }
+            };
             if data.len() >= 8 {
                 let pub_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
                 if data.len() >= 4 + pub_len + 4 {
@@ -314,17 +325,21 @@ impl CreditManager {
                             self.our_private_key = priv_key;
                             self.crypto_available = true;
                             tracing::info!("Loaded RSA keypair from {}", key_path.display());
-                            if migrated {
+                            // Rewrite when the public key was SPKI-normalised OR
+                            // the file was still legacy plaintext (so it gets
+                            // wrapped with DPAPI at-rest protection).
+                            if migrated || !was_protected {
                                 let mut out = Vec::new();
                                 out.extend_from_slice(&(self.our_public_key.len() as u32).to_le_bytes());
                                 out.extend_from_slice(&self.our_public_key);
                                 out.extend_from_slice(&(self.our_private_key.len() as u32).to_le_bytes());
                                 out.extend_from_slice(&self.our_private_key);
-                                if let Err(e) = crate::security::atomic_write(&key_path, &out, true) {
+                                let protected = crate::storage::secret_store::protect(&out);
+                                if let Err(e) = crate::security::atomic_write(&key_path, &protected, true) {
                                     tracing::warn!(
-                                        "Failed to persist SPKI-normalised keypair: {e}"
+                                        "Failed to persist protected/normalised keypair: {e}"
                                     );
-                                } else {
+                                } else if migrated {
                                     tracing::info!(
                                         "Migrated cryptkey.dat public key from PKCS#1 to SPKI"
                                     );
@@ -349,7 +364,8 @@ impl CreditManager {
             out.extend_from_slice(&self.our_public_key);
             out.extend_from_slice(&(self.our_private_key.len() as u32).to_le_bytes());
             out.extend_from_slice(&self.our_private_key);
-            match crate::security::atomic_write(&key_path, &out, true) {
+            let protected = crate::storage::secret_store::protect(&out);
+            match crate::security::atomic_write(&key_path, &protected, true) {
                 Ok(()) => tracing::info!("Generated and saved new RSA keypair to {}", key_path.display()),
                 Err(e) => tracing::warn!("Failed to save RSA keypair: {e}"),
             }
@@ -571,7 +587,7 @@ impl CreditManager {
 
     pub fn set_public_key(&mut self, user_hash: [u8; 16], key: Vec<u8>) {
         if key.len() > 4096 {
-            tracing::warn!("Rejecting oversized public key ({} bytes) from {}", key.len(), hex::encode(user_hash));
+            tracing::warn!("Rejecting oversized public key ({} bytes) from {}", key.len(), crate::security::short_hash(&user_hash));
             return;
         }
         let record = self.get_or_create(user_hash);

@@ -1,0 +1,30 @@
+# cargo-audit configuration (https://github.com/rustsec/rustsec/tree/main/cargo-audit)
+#
+# Run from this directory:  cargo audit
+#
+# Documented, accepted exceptions follow. Everything NOT listed here must stay
+# clean — re-triage on every dependency bump.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack" timing side-channel in the `rsa`
+    # crate (medium, 5.9). No fixed upgrade exists upstream.
+    #
+    # Why accepted:
+    #   * `rsa` is used only for eMule "Secure Identification" (SecIdent), a
+    #     legacy ed2k-protocol feature we must remain wire-compatible with;
+    #     there is no eMule-compatible constant-time replacement.
+    #   * The attack requires an adversary to measure decryption timing across
+    #     many chosen ciphertexts. Our SecIdent path performs challenge
+    #     signing/verification, not a high-volume chosen-ciphertext decryption
+    #     oracle, so the practical exposure is limited.
+    #   * File-content integrity and peer identity in the Ember overlay rely on
+    #     Ed25519 / Noise, not on this RSA key.
+    # Revisit if the `rsa` crate ships a constant-time fix.
+    "RUSTSEC-2023-0071",
+]
+
+# Unmaintained-crate *warnings* (atk/gdk/gtk* GTK3 bindings, fxhash,
+# proc-macro-error, …) are left visible on purpose. They are transitive build
+# deps of the Tauri/Linux webview stack — the GTK3 ones are not even compiled
+# into the shipped Windows build — and are informational, not vulnerabilities.
