@@ -126,11 +126,43 @@ impl NodeIdentity {
     /// generation.
     pub fn load_or_create(data_dir: &Path) -> anyhow::Result<Self> {
         let path = data_dir.join("identity.json");
-        match std::fs::read_to_string(&path) {
-            Ok(data) => {
-                match serde_json::from_str::<NodeIdentity>(&data) {
+        match std::fs::read(&path) {
+            Ok(raw) => {
+                // Unwrap DPAPI at-rest protection. Legacy plaintext files pass
+                // through unchanged and are re-saved in protected form below.
+                let was_protected = crate::storage::secret_store::is_protected(&raw);
+                let data = match crate::storage::secret_store::unprotect(&raw) {
+                    Ok(d) => d,
+                    Err(unwrap_err) => {
+                        tracing::error!("identity.json could not be decrypted: {unwrap_err}");
+                        let bak = path.with_extension("json.corrupt");
+                        let backup_note = match std::fs::copy(&path, &bak) {
+                            Ok(_) => {
+                                crate::security::restrict_file_permissions(&bak);
+                                format!("A copy has been saved to {}. ", bak.display())
+                            }
+                            Err(bak_err) => {
+                                tracing::warn!(
+                                    "Failed to back up undecryptable identity.json: {bak_err}"
+                                );
+                                String::new()
+                            }
+                        };
+                        return Err(anyhow::anyhow!(
+                            "Identity file at {} is protected for a different Windows user \
+                             account or is corrupt ({}). {}Refusing to generate a new identity \
+                             automatically because this would permanently reset your KAD ID, \
+                             user hash, friend relationships, and upload credits. Sign in as the \
+                             original Windows user, or restore/delete identity.json to reset.",
+                            path.display(), unwrap_err, backup_note
+                        ));
+                    }
+                };
+                match serde_json::from_slice::<NodeIdentity>(&data) {
                     Ok(mut id) => {
-                        let mut migrated = false;
+                        // A legacy (unprotected) file is treated as needing
+                        // migration so it gets re-saved in DPAPI-wrapped form.
+                        let mut migrated = !was_protected;
 
                         // Migrate: older identities lack Ed25519 keys
                         if id.ed25519_secret_key == [0u8; 32] {
@@ -164,10 +196,9 @@ impl NodeIdentity {
                         }
 
                         if migrated {
-                            let updated = serde_json::to_string_pretty(&id)?;
-                            let tmp_path = path.with_extension("json.tmp");
-                            crate::security::write_file_restricted(&tmp_path, updated.as_bytes())?;
-                            std::fs::rename(&tmp_path, &path)?;
+                            let updated = serde_json::to_vec_pretty(&id)?;
+                            let protected = crate::storage::secret_store::protect(&updated);
+                            crate::security::atomic_write(&path, &protected, true)?;
                         }
                         info!("Loaded persistent identity (KAD ID={}…)", &hex::encode(id.kad_id)[..4]);
                         Ok(id)
@@ -198,9 +229,10 @@ impl NodeIdentity {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let id = Self::generate();
-                let data = serde_json::to_string_pretty(&id)?;
+                let data = serde_json::to_vec_pretty(&id)?;
+                let protected = crate::storage::secret_store::protect(&data);
                 std::fs::create_dir_all(data_dir)?;
-                crate::security::atomic_write(&path, data.as_bytes(), true)?;
+                crate::security::atomic_write(&path, &protected, true)?;
                 info!("Generated new identity (KAD ID={}…)", &hex::encode(id.kad_id)[..4]);
                 Ok(id)
             }

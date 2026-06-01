@@ -43,6 +43,10 @@ struct CountryField {
 
 pub fn lookup_country(reader: &GeoIpReader, ip: IpAddr) -> Option<String> {
     let r = reader.as_ref().as_ref()?;
-    let record: CountryRecord = r.lookup(ip).ok()?;
+    // maxminddb 0.28: `lookup` returns a `LookupResult`; `decode` then yields
+    // `Result<Option<T>, _>` (None when the IP isn't present). Treat any
+    // lookup/decode error or a missing record as "no country".
+    let result = r.lookup(ip).ok()?;
+    let record: CountryRecord = result.decode().ok().flatten()?;
     record.country?.iso_code
 }

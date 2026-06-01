@@ -157,9 +157,10 @@ pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServer
     let p = BigUint::from_bytes_be(&DH768_P);
     let g = BigUint::from(2u32);
 
-    // Generate 128-bit random private key
+    // Generate 128-bit random private key from a CSPRNG (OsRng): this is the
+    // DH secret exponent, so it must be cryptographically unpredictable.
     let mut a_bytes = [0u8; DH_A_BITS / 8];
-    for b in &mut a_bytes { *b = rand::random(); }
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut a_bytes);
     let a = BigUint::from_bytes_be(&a_bytes);
 
     let g_a_mod_p = g.modpow(&a, &p);

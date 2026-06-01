@@ -434,6 +434,12 @@ impl AICHRecoveryHashSet {
             return false;
         }
         let block_count = u16::from_le_bytes([data[0], data[1]]) as usize;
+        // A single part can never legitimately carry more than
+        // BLOCKS_PER_FULL_PART block hashes. Reject an inflated count before it
+        // drives a large speculative `leaf_hashes` growth.
+        if block_count > BLOCKS_PER_FULL_PART {
+            return false;
+        }
         let expected_len = 2 + block_count * 20;
         if data.len() < expected_len {
             return false;
