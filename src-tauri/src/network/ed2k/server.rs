@@ -1357,9 +1357,13 @@ fn read_tag_value(
                 let skip = blob_len as usize;
                 let pos = cursor.position() as usize;
                 let len = cursor.get_ref().len();
-                if pos + skip <= len {
-                    cursor.set_position((pos + skip) as u64);
-                    return true;
+                // checked_add: avoid pos+skip wrapping on 32-bit usize, which
+                // could let a bogus length pass the `<= len` gate.
+                if let Some(end) = pos.checked_add(skip) {
+                    if end <= len {
+                        cursor.set_position(end as u64);
+                        return true;
+                    }
                 }
             }
             false
@@ -1398,9 +1402,11 @@ fn read_tag_value(
                 let skip = bsob_len as usize;
                 let pos = cursor.position() as usize;
                 let len = cursor.get_ref().len();
-                if pos + skip <= len {
-                    cursor.set_position((pos + skip) as u64);
-                    return true;
+                if let Some(end) = pos.checked_add(skip) {
+                    if end <= len {
+                        cursor.set_position(end as u64);
+                        return true;
+                    }
                 }
             }
             false

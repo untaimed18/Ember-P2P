@@ -261,8 +261,9 @@ impl ServerUdpSocket {
             }
         }
 
-        // eMule: send 4-byte random challenge with status ping (anti-spoof)
-        let challenge = rand::random::<u32>().wrapping_add(1);
+        // eMule: send 4-byte random challenge with status ping (anti-spoof).
+        // CSPRNG (OsRng) so the anti-spoof value is unpredictable.
+        let challenge = rand::RngCore::next_u32(&mut rand::rngs::OsRng).wrapping_add(1);
         let mut packet = Vec::with_capacity(6);
         packet.push(OP_EDONKEYPROT);
         packet.push(OP_GLOBSERVSTATREQ);

@@ -596,6 +596,15 @@ pub fn sanitize_filename(name: &str) -> String {
     safe
 }
 
+/// Render a peer hash for logs without leaking the full identifier. Returns
+/// the first 8 hex chars (4 bytes) plus an ellipsis — enough to correlate log
+/// lines across a session, not enough to deanonymize a peer from a leaked log.
+pub fn short_hash(bytes: &[u8]) -> String {
+    let hex = hex::encode(bytes);
+    let n = hex.len().min(8);
+    format!("{}…", &hex[..n])
+}
+
 /// Validate that a path stays within the given base directory.
 /// Returns the safe path, or None if it escapes the base.
 pub fn validate_path_within(base: &Path, relative: &str) -> Option<PathBuf> {

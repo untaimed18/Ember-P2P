@@ -14836,9 +14836,16 @@ async fn read_ed2k_packet_simple(
     }
     let opcode = reader.read_u8().await?;
     let payload_len = length.saturating_sub(1);
-    let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 {
-        reader.read_exact(&mut payload).await?;
+    // Grow with bytes that actually arrive rather than trusting the declared
+    // length up front (avoids a stalled peer pinning a multi-MiB allocation).
+    let mut payload = Vec::new();
+    let mut remaining = payload_len;
+    let mut chunk = [0u8; 65536];
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        reader.read_exact(&mut chunk[..want]).await?;
+        payload.extend_from_slice(&chunk[..want]);
+        remaining -= want;
     }
     Ok((protocol, opcode, payload))
 }

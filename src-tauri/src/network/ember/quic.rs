@@ -87,9 +87,15 @@ fn build_server_config(cert_der: &[u8], key_der: &[u8]) -> anyhow::Result<Server
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der.to_vec()));
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let supported_algs = provider.signature_verification_algorithms;
+    // Require inbound peers to present a well-formed Ember cert and prove
+    // possession of its key (handshake signature is verified). Symmetric to
+    // the client-side EmberCertVerifier — closes the "accept any client"
+    // gap. Node-identity auth still rests on the TCP Ed25519 PoP layer.
+    let client_verifier = Arc::new(EmberClientCertVerifier { supported_algs });
     let mut tls_config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
+        .with_client_cert_verifier(client_verifier)
         .with_single_cert(vec![cert], key)?;
     tls_config.alpn_protocols = vec![b"ember/1".to_vec()];
 
@@ -124,10 +130,17 @@ pub fn build_client_config(
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der.to_vec()));
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    // Capture the provider's signature-verification algorithms so the
+    // verifier can *actually* check the TLS handshake signature against the
+    // presented end-entity certificate's public key (see EmberCertVerifier).
+    let supported_algs = provider.signature_verification_algorithms;
     let mut tls_config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(EmberCertVerifier { expected_node_id }))
+        .with_custom_certificate_verifier(Arc::new(EmberCertVerifier {
+            expected_node_id,
+            supported_algs,
+        }))
         .with_client_auth_cert(vec![cert], key)?;
     tls_config.alpn_protocols = vec![b"ember/1".to_vec()];
 
@@ -200,13 +213,25 @@ fn extract_ember_san_hex(cert_der: &[u8]) -> Option<String> {
 ///   come in via unauthenticated rendezvous and EPX channels, so we
 ///   don't always have the node_id).
 ///
-/// File-transfer integrity does NOT depend on this verifier: the
-/// eMule/Ember TCP layer runs its own mutual Ed25519 PoP. A QUIC MITM
-/// can disrupt broker/relay setup but can't read file content or
-/// impersonate a specific friend.
+/// In all cases the TLS handshake signature is now verified against the
+/// presented end-entity certificate's public key (see
+/// `verify_tls1{2,3}_signature` below) using the active crypto provider's
+/// algorithms — so the channel is cryptographically bound to a peer that
+/// actually holds the cert's private key. An on-path attacker can no longer
+/// splice a forged or substring-only cert without that key. What the
+/// unpinned path still cannot do is prove the key belongs to a *specific*
+/// node_id (that needs `expected_node_id`); the node_id↔key binding is
+/// established out-of-band by the eMule/Ember TCP layer's mutual Ed25519
+/// proof-of-possession, on which file-transfer integrity solely depends.
 #[derive(Debug)]
 struct EmberCertVerifier {
     expected_node_id: Option<[u8; 16]>,
+    /// Signature-verification algorithms from the active crypto provider.
+    /// Used to verify the TLS handshake signature against the presented
+    /// end-entity certificate's public key. Without this the handshake
+    /// callbacks below would be rubber stamps and an on-path attacker could
+    /// splice the connection with a cert it doesn't hold the key for.
+    supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
 impl rustls::client::danger::ServerCertVerifier for EmberCertVerifier {
@@ -236,31 +261,77 @@ impl rustls::client::danger::ServerCertVerifier for EmberCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported_algs)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported_algs)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-        ]
+        self.supported_algs.supported_schemes()
+    }
+}
+
+/// Server-side counterpart to [`EmberCertVerifier`]. Requires inbound QUIC
+/// clients to present a well-formed Ember self-signed cert and proves they
+/// hold its private key (the handshake signature is verified). This makes the
+/// QUIC channel mutually key-authenticated instead of accepting any client.
+/// As on the client side, binding a cert key to a specific node_id is the
+/// job of the TCP Ed25519 proof-of-possession, not this verifier.
+#[derive(Debug)]
+struct EmberClientCertVerifier {
+    supported_algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl rustls::server::danger::ClientCertVerifier for EmberClientCertVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        if extract_ember_san_hex(end_entity.as_ref()).is_none() {
+            return Err(rustls::Error::General(
+                "ember client cert: no `ember-{hex}` marker found in certificate".into(),
+            ));
+        }
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported_algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported_algs.supported_schemes()
     }
 }
 
