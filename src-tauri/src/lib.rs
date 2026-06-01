@@ -31,6 +31,28 @@ use storage::database::Database;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Give async tasks a larger worker-thread stack than tokio's 2 MiB default.
+    //
+    // Ember drives several very large async state machines — the multi-source
+    // download loop, the per-peer message loops, and the central network
+    // `select!` loop. In debug builds these compile to deep, unboxed poll
+    // chains whose combined stack frames sit close to the 2 MiB limit, and
+    // small additions have overflowed it (STATUS_STACK_OVERFLOW) right as a
+    // download starts. Build our own multi-thread runtime with a roomier stack
+    // and hand its handle to Tauri *before* anything spawns (the first spawn
+    // happens in `.setup`, and `async_runtime::set` panics if the runtime was
+    // already initialized). The runtime is intentionally leaked: Tauri requires
+    // the underlying Tokio runtime to outlive the app, and it lives for the
+    // whole process regardless.
+    let rt = Box::leak(Box::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(8 * 1024 * 1024)
+            .build()
+            .expect("failed to build Tokio runtime"),
+    ));
+    tauri::async_runtime::set(rt.handle().clone());
+
     // Install the process-wide rustls CryptoProvider before *anything*
     // can do TLS. Multiple crates in this app speak rustls 0.23
     // (`quinn`, `tokio-tungstenite`, `reqwest`) and 0.23 deliberately

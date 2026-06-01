@@ -14836,15 +14836,20 @@ async fn read_ed2k_packet_simple(
     }
     let opcode = reader.read_u8().await?;
     let payload_len = length.saturating_sub(1);
-    // Grow with bytes that actually arrive rather than trusting the declared
-    // length up front (avoids a stalled peer pinning a multi-MiB allocation).
+    // Grow on the heap in bounded steps with bytes that actually arrive rather
+    // than trusting the declared length up front (avoids a stalled peer pinning
+    // a multi-MiB allocation). Reading directly into the Vec — instead of via a
+    // 64 KiB stack array — keeps this read's frame small, since it's awaited
+    // inside large network futures where a big stack buffer can overflow the
+    // worker stack in debug builds.
     let mut payload = Vec::new();
     let mut remaining = payload_len;
-    let mut chunk = [0u8; 65536];
+    const READ_STEP: usize = 65536;
     while remaining > 0 {
-        let want = remaining.min(chunk.len());
-        reader.read_exact(&mut chunk[..want]).await?;
-        payload.extend_from_slice(&chunk[..want]);
+        let want = remaining.min(READ_STEP);
+        let start = payload.len();
+        payload.resize(start + want, 0);
+        reader.read_exact(&mut payload[start..start + want]).await?;
         remaining -= want;
     }
     Ok((protocol, opcode, payload))
@@ -20035,17 +20040,18 @@ async fn handle_download_event(
         }
         DownloadEvent::Completed { transfer_id } => {
             stats_manager.record_completed_download();
-            // Flush the final in-memory progress snapshot to the DB before
-            // changing status. Progress persistence is rate-limited during
-            // the download, so the last persisted row could be up to a few
-            // seconds stale; make sure the terminal state reflects reality.
-            let final_progress = {
+            // A download reaches Completed only after every part is present
+            // and hash-verified, so the terminal row represents the whole
+            // file. Persist 100% / full bytes (not the last in-memory progress
+            // snapshot, which the rate-limited progress ticks can leave a few
+            // percent short) so the saved row — and the UI after a refresh or
+            // restart — shows a completed bar.
+            let final_total = {
                 let mgr = transfer_manager.read().await;
-                mgr.get_transfer(&transfer_id)
-                    .map(|t| (t.transferred, t.progress, t.speed))
+                mgr.get_transfer(&transfer_id).map(|t| t.total_size)
             };
-            if let Some((transferred, progress, speed)) = final_progress {
-                if let Err(e) = db.update_transfer_progress(&transfer_id, transferred, progress, speed) {
+            if let Some(total_size) = final_total {
+                if let Err(e) = db.update_transfer_progress(&transfer_id, total_size, 100.0, 0) {
                     warn!("DB update_transfer_progress (final) failed for {transfer_id}: {e}");
                 }
             }
