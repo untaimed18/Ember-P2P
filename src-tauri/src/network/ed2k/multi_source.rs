@@ -7144,9 +7144,17 @@ async fn read_packet_async_ms<R: AsyncReadExt + Unpin + ?Sized>(
     }
     let opcode = reader.read_u8().await?;
     let payload_len = length - 1;
-    let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 {
-        reader.read_exact(&mut payload).await?;
+    // Grow the buffer with bytes that actually arrive rather than trusting the
+    // declared length up front. A peer that announces a near-10 MiB packet but
+    // then stalls can otherwise pin a full ~10 MiB allocation per connection.
+    let mut payload = Vec::new();
+    let mut remaining = payload_len;
+    let mut chunk = [0u8; 65536];
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        reader.read_exact(&mut chunk[..want]).await?;
+        payload.extend_from_slice(&chunk[..want]);
+        remaining -= want;
     }
     if protocol == OP_PACKEDPROT {
         use std::io::Read;

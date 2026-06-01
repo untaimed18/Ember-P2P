@@ -93,11 +93,19 @@ pub fn create_preview_file(
     let stem = Path::new(file_name)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "preview".to_string())
-        .replace(['/', '\\', ':', '\0'], "_");
-    let ext = ext.replace(['/', '\\', ':', '\0'], "_");
+        .unwrap_or_else(|| "preview".to_string());
 
-    let preview_path = temp_dir.join(format!("{stem}_preview.{ext}"));
+    // Route the temp filename through the same sanitizer used for downloads so
+    // a hostile `file_name` can't produce traversal, reserved-device, or other
+    // odd names in the preview dir. `sanitize_filename` returns a single path
+    // component, which keeps the joined result inside `temp_dir`.
+    let raw = if ext.is_empty() {
+        format!("{stem}_preview")
+    } else {
+        format!("{stem}_preview.{ext}")
+    };
+    let safe = crate::security::sanitize_filename(&raw);
+    let preview_path = temp_dir.join(safe);
 
     let mut src = std::fs::File::open(part_file_path)?;
     let mut dst = std::fs::File::create(&preview_path)?;

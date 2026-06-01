@@ -1265,21 +1265,32 @@ impl UploadHandler {
             let path = PathBuf::from(&file.path);
             let is_partial = path.extension().map(|e| e == "part").unwrap_or(false);
             if !is_partial {
+                // Always enforce containment: the served file must canonicalize
+                // to a location inside a shared folder or a download root.
+                // Previously this check was skipped when `shared_folders` was
+                // empty, which meant a stale index entry could still be served
+                // after the user cleared all shares. The index is only ever
+                // populated by scanning shared folders, so when no folders are
+                // configured the only legitimately-servable files are download
+                // partials/completed under the download roots.
                 let folders = self.shared_folders.read().await;
-                if !folders.is_empty() {
-                    let in_shared = std::fs::canonicalize(&path)
-                        .map(|canon| {
-                            crate::security::is_path_within_dirs(&canon, &folders)
-                                || crate::security::is_path_within_dirs(&canon, &[
-                                    self.download_folder.to_string_lossy().to_string(),
-                                    self.download_folder.join("Downloads").to_string_lossy().to_string(),
-                                ])
-                        })
-                        .unwrap_or(false);
-                    if !in_shared {
-                        tracing::debug!("Rejecting resolve for file not in shared folders: {}", hash_hex);
-                        return None;
-                    }
+                let mut allowed: Vec<String> = folders.clone();
+                allowed.push(self.download_folder.to_string_lossy().to_string());
+                allowed.push(
+                    self.download_folder
+                        .join("Downloads")
+                        .to_string_lossy()
+                        .to_string(),
+                );
+                let in_allowed = std::fs::canonicalize(&path)
+                    .map(|canon| crate::security::is_path_within_dirs(&canon, &allowed))
+                    .unwrap_or(false);
+                if !in_allowed {
+                    tracing::debug!(
+                        "Rejecting resolve for file not within shared/download roots: {}",
+                        hash_hex
+                    );
+                    return None;
                 }
             }
             return Some(ResolvedUploadFile {
@@ -1774,7 +1785,7 @@ impl UploadHandler {
         if peer_user_hash != [0u8; 16] {
             if let Ok(set) = self.banned_hashes.read() {
                 if set.contains(&peer_user_hash) {
-                    info!("Rejecting upload session from banned user {} ({})", hex::encode(peer_user_hash), peer_addr);
+                    info!("Rejecting upload session from banned user {} ({})", crate::security::short_hash(&peer_user_hash), peer_addr);
                     return Ok(());
                 }
             }
@@ -1871,14 +1882,14 @@ impl UploadHandler {
                         .map(|k| match k {
                             PendingKadCallbackKey::SourceIp(ip) => format!("ip={ip}"),
                             PendingKadCallbackKey::SourceUserHash(h) => {
-                                format!("uh={}", hex::encode(h))
+                                format!("uh={}", crate::security::short_hash(h))
                             }
                         })
                         .collect();
                     info!(
                         "Inbound conn from {peer_addr} (user={}, hello_port={peer_hello_port}) \
                          did NOT match any of {} pending KAD callback(s): [{}]",
-                        hex::encode(peer_user_hash),
+                        crate::security::short_hash(&peer_user_hash),
                         cbs.len(),
                         pending_summary.join(", "),
                     );

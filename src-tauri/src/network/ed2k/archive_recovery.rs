@@ -371,6 +371,31 @@ fn sanitize_archive_name_in_place(name: &mut [u8]) {
             *byte = b'_';
         }
     }
+    // Neutralize Windows reserved device names (CON, PRN, NUL, COM1…) by
+    // overwriting the first byte. We can't change the length here, so we
+    // mutate in place; this still breaks the reserved match so an extractor
+    // on Windows doesn't choke on the recovered entry.
+    let base_end = name.iter().position(|&b| b == b'.').unwrap_or(name.len());
+    if is_windows_reserved_base(&name[..base_end]) {
+        if let Some(first) = name.first_mut() {
+            *first = b'_';
+        }
+    }
+}
+
+/// Reserved Windows device base names (matched case-insensitively, before any
+/// extension). Writing a file with one of these basenames fails or behaves
+/// surprisingly on Windows.
+fn is_windows_reserved_base(base: &[u8]) -> bool {
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let Ok(s) = std::str::from_utf8(base) else {
+        return false;
+    };
+    let upper = s.trim().to_ascii_uppercase();
+    RESERVED.contains(&upper.as_str())
 }
 
 /// D17: rewrite an inner ZIP entry name so it cannot zip-slip when a
@@ -396,6 +421,14 @@ fn sanitize_zip_entry_name(raw: &[u8]) -> Vec<u8> {
             .filter(|c| *c != '\0' && !c.is_control() && *c != ':')
             .collect();
         if cleaned.is_empty() { continue; }
+        // Neutralize Windows reserved device names per path component so the
+        // extracted tree can't contain a CON/PRN/NUL/COM1… entry.
+        let base_end = cleaned.find('.').unwrap_or(cleaned.len());
+        let cleaned = if is_windows_reserved_base(&cleaned.as_bytes()[..base_end]) {
+            format!("_{cleaned}")
+        } else {
+            cleaned
+        };
         parts.push(cleaned);
     }
     let joined = parts.join("/");
