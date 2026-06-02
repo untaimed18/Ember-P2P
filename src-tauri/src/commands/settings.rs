@@ -233,14 +233,30 @@ pub async fn update_settings(
         .bandwidth_limiter
         .set_configured_limits(settings.max_upload_speed, settings.max_download_speed);
 
-    {
+    // Apply the new concurrent-download cap and promote any queued downloads
+    // that the higher cap now allows. Previously this only set the field, so
+    // raising the limit left queued downloads waiting until some unrelated
+    // event (a completion/failure) happened to trigger promotion.
+    let promoted = {
         let mut manager = state.transfer_manager.write().await;
-        manager.max_concurrent = settings.max_concurrent_downloads;
+        manager.set_max_concurrent(settings.max_concurrent_downloads)
+    };
+    if !promoted.is_empty() {
+        super::transfers::start_promoted_downloads(&state, &promoted).await;
     }
 
     {
         let mut live = state.upload_shared_folders.write().await;
         *live = settings.shared_folders.clone();
+    }
+
+    // Keep the shared-folder filesystem watcher in sync. The dedicated
+    // add/remove-folder commands do this, but the generic settings save can
+    // also change `shared_folders`, and without re-syncing the watcher would
+    // keep monitoring the old set (missing auto-detection of files in newly
+    // added folders, and needlessly watching removed ones).
+    if let Some(watcher) = state.shared_folder_watcher.as_ref() {
+        watcher.sync_paths(&settings.shared_folders);
     }
 
     // Settings are already persisted to disk above; the network task

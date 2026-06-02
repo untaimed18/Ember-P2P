@@ -565,7 +565,12 @@
 
   // --- Uploads ---
   function isUploadFinished(t: Transfer): boolean {
-    return t.status === 'completed' || t.status === 'failed' || (t.status === 'active' && t.total_size > 0 && t.transferred >= t.total_size);
+    // Only a terminal status finishes an upload. An *active* upload that has
+    // sent total_size bytes is still seeding (the peer may keep requesting, and
+    // the byte counter can be cumulative), so it must stay visible until the
+    // backend emits the terminal transfer-complete/-failed event (which removes
+    // the row outright). The old byte-count clause hid such rows prematurely.
+    return t.status === 'completed' || t.status === 'failed';
   }
   // Single-pass partition (same rationale as `downloadPartition` above).
   let uploadPartition = $derived.by(() => {

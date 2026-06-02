@@ -286,24 +286,39 @@ impl CreditManager {
         if let Ok(raw) = std::fs::read(&key_path) {
             let was_protected = crate::storage::secret_store::is_protected(&raw);
             // Unwrap DPAPI at-rest protection; legacy plaintext passes through
-            // unchanged. A decrypt failure (e.g. file copied from another user)
-            // falls through to regeneration, same as a corrupt file.
+            // unchanged. `unprotect` only returns Err when the file carries
+            // the DPAPI magic but cannot be decrypted (wrong Windows user,
+            // transient DPAPI failure, file copied from another machine).
+            // That is NOT corruption, so we fail CLOSED: back the file up,
+            // leave SecIdent disabled for this session, and return WITHOUT
+            // regenerating. Regenerating here would permanently destroy a
+            // recoverable keypair (the old behavior). Mirrors identity.rs.
             let data = match crate::storage::secret_store::unprotect(&raw) {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!("cryptkey.dat could not be decrypted ({e}); regenerating keypair");
-                    Vec::new()
+                    tracing::error!(
+                        "cryptkey.dat is protected but could not be decrypted ({e}); \
+                         leaving SecIdent disabled this session and NOT regenerating \
+                         (the keypair may be recoverable on the correct account)"
+                    );
+                    let backup = key_path.with_extension("dat.undecryptable");
+                    let _ = std::fs::copy(&key_path, &backup);
+                    self.crypto_available = false;
+                    return;
                 }
             };
             if data.len() >= 8 {
                 let pub_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-                if data.len() >= 4 + pub_len + 4 {
+                // checked_add guards a 32-bit-usize overflow where a crafted
+                // pub_len near usize::MAX could wrap past the length check.
+                if pub_len.checked_add(8).is_some_and(|min| data.len() >= min) {
                     let pub_key = data[4..4 + pub_len].to_vec();
                     let priv_off = 4 + pub_len;
                     let priv_len = u32::from_le_bytes([
                         data[priv_off], data[priv_off + 1], data[priv_off + 2], data[priv_off + 3],
                     ]) as usize;
-                    if data.len() >= priv_off + 4 + priv_len {
+                    let priv_end = priv_off.checked_add(4).and_then(|o| o.checked_add(priv_len));
+                    if priv_end.is_some_and(|end| data.len() >= end) {
                         let priv_key = data[priv_off + 4..priv_off + 4 + priv_len].to_vec();
                         if !pub_key.is_empty() && !priv_key.is_empty() {
                             // Normalise legacy PKCS#1 public keys from older

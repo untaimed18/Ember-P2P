@@ -247,12 +247,32 @@ pub async fn download_collection_files(
                     // addresses; the network task handles full source
                     // discovery for each.
                     extra_sources: Vec::new(),
-                    transfer_id,
+                    transfer_id: transfer_id.clone(),
                     control,
                 })
                 .await
             {
                 tracing::warn!("Failed to send StartDownload for collection entry '{}': {e}", file.name);
+                // Roll the just-enqueued (now active) transfer back to Failed
+                // so it doesn't pin a download slot forever once the network
+                // channel is gone. Persist + emit so the DB row and UI match
+                // the in-memory state (mirrors `start_download`'s rollback).
+                {
+                    let mut mgr = state.transfer_manager.write().await;
+                    let _ = mgr.fail(
+                        &transfer_id,
+                        "Network channel unavailable",
+                        Some("permanent".to_string()),
+                        None,
+                    );
+                }
+                if let Some(failed) = {
+                    let mgr = state.transfer_manager.read().await;
+                    mgr.get_transfer(&transfer_id).cloned()
+                } {
+                    super::transfers::persist_transfer(&state, &failed).await;
+                    let _ = app.emit("transfer-failed", &failed);
+                }
             }
         }
     }

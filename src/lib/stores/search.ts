@@ -144,7 +144,13 @@ export function clearRetryRequestId(tabId: string) {
     const i = tabs.findIndex((t) => t.id === tabId);
     if (i === -1 || tabs[i].retryRequestId == null) return tabs;
     const next = [...tabs];
-    next[i] = { ...next[i], retryRequestId: null };
+    // The retry is always the last search phase (it's user-triggered only
+    // after the primary search has already finished and reported no/low
+    // results), so its completion ends all searching for the tab. Also clear
+    // `isSearching`/`progress` here: if the primary's `search-complete` event
+    // was ever lost, the completion fallback refuses to fire while a retry is
+    // attached, which would otherwise leave the spinner stuck on forever.
+    next[i] = { ...next[i], retryRequestId: null, isSearching: false, progress: null };
     return next;
   });
 }
