@@ -446,8 +446,13 @@ export async function initTransferStore() {
                 failure_kind: failure_kind ?? t.failure_kind,
                 failure_stage: failure_stage ?? t.failure_stage,
                 health: health ?? t.health,
-                health_reason: health_reason,
-                stalled_since,
+                // Only let the event's reason/stalled fields take effect when it
+                // actually carries a new `health` value (in which case they are
+                // authoritative for that state, including clearing them for a
+                // 'healthy' transition). When `health` is omitted, preserve the
+                // existing values instead of clobbering them to undefined.
+                health_reason: health !== undefined ? health_reason : t.health_reason,
+                stalled_since: health !== undefined ? stalled_since : t.stalled_since,
               }
             : t
         )
@@ -517,7 +522,7 @@ export async function initTransferStore() {
         const eventItem = currentById.get(apiItem.id);
         if (eventItem) {
           const preferEvent = isMoreAdvancedStatus(eventItem.status, apiItem.status);
-          return {
+          return snapCompletedDownload({
             ...apiItem,
             status: preferEvent ? eventItem.status : apiItem.status,
             speed: eventItem.speed,
@@ -533,9 +538,9 @@ export async function initTransferStore() {
             sources: Math.max(apiItem.sources ?? 0, eventItem.sources ?? 0),
             active_sources: Math.max(apiItem.active_sources ?? 0, eventItem.active_sources ?? 0),
             queued_sources: Math.max(apiItem.queued_sources ?? 0, eventItem.queued_sources ?? 0),
-          };
+          });
         }
-        return apiItem;
+        return snapCompletedDownload(apiItem);
       });
       for (const t of current) {
         if (!merged.some((m) => m.id === t.id)) {
@@ -549,6 +554,42 @@ export async function initTransferStore() {
   }
 }
 
+/**
+ * Defense-in-depth for the "completed but <100%" bar: a completed download is
+ * by definition the whole file, so snap its progress/byte counters to full.
+ * The `transfer-complete` event path already does this, but the poll/initial
+ * merges take `Math.max(api, event)` of the raw values, so a backend row that
+ * predates the server-side fix (or any rounding gap) could still surface a
+ * completed row at e.g. 98%. Uploads are never snapped (a session legitimately
+ * ends short of total_size).
+ */
+function snapCompletedDownload(t: Transfer): Transfer {
+  if (
+    t.status === 'completed' &&
+    t.direction !== 'upload' &&
+    t.total_size > 0 &&
+    ((t.progress ?? 0) < 100 || (t.transferred ?? 0) < t.total_size)
+  ) {
+    return {
+      ...t,
+      progress: 100,
+      transferred: t.total_size,
+      completed_size: t.total_size,
+      speed: 0,
+    };
+  }
+  return t;
+}
+
+/**
+ * Per-row timestamp of when an event-only transfer first went missing from the
+ * backend's `list_transfers()` snapshot. Used by the poll merge to drop
+ * non-terminal "zombie" rows the backend has consistently stopped reporting,
+ * while still riding out a single poll/event race.
+ */
+const missingFromApiSince = new Map<string, number>();
+const ZOMBIE_GRACE_MS = 12_000;
+
 export function cleanupTransferStore() {
   for (const unlisten of unlisteners) unlisten();
   unlisteners = [];
@@ -560,6 +601,7 @@ export function cleanupTransferStore() {
   pollConsumers = 0;
   pendingProgress.clear();
   recentlyRemovedUploads.clear();
+  missingFromApiSince.clear();
   progressFlushScheduled = false;
   initialized = false;
   transfers.set([]);
@@ -664,14 +706,31 @@ export function startTransferPoll() {
               active_sources: Math.max(apiItem.active_sources ?? 0, eventItem.active_sources ?? 0),
               queued_sources: Math.max(apiItem.queued_sources ?? 0, eventItem.queued_sources ?? 0),
             };
-          });
+          })
+          .map(snapCompletedDownload);
         const terminalStatuses: Transfer['status'][] = ['completed', 'failed', 'stopped'];
         const mergedIds = new Set(merged.map((t) => t.id));
         for (const t of current) {
-          if (mergedIds.has(t.id)) continue;
-          if (apiIds.has(t.id)) continue; // dropped by recently-removed filter
-          if (terminalStatuses.includes(t.status)) continue;
-          merged.push(t);
+          if (mergedIds.has(t.id) || apiIds.has(t.id)) {
+            // Still known to the backend (or intentionally dropped by the
+            // recently-removed filter) — clear any "missing" timer.
+            missingFromApiSince.delete(t.id);
+            continue;
+          }
+          if (terminalStatuses.includes(t.status)) {
+            missingFromApiSince.delete(t.id);
+            continue;
+          }
+          // Non-terminal row the backend snapshot doesn't include. Keep it
+          // briefly to absorb a poll/event race, but drop it once the backend
+          // has consistently omitted it for the grace window — otherwise an
+          // event-only row whose transfer the backend dropped would linger
+          // forever as a stuck "active" zombie.
+          const firstMissing = missingFromApiSince.get(t.id) ?? now;
+          missingFromApiSince.set(t.id, firstMissing);
+          if (now - firstMissing <= ZOMBIE_GRACE_MS) {
+            merged.push(t);
+          }
         }
         return merged;
       });

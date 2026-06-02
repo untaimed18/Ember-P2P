@@ -58,13 +58,18 @@ impl LocalIndex {
     }
 
     pub fn reconcile_files_for_folders(&mut self, folders: &[String], discovered: Vec<FileInfo>) {
-        let discovered_paths: HashSet<String> =
-            discovered.iter().map(|file| file.path.clone()).collect();
+        // Use case-normalized keys so a discovered file isn't dropped (then
+        // re-added) just because its path casing differs from the stored one
+        // on a case-insensitive filesystem.
+        let discovered_keys: HashSet<String> = discovered
+            .iter()
+            .map(|file| normalize_path_key(&file.path))
+            .collect();
         self.files.retain(|file| {
             !folders
                 .iter()
                 .any(|folder| crate::security::path_matches_dir(&file.path, folder))
-                || discovered_paths.contains(&file.path)
+                || discovered_keys.contains(&normalize_path_key(&file.path))
         });
         for file in discovered {
             self.upsert_file(file);
@@ -330,7 +335,16 @@ impl LocalIndex {
     }
 
     fn upsert_file(&mut self, mut file: FileInfo) {
-        if let Some(pos) = self.files.iter().position(|f| f.path == file.path) {
+        // Match by the same case-normalized key used for `path_map` (lowercased
+        // on Windows). Comparing raw path strings let the same file re-appear
+        // under different casing (e.g. C:\Foo vs c:\foo), which pushed a
+        // duplicate entry while the index silently collapsed them onto one key.
+        let key = normalize_path_key(&file.path);
+        if let Some(pos) = self
+            .files
+            .iter()
+            .position(|f| normalize_path_key(&f.path) == key)
+        {
             preserve_runtime_state(&self.files[pos], &mut file);
             self.files[pos] = file;
         } else {

@@ -72,7 +72,7 @@ async fn persist_transfer_status(state: &AppState, transfer_id: &str, status: &T
     }
 }
 
-async fn start_promoted_downloads(state: &AppState, promoted: &[Transfer]) {
+pub(crate) async fn start_promoted_downloads(state: &AppState, promoted: &[Transfer]) {
     for transfer in promoted {
         let control = {
             let mut manager = state.transfer_manager.write().await;
@@ -419,7 +419,7 @@ pub async fn start_download(
         });
     }
 
-    state
+    if let Err(e) = state
         .network_tx
         .send(NetworkCommand::StartDownload {
             file_hash,
@@ -432,7 +432,33 @@ pub async fn start_download(
             control,
         })
         .await
-        .map_err(|e| coded_ctx("transfers_start_download_failed", "Failed to start download", e))?;
+    {
+        // The network channel is gone, so this transfer will never start.
+        // It was already enqueued as active and occupies a download slot;
+        // roll it back to Failed so it doesn't pin that slot forever and
+        // block promotion of queued downloads.
+        {
+            let mut manager = state.transfer_manager.write().await;
+            let _ = manager.fail(
+                &transfer_id,
+                "Network channel unavailable",
+                Some("permanent".to_string()),
+                None,
+            );
+        }
+        if let Some(failed) = {
+            let manager = state.transfer_manager.read().await;
+            manager.get_transfer(&transfer_id).cloned()
+        } {
+            persist_transfer(&state, &failed).await;
+            let _ = app.emit("transfer-failed", &failed);
+        }
+        return Err(coded_ctx(
+            "transfers_start_download_failed",
+            "Failed to start download",
+            e,
+        ));
+    }
 
     Ok(StartDownloadResponse {
         transfer_id,

@@ -150,7 +150,9 @@ export function formatRemaining(totalSize: number, transferred: number, speed: n
   if (transferred >= totalSize) return '\u2014';
   const remaining = totalSize - transferred;
   const remainStr = formatBytes(remaining);
-  if (speed <= 0) return remainStr;
+  // Guard against a non-finite speed (NaN/Infinity) — `NaN <= 0` is false, so
+  // without `Number.isFinite` the ETA math below would render "NaNd NaNh".
+  if (!Number.isFinite(speed) || speed <= 0) return remainStr;
   const secs = Math.round(remaining / speed);
   const days = Math.floor(secs / 86400);
   const hrs = Math.floor((secs % 86400) / 3600);

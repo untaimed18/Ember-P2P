@@ -11,6 +11,16 @@ const PARTSIZE: usize = 9_728_000;
 /// Blocks per full part (used to compute global block offsets)
 const BLOCKS_PER_FULL_PART: usize = (PARTSIZE + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE;
 
+/// Upper bound on the trailing recovery-data blob in an `OP_AICHANSWER`.
+///
+/// An answer covers a single part, whose block-hash synchronisation tree is
+/// only ~1 KiB (at most `BLOCKS_PER_FULL_PART` leaves plus the path to the
+/// root). This 256 KiB ceiling is hundreds of times that, so it never rejects
+/// a legitimate answer, yet stops a peer from padding a valid-looking answer
+/// with megabytes of junk that we'd otherwise copy and hold for the full
+/// AICH wait window.
+pub const MAX_AICH_RECOVERY_BYTES: usize = 256 * 1024;
+
 pub fn compute_aich_root(path: &Path) -> anyhow::Result<[u8; 20]> {
     static NEVER: AtomicBool = AtomicBool::new(false);
     compute_aich_root_cancellable(path, &NEVER)
