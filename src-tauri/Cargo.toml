@@ -60,6 +60,11 @@ igd-next = { version = "0.15", features = ["aio_tokio"] }
 socket2 = "0.5"
 tracing-appender = "0.2.4"
 tauri-plugin-single-instance = "2.4.0"
+# Registers the `ed2k://` URI scheme with the OS so browser/forum links
+# launch (or focus) Ember. Combined with single-instance, a link clicked
+# while Ember is already running is delivered to the existing instance as
+# a command-line argument rather than spawning a second copy.
+tauri-plugin-deep-link = "2"
 
 tauri-plugin-process = "2"
 rsa = "0.9"

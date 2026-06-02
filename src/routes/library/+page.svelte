@@ -25,6 +25,7 @@
   import { getFileComments, setFileComment, type FileCommentInfo } from '$lib/api/comments';
   import { formatEd2kLink } from '$lib/api/search';
   import { loadCollection, createCollection, downloadCollectionFiles, type Collection, type CollectionFile } from '$lib/api/collections';
+  import { incomingCollection } from '$lib/stores/collection';
   import { toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
   import { networkStats } from '$lib/stores/network';
   import { formatSize } from '$lib/utils';
@@ -1319,6 +1320,19 @@
     filtersRestored = true;
 
     refresh();
+
+    // A collection opened from the OS (double-clicked .emulecollection) is
+    // parsed by the deep-link handler, which stashes it here and routes us to
+    // this page. Adopt it into the normal collection viewer, then clear the
+    // store so navigating back later doesn't re-open a stale collection.
+    {
+      const incoming = $incomingCollection;
+      if (incoming) {
+        loadedCollection = incoming;
+        collectionsOpen = true;
+        incomingCollection.set(null);
+      }
+    }
 
     // Poll every 3s: detect scan completion and refresh data while scanning.
     // The poll never INITIATES the scanning UI state -- only progress events do that.
