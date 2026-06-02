@@ -805,6 +805,13 @@ pub struct SearchManager {
     /// Contact IDs that need to be marked in-use on the routing table.
     /// Accumulated by start_search, drained by the caller via `drain_in_use_ids`.
     pending_in_use: Vec<KadId>,
+    /// In-use contact IDs of searches that were evicted *outside* the normal
+    /// `cleanup()` path (currently the search-storm eviction in `start_search`).
+    /// Those evictions remove the search before `cleanup()` would, so their
+    /// in-use marks must be released here or the routing table would pin those
+    /// contacts as in-use forever (blocking dead-contact eviction). Drained by
+    /// the main loop via `drain_pending_release`.
+    pending_release: Vec<KadId>,
 }
 
 impl SearchManager {
@@ -821,6 +828,7 @@ impl SearchManager {
             active: HashMap::new(),
             target_map: HashMap::new(),
             pending_in_use: Vec::new(),
+            pending_release: Vec::new(),
         }
     }
 
@@ -856,6 +864,10 @@ impl SearchManager {
                     if self.target_map.get(&k) == Some(&id) {
                         self.target_map.remove(&k);
                     }
+                    // Release this evicted search's in-use marks (see
+                    // `pending_release`). Without this the routing table would
+                    // keep these contacts pinned in-use indefinitely.
+                    self.pending_release.extend(s.in_use_ids);
                 }
             }
             if self.active_count() >= MAX_ACTIVE_SEARCHES {
@@ -1046,6 +1058,14 @@ impl SearchManager {
             }
         }
         ids
+    }
+
+    /// Drain contact IDs that should be released from the routing table's
+    /// in-use set because their owning search was evicted outside the normal
+    /// `cleanup()` path. Called by the main loop alongside
+    /// `drain_pending_in_use`.
+    pub fn drain_pending_release(&mut self) -> Vec<KadId> {
+        std::mem::take(&mut self.pending_release)
     }
 
     pub fn remove(&mut self, id: &SearchId) -> Option<SearchState> {

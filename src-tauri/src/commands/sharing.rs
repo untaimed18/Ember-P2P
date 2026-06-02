@@ -138,11 +138,21 @@ pub async fn add_shared_folder(
     if path.len() > MAX_PATH_LEN {
         return Err(coded_ctx("sharing_folder_path_too_long", format!("Folder path exceeds {MAX_PATH_LEN} bytes"), MAX_PATH_LEN));
     }
-    let p = std::path::Path::new(&path);
-    if !p.exists() || !p.is_dir() {
-        return Err(coded("sharing_path_not_dir", "Path does not exist or is not a directory"));
-    }
-    let canonical = p.canonicalize().map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
+    // Run the blocking filesystem checks off the async runtime: on a slow or
+    // disconnected network path, exists()/is_dir()/canonicalize() can block a
+    // worker thread for the OS timeout.
+    let canonical = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || -> Result<std::path::PathBuf, String> {
+            let p = std::path::Path::new(&path);
+            if !p.exists() || !p.is_dir() {
+                return Err(coded("sharing_path_not_dir", "Path does not exist or is not a directory"));
+            }
+            p.canonicalize().map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))
+        }
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))??;
     let blocked_segments: &[&str] = &[
         "windows", "program files", "program files (x86)",
         "programdata", ".ssh", ".gnupg",
@@ -420,10 +430,18 @@ pub async fn remove_shared_folder(
     // folder to come back on the next reload, but with the index
     // already torn down. Reject the call instead so the UI can surface
     // a clear error and the on-disk state stays consistent.
-    let canonical_path = std::path::Path::new(&path)
-        .canonicalize()
-        .map(|p| p.to_string_lossy().to_string())
-        .map_err(|e| coded_ctx("sharing_invalid_folder_path", format!("Invalid folder path '{path}'"), e))?;
+    // Canonicalize off the async runtime (blocking I/O on slow/network paths).
+    let canonical_path = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || -> Result<String, String> {
+            std::path::Path::new(&path)
+                .canonicalize()
+                .map(|p| p.to_string_lossy().to_string())
+                .map_err(|e| coded_ctx("sharing_invalid_folder_path", format!("Invalid folder path '{path}'"), e))
+        }
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))??;
     // `add_shared_folder` stores the *canonical* form in
     // `shared_folders` and `upload_shared_folders`; the cancel-flag
     // map is also keyed by canonical paths. Comparing against the
@@ -712,7 +730,20 @@ pub async fn reload_shared_files(
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let reload_key = format!("__reload_{}__", RELOAD_COUNTER.fetch_add(1, Ordering::Relaxed));
-    cancel_flags.write().await.insert(reload_key.clone(), cancel_flag.clone());
+    {
+        let mut flags = cancel_flags.write().await;
+        // Single-flight: signal any reload already in progress to stop before
+        // starting this one. Two concurrent reloads would race on the shared
+        // local index and emit conflicting progress events; the newest request
+        // wins. (Only `__reload_*` keys are reloads — other entries are
+        // per-file hash-cancel flags, which we must not touch.)
+        for (key, flag) in flags.iter() {
+            if key.starts_with("__reload_") {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+        flags.insert(reload_key.clone(), cancel_flag.clone());
+    }
 
     tokio::spawn(async move {
         scanning.fetch_add(1, Ordering::Relaxed);

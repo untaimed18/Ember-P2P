@@ -769,6 +769,9 @@ impl Database {
     /// exactly. SQLite's transaction guarantees that either the whole
     /// replacement lands or nothing changes, so a crash mid-flush won't
     /// leave the table empty.
+    // Retained as a focused, unit-tested building block (full-replacement
+    // semantics); production flushes go through `save_all_credits_with_ember`.
+    #[allow(dead_code)]
     pub fn save_all_credits(&self, credits: &[(&[u8; 16], u64, u64, i64, &[u8])]) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
@@ -855,7 +858,7 @@ impl Database {
     /// in-memory `CreditManager.ember_credits` snapshot exactly. A
     /// crash mid-flush leaves the pre-save rows intact thanks to
     /// SQLite's all-or-nothing transaction guarantee.
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, dead_code)]
     pub fn save_all_ember_credits(
         &self,
         credits: &[(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)],
@@ -871,6 +874,58 @@ impl Database {
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             for (pk, up, down, last_up, last_down, completed, total, avg_speed, last_seen, verified) in credits {
+                stmt.execute(params![
+                    &pk[..],
+                    i64::try_from(*up).unwrap_or(i64::MAX),
+                    i64::try_from(*down).unwrap_or(i64::MAX),
+                    *last_up,
+                    *last_down,
+                    i64::from(*completed),
+                    i64::from(*total),
+                    i64::try_from(*avg_speed).unwrap_or(i64::MAX),
+                    *last_seen,
+                    i64::from(*verified),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Full-replacement save of BOTH credit tables inside a SINGLE
+    /// transaction, so the `credits` and `ember_credits` tables can never
+    /// diverge across a crash or a partial failure. The previous code ran
+    /// `save_all_credits` and `save_all_ember_credits` as two independent
+    /// committed transactions back-to-back; if the second failed (or the
+    /// process died between them) the two tables ended up inconsistent
+    /// despite a comment claiming "either both land or neither". Both
+    /// DELETE+INSERT pairs now share one `tx`, restoring that guarantee.
+    #[allow(clippy::type_complexity)]
+    pub fn save_all_credits_with_ember(
+        &self,
+        credits: &[(&[u8; 16], u64, u64, i64, &[u8])],
+        ember_credits: &[(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)],
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM credits", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key) VALUES (?1, ?2, ?3, ?4, ?5)"
+            )?;
+            for (hash, uploaded, downloaded, last_seen, public_key) in credits {
+                stmt.execute(params![&hash[..], i64::try_from(*uploaded).unwrap_or(i64::MAX), i64::try_from(*downloaded).unwrap_or(i64::MAX), *last_seen, *public_key])?;
+            }
+        }
+        tx.execute("DELETE FROM ember_credits", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO ember_credits (\
+                    pub_key, uploaded, downloaded, last_upload_time, last_download_time, \
+                    completed_sessions, total_sessions, avg_upload_speed, last_seen, ident_verified\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?;
+            for (pk, up, down, last_up, last_down, completed, total, avg_speed, last_seen, verified) in ember_credits {
                 stmt.execute(params![
                     &pk[..],
                     i64::try_from(*up).unwrap_or(i64::MAX),

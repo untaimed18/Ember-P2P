@@ -5692,7 +5692,10 @@ async fn download_parts_from_source(
                     }
                     let _ = progress_tx.send((_src_idx, piece_len as i64)).await;
                 }
-                (OP_EMULEPROT, OP_AICHANSWER) if payload.len() >= 38 => {
+                (OP_EMULEPROT, OP_AICHANSWER)
+                    if (38..=38 + crate::network::ed2k::aich::MAX_AICH_RECOVERY_BYTES)
+                        .contains(&payload.len()) =>
+                {
                     let mut ans_hash = [0u8; 16];
                     ans_hash.copy_from_slice(&payload[..16]);
                     let ans_part = u16::from_le_bytes([payload[16], payload[17]]) as usize;
@@ -7103,7 +7106,11 @@ async fn wait_for_aich_recovery_answer_ms<R: AsyncReadExt + Unpin + ?Sized>(
         let chunk = remaining.min(std::time::Duration::from_secs(2));
         match tokio::time::timeout(chunk, read_packet_async_ms(reader)).await {
             Ok(Ok((proto, opcode, payload))) => {
-                if proto == OP_EMULEPROT && opcode == OP_AICHANSWER && payload.len() >= 38 {
+                if proto == OP_EMULEPROT
+                    && opcode == OP_AICHANSWER
+                    && (38..=38 + crate::network::ed2k::aich::MAX_AICH_RECOVERY_BYTES)
+                        .contains(&payload.len())
+                {
                     let mut ans_hash = [0u8; 16];
                     ans_hash.copy_from_slice(&payload[..16]);
                     let ans_part = u16::from_le_bytes([payload[16], payload[17]]) as usize;

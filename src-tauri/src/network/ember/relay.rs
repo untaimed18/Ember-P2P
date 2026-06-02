@@ -40,17 +40,55 @@ fn relay_http_client() -> reqwest::Client {
     {
         Ok(c) => c,
         Err(e) => {
-            // Fall back to a plain client rather than panicking, but
-            // log loudly — `https_only(true)` is the main thing we
-            // lose, and the call sites already bail on error
-            // responses, so the worst case is a misconfigured local
-            // build that will fail health checks anyway.
+            // Fall back rather than panicking, but keep the proxy-bypass and
+            // timeout (only the TLS-backend-dependent `https_only` is at risk
+            // of failing). The HTTPS requirement itself is still enforced
+            // independently by `require_https` at every call site, so even
+            // this degraded client can't be used against a plain-HTTP URL.
             tracing::warn!(
-                "relay http client builder failed ({e}); falling back to default client"
+                "relay http client builder failed ({e}); falling back to a no-proxy timeout client"
             );
-            reqwest::Client::new()
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .no_proxy()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
         }
     }
+}
+
+/// Defense-in-depth: refuse to contact a non-HTTPS rendezvous/relay URL.
+/// `relay_http_client()` already sets `https_only(true)`, but this makes the
+/// requirement explicit at each call site and also covers the (near-
+/// impossible) builder-failure fallback client.
+fn require_https(url: &str) -> Result<(), String> {
+    if url.starts_with("https://") {
+        Ok(())
+    } else {
+        Err(format!("refusing non-HTTPS rendezvous/relay URL: {url}"))
+    }
+}
+
+/// Rendezvous/relay endpoints return tiny JSON shapes; 64 KiB is generous.
+const MAX_RENDEZVOUS_JSON_BYTES: usize = 64 * 1024;
+
+/// Read a response body into memory with a hard cap, then deserialize it.
+/// `reqwest::Response::json()` buffers the whole body with no size limit, so
+/// a malicious or compromised rendezvous server could OOM us by streaming an
+/// unbounded body. Stream chunks and bail once the cap is exceeded.
+async fn read_json_capped<T: serde::de::DeserializeOwned>(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+    ctx: &str,
+) -> Result<T, String> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("{ctx}: {e}"))? {
+        if buf.len() + chunk.len() > max_bytes {
+            return Err(format!("{ctx}: response exceeds {max_bytes} byte cap"));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf).map_err(|e| format!("{ctx} parse: {e}"))
 }
 /// Per-direction byte ceiling for a single relay session. Picked to be
 /// large enough that real file transfers (eD2K parts are ~9.5 MiB,
@@ -219,6 +257,16 @@ impl RelayManager {
 
 /// Encode a relay protocol message.
 pub fn encode_relay_message(msg_type: u8, session_id: u32, payload: &[u8]) -> Vec<u8> {
+    // The wire framing uses a u16 length prefix. All current callers stay
+    // well under that (RELAY_DATA is capped at MAX_RELAY_DATA_SIZE = 16 KiB,
+    // every other message is a few bytes), but assert it so a future caller
+    // that overflows the prefix — which would silently corrupt the framing —
+    // is caught in debug builds rather than producing undecodable messages.
+    debug_assert!(
+        payload.len() <= u16::MAX as usize,
+        "relay message payload {} exceeds u16 length prefix",
+        payload.len()
+    );
     let len = payload.len() as u16;
     let mut buf = Vec::with_capacity(7 + payload.len());
     buf.push(msg_type);
@@ -318,6 +366,7 @@ pub async fn register_punch(
     port: u16,
     nat_type: u8,
 ) -> Result<(), String> {
+    require_https(rendezvous_url)?;
     let url = format!("{}/punch", rendezvous_url);
     let client = relay_http_client();
     let resp = client
@@ -356,6 +405,7 @@ pub async fn poll_punch(
     rendezvous_url: &str,
     our_id: &str,
 ) -> Result<Option<PunchInfo>, String> {
+    require_https(rendezvous_url)?;
     let url = format!("{}/punch/{}", rendezvous_url, our_id);
     let client = relay_http_client();
     let resp = client
@@ -372,7 +422,8 @@ pub async fn poll_punch(
         return Err(format!("punch poll: status {}", resp.status()));
     }
 
-    let body: serde_json::Value = resp.json().await.map_err(|e| format!("punch poll parse: {e}"))?;
+    let body: serde_json::Value =
+        read_json_capped(resp, MAX_RENDEZVOUS_JSON_BYTES, "punch poll").await?;
     Ok(Some(PunchInfo {
         from_id: body["from_id"].as_str().unwrap_or("").to_string(),
         ip: body["ip"].as_str().unwrap_or("").to_string(),
@@ -1012,6 +1063,7 @@ pub async fn post_relay_invite(
     target_id: &str,
     session_id: &str,
 ) -> Result<(), String> {
+    require_https(rendezvous_url)?;
     let url = format!("{}/relay-invite", rendezvous_url.trim_end_matches('/'));
     let client = relay_http_client();
     let resp = client
@@ -1038,6 +1090,7 @@ pub async fn poll_relay_invites(
     rendezvous_url: &str,
     our_id: &str,
 ) -> Result<Vec<String>, String> {
+    require_https(rendezvous_url)?;
     let url = format!("{}/relay-invites/{}", rendezvous_url.trim_end_matches('/'), our_id);
     let client = relay_http_client();
     let resp = client
@@ -1054,8 +1107,8 @@ pub async fn poll_relay_invites(
         return Err(format!("relay invite poll: status {}", resp.status()));
     }
 
-    let body: Vec<serde_json::Value> = resp.json().await
-        .map_err(|e| format!("relay invite poll parse: {e}"))?;
+    let body: Vec<serde_json::Value> =
+        read_json_capped(resp, MAX_RENDEZVOUS_JSON_BYTES, "relay invite poll").await?;
     Ok(body.iter()
         .filter_map(|v| v["session_id"].as_str().map(|s| s.to_string()))
         .collect())

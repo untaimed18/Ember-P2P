@@ -65,9 +65,28 @@ pub fn resolve_data_dir() -> PathBuf {
 }
 
 fn project_dirs_fallback() -> PathBuf {
-    directories::ProjectDirs::from("com", "ember", "p2p")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(std::env::temp_dir)
+    if let Some(d) = directories::ProjectDirs::from("com", "ember", "p2p") {
+        return d.data_dir().to_path_buf();
+    }
+    // ProjectDirs only fails when no valid home directory can be determined.
+    // Fall back to an explicit per-user location rather than a volatile temp
+    // dir: the OS can purge temp between runs, which would silently drop the
+    // user's identity, downloads DB, and .met state. Temp is the absolute
+    // last resort, with a loud warning so the situation is diagnosable.
+    #[cfg(target_os = "windows")]
+    let base = std::env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(not(target_os = "windows"))]
+    let base = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"));
+    if let Some(base) = base {
+        if !base.as_os_str().is_empty() {
+            return base.join("ember").join("p2p");
+        }
+    }
+    tracing::error!(
+        "Could not determine a stable data directory (no ProjectDirs / APPDATA / HOME); \
+         falling back to a temp directory — data may NOT persist across runs"
+    );
+    std::env::temp_dir().join("ember-p2p")
 }
 
 /// Convenience: resolve and `create_dir_all` the canonical data directory.

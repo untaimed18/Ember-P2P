@@ -498,18 +498,27 @@ impl KnownFileList {
         }
 
         crate::security::atomic_write(path, &buf, false)?;
-        self.dirty = false;
         // Pair the companion path index to this specific known.met revision
         // by embedding known.met's current mtime. On load we only use the
         // cached path index when the mtime still matches — otherwise the
         // two files got out of sync (partial write, crash between writes)
         // and the stale index is silently discarded instead of producing
         // confusing name+size+mtime mismatches.
+        //
+        // Only clear `dirty` once BOTH known.met and its companion path
+        // index are durable. Previously `dirty` was cleared right after
+        // known.met, so a failed known_paths.dat write was never retried
+        // until the next mutating change — leaving a stale/empty path index
+        // after restart (files then matched by name only).
         let known_mtime_ns = mtime_ns(path).unwrap_or(0);
-        if let Err(e) =
-            self.save_path_index(&path.with_file_name("known_paths.dat"), known_mtime_ns)
-        {
-            warn!("Failed to save known_paths.dat: {e}");
+        match self.save_path_index(&path.with_file_name("known_paths.dat"), known_mtime_ns) {
+            Ok(()) => {
+                self.dirty = false;
+            }
+            Err(e) => {
+                warn!("Failed to save known_paths.dat: {e}; keeping dirty flag set to retry next cycle");
+                self.dirty = true;
+            }
         }
         info!("Saved {} known files to known.met", self.files.len());
         Ok(())

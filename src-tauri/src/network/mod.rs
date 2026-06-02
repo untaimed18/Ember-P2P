@@ -2706,36 +2706,41 @@ async fn flush_credit_state(
             .iter()
             .map(|(h, u, d, l, p)| (h, *u, *d, *l, p.as_slice()))
             .collect();
-        let result = db_ref.save_all_credits(&refs);
-        // Persist Ember records in the same blocking task so the two
-        // tables can't get out of sync across crashes — either both
-        // land or neither does (each save is its own transaction, but
-        // the two run back-to-back within the same spawn_blocking so
-        // there's no async scheduling gap).
+        // Persist both credit tables in ONE SQLite transaction so they can
+        // never diverge across a crash or partial failure.
         let ember_refs: Vec<(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)> = ember_owned
             .iter()
             .map(|(pk, u, d, lu, ld, c, t, s, ls, v)| (pk, *u, *d, *lu, *ld, *c, *t, *s, *ls, *v))
             .collect();
-        let ember_result = db_ref.save_all_ember_credits(&ember_refs);
+        let result = db_ref.save_all_credits_with_ember(&refs, &ember_refs);
         db_ref.incremental_vacuum();
-        result.and(ember_result)
+        result
     })
     .await;
-    match db_save {
+    let db_ok = matches!(db_save, Ok(Ok(())));
+    match &db_save {
         Ok(Ok(())) => {}
         Ok(Err(e)) => error!("Failed to save credits: {e}"),
         Err(e) => error!("Credit save task failed: {e}"),
     }
 
-    let clients_met = data_dir.join("clients.met");
-    let clients_bak = data_dir.join("clients.met.bak");
-    if clients_met.exists() {
-        if let Err(e) = std::fs::copy(&clients_met, &clients_bak) {
-            debug!("Failed to create clients.met backup: {e}");
+    // Only refresh the clients.met cache when the authoritative DB write
+    // succeeded. The DB wins on load, so writing a newer cache while the DB
+    // still holds the old rows would just be confusing on recovery; skip it
+    // and keep the previous cache intact.
+    if db_ok {
+        let clients_met = data_dir.join("clients.met");
+        let clients_bak = data_dir.join("clients.met.bak");
+        if clients_met.exists() {
+            if let Err(e) = std::fs::copy(&clients_met, &clients_bak) {
+                debug!("Failed to create clients.met backup: {e}");
+            }
         }
-    }
-    if let Err(e) = crate::security::atomic_write(&clients_met, &serialized_bytes, false) {
-        debug!("Failed to finalize clients.met: {e}");
+        if let Err(e) = crate::security::atomic_write(&clients_met, &serialized_bytes, false) {
+            debug!("Failed to finalize clients.met: {e}");
+        }
+    } else {
+        debug!("Skipping clients.met cache write because the DB credit flush failed");
     }
 }
 
@@ -6359,6 +6364,12 @@ pub async fn start_network(
                 let new_in_use = state.search_manager.drain_pending_in_use();
                 if !new_in_use.is_empty() {
                     state.routing_table.mark_contacts_in_use(&new_in_use);
+                }
+                // Release in-use marks for searches evicted by the search-storm
+                // cap in start_search (cleanup() handles the normal path).
+                let to_release = state.search_manager.drain_pending_release();
+                if !to_release.is_empty() {
+                    state.routing_table.release_contacts_in_use(&to_release);
                 }
                 let queries = state.search_manager.poll_queries();
                 for (sid, addr, msg, contact_id) in &queries {
@@ -15919,24 +15930,39 @@ async fn handle_udp_packet_inner(
             let search_ids: Vec<SearchId> = if let Some(sid) = owning_sid {
                 vec![sid]
             } else {
-                // Fallback: no search claims this sender via tried — pick the most recent one.
-                let mut candidates: Vec<SearchId> = state.search_manager.active.iter()
-                    .filter(|(_, s)| s.target == target && !s.completed)
-                    .map(|(id, _)| *id)
-                    .collect();
-                candidates.sort_by(|a, b| b.0.cmp(&a.0));
-                candidates.truncate(1);
-                candidates
+                // No active search queried this sender on the exact (ip, port).
+                // Fall back to a search that queried this sender's *IP* (the
+                // KAD UDP source port can be rewritten by carrier-grade NAT),
+                // matching eMule's by-IP responder lookup. We do NOT fall back
+                // to "any search with this target": accepting routing contacts
+                // from a node no active search ever queried would let an
+                // unsolicited peer inject contacts (eMule's IsOnOutTrackList).
+                sender_ip_port
+                    .and_then(|(ip, _)| {
+                        state.search_manager.active.iter()
+                            .filter(|(_, s)| s.target == target && !s.completed)
+                            .find(|(_, s)| s.tried.keys().any(|(tip, _)| *tip == ip))
+                            .map(|(id, _)| *id)
+                    })
+                    .into_iter()
+                    .collect()
             };
 
             if search_ids.is_empty() {
-                debug!("  No active search for this target");
+                debug!("  KadRes from {from}: no search queried this sender for target {target}; ignoring unsolicited response");
             }
 
             for sid in search_ids {
                 let sender_id = sender_ip_port.and_then(|(ip, port)| {
-                    state.search_manager.active.get(&sid)
-                        .and_then(|s| s.tried.get(&(ip, port)).copied())
+                    state.search_manager.active.get(&sid).and_then(|s| {
+                        // Exact (ip, port) first, then any contact from the
+                        // same IP we queried (NAT port rewrite).
+                        s.tried.get(&(ip, port)).copied().or_else(|| {
+                            s.tried.iter()
+                                .find(|((tip, _), _)| *tip == ip)
+                                .map(|(_, id)| *id)
+                        })
+                    })
                 }).or_else(|| {
                     sender_ip_port.and_then(|(ip, port)| {
                         state.routing_table.all_contacts()
@@ -16084,23 +16110,37 @@ async fn handle_udp_packet_inner(
             let search_ids: Vec<SearchId> = if let Some(sid) = owning_sid {
                 vec![sid]
             } else {
-                let mut candidates: Vec<SearchId> = state.search_manager.active.iter()
-                    .filter(|(_, s)| s.target == target && !s.completed)
-                    .map(|(id, _)| *id)
-                    .collect();
-                candidates.sort_by(|a, b| b.0.cmp(&a.0));
-                candidates.truncate(1);
-                candidates
+                // Fall back to a search that queried this sender's *IP* (the
+                // source port can be rewritten by carrier-grade NAT). We do
+                // NOT fall back to "any search with this target": accepting
+                // results from a node no active search ever queried would let
+                // an unsolicited peer poison the result set.
+                sender_ip_port
+                    .and_then(|(ip, _)| {
+                        state.search_manager.active.iter()
+                            .filter(|(_, s)| s.target == target && !s.completed)
+                            .find(|(_, s)| s.tried.keys().any(|(tip, _)| *tip == ip))
+                            .map(|(id, _)| *id)
+                    })
+                    .into_iter()
+                    .collect()
             };
 
             if search_ids.is_empty() {
-                debug!("  No active search for this target");
+                debug!("  No active search queried this sender for this target");
             }
 
             for sid in search_ids {
                 let resolved_sender_id = sender_ip_port.and_then(|(ip, port)| {
-                    state.search_manager.active.get(&sid)
-                        .and_then(|s| s.tried.get(&(ip, port)).copied())
+                    state.search_manager.active.get(&sid).and_then(|s| {
+                        // Exact (ip, port) first, then any contact from the
+                        // same IP we queried (NAT port rewrite).
+                        s.tried.get(&(ip, port)).copied().or_else(|| {
+                            s.tried.iter()
+                                .find(|((tip, _), _)| *tip == ip)
+                                .map(|(_, id)| *id)
+                        })
+                    })
                 }).or_else(|| {
                     sender_ip_port.and_then(|(ip, port)| {
                         state.routing_table.all_contacts()
