@@ -6,6 +6,7 @@
   import StatusBar from '$lib/components/StatusBar.svelte';
   import Toast from '$lib/components/Toast.svelte';
   import CloseAppDialog from '$lib/components/CloseAppDialog.svelte';
+  import DeepLinkHandler from '$lib/components/DeepLinkHandler.svelte';
   // Hidden until developer decides to introduce the feature.
   // import ChatDock from '$lib/components/ChatDock.svelte';
 
@@ -256,6 +257,11 @@
     <StatusBar />
   </div>
   <Toast />
+  {#if initialized && !initError && !showWizard}
+    <!-- Headless: routes OS-delivered ed2k:// links and .emulecollection
+    files into the app once the shell is ready (settings loaded, no wizard). -->
+    <DeepLinkHandler />
+  {/if}
   <!-- Hidden until developer decides to introduce the feature.
   Multi-conversation chat dock. Mounted at the app shell so chats
   persist across route changes — the user can answer a message from
