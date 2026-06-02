@@ -1,5 +1,6 @@
 pub mod collections;
 pub mod comments;
+pub mod deeplink;
 pub mod errors;
 pub mod peers;
 pub mod preview;

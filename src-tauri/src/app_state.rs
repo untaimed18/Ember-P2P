@@ -86,6 +86,14 @@ pub struct AppState {
     /// in `update_settings` and `set_close_behavior`. Holds one of the
     /// validated strings: `"ask"`, `"tray"`, or `"exit"`.
     pub close_behavior: Arc<parking_lot::RwLock<String>>,
+    /// Deep-link payloads (ed2k:// URIs or `.emulecollection` file paths)
+    /// captured from the launch arguments or a second instance's argv before
+    /// the webview was ready to handle them. The frontend drains this buffer
+    /// via `take_pending_deep_links` on mount and whenever a
+    /// `deep-link-received` event wakes it. A synchronous `parking_lot::Mutex`
+    /// is used because the single-instance callback runs on the OS event
+    /// thread (no async context) and pushes into it directly.
+    pub pending_deep_links: Arc<parking_lot::Mutex<Vec<String>>>,
 }
 
 impl AppState {
