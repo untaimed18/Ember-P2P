@@ -102,9 +102,22 @@ pub fn run() {
         .map(|v| v.trim().is_empty())
         .unwrap_or(true)
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.set_focus();
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // A second launch is how the OS delivers an `ed2k://` link or a
+            // `.emulecollection` file while Ember is already running: it spawns
+            // a new process with the payload in argv, which this plugin routes
+            // here before closing the duplicate. Forward any payload to the
+            // existing instance; otherwise just focus the window (the user
+            // re-launched the app to bring it to the front).
+            let payloads = commands::deeplink::extract_deep_link_payloads(&args);
+            if payloads.is_empty() {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            } else {
+                commands::deeplink::dispatch_deep_links(app, payloads);
             }
         }));
     } else {
@@ -114,10 +127,37 @@ pub fn run() {
         );
     }
     builder
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let app_handle = app.handle().clone();
+
+            // Associate the `ed2k://` scheme with this executable.
+            //
+            // URI schemes have no Windows "UserChoice" protection: the last
+            // writer wins, and a per-user (HKCU) entry overrides a machine-wide
+            // one. So calling `register_all()` on every production launch would
+            // silently re-claim `ed2k://` from whatever client the user
+            // actually prefers (eMule, another ed2k app) — even if they set it
+            // back by hand. That's hostile, so we DON'T do it in release.
+            //
+            // Instead, installed builds get the scheme registered once by the
+            // NSIS/MSI installer (driven by `plugins.deep-link.desktop.schemes`
+            // in tauri.conf.json), which is an explicit, user-initiated install
+            // action and is undone on uninstall. Runtime `register_all()` is
+            // only needed for dev builds, which aren't installed and so have no
+            // installer to register the scheme — hence the `debug_assertions`
+            // gate on Windows. Linux has no standard installer-side mechanism,
+            // so it registers at runtime there. macOS reads the association
+            // from the bundle's Info.plist and needs neither path.
+            #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                if let Err(e) = app.deep_link().register_all() {
+                    tracing::warn!("Failed to register ed2k:// deep link scheme: {e}");
+                }
+            }
 
             // Show the running version in the main window title so users
             // can confirm which build they're on at a glance (matches the
@@ -274,7 +314,21 @@ pub fn run() {
                 close_behavior: Arc::new(parking_lot::RwLock::new(
                     settings.close_to_tray_behavior.clone(),
                 )),
+                pending_deep_links: Arc::new(parking_lot::Mutex::new(Vec::new())),
             });
+
+            // Cold-start deep link: an `ed2k://` link or `.emulecollection`
+            // file that launched Ember arrives in our own process args. Buffer
+            // it now (AppState is managed above) — the frontend drains the
+            // buffer once it mounts the deep-link handler. Done after
+            // `app.manage` so `dispatch_deep_links` can reach the buffer.
+            {
+                let args: Vec<String> = std::env::args().collect();
+                let payloads = commands::deeplink::extract_deep_link_payloads(&args);
+                if !payloads.is_empty() {
+                    commands::deeplink::dispatch_deep_links(&app_handle, payloads);
+                }
+            }
 
             // System tray icon. Rendered unconditionally so users who pick
             // "Minimize to Tray" (or the saved `tray` behavior) always have
@@ -741,6 +795,8 @@ pub fn run() {
             commands::collections::download_collection_files,
             commands::preview::preview_file,
             commands::speed_test::run_speed_test,
+            commands::deeplink::take_pending_deep_links,
+            commands::deeplink::open_collection_file,
         ])
         .on_window_event(|window, event| {
             // Title-bar X handler. Decides whether to fully exit, hide to
