@@ -966,6 +966,15 @@ impl TransferManager {
             .or_else(|| self.completed.iter().find(|t| t.id == id))
     }
 
+    /// Update the concurrent-download cap and promote any queued downloads
+    /// that the new cap now permits. Returns the newly promoted transfers so
+    /// the caller can start them (empty when the cap was lowered or no queued
+    /// download is eligible).
+    pub fn set_max_concurrent(&mut self, max: u32) -> Vec<Transfer> {
+        self.max_concurrent = max;
+        self.promote_next()
+    }
+
     fn promote_next(&mut self) -> Vec<Transfer> {
         let mut promoted = Vec::new();
         loop {

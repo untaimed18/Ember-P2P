@@ -131,9 +131,9 @@ impl PublishManager {
             .values()
             .filter(|r| {
                 // K15: honour per-file exponential backoff. Cap the shift
-                // at 4 so the interval never exceeds 16x the base — that
-                // gives us a ceiling around 4 hours for a keyword that's
-                // saturated on every receiver.
+                // at 4 so the interval never exceeds 16x the base (24h) —
+                // a ceiling of ~16 days for a keyword that reports
+                // saturation on every receiver.
                 let shift = r.keyword_backoff_shift.min(4);
                 let interval = REPUBLISH_KEYWORD_SECS.saturating_mul(1_i64 << shift);
                 now - r.last_keyword_publish > interval

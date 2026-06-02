@@ -472,13 +472,39 @@ pub fn atomic_write(final_path: &Path, data: &[u8], restrict: bool) -> std::io::
     if let Err(e) = std::fs::rename(&tmp, final_path) {
         #[cfg(target_os = "windows")]
         {
-            // Windows rejects rename-over-existing in some cases; fall back
-            // to remove+rename while still preserving atomicity intent.
+            // Windows rejects rename-over-existing in some cases. The old
+            // fallback deleted the destination outright and then retried the
+            // rename — but if that retry also failed (AV lock, open handle),
+            // the user's original file was already gone AND the temp was
+            // removed, destroying data (identity.json, cryptkey.dat, etc.).
+            //
+            // Instead, move the existing destination aside first, publish the
+            // replacement, and only then drop the backup. On any failure we
+            // restore the original, so the destination is never lost.
             let _ = e;
-            let _ = std::fs::remove_file(final_path);
-            if let Err(retry_err) = std::fs::rename(&tmp, final_path) {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(retry_err);
+            let backup = final_path.with_extension("ember-replace-bak");
+            let _ = std::fs::remove_file(&backup);
+            match std::fs::rename(final_path, &backup) {
+                Ok(()) => {
+                    if let Err(retry_err) = std::fs::rename(&tmp, final_path) {
+                        // Publish failed — put the original back exactly where
+                        // it was and report the error. The temp is cleaned up.
+                        let _ = std::fs::rename(&backup, final_path);
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(retry_err);
+                    }
+                    let _ = std::fs::remove_file(&backup);
+                }
+                Err(_) => {
+                    // Couldn't move the destination aside (locked, or it no
+                    // longer exists). Retry the rename directly WITHOUT
+                    // deleting anything: if it fails, the original is left
+                    // intact rather than destroyed.
+                    if let Err(retry_err) = std::fs::rename(&tmp, final_path) {
+                        let _ = std::fs::remove_file(&tmp);
+                        return Err(retry_err);
+                    }
+                }
             }
         }
         #[cfg(not(target_os = "windows"))]

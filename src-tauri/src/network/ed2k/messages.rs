@@ -929,7 +929,7 @@ pub fn parse_hello_answer(payload: &[u8]) -> io::Result<([u8; 16], PeerCapabilit
     }
 
     // eMule appends server_ip(u32) + server_port(u16) after the tag list
-    let remaining = payload.len() - cursor.position() as usize;
+    let remaining = payload.len().saturating_sub(cursor.position() as usize);
     if remaining >= 6 {
         let _server_ip = cursor.read_u32::<LittleEndian>().unwrap_or(0);
         let _server_port = cursor.read_u16::<LittleEndian>().unwrap_or(0);
@@ -1261,7 +1261,7 @@ pub fn parse_hashset_answer2(payload: &[u8]) -> io::Result<Hashset2Response> {
         if count > MAX_HASHSET2_PARTS {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("hashset2 md4 count {count} exceeds maximum")));
         }
-        let remaining = payload.len() - cursor.position() as usize;
+        let remaining = payload.len().saturating_sub(cursor.position() as usize);
         if remaining < count * 16 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("hashset2 md4 claims {count} hashes but only {remaining} bytes remain")));
         }
@@ -1280,7 +1280,7 @@ pub fn parse_hashset_answer2(payload: &[u8]) -> io::Result<Hashset2Response> {
         if count > MAX_HASHSET2_PARTS {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("hashset2 aich count {count} exceeds maximum")));
         }
-        let remaining = payload.len() - cursor.position() as usize;
+        let remaining = payload.len().saturating_sub(cursor.position() as usize);
         if remaining < count * 20 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("hashset2 aich claims {count} hashes but only {remaining} bytes remain")));
         }
@@ -1574,12 +1574,12 @@ pub fn parse_multipacket(payload: &[u8], opcode: u8) -> io::Result<MultiPacketRe
                 // eMule ExtendedRequests v1+: partcount(u16) + part_status_bitmap
                 // eMule ExtendedRequests v2+: + complete_sources(u16)
                 // We must consume this data to keep alignment with subsequent sub-opcodes.
-                let remaining = payload.len() - cursor.position() as usize;
+                let remaining = payload.len().saturating_sub(cursor.position() as usize);
                 if remaining >= 2 {
                     let part_count = cursor.read_u16::<LittleEndian>()? as usize;
                     let bitmap_bytes = (part_count + 7) / 8;
                     let pos = cursor.position() as usize;
-                    if pos + bitmap_bytes <= payload.len() {
+                    if pos.checked_add(bitmap_bytes).is_some_and(|end| end <= payload.len()) {
                         cursor.set_position((pos + bitmap_bytes) as u64);
                         // v2: complete sources count. Only consume it if it does not
                         // look like the next byte is already another sub-opcode.
