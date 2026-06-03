@@ -519,6 +519,16 @@ const MAX_UDP_SOURCE_QUEUE: usize = 500;
 /// 100–200 servers fit without truncation.
 const MAX_UDP_SEARCH_QUEUE: usize = 500;
 
+/// Minimum number of *verified* routing-table contacts before we report the
+/// KAD status as `Connected`. `routing_table.len()` also counts unverified
+/// contacts (e.g. loaded from `nodes.dat` or learned from FindNode responses
+/// but never confirmed); a table that holds only unverified contacts can't
+/// actually route, since `find_closest` returns verified contacts only. Gating
+/// on at least one verified contact keeps the reported status honest — we
+/// don't claim to be on the network until we have a contact we can really
+/// reach.
+const KAD_MIN_VERIFIED_FOR_CONNECTED: usize = 1;
+
 fn enqueue_overflow_source(
     state: &mut NetworkState,
     transfer_id: &str,
@@ -1999,6 +2009,18 @@ struct SearchCompleteEvent {
     request_id: u64,
 }
 
+/// A note (comment/rating) we have explicitly published to the KAD DHT via
+/// `PublishNote`. DHT note entries expire after ~24h, so these are
+/// re-published periodically (see the publish-timer notes block) and persisted
+/// in the `published_notes` table so republishing survives restarts.
+#[derive(Clone, Debug)]
+struct PublishedNote {
+    rating: u8,
+    comment: String,
+    /// Unix timestamp of the most recent (re)publish.
+    last_publish: i64,
+}
+
 struct NetworkState {
     local_id: KadId,
     user_hash: [u8; 16],
@@ -2092,6 +2114,11 @@ struct NetworkState {
     pending_notes_searches: HashMap<SearchId, oneshot::Sender<Vec<SearchResult>>>,
     /// Pending note publishes: search_id -> (file_hash, rating, comment)
     pending_note_publishes: HashMap<SearchId, (KadId, u8, String)>,
+    /// Notes we have published to the KAD DHT, keyed by the file's KadId.
+    /// Re-published periodically so our comments/ratings don't expire from
+    /// the network after ~24h; loaded from the `published_notes` table at
+    /// startup so republishing survives restarts.
+    published_notes: HashMap<KadId, PublishedNote>,
     /// Nodes that reported load=100 -- avoid publishing to them for a while
     overloaded_nodes: HashMap<Ipv4Addr, i64>,
     flood_protection: FloodProtection,
@@ -2474,6 +2501,7 @@ fn is_search_source_safe(state: &NetworkState, ip: Ipv4Addr) -> bool {
 async fn enrich_and_emit_search_results(
     app_handle: &tauri::AppHandle,
     spam_filter: &Arc<RwLock<crate::search::spam::SpamFilter>>,
+    comment_manager: &Arc<RwLock<CommentManager>>,
     settings: &AppSettings,
     request_id: u64,
     mut results: Vec<SearchResult>,
@@ -2491,17 +2519,60 @@ async fn enrich_and_emit_search_results(
     let cleanup_strings =
         crate::search::cleanup::parse_cleanup_strings(&settings.filename_cleanups);
 
-    let spam = spam_filter.read().await;
-    crate::commands::search::apply_search_enrichment(
-        &mut results,
-        &spam,
-        keywords,
-        server_ip,
-        spam_enabled,
-        spam_profile,
-        &cleanup_strings,
-    );
-    drop(spam);
+    // Community verdict per result (peer/KAD "fake" votes). Keyed by the raw
+    // result hash so the lookup in `apply_search_enrichment` uses the exact
+    // same string with no normalization mismatch. Skipped when the filter is
+    // off and for the `relaxed` profile, which is intentionally local-only.
+    let community: std::collections::HashMap<String, crate::search::spam::CommunityRating> =
+        if spam_enabled && spam_profile != crate::search::spam::SpamFilterProfile::Relaxed {
+            let cm = comment_manager.read().await;
+            results
+                .iter()
+                .filter_map(|r| {
+                    let (fake, total) = cm.fake_rating_stats(&r.file.hash);
+                    if total > 0 {
+                        Some((
+                            r.file.hash.clone(),
+                            crate::search::spam::CommunityRating { fake_votes: fake, total_votes: total },
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+    {
+        let spam = spam_filter.read().await;
+        crate::commands::search::apply_search_enrichment(
+            &mut results,
+            &spam,
+            keywords,
+            server_ip,
+            spam_enabled,
+            spam_profile,
+            &cleanup_strings,
+            &community,
+        );
+    }
+
+    // Auto-redemption: if a server's results came back mostly clean, decay its
+    // learned spam reputation (escalation stays user-driven). Only relevant for
+    // server-sourced batches, so it's gated on a known server IP.
+    if spam_enabled {
+        if let Some(sip) = server_ip {
+            let total = results.len();
+            let clean = results.iter().filter(|r| !r.is_spam).count();
+            if clean > 0 {
+                spam_filter
+                    .write()
+                    .await
+                    .record_server_clean_batch(sip, clean, total);
+            }
+        }
+    }
 
     emit_search_results(app_handle, request_id, results, file_type_filter);
 }
@@ -3811,6 +3882,7 @@ pub async fn start_network(
         store_source_searches: HashMap::new(),
         pending_notes_searches: HashMap::new(),
         pending_note_publishes: HashMap::new(),
+        published_notes: HashMap::new(),
         overloaded_nodes: HashMap::new(),
         flood_protection: FloodProtection::new(),
         buddy_manager,
@@ -4015,6 +4087,26 @@ pub async fn start_network(
     // Load comments from database
     if let Ok(rows) = db.load_file_comments() {
         state.comment_manager.write().await.load_from_db_rows(rows);
+    }
+
+    // Load previously-published KAD notes so the periodic republish loop can
+    // keep them alive on the network across restarts (DHT note entries expire
+    // after ~24h).
+    if let Ok(rows) = db.load_published_notes() {
+        for (hash_hex, rating, comment, last_publish) in rows {
+            if let Some(kad_id) = KadId::from_hex(&hash_hex) {
+                state.published_notes.insert(
+                    kad_id,
+                    PublishedNote { rating, comment, last_publish },
+                );
+            }
+        }
+        if !state.published_notes.is_empty() {
+            info!(
+                "Loaded {} published KAD notes for periodic republish",
+                state.published_notes.len()
+            );
+        }
     }
 
     let firewall_probe_ips: upload_server::FirewallProbeSet =
@@ -6498,6 +6590,7 @@ pub async fn start_network(
                                 enrich_and_emit_search_results(
                                     &app_handle,
                                     &spam_filter,
+                                    &comment_manager,
                                     &settings,
                                     pending_request_id,
                                     batch,
@@ -7911,10 +8004,25 @@ pub async fn start_network(
                 // Self-lookup: FindNode for our own ID to populate close-to-home buckets.
                 // eMule: m_tNextSelfLookup = start + MIN2S(3), then + HR2S(4) after each run.
                 const SELF_LOOKUP_FIRST_DELAY_SECS: i64 = 3 * 60;
+                // Warm-start floor + verified-contact threshold for an early
+                // first self-lookup (see below).
+                const SELF_LOOKUP_WARM_DELAY_SECS: i64 = 20;
+                const SELF_LOOKUP_WARM_VERIFIED: usize = 16;
                 const SELF_LOOKUP_REPEAT_SECS: i64 = 4 * 3600;
                 let now_ts = chrono::Utc::now().timestamp();
                 let self_lookup_due = if !state.self_lookup_done {
-                    now_ts >= state.kad_started_at + SELF_LOOKUP_FIRST_DELAY_SECS
+                    let elapsed = now_ts - state.kad_started_at;
+                    // eMule waits a flat 3 minutes before the first self-lookup.
+                    // On a warm start (a populated nodes.dat) the table can be
+                    // healthy within seconds, so once we already hold a solid
+                    // set of *verified* contacts there's no reason to idle for
+                    // the full ceiling — fill the close-to-home buckets right
+                    // away so we become publishable/discoverable sooner. The
+                    // 3-minute ceiling still applies as the upper bound for cold
+                    // starts that bootstrap slowly.
+                    elapsed >= SELF_LOOKUP_FIRST_DELAY_SECS
+                        || (elapsed >= SELF_LOOKUP_WARM_DELAY_SECS
+                            && state.routing_table.verified_len() >= SELF_LOOKUP_WARM_VERIFIED)
                 } else {
                     now_ts - state.last_self_lookup >= SELF_LOOKUP_REPEAT_SECS
                 };
@@ -8146,7 +8254,9 @@ pub async fn start_network(
 
                 let count = state.routing_table.len() as u32;
                 info!("Routing table: {count} contacts");
-                if count > 0 && state.stats.status != NetworkStatus::Connected {
+                if state.stats.status != NetworkStatus::Connected
+                    && state.routing_table.verified_len() >= KAD_MIN_VERIFIED_FOR_CONNECTED
+                {
                     state.stats.status = NetworkStatus::Connected;
                     let _ = app_handle.emit("network-status", NetworkStatus::Connected);
 
@@ -8639,6 +8749,70 @@ pub async fn start_network(
                     }
                     if !any_started {
                         // No search started for any keyword — don't mark as published
+                    }
+                }
+
+                // Periodic notes republish: our own published comments/ratings
+                // expire from the DHT after ~24h, so re-push any that are due.
+                // Mirrors the keyword/source republish above and reuses the
+                // same StoreNotes -> PublishNotesReq path as the on-demand
+                // `PublishNote` command. Capped per cycle to keep egress
+                // predictable.
+                {
+                    const REPUBLISH_NOTE_SECS: i64 = 24 * 3600;
+                    let max_notes_per_cycle: usize =
+                        if !state.first_publish_done || state.publish_confirmed == 0 { 5 } else { 2 };
+                    let now_ts = chrono::Utc::now().timestamp();
+                    // Don't start a second republish for a note whose previous
+                    // publish search is still in flight.
+                    let in_flight: HashSet<KadId> = state
+                        .pending_note_publishes
+                        .values()
+                        .map(|(h, _, _)| *h)
+                        .collect();
+                    let due_notes: Vec<(KadId, u8, String)> = state
+                        .published_notes
+                        .iter()
+                        .filter(|(hash, note)| {
+                            now_ts - note.last_publish > REPUBLISH_NOTE_SECS
+                                && !in_flight.contains(*hash)
+                        })
+                        .take(max_notes_per_cycle)
+                        .map(|(hash, note)| (*hash, note.rating, note.comment.clone()))
+                        .collect();
+                    for (file_hash, rating, comment) in due_notes {
+                        let closest = state
+                            .routing_table
+                            .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
+                        if closest.is_empty() {
+                            continue;
+                        }
+                        let sid = state.search_manager.start_search(
+                            file_hash,
+                            SearchType::StoreNotes,
+                            closest,
+                        );
+                        if sid == SearchId(0) {
+                            continue;
+                        }
+                        state
+                            .pending_note_publishes
+                            .insert(sid, (file_hash, rating, comment.clone()));
+                        // Optimistically mark republished now so the next cycle
+                        // doesn't re-trigger while this search is in flight, and
+                        // persist the new timestamp so the schedule survives a
+                        // restart. A transient failure just defers the next
+                        // attempt by the normal interval, which is acceptable
+                        // for an already-published note.
+                        if let Some(note) = state.published_notes.get_mut(&file_hash) {
+                            note.last_publish = now_ts;
+                        }
+                        if let Err(e) =
+                            db.save_published_note(&file_hash.to_hex(), rating, &comment, now_ts)
+                        {
+                            warn!("Failed to persist note republish timestamp: {e}");
+                        }
+                        info!("Republishing KAD note for file {file_hash} (search {})", sid.0);
                     }
                 }
 
@@ -11258,6 +11432,7 @@ pub async fn start_network(
                                             enrich_and_emit_search_results(
                                                 &app_handle,
                                                 &spam_filter,
+                                                &comment_manager,
                                                 &settings,
                                                 request_id,
                                                 search_results,
@@ -12230,6 +12405,7 @@ pub async fn start_network(
                                     enrich_and_emit_search_results(
                                         &app_handle,
                                         &spam_filter,
+                                        &comment_manager,
                                         &settings,
                                         request_id,
                                         search_results,
@@ -15593,7 +15769,9 @@ async fn handle_udp_packet_inner(
             let table_size = state.routing_table.len();
             debug!("Routing table now has {table_size} contacts");
             state.stats.connected_peers = table_size as u32;
-            if state.stats.status != NetworkStatus::Connected {
+            if state.stats.status != NetworkStatus::Connected
+                && state.routing_table.verified_len() >= KAD_MIN_VERIFIED_FOR_CONNECTED
+            {
                 state.stats.status = NetworkStatus::Connected;
                 let _ = app_handle.emit("network-status", NetworkStatus::Connected);
             }
@@ -17947,6 +18125,22 @@ async fn handle_command_inner(
                     "Started StoreNotes search {} for file {} (rating={}, comment_len={})",
                     sid.0, file_hash, rating, comment.len()
                 );
+                // Remember this note so it gets re-published every ~24h (DHT
+                // note entries expire), and persist it so republishing
+                // survives restarts. Only non-empty notes are tracked — an
+                // empty note would be a no-op publish. The `publish_note`
+                // command already rejects fully-empty notes, but we re-check
+                // here to stay robust against other internal callers.
+                if rating > 0 || !comment.trim().is_empty() {
+                    let now_ts = chrono::Utc::now().timestamp();
+                    state.published_notes.insert(
+                        file_hash,
+                        PublishedNote { rating, comment: comment.clone(), last_publish: now_ts },
+                    );
+                    if let Err(e) = db.save_published_note(&file_hash.to_hex(), rating, &comment, now_ts) {
+                        warn!("Failed to persist published note for republish: {e}");
+                    }
+                }
             }
         }
 
