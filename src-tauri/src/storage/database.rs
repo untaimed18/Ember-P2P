@@ -51,7 +51,7 @@ impl Database {
         // Ember build. Silently running would invite subtle data corruption
         // (missing columns, renamed tables, semantic changes). Bump this
         // when introducing a new migration.
-        const MAX_SUPPORTED_VERSION: i64 = 15;
+        const MAX_SUPPORTED_VERSION: i64 = 16;
         if version > MAX_SUPPORTED_VERSION {
             anyhow::bail!(
                 "Database schema version {version} is newer than this Ember build supports \
@@ -346,6 +346,27 @@ impl Database {
                 );",
             )?;
             set_version(&tx, 15)?;
+            tx.commit()?;
+        }
+
+        if version < 16 {
+            // Notes (comments/ratings) we have explicitly published to the
+            // KAD DHT. DHT note entries expire after ~24h, so we re-publish
+            // them periodically; persisting the set here means republishing
+            // survives restarts. `last_publish` is a Unix timestamp of the
+            // most recent (re)publish. Distinct from `file_comments`, which
+            // holds local comments on our *own* shared files exchanged over
+            // ed2k and intentionally NOT broadcast to the DHT.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS published_notes (
+                    file_hash TEXT PRIMARY KEY,
+                    rating INTEGER NOT NULL DEFAULT 0,
+                    comment TEXT NOT NULL DEFAULT '',
+                    last_publish INTEGER NOT NULL DEFAULT 0
+                );",
+            )?;
+            set_version(&tx, 16)?;
             tx.commit()?;
         }
 
@@ -751,6 +772,61 @@ impl Database {
         conn.execute(
             "INSERT OR REPLACE INTO file_comments (file_hash, rating, comment) VALUES (?1, ?2, ?3)",
             params![file_hash, rating as i32, comment],
+        )?;
+        Ok(())
+    }
+
+    /// Load every note we have published to the KAD DHT, along with the
+    /// timestamp of its last (re)publish. Used at startup to seed the
+    /// periodic notes-republish loop so our comments/ratings keep refreshing
+    /// after a restart instead of silently expiring from the network.
+    pub fn load_published_notes(&self) -> anyhow::Result<Vec<(String, u8, String, i64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT file_hash, rating, comment, last_publish FROM published_notes")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get::<_, i32>(1)?).clamp(0, 5) as u8,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("Skipping malformed published note row: {e}");
+                    None
+                }
+            })
+            .collect();
+        Ok(rows)
+    }
+
+    /// Record (or refresh) a note we have published to the DHT. `last_publish`
+    /// is the Unix timestamp of this publish so the republish loop can tell
+    /// when the entry is due to be pushed again.
+    pub fn save_published_note(
+        &self,
+        file_hash: &str,
+        rating: u8,
+        comment: &str,
+        last_publish: i64,
+    ) -> anyhow::Result<()> {
+        const MAX_COMMENT_BYTES: usize = 4096;
+        if comment.len() > MAX_COMMENT_BYTES {
+            return Err(anyhow::anyhow!(
+                "comment too long ({} bytes > {} max)",
+                comment.len(),
+                MAX_COMMENT_BYTES
+            ));
+        }
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT OR REPLACE INTO published_notes (file_hash, rating, comment, last_publish) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![file_hash, rating as i32, comment, last_publish],
         )?;
         Ok(())
     }

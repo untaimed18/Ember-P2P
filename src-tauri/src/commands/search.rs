@@ -7,8 +7,9 @@ use crate::network::ed2k::hash;
 use crate::network::kad::publish::md4_bytes_to_kad_id;
 use crate::search::cleanup::{cleanup_filename, parse_cleanup_strings, strip_comment_urls};
 use crate::search::merge;
-use crate::search::spam::{SpamFilter, SpamFilterProfile};
+use crate::search::spam::{BatchSpamContext, CommunityRating, SpamFilter, SpamFilterProfile};
 use crate::types::SearchResult;
+use std::collections::HashMap;
 
 const SEARCH_TIMEOUT_MIN: u64 = 30;
 const SEARCH_TIMEOUT_MAX: u64 = 600;
@@ -82,6 +83,7 @@ fn parse_exact_file_hash(file_hash: &str) -> Result<[u8; 16], String> {
 /// batch of results, given pre-resolved configuration. Pure enrichment
 /// — no I/O, no locking. Used by both the synchronous `search_files`
 /// command path and the streaming network event loop.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_search_enrichment(
     results: &mut [SearchResult],
     spam: &SpamFilter,
@@ -90,10 +92,22 @@ pub fn apply_search_enrichment(
     spam_enabled: bool,
     spam_profile: SpamFilterProfile,
     cleanup_strings: &[String],
+    community: &HashMap<String, CommunityRating>,
 ) {
+    // Statistical signals over the whole batch (same-name/many-hashes,
+    // same-hash/many-names, source-IP concentration). Computed once and shared
+    // across all results. Skipped for the `relaxed` profile (local-only) and
+    // when the filter is off; also a no-op below the minimum batch size.
+    let batch = if spam_enabled && spam_profile != SpamFilterProfile::Relaxed {
+        BatchSpamContext::analyze(results)
+    } else {
+        BatchSpamContext::default()
+    };
     for result in results.iter_mut() {
         if spam_enabled {
-            result.spam_rating = spam.rate_result(result, search_keywords, server_ip, spam_profile);
+            let cr = community.get(&result.file.hash).copied().unwrap_or_default();
+            result.spam_rating =
+                spam.rate_result(result, search_keywords, server_ip, spam_profile, cr, &batch);
             result.is_spam = SpamFilter::is_spam(result.spam_rating, spam_profile);
         }
         result.clean_name = cleanup_filename(&result.file.name, cleanup_strings);
@@ -121,6 +135,11 @@ pub async fn enrich_results(
     let cleanup_strings = parse_cleanup_strings(&config.settings.filename_cleanups);
     drop(config);
 
+    // The synchronous command path (local index + initial returned set) has no
+    // access to the comment manager, so community ratings aren't applied here.
+    // The bulk of network results flow through the streaming path
+    // (`enrich_and_emit_search_results`), which does supply them.
+    let community = HashMap::new();
     apply_search_enrichment(
         results,
         &spam,
@@ -129,6 +148,7 @@ pub async fn enrich_results(
         spam_enabled,
         spam_profile,
         &cleanup_strings,
+        &community,
     );
 }
 
@@ -549,7 +569,19 @@ pub async fn explain_spam_result(
     drop(cfg);
 
     let spam = state.spam_filter.read().await;
-    let details = spam.explain_result(&result, &search_keywords, server_ip.as_deref(), profile);
+    // The standalone "why is this spam?" view scores a single result, so the
+    // batch-statistical and community signals (which need the full result set /
+    // comment manager) aren't available here — pass neutral values. The
+    // authoritative is_spam flag shown in the result list comes from the
+    // streaming enrichment path, which does include them.
+    let details = spam.explain_result(
+        &result,
+        &search_keywords,
+        server_ip.as_deref(),
+        profile,
+        CommunityRating::default(),
+        &BatchSpamContext::default(),
+    );
     Ok(SpamExplainResponse {
         score: details.score,
         threshold: details.threshold,
