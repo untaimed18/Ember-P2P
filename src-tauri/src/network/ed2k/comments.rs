@@ -109,6 +109,29 @@ impl CommentManager {
             .unwrap_or(false)
     }
 
+    /// Count of `(fake_votes, total_rated_votes)` among peer ratings for a
+    /// file. Feeds the spam filter's community-verdict signal: a file the
+    /// network has predominantly rated "fake" is a strong spam indicator.
+    /// Only rated (rating > 0) peer comments are counted.
+    pub fn fake_rating_stats(&self, file_hash: &str) -> (u32, u32) {
+        match self.comments.get(file_hash) {
+            Some(info) => {
+                let mut fake = 0u32;
+                let mut total = 0u32;
+                for c in &info.peer_comments {
+                    if c.rating > 0 {
+                        total += 1;
+                        if c.rating == RATING_FAKE {
+                            fake += 1;
+                        }
+                    }
+                }
+                (fake, total)
+            }
+            None => (0, 0),
+        }
+    }
+
     pub fn all_comments(&self) -> &HashMap<String, FileCommentInfo> {
         &self.comments
     }
