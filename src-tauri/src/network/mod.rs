@@ -2738,10 +2738,10 @@ async fn flush_credit_state(
     let (serialized_bytes, owned, ember_owned) = {
         let cm = credit_manager.read().await;
         let bytes = cm.serialize();
-        let records: Vec<([u8; 16], u64, u64, i64, Vec<u8>)> = cm
+        let records: Vec<([u8; 16], u64, u64, i64, Vec<u8>, u32, u8)> = cm
             .all_records()
             .iter()
-            .map(|r| (r.user_hash, r.uploaded, r.downloaded, r.last_seen, r.public_key.clone()))
+            .map(|r| (r.user_hash, r.uploaded, r.downloaded, r.last_seen, r.public_key.clone(), r.ident_ip, r.ident_state.to_u8()))
             .collect();
         // Snapshot the Ember table too. The columns are plain scalars
         // so an owned copy is cheap; holding the read lock only long
@@ -2773,9 +2773,9 @@ async fn flush_credit_state(
     // via the DB; the on-disk cache may lag but does not clobber fresh data.
     let db_ref = db.clone();
     let db_save = tokio::task::spawn_blocking(move || {
-        let refs: Vec<(&[u8; 16], u64, u64, i64, &[u8])> = owned
+        let refs: Vec<(&[u8; 16], u64, u64, i64, &[u8], u32, u8)> = owned
             .iter()
-            .map(|(h, u, d, l, p)| (h, *u, *d, *l, p.as_slice()))
+            .map(|(h, u, d, l, p, ip, st)| (h, *u, *d, *l, p.as_slice(), *ip, *st))
             .collect();
         // Persist both credit tables in ONE SQLite transaction so they can
         // never diverge across a crash or partial failure.
@@ -4185,7 +4185,7 @@ pub async fn start_network(
         let mut cm = CreditManager::new();
         cm.load_or_create_keypair(&data_dir);
         if let Ok(records) = db.load_credits() {
-            for (hash, uploaded, downloaded, last_seen, public_key) in records {
+            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) in records {
                 // `get_or_create` bumps `last_seen` to "now" — the right
                 // behaviour for live mutations but wrong on a startup
                 // load. The explicit `record.last_seen = last_seen`
@@ -4198,6 +4198,12 @@ pub async fn start_network(
                 record.downloaded = downloaded;
                 record.last_seen = last_seen;
                 record.public_key = public_key;
+                // Restore SecureIdent state so the Known Clients tab keeps the
+                // peer's last-known IP and country flag (both derived from
+                // ident_ip) across restarts instead of blanking until the peer
+                // reconnects.
+                record.ident_ip = ident_ip;
+                record.ident_state = ed2k::credits::IdentState::from_u8(ident_state);
             }
             info!("Loaded {} credit records from database", cm.all_records().len());
         }

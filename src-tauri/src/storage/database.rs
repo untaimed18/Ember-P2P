@@ -370,6 +370,22 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 17 {
+            // SecureIdent state for eMule credit records. Previously only
+            // uploaded/downloaded/last_seen/public_key were persisted, so on
+            // every restart `ident_ip` reset to 0 and `ident_state` to
+            // Unknown. Because the Known Clients tab derives the last-known
+            // IP *and* the country flag purely from `ident_ip`, both vanished
+            // after a relaunch until the peer was seen again. Persisting them
+            // makes those columns survive restarts. Defaults (0 / Unknown)
+            // are correct for rows migrated from v16.
+            let tx = conn.unchecked_transaction()?;
+            Self::add_column_if_missing(&tx, "credits", "ident_ip", "INTEGER NOT NULL DEFAULT 0")?;
+            Self::add_column_if_missing(&tx, "credits", "ident_state", "INTEGER NOT NULL DEFAULT 0")?;
+            set_version(&tx, 17)?;
+            tx.commit()?;
+        }
+
         Ok(())
     }
 
@@ -672,9 +688,9 @@ impl Database {
         Ok(())
     }
 
-    pub fn load_credits(&self) -> anyhow::Result<Vec<([u8; 16], u64, u64, i64, Vec<u8>)>> {
+    pub fn load_credits(&self) -> anyhow::Result<Vec<([u8; 16], u64, u64, i64, Vec<u8>, u32, u8)>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare("SELECT user_hash, uploaded, downloaded, last_seen, public_key FROM credits")?;
+        let mut stmt = conn.prepare("SELECT user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state FROM credits")?;
         let records = stmt
             .query_map([], |row| {
                 let hash_blob: Vec<u8> = row.get(0)?;
@@ -689,6 +705,10 @@ impl Database {
                     row.get::<_, i64>(2)?.max(0) as u64,
                     row.get::<_, i64>(3)?,
                     row.get::<_, Vec<u8>>(4)?,
+                    // ident_ip is a 32-bit IPv4 stored as INTEGER; clamp to the
+                    // u32 range defensively in case of a malformed row.
+                    row.get::<_, i64>(5)?.clamp(0, u32::MAX as i64) as u32,
+                    row.get::<_, i64>(6)?.clamp(0, u8::MAX as i64) as u8,
                 ))
             })?
             .filter_map(|r| match r {
@@ -848,16 +868,16 @@ impl Database {
     // Retained as a focused, unit-tested building block (full-replacement
     // semantics); production flushes go through `save_all_credits_with_ember`.
     #[allow(dead_code)]
-    pub fn save_all_credits(&self, credits: &[(&[u8; 16], u64, u64, i64, &[u8])]) -> anyhow::Result<()> {
+    pub fn save_all_credits(&self, credits: &[(&[u8; 16], u64, u64, i64, &[u8], u32, u8)]) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM credits", [])?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key) VALUES (?1, ?2, ?3, ?4, ?5)"
+                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
             )?;
-            for (hash, uploaded, downloaded, last_seen, public_key) in credits {
-                stmt.execute(params![&hash[..], i64::try_from(*uploaded).unwrap_or(i64::MAX), i64::try_from(*downloaded).unwrap_or(i64::MAX), *last_seen, *public_key])?;
+            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) in credits {
+                stmt.execute(params![&hash[..], i64::try_from(*uploaded).unwrap_or(i64::MAX), i64::try_from(*downloaded).unwrap_or(i64::MAX), *last_seen, *public_key, i64::from(*ident_ip), i64::from(*ident_state)])?;
             }
         }
         tx.commit()?;
@@ -979,7 +999,7 @@ impl Database {
     #[allow(clippy::type_complexity)]
     pub fn save_all_credits_with_ember(
         &self,
-        credits: &[(&[u8; 16], u64, u64, i64, &[u8])],
+        credits: &[(&[u8; 16], u64, u64, i64, &[u8], u32, u8)],
         ember_credits: &[(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)],
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
@@ -987,10 +1007,10 @@ impl Database {
         tx.execute("DELETE FROM credits", [])?;
         {
             let mut stmt = tx.prepare(
-                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key) VALUES (?1, ?2, ?3, ?4, ?5)"
+                "INSERT INTO credits (user_hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
             )?;
-            for (hash, uploaded, downloaded, last_seen, public_key) in credits {
-                stmt.execute(params![&hash[..], i64::try_from(*uploaded).unwrap_or(i64::MAX), i64::try_from(*downloaded).unwrap_or(i64::MAX), *last_seen, *public_key])?;
+            for (hash, uploaded, downloaded, last_seen, public_key, ident_ip, ident_state) in credits {
+                stmt.execute(params![&hash[..], i64::try_from(*uploaded).unwrap_or(i64::MAX), i64::try_from(*downloaded).unwrap_or(i64::MAX), *last_seen, *public_key, i64::from(*ident_ip), i64::from(*ident_state)])?;
             }
         }
         tx.execute("DELETE FROM ember_credits", [])?;
@@ -1514,7 +1534,9 @@ mod tests {
                 uploaded INTEGER NOT NULL DEFAULT 0,
                 downloaded INTEGER NOT NULL DEFAULT 0,
                 last_seen INTEGER NOT NULL DEFAULT 0,
-                public_key BLOB NOT NULL DEFAULT x''
+                public_key BLOB NOT NULL DEFAULT x'',
+                ident_ip INTEGER NOT NULL DEFAULT 0,
+                ident_state INTEGER NOT NULL DEFAULT 0
             );",
         )
         .expect("create schema");
@@ -1538,9 +1560,9 @@ mod tests {
 
         // Seed three records.
         db.save_all_credits(&[
-            (&h1, 100, 200, 1_700_000_000, pk),
-            (&h2, 300, 400, 1_700_000_001, pk),
-            (&h3, 500, 600, 1_700_000_002, pk),
+            (&h1, 100, 200, 1_700_000_000, pk, 0, 0),
+            (&h2, 300, 400, 1_700_000_001, pk, 0x0102_0304, 1),
+            (&h3, 500, 600, 1_700_000_002, pk, 0, 0),
         ])
         .expect("seed");
         let loaded = db.load_credits().expect("reload after seed");
@@ -1549,7 +1571,7 @@ mod tests {
         // Re-save with only one of the three. The other two represent
         // stale records the in-memory pruner has just dropped — they
         // must NOT survive in the database.
-        db.save_all_credits(&[(&h2, 999, 888, 1_700_000_999, pk)])
+        db.save_all_credits(&[(&h2, 999, 888, 1_700_000_999, pk, 0x0102_0304, 1)])
             .expect("replace");
         let after = db.load_credits().expect("reload after replace");
         assert_eq!(after.len(), 1, "stale records must not persist");
@@ -1559,6 +1581,10 @@ mod tests {
         assert_eq!(after[0].1, 999);
         assert_eq!(after[0].2, 888);
         assert_eq!(after[0].3, 1_700_000_999);
+        // ident_ip / ident_state must round-trip so the Known Clients tab
+        // keeps the peer's last IP + country flag across restarts.
+        assert_eq!(after[0].5, 0x0102_0304, "ident_ip must persist");
+        assert_eq!(after[0].6, 1, "ident_state must persist");
     }
 
     /// Saving an empty slice must clear every existing row — the only
@@ -1568,7 +1594,7 @@ mod tests {
     fn save_all_credits_with_empty_input_clears_table() {
         let db = credits_only_db();
         let h1 = [0x01u8; 16];
-        db.save_all_credits(&[(&h1, 1, 1, 0, &[])])
+        db.save_all_credits(&[(&h1, 1, 1, 0, &[], 0, 0)])
             .expect("seed");
         assert_eq!(db.load_credits().expect("reload").len(), 1);
 

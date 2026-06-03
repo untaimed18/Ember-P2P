@@ -72,6 +72,40 @@ pub enum IdentState {
     Needed,
 }
 
+impl IdentState {
+    /// Stable on-disk encoding used by both the SQLite `credits.ident_state`
+    /// column and the versioned `clients.met` cache. Keep these values fixed;
+    /// changing them would reinterpret existing persisted records.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            IdentState::Unknown => 0,
+            IdentState::Verified => 1,
+            IdentState::Failed => 2,
+            IdentState::BadGuy => 3,
+            IdentState::Needed => 4,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> IdentState {
+        match v {
+            1 => IdentState::Verified,
+            2 => IdentState::Failed,
+            3 => IdentState::BadGuy,
+            4 => IdentState::Needed,
+            _ => IdentState::Unknown,
+        }
+    }
+}
+
+/// Magic word that prefixes the versioned `clients.met` cache. Chosen so that,
+/// read as the legacy `count: u32` header, it dwarfs the 50k record cap — so
+/// even an older build that didn't know about the format would safely load
+/// nothing from a v1 file rather than misparsing it.
+const CLIENTS_MET_MAGIC: u32 = 0xE3B2_0001;
+/// Layout version that follows the magic. Bump only if the per-record fields
+/// change again.
+const CLIENTS_MET_VERSION: u8 = 1;
+
 pub const CRYPT_CIP_REMOTECLIENT: u8 = 10;
 pub const CRYPT_CIP_LOCALCLIENT: u8 = 20;
 pub const CRYPT_CIP_NONECLIENT: u8 = 30;
@@ -813,16 +847,24 @@ impl CreditManager {
         (wait_secs as f64) * ratio * file_priority * reliability * speed
     }
 
-    /// Serialize credits to bytes (eMule clients.met format).
+    /// Serialize credits to the versioned `clients.met` cache format. Adds
+    /// `ident_ip` + `ident_state` per record (vs. the original layout) so the
+    /// Known Clients tab's last-IP and country flag survive a restart. Old
+    /// builds reading this file see the magic as an implausibly large record
+    /// count and load nothing rather than misparsing — see `load_from_file`.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         let records: Vec<_> = self.credits.values().filter(|r| r.uploaded > 0 || r.downloaded > 0).collect();
+        buf.extend_from_slice(&CLIENTS_MET_MAGIC.to_le_bytes());
+        buf.push(CLIENTS_MET_VERSION);
         buf.extend_from_slice(&(records.len() as u32).to_le_bytes());
         for r in &records {
             buf.extend_from_slice(&r.user_hash);
             buf.extend_from_slice(&r.uploaded.to_le_bytes());
             buf.extend_from_slice(&r.downloaded.to_le_bytes());
             buf.extend_from_slice(&r.last_seen.to_le_bytes());
+            buf.extend_from_slice(&r.ident_ip.to_le_bytes());
+            buf.push(r.ident_state.to_u8());
             buf.extend_from_slice(&(r.public_key.len() as u16).to_le_bytes());
             buf.extend_from_slice(&r.public_key);
         }
@@ -838,26 +880,51 @@ impl CreditManager {
         }
         let data = std::fs::read(path)?;
         if data.len() < 4 { return Ok(0); }
-        let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        let mut offset = 4;
+
+        // Format detection. The versioned (v1) cache leads with CLIENTS_MET_MAGIC
+        // followed by a version byte and the record count; the original layout
+        // started straight with the count. We branch on the magic and, for v1,
+        // read the two extra per-record fields (ident_ip + ident_state).
+        let versioned = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == CLIENTS_MET_MAGIC;
+        let (count, mut offset) = if versioned {
+            if data.len() < 9 { return Ok(0); }
+            (u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize, 9usize)
+        } else {
+            (u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize, 4usize)
+        };
+        // Fixed-size prefix preceding the variable-length public key.
+        let fixed_prefix = if versioned { 16 + 8 + 8 + 8 + 4 + 1 + 2 } else { 16 + 8 + 8 + 8 + 2 };
+
+        let read_err = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad credit record");
         let mut loaded = 0;
         for _ in 0..count.min(50000) {
-            if offset + 16 + 8 + 8 + 8 + 2 > data.len() { break; }
+            if offset + fixed_prefix > data.len() { break; }
             let mut user_hash = [0u8; 16];
             user_hash.copy_from_slice(&data[offset..offset + 16]);
             offset += 16;
             let uploaded = u64::from_le_bytes(
-                data[offset..offset + 8].try_into().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad credit record"))?,
+                data[offset..offset + 8].try_into().map_err(|_| read_err())?,
             );
             offset += 8;
             let downloaded = u64::from_le_bytes(
-                data[offset..offset + 8].try_into().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad credit record"))?,
+                data[offset..offset + 8].try_into().map_err(|_| read_err())?,
             );
             offset += 8;
             let last_seen = i64::from_le_bytes(
-                data[offset..offset + 8].try_into().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad credit record"))?,
+                data[offset..offset + 8].try_into().map_err(|_| read_err())?,
             );
             offset += 8;
+            let (ident_ip, ident_state) = if versioned {
+                let ip = u32::from_le_bytes(
+                    data[offset..offset + 4].try_into().map_err(|_| read_err())?,
+                );
+                offset += 4;
+                let st = IdentState::from_u8(data[offset]);
+                offset += 1;
+                (ip, st)
+            } else {
+                (0, IdentState::Unknown)
+            };
             let pk_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
             offset += 2;
             let public_key = if offset + pk_len <= data.len() {
@@ -873,8 +940,8 @@ impl CreditManager {
                 downloaded,
                 last_seen,
                 public_key,
-                ident_state: IdentState::Unknown,
-                ident_ip: 0,
+                ident_state,
+                ident_ip,
             };
             self.credits.insert(user_hash, record);
             loaded += 1;
@@ -1043,6 +1110,15 @@ fn verify_challenge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Monotonic-ish suffix for temp filenames so concurrent test runs don't
+    /// collide on a shared temp path.
+    fn unique_nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
 
     /// eMule's Crypto++ `RSASSA_PKCS1v15_SHA_Verifier(StringSource&)`
     /// constructor feeds the raw OP_PUBLICKEY bytes into
@@ -1492,5 +1568,83 @@ mod tests {
         cm.cleanup_stale(90);
         assert!(cm.get_ember_record(&fresh).is_some());
         assert!(cm.get_ember_record(&stale).is_none());
+    }
+
+    /// Regression for the "Known Clients IP + country flag disappear after
+    /// relaunch" bug: `ident_ip` and `ident_state` must survive a
+    /// serialize → load round-trip through the versioned clients.met cache.
+    #[test]
+    fn clients_met_roundtrip_preserves_ident_fields() {
+        let mut cm = CreditManager::new();
+        let hash = [0x42u8; 16];
+        {
+            let r = cm.get_or_create(hash);
+            r.uploaded = 4096; // pass the >0 serialize filter
+            r.downloaded = 8192;
+            r.last_seen = 1_700_000_123;
+            r.ident_ip = 0x0102_0304;
+            r.ident_state = IdentState::Verified;
+            r.public_key = vec![0xAB; 12];
+        }
+        let bytes = cm.serialize();
+        // Sanity: the versioned magic must lead the buffer.
+        assert_eq!(&bytes[0..4], &CLIENTS_MET_MAGIC.to_le_bytes());
+
+        let path = std::env::temp_dir().join(format!(
+            "ember_clients_met_roundtrip_{}_{}.met",
+            std::process::id(),
+            unique_nanos(),
+        ));
+        std::fs::write(&path, &bytes).expect("write temp clients.met");
+
+        let mut loaded = CreditManager::new();
+        let n = loaded.load_from_file(&path).expect("load versioned clients.met");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(n, 1);
+        let rec = loaded.get_record(&hash).expect("record must load");
+        assert_eq!(rec.ident_ip, 0x0102_0304, "ident_ip must survive restart");
+        assert_eq!(rec.ident_state, IdentState::Verified, "ident_state must survive restart");
+        assert_eq!(rec.uploaded, 4096);
+        assert_eq!(rec.downloaded, 8192);
+        assert_eq!(rec.last_seen, 1_700_000_123);
+        assert_eq!(rec.public_key, vec![0xAB; 12]);
+    }
+
+    /// A pre-v1 (legacy) clients.met — count-prefixed, no ident fields — must
+    /// still load on a new build, defaulting ident_ip/ident_state. This keeps
+    /// users upgrading from an older build from losing their credit ledger.
+    #[test]
+    fn clients_met_legacy_format_still_loads() {
+        let hash = [0x7Fu8; 16];
+        let public_key = vec![0xCDu8; 6];
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&1u32.to_le_bytes()); // count
+        legacy.extend_from_slice(&hash);
+        legacy.extend_from_slice(&2048u64.to_le_bytes()); // uploaded
+        legacy.extend_from_slice(&1024u64.to_le_bytes()); // downloaded
+        legacy.extend_from_slice(&1_699_999_999i64.to_le_bytes()); // last_seen
+        legacy.extend_from_slice(&(public_key.len() as u16).to_le_bytes());
+        legacy.extend_from_slice(&public_key);
+
+        let path = std::env::temp_dir().join(format!(
+            "ember_clients_met_legacy_{}_{}.met",
+            std::process::id(),
+            unique_nanos(),
+        ));
+        std::fs::write(&path, &legacy).expect("write legacy clients.met");
+
+        let mut cm = CreditManager::new();
+        let n = cm.load_from_file(&path).expect("load legacy clients.met");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(n, 1);
+        let rec = cm.get_record(&hash).expect("legacy record must load");
+        assert_eq!(rec.uploaded, 2048);
+        assert_eq!(rec.downloaded, 1024);
+        assert_eq!(rec.last_seen, 1_699_999_999);
+        assert_eq!(rec.public_key, public_key);
+        assert_eq!(rec.ident_ip, 0, "legacy rows default ident_ip to 0");
+        assert_eq!(rec.ident_state, IdentState::Unknown, "legacy rows default to Unknown");
     }
 }
