@@ -112,6 +112,46 @@ impl RoutingBin {
         }
     }
 
+    /// Admit a freshly *verified* contact into a full bin by evicting the
+    /// least-recently-seen *unverified* contact.
+    ///
+    /// Called only when the bin is full and the owning zone cannot split,
+    /// i.e. the alternative is dropping `contact` outright. A verified
+    /// contact has completed the Kad2 handshake (its IP is confirmed and
+    /// it answered with a valid UDP key), so it is strictly more
+    /// trustworthy than an unverified squatter. We never evict a verified
+    /// contact, so this can only raise the bin's overall trust level —
+    /// never regress it — and it strengthens poisoning resistance by
+    /// letting confirmed nodes displace unconfirmed ones. The front of the
+    /// `VecDeque` is the least-recently-seen entry (fresh contacts are
+    /// pushed to the back), so the first unverified contact found is the
+    /// best eviction candidate.
+    ///
+    /// Returns the evicted contact's IP on success so the caller can keep
+    /// the routing table's global IP/subnet accounting consistent; returns
+    /// `None` (leaving `contact` dropped) when no replacement was made.
+    fn replace_unverified(&mut self, contact: KadContact) -> Option<Ipv4Addr> {
+        if self.contacts.iter().any(|c| c.id == contact.id) {
+            return None;
+        }
+        let pos = self.contacts.iter().position(|c| !c.verified)?;
+        // Honour the per-bin subnet diversity cap as if adding fresh, but
+        // exclude the victim (it is about to leave the bin).
+        let snet = subnet_key(contact.ip);
+        let same_subnets = self
+            .contacts
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| *i != pos && subnet_key(c.ip) == snet)
+            .count();
+        if same_subnets >= MAX_CONTACTS_SUBNET_PER_BIN && !ip_filter::is_lan_ip(contact.ip) {
+            return None;
+        }
+        let victim = self.contacts.remove(pos)?;
+        self.contacts.push_back(contact);
+        Some(victim.ip)
+    }
+
     /// eMule RoutingBin::ChangeContactIPAddress -- validate and apply IP change.
     fn change_contact_ip(
         &mut self,
@@ -427,6 +467,24 @@ impl RoutingZone {
                 } else {
                     children.1.add(contact, local_id, global_ip_count, global_subnet_count, order_gen, split_dropped_ips)
                 };
+            }
+        }
+
+        // The bin is full and this zone cannot split, so eMule would drop
+        // `contact` here. If `contact` is verified, first try to upgrade the
+        // bin's quality by evicting an unverified squatter instead (see
+        // `RoutingBin::replace_unverified`). The evicted IP is funnelled
+        // through `split_dropped_ips` so `RoutingTable::insert` removes it
+        // from the global IP/subnet accounting, exactly as it does for IPs
+        // dropped during a split.
+        if contact.verified
+            && check_global_limits(contact.ip, global_ip_count, global_subnet_count)
+        {
+            if let Some(bin) = self.bin.as_mut() {
+                if let Some(evicted_ip) = bin.replace_unverified(contact) {
+                    split_dropped_ips.push(evicted_ip);
+                    return AddResult::Added;
+                }
             }
         }
 
@@ -1132,6 +1190,16 @@ impl RoutingTable {
 
     pub fn len(&self) -> usize {
         self.root.get_num_contacts() as usize
+    }
+
+    /// Number of *verified* contacts in the table — those that completed the
+    /// Kad2 handshake and are therefore eligible for lookups/publishes (only
+    /// verified contacts are ever returned by `find_closest`). This is the
+    /// meaningful measure of whether we can actually participate in the DHT,
+    /// as opposed to `len()` which also counts unverified contacts learned
+    /// from FindNode responses but not yet confirmed.
+    pub fn verified_len(&self) -> usize {
+        self.all_contacts().filter(|c| c.verified).count()
     }
 
     pub fn is_empty(&self) -> bool {
