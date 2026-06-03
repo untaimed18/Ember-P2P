@@ -3911,6 +3911,35 @@
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
   }
+  /* Numeric columns render their values right-aligned (.num-cell), but the
+     default header is flush-left, so the label drifted to the opposite edge
+     of the column from its values. Right-align every numeric column header
+     and drop its right padding to the cells' 6px inset so each label sits
+     directly above its values. We align to the cells (rather than padding
+     the cells out to the header's 16px) so the narrow size/speed columns
+     keep their full content width and never truncate. Listed per table:
+     downloads, uploads, queue, known clients, and download clients. */
+  .transfer-table th.col-dl-size,
+  .transfer-table th.col-dl-speed,
+  .transfer-table th.col-dl-sources,
+  .transfer-table th.col-dl-remain,
+  .transfer-table th.col-ul-speed,
+  .transfer-table th.col-ul-size,
+  .transfer-table th.col-ul-total,
+  .transfer-table th.col-ul-uptime,
+  .transfer-table th.col-q-wait,
+  .transfer-table th.col-q-rank,
+  .transfer-table th.col-q-score,
+  .transfer-table th.col-q-hist,
+  .transfer-table th.col-k-up,
+  .transfer-table th.col-k-down,
+  .transfer-table th.col-k-score,
+  .transfer-table th.col-c-speed,
+  .transfer-table th.col-c-down,
+  .transfer-table th.col-c-parts {
+    text-align: right;
+    padding-right: 6px;
+  }
   .client-cell {
     color: var(--text-secondary);
     overflow: hidden;
