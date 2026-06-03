@@ -209,6 +209,31 @@
 
   // --- Search / Type filter ---
   let searchQuery = $state('');
+  // Debounced mirror of `searchQuery`. The heavy filter+sort pipeline keys
+  // off this rather than the raw input so that typing into the search box
+  // doesn't re-filter and re-sort the whole library (up to ~50k rows) on
+  // every keystroke. Immediate UI affordances (clear button, Escape, the
+  // "active filters" chip) still read `searchQuery` directly.
+  let debouncedQuery = $state('');
+  let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  $effect(() => {
+    const q = searchQuery;
+    if (searchDebounceTimer) {
+      clearTimeout(searchDebounceTimer);
+      searchDebounceTimer = null;
+    }
+    // Apply the first character of a new query (and restored filters on
+    // mount, where debouncedQuery is still '') synchronously so results
+    // appear instantly; debounce only the rapid follow-up keystrokes.
+    if (debouncedQuery === '') {
+      debouncedQuery = q;
+      return;
+    }
+    searchDebounceTimer = setTimeout(() => {
+      searchDebounceTimer = null;
+      debouncedQuery = q;
+    }, 150);
+  });
   let searchInputEl: HTMLInputElement | undefined = $state(undefined);
   const typeFilterOptions = ['All', 'Audio', 'Video', 'Image', 'Archive', 'Document', 'CD/DVD'] as const;
   type TypeFilter = (typeof typeFilterOptions)[number];
@@ -217,10 +242,18 @@
   let showMissingOnly = $state(false);
   let missingPathSet: Set<string> = $state(new Set());
   let missingScanInFlight = false;
+  // `scanMissingFiles` stats every shared file on disk, so it must not run on
+  // every data refresh — and `refresh()` itself fires every 3s while hashing.
+  // Throttle background scans to once per interval; user-initiated paths pass
+  // `force` to bypass it (e.g. right after removing missing entries).
+  let lastMissingScanAt = 0;
+  const MISSING_SCAN_MIN_INTERVAL_MS = 30_000;
 
-  async function refreshMissingSet() {
+  async function refreshMissingSet(force = false) {
     if (missingScanInFlight) return;
+    if (!force && Date.now() - lastMissingScanAt < MISSING_SCAN_MIN_INTERVAL_MS) return;
     missingScanInFlight = true;
+    lastMissingScanAt = Date.now();
     try {
       const list = await scanMissingFiles();
       if (!mounted) return;
@@ -444,7 +477,7 @@
   // files in the library). Collapsing to one `.filter` also lets the JIT
   // fuse the hot path and cuts one dependency read per skipped row.
   let filteredFiles = $derived.by(() => {
-    const q = searchQuery.trim().toLowerCase();
+    const q = debouncedQuery.trim().toLowerCase();
     const hasFolder = !!filterFolder;
     const folder = filterFolder;
     const hasQuery = q.length > 0;
@@ -497,6 +530,19 @@
   let checkedCount = $derived.by(() => {
     let n = 0;
     for (const f of sortedFiles) if (checkedPaths.has(f.path)) n++;
+    return n;
+  });
+  // Selections persist across filter changes, but bulk actions only operate on
+  // rows currently in `sortedFiles` (see getCheckedFiles). Count how many
+  // checked files exist in the library yet are hidden by the active filter so
+  // the bulk bar can warn rather than silently acting on a subset.
+  let checkedHiddenCount = $derived.by(() => {
+    if (!hasActiveLibraryFilters || checkedPaths.size === 0) return 0;
+    const visible = new Set(sortedFiles.map((f) => f.path));
+    let n = 0;
+    for (const p of checkedPaths) {
+      if (!visible.has(p) && fileByPath.has(p)) n++;
+    }
     return n;
   });
 
@@ -661,24 +707,43 @@
 
   const priorityOrder: Record<string, number> = { verylow: 0, low: 1, normal: 2, high: 3, release: 4, auto: 5 };
 
+  // One reused collator instead of an implicit `String.prototype.localeCompare`
+  // collator per comparison (which, on a 50k-row sort, is hundreds of
+  // thousands of allocations). `numeric: true` also gives natural ordering so
+  // "File2" sorts before "File10", and `sensitivity: 'base'` makes the sort
+  // case/accent-insensitive the way users expect from a file manager.
+  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
   let sortedFiles = $derived.by(() => {
     const copy = [...filteredFiles];
+    const dir = sortAsc ? 1 : -1;
     copy.sort((a, b) => {
       let cmp = 0;
       switch (sortField) {
-        case 'name': cmp = a.name.localeCompare(b.name); break;
+        case 'name': cmp = collator.compare(a.name, b.name); break;
         case 'size': cmp = a.size - b.size; break;
-        case 'extension': cmp = a.extension.localeCompare(b.extension); break;
+        case 'extension': cmp = collator.compare(a.extension, b.extension); break;
         case 'priority': cmp = (priorityOrder[a.priority] ?? 2) - (priorityOrder[b.priority] ?? 2); break;
-        case 'hash': cmp = a.hash.localeCompare(b.hash); break;
+        case 'hash': cmp = collator.compare(a.hash, b.hash); break;
         case 'requests': cmp = a.requests - b.requests; break;
         case 'accepted': cmp = a.accepted - b.accepted; break;
         case 'bytes_transferred': cmp = a.bytes_transferred - b.bytes_transferred; break;
-        case 'folder': cmp = a.folder.localeCompare(b.folder); break;
+        case 'folder': cmp = collator.compare(a.folder, b.folder); break;
         case 'complete_sources': cmp = a.complete_sources - b.complete_sources; break;
         case 'modified_at': cmp = (a.modified_at || 0) - (b.modified_at || 0); break;
       }
-      return sortAsc ? cmp : -cmp;
+      // Stable, deterministic ordering for ties: fall back to the file name
+      // (and then the full path, which is unique) so equal sizes/priorities/
+      // dates don't render in arbitrary order. The tiebreakers always read
+      // ascending regardless of the primary sort direction so names stay A→Z.
+      if (cmp === 0) {
+        if (sortField !== 'name') {
+          const byName = collator.compare(a.name, b.name);
+          if (byName !== 0) return byName;
+        }
+        return collator.compare(a.path, b.path);
+      }
+      return dir * cmp;
     });
     return copy;
   });
@@ -1431,6 +1496,7 @@
       destroyed = true;
       clearInterval(scanPoll);
       if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
+      if (searchDebounceTimer) { clearTimeout(searchDebounceTimer); searchDebounceTimer = null; }
       if (commentSaveTimer) {
         clearTimeout(commentSaveTimer);
         commentSaveTimer = null;
@@ -1953,6 +2019,19 @@
     {#if checkedCount > 0}
       <div class="bulk-action-bar">
         <span class="bulk-count">{checkedCount === 1 ? m.library_bulk_count_one() : m.library_bulk_count_other({ count: checkedCount })}</span>
+        {#if checkedHiddenCount > 0}
+          <button
+            type="button"
+            class="bulk-hidden-note"
+            onclick={clearLibraryFilters}
+            title={m.library_bulk_hidden_title({ shown: checkedCount.toLocaleString() })}
+          >
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
+              <path d="M2 3h12l-4.5 5.5V13l-3 1.5V8.5z"/>
+            </svg>
+            {checkedHiddenCount === 1 ? m.library_bulk_hidden_one() : m.library_bulk_hidden_other({ count: checkedHiddenCount.toLocaleString() })}
+          </button>
+        {/if}
         <div class="bulk-prio-group">
           <span class="bulk-label">{m.library_bulk_priority_label()}</span>
           {#each ['verylow', 'low', 'normal', 'high', 'release', 'auto'] as p}
@@ -2879,6 +2958,31 @@
     font-weight: 600;
     color: var(--accent);
     margin-right: 4px;
+  }
+  .bulk-hidden-note {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--warning, #e0a030);
+    background: color-mix(in srgb, var(--warning, #e0a030) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning, #e0a030) 30%, transparent);
+    border-radius: 999px;
+    padding: 1px 8px;
+    margin-right: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    font-family: inherit;
+    transition: background 0.12s ease, border-color 0.12s ease;
+  }
+  .bulk-hidden-note:hover {
+    background: color-mix(in srgb, var(--warning, #e0a030) 24%, transparent);
+    border-color: color-mix(in srgb, var(--warning, #e0a030) 55%, transparent);
+  }
+  .bulk-hidden-note:focus-visible {
+    outline: 2px solid var(--warning, #e0a030);
+    outline-offset: 1px;
   }
   .bulk-label {
     color: var(--text-muted);
