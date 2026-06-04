@@ -29,6 +29,13 @@ export interface PeerReputationInfo {
 export interface ReputationStatsInfo {
   tracked_peers: number;
   banned_peers: number;
+  /**
+   * Total IP addresses in the enforced ban set — manual bans plus the
+   * automatic IP bans (request flooding, sustained corruption) that
+   * don't go through the per-user-hash reputation tracker. Distinct
+   * from `banned_peers`, which only counts reputation-threshold bans.
+   */
+  banned_ips: number;
 }
 
 /**

@@ -383,15 +383,21 @@ impl CreditManager {
                                 out.extend_from_slice(&self.our_public_key);
                                 out.extend_from_slice(&(self.our_private_key.len() as u32).to_le_bytes());
                                 out.extend_from_slice(&self.our_private_key);
-                                let protected = crate::storage::secret_store::protect(&out);
-                                if let Err(e) = crate::security::atomic_write(&key_path, &protected, true) {
-                                    tracing::warn!(
-                                        "Failed to persist protected/normalised keypair: {e}"
-                                    );
-                                } else if migrated {
-                                    tracing::info!(
-                                        "Migrated cryptkey.dat public key from PKCS#1 to SPKI"
-                                    );
+                                match crate::storage::secret_store::protect(&out) {
+                                    Ok(protected) => {
+                                        if let Err(e) = crate::security::atomic_write(&key_path, &protected, true) {
+                                            tracing::warn!(
+                                                "Failed to persist protected/normalised keypair: {e}"
+                                            );
+                                        } else if migrated {
+                                            tracing::info!(
+                                                "Migrated cryptkey.dat public key from PKCS#1 to SPKI"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => tracing::error!(
+                                        "Not persisting cryptkey.dat: {e}"
+                                    ),
                                 }
                             }
                             return;
@@ -413,10 +419,12 @@ impl CreditManager {
             out.extend_from_slice(&self.our_public_key);
             out.extend_from_slice(&(self.our_private_key.len() as u32).to_le_bytes());
             out.extend_from_slice(&self.our_private_key);
-            let protected = crate::storage::secret_store::protect(&out);
-            match crate::security::atomic_write(&key_path, &protected, true) {
-                Ok(()) => tracing::info!("Generated and saved new RSA keypair to {}", key_path.display()),
-                Err(e) => tracing::warn!("Failed to save RSA keypair: {e}"),
+            match crate::storage::secret_store::protect(&out) {
+                Ok(protected) => match crate::security::atomic_write(&key_path, &protected, true) {
+                    Ok(()) => tracing::info!("Generated and saved new RSA keypair to {}", key_path.display()),
+                    Err(e) => tracing::warn!("Failed to save RSA keypair: {e}"),
+                },
+                Err(e) => tracing::error!("Not persisting RSA keypair: {e}"),
             }
         }
     }

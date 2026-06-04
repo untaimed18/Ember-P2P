@@ -5617,6 +5617,17 @@ async fn download_parts_from_source(
                         if opcode == OP_COMPRESSEDPART_I64 {
                             parse_compressed_part_i64(&payload)?
                         } else {
+                            // D19 (compressed): mirror the OP_SENDINGPART guard
+                            // above. eMule uses OP_COMPRESSEDPART_I64 for files
+                            // over 4 GiB; a 32-bit frame would have its start
+                            // offset truncated by parse_compressed_part_32 and
+                            // mis-write the .part. Reject rather than wrap.
+                            if file_size > u32::MAX as u64 {
+                                anyhow::bail!(
+                                    "source {_src_idx} sent 32-bit OP_COMPRESSEDPART for a {}-byte file (requires I64)",
+                                    file_size
+                                );
+                            }
                             parse_compressed_part_32(&payload)?
                         };
                     if hash != *file_hash {

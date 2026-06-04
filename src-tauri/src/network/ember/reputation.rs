@@ -197,6 +197,23 @@ impl ReputationManager {
         self.peers.values().filter(|p| p.is_banned(now)).count()
     }
 
+    /// Clear an active ban for a specific peer (manual unban from the UI).
+    /// Resets `banned_until` and pulls the score back above the ban
+    /// threshold so the peer isn't immediately re-banned by stale
+    /// negative score. Returns `true` if the peer had a record. No-op if
+    /// the peer is unknown.
+    pub fn clear_ban(&mut self, node_id: &[u8; 16]) -> bool {
+        if let Some(peer) = self.peers.get_mut(node_id) {
+            peer.banned_until = None;
+            if peer.score <= BAN_THRESHOLD {
+                peer.score = BAN_THRESHOLD + 1;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Lift bans that have expired.
     pub fn lift_expired_bans(&mut self) {
         let now = now_secs();

@@ -80,12 +80,12 @@
     void loadUpnpSetting();
     const connected = $networkStats.status === 'connected' || $networkStats.status === 'connecting';
     loading = connected;
-    // K26: only the $effect below drives refreshes. Kicking a refresh
-    // from onMount and from the effect caused a double refresh on
-    // mount-while-already-connected.
-    if (connected) {
-      refreshTimer = setInterval(tickRefresh, 5000);
-    }
+    // K26: the $effect below is the single owner of the refresh timer.
+    // onMount must NOT also create one — when the effect runs first and
+    // sets `refreshTimer`, an unconditional assignment here would
+    // overwrite the handle and leak the effect's interval (duplicate
+    // polling until unmount). The effect fires on mount too, so a
+    // connected-at-mount page still starts polling immediately.
 
     const onVisibility = () => { pageVisible = document.visibilityState === 'visible'; };
     pageVisible = document.visibilityState === 'visible';
