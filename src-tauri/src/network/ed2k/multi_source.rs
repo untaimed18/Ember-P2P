@@ -2873,7 +2873,10 @@ fn append_compressed_chunk_ms(
         );
     }
     if accumulated >= total_packed {
-        let data = &entry.compressed;
+        // Decompress exactly the declared packed size (see transfer.rs): the
+        // over-accumulation slack must not be fed to zlib, or trailing padding
+        // can corrupt the decompressed length and .part write.
+        let data = &entry.compressed[..total_packed];
         let decompressed = decompress_ed2k_part_ms(data)?;
         pending.remove(&start);
         Ok(Some(decompressed))
@@ -5559,34 +5562,55 @@ async fn download_parts_from_source(
                     consecutive_bad_blocks = 0;
                     bw.acquire_download(piece_len).await;
 
-                    // D20: only commit the fill_range to the tracker if the
-                    // disk write actually succeeded. The PartFileWriter
-                    // serializes the writes for us — this `await` is just
-                    // an mpsc round-trip, not a global file lock acquisition.
-                    if let Err(e) = output.write(start, data.to_vec()).await {
-                        tracing::warn!(
-                            "source {_src_idx}: disk write failed at start={start} ({piece_len} bytes): {e}"
+                    // D21: never overwrite bytes we already have. With several
+                    // sources in flight (and cross-part pipelining), source B
+                    // can deliver a block covering a range source A already
+                    // wrote — and possibly already MD4-verified. `fill_range`
+                    // leaves `part_verified` set when a write adds no new bytes,
+                    // so re-writing that range would silently replace
+                    // verified-good data on disk (which the upload path then
+                    // serves as safe). Only write/record bytes that overlap a
+                    // gap; duplicate bytes still flow through the request-
+                    // pipeline bookkeeping below (skipping it here could stall
+                    // the pipeline refill that keys off blocks_received).
+                    let fillable = {
+                        let t = tracker.read().await;
+                        t.newly_fillable(start, end)
+                    };
+                    if fillable > 0 {
+                        // D20: only commit the fill_range to the tracker if the
+                        // disk write actually succeeded. The PartFileWriter
+                        // serializes the writes for us — this `await` is just
+                        // an mpsc round-trip, not a global file lock acquisition.
+                        if let Err(e) = output.write(start, data.to_vec()).await {
+                            tracing::warn!(
+                                "source {_src_idx}: disk write failed at start={start} ({piece_len} bytes): {e}"
+                            );
+                            continue;
+                        }
+
+                        // Update byte-level gap tracker for mid-part resume.
+                        // Only reached when the disk write succeeded.
+                        {
+                            let mut t = tracker.write().await;
+                            t.fill_range(start, end);
+                        }
+
+                        if let (Some(ref etx), std::net::IpAddr::V4(v4)) = (&event_tx, addr.ip()) {
+                            let _ = etx
+                                .send(DownloadEvent::DataReceived {
+                                    file_hash: *file_hash,
+                                    start,
+                                    end,
+                                    sender_ip: v4,
+                                    sender_user_hash: Some(peer_user_hash),
+                                })
+                                .await;
+                        }
+                    } else {
+                        tracing::trace!(
+                            "source {_src_idx}: duplicate block at start={start} ({piece_len} bytes) — range already present, not rewriting"
                         );
-                        continue;
-                    }
-
-                    // Update byte-level gap tracker for mid-part resume.
-                    // Only reached when the disk write succeeded.
-                    {
-                        let mut t = tracker.write().await;
-                        t.fill_range(start, end);
-                    }
-
-                    if let (Some(ref etx), std::net::IpAddr::V4(v4)) = (&event_tx, addr.ip()) {
-                        let _ = etx
-                            .send(DownloadEvent::DataReceived {
-                                file_hash: *file_hash,
-                                start,
-                                end,
-                                sender_ip: v4,
-                                sender_user_hash: Some(peer_user_hash),
-                            })
-                            .await;
                     }
 
                     if !got_any_data {

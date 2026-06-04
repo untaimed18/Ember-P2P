@@ -286,16 +286,14 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
             let sender_id = KadId::read_from(cursor)?;
             let tcp_port = cursor.read_u16::<LittleEndian>()?;
             let version = cursor.read_u8()?;
+            // Cap the parsed count at 200 (sanity bound + allocation cap), then
+            // read exactly that many fixed-size contacts, failing on truncation
+            // rather than silently accepting a partial list as complete.
             let count = cursor.read_u16::<LittleEndian>()? as usize;
-            let mut contacts = Vec::with_capacity(count.min(200));
-            for _ in 0..count.min(200) {
-                match KadContact::read_from(cursor) {
-                    Ok(c) => contacts.push(c),
-                    Err(e) => {
-                        tracing::debug!("Stopping bootstrap contact parse ({} parsed so far): {e}", contacts.len());
-                        break;
-                    }
-                }
+            let take = count.min(200);
+            let mut contacts = Vec::with_capacity(take);
+            for _ in 0..take {
+                contacts.push(KadContact::read_from(cursor)?);
             }
             Ok(KadMessage::BootstrapRes {
                 sender_id,
@@ -350,15 +348,15 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
 
         KADEMLIA2_RES => {
             let target = KadId::read_from(cursor)?;
+            // `count` is a u8 (≤ 255) and each contact is a fixed 25-byte
+            // record, so `with_capacity(count)` is not an allocation risk.
+            // Read exactly `count` contacts and fail (via `?`) if the packet is
+            // truncated — previously a short/hostile packet was silently
+            // accepted as a partial-but-"complete" contact list.
             let count = cursor.read_u8()? as usize;
-            let remaining_bytes = cursor.get_ref().len() as u64 - cursor.position();
-            let capped_count = count.min((remaining_bytes / 25) as usize);
-            let mut contacts = Vec::with_capacity(capped_count);
-            for _ in 0..capped_count {
-                match KadContact::read_from(cursor) {
-                    Ok(c) => contacts.push(c),
-                    Err(_) => break,
-                }
+            let mut contacts = Vec::with_capacity(count);
+            for _ in 0..count {
+                contacts.push(KadContact::read_from(cursor)?);
             }
             Ok(KadMessage::KadRes { target, contacts })
         }
@@ -532,15 +530,10 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
         KADEMLIA_BOOTSTRAP_REQ_OLD => Ok(KadMessage::BootstrapReq),
         KADEMLIA_BOOTSTRAP_RES_OLD => {
             let count = cursor.read_u16::<LittleEndian>()? as usize;
-            let mut contacts = Vec::with_capacity(count.min(200));
-            for _ in 0..count.min(200) {
-                match KadContact::read_from(cursor) {
-                    Ok(c) => contacts.push(c),
-                    Err(e) => {
-                        tracing::debug!("Stopping legacy bootstrap contact parse ({} parsed so far): {e}", contacts.len());
-                        break;
-                    }
-                }
+            let take = count.min(200);
+            let mut contacts = Vec::with_capacity(take);
+            for _ in 0..take {
+                contacts.push(KadContact::read_from(cursor)?);
             }
             Ok(KadMessage::BootstrapRes {
                 sender_id: KadId::zero(),
