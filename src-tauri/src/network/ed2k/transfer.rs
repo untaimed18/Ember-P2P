@@ -275,6 +275,17 @@ pub enum DownloadEvent {
         part_index: u32,
         failed_ip: std::net::Ipv4Addr,
     },
+    /// A peer broke the ed2k wire protocol badly enough that we tore the
+    /// connection down — currently a run of consecutive structurally
+    /// invalid data blocks (bad offsets / over-long compressed chunks),
+    /// which a well-behaved client never sends. The network loop feeds
+    /// this into the reputation tracker as a `ProtocolViolation`, so a
+    /// peer that repeatedly does this is eventually banned rather than
+    /// just disconnected and immediately retried.
+    ProtocolViolation {
+        sender_ip: std::net::Ipv4Addr,
+        sender_user_hash: Option<[u8; 16]>,
+    },
 }
 
 /// Shared pending AICH recovery retries: `(file_hash, part_index) -> (failed_ips, retry_count)`.
@@ -2432,6 +2443,14 @@ impl Ed2kDownload {
                                 consecutive_bad_blocks += 1;
                                 warn!("Invalid block offsets: start={start}, end={end}, data_len={}, file_size={} (bad streak: {consecutive_bad_blocks})", data.len(), self.file_size);
                                 if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                                    if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
+                                        let _ = event_tx
+                                            .send(DownloadEvent::ProtocolViolation {
+                                                sender_ip: v4,
+                                                sender_user_hash: Some(peer_user_hash),
+                                            })
+                                            .await;
+                                    }
                                     anyhow::bail!("peer sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
                                 }
                                 continue;
@@ -2491,6 +2510,19 @@ impl Ed2kDownload {
                                 if opcode == OP_COMPRESSEDPART_I64 {
                                     parse_compressed_part_i64(&payload)?
                                 } else {
+                                    // D19 (compressed): a 32-bit OP_COMPRESSEDPART
+                                    // cannot address past 4 GiB. eMule sends
+                                    // OP_COMPRESSEDPART_I64 for large files (see
+                                    // CUpDownClient::CreatePackedPackets), so a
+                                    // 32-bit frame for a >4 GiB file would have its
+                                    // start offset truncated by parse_compressed_part_32
+                                    // and mis-write the .part. Reject rather than wrap.
+                                    if self.file_size > u32::MAX as u64 {
+                                        anyhow::bail!(
+                                            "peer sent 32-bit OP_COMPRESSEDPART for a {}-byte file (requires I64)",
+                                            self.file_size
+                                        );
+                                    }
                                     parse_compressed_part_32(&payload)?
                                 };
                             if hash != self.file_hash {
@@ -2515,6 +2547,14 @@ impl Ed2kDownload {
                                 consecutive_bad_blocks += 1;
                                 warn!("Compressed block exceeds file size: start={start}, len={piece_len}, file_size={} (bad streak: {consecutive_bad_blocks})", self.file_size);
                                 if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                                    if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
+                                        let _ = event_tx
+                                            .send(DownloadEvent::ProtocolViolation {
+                                                sender_ip: v4,
+                                                sender_user_hash: Some(peer_user_hash),
+                                            })
+                                            .await;
+                                    }
                                     anyhow::bail!("peer sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
                                 }
                                 continue;

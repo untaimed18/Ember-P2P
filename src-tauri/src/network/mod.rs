@@ -1906,6 +1906,11 @@ pub struct PeerReputationInfo {
 pub struct ReputationStatsInfo {
     pub tracked_peers: usize,
     pub banned_peers: usize,
+    /// Total IP addresses currently in the enforced ban set
+    /// (`state.banned_ips`): manual bans plus the automatic IP bans
+    /// (request flooding / corruption) that never touch the per-user-hash
+    /// reputation tracker, so `banned_peers` alone undercounts them.
+    pub banned_ips: usize,
 }
 
 struct PendingDownload {
@@ -3160,6 +3165,43 @@ fn kad_searches_snapshot(state: &NetworkState) -> Vec<KadSearchInfo> {
         .collect()
 }
 
+/// Apply a durable automatic IP ban: add it to the canonical in-memory
+/// ban set (`state.banned_ips`), mirror the whole set to the shared
+/// upload set, and persist it to the DB `banned_ips` table with a finite
+/// expiry. Persisting is what lets these bans survive both a process
+/// restart and the periodic `banned_ips` cap-reset (which rebuilds the
+/// in-memory set from the database). Used for the deterministic abuse
+/// auto-bans — request flooding and sustained corruption — that warrant
+/// surviving longer than a single session, as opposed to reputation
+/// bans whose lifetime is already governed (with its own TTL) by
+/// `reputation.json` + per-user-hash enforcement.
+fn apply_persistent_ip_ban(
+    banned_ips: &mut HashSet<Ipv4Addr>,
+    shared_banned_ips: &ed2k::upload::SharedBannedIps,
+    db: &Arc<Database>,
+    ip: Ipv4Addr,
+    reason: &str,
+) {
+    // 7 days: long enough to shrug off a determined abuser across
+    // restarts, short enough that the persistent ban list is
+    // self-healing and never grows without bound.
+    const AUTO_BAN_TTL_SECS: u64 = 7 * 24 * 3600;
+    if banned_ips.insert(ip) {
+        warn!("Auto-ban: banning IP {ip} ({reason})");
+    }
+    if let Ok(mut shared) = shared_banned_ips.write() {
+        *shared = banned_ips.clone();
+    }
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        .saturating_add(AUTO_BAN_TTL_SECS);
+    if let Err(e) = db.ban_ip(ip, reason, expires_at) {
+        warn!("Failed to persist auto-ban for {ip}: {e}");
+    }
+}
+
 async fn peers_snapshot(state: &NetworkState, db: &Arc<Database>) -> Vec<PeerInfo> {
     let mut peers: Vec<PeerInfo> = state
         .routing_table
@@ -3747,8 +3789,13 @@ pub async fn start_network(
         ip_filter.range_count(),
     );
 
-    // Extract banned peer IPs from the already-loaded peer list
-    let banned_ips: HashSet<Ipv4Addr> = saved_db_peers
+    // Extract banned peer IPs from the already-loaded peer list, then
+    // union in the persisted automatic IP bans (corruption / request
+    // flooding) from the dedicated `banned_ips` table. Both feed the
+    // same in-memory set so every enforcement path sees one combined
+    // ban list, and so the periodic cap-reset (which rebuilds from these
+    // same two sources) doesn't silently drop auto-bans.
+    let mut banned_ips: HashSet<Ipv4Addr> = saved_db_peers
         .iter()
         .filter(|p| p.banned)
         .filter_map(|p| {
@@ -3758,6 +3805,7 @@ pub async fn start_network(
             })
         })
         .collect();
+    banned_ips.extend(db.get_banned_ips().unwrap_or_default());
 
     // Extract banned user hashes for upload-only enforcement
     let banned_hashes: HashSet<[u8; 16]> = saved_db_peers
@@ -5831,14 +5879,17 @@ pub async fn start_network(
                 if let DownloadEvent::PartCorrupted { ref file_hash, part_start, part_end, ref sender_user_hash, .. } = event {
                     let ban_list = state.corruption_blackbox.corrupted_part(file_hash, part_start, part_end);
                     for ip in ban_list {
-                        if state.banned_ips.insert(ip) {
-                            warn!("Corruption blackbox: banning {} (high corruption ratio for file {})", ip, hex::encode(file_hash));
-                        }
-                    }
-                    if !state.banned_ips.is_empty() {
-                        if let Ok(mut shared) = shared_banned_ips.write() {
-                            *shared = state.banned_ips.clone();
-                        }
+                        // Sustained corruption is a deterministic, serious
+                        // signal — persist it so the ban survives a restart and
+                        // the periodic banned_ips cap reset.
+                        let reason = format!("corruption blackbox (high corruption ratio for file {})", hex::encode(file_hash));
+                        apply_persistent_ip_ban(
+                            &mut state.banned_ips,
+                            &shared_banned_ips,
+                            &db,
+                            ip,
+                            &reason,
+                        );
                     }
                     if let Some(ref uh) = sender_user_hash {
                         let newly_banned = state.reputation.record_event(uh, ember::reputation::ReputationEvent::CorruptData);
@@ -5854,6 +5905,38 @@ pub async fn start_network(
                             if let Ok(mut shared) = shared_banned_ips.write() {
                                 *shared = state.banned_ips.clone();
                             }
+                        }
+                    }
+                }
+                if let DownloadEvent::ProtocolViolation { sender_ip, ref sender_user_hash } = event {
+                    // Reputation-scored, not a deterministic abuse ban: a
+                    // single violation just nudges the score down, and only a
+                    // repeat offender crosses the ban threshold. We therefore
+                    // don't DB-persist here — reputation lifetime (and its
+                    // per-user-hash enforcement) is governed by reputation.json,
+                    // mirroring the other reputation-driven IP bans.
+                    if let Some(ref uh) = sender_user_hash {
+                        let newly_banned = state.reputation.record_event(uh, ember::reputation::ReputationEvent::ProtocolViolation);
+                        if newly_banned {
+                            if state.banned_ips.insert(sender_ip) {
+                                warn!("Reputation ban: banning IP {} (protocol violation, user_hash {})", sender_ip, hex::encode(uh));
+                            }
+                            let sm = source_manager.read().await;
+                            let ips = sm.find_ips_by_user_hash(uh);
+                            drop(sm);
+                            for ip in ips {
+                                state.banned_ips.insert(ip);
+                            }
+                            if let Ok(mut shared) = shared_banned_ips.write() {
+                                *shared = state.banned_ips.clone();
+                            }
+                        }
+                    } else if state.banned_ips.insert(sender_ip) {
+                        // No user hash to score against — fall back to a
+                        // direct IP ban for the offending source.
+                        warn!("Banning IP {} (protocol violation, no user hash)", sender_ip);
+                        if let Ok(mut shared) = shared_banned_ips.write() {
+                            *shared = state.banned_ips.clone();
                         }
                     }
                 }
@@ -6357,29 +6440,61 @@ pub async fn start_network(
                         drop(mgr);
                     }
                     UploadEventKind::Failed { .. } => {
-                        let mgr = transfer_manager.read().await;
-                        if let Some(t) = mgr.get_transfer(&event.transfer_id) {
-                            if let Some(ref uh_hex) = t.user_hash {
-                                if let Ok(bytes) = hex::decode(uh_hex) {
+                        // Pull the peer identity out first, then drop the
+                        // transfer-manager lock before touching the source
+                        // manager / reputation state.
+                        let peer_info: Option<([u8; 16], Option<Ipv4Addr>)> = {
+                            let mgr = transfer_manager.read().await;
+                            mgr.get_transfer(&event.transfer_id).and_then(|t| {
+                                t.user_hash.as_ref().and_then(|uh_hex| hex::decode(uh_hex).ok()).and_then(|bytes| {
                                     if bytes.len() == 16 {
                                         let mut uh = [0u8; 16];
                                         uh.copy_from_slice(&bytes);
-                                        let newly_banned = state.reputation.record_event(&uh, ember::reputation::ReputationEvent::FailedChunk);
-                                        if newly_banned {
-                                            if let Ok(peer_ip) = t.peer_id.split(':').next().unwrap_or("").parse::<Ipv4Addr>() {
-                                                if state.banned_ips.insert(peer_ip) {
-                                                    warn!("Reputation ban: banning IP {} (user_hash {})", peer_ip, uh_hex);
-                                                }
-                                                if let Ok(mut shared) = shared_banned_ips.write() {
-                                                    *shared = state.banned_ips.clone();
-                                                }
-                                            }
-                                        }
+                                        let peer_ip = t.peer_id.split(':').next().and_then(|s| s.parse::<Ipv4Addr>().ok());
+                                        Some((uh, peer_ip))
+                                    } else {
+                                        None
                                     }
+                                })
+                            })
+                        };
+                        if let Some((uh, peer_ip)) = peer_info {
+                            let newly_banned = state.reputation.record_event(&uh, ember::reputation::ReputationEvent::FailedChunk);
+                            if newly_banned {
+                                // Ban every known IP for this user hash (not just
+                                // the one address on the transfer row) so a
+                                // multi-homed peer can't keep going from another
+                                // address — matching the PartCorrupted path.
+                                let sm = source_manager.read().await;
+                                let mut ips = sm.find_ips_by_user_hash(&uh);
+                                drop(sm);
+                                if let Some(ip) = peer_ip {
+                                    if !ips.contains(&ip) {
+                                        ips.push(ip);
+                                    }
+                                }
+                                for ip in ips {
+                                    if state.banned_ips.insert(ip) {
+                                        warn!("Reputation ban: banning IP {} (user_hash {})", ip, hex::encode(uh));
+                                    }
+                                }
+                                if let Ok(mut shared) = shared_banned_ips.write() {
+                                    *shared = state.banned_ips.clone();
                                 }
                             }
                         }
-                        drop(mgr);
+                    }
+                    UploadEventKind::PeerAutoBanned { ip, reason } => {
+                        // The upload listener already added this to the
+                        // shared upload set for immediate effect; make it
+                        // canonical (UDP + download enforcement) and durable.
+                        apply_persistent_ip_ban(
+                            &mut state.banned_ips,
+                            &shared_banned_ips,
+                            &db,
+                            *ip,
+                            reason,
+                        );
                     }
                     _ => {}
                 }
@@ -9940,13 +10055,35 @@ pub async fn start_network(
                 // still in the database. The full ban persists in the DB.
                 const MAX_BANNED_IPS: usize = 10_000;
                 if state.banned_ips.len() > MAX_BANNED_IPS {
-                    let db_banned: HashSet<Ipv4Addr> = db.get_peers()
-                        .unwrap_or_default()
-                        .iter()
-                        .filter(|p| p.banned)
-                        .filter_map(|p| p.addresses.first().and_then(|a| a.rsplit_once(':').and_then(|(ip, _)| ip.parse().ok())))
-                        .collect();
-                    state.banned_ips = db_banned;
+                    // Rebuild the enforced set from the two durable sources
+                    // (manually-banned peer rows + the auto-ban table), but
+                    // ONLY if both DB reads succeed. On a transient DB error
+                    // we keep the current (oversized) in-memory set for this
+                    // cycle instead of replacing it with an empty/partial set
+                    // — dropping every live ban would be a fail-open. We also
+                    // union ALL addresses of each banned peer row (BanPeer
+                    // inserts all of them), not just the first.
+                    match (db.get_peers(), db.get_banned_ips()) {
+                        (Ok(peers), Ok(auto_bans)) => {
+                            let mut db_banned: HashSet<Ipv4Addr> = peers
+                                .iter()
+                                .filter(|p| p.banned)
+                                .flat_map(|p| p.addresses.iter())
+                                .filter_map(|a| a.rsplit_once(':').and_then(|(ip, _)| ip.parse().ok()))
+                                .collect();
+                            db_banned.extend(auto_bans);
+                            state.banned_ips = db_banned;
+                            if let Ok(mut shared) = shared_banned_ips.write() {
+                                *shared = state.banned_ips.clone();
+                            }
+                        }
+                        _ => {
+                            warn!(
+                                "banned_ips over cap ({}) but a DB read failed; keeping in-memory set this cycle",
+                                state.banned_ips.len()
+                            );
+                        }
+                    }
                 }
 
                 // Sweep orphaned Ember ping waiters. Each entry is created
@@ -13555,9 +13692,15 @@ pub async fn start_network(
                 stats_manager.save_cumulative(&db);
             }
 
-            // Periodic reputation maintenance (every 60s: lift bans)
+            // Periodic reputation maintenance (every 60s: lift expired
+            // bans and apply the hourly score decay). `maybe_decay`
+            // self-gates on DECAY_INTERVAL (1h), so calling it each minute
+            // is cheap and is what actually drives decay in production —
+            // nothing on the hot path calls `get_score` (the only other
+            // decay trigger), so without this scores never decayed.
             _ = reputation_timer.tick() => {
                 state.reputation.lift_expired_bans();
+                state.reputation.maybe_decay();
             }
 
             // Periodic reputation save (every 5 minutes)
@@ -15236,6 +15379,24 @@ async fn handle_udp_packet_inner(
     // warnings and waste cycles parsing garbage).
     if ember::transport::EmberTransport::is_ember_packet(data) {
         if settings.ember_native_enabled {
+            // Apply the same global per-IP UDP rate limit KAD traffic
+            // gets (opcode_hint 0xFF selects the global cap only — the
+            // per-opcode Layer-1 limits are KAD-specific). Without this,
+            // Ember-native UDP bypassed flood protection entirely and a
+            // peer could drive Noise handshakes at full line rate, which
+            // is pure CPU for us. The IP-filter + ban checks above already
+            // ran, so this only adds the rate gate.
+            let known_peer = match from.ip() {
+                std::net::IpAddr::V4(v4) => {
+                    state.routing_table.has_contact_ip(v4)
+                        || state.flood_protection.has_recent_ip(from.ip())
+                }
+                _ => state.flood_protection.has_recent_ip(from.ip()),
+            };
+            if state.flood_protection.check_rate_limit_with_opcode(from.ip(), known_peer, 0xFF) {
+                debug!("Rate limit exceeded for Ember UDP from {from}, dropping packet");
+                return;
+            }
             handle_ember_native_udp(socket, data, from, state).await;
         } else {
             debug!("Dropping Ember-magic UDP packet from {from}: ember_native_enabled=false");
@@ -18189,6 +18350,7 @@ async fn handle_command_inner(
             if let Some(kad_id) = KadId::from_hex(&peer_id_hex) {
                 if let Some(contact) = state.routing_table.get_contact(&kad_id) {
                     state.banned_ips.remove(&contact.ip);
+                    let _ = db.unban_ip(contact.ip);
                 }
             }
             if let Ok(peers) = db.get_peers() {
@@ -18198,6 +18360,8 @@ async fn handle_command_inner(
                             if let Some((ip_str, _)) = addr_str.rsplit_once(':') {
                                 if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
                                     state.banned_ips.remove(&ip);
+                                    // Also clear any persistent auto-ban for this IP.
+                                    let _ = db.unban_ip(ip);
                                 }
                             }
                         }
@@ -18207,10 +18371,16 @@ async fn handle_command_inner(
             if let Ok(mut shared) = shared_banned_ips.write() {
                 *shared = state.banned_ips.clone();
             }
-            // Also remove from upload-only banned set
+            // Also remove from upload-only banned set, and clear any
+            // reputation ban for this user hash — otherwise the source /
+            // callback paths (which gate on `reputation.is_banned`) would
+            // keep the peer blocked despite the UI showing them unbanned.
             if let Some(kad_id) = KadId::from_hex(&peer_id_hex) {
                 if let Ok(mut set) = shared_banned_hashes.write() {
                     set.remove(&kad_id.0);
+                }
+                if state.reputation.clear_ban(&kad_id.0) {
+                    debug!("Cleared reputation ban for {peer_id_hex}");
                 }
             }
             info!("Unbanned peer {peer_id_hex}");
@@ -19965,6 +20135,10 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::GetPeerReputation { user_hash, tx } => {
+            // Apply any pending hourly decay before snapshotting so the UI
+            // shows the same score the tracker would act on, not a stale
+            // pre-decay value.
+            state.reputation.maybe_decay();
             let info = state.reputation.get_peer(&user_hash).map(|p| {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -19986,6 +20160,7 @@ async fn handle_command_inner(
             let _ = tx.send(ReputationStatsInfo {
                 tracked_peers: state.reputation.tracked_count(),
                 banned_peers: state.reputation.banned_count(),
+                banned_ips: state.banned_ips.len(),
             });
         }
 
@@ -20412,6 +20587,7 @@ async fn handle_download_event(
         | DownloadEvent::PartCorrupted { .. }
         | DownloadEvent::AichRecoveryFailed { .. }
         | DownloadEvent::PartFileReady { .. }
+        | DownloadEvent::ProtocolViolation { .. }
         | DownloadEvent::FriendSeen { .. }
         | DownloadEvent::EmberChatMessage { .. }
         | DownloadEvent::EmberBrowseResponse { .. } => {
@@ -20582,6 +20758,7 @@ async fn handle_upload_event(
         | UploadEventKind::EmberBrowseResponse { .. }
         | UploadEventKind::EmberFriendDisconnected { .. }
         | UploadEventKind::EmberFriendSearchFailed { .. }
+        | UploadEventKind::PeerAutoBanned { .. }
         | UploadEventKind::EmberFriendRequest { .. } => {
             // Handled directly in the network event loop.
         }

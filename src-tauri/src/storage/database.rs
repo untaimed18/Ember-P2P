@@ -51,7 +51,7 @@ impl Database {
         // Ember build. Silently running would invite subtle data corruption
         // (missing columns, renamed tables, semantic changes). Bump this
         // when introducing a new migration.
-        const MAX_SUPPORTED_VERSION: i64 = 16;
+        const MAX_SUPPORTED_VERSION: i64 = 18;
         if version > MAX_SUPPORTED_VERSION {
             anyhow::bail!(
                 "Database schema version {version} is newer than this Ember build supports \
@@ -386,6 +386,35 @@ impl Database {
             tx.commit()?;
         }
 
+        if version < 18 {
+            // Persistent store for *automatic* IP bans (corruption
+            // blackbox, eMule-style AddRequestCount request-flooding).
+            // Kept deliberately separate from the `peers` table so
+            // machine-generated bans don't pollute the user-facing peer
+            // list (and so the manual ban/unban UI, which is keyed on a
+            // 32-hex user hash, never has to reason about bare IPs).
+            //
+            // `expires_at` is a Unix timestamp; 0 means "permanent".
+            // Auto-bans set a finite expiry so the list is self-healing
+            // and can't grow without bound the way the in-memory
+            // `banned_ips` cache could before this existed. The startup
+            // loader and the runtime `banned_ips` cap-reset both union
+            // the non-expired rows back into the live ban set, so these
+            // bans now survive both a restart and the 10k-entry cap
+            // reset that previously discarded them.
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS banned_ips (
+                    ip TEXT PRIMARY KEY,
+                    reason TEXT NOT NULL DEFAULT '',
+                    banned_at INTEGER NOT NULL DEFAULT 0,
+                    expires_at INTEGER NOT NULL DEFAULT 0
+                );",
+            )?;
+            set_version(&tx, 18)?;
+            tx.commit()?;
+        }
+
         Ok(())
     }
 
@@ -487,6 +516,55 @@ impl Database {
         Ok(())
     }
 
+    /// Persist an automatic IP ban. `expires_at` is a Unix timestamp
+    /// (0 = permanent). Re-banning an already-listed IP refreshes the
+    /// reason and extends the expiry, never shortening an existing
+    /// permanent ban down to a finite one.
+    pub fn ban_ip(&self, ip: std::net::Ipv4Addr, reason: &str, expires_at: u64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT INTO banned_ips (ip, reason, banned_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(ip) DO UPDATE SET
+               reason = excluded.reason,
+               expires_at = CASE
+                 WHEN banned_ips.expires_at = 0 OR excluded.expires_at = 0 THEN 0
+                 ELSE MAX(banned_ips.expires_at, excluded.expires_at)
+               END",
+            params![ip.to_string(), reason, now as i64, expires_at.min(i64::MAX as u64) as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Remove an automatic IP ban.
+    pub fn unban_ip(&self, ip: std::net::Ipv4Addr) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM banned_ips WHERE ip = ?1", params![ip.to_string()])?;
+        Ok(())
+    }
+
+    /// Load all auto-banned IPs that have not yet expired. Expired rows
+    /// are pruned as a side effect so the table stays bounded.
+    pub fn get_banned_ips(&self) -> anyhow::Result<Vec<std::net::Ipv4Addr>> {
+        let conn = self.conn.lock();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0) as i64;
+        conn.execute("DELETE FROM banned_ips WHERE expires_at != 0 AND expires_at <= ?1", params![now])?;
+        let mut stmt = conn.prepare("SELECT ip FROM banned_ips")?;
+        let ips = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .filter_map(|s| s.parse::<std::net::Ipv4Addr>().ok())
+            .collect();
+        Ok(ips)
+    }
+
     pub fn save_transfer(&self, transfer: &Transfer) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let direction: &str = match transfer.direction {
@@ -584,7 +662,11 @@ impl Database {
                         "hashing" => TransferStatus::Hashing,
                         "insufficient" => TransferStatus::Insufficient,
                         "noneneeded" => TransferStatus::NoneNeeded,
-                        _ => TransferStatus::Searching,
+                        // A corrupted or future-version status string must
+                        // not silently resume as an active "searching"
+                        // transfer (which would kick off network activity on
+                        // load). Fall back to the inert Stopped state.
+                        _ => TransferStatus::Stopped,
                     },
                     progress: row.get(7)?,
                     speed: row.get::<_, i64>(8)?.max(0) as u64,
@@ -1600,5 +1682,57 @@ mod tests {
 
         db.save_all_credits(&[]).expect("empty save");
         assert!(db.load_credits().expect("reload empty").is_empty());
+    }
+
+    /// In-memory `Database` with just the `banned_ips` table for
+    /// exercising the auto-ban persistence round-trip.
+    fn banned_ips_db() -> Database {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            "CREATE TABLE banned_ips (
+                ip TEXT PRIMARY KEY,
+                reason TEXT NOT NULL DEFAULT '',
+                banned_at INTEGER NOT NULL DEFAULT 0,
+                expires_at INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .expect("create schema");
+        Database { conn: Mutex::new(conn) }
+    }
+
+    #[test]
+    fn banned_ip_roundtrip_and_unban() {
+        let db = banned_ips_db();
+        let ip: std::net::Ipv4Addr = "203.0.113.7".parse().unwrap();
+        db.ban_ip(ip, "test", 0).expect("ban");
+        assert_eq!(db.get_banned_ips().expect("load"), vec![ip]);
+        db.unban_ip(ip).expect("unban");
+        assert!(db.get_banned_ips().expect("load after unban").is_empty());
+    }
+
+    #[test]
+    fn expired_bans_are_pruned_on_load() {
+        let db = banned_ips_db();
+        let live: std::net::Ipv4Addr = "203.0.113.1".parse().unwrap();
+        let expired: std::net::Ipv4Addr = "203.0.113.2".parse().unwrap();
+        let permanent: std::net::Ipv4Addr = "203.0.113.3".parse().unwrap();
+        db.ban_ip(live, "live", u64::MAX).expect("ban live");
+        db.ban_ip(expired, "expired", 1).expect("ban expired"); // expired far in the past
+        db.ban_ip(permanent, "permanent", 0).expect("ban permanent");
+        let mut loaded = db.get_banned_ips().expect("load");
+        loaded.sort();
+        assert_eq!(loaded, vec![live, permanent], "expired ban must be pruned");
+    }
+
+    /// Re-banning never shortens a permanent ban into a finite one, and
+    /// extends a finite ban to the later expiry.
+    #[test]
+    fn reban_expiry_merge_rules() {
+        let db = banned_ips_db();
+        let ip: std::net::Ipv4Addr = "203.0.113.9".parse().unwrap();
+        db.ban_ip(ip, "perm", 0).expect("perm");
+        db.ban_ip(ip, "finite", 100).expect("finite");
+        // Still permanent (present despite the finite re-ban being in the past).
+        assert_eq!(db.get_banned_ips().expect("load"), vec![ip]);
     }
 }

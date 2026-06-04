@@ -255,6 +255,24 @@ impl FileRequestTracker {
 
     fn cleanup_stale(&mut self) {
         self.entries.retain(|_, (t, _)| t.elapsed().as_secs() < 3600);
+        // Hard cap: a peer rotating through millions of distinct file
+        // hashes within the 1h window could otherwise grow this map
+        // without bound (cleanup_stale only drops entries older than 1h).
+        // When over the cap, keep the most-recently-active entries (those
+        // closest to a ban decision) and drop the oldest — dropping an old
+        // entry only resets a stale, near-expiry counter.
+        const MAX_FILE_REQUEST_ENTRIES: usize = 50_000;
+        if self.entries.len() > MAX_FILE_REQUEST_ENTRIES {
+            let mut by_age: Vec<((Ipv4Addr, [u8; 16]), std::time::Instant)> =
+                self.entries.iter().map(|(k, (t, _))| (*k, *t)).collect();
+            by_age.sort_by(|a, b| b.1.cmp(&a.1));
+            let keep: std::collections::HashSet<(Ipv4Addr, [u8; 16])> = by_age
+                .into_iter()
+                .take(MAX_FILE_REQUEST_ENTRIES)
+                .map(|(k, _)| k)
+                .collect();
+            self.entries.retain(|k, _| keep.contains(k));
+        }
     }
 }
 
@@ -412,6 +430,19 @@ pub enum UploadEventKind {
     /// state-mutation only and never reaches the UI.
     EmberFriendSearchFailed {
         ember_hash: [u8; 16],
+    },
+    /// The upload listener auto-banned an IP (eMule-style
+    /// AddRequestCount: a peer re-requesting the same file far too
+    /// frequently). Routed back to the network task so the ban lands in
+    /// the canonical `state.banned_ips` set — which is enforced on the
+    /// UDP and download paths and is the set every `*shared =
+    /// state.banned_ips.clone()` resync rebuilds from. Writing only to
+    /// the shared upload set (as this path used to) left the ban
+    /// invisible to those paths and made it vulnerable to being clobbered
+    /// by the next resync. The network task also persists it.
+    PeerAutoBanned {
+        ip: std::net::Ipv4Addr,
+        reason: String,
     },
 }
 
@@ -1465,6 +1496,32 @@ impl UploadHandler {
         Ok(())
     }
 
+    /// Route an upload-listener auto-ban (abuse tracker: request
+    /// flooding / hash probing) back to the network task so it lands in
+    /// the canonical `state.banned_ips` set (UDP + download enforcement)
+    /// and is persisted — mirroring the AddRequestCount path. ed2k is
+    /// IPv4-only, so a pure-IPv6 peer (which can't be ban-set keyed) is
+    /// dropped here; the abuse tracker's own per-connection enforcement
+    /// still applies in that case.
+    async fn emit_auto_ban(&self, ip: std::net::IpAddr, reason: &str) {
+        let v4 = match ip {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+        };
+        if let Some(v4) = v4 {
+            let _ = self
+                .upload_event_tx
+                .send(UploadEvent {
+                    transfer_id: String::new(),
+                    kind: UploadEventKind::PeerAutoBanned {
+                        ip: v4,
+                        reason: reason.to_string(),
+                    },
+                })
+                .await;
+        }
+    }
+
     async fn handle_connection(
         &self,
         stream: TcpStream,
@@ -1996,7 +2053,10 @@ impl UploadHandler {
         // count this as a real upload request for abuse tracking.
         {
             let mut tracker = self.abuse_tracker.lock().await;
-            if tracker.record_request(peer_addr.ip()) {
+            let banned = tracker.record_request(peer_addr.ip());
+            drop(tracker);
+            if banned {
+                self.emit_auto_ban(peer_addr.ip(), "excessive upload requests (rate limit)").await;
                 anyhow::bail!("auto-banned for excessive requests");
             }
         }
@@ -3029,7 +3089,11 @@ impl UploadHandler {
                             .await?;
                             {
                                 let mut tracker = self.abuse_tracker.lock().await;
-                                tracker.record_file_not_found(peer_addr.ip());
+                                let banned = tracker.record_file_not_found(peer_addr.ip());
+                                drop(tracker);
+                                if banned {
+                                    self.emit_auto_ban(peer_addr.ip(), "excessive file-not-found requests (hash probing)").await;
+                                }
                             }
                             current_file_hash = None;
                             total_size = 0;
@@ -3067,7 +3131,11 @@ impl UploadHandler {
                             .await?;
                             {
                                 let mut tracker = self.abuse_tracker.lock().await;
-                                tracker.record_file_not_found(peer_addr.ip());
+                                let banned = tracker.record_file_not_found(peer_addr.ip());
+                                drop(tracker);
+                                if banned {
+                                    self.emit_auto_ban(peer_addr.ip(), "excessive file-not-found requests (hash probing)").await;
+                                }
                             }
                             current_file_hash = None;
                             total_size = 0;
@@ -3125,9 +3193,24 @@ impl UploadHandler {
                             };
                             if should_ban {
                                 warn!("Banning {} for excessive file request frequency (AddRequestCount)", peer_addr);
+                                // Immediate local effect for the shared upload set so
+                                // any in-flight connection from this IP is rejected
+                                // right away...
                                 if let Ok(mut banned) = self.banned_ips.write() {
                                     banned.insert(peer_v4);
                                 }
+                                // ...and route it to the network task so it becomes
+                                // canonical (state.banned_ips, UDP + download
+                                // enforcement) and gets persisted. Without this the
+                                // direct write above is dropped by the next
+                                // `*shared = state.banned_ips.clone()` resync.
+                                let _ = self.upload_event_tx.send(UploadEvent {
+                                    transfer_id: String::new(),
+                                    kind: UploadEventKind::PeerAutoBanned {
+                                        ip: peer_v4,
+                                        reason: "excessive file request frequency (AddRequestCount)".to_string(),
+                                    },
+                                }).await;
                                 write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[]).await?;
                                 break;
                             }

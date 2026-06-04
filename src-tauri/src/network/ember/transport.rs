@@ -260,6 +260,15 @@ impl EmberTransport {
                 PendingHandshake::IkInitiator { queued, .. }
                 | PendingHandshake::XxInitiatorMsg1 { queued, .. }
                 | PendingHandshake::XxResponderMsg2 { queued, .. } => {
+                    // Bound per-peer queue: if the handshake stalls (the
+                    // peer never completes it), drop the oldest queued
+                    // payload instead of growing without limit. These are
+                    // best-effort outgoing app messages, so shedding the
+                    // stalest one is acceptable back-pressure.
+                    const MAX_QUEUED_PER_HANDSHAKE: usize = 64;
+                    if queued.len() >= MAX_QUEUED_PER_HANDSHAKE {
+                        queued.remove(0);
+                    }
                     queued.push(message.to_vec());
                     return OutgoingResult::Queued;
                 }

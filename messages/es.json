@@ -354,6 +354,8 @@
   "stats_session_tracker": "Rastreador de sesión",
   "stats_tracked_peers": "Pares rastreados",
   "stats_banned_peers": "Pares baneados",
+  "stats_banned_ips": "IP baneadas",
+  "stats_banned_ips_hint": "Direcciones IP actualmente bloqueadas, incluidos los baneos manuales y los automáticos por exceso de solicitudes o por enviar datos corruptos.",
 
   "security_title": "Seguridad",
   "security_loading": "Cargando datos del filtro IP…",

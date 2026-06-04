@@ -96,7 +96,47 @@ impl CorruptionBlackBox {
             corrupt: false,
         });
 
-        *self.records.entry(file_hash).or_default() = new_blocks;
+        let entry = self.records.entry(file_hash).or_default();
+        *entry = new_blocks;
+        // Bound per-file growth. A long multi-source download with heavy
+        // overlap can fragment the list into many small blocks. Once it
+        // grows large, collapse the verified blocks (which are never split
+        // again and only feed the per-IP byte denominator) into one
+        // aggregate per IP — lossless for the ban ratio, bounded in size.
+        const MAX_BLOCKS_BEFORE_COMPACT: usize = 4096;
+        if entry.len() > MAX_BLOCKS_BEFORE_COMPACT {
+            Self::compact(entry);
+        }
+    }
+
+    /// Merge each IP's verified blocks into a single aggregate block,
+    /// preserving total bytes. Verified blocks are skipped by
+    /// `record_data`'s overlap splitting and can never be re-marked
+    /// corrupt, so only their summed length matters (as the denominator
+    /// in `corrupted_part`'s ratio). Corrupt and not-yet-verified blocks
+    /// are preserved exactly.
+    fn compact(blocks: &mut Vec<RecordedBlock>) {
+        let mut verified_bytes: HashMap<Ipv4Addr, u64> = HashMap::new();
+        let mut kept: Vec<RecordedBlock> = Vec::new();
+        for b in blocks.drain(..) {
+            if b.verified && !b.corrupt {
+                *verified_bytes.entry(b.ip).or_default() += b.len();
+            } else {
+                kept.push(b);
+            }
+        }
+        for (ip, bytes) in verified_bytes {
+            if bytes > 0 {
+                kept.push(RecordedBlock {
+                    start: 0,
+                    end: bytes,
+                    ip,
+                    verified: true,
+                    corrupt: false,
+                });
+            }
+        }
+        *blocks = kept;
     }
 
     /// Marks all records overlapping [part_start, part_end) as verified (hash check passed).
