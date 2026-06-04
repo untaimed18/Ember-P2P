@@ -864,19 +864,33 @@
 
   async function stopSearch() {
     const t = activeTab;
-    if (!t?.isSearching) return;
-    clearSearchTimeoutForRequest(t.requestId);
-    try {
-      await cancelSearch(t.requestId);
-    } catch (e) {
-      console.error('Failed to cancel search:', e);
-    } finally {
-      patchSearchTabByRequestId(t.requestId, (tab) => ({
-        ...tab,
-        isSearching: false,
-        progress: null,
-      }));
+    if (!t) return;
+    // Nothing to stop if neither the primary search nor a server retry
+    // is in flight.
+    if (!t.isSearching && t.retryRequestId == null) return;
+    if (t.isSearching) {
+      clearSearchTimeoutForRequest(t.requestId);
+      try {
+        await cancelSearch(t.requestId);
+      } catch (e) {
+        console.error('Failed to cancel search:', e);
+      }
     }
+    // The server-retry leg can still be running after the primary
+    // search completed (isSearching === false); cancel it too so Stop
+    // actually stops all backend work for this tab.
+    if (t.retryRequestId != null) {
+      try {
+        await cancelSearch(t.retryRequestId);
+      } catch (e) {
+        console.error('Failed to cancel server retry:', e);
+      }
+    }
+    patchSearchTabByRequestId(t.requestId, (tab) => ({
+      ...tab,
+      isSearching: false,
+      progress: null,
+    }));
   }
 
   function dismissTabError() {

@@ -29,10 +29,18 @@ pub fn is_protected(stored: &[u8]) -> bool {
 }
 
 /// Wrap `plaintext` for at-rest storage. On success returns
-/// `MAGIC || ciphertext`. If protection is unavailable (non-Windows build, or
-/// a DPAPI failure), returns the plaintext unchanged so saving never fails —
-/// the restricted file ACL remains as the fallback control.
-pub fn protect(plaintext: &[u8]) -> Vec<u8> {
+/// `MAGIC || ciphertext`.
+///
+/// On Windows a DPAPI failure returns `Err` and the caller MUST NOT fall
+/// back to writing the secret unencrypted — silently persisting plaintext
+/// would defeat the whole point of the store (a copied key file would be
+/// usable on another account/machine). Failing the save and regenerating
+/// next launch is the safer degradation.
+///
+/// On non-Windows builds (developer/CI only — release ships Windows) this
+/// is a transparent pass-through and always succeeds; the restricted file
+/// ACL remains the control there.
+pub fn protect(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
     #[cfg(target_os = "windows")]
     {
         match win::protect(plaintext, ENTROPY) {
@@ -40,16 +48,17 @@ pub fn protect(plaintext: &[u8]) -> Vec<u8> {
                 let mut out = Vec::with_capacity(MAGIC.len() + ct.len());
                 out.extend_from_slice(MAGIC);
                 out.extend_from_slice(&ct);
-                return out;
+                Ok(out)
             }
-            Err(e) => {
-                tracing::warn!(
-                    "DPAPI protect failed ({e}); storing secret with restricted ACL only"
-                );
-            }
+            Err(e) => Err(anyhow::anyhow!(
+                "DPAPI protect failed ({e}); refusing to write secret material unencrypted"
+            )),
         }
     }
-    plaintext.to_vec()
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(plaintext.to_vec())
+    }
 }
 
 /// Inverse of [`protect`]. If `stored` begins with `MAGIC`, DPAPI-unprotect the
@@ -199,7 +208,7 @@ mod tests {
     #[test]
     fn roundtrip_protect_unprotect() {
         let secret = b"super secret key material \x00\x01\x02";
-        let wrapped = protect(secret);
+        let wrapped = protect(secret).expect("protect");
         let recovered = unprotect(&wrapped).expect("unprotect");
         assert_eq!(&recovered, secret);
     }
