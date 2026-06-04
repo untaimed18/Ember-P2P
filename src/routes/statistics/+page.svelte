@@ -357,12 +357,14 @@
     <!--
       Peer reputation snapshot. Surfaces the in-memory
       `ReputationTracker` state: how many peers we have behavioural
-      records for, and how many are currently banned. Banned count
-      coloured to draw attention — a non-zero value means the tracker
-      is actively filtering out misbehaving peers on this session.
-      Rendered only when we've had at least one successful fetch
-      (`repStats != null`) so a transient backend hiccup doesn't make
-      the row flash zeros and scare the user.
+      records for, how many are currently reputation-banned, and the
+      total enforced IP-ban count (which also includes automatic IP
+      bans — request flooding / corruption — that don't run through the
+      per-user-hash tracker). Banned counts are coloured to draw
+      attention — a non-zero value means we're actively filtering out
+      misbehaving peers. Rendered only when we've had at least one
+      successful fetch (`repStats != null`) so a transient backend
+      hiccup doesn't make the row flash zeros and scare the user.
     -->
     {#if repStats}
       <section class="card">
@@ -385,6 +387,12 @@
             <span class="rep-label">{m.stats_banned_peers()}</span>
             <span class="rep-value" class:rep-danger={repStats.banned_peers > 0}>
               {repStats.banned_peers.toLocaleString()}
+            </span>
+          </div>
+          <div class="rep-stat">
+            <span class="rep-label" title={m.stats_banned_ips_hint()}>{m.stats_banned_ips()}</span>
+            <span class="rep-value" class:rep-danger={repStats.banned_ips > 0}>
+              {repStats.banned_ips.toLocaleString()}
             </span>
           </div>
         </div>
@@ -613,12 +621,15 @@
     justify-content: start;
   }
 
-  /* Reputation row on the statistics page. Two stat pills side-by-side
-     mirrors the "total / active" pattern the overhead session row uses,
-     keeping visual rhythm consistent across the page. */
+  /* Reputation row on the statistics page. Stat pills side-by-side
+     mirror the "total / active" pattern the overhead session row uses,
+     keeping visual rhythm consistent across the page. Wraps so the
+     third "Banned IPs" pill drops to a new line on narrow widths
+     instead of overflowing the card. */
   .reputation-row {
     display: flex;
-    gap: 32px;
+    flex-wrap: wrap;
+    gap: 16px 32px;
     padding: 4px 0 2px;
   }
   .rep-stat {

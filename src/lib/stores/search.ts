@@ -192,12 +192,17 @@ export async function closeSearchTab(tabId: string): Promise<void> {
     } catch {
       /* best effort */
     }
-    if (tab.retryRequestId != null) {
-      try {
-        await cancelSearch(tab.retryRequestId);
-      } catch {
-        /* best effort */
-      }
+  }
+  // The server-retry leg often runs AFTER the primary search has
+  // finished (so `isSearching` is already false). Cancel it
+  // independently of `isSearching`, otherwise closing the tab would
+  // leave the backend retry running and its completion handlers firing
+  // against a tab that no longer exists.
+  if (tab.retryRequestId != null) {
+    try {
+      await cancelSearch(tab.retryRequestId);
+    } catch {
+      /* best effort */
     }
   }
   searchTabs.update((currentTabs) => currentTabs.filter((t) => t.id !== tabId));

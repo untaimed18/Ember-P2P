@@ -353,6 +353,8 @@
   "stats_session_tracker": "Session tracker",
   "stats_tracked_peers": "Tracked peers",
   "stats_banned_peers": "Banned peers",
+  "stats_banned_ips": "Banned IPs",
+  "stats_banned_ips_hint": "IP addresses currently blocked, including manual bans and automatic bans for request flooding or sending corrupt data.",
 
   "security_title": "Security",
   "security_loading": "Loading IP filter data…",

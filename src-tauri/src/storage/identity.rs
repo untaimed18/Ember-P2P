@@ -197,7 +197,7 @@ impl NodeIdentity {
 
                         if migrated {
                             let updated = serde_json::to_vec_pretty(&id)?;
-                            let protected = crate::storage::secret_store::protect(&updated);
+                            let protected = crate::storage::secret_store::protect(&updated)?;
                             crate::security::atomic_write(&path, &protected, true)?;
                         }
                         info!("Loaded persistent identity (KAD ID={}…)", &hex::encode(id.kad_id)[..4]);
@@ -230,7 +230,7 @@ impl NodeIdentity {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let id = Self::generate();
                 let data = serde_json::to_vec_pretty(&id)?;
-                let protected = crate::storage::secret_store::protect(&data);
+                let protected = crate::storage::secret_store::protect(&data)?;
                 std::fs::create_dir_all(data_dir)?;
                 crate::security::atomic_write(&path, &protected, true)?;
                 info!("Generated new identity (KAD ID={}…)", &hex::encode(id.kad_id)[..4]);
