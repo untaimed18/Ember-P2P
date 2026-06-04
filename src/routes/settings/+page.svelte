@@ -542,8 +542,13 @@
         text,
       };
       showSaveMsg(text, true, 5000);
-      // Revert UI toggle state since the backend refused the change.
+      // Revert UI toggle state since the backend refused the change. Keep the
+      // sync-effect baseline aligned with the reverted value so the effect does
+      // NOT immediately re-fire with the opposite `want` — otherwise a backend
+      // that keeps failing would make the toggle oscillate, hammering the
+      // backend with alternating enable/disable calls.
       if (settings) settings.antileech_enabled = !checked;
+      lastAppliedAntileechToggle = !checked;
     }
   }
 

@@ -228,7 +228,7 @@ pub async fn add_shared_folder(
     let cancel_key = canonical_str.clone();
     cancel_flags.write().await.insert(cancel_key.clone(), cancel_flag.clone());
 
-    tokio::spawn(async move {
+    let scan_handle = tokio::spawn(async move {
         scanning.fetch_add(1, Ordering::Relaxed);
         let _scan_guard = ScanGuard(scanning.clone());
 
@@ -409,6 +409,11 @@ pub async fn add_shared_folder(
         }));
         drop(_scan_guard);
     });
+
+    // Track the scan so shutdown can wait for it (and abort it after the grace
+    // window) instead of flushing local_index / known.met while a discovery +
+    // hash walk is still mutating them.
+    state.register_background_scan(scan_handle).await;
 
     Ok(())
 }
@@ -745,7 +750,7 @@ pub async fn reload_shared_files(
         flags.insert(reload_key.clone(), cancel_flag.clone());
     }
 
-    tokio::spawn(async move {
+    let scan_handle = tokio::spawn(async move {
         scanning.fetch_add(1, Ordering::Relaxed);
         let _scan_guard = ScanGuard(scanning.clone());
 
@@ -930,6 +935,10 @@ pub async fn reload_shared_files(
         }));
         drop(_scan_guard);
     });
+
+    // Track the reload scan so shutdown can wait for / abort it before the
+    // on-exit known.met / local_index flush (see add_shared_folder).
+    state.register_background_scan(scan_handle).await;
 
     Ok(())
 }

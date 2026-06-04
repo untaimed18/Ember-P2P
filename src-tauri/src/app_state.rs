@@ -99,10 +99,14 @@ pub struct AppState {
 impl AppState {
     /// Register a background scan task so it can be awaited on shutdown.
     /// The caller spawns with `tokio::spawn` and passes the returned handle.
-    #[allow(dead_code)]
     pub async fn register_background_scan(&self, handle: tokio::task::JoinHandle<()>) -> u64 {
         let id = self.background_scan_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64;
-        self.background_scans.write().await.insert(id, handle);
+        let mut map = self.background_scans.write().await;
+        // Reap already-finished scans so the map can't grow unbounded across a
+        // long session of folder adds / reloads (each spawns one task and we
+        // don't otherwise remove completed entries until shutdown).
+        map.retain(|_, h| !h.is_finished());
+        map.insert(id, handle);
         id
     }
 

@@ -2687,8 +2687,16 @@ impl Ed2kDownload {
                                 debug!("Peer comment: rating={rating}, comment='{comment}'");
                             }
                         }
-                        // AICH recovery answer from peer
-                        (OP_EMULEPROT, OP_AICHANSWER) if payload.len() >= 38 => {
+                        // AICH recovery answer from peer. Bound the payload the
+                        // same way `wait_for_aich_recovery_answer` does: the
+                        // recovery blob can't legitimately exceed
+                        // MAX_AICH_RECOVERY_BYTES, and without the upper bound a
+                        // peer (who knows the public master hash) could force a
+                        // multi-MB allocation held until part verification.
+                        (OP_EMULEPROT, OP_AICHANSWER)
+                            if (38..=38 + crate::network::ed2k::aich::MAX_AICH_RECOVERY_BYTES)
+                                .contains(&payload.len()) =>
+                        {
                             let mut ans_hash = [0u8; 16];
                             ans_hash.copy_from_slice(&payload[..16]);
                             let ans_part = u16::from_le_bytes([payload[16], payload[17]]) as usize;
@@ -3308,7 +3316,12 @@ fn append_compressed_chunk(
         );
     }
     if accumulated >= total_packed {
-        let data = &entry.compressed;
+        // Decompress exactly the declared packed size. The accumulation cap
+        // above tolerates a little over-run before bailing, but feeding those
+        // trailing padding bytes to the zlib stream can yield a wrong
+        // decompressed length (and a mis-sized .part write). eMule sends
+        // exactly `total_packed` compressed bytes per block.
+        let data = &entry.compressed[..total_packed];
         let decompressed = decompress_ed2k_part(data)?;
         pending.remove(&start);
         Ok(Some(decompressed))

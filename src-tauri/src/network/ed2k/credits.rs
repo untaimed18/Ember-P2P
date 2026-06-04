@@ -464,33 +464,40 @@ impl CreditManager {
     /// permissive behavior but still reject Failed/BadGuy.
     /// Returns false if credits were rejected due to identity state.
     pub fn add_uploaded(&mut self, user_hash: [u8; 16], bytes: u64) -> bool {
-        let crypto = self.crypto_available;
-        let record = self.get_or_create(user_hash);
-        if crypto {
-            if !matches!(record.ident_state, IdentState::Verified) {
-                return false;
-            }
-        } else if matches!(record.ident_state, IdentState::Failed | IdentState::BadGuy) {
+        if !self.credit_accepted(&user_hash) {
             return false;
         }
+        let record = self.get_or_create(user_hash);
         record.uploaded = record.uploaded.saturating_add(bytes);
         // `last_seen` already bumped by `get_or_create` above.
         true
     }
 
     pub fn add_downloaded(&mut self, user_hash: [u8; 16], bytes: u64) -> bool {
-        let crypto = self.crypto_available;
-        let record = self.get_or_create(user_hash);
-        if crypto {
-            if !matches!(record.ident_state, IdentState::Verified) {
-                return false;
-            }
-        } else if matches!(record.ident_state, IdentState::Failed | IdentState::BadGuy) {
+        if !self.credit_accepted(&user_hash) {
             return false;
         }
+        let record = self.get_or_create(user_hash);
         record.downloaded = record.downloaded.saturating_add(bytes);
         // `last_seen` already bumped by `get_or_create` above.
         true
+    }
+
+    /// Whether a credit accrual for `user_hash` is allowed, judged from the
+    /// *existing* record only. Crucially this does NOT create an entry: the
+    /// previous code called `get_or_create` before the identity check, so a
+    /// peer rotating user-hashes that never complete SecIdent (rejected in
+    /// crypto mode) still seeded a `CreditRecord` per hash, growing the map
+    /// until the 90-day sweep. With crypto available we require `Verified`;
+    /// without it we only reject `Failed`/`BadGuy` (permissive fallback,
+    /// matching the prior behaviour for genuinely-credited unknown peers).
+    fn credit_accepted(&self, user_hash: &[u8; 16]) -> bool {
+        let ident_state = self.credits.get(user_hash).map(|r| r.ident_state);
+        if self.crypto_available {
+            matches!(ident_state, Some(IdentState::Verified))
+        } else {
+            !matches!(ident_state, Some(IdentState::Failed | IdentState::BadGuy))
+        }
     }
 
     /// eMule IS_IDBADGUY: record the IP only when identity is first verified
