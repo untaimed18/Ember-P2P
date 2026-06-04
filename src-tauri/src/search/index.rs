@@ -47,10 +47,14 @@ impl LocalIndex {
         self.rebuild_indices();
     }
 
-    /// Insert/update a file without rebuilding indices. Call `rebuild_indices`
-    /// manually after a batch of insertions to amortise the O(n) cost.
+    /// Insert/update a file and incrementally patch `path_map`/`hash_map`/
+    /// `name_tokens` so lookups (`get_by_hash`, `get_by_path`) see the file
+    /// immediately, without paying the O(n) `rebuild_indices` cost. Used by the
+    /// per-file hashing loop: previously this only touched `files`, so a freshly
+    /// hashed share stayed invisible to the upload path (and path lookups) until
+    /// the entire folder scan finished and called `rebuild()`.
     pub fn add_file_no_rebuild(&mut self, file: FileInfo) {
-        self.upsert_file(file);
+        self.upsert_file_indexed(file);
     }
 
     pub fn rebuild(&mut self) {
@@ -332,6 +336,70 @@ impl LocalIndex {
             }
         }
         affected
+    }
+
+    /// Like `upsert_file`, but keeps `path_map`/`hash_map`/`name_tokens`
+    /// consistent for the affected slot so no full rebuild is required.
+    fn upsert_file_indexed(&mut self, mut file: FileInfo) {
+        let key = normalize_path_key(&file.path);
+        if let Some(pos) = self
+            .files
+            .iter()
+            .position(|f| normalize_path_key(&f.path) == key)
+        {
+            let old = self.files[pos].clone();
+            self.remove_index_entries(pos, &old);
+            preserve_runtime_state(&self.files[pos], &mut file);
+            self.files[pos] = file;
+            self.add_index_entries(pos);
+        } else {
+            let idx = self.files.len();
+            self.files.push(file);
+            self.add_index_entries(idx);
+        }
+    }
+
+    /// Remove the map contributions of the file currently (or formerly) at
+    /// `pos`. `file` must describe the path/hash/name whose entries are being
+    /// removed (it may differ from `self.files[pos]` when replacing in place).
+    fn remove_index_entries(&mut self, pos: usize, file: &FileInfo) {
+        self.path_map.remove(&normalize_path_key(&file.path));
+        if !file.hash.is_empty() {
+            if let Some(v) = self.hash_map.get_mut(&file.hash) {
+                v.retain(|&i| i != pos);
+                if v.is_empty() {
+                    self.hash_map.remove(&file.hash);
+                }
+            }
+        }
+        for token in tokenize(&file.name.to_lowercase()) {
+            if let Some(v) = self.name_tokens.get_mut(&token) {
+                v.retain(|&i| i != pos);
+                if v.is_empty() {
+                    self.name_tokens.remove(&token);
+                }
+            }
+        }
+    }
+
+    /// Add the map contributions for the file at `pos` (derived from
+    /// `self.files[pos]`).
+    fn add_index_entries(&mut self, pos: usize) {
+        let (path_key, hash, name_lower) = {
+            let file = &self.files[pos];
+            (
+                normalize_path_key(&file.path),
+                file.hash.clone(),
+                file.name.to_lowercase(),
+            )
+        };
+        self.path_map.insert(path_key, pos);
+        if !hash.is_empty() {
+            self.hash_map.entry(hash).or_default().push(pos);
+        }
+        for token in tokenize(&name_lower) {
+            self.name_tokens.entry(token).or_default().push(pos);
+        }
     }
 
     fn upsert_file(&mut self, mut file: FileInfo) {

@@ -150,10 +150,15 @@
   });
 
   function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-    return Promise.race([
-      promise,
-      new Promise<T>((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
-    ]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('timeout')), ms);
+    });
+    // Clear the watchdog once either side settles so the loser timer doesn't
+    // linger (and can't reject after the real promise already resolved).
+    return Promise.race([promise, timeout]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
   }
 
   async function refresh() {

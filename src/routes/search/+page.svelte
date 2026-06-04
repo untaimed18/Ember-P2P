@@ -116,6 +116,33 @@
     if (hashes.length > 0) queueHistoryFetch(hashes);
   });
 
+  // Force a re-fetch of the cached download-history status for a hash. Without
+  // this, `queueHistoryFetch` permanently skips any hash already in
+  // `historyFetchedHashes`, so a download that finishes (or a history entry
+  // that's removed) never updated the row badge until a full page reload.
+  function invalidateHistory(hash: string) {
+    if (!hash) return;
+    historyFetchedHashes.delete(hash);
+    historyHashGen.delete(hash);
+  }
+
+  // React to downloads finishing while results are on screen: drop the stale
+  // "already fetched" mark for the completed file and re-queue, so its
+  // completed/cancelled badge appears without a reload. A `completedHandled`
+  // guard keeps this from re-firing on every transfers-store tick.
+  const completedHandled = new Set<string>();
+  $effect(() => {
+    const list = $transfers;
+    if (destroyed) return;
+    for (const t of list) {
+      if (t.direction !== 'download' || t.status !== 'completed' || !t.file_hash) continue;
+      if (completedHandled.has(t.file_hash)) continue;
+      completedHandled.add(t.file_hash);
+      invalidateHistory(t.file_hash);
+      queueHistoryFetch([t.file_hash]);
+    }
+  });
+
   // Destructive-action confirmation state. Shared by "Clear Results" and
   // "Close Tab". Skip confirmation for empty / non-destructive cases.
   type ConfirmAction =
@@ -487,10 +514,13 @@
     // the user closes the tab mid-retry.
     const retryRequestId = newSearchNonce();
     attachRetryRequestId(tabId, retryRequestId);
+    let retryTimeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const results = await Promise.race([
         searchFiles(tabQuery, 'server', retryRequestId, activeTab.fileType || undefined, activeTab.filters),
-        new Promise<never>((_, reject) => setTimeout(() => reject(new Error(m.search_retry_timeout())), 60_000)),
+        new Promise<never>((_, reject) => {
+          retryTimeout = setTimeout(() => reject(new Error(m.search_retry_timeout())), 60_000);
+        }),
       ]);
       if (results && results.length > 0) {
         searchTabs.update((tabs) => tabs.map((t) => (
@@ -506,6 +536,9 @@
       const msg = translateError(e, m.search_retry_failed());
       addToast('error', msg);
     } finally {
+      // Clear the watchdog so the loser timer doesn't keep running (and can't
+      // fire a late rejection) after the search resolves first.
+      if (retryTimeout) clearTimeout(retryTimeout);
       clearRetryRequestId(tabId);
       serverRetryPending = false;
     }
@@ -1201,6 +1234,11 @@
       downloadHistoryMap = Object.fromEntries(
         Object.entries(downloadHistoryMap).filter(([k]) => k !== hash),
       );
+      // Drop the cache marks so a later re-download of this file is allowed to
+      // re-fetch and re-badge (otherwise the hash would stay permanently in
+      // `historyFetchedHashes` and never refresh).
+      invalidateHistory(hash);
+      completedHandled.delete(hash);
       addToast('success', m.search_removed_from_history());
     } catch (e) {
       console.error('Failed to remove from history:', e);
