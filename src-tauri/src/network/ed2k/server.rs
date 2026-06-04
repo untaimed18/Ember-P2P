@@ -1279,6 +1279,14 @@ fn read_tag_header(cursor: &mut Cursor<&[u8]>) -> Option<(u8, u8)> {
     } else {
         // Old format: u16 name length + name bytes
         let name_len = ReadBytesExt::read_u16::<LittleEndian>(cursor).ok()? as usize;
+        // Cap the name length before allocating: a hostile/buggy server can
+        // advertise name_len up to 65535 on every tag (256 tags/result), and
+        // `vec![0u8; name_len]` is allocated before the read can fail. eMule
+        // tag names are tiny; 256 matches `messages.rs` MAX_TAG_NAME_LEN.
+        const MAX_TAG_NAME_LEN: usize = 256;
+        if name_len > MAX_TAG_NAME_LEN {
+            return None;
+        }
         let name_id = if name_len == 1 {
             ReadBytesExt::read_u8(cursor).ok()?
         } else {
@@ -1350,6 +1358,25 @@ fn read_tag_value(
         0x05 => {
             let _ = ReadBytesExt::read_u8(cursor);
             true
+        }
+        // TAGTYPE_BOOLARRAY (0x06): u16 bit count followed by ceil(count/8)
+        // bytes. We don't consume the bits, but we MUST advance past them —
+        // returning `false` here (as the previous `_ => false` did) aborted
+        // the whole tag loop for the result, dropping the file_size/file_name
+        // tags that follow. Matches `server_udp.rs`.
+        0x06 => {
+            if let Ok(count) = ReadBytesExt::read_u16::<LittleEndian>(cursor) {
+                let skip = (count as usize + 7) / 8;
+                let pos = cursor.position() as usize;
+                let len = cursor.get_ref().len();
+                if let Some(end) = pos.checked_add(skip) {
+                    if end <= len {
+                        cursor.set_position(end as u64);
+                        return true;
+                    }
+                }
+            }
+            false
         }
         // TAGTYPE_BLOB (0x07)
         0x07 => {

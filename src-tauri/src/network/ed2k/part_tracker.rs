@@ -225,6 +225,25 @@ impl PartTracker {
         }
     }
 
+    /// How many bytes of `[start, end)` are still missing (overlap the gap
+    /// list). Read-only mirror of the overlap math in `fill_range`. A return
+    /// of 0 means every byte in the range is already on disk — writing it
+    /// again would risk clobbering data in a part that another source may have
+    /// already MD4-verified, so callers should skip the disk write.
+    pub fn newly_fillable(&self, start: u64, end: u64) -> u64 {
+        if start >= end {
+            return 0;
+        }
+        let mut fillable: u64 = 0;
+        for &(gs, ge) in &self.gaps {
+            if ge <= start || gs >= end {
+                continue;
+            }
+            fillable += ge.min(end) - gs.max(start);
+        }
+        fillable
+    }
+
     /// Record that bytes in [start, end) have been received.
     /// Returns the number of bytes that were actually newly filled (excluding
     /// overlap with already-filled regions).

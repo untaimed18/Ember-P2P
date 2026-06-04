@@ -5,6 +5,14 @@ use std::path::Path;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use tracing::{debug, info};
 
+/// Upper bounds on server.met tag field lengths. Each `vec![0u8; len]` is
+/// sized from an unchecked on-disk `u16` and allocated before the read can
+/// fail, so without a cap a crafted file could force large allocations per
+/// tag (50 tags/entry, up to thousands of entries). eMule tag names are tiny;
+/// server name/description strings are short in practice.
+const MAX_SERVER_TAG_NAME_LEN: usize = 256;
+const MAX_SERVER_TAG_STR_LEN: usize = 4096;
+
 #[derive(Debug, Clone, Default)]
 pub struct ServerMergeStats {
     pub added: usize,
@@ -507,6 +515,15 @@ impl ServerList {
             for _ in 0..tag_count {
                 let tag_type = cursor.read_u8()?;
                 let name_len = cursor.read_u16::<LittleEndian>()? as usize;
+                // Cap before allocating: each `vec![0u8; len]` is sized from an
+                // unchecked u16 and allocated before the read can fail, so a
+                // crafted/hostile server.met could force multi-MB allocations.
+                if name_len > MAX_SERVER_TAG_NAME_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("server.met entry for {ip}:{port} tag name_len {name_len} exceeds cap"),
+                    ));
+                }
                 let mut name = vec![0u8; name_len];
                 cursor.read_exact(&mut name)?;
                 let name_id = if name_len == 1 { name[0] } else { 0 };
@@ -514,6 +531,12 @@ impl ServerList {
                 match tag_type {
                     0x02 => {
                         let slen = cursor.read_u16::<LittleEndian>()? as usize;
+                        if slen > MAX_SERVER_TAG_STR_LEN {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("server.met entry for {ip}:{port} string tag len {slen} exceeds cap"),
+                            ));
+                        }
                         let mut sbuf = vec![0u8; slen];
                         cursor.read_exact(&mut sbuf)?;
                         match name_id {
@@ -617,6 +640,12 @@ impl ServerList {
                     Ok(v) => v as usize,
                     Err(_) => { unknown_tag = true; break; }
                 };
+                // Cap before allocating (see load_server_met): abort the merge
+                // rather than letting an unchecked u16 drive a huge allocation.
+                if name_len > MAX_SERVER_TAG_NAME_LEN {
+                    unknown_tag = true;
+                    break;
+                }
                 let mut name = vec![0u8; name_len];
                 if cursor.read_exact(&mut name).is_err() {
                     unknown_tag = true;
@@ -630,6 +659,10 @@ impl ServerList {
                             Ok(v) => v as usize,
                             Err(_) => { unknown_tag = true; break; }
                         };
+                        if slen > MAX_SERVER_TAG_STR_LEN {
+                            unknown_tag = true;
+                            break;
+                        }
                         let mut sbuf = vec![0u8; slen];
                         if cursor.read_exact(&mut sbuf).is_err() {
                             unknown_tag = true;

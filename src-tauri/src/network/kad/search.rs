@@ -521,16 +521,25 @@ impl SearchState {
 
     pub fn expire_pending(&mut self) -> Vec<KadId> {
         let now = chrono::Utc::now().timestamp();
+        // Time out when the request is older than the timeout. A negative
+        // elapsed means the wall clock jumped backwards since we recorded
+        // `sent_at`; treat that as timed out too so the entry can't get stuck
+        // pending for the whole search lifetime (the previous `now - sent_at`
+        // never reached the threshold while `sent_at` was in the future).
+        let is_timed_out = |sent_at: i64| {
+            let elapsed = now - sent_at;
+            elapsed < 0 || elapsed >= PENDING_TIMEOUT_SECS
+        };
         let timed_out: Vec<KadId> = self
             .pending_times
             .iter()
-            .filter(|(_, &sent_at)| now - sent_at >= PENDING_TIMEOUT_SECS)
+            .filter(|(_, &sent_at)| is_timed_out(sent_at))
             .map(|(&id, _)| id)
             .collect();
         let store_timed_out: Vec<KadId> = self
             .store_pending_times
             .iter()
-            .filter(|(_, &sent_at)| now - sent_at >= PENDING_TIMEOUT_SECS)
+            .filter(|(_, &sent_at)| is_timed_out(sent_at))
             .filter(|(id, _)| !timed_out.contains(id))
             .map(|(&id, _)| id)
             .collect();
