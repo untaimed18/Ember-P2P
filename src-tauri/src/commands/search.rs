@@ -387,13 +387,86 @@ pub struct Ed2kLinkInfo {
     pub name: String,
     pub size: u64,
     pub hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aich: Option<String>,
 }
 
 #[tauri::command]
 pub fn parse_ed2k_link(link: String) -> Result<Ed2kLinkInfo, String> {
     hash::parse_ed2k_link(&link)
-        .map(|(name, size, hash)| Ed2kLinkInfo { name, size, hash })
+        .map(|(name, size, hash, aich)| Ed2kLinkInfo { name, size, hash, aich })
         .ok_or_else(|| coded("search_invalid_ed2k_link", "Invalid ed2k link format"))
+}
+
+/// Build an ed2k link with optional AICH and/or our own endpoint as a source,
+/// matching eMule's "copy link" submenu variants. `aich_hash` is the 40-char
+/// hex AICH root from the library row (re-encoded to base32 for `h=`). When
+/// `with_sources` is set we append our reachable IP:port — this only makes
+/// sense with a HighID, so a firewalled client returns an error the UI can
+/// surface rather than emitting an unreachable source.
+#[tauri::command]
+pub async fn build_ed2k_link(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    size: u64,
+    file_hash: String,
+    aich_hash: Option<String>,
+    with_sources: bool,
+) -> Result<String, String> {
+    if name.is_empty() || name.len() > 4096 {
+        return Err(coded("search_file_name_invalid", "File name is empty or too long"));
+    }
+    if file_hash.len() != 32 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(coded("search_link_invalid_hash", "Invalid file hash (expected 32 hex characters)"));
+    }
+
+    let aich = aich_hash.and_then(|h| {
+        let t = h.trim().to_string();
+        (t.len() == 40 && t.chars().all(|c| c.is_ascii_hexdigit())).then_some(t)
+    });
+
+    let mut sources: Vec<(String, u16)> = Vec::new();
+    if with_sources {
+        let (tx, rx) = oneshot::channel();
+        state
+            .network_tx
+            .try_send(NetworkCommand::GetNetworkStatsSnapshot { tx })
+            .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+        let stats = rx
+            .await
+            .map_err(|e| coded_ctx("search_link_sources_failed", "Failed to read network state", e))?;
+        if stats.firewalled {
+            return Err(coded(
+                "search_link_firewalled",
+                "Cannot add sources to link while firewalled (LowID)",
+            ));
+        }
+        let ip = stats.external_ip.trim();
+        let valid_ip = ip.parse::<std::net::Ipv4Addr>().ok().filter(|a| {
+            !a.is_loopback() && !a.is_unspecified() && !a.is_private() && !a.is_link_local()
+        });
+        let tcp_port = {
+            let cfg = state.config.read().await;
+            cfg.settings.tcp_port
+        };
+        match (valid_ip, tcp_port) {
+            (Some(addr), port) if port > 0 => sources.push((addr.to_string(), port)),
+            _ => {
+                return Err(coded(
+                    "search_link_no_source",
+                    "No reachable public address available for a source link",
+                ))
+            }
+        }
+    }
+
+    Ok(hash::format_ed2k_link_ext(
+        &name,
+        size,
+        &file_hash,
+        aich.as_deref(),
+        &sources,
+    ))
 }
 
 #[tauri::command]
