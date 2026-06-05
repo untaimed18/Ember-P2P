@@ -20658,6 +20658,7 @@ async fn handle_upload_event(
             client_software,
             country_code,
             user_hash,
+            wait_seconds,
         } => {
             let transfer = Transfer {
                 id: event.transfer_id.clone(),
@@ -20687,7 +20688,7 @@ async fn handle_upload_event(
                 health_reason: None,
                 stalled_since: None,
                 category: String::new(),
-                wait_time: 0,
+                wait_time: wait_seconds,
                 upload_time: 0,
                 a4af_sources: 0,
                 max_sources: 0,
@@ -20741,7 +20742,6 @@ async fn handle_upload_event(
         }
         UploadEventKind::ShareInterest { .. } => {}
         UploadEventKind::Completed => {
-            stats_manager.record_completed_upload();
             // Match eMule's "session ends → row vanishes" UX. We still
             // call `mgr.complete()` so the queued-promotion logic fires
             // and stats are accurate, but we then immediately drop the
@@ -20760,6 +20760,12 @@ async fn handle_upload_event(
                 Some(promoted) => promoted,
                 None => return,
             };
+            // Only count a completed upload once `mgr.complete()` confirms the
+            // transfer existed and transitioned. Counting before the match
+            // over-reported the stat for duplicate or stale `Completed` events
+            // (e.g. a session that emitted Completed twice, or whose row was
+            // already removed) which returned `None` here.
+            stats_manager.record_completed_upload();
             for t in &promoted {
                 info!("Promoted queued transfer {} ({}) to active", t.id, t.file_name);
             }
