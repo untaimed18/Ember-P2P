@@ -517,8 +517,16 @@ impl CreditManager {
     pub fn get_current_ident_state(&self, user_hash: &[u8; 16], current_ip: u32) -> IdentState {
         match self.credits.get(user_hash) {
             Some(record) => {
+                // Only flag BadGuy when we have a CURRENT IP to compare against.
+                // `current_ip == 0` means the caller doesn't know the peer's
+                // live address (e.g. a disconnected/queued LowID peer in a UI
+                // snapshot, or a peer awaiting callback). With no current IP we
+                // can't conclude the verified identity moved, so fall back to the
+                // stored state instead of spuriously labelling a verified peer a
+                // BadGuy (which also wrongly floored their credit ratio).
                 if record.ident_state == IdentState::Verified
                     && record.ident_ip != 0
+                    && current_ip != 0
                     && record.ident_ip != current_ip
                 {
                     IdentState::BadGuy

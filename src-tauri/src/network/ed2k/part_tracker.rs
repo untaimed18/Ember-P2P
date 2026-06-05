@@ -370,6 +370,17 @@ impl PartTracker {
         (0..self.part_count).map(|i| self.is_part_complete(i)).collect()
     }
 
+    /// Parts that are BOTH gap-complete AND MD4-verified — i.e. the parts we
+    /// are actually willing to serve. Any availability bitmap advertised to a
+    /// peer must use this (not `completed_parts`), otherwise we advertise parts
+    /// the serve gate (`is_range_safe_to_serve`) will then refuse, freezing the
+    /// peer's download on a "dead" part it keeps re-requesting.
+    pub fn serveable_parts(&self) -> Vec<bool> {
+        (0..self.part_count)
+            .map(|i| self.is_part_complete(i) && self.is_part_verified(i))
+            .collect()
+    }
+
     /// Return the raw gap list.
     pub fn gap_list(&self) -> &[(u64, u64)] {
         &self.gaps
