@@ -113,6 +113,11 @@ pub async fn add_ip_filter_range(
     if u32::from(start) > u32::from(end) {
         return Err(coded("security_start_ip_must_be_less_than_end", "Start IP must be less than or equal to end IP"));
     }
+    // Bound the persisted description so a runaway caller can't grow the
+    // ip-filter config unboundedly.
+    if description.len() > 256 {
+        return Err(coded("security_description_too_long", "Description too long (max 256 bytes)"));
+    }
 
     state
         .network_tx
@@ -548,6 +553,14 @@ pub async fn set_antileech_patterns(
     state: tauri::State<'_, AppState>,
     patterns: Vec<String>,
 ) -> Result<crate::types::AntiLeechReplaceResult, String> {
+    // Bound the pattern set so a runaway caller can't push an unbounded list
+    // (each pattern is compiled and held in memory by the network task).
+    if patterns.len() > 10_000 {
+        return Err(coded("security_too_many_patterns", "Too many anti-leech patterns (max 10000)"));
+    }
+    if patterns.iter().any(|p| p.len() > 1024) {
+        return Err(coded("security_pattern_too_long", "Anti-leech pattern too long (max 1024 bytes)"));
+    }
     let (tx, rx) = oneshot::channel();
     state
         .network_tx

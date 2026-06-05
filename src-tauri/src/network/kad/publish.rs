@@ -136,7 +136,7 @@ impl PublishManager {
                 // saturation on every receiver.
                 let shift = r.keyword_backoff_shift.min(4);
                 let interval = REPUBLISH_KEYWORD_SECS.saturating_mul(1_i64 << shift);
-                now - r.last_keyword_publish > interval
+                now.saturating_sub(r.last_keyword_publish) > interval
             })
             .map(|r| &r.file)
             .collect()
@@ -150,7 +150,7 @@ impl PublishManager {
             .filter(|r| {
                 let shift = r.source_backoff_shift.min(4);
                 let interval = REPUBLISH_SOURCE_SECS.saturating_mul(1_i64 << shift);
-                now - r.last_source_publish > interval
+                now.saturating_sub(r.last_source_publish) > interval
             })
             .map(|r| &r.file)
             .collect()

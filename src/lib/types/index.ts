@@ -173,10 +173,16 @@ export interface NetworkStats {
   server_status?: string;
   stale?: boolean;
   degraded?: boolean;
-  degraded_reason?: string;
+  /** Stable reason code (localized at render time via
+   *  `degradedReasonText` in `$lib/i18n`), not a display string. */
+  degraded_reason?: DegradedReason;
   last_update_at?: number;
   last_poll_ok_at?: number;
 }
+
+/** Why the network is considered degraded. Kept as a stable code so the
+ *  UI can localize it; the store must never put a display string here. */
+export type DegradedReason = 'stale' | 'limited' | 'establishing';
 
 /** Diagnostic counters for the Ember mesh (EPX events, LowID broker
  *  outcomes, native transport ping/pong). Populated by

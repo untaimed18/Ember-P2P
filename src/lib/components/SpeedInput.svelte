@@ -19,7 +19,13 @@
 
   let unit: Unit = $state('KB/s');
   let displayValue: string = $state('');
+  let focused = $state(false);
   let isUnlimited = $derived(value === 0);
+  // Only collapse to the "Unlimited" display when the field isn't being
+  // edited. Otherwise clearing the input to retype a value (which momentarily
+  // makes `value === 0`) would yank the input out from under the user and
+  // replace it with the unlimited placeholder mid-keystroke.
+  let showUnlimited = $derived(value === 0 && !focused);
   let internalUpdate = false;
   let lastSyncedValue = -1;
 
@@ -89,8 +95,8 @@
 {#if label}
   <span class="speed-label">{label}</span>
 {/if}
-<div class="speed-input" class:unlimited={isUnlimited}>
-  {#if isUnlimited}
+<div class="speed-input" class:unlimited={showUnlimited}>
+  {#if showUnlimited}
     <div
       class="unlimited-display"
       role="button"
@@ -114,6 +120,8 @@
       step="any"
       value={displayValue}
       oninput={handleInput}
+      onfocus={() => (focused = true)}
+      onblur={() => (focused = false)}
       class="speed-number"
       placeholder="0"
     />

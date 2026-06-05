@@ -1,6 +1,6 @@
 use parking_lot::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use tracing::info;
 
 use crate::storage::paths;
@@ -512,6 +512,50 @@ impl Database {
         conn.execute(
             "UPDATE peers SET banned = 0 WHERE id = ?1",
             params![peer_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record `ip` as one of the addresses belonging to a (banned) peer.
+    ///
+    /// Used when a live upload session is torn down because its peer was
+    /// banned by user-hash: the connecting IP may not have been in the
+    /// routing table or peer DB at ban time, so without this it would not
+    /// be cleared by `unban_peer` (which reverses a ban by walking the
+    /// peer's known addresses). Storing it here makes ban/unban symmetric.
+    /// The port is recorded as 0 (placeholder) — only the IP is ever used
+    /// by the ban/unban paths, and boot-contact loading skips banned peers
+    /// so the placeholder never produces a junk KAD contact. The row is
+    /// upserted with `banned = 1` so a peer we only ever saw as an inbound
+    /// uploader still exists for `unban_peer` to flip. Idempotent: an IP
+    /// already present (under any port) is not duplicated.
+    pub fn add_banned_peer_address(&self, peer_id: &str, ip: std::net::Ipv4Addr) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT addresses FROM peers WHERE id = ?1",
+                params![peer_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut addresses: Vec<String> = existing
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let ip_str = ip.to_string();
+        let already_present = addresses.iter().any(|addr| {
+            addr.rsplit_once(':')
+                .map(|(host, _)| host == ip_str)
+                .unwrap_or(addr.as_str() == ip_str)
+        });
+        if !already_present {
+            addresses.push(format!("{ip_str}:0"));
+        }
+        let addresses_json = serde_json::to_string(&addresses)?;
+        conn.execute(
+            "INSERT INTO peers (id, addresses, banned) VALUES (?1, ?2, 1)
+             ON CONFLICT(id) DO UPDATE SET addresses = excluded.addresses, banned = 1",
+            params![peer_id, addresses_json],
         )?;
         Ok(())
     }

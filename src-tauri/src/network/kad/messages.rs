@@ -862,28 +862,55 @@ pub fn build_hello_req(
     })
 }
 
-/// Build a binary search expression for >=1 keywords (eMule AND tree format).
+/// Numeric / string constraints that eMule AND-combines with the keyword
+/// expression in a search request. Mirrors the attributes appended by
+/// `GetSearchPacket` (eMule `SearchResultsWnd.cpp`): file type, extension,
+/// min/max size and minimum availability.
+///
+/// Encoding these into the wire expression lets the remote node (eD2k server
+/// or Kad peer) filter *before* it truncates to its result cap (servers reply
+/// with at most ~200/300 hits), which a purely client-side filter cannot do —
+/// a tight size filter would otherwise discard most of a single unfiltered
+/// page and surface very few matches even when many exist.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SearchConstraints<'a> {
+    /// eD2k file-type label (e.g. "Video", "Audio") — FT_FILETYPE.
+    pub file_type: Option<&'a str>,
+    /// File extension without a leading dot (e.g. "mkv") — FT_FILEFORMAT.
+    pub file_extension: Option<&'a str>,
+    /// Minimum file size in bytes (inclusive) — FT_FILESIZE >=.
+    pub min_size: Option<u64>,
+    /// Maximum file size in bytes (inclusive) — FT_FILESIZE <=.
+    pub max_size: Option<u64>,
+    /// Minimum source/availability count (inclusive) — FT_SOURCES >=.
+    pub min_availability: Option<u32>,
+}
+
+// eD2k search comparison operators (eMule Opcodes.h ED2K_SEARCH_OP_*).
+const ED2K_SEARCH_OP_GREATER_EQUAL: u8 = 3;
+const ED2K_SEARCH_OP_LESS_EQUAL: u8 = 4;
+// eD2k meta-tag IDs (eMule Opcodes.h FT_*). FT_FILESIZE/FILETYPE/SOURCES are
+// re-exported from `types` as TAG_*; FT_FILEFORMAT has no TAG_* alias.
+const FT_FILEFORMAT: u8 = 0x04;
+
+/// Build a binary search expression for keywords plus optional constraints
+/// (eMule AND-tree format).
 ///
 /// For N keywords, builds a left-leaning AND tree:
 ///   AND(AND(kw1, kw2), kw3) for 3 keywords, etc.
-/// A single keyword produces a plain string leaf.  When a file_type filter
-/// is present it is AND-combined with the keyword tree.
+/// A single keyword produces a plain string leaf. Any present constraints
+/// (type / extension / size / availability) are each emitted as their own
+/// leaf and AND-combined with the keyword tree, matching eMule's
+/// `GetSearchPacket`.
 ///
-/// Returns empty only when there are zero keywords AND no file_type.
+/// Returns empty only when there are zero keywords AND no constraints.
 ///
-/// Wire format:
-///   0x00 0x00 = AND operator (followed by left child, right child)
-///   0x01      = String leaf  (followed by UTF-8 length-prefixed string)
-pub fn build_search_expression(keywords: &[String], file_type: Option<&str>) -> Vec<u8> {
-    let has_keywords = !keywords.is_empty();
-    let has_type = file_type.is_some_and(|t| !t.is_empty());
-
-    if !has_keywords && !has_type {
-        return Vec::new();
-    }
-
-    let mut buf = Vec::with_capacity(64);
-
+/// Wire format (eMule `CSearchExprTarget`):
+///   0x00 0x00      = AND operator (followed by left child, right child)
+///   0x01           = String leaf  (u16-len UTF-8 string)
+///   0x02           = Meta-string  (u16-len value, u16-len tag-name, tag id)
+///   0x03 / 0x08    = Numeric u32/u64 (value, 1-byte op, u16-len tag-name, tag id)
+pub fn build_search_expression(keywords: &[String], constraints: &SearchConstraints) -> Vec<u8> {
     fn write_string_leaf(buf: &mut Vec<u8>, s: &str) {
         buf.push(0x01);
         let bytes = s.as_bytes();
@@ -896,6 +923,23 @@ pub fn build_search_expression(keywords: &[String], file_type: Option<&str>) -> 
         let bytes = value.as_bytes();
         buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(bytes);
+        buf.extend_from_slice(&1u16.to_le_bytes()); // tag name length = 1
+        buf.push(tag_id);
+    }
+
+    // Numeric leaf. eMule uses the 32-bit form (type 0x03) when the value
+    // fits in a u32 and the 64-bit form (type 0x08) otherwise; Kad searches
+    // always advertise 64-bit support, so a >4 GiB size constraint is encoded
+    // losslessly rather than clamped.
+    fn write_numeric_leaf(buf: &mut Vec<u8>, value: u64, op: u8, tag_id: u8) {
+        if value > u32::MAX as u64 {
+            buf.push(0x08);
+            buf.extend_from_slice(&value.to_le_bytes());
+        } else {
+            buf.push(0x03);
+            buf.extend_from_slice(&(value as u32).to_le_bytes());
+        }
+        buf.push(op);
         buf.extend_from_slice(&1u16.to_le_bytes()); // tag name length = 1
         buf.push(tag_id);
     }
@@ -916,18 +960,208 @@ pub fn build_search_expression(keywords: &[String], file_type: Option<&str>) -> 
         }
     }
 
-    const FT_FILETYPE_TAG: u8 = 0x03;
+    // Each operand of the top-level AND is serialized independently, then
+    // folded into a right-leaning AND chain below.
+    let mut nodes: Vec<Vec<u8>> = Vec::new();
 
-    if has_keywords && has_type {
-        buf.push(0x00); // operator
-        buf.push(0x00); // AND
-        write_keyword_tree(&mut buf, keywords, keywords.len());
-        write_meta_string(&mut buf, file_type.unwrap(), FT_FILETYPE_TAG);
-    } else if has_keywords {
-        write_keyword_tree(&mut buf, keywords, keywords.len());
-    } else {
-        write_meta_string(&mut buf, file_type.unwrap(), FT_FILETYPE_TAG);
+    if !keywords.is_empty() {
+        let mut kw = Vec::with_capacity(32);
+        write_keyword_tree(&mut kw, keywords, keywords.len());
+        nodes.push(kw);
     }
 
+    if let Some(ft) = constraints.file_type.filter(|t| !t.is_empty()) {
+        let mut n = Vec::new();
+        write_meta_string(&mut n, ft, TAG_FILETYPE);
+        nodes.push(n);
+    }
+
+    if let Some(ext) = constraints.file_extension {
+        // FT_FILEFORMAT carries the bare extension (no leading dot).
+        let ext = ext.trim().trim_start_matches('.');
+        if !ext.is_empty() {
+            let mut n = Vec::new();
+            write_meta_string(&mut n, ext, FT_FILEFORMAT);
+            nodes.push(n);
+        }
+    }
+
+    if let Some(min_size) = constraints.min_size.filter(|v| *v > 0) {
+        let mut n = Vec::new();
+        write_numeric_leaf(&mut n, min_size, ED2K_SEARCH_OP_GREATER_EQUAL, TAG_FILESIZE);
+        nodes.push(n);
+    }
+
+    if let Some(max_size) = constraints.max_size.filter(|v| *v > 0) {
+        let mut n = Vec::new();
+        write_numeric_leaf(&mut n, max_size, ED2K_SEARCH_OP_LESS_EQUAL, TAG_FILESIZE);
+        nodes.push(n);
+    }
+
+    if let Some(min_avail) = constraints.min_availability.filter(|v| *v > 0) {
+        let mut n = Vec::new();
+        write_numeric_leaf(&mut n, min_avail as u64, ED2K_SEARCH_OP_GREATER_EQUAL, TAG_SOURCES);
+        nodes.push(n);
+    }
+
+    if nodes.is_empty() {
+        return Vec::new();
+    }
+
+    // Fold operands into a right-leaning AND chain:
+    //   [n0]                -> n0
+    //   [n0, n1]            -> AND n0 n1
+    //   [n0, n1, n2]        -> AND n0 AND n1 n2
+    // For a single node (the common keyword-only / type-only case) this emits
+    // exactly the bare leaf, byte-identical to the previous implementation.
+    let mut buf = Vec::with_capacity(64);
+    let last = nodes.len() - 1;
+    for node in &nodes[..last] {
+        buf.push(0x00); // operator
+        buf.push(0x00); // AND
+        buf.extend_from_slice(node);
+    }
+    buf.extend_from_slice(&nodes[last]);
     buf
+}
+
+#[cfg(test)]
+mod search_expr_tests {
+    use super::*;
+
+    fn kw(s: &str) -> Vec<String> {
+        vec![s.to_string()]
+    }
+
+    fn string_leaf(s: &str) -> Vec<u8> {
+        let mut v = vec![0x01];
+        v.extend_from_slice(&(s.len() as u16).to_le_bytes());
+        v.extend_from_slice(s.as_bytes());
+        v
+    }
+
+    fn meta_string(value: &str, tag: u8) -> Vec<u8> {
+        let mut v = vec![0x02];
+        v.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        v.extend_from_slice(value.as_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.push(tag);
+        v
+    }
+
+    #[test]
+    fn empty_when_no_keywords_and_no_constraints() {
+        assert!(build_search_expression(&[], &SearchConstraints::default()).is_empty());
+    }
+
+    #[test]
+    fn single_keyword_is_bare_string_leaf() {
+        let out = build_search_expression(&kw("movie"), &SearchConstraints::default());
+        assert_eq!(out, string_leaf("movie"));
+    }
+
+    #[test]
+    fn keyword_plus_filetype_matches_legacy_and_layout() {
+        // Backward-compat: AND(keyword, FT_FILETYPE meta-string).
+        let out = build_search_expression(
+            &kw("movie"),
+            &SearchConstraints { file_type: Some("Video"), ..Default::default() },
+        );
+        let mut expected = vec![0x00, 0x00];
+        expected.extend(string_leaf("movie"));
+        expected.extend(meta_string("Video", TAG_FILETYPE));
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn min_size_emits_u32_numeric_ge_filesize() {
+        let out = build_search_expression(
+            &kw("movie"),
+            &SearchConstraints { min_size: Some(1024), ..Default::default() },
+        );
+        let mut expected = vec![0x00, 0x00];
+        expected.extend(string_leaf("movie"));
+        // numeric u32 leaf: type 0x03, value LE, op GE(3), taglen=1, FT_FILESIZE
+        expected.push(0x03);
+        expected.extend_from_slice(&1024u32.to_le_bytes());
+        expected.push(ED2K_SEARCH_OP_GREATER_EQUAL);
+        expected.extend_from_slice(&1u16.to_le_bytes());
+        expected.push(TAG_FILESIZE);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn max_size_above_u32_uses_u64_numeric() {
+        let big = (u32::MAX as u64) + 1; // 4 GiB + 1 byte
+        let out = build_search_expression(
+            &kw("iso"),
+            &SearchConstraints { max_size: Some(big), ..Default::default() },
+        );
+        let mut expected = vec![0x00, 0x00];
+        expected.extend(string_leaf("iso"));
+        expected.push(0x08); // 64-bit numeric type
+        expected.extend_from_slice(&big.to_le_bytes());
+        expected.push(ED2K_SEARCH_OP_LESS_EQUAL);
+        expected.extend_from_slice(&1u16.to_le_bytes());
+        expected.push(TAG_FILESIZE);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn extension_is_dot_stripped_fileformat_meta() {
+        let out = build_search_expression(
+            &kw("song"),
+            &SearchConstraints { file_extension: Some(".mp3"), ..Default::default() },
+        );
+        let mut expected = vec![0x00, 0x00];
+        expected.extend(string_leaf("song"));
+        expected.extend(meta_string("mp3", FT_FILEFORMAT));
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn zero_valued_numeric_constraints_are_omitted() {
+        let out = build_search_expression(
+            &kw("movie"),
+            &SearchConstraints {
+                min_size: Some(0),
+                max_size: Some(0),
+                min_availability: Some(0),
+                file_extension: Some(""),
+                file_type: Some(""),
+            },
+        );
+        assert_eq!(out, string_leaf("movie"));
+    }
+
+    #[test]
+    fn constraints_only_no_keywords() {
+        // No keywords: the lone constraint leaf is emitted without an AND.
+        let out = build_search_expression(
+            &[],
+            &SearchConstraints { file_type: Some("Audio"), ..Default::default() },
+        );
+        assert_eq!(out, meta_string("Audio", TAG_FILETYPE));
+    }
+
+    #[test]
+    fn multiple_constraints_and_chain_is_parseable_length() {
+        // Two keywords + type + min size + availability should produce a
+        // right-leaning AND chain with one fewer AND than operands.
+        let out = build_search_expression(
+            &[String::from("big"), String::from("movie")],
+            &SearchConstraints {
+                file_type: Some("Video"),
+                min_size: Some(1_000_000),
+                min_availability: Some(5),
+                ..Default::default()
+            },
+        );
+        // Operands: keyword_tree, filetype, min_size, availability = 4 nodes
+        // => 3 leading AND operator pairs (0x00 0x00) at the chain joints,
+        //    plus the internal AND from the 2-keyword tree.
+        let and_pairs = out.windows(2).filter(|w| w == b"\x00\x00").count();
+        assert!(and_pairs >= 3, "expected at least 3 AND joints, got {and_pairs}");
+        assert!(!out.is_empty());
+    }
 }

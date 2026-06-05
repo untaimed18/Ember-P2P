@@ -25,13 +25,18 @@ impl AppConfig {
                 Err(e) => {
                     tracing::warn!("Config file corrupt, using defaults: {e}");
                     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
-                    let bak = config_path.with_extension(format!("json.{ts}.bak"));
-                    if !bak.exists() {
-                        let _ = std::fs::rename(&config_path, &bak);
-                    } else {
-                        let bak_fallback = config_path.with_extension("json.bak");
-                        let _ = std::fs::rename(&config_path, &bak_fallback);
+                    // Pick a backup name that doesn't already exist. The old
+                    // fallback reused a fixed `json.bak`, so a second corruption
+                    // within the same wall-clock second clobbered the previous
+                    // backup; disambiguate with a counter so every corrupt
+                    // config is preserved.
+                    let mut bak = config_path.with_extension(format!("json.{ts}.bak"));
+                    let mut n = 1u32;
+                    while bak.exists() && n < 1000 {
+                        bak = config_path.with_extension(format!("json.{ts}.{n}.bak"));
+                        n += 1;
                     }
+                    let _ = std::fs::rename(&config_path, &bak);
                     AppSettings::default()
                 }
             }

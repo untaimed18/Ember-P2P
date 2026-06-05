@@ -31,22 +31,31 @@
       // in-memory tracker) so there's no reason to serialise. If
       // reputation fails we still surface transfer stats; the inverse
       // is protected by the existing error path.
-      const [result, repResult] = await Promise.all([
+      // allSettled so a stats timeout can't discard an already-resolved
+      // reputation result (and vice versa) — they're independent fetches.
+      const [statsResult, repResult] = await Promise.allSettled([
         Promise.race([
           getStatistics(),
           new Promise<TransferStats>((_, reject) => {
             statsTimeoutId = setTimeout(() => reject(new Error('timeout')), 4000);
           }),
         ]),
-        getReputationStats().catch(() => null as ReputationStatsInfo | null),
+        getReputationStats(),
       ]);
       if (unmounted) return;
-      stats = result;
-      if (repResult) repStats = repResult;
-      error = null;
+      if (repResult.status === 'fulfilled') repStats = repResult.value;
+      if (statsResult.status === 'fulfilled') {
+        stats = statsResult.value;
+        error = null;
+      } else if (!stats) {
+        // Only surface a blocking error screen on the very first load.
+        // Once we have data, a transient poll failure must not blank the
+        // whole dashboard — keep showing the last-known stats.
+        error = translateError(statsResult.reason, m.error_operation_failed());
+      }
     } catch (e) {
       if (unmounted) return;
-      error = translateError(e, m.error_operation_failed());
+      if (!stats) error = translateError(e, m.error_operation_failed());
     } finally {
       // Clear the race watchdog so the loser timer doesn't linger until
       // it fires (otherwise each poll leaves an orphan timeout pending).

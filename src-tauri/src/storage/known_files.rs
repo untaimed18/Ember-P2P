@@ -93,12 +93,15 @@ impl KnownFileList {
         }
         let count = cursor.read_u32::<LittleEndian>()? as usize;
 
-        if count > 50_000 {
-            warn!("known.met declares {} records, capping parse at 50000", count);
-        }
-
+        // No artificial record cap here: `save()` writes the full `files.len()`
+        // header, so a hard 50k parse cap silently dropped every file past the
+        // 50,000th on restart for large libraries. Memory is already bounded
+        // before we get here — the caller refuses files over MAX_KNOWN_MET_BYTES
+        // (256 MiB), each record's part/tag counts are clamped, and the
+        // consecutive-failure guard below stops a truncated/garbage tail (e.g. a
+        // bogus huge `count`) after 3 failed reads.
         let mut consecutive_failures = 0u32;
-        for _ in 0..count.min(50_000) {
+        for _ in 0..count {
             match Self::read_record(&mut cursor, version) {
                 Ok(record) => {
                     consecutive_failures = 0;
