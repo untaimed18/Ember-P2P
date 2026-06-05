@@ -294,6 +294,16 @@
     if (filterDebounceTimer) clearTimeout(filterDebounceTimer);
   }
 
+  /** Format a media length (seconds) as H:MM:SS or M:SS, eMule-style. */
+  function formatMediaLength(secs: number): string {
+    if (!secs || secs <= 0) return '\u2014';
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = Math.floor(secs % 60);
+    const pad = (n: number) => n.toString().padStart(2, '0');
+    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+  }
+
   function getColumnText(result: SearchResult, column: FilterColumn): string {
     const displayName = result.clean_name || result.file.name;
     switch (column) {
@@ -2091,6 +2101,26 @@
           <div class="detail-row"><strong>{m.search_detail_size()}</strong> {formatSize(selectedResult.file.size)}</div>
           <div class="detail-row"><strong>{m.search_detail_hash()}</strong> <code>{selectedResult.file.hash}</code></div>
           <div class="detail-row"><strong>{m.search_detail_sources()}</strong> {selectedResult.availability}</div>
+          {#if selectedResult.media}
+            {#if selectedResult.media.duration}
+              <div class="detail-row"><strong>{m.search_detail_duration()}</strong> {formatMediaLength(selectedResult.media.duration)}</div>
+            {/if}
+            {#if selectedResult.media.bitrate}
+              <div class="detail-row"><strong>{m.search_detail_bitrate()}</strong> {m.search_bitrate_value({ kbps: selectedResult.media.bitrate })}</div>
+            {/if}
+            {#if selectedResult.media.codec}
+              <div class="detail-row"><strong>{m.search_detail_codec()}</strong> {selectedResult.media.codec}</div>
+            {/if}
+            {#if selectedResult.media.artist}
+              <div class="detail-row"><strong>{m.search_detail_artist()}</strong> {selectedResult.media.artist}</div>
+            {/if}
+            {#if selectedResult.media.album}
+              <div class="detail-row"><strong>{m.search_detail_album()}</strong> {selectedResult.media.album}</div>
+            {/if}
+            {#if selectedResult.media.title}
+              <div class="detail-row"><strong>{m.search_detail_title()}</strong> {selectedResult.media.title}</div>
+            {/if}
+          {/if}
           <div class="detail-row">
             <strong>{m.search_detail_spam_score()}</strong>
             {#if spamExplainLoading}

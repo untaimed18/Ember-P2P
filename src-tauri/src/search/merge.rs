@@ -70,6 +70,17 @@ fn merge_into(existing: &mut SearchResult, incoming: SearchResult) {
     if existing.comment.is_none() {
         existing.comment = incoming.comment;
     }
+    // Fill any media fields the other origin provided that we lack, so a hit
+    // found on both KAD and a server keeps whichever side carried the metadata.
+    if let Some(inc_media) = incoming.media {
+        let em = existing.media.get_or_insert_with(crate::types::MediaMetadata::default);
+        if em.duration.is_none() { em.duration = inc_media.duration; }
+        if em.bitrate.is_none() { em.bitrate = inc_media.bitrate; }
+        if em.codec.is_none() { em.codec = inc_media.codec; }
+        if em.artist.is_none() { em.artist = inc_media.artist; }
+        if em.album.is_none() { em.album = inc_media.album; }
+        if em.title.is_none() { em.title = inc_media.title; }
+    }
     if incoming.file.name.len() > existing.file.name.len() {
         existing.file.name = incoming.file.name;
     }
