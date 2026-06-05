@@ -48,6 +48,13 @@
   const PAGE_SIZE = 100;
   let loadingOlder = $state(false);
   let hasMoreHistory = $state(false);
+  // Pagination cursor: the smallest (oldest) DB row id we've loaded. Tracked
+  // separately from `messages` because live messages use negative ids and the
+  // MAX_LIVE_MESSAGES trim drops oldest-first — in a busy session that can
+  // evict every positive (DB) id from the array. Deriving the cursor from the
+  // array (the old `messages.find(m => m.id > 0)`) then returned undefined and
+  // wrongly hid "load older" even though the DB still had history.
+  let oldestDbId: number | null = null;
 
   $effect(() => {
     if (chatInputEl) {
@@ -84,6 +91,15 @@
       const gen = ++loadGen;
       if (unlisten) { unlisten(); unlisten = null; }
       messages = [];
+      // Reset load state for the new conversation. Without this, the
+      // previous tab's `loadError` (or stale `loading`/pagination flags)
+      // is shown against the just-cleared (empty) message list during the
+      // brief `await setupListener` window before `loadMessages` runs.
+      loadError = null;
+      loading = true;
+      loadingOlder = false;
+      hasMoreHistory = false;
+      oldestDbId = null;
       // Await the listener registration BEFORE the historical
       // snapshot fetch starts. Otherwise a chat-message that arrives
       // during the (possibly 50–200 ms) `getChatMessages` round trip
@@ -157,6 +173,8 @@
       if (gen !== loadGen) return;
       hasMoreHistory = rows.length >= PAGE_SIZE;
       const snapshot = rows.reverse();
+      // snapshot is ascending (oldest first); record the oldest loaded id.
+      if (snapshot.length > 0) oldestDbId = snapshot[0].id;
       if (messages.length === 0) {
         messages = snapshot;
       } else {
@@ -184,8 +202,8 @@
     loadingOlder = true;
     const gen = loadGen;
     try {
-      const cursor = messages.find((m) => m.id > 0)?.id;
-      if (cursor === undefined) {
+      const cursor = oldestDbId;
+      if (cursor === null) {
         hasMoreHistory = false;
         return;
       }
@@ -197,6 +215,8 @@
       }
       hasMoreHistory = rows.length >= PAGE_SIZE;
       const olderPage = rows.reverse();
+      // Advance the cursor to the new oldest loaded id (ascending order).
+      if (olderPage.length > 0) oldestDbId = olderPage[0].id;
       const el = messagesContainerEl;
       const prevScrollHeight = el?.scrollHeight ?? 0;
       const prevScrollTop = el?.scrollTop ?? 0;

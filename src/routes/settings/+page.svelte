@@ -468,6 +468,7 @@
   let antileechLoaded = $state(false);
 
   async function loadAntileech() {
+    antileechMessage = null;
     try {
       const snap = await getAntileechPatterns();
       antileechSnapshot = snap;
@@ -525,16 +526,21 @@
     }
   }
 
-  async function handleAntileechToggle(checked: boolean) {
+  async function handleAntileechToggle(checked: boolean, gen: number) {
     try {
       await setAntileechEnabled(checked);
+      // A newer toggle superseded this one while the IPC was in flight —
+      // stop so a slow earlier response can't clobber the latest state.
+      if (gen !== antileechToggleGen) return;
       if (settings) settings.antileech_enabled = checked;
       // Also refresh the snapshot so the on-disk badge stays in sync.
       if (antileechLoaded) {
         const snap = await getAntileechPatterns();
+        if (gen !== antileechToggleGen) return;
         antileechSnapshot = snap;
       }
     } catch (e: unknown) {
+      if (gen !== antileechToggleGen) return;
       const text = m.settings_antileech_toggle_failed({ error: translateError(e) });
       antileechMessage = {
         kind: 'err',
@@ -594,12 +600,15 @@
   // race with `handleAntileechToggle`'s catch path and could flip the
   // backend off if that redundant call ever failed).
   let lastAppliedAntileechToggle: boolean | null = $state(null);
+  // Monotonic id so only the most recent toggle's async response is allowed
+  // to mutate state — guards against rapid toggling resolving out of order.
+  let antileechToggleGen = 0;
   $effect(() => {
     if (!settings) return;
     const want = settings.antileech_enabled;
     if (lastAppliedAntileechToggle === want) return;
     lastAppliedAntileechToggle = want;
-    void handleAntileechToggle(want);
+    void handleAntileechToggle(want, ++antileechToggleGen);
   });
 
   async function handleDownloadNodes() {
@@ -1282,7 +1291,12 @@
           {#if settings.antileech_enabled}
             <div class="field nested antileech-block">
               {#if !antileechLoaded}
-                <div class="hint">{m.settings_antileech_loading()}</div>
+                {#if antileechMessage && antileechMessage.kind === 'err'}
+                  <span class="feedback error">{antileechMessage.text}</span>
+                  <button class="action-btn ghost" onclick={loadAntileech}>{m.common_retry()}</button>
+                {:else}
+                  <div class="hint">{m.settings_antileech_loading()}</div>
+                {/if}
               {:else}
                 <label for="antileech-textarea" class="antileech-label">
                   {m.settings_antileech_patterns_prefix()} <code>#</code> {m.settings_antileech_patterns_suffix()}

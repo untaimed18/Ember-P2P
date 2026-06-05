@@ -2282,13 +2282,22 @@
   // with no visual cue. Now a single-click selection is enough.
   // `activeDownloads` is read inside `untrack` so a download progress
   // tick (which mutates the array) doesn't re-run the effect.
+  // Tracks the id we last auto-expanded on this tab so an explicit user
+  // collapse isn't instantly undone. Plain (non-reactive) on purpose: the
+  // effect only needs to read/write it, and making it reactive would
+  // re-trigger the effect. Reset when the auto-expand precondition lapses
+  // (tab change / not exactly one selected) so a later re-selection of the
+  // same row auto-expands again.
+  let lastAutoExpandedClientsId: string | null = null;
   $effect(() => {
-    if (bottomView !== 'download_clients') return;
-    if (selectedDownloadIds.length !== 1) return;
+    if (bottomView !== 'download_clients') { lastAutoExpandedClientsId = null; return; }
+    if (selectedDownloadIds.length !== 1) { lastAutoExpandedClientsId = null; return; }
     const id = selectedDownloadIds[0];
-    if (expandedTransferId === id) return;
+    if (expandedTransferId === id) { lastAutoExpandedClientsId = id; return; }
+    // User explicitly collapsed this row's panel — don't reopen it.
+    if (lastAutoExpandedClientsId === id) return;
     const t = untrack(() => activeDownloads.find((x) => x.id === id));
-    if (t) toggleSourceDetail(t);
+    if (t) { lastAutoExpandedClientsId = id; toggleSourceDetail(t); }
   });
 
   $effect.pre(() => {

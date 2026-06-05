@@ -18,7 +18,7 @@
   import type { KadContact, KadSearchEntry } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
-  import { translateError } from '$lib/i18n';
+  import { translateError, degradedReasonText, firewallStatusText } from '$lib/i18n';
 
   let contacts: KadContact[] = $state([]);
   let searches: KadSearchEntry[] = $state([]);
@@ -158,6 +158,11 @@
         getKadSearches(),
       ]);
       if (!mounted) return;
+
+      // If we disconnected while these fetches were in flight, the
+      // disconnect effect has already cleared the lists — don't let a
+      // stale in-flight result repopulate them onto the disconnected view.
+      if ($networkStats.status === 'disconnected') return;
 
       if (c.status === 'fulfilled') contacts = c.value;
       if (s.status === 'fulfilled') searches = s.value;
@@ -710,7 +715,7 @@
               {$networkStats.stale
                 ? m.kad_health_stale()
                 : $networkStats.degraded
-                  ? ($networkStats.degraded_reason || m.kad_health_degraded())
+                  ? (degradedReasonText($networkStats.degraded_reason) || m.kad_health_degraded())
                   : m.kad_health_healthy()}
             </span>
           </div>
@@ -724,7 +729,7 @@
           <div class="stat-tile">
             <span class="stat-label" title={m.kad_stat_kad_users_title()}>{m.kad_stat_kad_users()}</span>
             <span class="stat-value stat-numeric">
-              {$networkStats.status === 'disconnected' || !$networkStats.kad_users_estimate
+              {$networkStats.status === 'disconnected' || $networkStats.kad_users_estimate == null
                 ? '—'
                 : $networkStats.kad_users_estimate.toLocaleString()}
             </span>
@@ -770,11 +775,11 @@
         <div class="stat-group stat-group-grid">
           <div class="stat-tile">
             <span class="stat-label">{m.kad_stat_tcp()}</span>
-            <span class="stat-value">{$networkStats.tcp_status || m.common_unknown()}</span>
+            <span class="stat-value">{firewallStatusText($networkStats.tcp_status)}</span>
           </div>
           <div class="stat-tile">
             <span class="stat-label">{m.kad_stat_udp()}</span>
-            <span class="stat-value">{$networkStats.udp_status || m.common_unknown()}</span>
+            <span class="stat-value">{firewallStatusText($networkStats.udp_status)}</span>
           </div>
           <div class="stat-tile">
             <span class="stat-label">{m.kad_stat_upnp()}</span>

@@ -1531,16 +1531,30 @@ fn parse_found_sources(payload: &[u8], obfuscated: bool) -> anyhow::Result<([u8;
     let mut sources = Vec::with_capacity(count);
 
     for _ in 0..count {
-        let id = ReadBytesExt::read_u32::<LittleEndian>(&mut cursor)?;
-        let port = ReadBytesExt::read_u16::<LittleEndian>(&mut cursor)?;
+        // A truncated tail must not discard the sources we already parsed
+        // successfully: a short/garbled final record should still leave the
+        // earlier (valid) sources usable, matching eMule's tolerant parsing.
+        let id = match ReadBytesExt::read_u32::<LittleEndian>(&mut cursor) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let port = match ReadBytesExt::read_u16::<LittleEndian>(&mut cursor) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
         let crypt_options = if obfuscated {
-            Some(ReadBytesExt::read_u8(&mut cursor)?)
+            match ReadBytesExt::read_u8(&mut cursor) {
+                Ok(v) => Some(v),
+                Err(_) => break,
+            }
         } else {
             None
         };
         let user_hash = if crypt_options.is_some_and(|opts| (opts & 0x80) != 0) {
             let mut hash = [0u8; 16];
-            Read::read_exact(&mut cursor, &mut hash)?;
+            if Read::read_exact(&mut cursor, &mut hash).is_err() {
+                break;
+            }
             Some(hash)
         } else {
             None

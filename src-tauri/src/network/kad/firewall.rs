@@ -90,6 +90,15 @@ impl FirewallChecker {
         self.udp_firewall_succeeded = false;
         // Clear IP votes so a new check cycle can detect external IP changes.
         self.external_ip_votes.clear();
+        // Also drop the previously confirmed IP so this cycle must re-confirm
+        // it. Without this a changed external IP (new ISP lease, reconnect)
+        // could stick forever: `handle_server_highid_response` keeps the old
+        // value on its `Some(existing)` branch, and a new IP that never reaches
+        // the 3-distinct-/24 KAD threshold would never replace it. Consumers
+        // (`external_ip()`) only ever overwrite `state.external_ip` on a fresh
+        // confirmation and never blank it, so the last-known IP is retained
+        // during the ~30s re-confirmation window.
+        self.confirmed_external_ip = None;
         // Preserve external_udp_port from previous cycle so UDP firewall
         // probes can be dispatched immediately without waiting for new pongs.
         // Port votes are cleared so pongs from this cycle can refine it.

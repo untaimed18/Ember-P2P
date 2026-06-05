@@ -594,9 +594,19 @@ impl ServerList {
             anyhow::bail!("Unknown server.met version: 0x{version:02X}");
         }
         let count = cursor.read_u32::<LittleEndian>()? as usize;
+        // Match load_server_met: reject absurd counts instead of silently
+        // truncating. The previous `count.min(500)` cap dropped every server
+        // past the 500th with no signal, so merging a large list appeared to
+        // succeed while importing only a 500-entry prefix.
+        const MAX_MERGE_SERVERS: usize = 5_000;
+        if count > MAX_MERGE_SERVERS {
+            anyhow::bail!(
+                "server.met declares {count} servers, exceeding cap of {MAX_MERGE_SERVERS}; refusing to merge to avoid silent truncation"
+            );
+        }
         let mut stats = ServerMergeStats::default();
 
-        for _ in 0..count.min(500) {
+        for _ in 0..count {
             let ip_raw = match cursor.read_u32::<LittleEndian>() {
                 Ok(v) => v,
                 Err(_) => break,

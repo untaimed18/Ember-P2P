@@ -145,19 +145,23 @@
     return () => { unmounted = true; clearTimeout(flashTimer); };
   });
 
+  let loadStatsSeq = 0;
   async function loadStats() {
     if (unmounted) return;
+    // Only the latest invocation commits, so overlapping refreshes (mount plus
+    // the several post-action reloads) can't clobber newer stats out of order.
+    const seq = ++loadStatsSeq;
     loading = true;
     error = null;
     try {
       const result = await getIpFilterStats();
-      if (unmounted) return;
+      if (unmounted || seq !== loadStatsSeq) return;
       stats = result;
     } catch (e: unknown) {
-      if (unmounted) return;
+      if (unmounted || seq !== loadStatsSeq) return;
       error = toErrorMsg(e);
     } finally {
-      if (!unmounted) loading = false;
+      if (!unmounted && seq === loadStatsSeq) loading = false;
     }
   }
 
