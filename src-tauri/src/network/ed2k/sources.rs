@@ -87,6 +87,12 @@ pub struct DownloadSourceEntry {
     pub state: DownloadSourceState,
     /// When we last sent a file request / reask to this source.
     pub last_asked: Instant,
+    /// When we last sent a UDP `OP_REASKFILEPING` to this source. Tracked
+    /// separately from `last_asked` so a UDP reask does NOT push out the
+    /// `MIN_TCP_RECONNECT_SECS` (20 min) TCP-reconnect gate in
+    /// `can_try_tcp_at` — previously `mark_udp_reask_sent` bumped
+    /// `last_asked`, silently delaying the next TCP attempt by 20 minutes.
+    pub last_udp_reask: Instant,
     /// When the state last changed (for timeout decisions).
     pub state_changed: Instant,
     /// Number of consecutive failures without a successful data transfer.
@@ -110,6 +116,7 @@ impl DownloadSourceEntry {
             udp_port: 0,
             state: DownloadSourceState::New,
             last_asked: now,
+            last_udp_reask: now,
             state_changed: now,
             fail_count: 0,
             callback_buddy_ip: None,
@@ -190,7 +197,11 @@ impl DownloadSourceEntry {
     /// (27 min after last ask, i.e. 2 min before FILEREASKTIME).
     pub fn needs_udp_reask(&self) -> bool {
         if self.udp_port == 0 { return false; }
-        let elapsed = self.last_asked.elapsed().as_secs();
+        // Gate on the most recent ask of EITHER kind so we neither spam UDP
+        // reasks nor reask right after a TCP ask, while keeping the TCP
+        // reconnect gate (`can_try_tcp_at`) keyed only on `last_asked`.
+        let last = self.last_asked.max(self.last_udp_reask);
+        let elapsed = last.elapsed().as_secs();
         let threshold = (FILEREASKTIME_SECS - 120).max(0) as u64;
         matches!(self.state, DownloadSourceState::OnQueue { .. } | DownloadSourceState::Failed)
             && elapsed >= threshold
@@ -527,7 +538,7 @@ impl PerFileSourceList {
     /// upstream.
     pub fn mark_udp_reask_sent(&mut self, ip: Ipv4Addr, tcp_port: u16) {
         if let Some(s) = self.find_mut(ip, tcp_port) {
-            s.last_asked = std::time::Instant::now();
+            s.last_udp_reask = std::time::Instant::now();
         }
     }
 

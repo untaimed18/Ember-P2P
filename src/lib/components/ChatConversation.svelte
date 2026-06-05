@@ -223,9 +223,14 @@
   }
 
   async function markAsRead() {
+    // Capture the hash up front: `friendHash` is a reactive prop that can
+    // change while the IPC round-trip is in flight (fast tab switching), and
+    // re-reading it after the await would clear unread for the WRONG friend.
+    const h = friendHash;
+    if (!h) return;
     try {
-      await markMessagesRead(friendHash);
-      clearUnread(friendHash);
+      await markMessagesRead(h);
+      clearUnread(h);
     } catch (e) {
       console.warn('markMessagesRead failed:', e);
     }

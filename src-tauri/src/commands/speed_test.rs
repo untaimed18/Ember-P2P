@@ -1,3 +1,4 @@
+use futures::StreamExt;
 use serde::Serialize;
 use tracing::info;
 use crate::commands::errors::coded_ctx;
@@ -5,6 +6,10 @@ use crate::commands::errors::coded_ctx;
 const DOWNLOAD_TEST_URL: &str = "https://speed.cloudflare.com/__down?bytes=5000000";
 const UPLOAD_TEST_URL: &str = "https://speed.cloudflare.com/__up";
 const UPLOAD_TEST_BYTES: usize = 2_000_000;
+/// Hard cap on the download-test body we will buffer. The endpoint is asked for
+/// 5 MB; this bounds memory in case a misbehaving server/proxy/redirect streams
+/// far more than requested.
+const MAX_DOWNLOAD_TEST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SpeedTestResult {
@@ -33,13 +38,20 @@ pub async fn run_speed_test() -> Result<SpeedTestResult, String> {
             .await
             .map_err(|e| coded_ctx("speed_download_test_failed", "Download test failed", e))?;
 
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| coded_ctx("speed_download_read_failed", "Download test read failed", e))?;
+        // Stream the body with a hard cap instead of `resp.bytes()` (which
+        // would buffer the entire response regardless of size).
+        let mut stream = resp.bytes_stream();
+        let mut actual_bytes: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .map_err(|e| coded_ctx("speed_download_read_failed", "Download test read failed", e))?;
+            actual_bytes += chunk.len() as u64;
+            if actual_bytes >= MAX_DOWNLOAD_TEST_BYTES {
+                break;
+            }
+        }
 
         let elapsed = start.elapsed().as_secs_f64();
-        let actual_bytes = bytes.len() as u64;
         let speed = if elapsed > 0.0 {
             (actual_bytes as f64 / elapsed) as u64
         } else {

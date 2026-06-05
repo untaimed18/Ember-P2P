@@ -483,6 +483,23 @@ impl EmberTransport {
                 return IncomingResult::Rejected;
             }
         };
+
+        // Don't let a NEW handshake from the same socket address silently
+        // replace a live session that belongs to a DIFFERENT Noise identity.
+        // A legitimate peer always re-handshakes with the same static key, so
+        // matching-key re-handshakes are still allowed (session refresh); only
+        // a mismatched static key (potential takeover via a shared NAT mapping
+        // or on-path attacker) is rejected.
+        if let Some(existing) = self.sessions.get(&from) {
+            if existing.remote_noise_pub != remote_noise_pub {
+                debug!(
+                    "IK init from {from} carries a different static key than the live session; \
+                     rejecting to prevent session takeover"
+                );
+                return IncomingResult::Rejected;
+            }
+        }
+
         let transport = match responder.into_transport_mode() {
             Ok(t) => t,
             Err(e) => {
