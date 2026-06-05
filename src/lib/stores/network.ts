@@ -203,6 +203,11 @@ export function cleanupNetworkStore() {
 
 let statsPollInterval: ReturnType<typeof setInterval> | null = null;
 let statsPollConsumers = 0;
+// Guard against overlapping polls: a slow `getNetworkStats()` (up to the 4 s
+// race timeout) can still be running when the next 3 s tick fires. Without
+// this, two requests run concurrently and the slower/older one can resolve
+// last and clobber fresher stats.
+let statsPollInFlight = false;
 
 // Module-scope so both the consumer-ref teardown and `cleanupNetworkStore`
 // can reliably detach it without keeping a dangling DOM listener. Set
@@ -255,7 +260,9 @@ export function startStatsPoll() {
       return;
     }
     if (!statsPumpOnNextVisible && Date.now() - lastEventUpdate < 5500) return;
+    if (statsPollInFlight) return;
     statsPumpOnNextVisible = false;
+    statsPollInFlight = true;
     let pollTimeout: ReturnType<typeof setTimeout> | undefined;
     try {
       const stats = await Promise.race([
@@ -291,6 +298,7 @@ export function startStatsPoll() {
     } finally {
       // Clear the race watchdog so the loser timer doesn't linger.
       if (pollTimeout) clearTimeout(pollTimeout);
+      statsPollInFlight = false;
     }
   }, 3000);
 

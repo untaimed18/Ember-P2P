@@ -350,7 +350,7 @@
     pendingRemove = null;
     try {
       await removeFriend(f.user_hash);
-      onlineFriendsStore.update(s => { s.delete(f.user_hash); return new Set(s); });
+      onlineFriendsStore.update(s => { const next = new Set(s); next.delete(f.user_hash); return next; });
       // Close any open chat tab for the removed friend; leaving it
       // open would show a session for someone who is no longer in
       // the user's friend list and silently fail to send.

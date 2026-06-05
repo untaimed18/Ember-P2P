@@ -41,6 +41,18 @@ pub async fn load_collection(
         return Err(coded("collections_file_outside_allowed_dirs", "Collection file must be inside a shared or download folder"));
     }
 
+    // Cap the on-disk size before `Collection::load` reads the whole file into
+    // memory (`std::fs::read`). `open_collection_file` already enforces this;
+    // the webview-callable `load_collection` path did not, so a multi-GiB file
+    // inside an allowed folder could OOM the client.
+    const MAX_COLLECTION_BYTES: u64 = 32 * 1024 * 1024;
+    let meta = tokio::fs::metadata(&canonical)
+        .await
+        .map_err(|e| coded_ctx("collections_stat_failed", "Cannot stat collection file", e))?;
+    if meta.len() > MAX_COLLECTION_BYTES {
+        return Err(coded("collections_file_too_large", "Collection file too large (max 32 MiB)"));
+    }
+
     tokio::task::spawn_blocking(move || {
         Collection::load(&canonical).map_err(|e| coded_ctx("collections_load_failed", "Failed to load collection", e))
     })

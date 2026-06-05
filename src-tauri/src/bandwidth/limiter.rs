@@ -16,6 +16,11 @@ pub struct BandwidthLimiter {
     configured_upload_rate: AtomicU64,
     upload_tokens: AtomicU64,
     download_tokens: AtomicU64,
+    /// Sub-token remainders carried between refill ticks so that very low
+    /// rates (where `max_rate * fraction < divisor`) are honored exactly
+    /// instead of being rounded up to a 1-token-per-tick floor.
+    upload_refill_rem: AtomicU64,
+    download_refill_rem: AtomicU64,
     total_uploaded: AtomicU64,
     total_downloaded: AtomicU64,
     upload_speed: AtomicU64,
@@ -33,6 +38,8 @@ impl BandwidthLimiter {
             configured_upload_rate: AtomicU64::new(max_upload),
             upload_tokens: AtomicU64::new(max_upload),
             download_tokens: AtomicU64::new(max_download),
+            upload_refill_rem: AtomicU64::new(0),
+            download_refill_rem: AtomicU64::new(0),
             total_uploaded: AtomicU64::new(0),
             total_downloaded: AtomicU64::new(0),
             upload_speed: AtomicU64::new(0),
@@ -130,8 +137,16 @@ impl BandwidthLimiter {
         let max_up = self.max_upload_rate.load(Ordering::Relaxed);
         let max_down = self.max_download_rate.load(Ordering::Relaxed);
 
+        // Carry sub-token remainders between ticks so the long-run refill
+        // rate equals exactly `max_rate` even when `max_rate * fraction <
+        // divisor` (the old `.max(1)` floor over-served low limits, e.g. a
+        // 5 B/s cap refilled at ~10 B/s). The refill timer is the only caller,
+        // so the remainder load/store needs no cross-task synchronization.
         if max_up > 0 {
-            let add = (max_up * fraction / divisor).max(1);
+            let prev_rem = self.upload_refill_rem.load(Ordering::Relaxed);
+            let numer = max_up.saturating_mul(fraction).saturating_add(prev_rem);
+            let add = numer / divisor;
+            self.upload_refill_rem.store(numer % divisor, Ordering::Relaxed);
             let cap = max_up.saturating_mul(2);
             loop {
                 let current = self.upload_tokens.load(Ordering::Relaxed);
@@ -144,9 +159,14 @@ impl BandwidthLimiter {
                     break;
                 }
             }
+        } else {
+            self.upload_refill_rem.store(0, Ordering::Relaxed);
         }
         if max_down > 0 {
-            let add = (max_down * fraction / divisor).max(1);
+            let prev_rem = self.download_refill_rem.load(Ordering::Relaxed);
+            let numer = max_down.saturating_mul(fraction).saturating_add(prev_rem);
+            let add = numer / divisor;
+            self.download_refill_rem.store(numer % divisor, Ordering::Relaxed);
             let cap = max_down.saturating_mul(2);
             loop {
                 let current = self.download_tokens.load(Ordering::Relaxed);
@@ -159,8 +179,35 @@ impl BandwidthLimiter {
                     break;
                 }
             }
+        } else {
+            self.download_refill_rem.store(0, Ordering::Relaxed);
         }
         self.refill_notify.notify_waiters();
+    }
+
+    /// Set ONLY the effective upload rate (used by USS dynamic throttling),
+    /// clamping the upload token bucket to the new 2× burst cap. Without the
+    /// clamp, lowering the rate would leave stale tokens from the previous
+    /// (higher) cap spendable, letting uploads briefly burst above the new
+    /// USS limit. The user-configured rate and download side are untouched.
+    pub fn set_upload_limit(&self, upload: u64) {
+        self.max_upload_rate.store(upload, Ordering::Relaxed);
+        if upload > 0 {
+            let cap = upload.saturating_mul(2);
+            loop {
+                let current = self.upload_tokens.load(Ordering::Relaxed);
+                if current <= cap {
+                    break;
+                }
+                if self
+                    .upload_tokens
+                    .compare_exchange_weak(current, cap, Ordering::Release, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
     }
 
     pub fn set_limits(&self, upload: u64, download: u64) {
@@ -323,7 +370,7 @@ pub async fn start_token_refill(
 
             if uss.is_enabled() {
                 if let Some(new_limit) = uss.compute_limit() {
-                    limiter.max_upload_rate.store(new_limit, Ordering::Relaxed);
+                    limiter.set_upload_limit(new_limit);
                 }
                 let configured_max = limiter.configured_upload_rate();
                 if configured_max > 0 {
