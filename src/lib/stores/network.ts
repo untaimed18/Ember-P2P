@@ -1,7 +1,7 @@
 import { writable } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
-import type { NetworkStats } from '$lib/types';
+import type { DegradedReason, NetworkStats } from '$lib/types';
 import { getNetworkStats } from '$lib/api/kad';
 import { toastError, toastWarning } from '$lib/stores/toast';
 
@@ -55,20 +55,23 @@ function withDerivedNetworkState(stats: NetworkStats, now = Date.now()): Network
   const udpStatus = stats.udp_status || 'Unknown';
 
   let degraded = false;
-  let degradedReason: string | undefined;
+  // Stable reason code, localized at render time (see `degradedReasonText` in
+  // `$lib/i18n`). The store must not embed a display string here, otherwise it
+  // would be frozen in whatever locale was active when the status last changed.
+  let degradedReason: DegradedReason | undefined;
 
   if (stale) {
     degraded = true;
-    degradedReason = 'Network status is stale';
+    degradedReason = 'stale';
   } else if (
     stats.status === 'connected' &&
     (stats.firewalled || tcpStatus === 'Firewalled' || udpStatus === 'Firewalled')
   ) {
     degraded = true;
-    degradedReason = 'Limited reachability';
+    degradedReason = 'limited';
   } else if (stats.status === 'connecting' && !stats.external_ip) {
     degraded = true;
-    degradedReason = 'Still establishing reachability';
+    degradedReason = 'establishing';
   }
 
   return {

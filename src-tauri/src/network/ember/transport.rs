@@ -822,6 +822,22 @@ impl EmberTransport {
                 return IncomingResult::Rejected;
             }
         };
+
+        // Mirror the IK responder guard: a completed XX handshake from the same
+        // socket address must not silently replace a live session belonging to
+        // a DIFFERENT Noise identity. A legitimate peer re-handshakes with its
+        // own static key (allowed — session refresh); a mismatched key is a
+        // potential takeover via a shared NAT mapping or on-path attacker.
+        if let Some(existing) = self.sessions.get(&from) {
+            if existing.remote_noise_pub != remote_noise_pub {
+                debug!(
+                    "XX msg3 from {from} carries a different static key than the live session; \
+                     rejecting to prevent session takeover"
+                );
+                return IncomingResult::Rejected;
+            }
+        }
+
         let mut transport = match state.into_transport_mode() {
             Ok(t) => t,
             Err(e) => {

@@ -1007,6 +1007,11 @@ pub async fn unshare_file(
 ) -> Result<(), String> {
     let file = {
         let mut index = state.local_index.write().await;
+        if index.get_by_path(&file_path).is_none() {
+            // Surface a desync instead of silently reporting success: the UI
+            // asked to unshare a path the backend index doesn't know about.
+            return Err(coded("sharing_file_not_in_index", "File not found in shared index"));
+        }
         if index.set_file_shared_by_path(&file_path, false) {
             index.get_by_path(&file_path).cloned()
         } else {
@@ -1037,6 +1042,11 @@ pub async fn share_file(
 ) -> Result<(), String> {
     let file = {
         let mut index = state.local_index.write().await;
+        if index.get_by_path(&file_path).is_none() {
+            // Surface a desync instead of silently reporting success: the UI
+            // asked to share a path the backend index doesn't know about.
+            return Err(coded("sharing_file_not_in_index", "File not found in shared index"));
+        }
         index.set_file_shared_by_path(&file_path, true);
         index.get_by_path(&file_path).cloned()
     };

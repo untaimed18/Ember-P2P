@@ -2459,26 +2459,36 @@ impl Ed2kDownload {
                             let piece_len = end - start;
                             self.acquire_download_bandwidth(piece_len).await;
 
-                            // Per-file writer thread serializes the writes for
-                            // us; await is just an mpsc round-trip.
-                            output
-                                .write(start, data.to_vec())
-                                .await
-                                .map_err(|e| anyhow::anyhow!("part write at {start}: {e}"))?;
+                            // Never overwrite bytes we already have. A duplicate
+                            // or malicious re-send of an already-filled (possibly
+                            // MD4-verified) range would otherwise replace
+                            // verified-good data on disk while `part_verified`
+                            // stays set, which the upload path then serves as
+                            // safe. Mirror the multi-source D21 gap guard; only
+                            // the disk write + gap fill are skipped, the transfer
+                            // counters below still account the bytes.
+                            if tracker.newly_fillable(start, end) > 0 {
+                                // Per-file writer thread serializes the writes for
+                                // us; await is just an mpsc round-trip.
+                                output
+                                    .write(start, data.to_vec())
+                                    .await
+                                    .map_err(|e| anyhow::anyhow!("part write at {start}: {e}"))?;
 
-                            // Update byte-level gap tracker for mid-part resume
-                            tracker.fill_range(start, end);
+                                // Update byte-level gap tracker for mid-part resume
+                                tracker.fill_range(start, end);
 
-                            if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
-                                let _ = event_tx
-                                    .send(DownloadEvent::DataReceived {
-                                        file_hash: self.file_hash,
-                                        start,
-                                        end,
-                                        sender_ip: v4,
-                                        sender_user_hash: Some(peer_user_hash),
-                                    })
-                                    .await;
+                                if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
+                                    let _ = event_tx
+                                        .send(DownloadEvent::DataReceived {
+                                            file_hash: self.file_hash,
+                                            start,
+                                            end,
+                                            sender_ip: v4,
+                                            sender_user_hash: Some(peer_user_hash),
+                                        })
+                                        .await;
+                                }
                             }
 
                             if !got_any_data {
@@ -2562,22 +2572,27 @@ impl Ed2kDownload {
                             consecutive_bad_blocks = 0;
                             self.acquire_download_bandwidth(piece_len).await;
 
-                            output
-                                .write(start, decompressed)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("part write at {start}: {e}"))?;
-                            tracker.fill_range(start, start + piece_len);
+                            // D21 (compressed): never overwrite already-present
+                            // (possibly verified) bytes — see the uncompressed
+                            // branch above.
+                            if tracker.newly_fillable(start, start + piece_len) > 0 {
+                                output
+                                    .write(start, decompressed)
+                                    .await
+                                    .map_err(|e| anyhow::anyhow!("part write at {start}: {e}"))?;
+                                tracker.fill_range(start, start + piece_len);
 
-                            if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
-                                let _ = event_tx
-                                    .send(DownloadEvent::DataReceived {
-                                        file_hash: self.file_hash,
-                                        start,
-                                        end: start + piece_len,
-                                        sender_ip: v4,
-                                        sender_user_hash: Some(peer_user_hash),
-                                    })
-                                    .await;
+                                if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
+                                    let _ = event_tx
+                                        .send(DownloadEvent::DataReceived {
+                                            file_hash: self.file_hash,
+                                            start,
+                                            end: start + piece_len,
+                                            sender_ip: v4,
+                                            sender_user_hash: Some(peer_user_hash),
+                                        })
+                                        .await;
+                                }
                             }
 
                             if !got_any_data {

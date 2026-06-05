@@ -5684,28 +5684,48 @@ async fn download_parts_from_source(
                     consecutive_bad_blocks = 0;
                     bw.acquire_download(piece_len).await;
 
-                    if let Err(e) = output.write(start, decompressed).await {
-                        tracing::warn!(
-                            "source {_src_idx}: compressed disk write failed at start={start} ({piece_len} bytes): {e}"
+                    // D21 (compressed): mirror the uncompressed gap guard above.
+                    // Never overwrite bytes we already have — a duplicate or
+                    // overlapping compressed block from another source can cover
+                    // a range we already wrote and possibly MD4-verified.
+                    // `fill_range` leaves `part_verified` set when a write adds no
+                    // new bytes, so re-writing would silently replace
+                    // verified-good data on disk (which the upload path then
+                    // serves as safe). Only write/record bytes that overlap a
+                    // gap; duplicate bytes still flow through the pipeline
+                    // bookkeeping below.
+                    let fillable = {
+                        let t = tracker.read().await;
+                        t.newly_fillable(start, start + piece_len)
+                    };
+                    if fillable > 0 {
+                        if let Err(e) = output.write(start, decompressed).await {
+                            tracing::warn!(
+                                "source {_src_idx}: compressed disk write failed at start={start} ({piece_len} bytes): {e}"
+                            );
+                            continue;
+                        }
+
+                        {
+                            let mut t = tracker.write().await;
+                            t.fill_range(start, start + piece_len);
+                        }
+
+                        if let (Some(ref etx), std::net::IpAddr::V4(v4)) = (&event_tx, addr.ip()) {
+                            let _ = etx
+                                .send(DownloadEvent::DataReceived {
+                                    file_hash: *file_hash,
+                                    start,
+                                    end: start + piece_len,
+                                    sender_ip: v4,
+                                    sender_user_hash: Some(peer_user_hash),
+                                })
+                                .await;
+                        }
+                    } else {
+                        tracing::trace!(
+                            "source {_src_idx}: duplicate compressed block at start={start} ({piece_len} bytes) — range already present, not rewriting"
                         );
-                        continue;
-                    }
-
-                    {
-                        let mut t = tracker.write().await;
-                        t.fill_range(start, start + piece_len);
-                    }
-
-                    if let (Some(ref etx), std::net::IpAddr::V4(v4)) = (&event_tx, addr.ip()) {
-                        let _ = etx
-                            .send(DownloadEvent::DataReceived {
-                                file_hash: *file_hash,
-                                start,
-                                end: start + piece_len,
-                                sender_ip: v4,
-                                sender_user_hash: Some(peer_user_hash),
-                            })
-                            .await;
                     }
 
                     if !got_any_data {

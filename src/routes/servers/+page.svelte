@@ -375,7 +375,17 @@
       const next = new Set(selectedServers);
       if (next.has(key)) next.delete(key); else next.add(key);
       selectedServers = next;
-      selectedServer = next.has(key) ? server : next.size === 0 ? null : selectedServer;
+      if (next.has(key)) {
+        selectedServer = server;
+      } else if (next.size === 0) {
+        selectedServer = null;
+      } else if (selectedServer && serverKey(selectedServer) === key) {
+        // Deselected the active row while others remain selected — promote
+        // another still-selected server so Connect doesn't target a row the
+        // user just unselected. (Keep current selection when an *other* row
+        // is toggled off.)
+        selectedServer = servers.find((s) => next.has(serverKey(s))) ?? null;
+      }
       if (next.size === 0) lastClickedKey = null;
       else lastClickedKey = key;
     } else if (e.shiftKey && lastClickedKey) {
@@ -446,12 +456,19 @@
       toRemove.map(s => removeServer(s.ip, s.port))
     );
     const count = results.filter((r) => r.status === 'fulfilled').length;
+    const failedCount = results.filter((r) => r.status === 'rejected').length;
     selectedServers = new Set();
     selectedServer = null;
     lastClickedKey = null;
     const removedMsg = count === 1 ? m.servers_removed_one() : m.servers_removed_other({ count });
     log(removedMsg);
-    flash(removedMsg);
+    // Mirror doRemoveAll: surface failures instead of flashing a success
+    // toast when some (or all) removals were rejected.
+    if (failedCount > 0) {
+      error = m.servers_removed_with_failures({ message: removedMsg, failed: failedCount });
+    } else if (count > 0) {
+      flash(removedMsg);
+    }
     await refresh();
   }
 

@@ -225,7 +225,11 @@
     // Apply the first character of a new query (and restored filters on
     // mount, where debouncedQuery is still '') synchronously so results
     // appear instantly; debounce only the rapid follow-up keystrokes.
-    if (debouncedQuery === '') {
+    // Also apply an empty query immediately: clearing the box (clear button,
+    // Escape, clearLibraryFilters, reveal-file) must un-filter the table at
+    // once so the table state matches the `hasActiveLibraryFilters` UI that
+    // reads `searchQuery` directly — otherwise they disagree for ~150 ms.
+    if (debouncedQuery === '' || q === '') {
       debouncedQuery = q;
       return;
     }
@@ -248,6 +252,11 @@
   // `force` to bypass it (e.g. right after removing missing entries).
   let lastMissingScanAt = 0;
   const MISSING_SCAN_MIN_INTERVAL_MS = 30_000;
+  // A persisted "missing only" filter is applied lazily: enabling it before
+  // the first missing-file scan completes would filter against an empty set
+  // and blank the whole library. Set from localStorage, consumed by the
+  // first refreshMissingSet().
+  let pendingRestoreMissingOnly = false;
 
   async function refreshMissingSet(force = false) {
     if (missingScanInFlight) return;
@@ -258,6 +267,12 @@
       const list = await scanMissingFiles();
       if (!mounted) return;
       missingPathSet = new Set(list);
+      // Apply a deferred persisted "missing only" filter now that we know
+      // whether any files are actually missing — only enable it if so.
+      if (pendingRestoreMissingOnly) {
+        pendingRestoreMissingOnly = false;
+        showMissingOnly = missingPathSet.size > 0;
+      }
       if (showMissingOnly && missingPathSet.size === 0) {
         showMissingOnly = false;
       }
@@ -431,6 +446,13 @@
 
   async function handleReload() {
     error = null;
+    // An explicit reload is a fresh user-initiated rescan, so clear any
+    // prior "stopped by user" state. Otherwise the progress listener and
+    // the scan-status poll (both gated on !stoppedByUser) stay suppressed,
+    // leaving the reload to run invisibly while the "hashing stopped"
+    // banner lingers.
+    stoppedByUser = false;
+    scanning = true;
     try {
       await reloadSharedFiles();
     } catch (e: unknown) {
@@ -493,7 +515,7 @@
     return files.filter((f) => {
       if (hasFolder && !isPathInFolder(f.path, folder!)) return false;
       if (hasQuery && !f.name.toLowerCase().includes(q)) return false;
-      if (hasType && fileType(f.extension) !== typeFilter) return false;
+      if (hasType && fileTypeKey(f.extension) !== typeFilter) return false;
       if (dupOnly && (!f.hash || !duplicateHashes.has(f.hash))) return false;
       if (missOnly && !missingPathSet.has(f.path)) return false;
       return true;
@@ -851,6 +873,22 @@
     if (docExts.has(lower)) return m.library_type_document();
     if (isoExts.has(lower)) return m.library_type_cd_dvd();
     return ext ? ext.toUpperCase() : '\u2014';
+  }
+
+  // Stable, locale-independent category key used by the type filter. The
+  // `typeFilter` state holds the English option *values* ('Audio', 'Video',
+  // ...), so the filter must compare against these keys rather than against
+  // `fileType()`, whose return value is translated (e.g. 'Vídeo' in Spanish)
+  // and would never match the stored value in non-English locales.
+  function fileTypeKey(ext: string): TypeFilter | '' {
+    const lower = ext.toLowerCase();
+    if (audioExts.has(lower)) return 'Audio';
+    if (videoExts.has(lower)) return 'Video';
+    if (imageExts.has(lower)) return 'Image';
+    if (archiveExts.has(lower)) return 'Archive';
+    if (docExts.has(lower)) return 'Document';
+    if (isoExts.has(lower)) return 'CD/DVD';
+    return '';
   }
 
   function formatTransferred(session: number, alltime: number): string {
@@ -1261,8 +1299,11 @@
         // immediately matches zero rows. The clearing in the onMount
         // effect (~line 221) handles the case where missing files
         // disappear later in the session.
-        if (typeof parsed.showMissingOnly === 'boolean') {
-          showMissingOnly = parsed.showMissingOnly;
+        if (parsed.showMissingOnly === true) {
+          // Defer until the first missing-file scan (see
+          // pendingRestoreMissingOnly) so we don't blank the library by
+          // filtering against an empty missing set on load.
+          pendingRestoreMissingOnly = true;
         }
         if (typeof parsed.topPanelOpen === 'boolean') {
           topPanelOpen = parsed.topPanelOpen;

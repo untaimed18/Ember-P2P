@@ -3806,14 +3806,18 @@ pub async fn start_network(
     // same in-memory set so every enforcement path sees one combined
     // ban list, and so the periodic cap-reset (which rebuilds from these
     // same two sources) doesn't silently drop auto-bans.
+    // Union ALL addresses of each banned peer row — not just the first.
+    // `BanPeer` and the periodic over-cap rebuild both enforce every
+    // address of a banned peer, so loading only `addresses.first()` here
+    // silently un-banned the 2nd+ IPs of a multi-homed banned peer across
+    // a restart. Mirror the other two paths (flat_map over all addresses).
     let mut banned_ips: HashSet<Ipv4Addr> = saved_db_peers
         .iter()
         .filter(|p| p.banned)
-        .filter_map(|p| {
-            p.addresses.first().and_then(|addr| {
-                addr.rsplit_once(':')
-                    .and_then(|(ip, _)| ip.parse().ok())
-            })
+        .flat_map(|p| p.addresses.iter())
+        .filter_map(|addr| {
+            addr.rsplit_once(':')
+                .and_then(|(ip, _)| ip.parse().ok())
         })
         .collect();
     banned_ips.extend(db.get_banned_ips().unwrap_or_default());
@@ -4859,6 +4863,19 @@ pub async fn start_network(
                     // here too keeps both UIs in sync after a save.
                     if state.ip_filter.is_enabled() != new_settings.ip_filter_enabled {
                         state.ip_filter.set_enabled(new_settings.ip_filter_enabled);
+                        // A session that started disabled never loaded the
+                        // on-disk ranges (boot only reads ipfilter.dat when
+                        // enabled). Enabling here without loading would leave
+                        // the filter active but empty. Mirror the
+                        // SetIpFilterEnabled handler: load the persisted file
+                        // when we're enabling and have no ranges yet.
+                        if new_settings.ip_filter_enabled && state.ip_filter.range_count() == 0 {
+                            let default_path = state.data_dir.join("ipfilter.dat");
+                            if default_path.exists() {
+                                let n = state.ip_filter.load_from_file(&default_path);
+                                info!("Loaded {n} IP filter entries on enable ({} ranges after merge)", state.ip_filter.range_count());
+                            }
+                        }
                         state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
                     }
                     if state.ip_filter.blocks_private() != new_settings.block_private_ips {
@@ -6495,7 +6512,7 @@ pub async fn start_network(
                             }
                         }
                     }
-                    UploadEventKind::PeerAutoBanned { ip, reason } => {
+                    UploadEventKind::PeerAutoBanned { ip, reason, user_hash } => {
                         // The upload listener already added this to the
                         // shared upload set for immediate effect; make it
                         // canonical (UDP + download enforcement) and durable.
@@ -6506,6 +6523,17 @@ pub async fn start_network(
                             *ip,
                             reason,
                         );
+                        // If this IP was captured from a live session whose
+                        // peer was manually banned by user-hash, record it
+                        // against that peer so unban_peer (which reverses a
+                        // ban by walking the peer's known addresses) clears
+                        // this IP too — keeping ban/unban symmetric.
+                        if let Some(uh) = user_hash {
+                            let peer_id_hex = hex::encode(uh);
+                            if let Err(e) = db.add_banned_peer_address(&peer_id_hex, *ip) {
+                                warn!("Failed to record captured ban IP {ip} for peer {peer_id_hex}: {e}");
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -17509,11 +17537,21 @@ async fn handle_command_inner(
             }
             active_request.keywords = keywords.clone();
 
-            // Build the search expression once, reuse for TCP + UDP.
-            // Single keyword → string leaf; multiple → AND tree; file-type
-            // filter is AND-combined when present.
+            // Build the search expression once, reuse for KAD + TCP + UDP.
+            // Single keyword → string leaf; multiple → AND tree. Any size /
+            // availability / type / extension filters are AND-combined as
+            // numeric/meta-string leaves (eMule `GetSearchPacket`) so the
+            // remote node filters *before* truncating to its result cap —
+            // a client-side-only filter can't recover hits lost to that cap.
             let kad_file_type = search_filters.as_ref().and_then(|f| f.file_type.clone());
-            let search_expr = kad::messages::build_search_expression(&keywords, kad_file_type.as_deref());
+            let search_constraints = kad::messages::SearchConstraints {
+                file_type: kad_file_type.as_deref(),
+                file_extension: search_filters.as_ref().and_then(|f| f.file_extension.as_deref()),
+                min_size: search_filters.as_ref().and_then(|f| f.min_size),
+                max_size: search_filters.as_ref().and_then(|f| f.max_size),
+                min_availability: search_filters.as_ref().and_then(|f| f.min_availability),
+            };
+            let search_expr = kad::messages::build_search_expression(&keywords, &search_constraints);
 
             // --- TCP server search ---
             let run_server = matches!(method, SearchMethod::Global | SearchMethod::Server);
@@ -18351,27 +18389,53 @@ async fn handle_command_inner(
 
         NetworkCommand::BanPeer { peer_id_hex } => {
             if let Some(kad_id) = KadId::from_hex(&peer_id_hex) {
-                // Grab the IP before removing from routing table
+                // Collect every IP we can associate with this peer so the
+                // ban also covers the IP-keyed paths (accept loop, UDP,
+                // download/source connect), not just the user-hash upload
+                // gate. Sources:
+                //   1. The KAD routing-table contact (only matches when the
+                //      ban id happens to be the peer's *node* id).
+                //   2. Peer DB rows whose id equals the ban id.
+                //   3. Known download sources for this user hash — the UI
+                //      bans by eD2K user hash, which (1) and (2) are keyed
+                //      differently from, so without this a non-active peer's
+                //      IP was never blocked. Mirrors the reputation-ban path.
+                let mut ips_to_ban: Vec<Ipv4Addr> = Vec::new();
                 let contact_ip = state.routing_table.get_contact(&kad_id).map(|c| c.ip);
                 if state.routing_table.remove(&kad_id) {
                     info!("Removed banned peer {} from routing table", peer_id_hex);
                     state.stats.connected_peers = state.routing_table.len() as u32;
                 }
                 if let Some(ip) = contact_ip {
-                    state.banned_ips.insert(ip);
+                    ips_to_ban.push(ip);
                 }
-                // Also check peer database for the IP
                 if let Ok(peers) = db.get_peers() {
                     for peer in &peers {
                         if peer.id == peer_id_hex {
                             for addr_str in &peer.addresses {
                                 if let Some((ip_str, _)) = addr_str.rsplit_once(':') {
                                     if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
-                                        state.banned_ips.insert(ip);
+                                        ips_to_ban.push(ip);
                                     }
                                 }
                             }
                         }
+                    }
+                }
+                {
+                    let sm = source_manager.read().await;
+                    for ip in sm.find_ips_by_user_hash(&kad_id.0) {
+                        ips_to_ban.push(ip);
+                    }
+                }
+                for ip in &ips_to_ban {
+                    state.banned_ips.insert(*ip);
+                    // Persist the IP against this peer so the ban survives a
+                    // restart (boot rebuilds banned_ips from banned peers'
+                    // addresses) and so unban_peer — which walks the peer's
+                    // addresses — clears it again. Keeps ban/unban symmetric.
+                    if let Err(e) = db.add_banned_peer_address(&peer_id_hex, *ip) {
+                        warn!("Failed to persist banned IP {ip} for peer {peer_id_hex}: {e}");
                     }
                 }
                 if let Ok(mut shared) = shared_banned_ips.write() {
@@ -18725,6 +18789,21 @@ async fn handle_command_inner(
 
         NetworkCommand::SetIpFilterEnabled { enabled } => {
             state.ip_filter.set_enabled(enabled);
+            // Boot only reads ipfilter.dat when the filter is already
+            // enabled, so a session that started disabled has an empty
+            // range set. Without loading here, toggling the filter on at
+            // runtime would "enable" a filter that blocks nothing but
+            // private/special IPs — the persisted ranges would only take
+            // effect after a manual re-import or a restart-while-enabled.
+            // Load the persisted file now (only when we have no ranges, so
+            // a Reload/import that already populated them isn't re-read).
+            if enabled && state.ip_filter.range_count() == 0 {
+                let default_path = state.data_dir.join("ipfilter.dat");
+                if default_path.exists() {
+                    let n = state.ip_filter.load_from_file(&default_path);
+                    info!("Loaded {n} IP filter entries on enable ({} ranges after merge)", state.ip_filter.range_count());
+                }
+            }
             state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
             info!("IP filter enabled: {enabled}");
         }
@@ -19368,12 +19447,52 @@ async fn handle_command_inner(
             handle_server_disconnect(state, shared_server_addr, app_handle, "User disconnected").await;
         }
 
-        NetworkCommand::AddServer { ip, port, name: _, tx } => {
-            let _ = tx.send(Err(format!("Server list is managed internally; cannot add {ip}:{port}")));
+        NetworkCommand::AddServer { ip, port, name, tx } => {
+            use crate::network::ed2k::server_list::{AddServerOutcome, ServerEntry};
+            let result = match ip.parse::<std::net::Ipv4Addr>() {
+                Err(_) => Err(format!("Invalid server IP: {ip}")),
+                Ok(_) if port == 0 => Err("Server port must not be zero".to_string()),
+                Ok(_) => {
+                    let mut entry = ServerEntry::new(ip.clone(), port);
+                    entry.name = name.clone();
+                    // A user-added server is static (eMule semantics): it is
+                    // exempt from automatic fail-count pruning.
+                    entry.is_static = true;
+                    match state.server_list.add_filtered(
+                        entry,
+                        settings.filter_servers_by_ip,
+                        &mut state.ip_filter,
+                    ) {
+                        AddServerOutcome::Added => {
+                            let met_path = state.data_dir.join("server.met");
+                            if let Err(e) = state.server_list.save_server_met(&met_path) {
+                                warn!("Failed to save server.met after adding server: {e}");
+                            }
+                            Ok(format!("Added server {ip}:{port}"))
+                        }
+                        AddServerOutcome::Duplicate => {
+                            Err(format!("Server {ip}:{port} is already in the list"))
+                        }
+                        AddServerOutcome::Filtered => {
+                            Err(format!("Server {ip}:{port} is blocked by the IP filter"))
+                        }
+                    }
+                }
+            };
+            let _ = tx.send(result);
         }
 
         NetworkCommand::RemoveServer { ip, port, tx } => {
-            let _ = tx.send(Err(format!("Server list is managed internally; cannot remove {ip}:{port}")));
+            let result = if state.server_list.remove(&ip, port) {
+                let met_path = state.data_dir.join("server.met");
+                if let Err(e) = state.server_list.save_server_met(&met_path) {
+                    warn!("Failed to save server.met after removing server: {e}");
+                }
+                Ok(format!("Removed server {ip}:{port}"))
+            } else {
+                Err(format!("Server {ip}:{port} not found in the list"))
+            };
+            let _ = tx.send(result);
         }
 
         NetworkCommand::GetServerListSnapshot { tx } => {
