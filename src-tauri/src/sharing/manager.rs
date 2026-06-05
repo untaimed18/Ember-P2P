@@ -384,12 +384,21 @@ impl TransferManager {
         if let Some(mut transfer) = transfer {
             transfer.status = TransferStatus::Completed;
             transfer.progress = 100.0;
-            // Snap the byte counter to the full size as well. A download only
-            // reaches Completed after every part is hash-verified, so the
-            // terminal row is by definition the whole file; without this a
+            // Snap the byte counter to the full size ONLY for downloads. A
+            // download reaches Completed after every part is hash-verified, so
+            // the terminal row is by definition the whole file; without this a
             // coalesced/late final progress tick could leave `transferred`
             // (and the UI's "x / total") short even though progress is 100%.
-            transfer.transferred = transfer.total_size;
+            //
+            // Uploads also flow through `complete()` (a session ending is
+            // reported as Completed, matching eMule UX), but an upload session
+            // almost never sends the entire file — the peer pulls a handful of
+            // parts. Snapping `transferred` to `total_size` there would falsely
+            // claim we uploaded the whole file this session, so we keep the real
+            // per-session byte count for uploads.
+            if transfer.direction == TransferDirection::Download {
+                transfer.transferred = transfer.total_size;
+            }
             transfer.speed = 0;
             Self::clear_failure_context(&mut transfer);
             Self::clear_runtime_health(&mut transfer);
