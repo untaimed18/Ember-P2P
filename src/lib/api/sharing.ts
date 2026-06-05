@@ -17,6 +17,19 @@ export async function getSharedFolders(): Promise<string[]> {
   return invoke('get_shared_folders');
 }
 
+export async function getFolderPriorities(): Promise<Record<string, string>> {
+  return invoke('get_folder_priorities');
+}
+
+/**
+ * Set (or, with an empty/`none` priority, clear) the default upload priority
+ * for a shared folder. Applies immediately to files under the folder and
+ * persists so newly indexed files inherit it. Returns the count updated.
+ */
+export async function setFolderPriority(folderPath: string, priority: string): Promise<number> {
+  return invoke('set_folder_priority', { folderPath, priority });
+}
+
 export async function setFilePriority(filePath: string, priority: 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto'): Promise<void> {
   return invoke('set_file_priority', { filePath, priority });
 }

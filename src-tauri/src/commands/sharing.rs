@@ -527,6 +527,103 @@ pub async fn get_shared_folders(
     Ok(config.settings.shared_folders.clone())
 }
 
+/// Current per-folder default upload priorities (folder path -> priority).
+#[tauri::command]
+pub async fn get_folder_priorities(
+    state: tauri::State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let config = state.config.read().await;
+    Ok(config.settings.folder_priorities.clone())
+}
+
+/// Set (or clear, with an empty/`none` priority) the default upload priority
+/// for a shared folder. The default is persisted and applied immediately to
+/// every file currently indexed under the folder, mirroring eMule's
+/// per-directory priority. Returns the number of files updated.
+#[tauri::command]
+pub async fn set_folder_priority(
+    state: tauri::State<'_, AppState>,
+    folder_path: String,
+    priority: String,
+) -> Result<u32, String> {
+    let clearing = priority.is_empty() || priority == "none";
+    if !clearing {
+        let valid = ["verylow", "low", "normal", "high", "release", "auto"];
+        if !valid.contains(&priority.as_str()) {
+            return Err(coded_ctx("sharing_invalid_priority", "Invalid priority", &priority));
+        }
+    }
+    {
+        let config = state.config.read().await;
+        if !config
+            .settings
+            .shared_folders
+            .iter()
+            .any(|f| paths_equal_ignore_case(f, &folder_path))
+        {
+            return Err(coded("sharing_folder_not_shared", "Folder is not a shared folder"));
+        }
+    }
+    let save_data = {
+        let mut config = state.config.write().await;
+        // Drop any case-variant key first so the map never accumulates dupes.
+        config
+            .settings
+            .folder_priorities
+            .retain(|k, _| !paths_equal_ignore_case(k, &folder_path));
+        if !clearing {
+            config
+                .settings
+                .folder_priorities
+                .insert(folder_path.clone(), priority.clone());
+        }
+        config
+            .prepare_save()
+            .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
+    };
+    {
+        let (data, tmp, final_path) = save_data;
+        tokio::task::spawn_blocking(move || {
+            crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
+        })
+        .await
+        .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?
+        .map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?;
+    }
+    // Clearing only stops the default from being re-applied; existing files
+    // keep whatever priority they currently have.
+    if clearing {
+        info!("Cleared folder priority for {folder_path}");
+        return Ok(0);
+    }
+    let changed = {
+        let mut index = state.local_index.write().await;
+        index.set_priority_under_folder(&folder_path, &priority)
+    };
+    if !changed.is_empty() {
+        refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
+        let prio_u8 = priority_str_to_u8(&priority);
+        for (_, hash) in &changed {
+            if hash.is_empty() {
+                continue;
+            }
+            if state
+                .network_tx
+                .try_send(NetworkCommand::SetUploadPriority {
+                    file_hash_hex: hash.clone(),
+                    priority: prio_u8,
+                })
+                .is_err()
+            {
+                warn!("Network channel full during folder priority push");
+                break;
+            }
+        }
+    }
+    info!("Set folder priority {priority} for {folder_path} ({} files)", changed.len());
+    Ok(changed.len() as u32)
+}
+
 /// Encode a UI priority label into the u8 stored in
 /// `KnownFileRecord::upload_priority` (and shipped over the wire as the
 /// `FT_ULPRIORITY` known-file tag). Order matches eMule's priority

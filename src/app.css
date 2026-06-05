@@ -299,6 +299,30 @@ input:disabled, select:disabled, textarea:disabled {
   cursor: not-allowed;
 }
 
+/* Checkboxes and radios must keep their native control rendering. The generic
+   `input` rule above paints a background/border/padding onto them, which hides
+   the native check glyph and leaves the box blank when checked. Reset those and
+   tint the control with the theme accent. */
+input[type="checkbox"], input[type="radio"] {
+  appearance: auto;
+  -webkit-appearance: auto;
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+input[type="checkbox"]:focus, input[type="radio"]:focus,
+input[type="checkbox"]:focus-visible, input[type="radio"]:focus-visible {
+  box-shadow: none;
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 input::placeholder {
   color: var(--text-muted);
 }

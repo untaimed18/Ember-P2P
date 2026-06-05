@@ -21,9 +21,11 @@
     republishFile,
     scanMissingFiles,
     removeMissingFiles,
+    getFolderPriorities,
+    setFolderPriority,
   } from '$lib/api/sharing';
   import { getFileComments, setFileComment, type FileCommentInfo } from '$lib/api/comments';
-  import { formatEd2kLink } from '$lib/api/search';
+  import { formatEd2kLink, buildEd2kLink } from '$lib/api/search';
   import { loadCollection, createCollection, downloadCollectionFiles, type Collection, type CollectionFile } from '$lib/api/collections';
   import { incomingCollection } from '$lib/stores/collection';
   import { toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
@@ -38,6 +40,7 @@
   import { translateError } from '$lib/i18n';
 
   let folders: string[] = $state([]);
+  let folderPriorities: Record<string, string> = $state({});
   let files: FileInfo[] = $state([]);
   let scanning = $state(false);
   let error: string | null = $state(null);
@@ -378,11 +381,12 @@
     busy = true;
     pendingRefresh = false;
     try {
-      const [newFolders, newFiles, isScanning] = await withTimeout(
+      const [newFolders, newFiles, isScanning, newPriorities] = await withTimeout(
         Promise.all([
           getSharedFolders(),
           getSharedFiles(),
           getScanStatus(),
+          getFolderPriorities(),
         ]),
         5000,
       );
@@ -390,6 +394,7 @@
       folders = newFolders;
       if (!stoppedByUser) scanning = isScanning;
       files = newFiles;
+      folderPriorities = newPriorities;
     } catch (e) {
       if (mounted && e instanceof Error && e.message !== 'timeout')
         console.error('Failed to load shared files:', e);
@@ -417,6 +422,26 @@
       scanning = true;
       await addSharedFolder(selected as string);
       if (mounted) await refresh();
+    } catch (e: unknown) {
+      if (mounted) error = toErr(e);
+    }
+  }
+
+  async function handleSetFolderPriority(path: string, priority: string) {
+    try {
+      error = null;
+      const count = await setFolderPriority(path, priority);
+      if (!mounted) return;
+      if (priority) {
+        folderPriorities = { ...folderPriorities, [path]: priority };
+        toastSuccess(m.library_folder_priority_set({ count: count.toLocaleString() }));
+      } else {
+        const next = { ...folderPriorities };
+        delete next[path];
+        folderPriorities = next;
+        toastSuccess(m.library_folder_priority_cleared());
+      }
+      await refresh();
     } catch (e: unknown) {
       if (mounted) error = toErr(e);
     }
@@ -980,6 +1005,7 @@
   // --- Context menu ---
   let ctxMenu: { x: number; y: number; file: FileInfo } | null = $state(null);
   let ctxPrioritySub = $state(false);
+  let ctxCopySub = $state(false);
   let ctxMenuEl: HTMLDivElement | undefined = $state(undefined);
   let ctxSubmenuLeft = $state(false);
   let ctxSubmenuUp = $state(false);
@@ -1002,6 +1028,7 @@
   function onCtx(e: MouseEvent, f: FileInfo) {
     e.preventDefault();
     ctxPrioritySub = false;
+    ctxCopySub = false;
     ctxMenu = { x: e.clientX, y: e.clientY, file: f };
     selectedPath = f.path;
     void positionCtxMenu();
@@ -1009,6 +1036,7 @@
   function closeCtx() {
     ctxMenu = null;
     ctxPrioritySub = false;
+    ctxCopySub = false;
     ctxSubmenuLeft = false;
     ctxSubmenuUp = false;
   }
@@ -1208,10 +1236,21 @@
         }
         case 'priority': if (extra) { await setFilePriority(f.path, extra as 'verylow' | 'low' | 'normal' | 'high' | 'release' | 'auto'); await refresh(); } break;
         case 'copy_link': {
-          const link = await formatEd2kLink(f.name, f.size, f.hash);
+          let link: string;
+          if (extra === 'aich') {
+            link = await buildEd2kLink(f.name, f.size, f.hash, { aichHash: f.aich_hash || undefined });
+          } else if (extra === 'sources') {
+            link = await buildEd2kLink(f.name, f.size, f.hash, { withSources: true });
+          } else {
+            link = await formatEd2kLink(f.name, f.size, f.hash);
+          }
           await navigator.clipboard.writeText(link);
           if (!f.shared) {
             toastWarning(m.library_copied_link_unshared_single());
+          } else if (extra === 'aich') {
+            toastSuccess(m.library_copied_ed2k_link_aich());
+          } else if (extra === 'sources') {
+            toastSuccess(m.library_copied_ed2k_link_sources());
           } else {
             toastSuccess(m.library_copied_ed2k_link());
           }
@@ -1867,6 +1906,23 @@
             </span>
           </span>
           <span class="tree-count">{(folderStats.counts.get(folder) ?? 0).toLocaleString()} &middot; {formatSize(folderStats.sizes.get(folder) ?? 0)}</span>
+          <select
+            class="tree-prio"
+            class:tree-prio-set={!!folderPriorities[folder]}
+            title={m.library_folder_priority_title()}
+            aria-label={m.library_folder_priority_title()}
+            value={folderPriorities[folder] ?? ''}
+            onclick={(e) => e.stopPropagation()}
+            onchange={(e) => { e.stopPropagation(); handleSetFolderPriority(folder, (e.currentTarget as HTMLSelectElement).value); }}
+          >
+            <option value="">{m.library_folder_priority_default()}</option>
+            <option value="verylow">{m.library_priority_verylow()}</option>
+            <option value="low">{m.library_priority_low()}</option>
+            <option value="normal">{m.library_priority_normal()}</option>
+            <option value="high">{m.library_priority_high()}</option>
+            <option value="release">{m.library_priority_release()}</option>
+            <option value="auto">{m.library_priority_auto()}</option>
+          </select>
           <span class="tree-actions">
             <button
               class="tree-btn"
@@ -2080,14 +2136,18 @@
         {/if}
         <div class="bulk-prio-group">
           <span class="bulk-label">{m.library_bulk_priority_label()}</span>
-          {#each ['verylow', 'low', 'normal', 'high', 'release', 'auto'] as p}
-            <button class="tb-btn bulk-prio-btn" onclick={() => bulkSetPriority(p as FileInfo['priority'])} title={m.library_set_priority_title({ priority: priorityLabel(p) })}>{priorityLabel(p)}</button>
-          {/each}
+          <div class="bulk-prio-seg">
+            {#each ['verylow', 'low', 'normal', 'high', 'release', 'auto'] as p}
+              <button class="bulk-prio-btn" onclick={() => bulkSetPriority(p as FileInfo['priority'])} title={m.library_set_priority_title({ priority: priorityLabel(p) })}>{priorityLabel(p)}</button>
+            {/each}
+          </div>
         </div>
+        <span class="bulk-sep" aria-hidden="true"></span>
         <button class="tb-btn" onclick={bulkShare} title={m.library_bulk_share_title()}>{m.library_bulk_share()}</button>
         <button class="tb-btn" onclick={bulkUnshare} title={m.library_bulk_unshare_title()}>{m.library_bulk_unshare()}</button>
         <button class="tb-btn" onclick={bulkCopyLinks} title={m.library_bulk_copy_links_title()}>{m.library_copy_links()}</button>
         <button class="tb-btn" onclick={openCreateDialogFromSelection} title={m.library_bulk_new_collection_title()}>{m.library_bulk_new_collection()}</button>
+        <span class="bulk-spacer"></span>
         <button class="tb-btn tb-danger" onclick={bulkDelete} title={m.library_bulk_delete_title()}>{m.common_delete()}</button>
         <button class="tb-btn" onclick={clearChecked} title={m.library_bulk_clear_title()}>{m.common_clear()}</button>
       </div>
@@ -2286,7 +2346,25 @@
         {/if}
       </div>
       <div class="ctx-sep"></div>
-      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.servers_copy_ed2k_link()}</button>
+      <div
+        class="ctx-item ctx-sub-parent"
+        role="menuitem"
+        tabindex="0"
+        onmouseenter={() => ctxCopySub = true}
+        onmouseleave={() => ctxCopySub = false}
+        onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'ArrowRight') ctxCopySub = true; }}
+      >
+        {m.servers_copy_ed2k_link()} &raquo;
+        {#if ctxCopySub}
+          <div class="ctx-submenu" class:ctx-submenu-left={ctxSubmenuLeft} class:ctx-submenu-up={ctxSubmenuUp} role="menu">
+            <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.library_copy_link_plain()}</button>
+            {#if ctxMenu.file.aich_hash}
+              <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link', 'aich')}>{m.library_copy_link_aich()}</button>
+            {/if}
+            <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link', 'sources')}>{m.library_copy_link_sources()}</button>
+          </div>
+        {/if}
+      </div>
       <div class="ctx-sep"></div>
       {#if ctxMenu.file.shared}
         <button
@@ -2669,6 +2747,33 @@
     background: var(--bg-hover);
     color: var(--text-primary);
   }
+  /* Per-folder default upload priority. Hidden until row hover/focus unless a
+     non-default priority is set, in which case it stays visible as a hint. */
+  .tree-prio {
+    flex-shrink: 0;
+    max-width: 84px;
+    height: 20px;
+    padding: 0 4px;
+    font-size: 11px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    opacity: 0;
+    transition: opacity 0.12s;
+    cursor: pointer;
+  }
+  .tree-item:hover .tree-prio,
+  .tree-item.active .tree-prio,
+  .tree-item:focus-within .tree-prio {
+    opacity: 1;
+  }
+  .tree-prio.tree-prio-set {
+    opacity: 1;
+    color: var(--text-accent);
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    background: color-mix(in srgb, var(--accent-dim) 45%, transparent);
+  }
 
   .sidebar-divider {
     width: 4px;
@@ -2690,9 +2795,9 @@
 
   /* --- Detail drawer (right side) --- */
   .detail-drawer {
-    width: 320px;
-    min-width: 260px;
-    max-width: 420px;
+    width: 420px;
+    min-width: 360px;
+    max-width: 520px;
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
@@ -2991,8 +3096,9 @@
   /* --- Bulk action bar --- */
   .bulk-action-bar {
     border-top: 1px solid var(--border);
-    background: color-mix(in srgb, var(--accent-dim) 30%, var(--bg-secondary));
-    padding: 6px 12px;
+    background: color-mix(in srgb, var(--accent-dim) 22%, var(--bg-secondary));
+    box-shadow: 0 -2px 6px -4px rgba(0, 0, 0, 0.25);
+    padding: 8px 14px;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -3003,7 +3109,44 @@
   .bulk-count {
     font-weight: 600;
     color: var(--accent);
-    margin-right: 4px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    white-space: nowrap;
+  }
+  /* Toolbar-style buttons: the library page has no base .tb-btn rule, so without
+     this they fall back to the global accent-filled <button> style. Match the
+     clean bordered look used by the other toolbars. */
+  .bulk-action-bar .tb-btn {
+    font-size: 12px;
+    font-weight: 500;
+    padding: 4px 11px;
+    min-height: 26px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.13s ease, border-color 0.13s ease, color 0.13s ease;
+  }
+  .bulk-action-bar .tb-btn:hover:not(:disabled) {
+    background: var(--bg-hover);
+    border-color: var(--border-light);
+  }
+  .bulk-action-bar .tb-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .bulk-sep {
+    width: 1px;
+    align-self: stretch;
+    margin: 2px 2px;
+    background: var(--border);
+  }
+  .bulk-spacer {
+    flex: 1 1 auto;
+    min-width: 8px;
   }
   .bulk-hidden-note {
     display: inline-flex;
@@ -3033,13 +3176,40 @@
   .bulk-label {
     color: var(--text-muted);
     font-size: 11px;
+    white-space: nowrap;
   }
   .bulk-prio-group {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: 6px;
   }
-  .bulk-prio-btn { font-size: 11px; padding: 2px 6px; }
+  /* Segmented control for the six priority levels. */
+  .bulk-prio-seg {
+    display: inline-flex;
+    align-items: stretch;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+  }
+  .bulk-prio-btn {
+    font-size: 11px;
+    font-weight: 500;
+    padding: 3px 9px;
+    min-height: 26px;
+    border: none;
+    border-left: 1px solid var(--border);
+    border-radius: 0;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.13s ease, color 0.13s ease;
+  }
+  .bulk-prio-btn:first-child { border-left: none; }
+  .bulk-prio-btn:hover:not(:disabled) {
+    background: var(--accent);
+    color: #fff;
+  }
   .spinner-inline {
     display: inline-block;
     width: 10px;
