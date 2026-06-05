@@ -244,6 +244,45 @@ pub enum SourceStatus {
     Failed,
 }
 
+/// Media metadata for a search hit (eMule `FT_MEDIA_*` tags). Each field is
+/// optional because a remote node only fills the ones it knows. Grouped into a
+/// single optional struct so a hit with no media info serializes to nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MediaMetadata {
+    /// Playback length in whole seconds (eMule `FT_MEDIA_LENGTH`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u32>,
+    /// Bitrate in kbps (eMule `FT_MEDIA_BITRATE`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate: Option<u32>,
+    /// Codec label, e.g. "mp3", "h264" (eMule `FT_MEDIA_CODEC`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artist: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+impl MediaMetadata {
+    /// True when no field carries a value (so callers can collapse to `None`).
+    pub fn is_empty(&self) -> bool {
+        self.duration.is_none()
+            && self.bitrate.is_none()
+            && self.codec.is_none()
+            && self.artist.is_none()
+            && self.album.is_none()
+            && self.title.is_none()
+    }
+
+    /// Wrap in `Some` only when at least one field is set.
+    pub fn into_option(self) -> Option<MediaMetadata> {
+        if self.is_empty() { None } else { Some(self) }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub file: FileInfo,
@@ -256,6 +295,10 @@ pub struct SearchResult {
     pub rating: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// Media metadata (duration/bitrate/codec/artist/album/title) when the
+    /// source advertised any (eMule `FT_MEDIA_*`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaMetadata>,
     #[serde(default)]
     pub spam_rating: u32,
     #[serde(default)]
