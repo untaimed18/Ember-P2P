@@ -91,6 +91,7 @@
     { key: 'speed', get label() { return m.transfers_col_speed(); }, width: 70, minWidth: 56, className: 'col-ul-speed', sortField: 'speed' },
     { key: 'transferred', get label() { return m.transfers_col_transferred(); }, width: 80, minWidth: 56, className: 'col-ul-size', sortField: 'transferred' },
     { key: 'total_size', get label() { return m.transfers_col_size(); }, width: 70, minWidth: 56, className: 'col-ul-total' },
+    { key: 'waited', get label() { return m.transfers_col_wait_time(); }, width: 80, minWidth: 72, className: 'col-ul-wait', sortField: 'waited' },
     { key: 'upload_time', get label() { return m.transfers_col_upload_time(); }, width: 80, minWidth: 72, className: 'col-ul-uptime', sortField: 'upload_time' },
     { key: 'status', get label() { return m.transfers_col_status(); }, width: 100, minWidth: 84, className: 'col-ul-status', sortField: 'status' },
     { key: 'up_status', get label() { return m.transfers_col_up_status(); }, width: 170, minWidth: 120, className: 'col-ul-bar' },
@@ -2917,6 +2918,8 @@
                     <td class="num-cell">{formatSize(t.transferred)}</td>
                   {:else if column.key === 'total_size'}
                     <td class="num-cell">{formatSize(t.total_size)}</td>
+                  {:else if column.key === 'waited'}
+                    <td class="num-cell">{formatDuration(t.wait_time * 1000)}</td>
                   {:else if column.key === 'upload_time'}
                     <td class="num-cell">{formatDuration(t.upload_time)}</td>
                   {:else if column.key === 'status'}

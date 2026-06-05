@@ -42,10 +42,33 @@ impl UploadSlotGuard {
         Self { active_count, slot_notify, armed: false }
     }
 
-    fn activate(&mut self) {
-        if !self.armed {
-            self.active_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.armed = true;
+    /// Atomically reserve a slot iff the live count is still below `limit`.
+    /// Returns `true` if this guard now owns a slot. Unlike `activate()` (an
+    /// unconditional `fetch_add`), this closes the check-then-activate race
+    /// where several connection tasks each observe an open slot across their
+    /// `.await` points and all increment past `limit`. Already-armed guards
+    /// return `true` without double-counting.
+    fn try_activate(&mut self, limit: usize) -> bool {
+        if self.armed {
+            return true;
+        }
+        let mut current = self.active_count.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            if current >= limit {
+                return false;
+            }
+            match self.active_count.compare_exchange_weak(
+                current,
+                current + 1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.armed = true;
+                    return true;
+                }
+                Err(actual) => current = actual,
+            }
         }
     }
 
@@ -352,6 +375,9 @@ pub enum UploadEventKind {
         client_software: String,
         country_code: Option<String>,
         user_hash: Option<String>,
+        /// Seconds this peer spent in the upload queue before the slot was
+        /// granted (eMule "Waited" column). Surfaced as `Transfer.wait_time`.
+        wait_seconds: u64,
     },
     Progress {
         uploaded: u64,
@@ -2699,7 +2725,18 @@ impl UploadHandler {
                                 drop(cm);
 
                                 if let Some(best_idx) = best_idx {
-                                    if best_identity.as_ref() == Some(queued_key) {
+                                    // Reserve the slot atomically BEFORE removing the
+                                    // queue entry or sending OP_ACCEPTUPLOADREQ. The
+                                    // `current_active < dynamic_slots` check above is
+                                    // separated from the grant by `.await` points, so a
+                                    // concurrent connection could have taken the slot.
+                                    // `try_activate` only runs when we are the winner
+                                    // (short-circuit) and only commits if a slot is free;
+                                    // on a lost race we keep the queue entry and retry on
+                                    // the next poll instead of over-granting.
+                                    if best_identity.as_ref() == Some(queued_key)
+                                        && slot_guard.try_activate(dynamic_slots)
+                                    {
                                         let mut queue = self.upload_queue.lock().await;
                                         if best_idx < queue.len() && queue[best_idx].identity == *queued_key {
                                             queue.remove(best_idx);
@@ -2718,7 +2755,7 @@ impl UploadHandler {
                                             self.record_share_accepted(&h).await;
                                         }
 
-                                        slot_guard.activate();
+                                        // Slot already reserved atomically above.
                                         queued_identity = None;
                                         uploaded = 0;
                                         queue_wait_at_grant = queue_join_time.elapsed().as_secs();
@@ -2742,10 +2779,16 @@ impl UploadHandler {
                                             last_progress_uploaded = 0;
 
                                             let hash_hex = hex::encode(hash);
-                                            let file_name = {
-                                                let index = self.local_index.read().await;
-                                                index.get_by_hash(&hash_hex).map(|f| f.name.clone())
-                                            };
+                                            // Resolve the name through `resolve_upload_file` rather
+                                            // than the shared index alone: files we serve from an
+                                            // in-progress download live as a `.part` under Temp and
+                                            // are NOT in the shared index, so an index-only lookup
+                                            // returned None and the Uploading list showed a blank
+                                            // File column for partial-file seeds.
+                                            let file_name = self
+                                                .resolve_upload_file(&hash)
+                                                .await
+                                                .map(|rf| rf.name);
 
                                             let _ = self
                                                 .upload_event_tx
@@ -2760,6 +2803,7 @@ impl UploadHandler {
                                                         client_software: ul_client_software.clone(),
                                                         country_code: ul_country_code.clone(),
                                                         user_hash: if peer_user_hash != [0u8; 16] { Some(hex::encode(peer_user_hash)) } else { None },
+                                                        wait_seconds: queue_wait_at_grant,
                                                     },
                                                 })
                                                 .await;
@@ -3001,6 +3045,34 @@ impl UploadHandler {
                     if payload.len() >= 16 {
                         let mut hash = [0u8; 16];
                         hash.copy_from_slice(&payload[..16]);
+                        // Mid-slot file switch: a peer that already holds an active
+                        // transfer (transfer_id is Some) just asked us to serve a
+                        // *different* file. The progress/UI row is keyed by the old
+                        // transfer_id and file, so reporting the new file's bytes
+                        // under that row mislabels it (wrong name/size) and, on
+                        // session end, snaps the stale row to the OLD file's full
+                        // size. Finalize the old row now; the next serve mints a
+                        // fresh transfer_id for the new file. (Same-file re-queries
+                        // and handshake-time SETREQFILEID — when transfer_id is None
+                        // — are unaffected.)
+                        if let Some(prev) = current_file_hash {
+                            if prev != hash {
+                                if let Some(tid) = transfer_id.take() {
+                                    let kind = if uploaded > 0 {
+                                        UploadEventKind::Completed
+                                    } else {
+                                        UploadEventKind::Failed {
+                                            error: "Peer switched files before any data was sent".to_string(),
+                                        }
+                                    };
+                                    let _ = self.upload_event_tx.send(UploadEvent {
+                                        transfer_id: tid,
+                                        kind,
+                                    }).await;
+                                    uploaded = 0;
+                                }
+                            }
+                        }
                         current_file_hash = Some(hash);
 
                         if let Some(file) = self.resolve_upload_file(&hash).await {
@@ -3155,7 +3227,7 @@ impl UploadHandler {
                     // they've already received OP_ACCEPTUPLOADREQ — e.g. in
                     // response to an unexpected QUEUERANKING, or as a soft
                     // retry during an early handshake race. The handler below
-                    // unconditionally runs `slot_guard.activate()`, resets
+                    // reserves a slot, resets
                     // `uploaded = 0`, mints a fresh `transfer_id`, and fires a
                     // new `Started` event. That orphans the original
                     // transfer_id (the UI row never receives a terminal
@@ -3288,6 +3360,15 @@ impl UploadHandler {
                             }
                         }
                     };
+
+                    // Atomically reserve the slot to close the check-then-activate
+                    // race: the slot-count check and the queue scoring above both
+                    // contain `.await` points, so a concurrent connection could
+                    // have taken the last slot in between. `try_activate` only
+                    // succeeds while we are still under `dynamic_slots`; on a lost
+                    // race we fall through to the queue path (which re-inserts the
+                    // entry that the `should_accept` scoring may have removed).
+                    let should_accept = should_accept && slot_guard.try_activate(dynamic_slots);
 
                     if !should_accept {
                         // Friend-slot priority requires proof-of-possession
@@ -3453,7 +3534,7 @@ impl UploadHandler {
                         self.record_share_accepted(&h).await;
                     }
 
-                    slot_guard.activate();
+                    // Slot already reserved atomically via `try_activate` above.
                     queued_identity = None;
                     uploaded = 0;
                     queue_wait_at_grant = queue_join_time.elapsed().as_secs();
@@ -3473,10 +3554,14 @@ impl UploadHandler {
                         last_progress_uploaded = 0;
 
                         let hash_hex = hex::encode(hash);
-                        let file_name = {
-                            let index = self.local_index.read().await;
-                            index.get_by_hash(&hash_hex).map(|f| f.name.clone())
-                        };
+                        // Resolve via `resolve_upload_file` (not the shared index alone) so
+                        // files served from an in-progress download (a `.part` under Temp,
+                        // absent from the shared index) report their name instead of a blank
+                        // File column in the Uploading list.
+                        let file_name = self
+                            .resolve_upload_file(&hash)
+                            .await
+                            .map(|rf| rf.name);
 
                         let _ = self.upload_event_tx.send(UploadEvent {
                             transfer_id: tid,
@@ -3489,12 +3574,50 @@ impl UploadHandler {
                                 client_software: ul_client_software.clone(),
                                 country_code: ul_country_code.clone(),
                                 user_hash: if peer_user_hash != [0u8; 16] { Some(hex::encode(peer_user_hash)) } else { None },
+                                wait_seconds: queue_wait_at_grant,
                             },
                         }).await;
                     }
                 }
 
                 (OP_EMULEPROT, OP_REQUESTPARTS_I64) | (OP_EDONKEYHEADER, OP_REQUESTPARTS) => {
+                    // The first 16 bytes of an OP_REQUESTPARTS payload are the
+                    // requested file's ED2K hash. Honor it as authoritative for
+                    // what to serve rather than blindly serving whatever
+                    // `current_file_hash` happens to be: a peer that pipelines a
+                    // request for a different file than the one negotiated on this
+                    // slot must not receive the wrong file's bytes (which would
+                    // corrupt their download under the other file's hash). On a
+                    // genuine switch we finalize the previous UI row (mirroring the
+                    // OP_SETREQFILEID path) and force a size re-resolve below.
+                    if payload.len() >= 16 {
+                        let mut requested = [0u8; 16];
+                        requested.copy_from_slice(&payload[..16]);
+                        if current_file_hash != Some(requested) {
+                            if let Some(prev) = current_file_hash {
+                                if prev != requested {
+                                    if let Some(tid) = transfer_id.take() {
+                                        let kind = if uploaded > 0 {
+                                            UploadEventKind::Completed
+                                        } else {
+                                            UploadEventKind::Failed {
+                                                error: "Peer switched files before any data was sent".to_string(),
+                                            }
+                                        };
+                                        let _ = self.upload_event_tx.send(UploadEvent {
+                                            transfer_id: tid,
+                                            kind,
+                                        }).await;
+                                        uploaded = 0;
+                                    }
+                                }
+                            }
+                            current_file_hash = Some(requested);
+                            // Force the size backstop below to re-resolve for the
+                            // newly-targeted file.
+                            total_size = 0;
+                        }
+                    }
                     let hash = if let Some(h) = current_file_hash {
                         h
                     } else {
@@ -3528,6 +3651,51 @@ impl UploadHandler {
                         parse_request_parts_32(&payload)?
                     };
                     let raw_offset_count = offsets.len();
+
+                    // Backstop / UI-row (re)establishment. `total_size` is only
+                    // set by OP_SETREQFILEID and the size-bearing MultiPacket, and
+                    // `transfer_id` is minted at grant time. A peer can reach
+                    // OP_REQUESTPARTS with either still unset:
+                    //   * single-part (< PARTSIZE) files where our own downloader
+                    //     omits OP_SETREQFILEID (multi_source.rs) leave total_size
+                    //     == 0; without a resolved size the range filter below
+                    //     drops every request and we serve nothing.
+                    //   * a mid-slot file switch (handled in OP_SETREQFILEID /
+                    //     MultiPacket / the hash check above) finalizes the prior
+                    //     row and nulls transfer_id, so the newly-targeted file has
+                    //     no UI row yet — Progress events are gated on a live
+                    //     transfer_id and would be silently dropped.
+                    // Resolve once and repair both. Only runs on these off-nominal
+                    // paths, so there's no cost on the steady-state serve loop.
+                    if total_size == 0 || transfer_id.is_none() {
+                        if let Some(file) = self.resolve_upload_file(&hash).await {
+                            if total_size == 0 {
+                                total_size = file.size;
+                            }
+                            if transfer_id.is_none() {
+                                let tid = uuid::Uuid::new_v4().to_string();
+                                transfer_id = Some(tid.clone());
+                                // Fresh row: emit the first Progress immediately
+                                // rather than coalescing against the prior file's.
+                                last_progress_emit = None;
+                                last_progress_uploaded = 0;
+                                let _ = self.upload_event_tx.send(UploadEvent {
+                                    transfer_id: tid,
+                                    kind: UploadEventKind::Started {
+                                        file_name: file.name.clone(),
+                                        file_hash: hex::encode(hash),
+                                        total_size,
+                                        peer_addr: peer_addr.to_string(),
+                                        peer_name: ul_peer_name.clone(),
+                                        client_software: ul_client_software.clone(),
+                                        country_code: ul_country_code.clone(),
+                                        user_hash: if peer_user_hash != [0u8; 16] { Some(hex::encode(peer_user_hash)) } else { None },
+                                        wait_seconds: queue_wait_at_grant,
+                                    },
+                                }).await;
+                            }
+                        }
+                    }
 
                     let mut offsets: Vec<(u64, u64)> = offsets
                         .into_iter()
@@ -4243,9 +4411,22 @@ impl UploadHandler {
                         .await?;
 
                         if let Some(tid) = &transfer_id {
+                            // Terminal event for the rotated-out session. Use
+                            // Completed only if we actually moved bytes; a slot
+                            // that was granted then immediately rotated (e.g. score
+                            // preemption) without sending any data emits Failed so
+                            // the UI row is distinguishable from a real transfer and
+                            // the stats don't record a phantom completed upload.
+                            let kind = if uploaded > 0 {
+                                UploadEventKind::Completed
+                            } else {
+                                UploadEventKind::Failed {
+                                    error: "Slot rotated before any data was sent".to_string(),
+                                }
+                            };
                             let _ = self.upload_event_tx.send(UploadEvent {
                                 transfer_id: tid.clone(),
-                                kind: UploadEventKind::Completed,
+                                kind,
                             }).await;
                         }
                         transfer_id = None;
@@ -4254,6 +4435,12 @@ impl UploadHandler {
                         session_start = None;
                         self.slot_rates.lock().unwrap_or_else(|e| e.into_inner()).remove(&peer_addr);
                         rate_tracker = SessionRateTracker::new();
+                        // Re-arm the promotion poller. We re-queue this peer just
+                        // below, so the periodic grant path (read-timeout branch)
+                        // must track its identity to consider it for re-promotion;
+                        // otherwise the peer stays connected but is never granted a
+                        // new slot until the idle timeout drops it.
+                        queued_identity = Some(queue_identity.clone());
 
                         // Re-add to upload queue so they can get another turn
                         {
@@ -4591,12 +4778,39 @@ impl UploadHandler {
                                     continue;
                                 }
                                 }
+                            // Mid-slot file switch (see OP_SETREQFILEID): if this
+                            // MultiPacket targets a different file than the one we're
+                            // actively serving, finalize the old UI row so the new
+                            // file's bytes aren't reported under the stale transfer.
+                            if let Some(prev) = current_file_hash {
+                                if prev != mpreq.file_hash {
+                                    if let Some(tid) = transfer_id.take() {
+                                        let kind = if uploaded > 0 {
+                                            UploadEventKind::Completed
+                                        } else {
+                                            UploadEventKind::Failed {
+                                                error: "Peer switched files before any data was sent".to_string(),
+                                            }
+                                        };
+                                        let _ = self.upload_event_tx.send(UploadEvent {
+                                            transfer_id: tid,
+                                            kind,
+                                        }).await;
+                                        uploaded = 0;
+                                    }
+                                }
+                            }
                             current_file_hash = Some(mpreq.file_hash);
                             total_size = file.size;
 
                                 let partial_bitmap = if file.is_partial && file.size > 0 {
                                     let tracker = super::part_tracker::PartTracker::new(file.size, &file.path);
-                                    Some(tracker.completed_parts())
+                                    // Advertise only parts we will actually serve
+                                    // (complete AND MD4-verified). Using bare
+                                    // `completed_parts()` here advertised unverified
+                                    // parts that the serve gate then rejected,
+                                    // freezing partial-file seeds over MultiPacket.
+                                    Some(tracker.serveable_parts())
                                 } else {
                                     None
                                 };
