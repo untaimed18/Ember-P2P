@@ -20,13 +20,13 @@
     type SearchTab,
   } from '$lib/stores/search';
   import { networkStats, serverStatus } from '$lib/stores/network';
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import { get } from 'svelte/store';
   import type { SearchResult, SpamExplanation } from '$lib/types';
   import { formatSize, formatSpeed } from '$lib/utils';
   import { addToast } from '$lib/stores/toast';
   import * as m from '$lib/paraglide/messages';
-  import { translateError } from '$lib/i18n';
+  import { translateError, degradedReasonText } from '$lib/i18n';
 
   const searchTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
 
@@ -225,6 +225,21 @@
     const parts = o.split(' · ').map((s) => s.trim()).filter(Boolean);
     if (parts.length === 0) return r.peer_id === 'local';
     return parts.every((p) => p === 'Local');
+  }
+
+  /**
+   * Whether a (visible) result is effectively "already in the library" with
+   * nothing to fetch. Pure-local rows are filtered out by
+   * `isLocalOnlySearchResult`, but a row can carry a mixed origin like
+   * `KAD · Local` when a file we share is also found on the network — those
+   * rows DO have downloadable network sources. This mirrors the exact early
+   * exit in `download()` so the in-library badge / disabled download button
+   * only show when the action would genuinely be a no-op.
+   */
+  function isInLibraryOnly(r: SearchResult): boolean {
+    if (!r.result_origin?.includes('Local')) return false;
+    const net = (r.source_addresses ?? []).filter((a) => a && a !== 'local');
+    return net.length === 0;
   }
   let spamProfile = $state<'relaxed' | 'balanced' | 'aggressive'>('balanced');
   let showSpamHelp = $state(false);
@@ -522,6 +537,17 @@
           retryTimeout = setTimeout(() => reject(new Error(m.search_retry_timeout())), 60_000);
         }),
       ]);
+      // Bail out if the user stopped this retry or closed the tab while the
+      // invoke was in flight: the backend resolves `search_files` with
+      // partial results on cancel (it sends on the oneshot rather than
+      // rejecting), so without this guard a stopped/closed retry would still
+      // merge rows and flash a "server returned N" toast. `stopSearch()` and
+      // `closeSearchTab()` both detach the retry id, so a mismatch (or a
+      // missing tab) means this result is stale.
+      const liveTab = get(searchTabs).find((t) => t.id === tabId);
+      if (!liveTab || liveTab.retryRequestId !== retryRequestId) {
+        return;
+      }
       if (results && results.length > 0) {
         searchTabs.update((tabs) => tabs.map((t) => (
           t.id === tabId
@@ -533,6 +559,12 @@
         addToast('info', m.search_server_no_results_retry());
       }
     } catch (e: unknown) {
+      // Suppress the error toast too when the retry was stopped/closed
+      // mid-flight (e.g. cancel surfaced as a rejected invoke).
+      const liveTab = get(searchTabs).find((t) => t.id === tabId);
+      if (!liveTab || liveTab.retryRequestId !== retryRequestId) {
+        return;
+      }
       const msg = translateError(e, m.search_retry_failed());
       addToast('error', msg);
     } finally {
@@ -681,6 +713,29 @@
   let someFilteredChecked = $derived(
     filteredResults.some((r) => checkedKeys.has(resultKey(r)))
   );
+  // Keep the checked set confined to currently-visible results. A row can
+  // be checked and then hidden by a filter change; without this the bulk
+  // toolbar would count it ("N selected") while `downloadChecked` — which
+  // only iterates `filteredResults` — would silently skip it, so the count
+  // overstated what actually downloads. Reconciling to the visible set
+  // (as the transfers page does for its selection) keeps `checkedCount`
+  // and the bulk action in agreement. `untrack` so writing `checkedKeys`
+  // here doesn't retrigger this effect.
+  $effect(() => {
+    const visible = new Set(filteredResults.map((r) => resultKey(r)));
+    untrack(() => {
+      let changed = false;
+      const next = new Set<string>();
+      for (const k of checkedKeys) {
+        if (visible.has(k)) next.add(k);
+        else changed = true;
+      }
+      if (changed) {
+        checkedKeys = next;
+        if (lastCheckedKey && !visible.has(lastCheckedKey)) lastCheckedKey = null;
+      }
+    });
+  });
 
   function clearSearchTimeoutForRequest(requestId: number) {
     const t = searchTimeouts.get(requestId);
@@ -901,6 +956,16 @@
     // Nothing to stop if neither the primary search nor a server retry
     // is in flight.
     if (!t.isSearching && t.retryRequestId == null) return;
+    const retryRequestId = t.retryRequestId;
+    // Detach the retry routing and clear the page-local "retrying" flag
+    // synchronously, BEFORE awaiting the cancel round-trips. The in-flight
+    // `retryServerSearch()` promise guards on the tab still carrying its
+    // retry id, so clearing it here ensures a stopped retry can't merge late
+    // results or flash a toast once `search_files` resolves on cancel.
+    if (retryRequestId != null) {
+      clearRetryRequestId(t.id);
+      serverRetryPending = false;
+    }
     if (t.isSearching) {
       clearSearchTimeoutForRequest(t.requestId);
       try {
@@ -912,9 +977,9 @@
     // The server-retry leg can still be running after the primary
     // search completed (isSearching === false); cancel it too so Stop
     // actually stops all backend work for this tab.
-    if (t.retryRequestId != null) {
+    if (retryRequestId != null) {
       try {
-        await cancelSearch(t.retryRequestId);
+        await cancelSearch(retryRequestId);
       } catch (e) {
         console.error('Failed to cancel server retry:', e);
       }
@@ -1479,7 +1544,10 @@
       <option value={ft.value}>{ft.label}</option>
     {/each}
   </select>
-  {#if activeTab?.isSearching}
+  {#if activeTab?.isSearching || activeTab?.retryRequestId != null}
+    <!-- Also show Stop while a server retry is in flight (isSearching is
+         false then, but retryRequestId is set) so the user can cancel it;
+         stopSearch already cancels the retry leg. -->
     <button class="stop-btn" onclick={stopSearch}>{m.common_stop()}</button>
   {:else}
     <button onclick={() => handleSearch(barQuery)}>{m.search_title()}</button>
@@ -1713,7 +1781,7 @@
     </div>
   {:else if $networkStats.degraded && $networkStats.degraded_reason}
     <div class="search-readiness-hint search-readiness-muted" role="status">
-      {m.search_network_degraded_hint({ reason: $networkStats.degraded_reason })}
+      {m.search_network_degraded_hint({ reason: degradedReasonText($networkStats.degraded_reason) })}
     </div>
   {/if}
   {#if activeTab?.error}
@@ -1905,7 +1973,7 @@
               </span>
             </td>
             <td class="col-history">
-              {#if result.result_origin?.includes('Local')}
+              {#if isInLibraryOnly(result)}
                 <span class="history-badge in-library" title={m.search_history_in_library_title()}>{m.search_history_in_library()}</span>
               {:else if downloadHistoryMap[result.file.hash] === 'completed'}
                 <span class="history-badge history-completed" title={m.search_history_downloaded_title()}>{m.search_history_downloaded()}</span>
@@ -1919,7 +1987,7 @@
                    the right-click menu. Disabled-state mirrors the
                    `download()` function's early-exit checks so the
                    button is faithful to what the action would do. -->
-              {#if result.result_origin?.includes('Local')}
+              {#if isInLibraryOnly(result)}
                 <button
                   class="row-dl-btn"
                   type="button"

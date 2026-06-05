@@ -202,6 +202,45 @@ export function translateErrorCode(input: unknown): string {
 }
 
 /**
+ * Localize a network `degraded_reason` code (see `NetworkStats`). The store
+ * keeps a stable code rather than an English string so the reason re-renders
+ * in the active locale. Unknown values fall back to the raw string (or empty)
+ * so a newer backend/store code can't blank the UI.
+ */
+export function degradedReasonText(reason: string | undefined): string {
+  switch (reason) {
+    case 'stale':
+      return m.network_degraded_stale();
+    case 'limited':
+      return m.network_degraded_limited();
+    case 'establishing':
+      return m.network_degraded_establishing();
+    default:
+      return reason ?? '';
+  }
+}
+
+/**
+ * Localize a backend firewall-status string (eMule `FirewallStatus` debug
+ * form: "Open" / "Firewalled" / "Unknown"). Reuses the existing firewall
+ * labels. Any unrecognized value is shown verbatim rather than dropped.
+ */
+export function firewallStatusText(status: string | undefined): string {
+  switch (status) {
+    case 'Open':
+      return m.kad_firewall_open();
+    case 'Firewalled':
+      return m.kad_firewall_firewalled();
+    case 'Unknown':
+    case undefined:
+    case '':
+      return m.common_unknown();
+    default:
+      return status;
+  }
+}
+
+/**
  * Like {@link translateErrorCode}, but lets the caller supply the
  * message shown when the error carries no usable string (e.g. a
  * thrown non-Error value). Call sites that previously had their own

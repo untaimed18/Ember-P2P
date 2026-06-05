@@ -75,11 +75,17 @@ impl DhtStore {
                 bucket[pos].tags = entry.tags;
                 bucket[pos].stored_at = now;
             } else {
+                // Skip *this* new entry when full, but keep scanning the rest
+                // of the batch: later entries may be updates to existing records
+                // (the branch above) which cost no capacity and must still
+                // refresh `stored_at`, otherwise an active republish that
+                // happens to include one over-cap new entry would let its other
+                // (already-stored) entries expire.
                 if self.total_count >= MAX_TOTAL_ENTRIES {
-                    break;
+                    continue;
                 }
                 if bucket.len() >= MAX_ENTRIES_PER_KEY {
-                    break;
+                    continue;
                 }
                 bucket.push(StoredEntry {
                     id: entry.id,

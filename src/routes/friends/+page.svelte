@@ -288,19 +288,24 @@
     return translateError(e, m.error_operation_failed());
   }
 
+  let loadFriendsSeq = 0;
   async function loadFriends() {
     if (destroyed) return;
+    // Guard against overlapping loads (mount + 'ember:friend-confirmed' event,
+    // or rapid events) resolving out of order and clobbering newer data with a
+    // stale snapshot. Only the most recent invocation commits its result.
+    const seq = ++loadFriendsSeq;
     loading = true;
     error = null;
     try {
       const list = await getFriends();
-      if (destroyed) return;
+      if (destroyed || seq !== loadFriendsSeq) return;
       friends = list;
     } catch (e: unknown) {
-      if (destroyed) return;
+      if (destroyed || seq !== loadFriendsSeq) return;
       error = toErr(e);
     } finally {
-      if (!destroyed) loading = false;
+      if (!destroyed && seq === loadFriendsSeq) loading = false;
     }
   }
 
@@ -718,7 +723,7 @@
                 onkeydown={editKeydown}
                 onblur={saveEdit}
                 maxlength="64"
-                placeholder="Enter nickname"
+                placeholder={m.friends_nickname_edit_placeholder()}
                 use:autoFocus
               />
             {:else}

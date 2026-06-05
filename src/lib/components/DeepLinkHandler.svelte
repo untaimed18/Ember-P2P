@@ -84,6 +84,9 @@
 
   let processing = false;
   let rerun = false;
+  // Set on unmount so an in-flight drain stops routing payloads (goto/toasts)
+  // into a component that no longer exists.
+  let destroyed = false;
 
   async function drain() {
     // Coalesce concurrent triggers (mount + event, or two rapid events) into a
@@ -97,11 +100,14 @@
     try {
       do {
         rerun = false;
+        if (destroyed) break;
         let links = await takePendingDeepLinks();
         while (links.length > 0) {
           for (const link of links) {
+            if (destroyed) return;
             await handlePayload(link);
           }
+          if (destroyed) break;
           links = await takePendingDeepLinks();
         }
       } while (rerun);
@@ -132,6 +138,7 @@
 
     return () => {
       mounted = false;
+      destroyed = true;
       if (unlisten) unlisten();
     };
   });

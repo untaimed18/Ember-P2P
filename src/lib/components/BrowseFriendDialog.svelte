@@ -185,6 +185,15 @@
     if (e.key === 'Escape') onclose();
   }
 
+  // The keydown handler lives on the modal, but the modal isn't focused
+  // when it opens — so Escape did nothing until the user tabbed/clicked
+  // into the dialog. Focus it on open so Escape works immediately (other
+  // dialogs in this app do the same).
+  let modalEl: HTMLDivElement | undefined = $state(undefined);
+  $effect(() => {
+    if (open && modalEl) modalEl.focus();
+  });
+
   onDestroy(() => {
     clearTimeout(browseTimeout);
     if (unlisten) { unlisten(); unlisten = null; }
@@ -198,7 +207,7 @@
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="browse-overlay" onclick={onclose}></div>
   <!-- svelte-ignore a11y_interactive_supports_focus -->
-  <div class="browse-modal" role="dialog" onkeydown={handleKeydown}>
+  <div class="browse-modal" role="dialog" tabindex="-1" bind:this={modalEl} onkeydown={handleKeydown}>
     <div class="browse-header">
       <h3>{m.browse_title_prefix()} <bdi>{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi></h3>
       <button class="browse-close" onclick={onclose} title={m.common_close()} aria-label={m.common_close()}>

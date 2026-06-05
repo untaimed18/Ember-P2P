@@ -651,6 +651,25 @@ impl AsyncWrite for WsStream {
 /// Timeout for the relay node to connect to the target peer.
 const RELAY_TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// A relay target must be a globally-routable IPv4 unicast address.
+///
+/// The relay dials whatever `target_ip:target_port` the initiator puts in the
+/// RELAY_REQUEST. Without this filter a malicious initiator could point the
+/// relay at loopback, RFC1918, link-local or other reserved ranges and use the
+/// operator's node as an SSRF / internal-port-scan proxy into its own LAN.
+/// Only public unicast targets are dialable.
+fn is_public_relay_target(ip: Ipv4Addr) -> bool {
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        // 0.0.0.0/8 ("this network") — not covered by the helpers above.
+        || ip.octets()[0] == 0)
+}
+
 /// Maximum number of in-flight QUIC accept tasks. The semaphore is
 /// taken **before** spawning to bound pre-auth work — without this,
 /// a peer flooding QUIC connections could exhaust scheduler/memory
@@ -777,6 +796,16 @@ pub async fn run_quic_accept_loop(
                         return;
                     }
                 };
+
+                // Refuse to relay to non-public destinations (SSRF/scan guard).
+                if target_port == 0 || !is_public_relay_target(target_ip) {
+                    debug!(
+                        "QUIC accept: refusing relay to non-public target {target_ip}:{target_port} from {remote}"
+                    );
+                    let reject = build_relay_reject(peer_session_id, 0x02);
+                    let _ = init_send.write_all(&reject).await;
+                    return;
+                }
 
                 let initiator_ip = match remote.ip() {
                     std::net::IpAddr::V4(v4) => v4,

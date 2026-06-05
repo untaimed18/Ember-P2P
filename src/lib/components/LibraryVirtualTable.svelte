@@ -91,6 +91,14 @@
 
   let scrollContainer: HTMLDivElement | undefined = $state(undefined);
   let headerWrap: HTMLDivElement | undefined = $state(undefined);
+  // `indeterminate` is an IDL property only — it has no HTML attribute, so a
+  // one-way `indeterminate={...}` in the template is a no-op in Svelte 5.
+  // Drive it imperatively from an effect so the header checkbox shows the
+  // partial-selection dash.
+  let headerCheckbox: HTMLInputElement | undefined = $state(undefined);
+  $effect(() => {
+    if (headerCheckbox) headerCheckbox.indeterminate = someChecked && !allChecked;
+  });
   let scrollTop = $state(0);
   let viewportHeight = $state(600);
   let scrollbarWidth = $state(0);
@@ -455,8 +463,8 @@
           <th class="col-check">
             <input
               type="checkbox"
+              bind:this={headerCheckbox}
               checked={allChecked}
-              indeterminate={someChecked && !allChecked}
               onchange={() => onToggleCheckAll?.()}
               aria-label={m.library_select_all_files()}
               title={m.library_select_all_files()}

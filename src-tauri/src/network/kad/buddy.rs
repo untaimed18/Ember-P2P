@@ -560,6 +560,10 @@ impl BuddyManager {
         }
         self.serving_writer = None;
         self.serving_buddy_for = None;
+        // Clear the callback-check token too (mirrors `reset()`); leaving a
+        // stale token behind would let a later relay path validate against a
+        // peer we are no longer serving.
+        self.serving_callback_check = None;
         info!("Stopped serving as buddy");
     }
 

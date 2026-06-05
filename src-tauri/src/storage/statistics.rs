@@ -73,6 +73,12 @@ pub struct StatsManager {
     pub session_down_counter: Arc<AtomicU64>,
     pub session_up_counter: Arc<AtomicU64>,
     pub sx_counters: SharedSxOverheadCounters,
+    /// Monotonic session-start marker for connection-time accounting.
+    /// `session_start_time` is a wall-clock timestamp (used for display);
+    /// deriving elapsed connection time from it lets a forward clock jump
+    /// (NTP correction, suspend/resume) spike `cum_conn_time`. `Instant` is
+    /// immune to wall-clock changes, so we measure session duration with it.
+    session_start_instant: std::time::Instant,
 }
 
 impl StatsManager {
@@ -91,6 +97,7 @@ impl StatsManager {
             session_down_counter: Arc::new(AtomicU64::new(0)),
             session_up_counter: Arc::new(AtomicU64::new(0)),
             sx_counters: Arc::new(SxOverheadCounters::default()),
+            session_start_instant: std::time::Instant::now(),
         }
     }
 
@@ -145,7 +152,9 @@ impl StatsManager {
             ("cum_down_overhead", safe_add(self.stats.cum_down_overhead, self.stats.session_down_overhead)),
             ("cum_up_overhead", safe_add(self.stats.cum_up_overhead, self.stats.session_up_overhead)),
             ("cum_conn_time", {
-                let session_time = (chrono::Utc::now().timestamp() - self.stats.session_start_time).max(0) as u64;
+                // Monotonic elapsed time — immune to wall-clock jumps that
+                // would otherwise spike the cumulative connection time.
+                let session_time = self.session_start_instant.elapsed().as_secs();
                 safe_add(self.stats.cum_conn_time, session_time)
             }),
             ("cum_completed_down", safe_add32(self.stats.cum_completed_down, self.stats.session_completed_down)),

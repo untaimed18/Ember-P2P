@@ -469,6 +469,11 @@ pub enum UploadEventKind {
     PeerAutoBanned {
         ip: std::net::Ipv4Addr,
         reason: String,
+        /// When set, the IP is also recorded against this peer's DB record
+        /// so a later manual `unban_peer` clears it (ban/unban symmetry).
+        /// `None` for anonymous abuse auto-bans (AddRequestCount etc.),
+        /// whose 7-day TTL self-heals and which have no manual unban path.
+        user_hash: Option<[u8; 16]>,
     },
 }
 
@@ -1542,10 +1547,48 @@ impl UploadHandler {
                     kind: UploadEventKind::PeerAutoBanned {
                         ip: v4,
                         reason: reason.to_string(),
+                        user_hash: None,
                     },
                 })
                 .await;
         }
+    }
+
+    /// Whether the peer in this session has been banned since it connected.
+    ///
+    /// The accept-loop ban check (banned IP) and the post-Hello check
+    /// (`banned_hashes`) both run exactly once, so a peer that is banned
+    /// *while actively downloading* would otherwise keep its in-progress
+    /// upload until it completed or idled out. The session loop calls this
+    /// each iteration, and the inner parts-send loop calls it per block, so a
+    /// ban now tears the live transfer down promptly. Matches the accept
+    /// loop's fail-closed policy: a poisoned lock is treated as "banned".
+    fn peer_is_banned(&self, user_hash: &[u8; 16], peer_addr: &SocketAddr) -> bool {
+        if *user_hash != [0u8; 16] {
+            match self.banned_hashes.read() {
+                Ok(set) => {
+                    if set.contains(user_hash) {
+                        return true;
+                    }
+                }
+                Err(_poisoned) => return true,
+            }
+        }
+        let ipv4 = match peer_addr.ip() {
+            std::net::IpAddr::V4(v4) => Some(v4),
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+        };
+        if let Some(ipv4) = ipv4 {
+            match self.banned_ips.read() {
+                Ok(set) => {
+                    if set.contains(&ipv4) {
+                        return true;
+                    }
+                }
+                Err(_poisoned) => return true,
+            }
+        }
+        false
     }
 
     async fn handle_connection(
@@ -2521,6 +2564,60 @@ impl UploadHandler {
                 break;
             }
 
+            // Peer banned mid-session. The accept-loop / post-Hello ban
+            // checks run only once, so without re-checking here a peer
+            // banned while actively downloading would keep its upload until
+            // completion. Breaking here closes the connection and runs the
+            // normal cleanup at function exit (slot release, queue removal,
+            // terminal transfer event).
+            if self.peer_is_banned(&peer_user_hash, &peer_addr) {
+                info!("Terminating upload session with {peer_addr}: peer banned");
+                // Capture this live session's IP into the ban list. A peer
+                // banned by user-hash while actively downloading may have an
+                // IP that wasn't in the routing table or peer DB at ban time
+                // (so `BanPeer` never learned it) — the hash check above is
+                // then the *only* thing that caught them, and a reconnect
+                // from the same IP would sail through the cheap accept-loop
+                // IP gate. Route the IP through the same canonical + durable
+                // path as the auto-ban (PeerAutoBanned -> apply_persistent_
+                // ip_ban) so the UDP / download / accept-loop paths cover it
+                // too and it survives a restart. Emit at most once (we break
+                // immediately after, and only when the IP isn't already set).
+                let peer_v4 = match peer_addr.ip() {
+                    std::net::IpAddr::V4(v4) => Some(v4),
+                    std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+                };
+                if let Some(peer_v4) = peer_v4 {
+                    let already = self
+                        .banned_ips
+                        .read()
+                        .map(|s| s.contains(&peer_v4))
+                        .unwrap_or(true);
+                    if !already {
+                        if let Ok(mut banned) = self.banned_ips.write() {
+                            banned.insert(peer_v4);
+                        }
+                        let _ = self
+                            .upload_event_tx
+                            .send(UploadEvent {
+                                transfer_id: String::new(),
+                                kind: UploadEventKind::PeerAutoBanned {
+                                    ip: peer_v4,
+                                    reason: "manual peer ban (captured from live upload session)"
+                                        .to_string(),
+                                    // Associate with the banned peer so a later
+                                    // unban_peer (which walks the peer's known
+                                    // addresses) also clears this captured IP.
+                                    user_hash: (peer_user_hash != [0u8; 16])
+                                        .then_some(peer_user_hash),
+                                },
+                            })
+                            .await;
+                    }
+                }
+                break;
+            }
+
             // No-useful-activity rotation gate. The read-side timeout
             // resets on every packet — even ones we ignore (mod-
             // specific opcodes, unrecognised keepalives, etc.). A
@@ -3281,6 +3378,7 @@ impl UploadHandler {
                                     kind: UploadEventKind::PeerAutoBanned {
                                         ip: peer_v4,
                                         reason: "excessive file request frequency (AddRequestCount)".to_string(),
+                                        user_hash: None,
                                     },
                                 }).await;
                                 write_packet_async(&mut writer, OP_EMULEPROT, OP_QUEUEFULL, &[]).await?;
@@ -3940,6 +4038,16 @@ impl UploadHandler {
                                 user_cancelled = true;
                                 break;
                             }
+                        }
+
+                        // Stop serving blocks the moment the peer is banned so
+                        // an in-flight transfer can't keep streaming through a
+                        // multi-block OP_REQUESTPARTS. Breaking the block loop
+                        // returns to the outer loop, whose ban check then ends
+                        // the session (and runs the normal cleanup).
+                        if self.peer_is_banned(&peer_user_hash, &peer_addr) {
+                            info!("Upload to {peer_addr} aborted: peer banned mid-transfer");
+                            break;
                         }
 
                         let len = ((end - start) as usize).min(PARTSIZE as usize);

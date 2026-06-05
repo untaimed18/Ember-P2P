@@ -17,18 +17,30 @@ impl ChunkSelector {
     }
 
     /// Recalculate per-part frequency from all source availability maps.
+    ///
+    /// `total_sources` counts only sources that already carry an availability
+    /// map (non-empty `available_parts`). Server/KAD-discovered sources start
+    /// with an empty map and are counted later, exactly once, when they learn
+    /// their `FileStatus` on the wire (the `!had_preexisting_availability`
+    /// branch in `multi_source`). Counting every source here as well would
+    /// double-count those, inflating `total_sources` and skewing the
+    /// rarest-first rarity zones toward "common".
     pub fn update_frequencies(&mut self, sources: &[DownloadSource]) {
         let part_count = self.part_frequency.len();
         self.part_frequency.fill(0);
-        self.total_sources = sources.len().min(u16::MAX as usize) as u16;
+        let mut counted = 0usize;
 
         for source in sources {
+            if !source.available_parts.is_empty() {
+                counted += 1;
+            }
             for (i, &has) in source.available_parts.iter().enumerate() {
                 if i < part_count && has {
                     self.part_frequency[i] = self.part_frequency[i].saturating_add(1);
                 }
             }
         }
+        self.total_sources = counted.min(u16::MAX as usize) as u16;
     }
 
     /// Remove a source's contribution from the frequency table.
