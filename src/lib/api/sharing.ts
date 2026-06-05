@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { FileInfo } from '$lib/types';
+import type { FileInfo, MediaMetadata } from '$lib/types';
 
 export async function addSharedFolder(path: string): Promise<void> {
   return invoke('add_shared_folder', { path });
@@ -19,6 +19,11 @@ export async function getSharedFolders(): Promise<string[]> {
 
 export async function getFolderPriorities(): Promise<Record<string, string>> {
   return invoke('get_folder_priorities');
+}
+
+/** On-demand media metadata for a shared file (null for non-media files). */
+export async function getFileMediaMetadata(filePath: string): Promise<MediaMetadata | null> {
+  return invoke('get_file_media_metadata', { filePath });
 }
 
 /**

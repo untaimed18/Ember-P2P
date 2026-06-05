@@ -23,6 +23,7 @@
     removeMissingFiles,
     getFolderPriorities,
     setFolderPriority,
+    getFileMediaMetadata,
   } from '$lib/api/sharing';
   import { getFileComments, setFileComment, type FileCommentInfo } from '$lib/api/comments';
   import { formatEd2kLink, buildEd2kLink } from '$lib/api/search';
@@ -31,7 +32,7 @@
   import { toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
   import { networkStats } from '$lib/stores/network';
   import { formatSize } from '$lib/utils';
-  import type { FileInfo } from '$lib/types';
+  import type { FileInfo, MediaMetadata } from '$lib/types';
   import { onMount, tick } from 'svelte';
 
   import { listen } from '@tauri-apps/api/event';
@@ -59,6 +60,7 @@
   });
   let selectedFile = $derived(selectedPath ? (fileByPath.get(selectedPath) ?? null) : null);
   let selectedHash = $derived.by(() => selectedFile?.hash || null);
+  let selectedMedia: MediaMetadata | null = $state(null);
 
   let hashedLibraryFiles = $derived.by(() => files.filter((f) => !!f.hash));
 
@@ -410,6 +412,15 @@
 
   function toErr(e: unknown): string {
     return translateError(e, m.error_operation_failed());
+  }
+
+  async function copyToClipboard(text: string, label: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      toastSuccess(label);
+    } catch {
+      toastError(m.library_copy_failed());
+    }
   }
 
   async function handleAddFolder() {
@@ -975,6 +986,40 @@
       });
     }, 200);
   });
+
+  // Lazily probe media metadata (duration/bitrate/codec/tags) for the selected
+  // file. Keyed on path (not hash) so it works before hashing completes.
+  let mediaFetchTimer: ReturnType<typeof setTimeout> | null = null;
+  $effect(() => {
+    const path = selectedPath;
+    if (mediaFetchTimer) {
+      clearTimeout(mediaFetchTimer);
+      mediaFetchTimer = null;
+    }
+    selectedMedia = null;
+    if (!path) return;
+    mediaFetchTimer = setTimeout(() => {
+      mediaFetchTimer = null;
+      if (selectedPath !== path) return;
+      getFileMediaMetadata(path).then((media) => {
+        if (selectedPath !== path) return;
+        selectedMedia = media;
+      }).catch(() => {
+        if (selectedPath !== path) return;
+        selectedMedia = null;
+      });
+    }, 200);
+  });
+
+  function formatMediaLength(seconds: number): string {
+    const s = Math.max(0, Math.floor(seconds));
+    const h = Math.floor(s / 3600);
+    const m2 = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    return h > 0
+      ? `${h}:${String(m2).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
+      : `${m2}:${String(sec).padStart(2, '0')}`;
+  }
 
   async function handleSaveComment() {
     const hash = selectedHash;
@@ -1652,7 +1697,7 @@
       onclick={() => (showDuplicatesOnly = !showDuplicatesOnly)}
       title={duplicateHashes.size === 0 ? m.library_no_duplicates() : m.library_duplicates_tooltip({ files: duplicateFileCount, hashes: duplicateHashes.size })}
     >
-      {showDuplicatesOnly ? '\u2714' : ' '} {m.library_duplicates()}{duplicateHashes.size > 0 ? ` (${duplicateFileCount})` : ''}
+      {m.library_duplicates()}{duplicateHashes.size > 0 ? ` (${duplicateFileCount})` : ''}
     </button>
     <button
       class="dupes-toggle missing-toggle"
@@ -1661,7 +1706,7 @@
       onclick={() => (showMissingOnly = !showMissingOnly)}
       title={missingPathSet.size === 0 ? m.library_no_missing() : m.library_missing_tooltip({ count: missingPathSet.size })}
     >
-      {showMissingOnly ? '\u2714' : ' '} {m.library_missing()}{missingPathSet.size > 0 ? ` (${missingPathSet.size})` : ''}
+      {m.library_missing()}{missingPathSet.size > 0 ? ` (${missingPathSet.size})` : ''}
     </button>
     {#if showMissingOnly && missingPathSet.size > 0}
       <button
@@ -2115,6 +2160,7 @@
         someChecked={someFilteredChecked}
         onToggleCheck={toggleCheck}
         onToggleCheckAll={toggleCheckAll}
+        missingPaths={missingPathSet}
       />
     {/if}
 
@@ -2189,16 +2235,20 @@
             <span class="meta-label">{m.library_meta_hash()}</span>
             <span class="meta-value meta-hash">
               <code>{selectedFile.hash}</code>
-              <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) navigator.clipboard.writeText(f.hash).catch(() => {}); }} title={m.library_meta_copy_hash()}>{m.common_copy()}</button>
+              <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.hash, m.library_copied_hash()); }} title={m.library_meta_copy_hash()}>{m.common_copy()}</button>
             </span>
           {/if}
           {#if selectedFile.aich_hash}
             <span class="meta-label">{m.library_meta_aich()}</span>
             <span class="meta-value meta-hash">
               <code>{selectedFile.aich_hash}</code>
-              <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) navigator.clipboard.writeText(f.aich_hash).catch(() => {}); }} title={m.library_meta_copy_aich()}>{m.common_copy()}</button>
+              <button class="ghost copy-btn" onclick={() => { const f = selectedFile; if (f) copyToClipboard(f.aich_hash, m.library_copied_aich()); }} title={m.library_meta_copy_aich()}>{m.common_copy()}</button>
             </span>
           {/if}
+          <span class="meta-label">{m.library_col_priority()}</span>
+          <span class="meta-value">
+            <span class="prio-badge prio-{selectedFile.priority}">{priorityLabel(selectedFile.priority)}</span>
+          </span>
           <span class="meta-label">{m.library_col_shared()}</span>
           <span class="meta-value">
             {selectedFile.shared ? m.common_yes() : m.common_no()}
@@ -2223,6 +2273,36 @@
             </span>
           {/if}
         </div>
+
+        {#if selectedMedia}
+          <div class="drawer-section-divider"></div>
+          <div class="details-meta-grid">
+            {#if selectedMedia.title}
+              <span class="meta-label">{m.library_meta_title()}</span>
+              <span class="meta-value"><bdi>{selectedMedia.title}</bdi></span>
+            {/if}
+            {#if selectedMedia.artist}
+              <span class="meta-label">{m.library_meta_artist()}</span>
+              <span class="meta-value"><bdi>{selectedMedia.artist}</bdi></span>
+            {/if}
+            {#if selectedMedia.album}
+              <span class="meta-label">{m.library_meta_album()}</span>
+              <span class="meta-value"><bdi>{selectedMedia.album}</bdi></span>
+            {/if}
+            {#if selectedMedia.duration}
+              <span class="meta-label">{m.library_meta_duration()}</span>
+              <span class="meta-value">{formatMediaLength(selectedMedia.duration)}</span>
+            {/if}
+            {#if selectedMedia.bitrate}
+              <span class="meta-label">{m.library_meta_bitrate()}</span>
+              <span class="meta-value">{m.library_meta_bitrate_value({ kbps: selectedMedia.bitrate })}</span>
+            {/if}
+            {#if selectedMedia.codec}
+              <span class="meta-label">{m.library_meta_codec()}</span>
+              <span class="meta-value">{selectedMedia.codec}</span>
+            {/if}
+          </div>
+        {/if}
 
         <div class="drawer-actions">
           <button class="drawer-action-btn" onclick={() => openSharedFile(selectedFile.path)} title={m.library_open_file_title()}>
@@ -3316,6 +3396,29 @@
   .meta-badge.meta-badge-aich {
     background: #27ae60;
   }
+
+  .drawer-section-divider {
+    height: 1px;
+    background: var(--border);
+    margin: 10px 0;
+  }
+
+  /* Priority pill in the properties drawer — mirrors the table cell colors. */
+  .prio-badge {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--bg-surface);
+  }
+  .prio-badge.prio-verylow { color: #888; }
+  .prio-badge.prio-low { color: #59b; }
+  .prio-badge.prio-normal { color: var(--text-primary); }
+  .prio-badge.prio-high { color: #e0a030; border-color: color-mix(in srgb, #e0a030 45%, var(--border)); }
+  .prio-badge.prio-release { color: #e05050; border-color: color-mix(in srgb, #e05050 45%, var(--border)); }
+  .prio-badge.prio-auto { color: #7cb342; }
 
   /* --- Comment panel --- */
   .comment-last-saved {
