@@ -92,6 +92,7 @@ notify-debouncer-mini = { version = "0.7", default-features = false }
 # Unicode tables we don't need (we match ASCII-only client-software
 # strings) — saves ~250 KiB binary and ~50 ms startup compile time.
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
+lofty = "0.22.2"
 
 [profile.release]
 strip = true

@@ -527,6 +527,75 @@ pub async fn get_shared_folders(
     Ok(config.settings.shared_folders.clone())
 }
 
+/// Map a lofty `FileType` to a short eMule-style codec label.
+fn media_file_type_label(ft: lofty::file::FileType) -> String {
+    use lofty::file::FileType;
+    match ft {
+        FileType::Mpeg => "mp3".to_string(),
+        FileType::Mp4 => "aac".to_string(),
+        FileType::Aac => "aac".to_string(),
+        FileType::Flac => "flac".to_string(),
+        FileType::Vorbis => "vorbis".to_string(),
+        FileType::Opus => "opus".to_string(),
+        FileType::Speex => "speex".to_string(),
+        FileType::Wav => "wav".to_string(),
+        FileType::Aiff => "aiff".to_string(),
+        FileType::Ape => "ape".to_string(),
+        FileType::WavPack => "wavpack".to_string(),
+        other => format!("{other:?}").to_lowercase(),
+    }
+}
+
+/// Extract media metadata (duration/bitrate/codec/tags) from a media file using
+/// lofty (header-only read; no full decode). Returns `None` for non-media files
+/// or on any parse error so the caller can treat "no media" uniformly. Audio
+/// formats are covered; video files generally return `None`.
+fn extract_media_metadata(path: &str) -> Option<crate::types::MediaMetadata> {
+    use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::probe::Probe;
+    use lofty::tag::Accessor;
+
+    let tagged = Probe::open(path).ok()?.read().ok()?;
+    let props = tagged.properties();
+    let mut media = crate::types::MediaMetadata::default();
+
+    let secs = props.duration().as_secs();
+    if secs > 0 {
+        media.duration = Some(secs.min(u32::MAX as u64) as u32);
+    }
+    media.bitrate = props.audio_bitrate().filter(|b| *b > 0);
+    media.codec = Some(media_file_type_label(tagged.file_type()));
+
+    if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
+        media.artist = tag.artist().map(|c| c.to_string()).filter(|s| !s.is_empty());
+        media.album = tag.album().map(|c| c.to_string()).filter(|s| !s.is_empty());
+        media.title = tag.title().map(|c| c.to_string()).filter(|s| !s.is_empty());
+    }
+
+    media.into_option()
+}
+
+/// On-demand media metadata for a single shared file (used by the library
+/// properties drawer). Restricted to files inside shared folders so the IPC
+/// surface can't be used to probe arbitrary paths. Returns `None` when the
+/// file isn't a recognized media file.
+#[tauri::command]
+pub async fn get_file_media_metadata(
+    state: tauri::State<'_, AppState>,
+    file_path: String,
+) -> Result<Option<crate::types::MediaMetadata>, String> {
+    {
+        let config = state.config.read().await;
+        if !file_in_shared_folders(&file_path, &config.settings.shared_folders) {
+            return Err(coded("sharing_file_not_shared", "File is not in a shared folder"));
+        }
+    }
+    let path = file_path;
+    tokio::task::spawn_blocking(move || extract_media_metadata(&path))
+        .await
+        .map_err(|e| coded_ctx("sharing_media_task_failed", "Media task failed", e))
+}
+
 /// Current per-folder default upload priorities (folder path -> priority).
 #[tauri::command]
 pub async fn get_folder_priorities(
