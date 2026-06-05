@@ -536,6 +536,22 @@ impl TransferManager {
             }
             sources.push(source);
         }
+
+        // eMule's "last seen complete": stamp the moment the file is seen
+        // complete on the network. eMule derives it from aggregate per-part
+        // availability covering every part (PartFile.cpp:3638); our SourceInfo
+        // only carries an available-part *count* (no bitmap), so we use the
+        // strongest signal it can express — a single source that holds every
+        // part. That captures the common seeder case; partial sources that
+        // only together cover 100% aren't detectable from counts alone.
+        let seen_complete = sources.iter().any(|s| {
+            matches!((s.available_parts, s.total_parts), (Some(a), Some(t)) if t > 0 && a >= t)
+        });
+        if seen_complete {
+            if let Some(transfer) = self.active.get_mut(transfer_id) {
+                transfer.last_seen_complete = Some(chrono::Utc::now().timestamp());
+            }
+        }
     }
 
     /// Get all source details for a transfer.

@@ -114,6 +114,18 @@ export interface SourceInfo {
   country_code?: string;
 }
 
+/** Media metadata for a search hit (eMule `FT_MEDIA_*` tags). */
+export interface MediaMetadata {
+  /** Playback length in whole seconds. */
+  duration?: number;
+  /** Bitrate in kbps. */
+  bitrate?: number;
+  codec?: string;
+  artist?: string;
+  album?: string;
+  title?: string;
+}
+
 export interface SearchResult {
   file: FileInfo;
   peer_id: string;
@@ -123,6 +135,7 @@ export interface SearchResult {
   source_addresses: string[];
   rating?: number;
   comment?: string;
+  media?: MediaMetadata;
   spam_rating: number;
   is_spam: boolean;
   clean_name: string;

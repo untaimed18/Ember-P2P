@@ -481,6 +481,9 @@ pub struct ServerSearchResult {
     pub client_port: u16,
     pub file_name: String,
     pub file_size: u64,
+    pub rating: Option<u8>,
+    pub comment: Option<String>,
+    pub media: crate::types::MediaMetadata,
 }
 
 fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpResponse> {
@@ -648,6 +651,75 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
         _ => None,
     }
 }
+/// Parse an eMule media-length string ("h:mm:ss"/"mm:ss"/"ss") into seconds.
+fn parse_media_length_str(s: &str) -> Option<u32> {
+    let parts: Vec<u32> = s
+        .split(':')
+        .map(|p| p.trim().parse::<u32>().ok())
+        .collect::<Option<Vec<u32>>>()?;
+    match parts.as_slice() {
+        [h, m, sec] => Some(h * 3600 + m * 60 + sec),
+        [m, sec] => Some(m * 60 + sec),
+        [sec] => Some(*sec),
+        _ => None,
+    }
+}
+
+/// Route a string tag value (by id or lowercased name) into filename, comment,
+/// or media fields. Mirrors the TCP server parser's `apply_string`.
+fn apply_udp_string_tag(
+    name_id: u8,
+    name: Option<&str>,
+    value: String,
+    file_name: &mut String,
+    comment: &mut Option<String>,
+    media: &mut crate::types::MediaMetadata,
+) {
+    if name_id == 0x01 {
+        *file_name = value;
+        return;
+    }
+    if value.is_empty() {
+        return;
+    }
+    let is = |n: &str| name == Some(n);
+    match name_id {
+        0xF6 => *comment = Some(value),
+        0xD0 => media.artist = Some(value),
+        0xD1 => media.album = Some(value),
+        0xD2 => media.title = Some(value),
+        0xD5 => media.codec = Some(value),
+        0xD3 => media.duration = parse_media_length_str(&value),
+        _ if is("comment") || is("description") => *comment = Some(value),
+        _ if is("artist") => media.artist = Some(value),
+        _ if is("album") => media.album = Some(value),
+        _ if is("title") => media.title = Some(value),
+        _ if is("codec") => media.codec = Some(value),
+        _ if is("length") => media.duration = parse_media_length_str(&value),
+        _ => {}
+    }
+}
+
+/// Route an unsigned-int tag value (by id or name) into rating/media fields.
+fn apply_udp_uint_tag(
+    name_id: u8,
+    name: Option<&str>,
+    value: u64,
+    rating: &mut Option<u8>,
+    media: &mut crate::types::MediaMetadata,
+) {
+    let is = |n: &str| name == Some(n);
+    match name_id {
+        0xD3 if value > 0 => media.duration = Some(value as u32),
+        0xD4 if value > 0 => media.bitrate = Some(value as u32),
+        0xF7 => *rating = Some(value as u8),
+        _ if is("bitrate") && value > 0 => media.bitrate = Some(value as u32),
+        _ if is("length") && value > 0 => media.duration = Some(value as u32),
+        _ if is("filerating") || is("rating") => *rating = Some(value as u8),
+        _ => {}
+    }
+}
+
 fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
     let mut cursor = Cursor::new(payload);
     let mut results = Vec::new();
@@ -664,24 +736,30 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
 
         let mut file_name = String::new();
         let mut file_size: u64 = 0;
+        let mut rating: Option<u8> = None;
+        let mut comment: Option<String> = None;
+        let mut media = crate::types::MediaMetadata::default();
 
         for _ in 0..tag_count.min(50) {
             let raw_type = cursor.read_u8().ok()?;
-            let (name_id, tag_type) = if raw_type & 0x80 != 0 {
+            let (name_id, tag_type, tag_name) = if raw_type & 0x80 != 0 {
                 let t = raw_type & 0x7F;
                 let n = cursor.read_u8().ok()?;
-                (n, t)
+                (n, t, None)
             } else {
                 let name_len = cursor.read_u16::<LittleEndian>().ok()? as usize;
-                let n = if name_len == 1 {
-                    cursor.read_u8().ok()?
+                if name_len == 1 {
+                    let n = cursor.read_u8().ok()?;
+                    (n, raw_type, None)
                 } else {
+                    // Preserve the string name so ED2K media tags
+                    // ("length"/"bitrate"/"codec"/...) can be matched.
                     let mut name_buf = vec![0u8; name_len];
                     std::io::Read::read_exact(&mut cursor, &mut name_buf).ok()?;
-                    0u8
-                };
-                (n, raw_type)
+                    (0u8, raw_type, Some(String::from_utf8_lossy(&name_buf).to_ascii_lowercase()))
+                }
             };
+            let tag_name = tag_name.as_deref();
 
             let ok = match tag_type {
                 0x01 => { // TAGTYPE_HASH
@@ -697,10 +775,9 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
                     } else {
                         let bytes = &payload[start..end];
                         cursor.set_position(end as u64);
-                        if name_id == 0x01 {
-                            let keep = &bytes[..bytes.len().min(8192)];
-                            file_name = String::from_utf8_lossy(keep).to_string();
-                        }
+                        let keep = &bytes[..bytes.len().min(8192)];
+                        let value = String::from_utf8_lossy(keep).to_string();
+                        apply_udp_string_tag(name_id, tag_name, value, &mut file_name, &mut comment, &mut media);
                         true
                     }
                 }
@@ -709,7 +786,7 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
                         match name_id {
                             0x02 => file_size = (file_size & 0xFFFF_FFFF_0000_0000) | v as u64,
                             0x3A => file_size = (file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32),
-                            _ => {}
+                            _ => apply_udp_uint_tag(name_id, tag_name, v as u64, &mut rating, &mut media),
                         }
                         true
                     } else { false }
@@ -739,12 +816,14 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
                 0x08 => { // TAGTYPE_UINT16
                     if let Ok(v) = cursor.read_u16::<LittleEndian>() {
                         if name_id == 0x02 { file_size = v as u64; }
+                        else { apply_udp_uint_tag(name_id, tag_name, v as u64, &mut rating, &mut media); }
                         true
                     } else { false }
                 }
                 0x09 => { // TAGTYPE_UINT8
                     if let Ok(v) = cursor.read_u8() {
                         if name_id == 0x02 { file_size = v as u64; }
+                        else { apply_udp_uint_tag(name_id, tag_name, v as u64, &mut rating, &mut media); }
                         true
                     } else { false }
                 }
@@ -758,6 +837,7 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
                 0x0B => { // TAGTYPE_UINT64
                     if let Ok(v) = cursor.read_u64::<LittleEndian>() {
                         if name_id == 0x02 { file_size = v; }
+                        else { apply_udp_uint_tag(name_id, tag_name, v, &mut rating, &mut media); }
                         true
                     } else { false }
                 }
@@ -765,7 +845,8 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
                     let slen = (t - 0x11 + 1) as usize;
                     let mut sbuf = vec![0u8; slen];
                     if std::io::Read::read_exact(&mut cursor, &mut sbuf).is_ok() {
-                        if name_id == 0x01 { file_name = String::from_utf8_lossy(&sbuf).to_string(); }
+                        let value = String::from_utf8_lossy(&sbuf).to_string();
+                        apply_udp_string_tag(name_id, tag_name, value, &mut file_name, &mut comment, &mut media);
                         true
                     } else { false }
                 }
@@ -780,6 +861,9 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
             client_port,
             file_name,
             file_size,
+            rating,
+            comment,
+            media,
         });
     }
 
