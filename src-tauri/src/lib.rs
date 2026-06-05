@@ -476,9 +476,20 @@ pub fn run() {
                     commands::sharing::file_in_shared_folders(&file.path, &current_shared_folders)
                 });
 
+                let folder_priorities = {
+                    let state = startup_app.state::<AppState>();
+                    let cfg = state.config.read().await;
+                    cfg.settings.folder_priorities.clone()
+                };
                 {
                     let mut index = index_clone.write().await;
                     index.add_files(all_discovered.clone());
+                    // Apply each shared folder's default upload priority so
+                    // newly discovered files (and files added while the app
+                    // was closed) inherit eMule-style per-directory priority.
+                    for (folder, priority) in &folder_priorities {
+                        index.set_priority_under_folder(folder, priority);
+                    }
                 }
                 commands::sharing::refresh_file_cache(&index_clone, &csf).await;
 
@@ -675,6 +686,7 @@ pub fn run() {
             commands::search::compute_ed2k_hash,
             commands::search::publish_note,
             commands::search::format_ed2k_link,
+            commands::search::build_ed2k_link,
             commands::search::parse_ed2k_link,
             commands::search::mark_spam,
             commands::search::mark_not_spam,
@@ -711,6 +723,8 @@ pub fn run() {
             commands::sharing::remove_shared_folder,
             commands::sharing::get_shared_files,
             commands::sharing::get_shared_folders,
+            commands::sharing::get_folder_priorities,
+            commands::sharing::set_folder_priority,
             commands::sharing::set_file_priority,
             commands::sharing::batch_set_priority,
             commands::sharing::batch_share,

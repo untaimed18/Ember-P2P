@@ -32,7 +32,27 @@ export async function formatEd2kLink(name: string, size: number, fileHash: strin
   return invoke('format_ed2k_link', { name, size, fileHash });
 }
 
-export async function parseEd2kLink(link: string): Promise<{ name: string; size: number; hash: string }> {
+/**
+ * Build an ed2k link variant. When `aichHash` (40-char hex) is supplied it is
+ * embedded as a base32 `h=` segment; when `withSources` is true our reachable
+ * endpoint is appended as a `sources,` segment (errors if firewalled).
+ */
+export async function buildEd2kLink(
+  name: string,
+  size: number,
+  fileHash: string,
+  opts: { aichHash?: string; withSources?: boolean } = {},
+): Promise<string> {
+  return invoke('build_ed2k_link', {
+    name,
+    size,
+    fileHash,
+    aichHash: opts.aichHash ?? null,
+    withSources: opts.withSources ?? false,
+  });
+}
+
+export async function parseEd2kLink(link: string): Promise<{ name: string; size: number; hash: string; aich?: string }> {
   return invoke('parse_ed2k_link', { link });
 }
 
