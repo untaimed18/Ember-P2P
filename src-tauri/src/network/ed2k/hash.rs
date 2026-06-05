@@ -251,7 +251,119 @@ fn percent_encode_ed2k(name: &str) -> String {
 
 /// Format an ed2k link: ed2k://|file|name|size|hash|/
 pub fn format_ed2k_link(name: &str, size: u64, hash: &str) -> String {
-    format!("ed2k://|file|{}|{}|{}|/", percent_encode_ed2k(name), size, hash.to_uppercase())
+    format_ed2k_link_ext(name, size, hash, None, &[])
+}
+
+/// Format an ed2k link with optional AICH root hash and source endpoints,
+/// matching eMule's link variants:
+///   ed2k://|file|name|size|hash|h=<base32 AICH>|sources,ip:port,...|/
+///
+/// `aich_hex` is the 40-char hex AICH root (as stored on `FileInfo`); it is
+/// re-encoded to base32 for the `h=` segment the way eMule expects. `sources`
+/// are appended only when non-empty.
+pub fn format_ed2k_link_ext(
+    name: &str,
+    size: u64,
+    hash: &str,
+    aich_hex: Option<&str>,
+    sources: &[(String, u16)],
+) -> String {
+    let mut link = format!(
+        "ed2k://|file|{}|{}|{}|",
+        percent_encode_ed2k(name),
+        size,
+        hash.to_uppercase()
+    );
+    if let Some(hex_str) = aich_hex {
+        if let Some(b32) = aich_hex_to_base32(hex_str) {
+            link.push_str("h=");
+            link.push_str(&b32);
+            link.push('|');
+        }
+    }
+    if !sources.is_empty() {
+        link.push_str("sources");
+        for (ip, port) in sources {
+            link.push(',');
+            link.push_str(ip);
+            link.push(':');
+            link.push_str(&port.to_string());
+        }
+        link.push('|');
+    }
+    link.push('/');
+    link
+}
+
+const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+/// RFC 4648 base32 encode (uppercase, no padding) — the form eMule uses for
+/// the `h=` AICH segment of ed2k links.
+fn base32_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(5) * 8);
+    let mut buffer: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in data {
+        buffer = (buffer << 8) | b as u32;
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(BASE32_ALPHABET[((buffer >> bits) & 0x1f) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(BASE32_ALPHABET[((buffer << (5 - bits)) & 0x1f) as usize] as char);
+    }
+    out
+}
+
+/// Decode RFC 4648 base32 (case-insensitive, padding tolerated). Returns the
+/// raw bytes, or `None` if a non-alphabet character is encountered.
+fn base32_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 5 / 8);
+    let mut buffer: u32 = 0;
+    let mut bits: u32 = 0;
+    for c in s.chars() {
+        if c == '=' {
+            break;
+        }
+        let val = match c.to_ascii_uppercase() {
+            ch @ 'A'..='Z' => ch as u32 - 'A' as u32,
+            ch @ '2'..='7' => ch as u32 - '2' as u32 + 26,
+            _ => return None,
+        };
+        buffer = (buffer << 5) | val;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buffer >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Convert a 40-char hex AICH root into its base32 representation. Returns
+/// `None` when the input is not exactly 20 bytes of valid hex.
+fn aich_hex_to_base32(aich_hex: &str) -> Option<String> {
+    let trimmed = aich_hex.trim();
+    if trimmed.len() != 40 {
+        return None;
+    }
+    let bytes = hex::decode(trimmed).ok()?;
+    if bytes.len() != 20 {
+        return None;
+    }
+    Some(base32_encode(&bytes))
+}
+
+/// Convert a base32 AICH segment back into 40-char hex. Returns `None` unless
+/// it decodes to exactly 20 bytes.
+fn aich_base32_to_hex(b32: &str) -> Option<String> {
+    let bytes = base32_decode(b32.trim())?;
+    if bytes.len() != 20 {
+        return None;
+    }
+    Some(hex::encode(bytes))
 }
 
 pub fn percent_decode_str(s: &str) -> String {
@@ -275,8 +387,12 @@ pub fn percent_decode_str(s: &str) -> String {
     String::from_utf8(result).unwrap_or_else(|_| s.to_string())
 }
 
-/// Parse an ed2k link, returning (name, size, hash)
-pub fn parse_ed2k_link(link: &str) -> Option<(String, u64, String)> {
+/// Parse an ed2k link, returning (name, size, hash, optional AICH hex).
+///
+/// Trailing optional segments (`h=<base32 AICH>`, `sources,...`, `s=<url>`,
+/// etc.) are tolerated; only the AICH root is currently surfaced so imported
+/// links can carry recovery data.
+pub fn parse_ed2k_link(link: &str) -> Option<(String, u64, String, Option<String>)> {
     let trimmed = link.trim();
     if !trimmed.starts_with("ed2k://|file|") {
         return None;
@@ -293,6 +409,91 @@ pub fn parse_ed2k_link(link: &str) -> Option<(String, u64, String)> {
     if hash.len() != 32 || hex::decode(&hash).is_err() {
         return None;
     }
-    Some((name, size, hash))
+    let mut aich: Option<String> = None;
+    for seg in parts {
+        if let Some(b32) = seg.strip_prefix("h=") {
+            aich = aich_base32_to_hex(b32);
+        }
+    }
+    Some((name, size, hash, aich))
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef";
+    // 20-byte AICH root (hex) -> known base32.
+    const AICH_HEX: &str = "0000000000000000000000000000000000000000";
+
+    #[test]
+    fn base32_round_trips_aich() {
+        let aich = "1f2e3d4c5b6a798877665544332211000aabbccd";
+        let b32 = aich_hex_to_base32(aich).expect("encode");
+        assert_eq!(b32.len(), 32, "20 bytes -> 32 base32 chars");
+        let back = aich_base32_to_hex(&b32).expect("decode");
+        assert_eq!(back, aich);
+    }
+
+    #[test]
+    fn base32_all_zero_aich() {
+        let b32 = aich_hex_to_base32(AICH_HEX).expect("encode");
+        assert_eq!(b32, "A".repeat(32));
+    }
+
+    #[test]
+    fn plain_link_unchanged() {
+        let link = format_ed2k_link("movie.avi", 1234, HASH);
+        assert_eq!(
+            link,
+            "ed2k://|file|movie.avi|1234|0123456789ABCDEF0123456789ABCDEF|/"
+        );
+    }
+
+    #[test]
+    fn link_with_aich_has_h_segment() {
+        let aich = "1f2e3d4c5b6a798877665544332211000aabbccd";
+        let link = format_ed2k_link_ext("movie.avi", 1234, HASH, Some(aich), &[]);
+        assert!(link.contains("|h="), "expected h= segment: {link}");
+        assert!(link.ends_with("|/"));
+        // Round-trip the embedded AICH back out.
+        let (_, _, _, parsed) = parse_ed2k_link(&link).expect("parse");
+        assert_eq!(parsed.as_deref(), Some(aich));
+    }
+
+    #[test]
+    fn link_with_sources_appends_endpoint() {
+        let sources = vec![("203.0.113.5".to_string(), 4662u16)];
+        let link = format_ed2k_link_ext("movie.avi", 1234, HASH, None, &sources);
+        assert!(link.contains("|sources,203.0.113.5:4662|"), "{link}");
+    }
+
+    #[test]
+    fn link_with_aich_and_sources_keeps_order() {
+        let aich = "1f2e3d4c5b6a798877665544332211000aabbccd";
+        let sources = vec![("203.0.113.5".to_string(), 4662u16)];
+        let link = format_ed2k_link_ext("a.bin", 9, HASH, Some(aich), &sources);
+        let h_pos = link.find("h=").unwrap();
+        let s_pos = link.find("sources,").unwrap();
+        assert!(h_pos < s_pos, "h= must precede sources: {link}");
+    }
+
+    #[test]
+    fn parse_ignores_unknown_trailing_segments() {
+        let link = format!("ed2k://|file|a.bin|9|{HASH}|sources,1.2.3.4:1|s=http://x/y|/");
+        let (name, size, hash, aich) = parse_ed2k_link(&link).expect("parse");
+        assert_eq!(name, "a.bin");
+        assert_eq!(size, 9);
+        assert_eq!(hash, HASH);
+        assert!(aich.is_none());
+    }
+
+    #[test]
+    fn parse_rejects_bad_base32_aich() {
+        // '1' and '0' are not in the base32 alphabet -> decode fails -> None.
+        let link = format!("ed2k://|file|a.bin|9|{HASH}|h=10101010101010101010101010101010|/");
+        let (_, _, _, aich) = parse_ed2k_link(&link).expect("parse");
+        assert!(aich.is_none());
+    }
 }
 

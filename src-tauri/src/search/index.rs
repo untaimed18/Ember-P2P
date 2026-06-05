@@ -315,6 +315,22 @@ impl LocalIndex {
         false
     }
 
+    /// Apply `priority` to every file that lives under `folder` (the folder
+    /// itself or any descendant), mirroring eMule's per-directory priority.
+    /// Returns the `(path, hash)` of each file actually changed so the caller
+    /// can push the new priority into `known.met`. Files already at `priority`
+    /// are skipped so the returned set stays minimal.
+    pub fn set_priority_under_folder(&mut self, folder: &str, priority: &str) -> Vec<(String, String)> {
+        let mut changed = Vec::new();
+        for file in &mut self.files {
+            if crate::security::path_matches_dir(&file.path, folder) && file.priority != priority {
+                file.priority = priority.to_string();
+                changed.push((file.path.clone(), file.hash.clone()));
+            }
+        }
+        changed
+    }
+
     pub fn set_file_shared_by_path(&mut self, path: &str, shared: bool) -> bool {
         if let Some(&idx) = self.path_map.get(&normalize_path_key(path)) {
             if let Some(file) = self.files.get_mut(idx) {

@@ -531,7 +531,7 @@
                 <input
                   type="checkbox"
                   checked={checkedPaths.has(file.path)}
-                  onclick={(e) => { e.stopPropagation(); onToggleCheck(file.path, e.shiftKey); e.preventDefault(); }}
+                  onclick={(e) => { e.stopPropagation(); onToggleCheck(file.path, e.shiftKey); }}
                   aria-label={m.library_select_file({ name: file.name })}
                 />
               </td>

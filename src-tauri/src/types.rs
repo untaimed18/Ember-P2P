@@ -599,6 +599,12 @@ pub struct AppSettings {
     /// users on older configs.
     #[serde(default = "default_close_to_tray_behavior")]
     pub close_to_tray_behavior: String,
+    /// Per-shared-folder default upload priority (eMule: directory priority).
+    /// Maps a shared folder path to one of the priority strings
+    /// (`verylow`/`low`/`normal`/`high`/`release`/`auto`). Files discovered
+    /// under a folder adopt its priority unless individually overridden.
+    #[serde(default)]
+    pub folder_priorities: std::collections::HashMap<String, String>,
 }
 
 /// Sanitized ed2k download limits derived from [`AppSettings`] (clamped for safety).
@@ -855,6 +861,7 @@ impl Default for AppSettings {
             max_concurrent_uploads: 5,
             tcp_port: DEFAULT_TCP_PORT,
             udp_port: DEFAULT_UDP_PORT,
+            folder_priorities: std::collections::HashMap::new(),
             nodes_dat_path: String::new(),
             upnp_enabled: false,
             obfuscation_enabled: true,
