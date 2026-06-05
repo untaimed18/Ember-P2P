@@ -65,6 +65,7 @@
     someChecked = false,
     onToggleCheck,
     onToggleCheckAll,
+    missingPaths = new Set<string>(),
   }: {
     sortedFiles: FileInfo[];
     selectedPath: string | null;
@@ -83,6 +84,7 @@
     someChecked?: boolean;
     onToggleCheck?: (path: string, shiftKey: boolean) => void;
     onToggleCheckAll?: () => void;
+    missingPaths?: Set<string>;
   } = $props();
 
   // --- Virtualization ---
@@ -521,6 +523,7 @@
           <tr
             class:row-alt={((virtualSlice.startIdx + i) & 1) === 1}
             class:selected={selectedPath === file.path}
+            class:row-missing={missingPaths.has(file.path)}
             onclick={() => onSelectPath(file.path)}
             ondblclick={() => onOpenFile(file.path)}
             oncontextmenu={(e) => onRowContextMenu(e, file)}
@@ -538,7 +541,14 @@
             {/if}
             {#each visibleColumns as col (col.key)}
               {#if col.key === 'name'}
-                <td class="cell-name" title={file.path}>{file.name}</td>
+                <td class="cell-name" title={missingPaths.has(file.path) ? m.library_row_missing_title({ path: file.path }) : file.path}>
+                  {#if missingPaths.has(file.path)}
+                    <svg class="missing-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true">
+                      <path d="M8 1.5 1 14h14z"/><line x1="8" y1="6.5" x2="8" y2="9.5"/><line x1="8" y1="11.5" x2="8" y2="11.5"/>
+                    </svg>
+                  {/if}
+                  {file.name}
+                </td>
               {:else if col.key === 'size'}
                 <td class="cell-num">{formatSize(file.size)}</td>
               {:else if col.key === 'type'}
@@ -840,6 +850,21 @@
   .shared-badge.aich {
     background: rgba(39, 174, 96, 0.15);
     color: #27ae60;
+  }
+
+  /* Missing files: path no longer resolves on disk. Dim the row and tint the
+     name so broken shares stand out passively (not just under the filter). */
+  .row-missing .cell-name {
+    color: var(--danger, #e74c3c);
+  }
+  .row-missing :global(td:not(.cell-name)) {
+    opacity: 0.55;
+  }
+  .missing-icon {
+    color: var(--danger, #e74c3c);
+    vertical-align: -1px;
+    margin-right: 3px;
+    flex-shrink: 0;
   }
 
   .prio-verylow { color: #888; }
