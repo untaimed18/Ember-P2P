@@ -486,6 +486,14 @@ pub const TAG_FILESIZE: u8 = 0x02;
 pub const TAG_FILETYPE: u8 = 0x03;
 pub const TAG_SOURCES: u8 = 0x15;
 pub const TAG_COMPLETE_SOURCES: u8 = 0x30;
+// Media metadata tag IDs (eMule Opcodes.h FT_MEDIA_*). KAD carries these as
+// single-byte tag IDs; length/bitrate are uint32, the rest are strings.
+pub const TAG_MEDIA_ARTIST: u8 = 0xD0;
+pub const TAG_MEDIA_ALBUM: u8 = 0xD1;
+pub const TAG_MEDIA_TITLE: u8 = 0xD2;
+pub const TAG_MEDIA_LENGTH: u8 = 0xD3;
+pub const TAG_MEDIA_BITRATE: u8 = 0xD4;
+pub const TAG_MEDIA_CODEC: u8 = 0xD5;
 pub const TAG_DESCRIPTION: u8 = 0x0B;
 pub const TAG_SOURCEIP: u8 = 0xFE;
 pub const TAG_SOURCEPORT: u8 = 0xFD;

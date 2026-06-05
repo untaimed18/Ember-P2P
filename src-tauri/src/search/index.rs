@@ -118,6 +118,7 @@ impl LocalIndex {
                     source_addresses: vec!["local".to_string()],
                     rating: None,
                     comment: None,
+                    media: None,
                     spam_rating: 0,
                     is_spam: false,
                     clean_name: String::new(),

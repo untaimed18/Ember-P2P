@@ -1532,6 +1532,47 @@ mod tests {
         assert_eq!(results[0].rating, Some(5));
     }
 
+    #[test]
+    fn search_results_extract_kad_media_tags() {
+        let entries = vec![SearchResultEntry {
+            id: KadId([0x44; 16]),
+            tags: vec![
+                KadTag { name: TagName::Id(TAG_FILENAME), value: TagValue::String("track.mp3".to_string()) },
+                KadTag { name: TagName::Id(TAG_FILESIZE), value: TagValue::Uint32(4_000_000) },
+                KadTag { name: TagName::Id(TAG_MEDIA_ARTIST), value: TagValue::String("Some Artist".to_string()) },
+                KadTag { name: TagName::Id(TAG_MEDIA_ALBUM), value: TagValue::String("Some Album".to_string()) },
+                KadTag { name: TagName::Id(TAG_MEDIA_TITLE), value: TagValue::String("Some Title".to_string()) },
+                KadTag { name: TagName::Id(TAG_MEDIA_LENGTH), value: TagValue::Uint32(225) },
+                KadTag { name: TagName::Id(TAG_MEDIA_BITRATE), value: TagValue::Uint32(320) },
+                KadTag { name: TagName::Id(TAG_MEDIA_CODEC), value: TagValue::String("mp3".to_string()) },
+            ],
+        }];
+
+        let results = convert_search_results(&entries);
+        assert_eq!(results.len(), 1);
+        let media = results[0].media.as_ref().expect("media present");
+        assert_eq!(media.artist.as_deref(), Some("Some Artist"));
+        assert_eq!(media.album.as_deref(), Some("Some Album"));
+        assert_eq!(media.title.as_deref(), Some("Some Title"));
+        assert_eq!(media.duration, Some(225));
+        assert_eq!(media.bitrate, Some(320));
+        assert_eq!(media.codec.as_deref(), Some("mp3"));
+    }
+
+    #[test]
+    fn search_results_without_media_leave_field_none() {
+        let entries = vec![SearchResultEntry {
+            id: KadId([0x55; 16]),
+            tags: vec![
+                KadTag { name: TagName::Id(TAG_FILENAME), value: TagValue::String("doc.pdf".to_string()) },
+                KadTag { name: TagName::Id(TAG_FILESIZE), value: TagValue::Uint32(1234) },
+            ],
+        }];
+        let results = convert_search_results(&entries);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].media.is_none());
+    }
+
     /// `extract_kad_sources` must read the `"ember"` capability tag we
     /// emit in `kad/publish.rs::build_source_publish` and surface it as
     /// `is_ember_capable`. This is the linchpin of the broker dispatch
@@ -11593,17 +11634,18 @@ pub async fn start_network(
                                                 shared_kad: false,
                                                 shared_ed2k: false,
                                             },
-                                            peer_id: String::new(),
-                                            peer_name: String::new(),
-                                            availability: sr.source_count,
-                                            file_type: crate::search::index::infer_file_type(&extension),
-                                            source_addresses,
-                                            rating: None,
-                                            comment: None,
-                                            spam_rating: 0,
-                                            is_spam: false,
-                                            clean_name: String::new(),
-                                            result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
+                                        peer_id: String::new(),
+                                        peer_name: String::new(),
+                                        availability: sr.source_count,
+                                        file_type: crate::search::index::infer_file_type(&extension),
+                                        source_addresses,
+                                        rating: sr.rating,
+                                        comment: sr.comment.clone(),
+                                        media: sr.media.clone().into_option(),
+                                        spam_rating: 0,
+                                        is_spam: false,
+                                        clean_name: String::new(),
+                                        result_origin: crate::search::merge::ORIGIN_SERVER_TCP.to_string(),
                                         }
                                     }).collect();
 
@@ -12595,8 +12637,9 @@ pub async fn start_network(
                                         availability: 1,
                                         file_type: crate::search::index::infer_file_type(&extension),
                                         source_addresses,
-                                        rating: None,
-                                        comment: None,
+                                        rating: sr.rating,
+                                        comment: sr.comment.clone(),
+                                        media: sr.media.clone().into_option(),
                                         spam_rating: 0,
                                         is_spam: false,
                                         clean_name: String::new(),
@@ -20961,6 +21004,30 @@ fn convert_search_results(
         complete_sources_tag: u32,
         rating: Option<u8>,
         comment: Option<String>,
+        media: crate::types::MediaMetadata,
+    }
+
+    // eMule sends a media length over KAD as a uint32 (seconds). When a value
+    // arrives as a string (e.g. an ED2K-bridged "h:mm:ss"/"mm:ss"/"ss" form),
+    // parse it the same way eMule's ConvertED2KTag does.
+    fn parse_media_length(tag: &KadTag) -> Option<u32> {
+        if let Some(v) = tag.uint32_value() {
+            return Some(v);
+        }
+        if let Some(v) = tag.uint16_value() {
+            return Some(v as u32);
+        }
+        let s = tag.string_value()?;
+        let parts: Vec<u32> = s
+            .split(':')
+            .map(|p| p.trim().parse::<u32>().ok())
+            .collect::<Option<Vec<u32>>>()?;
+        match parts.as_slice() {
+            [h, m, sec] => Some(h * 3600 + m * 60 + sec),
+            [m, sec] => Some(m * 60 + sec),
+            [sec] => Some(*sec),
+            _ => None,
+        }
     }
 
     let parsed: Vec<ParsedEntry> = entries
@@ -20975,9 +21042,73 @@ fn convert_search_results(
             let mut complete_sources_tag = 0u32;
             let mut rating: Option<u8> = None;
             let mut comment: Option<String> = None;
+            let mut media = crate::types::MediaMetadata::default();
 
             for tag in &entry.tags {
                 match &tag.name {
+                    TagName::Id(TAG_MEDIA_ARTIST) => {
+                        if let Some(s) = tag.string_value() {
+                            if !s.is_empty() { media.artist = Some(s.to_string()); }
+                        }
+                    }
+                    TagName::Id(TAG_MEDIA_ALBUM) => {
+                        if let Some(s) = tag.string_value() {
+                            if !s.is_empty() { media.album = Some(s.to_string()); }
+                        }
+                    }
+                    TagName::Id(TAG_MEDIA_TITLE) => {
+                        if let Some(s) = tag.string_value() {
+                            if !s.is_empty() { media.title = Some(s.to_string()); }
+                        }
+                    }
+                    TagName::Id(TAG_MEDIA_LENGTH) => {
+                        if let Some(v) = parse_media_length(tag) {
+                            if v > 0 { media.duration = Some(v); }
+                        }
+                    }
+                    TagName::Id(TAG_MEDIA_BITRATE) => {
+                        if let Some(v) = tag.uint32_value() {
+                            if v > 0 { media.bitrate = Some(v); }
+                        } else if let Some(v) = tag.uint16_value() {
+                            if v > 0 { media.bitrate = Some(v as u32); }
+                        }
+                    }
+                    TagName::Id(TAG_MEDIA_CODEC) => {
+                        if let Some(s) = tag.string_value() {
+                            if !s.is_empty() { media.codec = Some(s.to_string()); }
+                        }
+                    }
+                    // ED2K-bridged KAD entries may carry the string tag names.
+                    TagName::Str(s) if s.eq_ignore_ascii_case("artist") => {
+                        if let Some(v) = tag.string_value() {
+                            if !v.is_empty() { media.artist = Some(v.to_string()); }
+                        }
+                    }
+                    TagName::Str(s) if s.eq_ignore_ascii_case("album") => {
+                        if let Some(v) = tag.string_value() {
+                            if !v.is_empty() { media.album = Some(v.to_string()); }
+                        }
+                    }
+                    TagName::Str(s) if s.eq_ignore_ascii_case("title") => {
+                        if let Some(v) = tag.string_value() {
+                            if !v.is_empty() { media.title = Some(v.to_string()); }
+                        }
+                    }
+                    TagName::Str(s) if s.eq_ignore_ascii_case("length") => {
+                        if let Some(v) = parse_media_length(tag) {
+                            if v > 0 { media.duration = Some(v); }
+                        }
+                    }
+                    TagName::Str(s) if s.eq_ignore_ascii_case("bitrate") => {
+                        if let Some(v) = tag.uint32_value() {
+                            if v > 0 { media.bitrate = Some(v); }
+                        }
+                    }
+                    TagName::Str(s) if s.eq_ignore_ascii_case("codec") => {
+                        if let Some(v) = tag.string_value() {
+                            if !v.is_empty() { media.codec = Some(v.to_string()); }
+                        }
+                    }
                     TagName::Id(TAG_FILENAME) => {
                         if let Some(s) = tag.string_value() {
                             name = s.to_string();
@@ -21086,6 +21217,7 @@ fn convert_search_results(
                 complete_sources_tag,
                 rating,
                 comment,
+                media,
             })
         })
         .collect();
@@ -21129,6 +21261,17 @@ fn convert_search_results(
             if existing.comment.is_none() && p.comment.is_some() {
                 existing.comment = p.comment;
             }
+            // Fill any media fields this node provided that we don't have yet
+            // (only allocate the struct when there's something to store).
+            if !p.media.is_empty() {
+                let em = existing.media.get_or_insert_with(crate::types::MediaMetadata::default);
+                if em.duration.is_none() { em.duration = p.media.duration; }
+                if em.bitrate.is_none() { em.bitrate = p.media.bitrate; }
+                if em.codec.is_none() { em.codec = p.media.codec.clone(); }
+                if em.artist.is_none() { em.artist = p.media.artist.clone(); }
+                if em.album.is_none() { em.album = p.media.album.clone(); }
+                if em.title.is_none() { em.title = p.media.title.clone(); }
+            }
         } else {
             let mut source_addresses = Vec::new();
             if !p.source_addr.is_empty() {
@@ -21169,6 +21312,7 @@ fn convert_search_results(
                     source_addresses,
                     rating: p.rating,
                     comment: p.comment,
+                    media: p.media.into_option(),
                     spam_rating: 0,
                     is_spam: false,
                     clean_name: String::new(),
@@ -21291,6 +21435,7 @@ fn convert_note_search_results(
                 source_addresses: Vec::new(),
                 rating,
                 comment,
+                media: None,
                 spam_rating: 0,
                 is_spam: false,
                 clean_name: String::new(),

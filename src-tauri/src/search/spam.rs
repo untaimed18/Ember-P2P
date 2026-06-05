@@ -1085,6 +1085,7 @@ mod tests {
             source_addresses: Vec::new(),
             rating: None,
             comment: None,
+            media: None,
             spam_rating: 0,
             is_spam: false,
             clean_name: String::new(),

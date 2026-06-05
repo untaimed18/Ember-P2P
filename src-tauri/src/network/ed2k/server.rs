@@ -64,6 +64,9 @@ pub struct ServerSearchResult {
     pub file_size: u64,
     pub source_count: u32,
     pub complete_source_count: u32,
+    pub rating: Option<u8>,
+    pub comment: Option<String>,
+    pub media: crate::types::MediaMetadata,
 }
 
 #[derive(Debug, Clone)]
@@ -1039,6 +1042,63 @@ mod tests {
         let buf = build_search_request("test");
         assert_eq!(buf, vec![0x01, 0x04, 0x00, b't', b'e', b's', b't']);
     }
+
+    #[test]
+    fn search_result_extracts_media_rating_and_comment() {
+        fn put_str(buf: &mut Vec<u8>, s: &str) {
+            buf.extend_from_slice(&(s.len() as u16).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        fn old_name(buf: &mut Vec<u8>, tag_type: u8, name: &str) {
+            buf.push(tag_type); // no high bit => old format
+            buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+        }
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes()); // result count
+        payload.extend_from_slice(&[0u8; 16]); // file hash
+        payload.extend_from_slice(&0x0102_0304u32.to_le_bytes()); // HighID client id
+        payload.extend_from_slice(&4662u16.to_le_bytes()); // client port
+        payload.extend_from_slice(&7u32.to_le_bytes()); // tag count
+
+        // FT_FILENAME (new-format string, name id 0x01)
+        payload.push(0x02 | 0x80);
+        payload.push(0x01);
+        put_str(&mut payload, "song.mp3");
+        // FT_FILESIZE (new-format uint32, name id 0x02)
+        payload.push(0x03 | 0x80);
+        payload.push(0x02);
+        payload.extend_from_slice(&5_000_000u32.to_le_bytes());
+        // media length as old-format string "length" = "3:45"
+        old_name(&mut payload, 0x02, "length");
+        put_str(&mut payload, "3:45");
+        // bitrate as old-format uint32 "bitrate" = 192
+        old_name(&mut payload, 0x03, "bitrate");
+        payload.extend_from_slice(&192u32.to_le_bytes());
+        // codec as old-format string "codec" = "mp3"
+        old_name(&mut payload, 0x02, "codec");
+        put_str(&mut payload, "mp3");
+        // FT_FILERATING (new-format uint32, name id 0xF7) = 4
+        payload.push(0x03 | 0x80);
+        payload.push(0xF7);
+        payload.extend_from_slice(&4u32.to_le_bytes());
+        // FT_FILECOMMENT (new-format string, name id 0xF6)
+        payload.push(0x02 | 0x80);
+        payload.push(0xF6);
+        put_str(&mut payload, "great rip");
+
+        let results = parse_search_result(&payload).expect("parse");
+        assert_eq!(results.len(), 1);
+        let r = &results[0];
+        assert_eq!(r.file_name, "song.mp3");
+        assert_eq!(r.file_size, 5_000_000);
+        assert_eq!(r.media.duration, Some(3 * 60 + 45));
+        assert_eq!(r.media.bitrate, Some(192));
+        assert_eq!(r.media.codec.as_deref(), Some("mp3"));
+        assert_eq!(r.rating, Some(4));
+        assert_eq!(r.comment.as_deref(), Some("great rip"));
+    }
 }
 
 // CT_SERVER_FLAGS capability bits (from eMule Opcodes.h)
@@ -1268,14 +1328,14 @@ fn write_search_meta_string(buf: &mut Vec<u8>, value: &str, tag_name_id: u8) {
 
 /// Read one eMule-style tag (supports both old and "new tags" compressed format).
 /// Returns (name_id, tag_type, was read successfully).
-fn read_tag_header(cursor: &mut Cursor<&[u8]>) -> Option<(u8, u8)> {
+fn read_tag_header(cursor: &mut Cursor<&[u8]>) -> Option<(u8, u8, Option<String>)> {
     let raw_type = ReadBytesExt::read_u8(cursor).ok()?;
 
     if raw_type & 0x80 != 0 {
         // New tag format: high bit set → single-byte name follows, type is low 7 bits
         let tag_type = raw_type & 0x7F;
         let name_id = ReadBytesExt::read_u8(cursor).ok()?;
-        Some((name_id, tag_type))
+        Some((name_id, tag_type, None))
     } else {
         // Old format: u16 name length + name bytes
         let name_len = ReadBytesExt::read_u16::<LittleEndian>(cursor).ok()? as usize;
@@ -1287,14 +1347,93 @@ fn read_tag_header(cursor: &mut Cursor<&[u8]>) -> Option<(u8, u8)> {
         if name_len > MAX_TAG_NAME_LEN {
             return None;
         }
-        let name_id = if name_len == 1 {
-            ReadBytesExt::read_u8(cursor).ok()?
+        if name_len == 1 {
+            let name_id = ReadBytesExt::read_u8(cursor).ok()?;
+            Some((name_id, raw_type, None))
         } else {
+            // Preserve the string name: ED2K servers send media metadata under
+            // string tag names ("Artist"/"length"/"bitrate"/"codec"/...), which
+            // map to no single-byte id. Lowercased so the caller can match
+            // case-insensitively.
             let mut name_buf = vec![0u8; name_len];
             Read::read_exact(cursor, &mut name_buf).ok()?;
-            0u8
-        };
-        Some((name_id, raw_type))
+            let name = String::from_utf8_lossy(&name_buf).to_ascii_lowercase();
+            Some((0u8, raw_type, Some(name)))
+        }
+    }
+}
+
+/// Accumulator for the per-result tags we care about (filled across the tag
+/// loop, then moved into a [`ServerSearchResult`]).
+#[derive(Default)]
+struct ServerResultTags {
+    file_name: String,
+    file_size: u64,
+    source_count: u32,
+    complete_sources: u32,
+    rating: Option<u8>,
+    comment: Option<String>,
+    media: crate::types::MediaMetadata,
+}
+
+/// Parse an eMule media-length string ("h:mm:ss" / "mm:ss" / "ss") into whole
+/// seconds (matches `ConvertED2KTag` in eMule's SearchFile.cpp).
+fn parse_media_length_str(s: &str) -> Option<u32> {
+    let parts: Vec<u32> = s
+        .split(':')
+        .map(|p| p.trim().parse::<u32>().ok())
+        .collect::<Option<Vec<u32>>>()?;
+    match parts.as_slice() {
+        [h, m, sec] => Some(h * 3600 + m * 60 + sec),
+        [m, sec] => Some(m * 60 + sec),
+        [sec] => Some(*sec),
+        _ => None,
+    }
+}
+
+impl ServerResultTags {
+    /// Route a decoded string value to the right field by tag id (KAD-style
+    /// byte ids) or, for old-format tags, by lowercased name.
+    fn apply_string(&mut self, name_id: u8, name: Option<&str>, value: String) {
+        if name_id == 0x01 {
+            self.file_name = value;
+            return;
+        }
+        if value.is_empty() {
+            return;
+        }
+        let is = |n: &str| name == Some(n);
+        match name_id {
+            0xF6 => self.comment = Some(value),
+            0xD0 => self.media.artist = Some(value),
+            0xD1 => self.media.album = Some(value),
+            0xD2 => self.media.title = Some(value),
+            0xD5 => self.media.codec = Some(value),
+            0xD3 => self.media.duration = parse_media_length_str(&value),
+            _ if is("comment") || is("description") => self.comment = Some(value),
+            _ if is("artist") => self.media.artist = Some(value),
+            _ if is("album") => self.media.album = Some(value),
+            _ if is("title") => self.media.title = Some(value),
+            _ if is("codec") => self.media.codec = Some(value),
+            _ if is("length") => self.media.duration = parse_media_length_str(&value),
+            _ => {}
+        }
+    }
+
+    /// Route a decoded unsigned-int value to the right field by tag id or name.
+    fn apply_uint(&mut self, name_id: u8, name: Option<&str>, value: u64) {
+        let is = |n: &str| name == Some(n);
+        match name_id {
+            0x15 => self.source_count = value as u32,
+            0x30 => self.complete_sources = value as u32,
+            0xD3 if value > 0 => self.media.duration = Some(value as u32),
+            0xD4 if value > 0 => self.media.bitrate = Some(value as u32),
+            0xF7 => self.rating = Some(value as u8),
+            _ if is("bitrate") && value > 0 => self.media.bitrate = Some(value as u32),
+            _ if is("length") && value > 0 => self.media.duration = Some(value as u32),
+            _ if (is("filerating") || is("rating")) => self.rating = Some(value as u8),
+            _ => {}
+        }
     }
 }
 
@@ -1304,10 +1443,8 @@ fn read_tag_value(
     cursor: &mut Cursor<&[u8]>,
     tag_type: u8,
     name_id: u8,
-    file_name: &mut String,
-    file_size: &mut u64,
-    source_count: &mut u32,
-    complete_sources: &mut u32,
+    name: Option<&str>,
+    sink: &mut ServerResultTags,
 ) -> bool {
     match tag_type {
         // TAGTYPE_HASH (0x01)
@@ -1328,10 +1465,8 @@ fn read_tag_value(
             }
             let bytes = cursor.get_ref().get(start..end).unwrap_or(&[]);
             cursor.set_position(end as u64);
-            if name_id == 0x01 { // FT_FILENAME
-                let keep = &bytes[..bytes.len().min(8192)];
-                *file_name = String::from_utf8_lossy(keep).to_string();
-            }
+            let keep = &bytes[..bytes.len().min(8192)];
+            sink.apply_string(name_id, name, String::from_utf8_lossy(keep).to_string());
             true
         }
         // TAGTYPE_UINT32 (0x03)
@@ -1341,11 +1476,9 @@ fn read_tag_value(
                 Err(_) => return false,
             };
             match name_id {
-                0x02 => *file_size = (*file_size & 0xFFFF_FFFF_0000_0000) | v as u64,
-                0x3A => *file_size = (*file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32),
-                0x15 => *source_count = v,
-                0x30 => *complete_sources = v,
-                _ => {}
+                0x02 => sink.file_size = (sink.file_size & 0xFFFF_FFFF_0000_0000) | v as u64,
+                0x3A => sink.file_size = (sink.file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32),
+                _ => sink.apply_uint(name_id, name, v as u64),
             }
             true
         }
@@ -1398,12 +1531,8 @@ fn read_tag_value(
         // TAGTYPE_UINT16 (0x08)
         0x08 => {
             if let Ok(v) = ReadBytesExt::read_u16::<LittleEndian>(cursor) {
-                match name_id {
-                    0x02 => *file_size = v as u64,
-                    0x15 => *source_count = v as u32,
-                    0x30 => *complete_sources = v as u32,
-                    _ => {}
-                }
+                if name_id == 0x02 { sink.file_size = v as u64; }
+                else { sink.apply_uint(name_id, name, v as u64); }
                 true
             } else {
                 false
@@ -1412,12 +1541,8 @@ fn read_tag_value(
         // TAGTYPE_UINT8 (0x09)
         0x09 => {
             if let Ok(v) = ReadBytesExt::read_u8(cursor) {
-                match name_id {
-                    0x02 => *file_size = v as u64,
-                    0x15 => *source_count = v as u32,
-                    0x30 => *complete_sources = v as u32,
-                    _ => {}
-                }
+                if name_id == 0x02 { sink.file_size = v as u64; }
+                else { sink.apply_uint(name_id, name, v as u64); }
                 true
             } else {
                 false
@@ -1442,7 +1567,9 @@ fn read_tag_value(
         0x0B => {
             if let Ok(v) = ReadBytesExt::read_u64::<LittleEndian>(cursor) {
                 if name_id == 0x02 { // FT_FILESIZE
-                    *file_size = v;
+                    sink.file_size = v;
+                } else {
+                    sink.apply_uint(name_id, name, v);
                 }
                 true
             } else {
@@ -1456,9 +1583,7 @@ fn read_tag_value(
             if Read::read_exact(cursor, &mut sbuf).is_err() {
                 return false;
             }
-            if name_id == 0x01 { // FT_FILENAME
-                *file_name = String::from_utf8_lossy(&sbuf).to_string();
-            }
+            sink.apply_string(name_id, name, String::from_utf8_lossy(&sbuf).to_string());
             true
         }
         _ => false,
@@ -1488,20 +1613,14 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<Vec<ServerSearchResult>
             Ok(v) => v,
             Err(_) => break,
         };
-        let mut file_name = String::new();
-        let mut file_size: u64 = 0;
-        let mut source_count: u32 = 0;
-        let mut complete_sources: u32 = 0;
+        let mut tags = ServerResultTags::default();
 
         for _ in 0..tag_count.min(256) {
-            let (name_id, tag_type) = match read_tag_header(&mut cursor) {
+            let (name_id, tag_type, name) = match read_tag_header(&mut cursor) {
                 Some(v) => v,
                 None => break,
             };
-            if !read_tag_value(
-                &mut cursor, tag_type, name_id,
-                &mut file_name, &mut file_size, &mut source_count, &mut complete_sources,
-            ) {
+            if !read_tag_value(&mut cursor, tag_type, name_id, name.as_deref(), &mut tags) {
                 break;
             }
         }
@@ -1510,10 +1629,13 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<Vec<ServerSearchResult>
             file_hash,
             client_id,
             client_port,
-            file_name,
-            file_size,
-            source_count,
-            complete_source_count: complete_sources,
+            file_name: tags.file_name,
+            file_size: tags.file_size,
+            source_count: tags.source_count,
+            complete_source_count: tags.complete_sources,
+            rating: tags.rating,
+            comment: tags.comment,
+            media: tags.media,
         });
     }
 
