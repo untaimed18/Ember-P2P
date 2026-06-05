@@ -158,6 +158,11 @@ const KNOWN_EMBER_PEER_TTL: std::time::Duration = std::time::Duration::from_secs
 /// rebuilds have a diverse pool to rotate from while still keeping
 /// per-session memory bounded (≈12 KB worst case).
 const MAX_KNOWN_EMBER_PEERS: usize = 500;
+/// Hard cap on the `ember_capable_peers` hint set. It records every KAD source
+/// that advertised Ember capability and was previously cleared only at
+/// shutdown, so a long session with many searches could grow it without bound.
+/// Once full we stop adding (the set is only a best-effort dialing hint).
+const MAX_EMBER_CAPABLE_PEERS: usize = 4000;
 
 /// Hard cap on `ember_noise_keys` size. Each entry is roughly 50 bytes
 /// (key + timestamp + map overhead), so the same 500-entry cap bounds
@@ -508,6 +513,12 @@ fn try_inject_source(
 }
 
 const MAX_ACTIVE_SOURCE_OVERFLOW: usize = 128;
+/// Buffer depth for newly-established (hole-punched / callback / relayed) peer
+/// streams handed to a download worker before it picks them up. Each of these
+/// is a live TCP connection that cannot be cheaply recreated, so the buffer is
+/// kept generous to avoid dropping working connections under burst arrivals;
+/// the worker drains it promptly so streams do not sit idle long.
+const ESTABLISHED_SOURCE_CHANNEL_CAP: usize = 32;
 const MAX_UDP_SOURCE_QUEUE: usize = 500;
 /// Mirrors `MAX_UDP_SOURCE_QUEUE`. Without this cap a single
 /// `start_search` call enqueues one packet per known server, so a user
@@ -3005,7 +3016,7 @@ async fn try_start_pending_download_from_known_sources(
     // downloading, which is naturally rate-limited by NAT-traversal
     // round-trips.
     let (est_inject_tx, est_inject_rx) =
-        mpsc::channel::<ed2k::multi_source::EstablishedSource>(8);
+        mpsc::channel::<ed2k::multi_source::EstablishedSource>(ESTABLISHED_SOURCE_CHANNEL_CAP);
     let ms_download = MultiSourceDownload {
         transfer_id: pending.transfer_id,
         file_hash: hash_bytes,
@@ -6775,7 +6786,9 @@ pub async fn start_network(
                             // needing the harness to copy hex from devtools.
                             for s in &all {
                                 if !s.ip.is_unspecified() && s.tcp_port != 0 {
-                                    if s.is_ember_capable {
+                                    if s.is_ember_capable
+                                        && state.ember_capable_peers.len() < MAX_EMBER_CAPABLE_PEERS
+                                    {
                                         state.ember_capable_peers.insert((s.ip, s.tcp_port));
                                     }
                                     if let Some(npub) = s.ember_noise_pub {
@@ -6858,7 +6871,9 @@ pub async fn start_network(
                             // a pure function with no `state` dependency.
                             for s in &all {
                                 if !s.ip.is_unspecified() && s.tcp_port != 0 {
-                                    if s.is_ember_capable {
+                                    if s.is_ember_capable
+                                        && state.ember_capable_peers.len() < MAX_EMBER_CAPABLE_PEERS
+                                    {
                                         state.ember_capable_peers.insert((s.ip, s.tcp_port));
                                     }
                                     if let Some(npub) = s.ember_noise_pub {
@@ -7680,7 +7695,7 @@ pub async fn start_network(
                                     };
                                     let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
                                     let (est_inject_tx, est_inject_rx) =
-                                        mpsc::channel::<ed2k::multi_source::EstablishedSource>(8);
+                                        mpsc::channel::<ed2k::multi_source::EstablishedSource>(ESTABLISHED_SOURCE_CHANNEL_CAP);
                                     let ms_download = MultiSourceDownload {
                                         transfer_id: pending.transfer_id,
                                         file_hash: hash_bytes,
@@ -9121,6 +9136,13 @@ pub async fn start_network(
                 }
                 state.dht_store.cleanup_expired();
 
+                // Prune the DB-progress throttle map so cancelled/removed
+                // downloads (whose handles are gone) don't leave dead entries
+                // accumulating for the lifetime of the session. Completed and
+                // failed transfers are already pruned in handle_download_event;
+                // this catches the cancel/pause paths that bypass it.
+                db_progress_last_persist.retain(|tid, _| state.download_handles.contains_key(tid));
+
                 // Drop expired inbound-callback expectations. UI placeholders
                 // are managed separately by `source_retry_timer`.
                 {
@@ -10517,7 +10539,7 @@ pub async fn start_network(
                         };
                         let (new_source_tx, new_source_rx) = mpsc::channel::<DownloadSource>(64);
                         let (new_established_tx, new_established_rx) =
-                            mpsc::channel::<ed2k::multi_source::EstablishedSource>(8);
+                            mpsc::channel::<ed2k::multi_source::EstablishedSource>(ESTABLISHED_SOURCE_CHANNEL_CAP);
                         state.active_source_senders.insert(tid.clone(), new_source_tx);
                         state.active_established_senders.insert(tid.clone(), new_established_tx);
                         let ms_download = MultiSourceDownload {
@@ -10689,7 +10711,7 @@ pub async fn start_network(
                         };
                         let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
                         let (est_inject_tx, est_inject_rx) =
-                            mpsc::channel::<ed2k::multi_source::EstablishedSource>(8);
+                            mpsc::channel::<ed2k::multi_source::EstablishedSource>(ESTABLISHED_SOURCE_CHANNEL_CAP);
                         let ms_download = MultiSourceDownload {
                             transfer_id: pending.transfer_id,
                             file_hash: hash_bytes,
@@ -10859,6 +10881,13 @@ pub async fn start_network(
                 // so the normal TCP reask path can carry OP_REQUESTSOURCES.
                 {
                     let reask_interval = ed2k::dead_sources::FILEREASKTIME_SECS;
+                    // Plan every UDP reask packet while holding the SourceManager
+                    // lock (no `.await` in this scope), then drop the lock and do
+                    // the actual `send_to` calls. Holding `source_manager.write()`
+                    // across UDP `.await`s previously stalled the whole network
+                    // task (and download workers that share the lock) whenever the
+                    // socket applied backpressure or the source list was large.
+                    let mut to_send: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
                     let mut sm = source_manager.write().await;
                     for tid in &to_retry {
                         let (fh, file_size) = match state.pending_downloads.get(tid) {
@@ -10905,8 +10934,10 @@ pub async fn start_network(
                             let addr = SocketAddr::new((*ip).into(), *udp_port);
                             let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                             pkt.extend_from_slice(&reask_payload);
-                            let _ = udp_socket.send_to(&pkt, addr).await;
+                            // Mark optimistically under the lock; the send happens
+                            // after the lock is released below.
                             sm.mark_asked(&fh, *ip, *tcp_port);
+                            to_send.push((addr, pkt));
                             sent_this_tick.insert((*ip, *tcp_port));
                             sent += 1;
                         }
@@ -10935,20 +10966,24 @@ pub async fn start_network(
                                 let addr = SocketAddr::new((*ip).into(), *udp_port);
                                 let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
                                 pkt.extend_from_slice(&reask_payload);
-                                if udp_socket.send_to(&pkt, addr).await.is_ok() {
-                                    // Bump last_asked so this entry isn't
-                                    // "due" again until the next full
-                                    // FILEREASKTIME window — without this
-                                    // the 5s timer pings the same peer
-                                    // every tick forever.
-                                    pfs.mark_udp_reask_sent(*ip, *tcp_port);
-                                    pfs_sent += 1;
-                                }
+                                // Bump last_asked so this entry isn't "due" again
+                                // until the next full FILEREASKTIME window — without
+                                // this the 5s timer pings the same peer every tick
+                                // forever. Marked optimistically under the lock; the
+                                // send happens after the lock is released below.
+                                pfs.mark_udp_reask_sent(*ip, *tcp_port);
+                                to_send.push((addr, pkt));
+                                pfs_sent += 1;
                             }
                             if pfs_sent > 0 {
                                 debug!("Sent UDP reask to {} persistent sources for {}", pfs_sent, tid);
                             }
                         }
+                    }
+                    // Release the SourceManager lock BEFORE doing any network I/O.
+                    drop(sm);
+                    for (addr, pkt) in &to_send {
+                        let _ = udp_socket.send_to(pkt, *addr).await;
                     }
                 }
 
@@ -13036,7 +13071,7 @@ pub async fn start_network(
 
                                 let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
                                 let (est_inject_tx, est_inject_rx) =
-                                    mpsc::channel::<ed2k::multi_source::EstablishedSource>(8);
+                                    mpsc::channel::<ed2k::multi_source::EstablishedSource>(ESTABLISHED_SOURCE_CHANNEL_CAP);
                                 let ms_download = MultiSourceDownload {
                                     transfer_id: pd.transfer_id.clone(),
                                     file_hash,
@@ -17641,7 +17676,10 @@ async fn handle_command_inner(
                     }
                 }
                 handle.abort();
-                let _ = handle.await;
+                // Bounded wait: abort() cannot interrupt a task parked in
+                // spawn_blocking (fsync / hashing), so a slow unwind must not
+                // freeze the entire single-threaded network task.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
             }
             if cleanup_ack.is_some() {
                 if let Ok(mut reg) = state.tracker_registry.lock() {
@@ -17875,7 +17913,7 @@ async fn handle_command_inner(
                 }
                 let (src_inject_tx, src_inject_rx) = mpsc::channel::<DownloadSource>(32);
                 let (est_inject_tx, est_inject_rx) =
-                    mpsc::channel::<ed2k::multi_source::EstablishedSource>(8);
+                    mpsc::channel::<ed2k::multi_source::EstablishedSource>(ESTABLISHED_SOURCE_CHANNEL_CAP);
                 let ms_download = MultiSourceDownload {
                     // Clone instead of move so the outer `transfer_id`
                     // survives for the source-discovery dispatch below.
@@ -18849,7 +18887,9 @@ async fn handle_command_inner(
 
             for (tid, handle) in state.download_handles.drain() {
                 handle.abort();
-                let _ = handle.await;
+                // Bounded wait so one download stuck in blocking I/O cannot
+                // freeze the network loop during a (user-visible) disconnect.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
                 debug!("Aborted download task {tid} on KAD disconnect");
             }
 
@@ -19632,7 +19672,12 @@ async fn handle_command_inner(
                         .collect();
                     let completed_bytes = tracker.completed_bytes();
                     let has_part_hashes = !tracker.part_hashes().is_empty();
-                    let verified_complete_parts = tracker.completed_parts();
+                    // `can_preview` requires MD4-VERIFIED parts (not merely
+                    // gap-complete ones) so we never open a media player on
+                    // bytes that haven't been hash-checked against the
+                    // publisher's part hashes. `verified_parts()` is persisted
+                    // in `.part.met` and restored on load.
+                    let verified_complete_parts = tracker.verified_parts();
                     (filled_ranges, completed_bytes, has_part_hashes, verified_complete_parts)
                 })
                 .await

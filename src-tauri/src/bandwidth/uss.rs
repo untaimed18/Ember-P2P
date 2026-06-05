@@ -57,6 +57,12 @@ impl UploadSpeedSense {
             self.initial_ping_ms = 0.0;
             self.start_time = Some(Instant::now());
             self.ping_history.clear();
+            // Start each (re-)enable from the full configured cap. Without
+            // this, toggling USS off and back on would resume from the last
+            // throttled `current_limit` and have to ratchet back up slowly.
+            if self.max_upload > 0 {
+                self.current_limit = self.max_upload;
+            }
             info!("USS enabled, waiting for RTT baseline");
         }
     }
@@ -82,7 +88,7 @@ impl UploadSpeedSense {
             return;
         }
 
-        if latency_ms <= 0.0 || latency_ms > 30_000.0 {
+        if !latency_ms.is_finite() || latency_ms <= 0.0 || latency_ms > 30_000.0 {
             return;
         }
 
@@ -121,6 +127,12 @@ impl UploadSpeedSense {
         if current_ping > target_ping {
             let new_limit = (self.current_limit as f64 - (self.current_limit as f64 / down_divider)) as u64;
             self.current_limit = new_limit.max(self.min_upload);
+            // Never exceed the configured cap, even on the decrease path: if
+            // the user just lowered `max_upload` below `current_limit`, this
+            // clamps immediately instead of waiting for RTT-driven decay.
+            if self.max_upload > 0 && self.current_limit > self.max_upload {
+                self.current_limit = self.max_upload.max(self.min_upload.min(self.max_upload));
+            }
             debug!("USS: RTT {current_ping:.1}ms > target {target_ping:.1}ms, decreasing to {} B/s", self.current_limit);
         } else {
             let headroom = 1.0 - (current_ping / target_ping);
@@ -155,6 +167,13 @@ impl UploadSpeedSense {
     pub fn set_limits(&mut self, min_upload: u64, max_upload: u64) {
         self.min_upload = min_upload.max(MIN_UPLOAD_BYTES);
         self.max_upload = max_upload;
+        // Keep the live limit inside the new [min, max] window so a lowered
+        // cap is honored on the very next `compute_limit()` rather than
+        // letting a stale higher `current_limit` leak through.
+        if max_upload > 0 {
+            let lo = self.min_upload.min(max_upload);
+            self.current_limit = self.current_limit.clamp(lo, max_upload);
+        }
     }
 
     pub fn set_tolerance(&mut self, tolerance: f64) {

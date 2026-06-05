@@ -689,12 +689,22 @@ pub async fn kad_bootstrap_url(
             tx,
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-    // No CMD_REPLY_TIMEOUT wrapper here, unlike the other commands: the
-    // handler performs the actual HTTP download (bounded by the pinned
-    // client's own 60s request timeout), which legitimately runs longer
-    // than the short snapshot/enqueue replies elsewhere.
-    rx.await
-        .map_err(|_| coded("peers_bootstrap_worker_dropped", "Bootstrap worker dropped the request"))?
+    // Not the short CMD_REPLY_TIMEOUT used elsewhere: the handler performs an
+    // actual HTTP download (bounded by the pinned client's own 60s request
+    // timeout), so we allow a generous 90s ceiling. We still cap it, though —
+    // bare `rx.await` would hang the IPC call forever if the network task ever
+    // dropped the oneshot without replying.
+    match tokio::time::timeout(std::time::Duration::from_secs(90), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(coded(
+            "peers_bootstrap_worker_dropped",
+            "Bootstrap worker dropped the request",
+        )),
+        Err(_) => Err(coded(
+            "peers_bootstrap_timeout",
+            "Bootstrap timed out waiting for the network task",
+        )),
+    }
 }
 
 #[tauri::command]
