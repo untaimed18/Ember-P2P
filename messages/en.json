@@ -219,6 +219,8 @@
   "layout_settings_load_error": "Could not load app settings. Please restart the app.",
   "layout_settings_load_error_detail": "Could not load app settings: {detail}. Please restart the app.",
   "layout_init_failed": "Failed to initialize. Please restart the app.",
+  "layout_config_corrupt": "Your settings file was corrupt and has been reset to defaults.",
+  "layout_config_corrupt_backup": "Your settings file was corrupt and has been reset to defaults. A backup of the original was saved to {path}.",
 
   "speed_input_unlimited": "Unlimited",
   "speed_input_unlimited_aria": "Unlimited — activate to set a limit",

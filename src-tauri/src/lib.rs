@@ -197,6 +197,9 @@ pub fn run() {
                 e
             })?;
             let settings = config.settings.clone();
+            // If config.json was corrupt and reset to defaults, surface it to the
+            // user once the webview has mounted (the file is preserved as a .bak).
+            let corrupt_backup = config.corrupt_backup.clone();
 
             let spam_data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
             let spam_filter = Arc::new(RwLock::new(
@@ -316,6 +319,21 @@ pub fn run() {
                 )),
                 pending_deep_links: Arc::new(parking_lot::Mutex::new(Vec::new())),
             });
+
+            // Non-silent recovery notice: if config.json was corrupt at load,
+            // tell the user (their settings were reset to defaults; the original
+            // is preserved). Delay the emit so the webview has registered its
+            // listeners — the file is already safely backed up regardless.
+            if let Some(bak) = corrupt_backup {
+                let emit_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let _ = emit_handle.emit(
+                        "config-corrupt-recovered",
+                        serde_json::json!({ "backup_path": bak.to_string_lossy().to_string() }),
+                    );
+                });
+            }
 
             // Cold-start deep link: an `ed2k://` link or `.emulecollection`
             // file that launched Ember arrives in our own process args. Buffer

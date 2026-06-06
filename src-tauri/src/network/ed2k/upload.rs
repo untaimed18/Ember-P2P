@@ -2799,10 +2799,10 @@ impl UploadHandler {
                                 };
                                 let cm = self.credit_manager.read().await;
                                 let idx_snap = self.local_index.read().await;
-                                let mut best_idx: Option<usize> = None;
                                 let mut best_identity = None;
+                                let mut best_join: Option<std::time::Instant> = None;
                                 let mut best_score = f64::MIN;
-                                for &(i, ref identity, current_addr, join_time, file_hash, ref user_hash, emule_version, is_friend_slot, ref ember_pubkey, ember_verified) in &queue_snapshot {
+                                for &(_i, ref identity, current_addr, join_time, file_hash, ref user_hash, emule_version, is_friend_slot, ref ember_pubkey, ember_verified) in &queue_snapshot {
                                     if current_addr.is_none() {
                                         continue;
                                     }
@@ -2812,16 +2812,20 @@ impl UploadHandler {
                                         emule_version, is_friend_slot,
                                         ember_pubkey.as_ref(), ember_verified,
                                     );
-                                    if score > best_score {
+                                    // Tie-break by earlier join_time to agree with
+                                    // compute_queue_rank's FIFO tie ordering.
+                                    if score > best_score
+                                        || (score == best_score && best_join.map_or(true, |bj| join_time < bj))
+                                    {
                                         best_score = score;
-                                        best_idx = Some(i);
                                         best_identity = Some(identity.clone());
+                                        best_join = Some(join_time);
                                     }
                                 }
                                 drop(idx_snap);
                                 drop(cm);
 
-                                if let Some(best_idx) = best_idx {
+                                if best_identity.is_some() {
                                     // Reserve the slot atomically BEFORE removing the
                                     // queue entry or sending OP_ACCEPTUPLOADREQ. The
                                     // `current_active < dynamic_slots` check above is
@@ -2835,8 +2839,14 @@ impl UploadHandler {
                                         && slot_guard.try_activate(dynamic_slots)
                                     {
                                         let mut queue = self.upload_queue.lock().await;
-                                        if best_idx < queue.len() && queue[best_idx].identity == *queued_key {
-                                            queue.remove(best_idx);
+                                        // Remove by IDENTITY, not the snapshot index:
+                                        // other connections may have purged/removed
+                                        // entries since the snapshot, shifting indices.
+                                        // An index-only removal could leave this peer's
+                                        // entry as a ghost (slot granted, still queued)
+                                        // or remove the wrong peer.
+                                        if let Some(pos) = queue.iter().position(|e| e.identity == *queued_key) {
+                                            queue.remove(pos);
                                         }
                                         drop(queue);
 
@@ -3409,14 +3419,26 @@ impl UploadHandler {
                         };
                         if queue_empty {
                             true
+                        } else if queue_snapshot.iter().any(|t| t.1 == queue_identity && t.8) {
+                            // eMule m_bAddNextConnect: this reconnecting peer was flagged
+                            // (it would have won while disconnected), so grant it the next
+                            // slot ahead of normal scoring and drop its queue entry. The
+                            // shared `slot_guard.try_activate` below still gates on a free
+                            // slot, so this cannot over-grant.
+                            let mut queue = self.upload_queue.lock().await;
+                            if let Some(pos) = queue.iter().position(|e| e.identity == queue_identity) {
+                                queue.remove(pos);
+                            }
+                            true
                         } else {
                             let cm = self.credit_manager.read().await;
                             let idx_snap = self.local_index.read().await;
-                            let mut best_idx: Option<usize> = None;
+                            let mut best_identity: Option<QueueIdentity> = None;
+                            let mut best_join: Option<std::time::Instant> = None;
                             let mut best_score = f64::MIN;
-                            let mut best_low_idx: Option<usize> = None;
+                            let mut best_low_identity: Option<QueueIdentity> = None;
                             let mut best_low_score = f64::MIN;
-                            for &(i, ref _identity, current_addr, join_time, file_hash, ref user_hash, emule_version, is_friend_slot, add_next_connect, ref ember_pubkey, ember_verified) in &queue_snapshot {
+                            for &(_i, ref identity, current_addr, join_time, file_hash, ref user_hash, emule_version, is_friend_slot, add_next_connect, ref ember_pubkey, ember_verified) in &queue_snapshot {
                                 let score = score_queue_entry(
                                     &cm, &idx_snap, user_hash, file_hash,
                                     join_time.elapsed().as_secs(), current_addr,
@@ -3424,37 +3446,52 @@ impl UploadHandler {
                                     ember_pubkey.as_ref(), ember_verified,
                                 );
                                 if current_addr.is_some() {
-                                    if score > best_score {
+                                    // Tie-break by earlier join_time so this grant
+                                    // decision agrees with compute_queue_rank (which
+                                    // ranks equal-score peers FIFO). Without this, the
+                                    // peer shown rank #1 could lose the grant to a
+                                    // later joiner with the same score.
+                                    if score > best_score
+                                        || (score == best_score && best_join.map_or(true, |bj| join_time < bj))
+                                    {
                                         best_score = score;
-                                        best_idx = Some(i);
+                                        best_identity = Some(identity.clone());
+                                        best_join = Some(join_time);
                                     }
-                                } else if !add_next_connect {
-                                    if score > best_low_score {
-                                        best_low_score = score;
-                                        best_low_idx = Some(i);
-                                    }
+                                } else if !add_next_connect && score > best_low_score {
+                                    best_low_score = score;
+                                    best_low_identity = Some(identity.clone());
                                 }
                             }
-                            // H4: If disconnected Low-ID would have won, flag it
-                            if let Some(li) = best_low_idx {
+                            // H4: if a disconnected Low-ID would have won, flag it so it
+                            // gets priority on reconnect. Match by IDENTITY, not a stale
+                            // snapshot index (the queue may have shifted across the
+                            // .await points above).
+                            if let Some(low_id) = best_low_identity {
                                 if best_low_score > best_score {
                                     let mut queue = self.upload_queue.lock().await;
-                                    if li < queue.len() {
-                                        queue[li].add_next_connect = true;
+                                    if let Some(e) = queue.iter_mut().find(|e| e.identity == low_id) {
+                                        e.add_next_connect = true;
                                     }
                                 }
                             }
+                            drop(idx_snap);
                             drop(cm);
-                            if let Some(best_idx) = best_idx {
-                                let mut queue = self.upload_queue.lock().await;
-                                if best_idx < queue.len() && queue[best_idx].identity == queue_identity {
-                                    queue.remove(best_idx);
+                            // Grant iff THIS peer is the best-scoring connected queued
+                            // peer. Compare by IDENTITY, never the snapshot index: the
+                            // queue can shift across the .await points above, so an
+                            // index-based check (`queue[best_idx]`) could deny the
+                            // rightful winner or match an unrelated entry.
+                            match best_identity {
+                                Some(bi) if bi == queue_identity => {
+                                    let mut queue = self.upload_queue.lock().await;
+                                    if let Some(pos) = queue.iter().position(|e| e.identity == queue_identity) {
+                                        queue.remove(pos);
+                                    }
                                     true
-                                } else {
-                                    false
                                 }
-                            } else {
-                                true
+                                Some(_) => false,
+                                None => true,
                             }
                         }
                     };

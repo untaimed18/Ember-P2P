@@ -163,6 +163,14 @@ pub fn decode_message(data: &[u8], has_pub_key: bool) -> anyhow::Result<DhtMessa
             if !crypto::verify(&pk, signed_data, &signature) {
                 anyhow::bail!("DHT message signature verification failed");
             }
+            // Bind sender_id to the public key. The signature only proves the
+            // sender holds *some* key; without this check a peer could sign with
+            // their own key while claiming a victim's sender_id (routing-table
+            // poisoning / impersonation in FOUND_NODE, STORE_RECORD, etc.).
+            // `node_id == BLAKE3(pubkey)[..16]` everywhere else in Ember.
+            if !crypto::verify_ember_hash_binding(pk_bytes, &sender_id.0) {
+                anyhow::bail!("DHT message sender_id does not match its public key");
+            }
         } else {
             anyhow::bail!("Invalid Ed25519 public key in DHT message");
         }

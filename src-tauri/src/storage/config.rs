@@ -8,6 +8,10 @@ use crate::types::AppSettings;
 pub struct AppConfig {
     pub settings: AppSettings,
     config_path: PathBuf,
+    /// Set to the `.bak` path when `config.json` was corrupt at load time and
+    /// the app fell back to defaults. Lets startup surface a non-silent notice
+    /// to the user (their settings were reset; the original is recoverable).
+    pub corrupt_backup: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -18,12 +22,12 @@ impl AppConfig {
         let config_path = app_dir.join("config.json");
 
         let config_existed = config_path.exists();
+        let mut corrupt_backup: Option<PathBuf> = None;
         let mut settings = if config_existed {
             let data = std::fs::read_to_string(&config_path)?;
             match serde_json::from_str(&data) {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!("Config file corrupt, using defaults: {e}");
                     let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
                     // Pick a backup name that doesn't already exist. The old
                     // fallback reused a fixed `json.bak`, so a second corruption
@@ -36,7 +40,18 @@ impl AppConfig {
                         bak = config_path.with_extension(format!("json.{ts}.{n}.bak"));
                         n += 1;
                     }
-                    let _ = std::fs::rename(&config_path, &bak);
+                    // Don't silently discard the user's settings: preserve the
+                    // corrupt file and log (and later surface) exactly where it
+                    // went so shared folders / download location can be recovered.
+                    if std::fs::rename(&config_path, &bak).is_ok() {
+                        tracing::warn!(
+                            "config.json corrupt ({e}); reset to defaults. Original preserved at {}",
+                            bak.display()
+                        );
+                        corrupt_backup = Some(bak);
+                    } else {
+                        tracing::warn!("config.json corrupt ({e}); reset to defaults (backup attempt failed)");
+                    }
                     AppSettings::default()
                 }
             }
@@ -94,6 +109,7 @@ impl AppConfig {
         Ok(Self {
             settings,
             config_path,
+            corrupt_backup,
         })
     }
 

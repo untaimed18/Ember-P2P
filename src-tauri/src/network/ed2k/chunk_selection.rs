@@ -47,14 +47,20 @@ impl ChunkSelector {
     /// Called when a source disconnects or completes so that rarity data stays
     /// accurate for subsequent `select_part` calls.
     pub fn remove_source(&mut self, available_parts: &[bool]) {
-        let mut any_decremented = false;
         for (i, &has) in available_parts.iter().enumerate() {
             if i < self.part_frequency.len() && has && self.part_frequency[i] > 0 {
                 self.part_frequency[i] -= 1;
-                any_decremented = true;
             }
         }
-        if any_decremented {
+        // Decrement total_sources to mirror the *counting* rule used by
+        // `update_frequencies` and the wire-learned increment: a source is
+        // counted iff it carries a non-empty availability map. The old guard
+        // (decrement only when some part frequency actually dropped) leaked the
+        // count whenever a counted source's map was non-empty but all-false —
+        // i.e. a peer that advertised having none of the file's parts. That
+        // inflated `total_sources` over a long session and skewed the
+        // rarest-first rarity zones toward "common".
+        if !available_parts.is_empty() {
             self.total_sources = self.total_sources.saturating_sub(1);
         }
     }

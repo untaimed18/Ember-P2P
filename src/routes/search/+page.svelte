@@ -868,6 +868,9 @@
     spamExplainError = null;
     clearChecked();
     closeContextMenu();
+    // The closed tab's result hashes are no longer referenced; drop their
+    // history bookkeeping so it doesn't accumulate across the session.
+    pruneHistoryToVisible();
     const next = get(activeSearchTabId);
     if (next) {
       const nt = get(searchTabs).find((x) => x.id === next);
@@ -1341,6 +1344,28 @@
     confirmOpen = true;
   }
 
+  // Bound the per-hash download-history bookkeeping to hashes still referenced
+  // by an open tab. Without this, `downloadHistoryMap`, `historyFetchedHashes`,
+  // `historyPendingHashes` and `historyHashGen` grow monotonically for the
+  // page's lifetime (every unique result hash is added and never evicted).
+  function pruneHistoryToVisible() {
+    const live = new Set<string>();
+    for (const t of get(searchTabs)) {
+      for (const r of t.results) {
+        const h = r?.file?.hash;
+        if (h) live.add(h);
+      }
+    }
+    const pruned: Record<string, string> = {};
+    for (const [h, v] of Object.entries(downloadHistoryMap)) {
+      if (live.has(h)) pruned[h] = v;
+    }
+    downloadHistoryMap = pruned;
+    for (const h of [...historyFetchedHashes]) if (!live.has(h)) historyFetchedHashes.delete(h);
+    for (const h of [...historyPendingHashes]) if (!live.has(h)) historyPendingHashes.delete(h);
+    for (const h of [...historyHashGen.keys()]) if (!live.has(h)) historyHashGen.delete(h);
+  }
+
   function performClearResults() {
     const tabId = get(activeSearchTabId);
     if (!tabId) return;
@@ -1355,6 +1380,7 @@
     spamExplainCache = {};
     spamTooltipKey = null;
     clearChecked();
+    pruneHistoryToVisible();
   }
 
   function handleConfirm() {

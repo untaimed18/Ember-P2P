@@ -1384,8 +1384,14 @@ fn parse_media_length_str(s: &str) -> Option<u32> {
         .map(|p| p.trim().parse::<u32>().ok())
         .collect::<Option<Vec<u32>>>()?;
     match parts.as_slice() {
-        [h, m, sec] => Some(h * 3600 + m * 60 + sec),
-        [m, sec] => Some(m * 60 + sec),
+        // Saturating: a garbage wire string ("99999:99999:99999") would
+        // otherwise wrap in release and report a nonsense duration.
+        [h, m, sec] => Some(
+            h.saturating_mul(3600)
+                .saturating_add(m.saturating_mul(60))
+                .saturating_add(*sec),
+        ),
+        [m, sec] => Some(m.saturating_mul(60).saturating_add(*sec)),
         [sec] => Some(*sec),
         _ => None,
     }
