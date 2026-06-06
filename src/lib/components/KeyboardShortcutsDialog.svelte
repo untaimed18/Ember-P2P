@@ -4,6 +4,9 @@
   // Grouped by scope so users can quickly scan to the shortcuts that
   // apply to where they are in the app.
   import * as m from '$lib/paraglide/messages';
+  import IconX from './IconX.svelte';
+  import { fade, scale } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
 
   type Shortcut = { keys: string[]; label: () => string };
   type Group = { title: () => string; shortcuts: Shortcut[] };
@@ -75,7 +78,7 @@
 
 {#if open}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="shortcut-overlay" onclick={() => (open = false)} onkeydown={onKeydown}>
+  <div class="shortcut-overlay" onclick={() => (open = false)} onkeydown={onKeydown} transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}>
     <div
       class="shortcut-panel"
       role="dialog"
@@ -84,10 +87,11 @@
       onclick={(e) => e.stopPropagation()}
       tabindex="-1"
       bind:this={panelEl}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
     >
       <div class="shortcut-header">
         <h3 id="kbd-shortcut-title">{m.shortcuts_dialog_title()}</h3>
-        <button class="shortcut-close" aria-label={m.common_close()} onclick={() => (open = false)}>&times;</button>
+        <button class="shortcut-close" aria-label={m.common_close()} onclick={() => (open = false)}><IconX size={16} /></button>
       </div>
       <div class="shortcut-body">
         {#each groups as group, gi (gi)}
@@ -125,7 +129,6 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    animation: fade-in 0.15s ease;
     backdrop-filter: blur(2px);
   }
   :global([data-theme="dark"]) .shortcut-overlay {
@@ -142,7 +145,6 @@
     max-height: min(80vh, 720px);
     display: flex;
     flex-direction: column;
-    animation: panel-in 0.2s ease;
   }
   :global([data-theme="dark"]) .shortcut-panel {
     box-shadow:
@@ -165,17 +167,24 @@
   }
 
   .shortcut-close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
     background: none;
-    border: none;
+    border: 1px solid transparent;
+    border-radius: 7px;
     color: var(--text-muted);
-    font-size: 22px;
-    line-height: 1;
     cursor: pointer;
-    padding: 0 4px;
+    padding: 0;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
   }
 
   .shortcut-close:hover {
-    color: var(--text-primary);
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
   }
 
   .shortcut-body {
@@ -277,15 +286,5 @@
     font-size: 10px;
     padding: 0 5px;
     margin: 0 2px;
-  }
-
-  @keyframes fade-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-
-  @keyframes panel-in {
-    from { opacity: 0; transform: scale(0.97) translateY(-8px); }
-    to { opacity: 1; transform: scale(1) translateY(0); }
   }
 </style>

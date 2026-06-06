@@ -1,5 +1,7 @@
 <script lang="ts">
   import * as m from '$lib/paraglide/messages';
+  import { fade, scale } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
   // Defaults route through the translated catalog so callers that
   // omit `title`/`confirmLabel`/`cancelLabel` get a localized
   // dialog. Svelte 5 evaluates destructuring defaults at instance
@@ -108,8 +110,13 @@
     tabindex="-1"
     onkeydown={handleKeydown}
     onclick={handleOverlayClick}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
   >
-    <div class="confirm-dialog" bind:this={dialogEl}>
+    <div
+      class="confirm-dialog"
+      bind:this={dialogEl}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
       <h3 id="confirm-title-{instanceId}">{title}</h3>
       <p id="confirm-message-{instanceId}">{message}</p>
       <div class="dialog-actions">

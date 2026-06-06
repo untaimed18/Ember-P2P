@@ -347,6 +347,7 @@ th {
 
 th.sortable {
   cursor: pointer;
+  transition: color var(--transition-fast) ease, background-color var(--transition-fast) ease;
 }
 
 th.sortable:hover {
@@ -365,6 +366,7 @@ td {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  transition: background-color var(--transition-fast) ease;
 }
 
 tr:hover td {
@@ -656,7 +658,6 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
   align-items: center;
   justify-content: center;
   z-index: 10000;
-  animation: fade-in 0.15s ease;
 }
 .confirm-dialog {
   background: var(--bg-secondary);
@@ -667,7 +668,6 @@ h4 { font-size: 14px; font-weight: 600; color: var(--text-primary); }
   max-width: 450px;
   overflow: hidden;
   box-shadow: 0 8px 32px rgba(0,0,0,0.24);
-  animation: dialog-in 0.2s ease;
 }
 
 /*

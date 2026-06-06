@@ -286,6 +286,13 @@
     inset: 0;
     background: rgba(0, 0, 0, 0.4);
     z-index: 999;
+    animation: browse-fade-in 0.15s ease;
+  }
+
+  :global([data-theme='dark']) .browse-overlay {
+    background: rgba(8, 10, 13, 0.45);
+    backdrop-filter: blur(6px) saturate(1.15);
+    -webkit-backdrop-filter: blur(6px) saturate(1.15);
   }
 
   .browse-modal {
@@ -303,6 +310,17 @@
     display: flex;
     flex-direction: column;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    animation: browse-pop-in 0.2s ease;
+  }
+
+  /* Keyframe keeps the translate centering while scaling/fading in. */
+  @keyframes browse-fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes browse-pop-in {
+    from { opacity: 0; transform: translate(-50%, -50%) scale(0.96); }
+    to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
   }
 
   .browse-header {
