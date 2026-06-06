@@ -144,8 +144,19 @@
   // When we regain visibility, kick off one refresh so the UI reflects activity
   // that accumulated while the tab was hidden. setInterval has been skipping
   // ticks via pageVisible, so the data can be up to interval-minutes stale.
+  let wasHidden = false;
   $effect(() => {
-    if (pageVisible && refreshTimer) void refresh();
+    if (!pageVisible) {
+      wasHidden = true;
+      return;
+    }
+    // Only refresh on a genuine hidden→visible transition — not when the
+    // refresh timer is (re)created while the page is already visible, which
+    // the connect effect already refreshes for.
+    if (wasHidden && refreshTimer) {
+      wasHidden = false;
+      void refresh();
+    }
   });
 
   async function refresh() {
@@ -291,6 +302,7 @@
     // shortcuts (Escape / Ctrl+Enter) work without a preceding click.
     queueMicrotask(() => {
       setTimeout(() => {
+        if (!mounted) return;
         if (mode === 'ip') bootstrapHostInput?.focus();
         else if (mode === 'url') bootstrapUrlInput?.focus();
       }, 0);
@@ -494,9 +506,16 @@
   // initializer in onMount of +layout) still surfaces here. Main's KAD
   // page reverted this for separation-of-concerns; V2 prefers the
   // single-pane visibility, so the dismiss button clears both stores.
+  let lastNetworkError: string | null = null;
   $effect(() => {
-    if ($networkError) {
-      kadError = $networkError;
+    const ne = $networkError;
+    // Mirror both directions: raise the banner when the global network error
+    // is set, and clear it when that error is cleared elsewhere. Tracking the
+    // previous value means a local (connect) error set while `networkError`
+    // didn't change is left intact.
+    if (ne !== lastNetworkError) {
+      lastNetworkError = ne;
+      kadError = ne;
     }
   });
 

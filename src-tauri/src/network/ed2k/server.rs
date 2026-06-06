@@ -1615,13 +1615,33 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<Vec<ServerSearchResult>
         };
         let mut tags = ServerResultTags::default();
 
-        for _ in 0..tag_count.min(256) {
+        let tag_limit = tag_count.min(256);
+        let mut in_sync = true;
+        for _ in 0..tag_limit {
             let (name_id, tag_type, name) = match read_tag_header(&mut cursor) {
                 Some(v) => v,
-                None => break,
+                None => { in_sync = false; break; }
             };
             if !read_tag_value(&mut cursor, tag_type, name_id, name.as_deref(), &mut tags) {
+                in_sync = false;
                 break;
+            }
+        }
+        // A result may legitimately carry more than the cap; consume (and
+        // discard) the surplus tags so the cursor stays aligned for the next
+        // result record. Without this, tag_count > 256 desyncs the parser and
+        // every subsequent result decodes from the wrong offset (garbage
+        // hashes/names). Only safe to skip when the capped loop stayed in sync.
+        if in_sync && tag_count > tag_limit {
+            let mut discard = ServerResultTags::default();
+            for _ in tag_limit..tag_count {
+                let (name_id, tag_type, name) = match read_tag_header(&mut cursor) {
+                    Some(v) => v,
+                    None => break,
+                };
+                if !read_tag_value(&mut cursor, tag_type, name_id, name.as_deref(), &mut discard) {
+                    break;
+                }
             }
         }
 
@@ -1755,9 +1775,21 @@ async fn read_server_packet<R: AsyncReadExt + Unpin>(
     }
     let opcode = reader.read_u8().await?;
     let payload_len = length - 1;
-    let mut payload = vec![0u8; payload_len];
+    let mut payload = Vec::new();
     if payload_len > 0 {
-        reader.read_exact(&mut payload).await?;
+        // Grow the buffer as bytes actually arrive rather than eagerly
+        // allocating the full declared length (up to 5 MiB). A slow/hostile
+        // server would otherwise pin that memory for the whole read window
+        // before sending a single byte.
+        payload.reserve(payload_len.min(64 * 1024));
+        let mut remaining = payload_len;
+        let mut chunk = [0u8; 32 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(chunk.len());
+            reader.read_exact(&mut chunk[..want]).await?;
+            payload.extend_from_slice(&chunk[..want]);
+            remaining -= want;
+        }
     }
 
     if protocol == OP_PACKEDPROT {

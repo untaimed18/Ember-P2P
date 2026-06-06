@@ -740,7 +740,9 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
         let mut comment: Option<String> = None;
         let mut media = crate::types::MediaMetadata::default();
 
-        for _ in 0..tag_count.min(50) {
+        let applied_tags = tag_count.min(50);
+        let mut tags_in_sync = true;
+        for _ in 0..applied_tags {
             let raw_type = cursor.read_u8().ok()?;
             let (name_id, tag_type, tag_name) = if raw_type & 0x80 != 0 {
                 let t = raw_type & 0x7F;
@@ -752,6 +754,13 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
                     let n = cursor.read_u8().ok()?;
                     (n, raw_type, None)
                 } else {
+                    // Bound the name allocation by the bytes actually left in
+                    // the packet so a bogus length can't force a large transient
+                    // buffer (the read would fail anyway).
+                    let remaining = payload.len().saturating_sub(cursor.position() as usize);
+                    if name_len > remaining {
+                        return None;
+                    }
                     // Preserve the string name so ED2K media tags
                     // ("length"/"bitrate"/"codec"/...) can be matched.
                     let mut name_buf = vec![0u8; name_len];
@@ -852,7 +861,7 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
                 }
                 _ => false,
             };
-            if !ok { break; }
+            if !ok { tags_in_sync = false; break; }
         }
 
         results.push(ServerSearchResult {
@@ -865,6 +874,14 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
             comment,
             media,
         });
+
+        // If a tag failed to decode, or the record declared more tags than the
+        // cap (so surplus tag bytes remain unconsumed), the cursor is no longer
+        // aligned to the next record. Stop here rather than decoding subsequent
+        // "results" from a mid-tag offset, which would emit garbage entries.
+        if !tags_in_sync || tag_count > applied_tags {
+            break;
+        }
     }
 
     if results.is_empty() {
