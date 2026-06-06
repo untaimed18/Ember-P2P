@@ -3331,6 +3331,12 @@
     padding: 4px 0;
     min-width: 160px;
     box-shadow: var(--shadow-md);
+    transform-origin: top left;
+    animation: context-menu-pop 0.12s ease;
+  }
+  @keyframes context-menu-pop {
+    from { opacity: 0; transform: scale(0.97); }
+    to { opacity: 1; transform: scale(1); }
   }
   .context-menu button {
     display: block;

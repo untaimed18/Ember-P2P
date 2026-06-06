@@ -8,6 +8,8 @@
   // ConfirmDialog only exposes Confirm / Cancel, so this is a sibling
   // component rather than a reuse.
   import * as m from '$lib/paraglide/messages';
+  import { fade, scale } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
 
   let {
     open = $bindable(false),
@@ -106,8 +108,13 @@
     tabindex="-1"
     onkeydown={handleKeydown}
     onclick={handleOverlayClick}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
   >
-    <div class="close-dialog" bind:this={dialogEl}>
+    <div
+      class="close-dialog"
+      bind:this={dialogEl}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
       <h3 id="close-title-{instanceId}">{m.close_dialog_title()}</h3>
       <p id="close-message-{instanceId}">
         {m.close_dialog_message()}
@@ -136,6 +143,13 @@
     place-items: center;
     background: rgba(0, 0, 0, 0.5);
     padding: 20px;
+  }
+
+  /* Frosted backdrop in dark mode, matching ConfirmDialog/AboutDialog. */
+  :global([data-theme='dark']) .close-overlay {
+    background: rgba(8, 10, 13, 0.45);
+    backdrop-filter: blur(6px) saturate(1.15);
+    -webkit-backdrop-filter: blur(6px) saturate(1.15);
   }
 
   .close-dialog {
