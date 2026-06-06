@@ -34,6 +34,8 @@
   import { formatSize } from '$lib/utils';
   import type { FileInfo, MediaMetadata } from '$lib/types';
   import { onMount, tick } from 'svelte';
+  import { fly } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
 
   import { listen } from '@tauri-apps/api/event';
   import LibraryVirtualTable from '$lib/components/LibraryVirtualTable.svelte';
@@ -1925,10 +1927,17 @@
         }}
       >
         <span class="tree-main">
-          <span class="tree-icon">◧</span>
+          <span class="tree-icon">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+              <rect x="5" y="5" width="8.5" height="8.5" rx="1.2"/>
+              <path d="M3 11V3.5a1 1 0 0 1 1-1H10"/>
+            </svg>
+          </span>
           <span class="tree-folder-name">{m.library_all_files()}</span>
         </span>
-        <span class="tree-count">{files.length.toLocaleString()}</span>
+        <div class="tree-meta">
+          <span class="tree-count">{files.length.toLocaleString()}</span>
+        </div>
       </div>
       {#each folders as folder (folder)}
         <div
@@ -1945,41 +1954,47 @@
           }}
         >
           <span class="tree-main">
-            <span class="tree-icon">◨</span>
+            <span class="tree-icon">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
+                <path d="M2 4.5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/>
+              </svg>
+            </span>
             <span class="tree-folder-name" title={folder}>
               {folder.split(/[\\/]/).filter(Boolean).pop() || folder}
             </span>
           </span>
-          <span class="tree-count">{(folderStats.counts.get(folder) ?? 0).toLocaleString()} &middot; {formatSize(folderStats.sizes.get(folder) ?? 0)}</span>
-          <select
-            class="tree-prio"
-            class:tree-prio-set={!!folderPriorities[folder]}
-            title={m.library_folder_priority_title()}
-            aria-label={m.library_folder_priority_title()}
-            value={folderPriorities[folder] ?? ''}
-            onclick={(e) => e.stopPropagation()}
-            onchange={(e) => { e.stopPropagation(); handleSetFolderPriority(folder, (e.currentTarget as HTMLSelectElement).value); }}
-          >
-            <option value="">{m.library_folder_priority_default()}</option>
-            <option value="verylow">{m.library_priority_verylow()}</option>
-            <option value="low">{m.library_priority_low()}</option>
-            <option value="normal">{m.library_priority_normal()}</option>
-            <option value="high">{m.library_priority_high()}</option>
-            <option value="release">{m.library_priority_release()}</option>
-            <option value="auto">{m.library_priority_auto()}</option>
-          </select>
-          <span class="tree-actions">
-            <button
-              class="tree-btn"
-              onclick={(e) => { e.stopPropagation(); handleUnshareFolder(folder); }}
-              title={m.library_unshare_folder_title()}
-            >&#x20E0;</button>
-            <button
-              class="tree-btn tree-remove"
-              onclick={(e) => { e.stopPropagation(); handleRemoveFolder(folder); }}
-              title={m.library_remove_folder_btn_title()}
-            >&times;</button>
-          </span>
+          <div class="tree-meta">
+            <span class="tree-count">{(folderStats.counts.get(folder) ?? 0).toLocaleString()} &middot; {formatSize(folderStats.sizes.get(folder) ?? 0)}</span>
+            <select
+              class="tree-prio"
+              class:tree-prio-set={!!folderPriorities[folder]}
+              title={m.library_folder_priority_title()}
+              aria-label={m.library_folder_priority_title()}
+              value={folderPriorities[folder] ?? ''}
+              onclick={(e) => e.stopPropagation()}
+              onchange={(e) => { e.stopPropagation(); handleSetFolderPriority(folder, (e.currentTarget as HTMLSelectElement).value); }}
+            >
+              <option value="">{m.library_folder_priority_default()}</option>
+              <option value="verylow">{m.library_priority_verylow()}</option>
+              <option value="low">{m.library_priority_low()}</option>
+              <option value="normal">{m.library_priority_normal()}</option>
+              <option value="high">{m.library_priority_high()}</option>
+              <option value="release">{m.library_priority_release()}</option>
+              <option value="auto">{m.library_priority_auto()}</option>
+            </select>
+            <span class="tree-actions">
+              <button
+                class="tree-btn tree-unshare"
+                onclick={(e) => { e.stopPropagation(); handleUnshareFolder(folder); }}
+                title={m.library_unshare_folder_title()}
+              >&#x20E0;</button>
+              <button
+                class="tree-btn tree-remove"
+                onclick={(e) => { e.stopPropagation(); handleRemoveFolder(folder); }}
+                title={m.library_remove_folder_btn_title()}
+              >&times;</button>
+            </span>
+          </div>
         </div>
       {/each}
     </div>
@@ -2216,10 +2231,15 @@
 
   <!-- Side drawer for file details + comments -->
   {#if selectedFile}
-    <div class="detail-drawer">
+    <div class="detail-drawer" transition:fly={{ x: 24, duration: prefersReducedMotion.current ? 0 : 200 }}>
       <div class="drawer-header">
         <span class="drawer-title" title={selectedFile.name}>{selectedFile.name}</span>
-        <button class="ghost drawer-close" onclick={() => selectedPath = null} title={m.library_close_details()}>&times;</button>
+        <button class="ghost drawer-close" onclick={() => selectedPath = null} title={m.library_close_details()} aria-label={m.library_close_details()}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15" aria-hidden="true">
+            <line x1="6" y1="6" x2="18" y2="18"/>
+            <line x1="18" y1="6" x2="6" y2="18"/>
+          </svg>
+        </button>
       </div>
       <div class="drawer-body">
         <div class="details-meta-grid">
@@ -2731,13 +2751,15 @@
   }
   .tree-item {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 5px;
     padding: 6px 8px;
     margin-bottom: 4px;
-    border: 1px solid transparent;
+    border: 1px solid var(--border);
+    border-left: 3px solid transparent;
     border-radius: var(--radius-sm);
+    background: var(--bg-surface);
     font-size: 12px;
     cursor: pointer;
     color: var(--text-secondary);
@@ -2746,44 +2768,72 @@
   .tree-item:hover {
     background: var(--bg-hover);
     border-color: var(--border);
+    border-left-color: color-mix(in srgb, var(--accent) 50%, transparent);
   }
   .tree-item.active {
     background: color-mix(in srgb, var(--accent-dim) 55%, transparent);
     border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    border-left-color: var(--accent);
     color: var(--text-primary);
     font-weight: 600;
   }
   .tree-main {
     display: inline-flex;
     align-items: center;
-    gap: 7px;
+    gap: 8px;
     min-width: 0;
-    flex: 1;
+    flex: 0 0 auto;
   }
+  /* Second row: count/size badge, priority dropdown and action buttons stacked
+     under the folder name so a long name gets the full width of the row. The
+     left padding lines the meta row up with the folder name (icon chip 24px +
+     8px gap). It wraps when the sidebar is narrow rather than squeezing the
+     name. */
+  .tree-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding-left: 32px;
+    min-width: 0;
+  }
+  /* Folder icon sits in a rounded tinted chip for a more deliberate, app-like
+     look; the chip and glyph both intensify on the active row. */
   .tree-icon {
-    width: 16px;
-    text-align: center;
-    color: var(--text-muted);
-    font-size: 11px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
     flex-shrink: 0;
   }
   .tree-item.active .tree-icon {
-    color: var(--text-accent);
+    background: color-mix(in srgb, var(--accent) 22%, transparent);
+    color: var(--accent);
   }
   .tree-folder-name {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
     min-width: 0;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    line-height: 1.3;
+    font-size: 12.5px;
+    font-weight: 500;
+    color: var(--text-primary);
   }
   .tree-count {
+    display: inline-flex;
+    align-items: center;
+    height: 22px;
     font-size: 11px;
-    color: var(--text-muted);
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
+    font-variant-numeric: tabular-nums;
+    color: var(--text-accent);
+    background: color-mix(in srgb, var(--accent-dim) 30%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 25%, var(--border));
     border-radius: 999px;
-    padding: 1px 7px;
-    line-height: 1.4;
+    padding: 0 8px;
     flex-shrink: 0;
   }
   .tree-item.active .tree-count {
@@ -2794,25 +2844,12 @@
   .tree-actions {
     display: inline-flex;
     gap: 4px;
-    opacity: 0;
-    transition: opacity 0.12s;
     flex-shrink: 0;
   }
-  /* Keyboard-a11y: a hover-only reveal hides the focus indicator from
-     keyboard users, so the action buttons are also surfaced whenever
-     anything inside the row is focused (:focus-within), when one of
-     the action buttons itself receives focus (:focus-visible), or when
-     the item is active. */
-  .tree-item:hover .tree-actions,
-  .tree-item.active .tree-actions,
-  .tree-item:focus-within .tree-actions,
-  .tree-actions:focus-within {
-    opacity: 1;
-  }
   .tree-btn {
-    width: 20px;
-    height: 20px;
-    border-radius: 4px;
+    width: 22px;
+    height: 22px;
+    border-radius: 5px;
     border: 1px solid var(--border);
     background: var(--bg-surface);
     color: var(--text-secondary);
@@ -2821,35 +2858,46 @@
     align-items: center;
     justify-content: center;
     line-height: 1;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
   }
-  .tree-btn.tree-remove { font-size: 13px; }
-  .tree-btn:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
+  /* Stop-sharing: warning (amber) tint; Remove: danger (red) tint. Subtle by
+     default, fully saturated on hover so the destructive action reads clearly. */
+  .tree-btn.tree-unshare {
+    color: var(--warning);
+    border-color: color-mix(in srgb, var(--warning) 35%, var(--border));
+    background: color-mix(in srgb, var(--warning) 12%, transparent);
   }
-  /* Per-folder default upload priority. Hidden until row hover/focus unless a
-     non-default priority is set, in which case it stays visible as a hint. */
+  .tree-btn.tree-unshare:hover {
+    color: #fff;
+    border-color: var(--warning);
+    background: var(--warning);
+  }
+  .tree-btn.tree-remove {
+    font-size: 13px;
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+  }
+  .tree-btn.tree-remove:hover {
+    color: #fff;
+    border-color: var(--danger);
+    background: var(--danger);
+  }
+  /* Per-folder default upload priority. Always visible; highlighted when a
+     non-default priority is set. */
   .tree-prio {
     flex-shrink: 0;
-    max-width: 84px;
-    height: 20px;
+    max-width: 96px;
+    height: 22px;
     padding: 0 4px;
     font-size: 11px;
-    border-radius: 4px;
+    border-radius: 5px;
     border: 1px solid var(--border);
     background: var(--bg-surface);
     color: var(--text-secondary);
-    opacity: 0;
-    transition: opacity 0.12s;
     cursor: pointer;
   }
-  .tree-item:hover .tree-prio,
-  .tree-item.active .tree-prio,
-  .tree-item:focus-within .tree-prio {
-    opacity: 1;
-  }
   .tree-prio.tree-prio-set {
-    opacity: 1;
     color: var(--text-accent);
     border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
     background: color-mix(in srgb, var(--accent-dim) 45%, transparent);
@@ -2904,24 +2952,27 @@
     min-width: 0;
   }
   .drawer-close {
-    font-size: 16px;
-    line-height: 1;
-    width: 22px;
-    height: 22px;
+    width: 28px;
+    height: 28px;
     padding: 0;
     cursor: pointer;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--bg-surface);
+    border: 1px solid transparent;
+    border-radius: 7px;
+    background: transparent;
     color: var(--text-muted);
     display: inline-flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
   }
   .drawer-close:hover {
-    color: var(--text-primary);
-    background: var(--bg-hover);
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+  }
+  .drawer-close:active {
+    background: color-mix(in srgb, var(--danger) 20%, transparent);
   }
   .drawer-body {
     flex: 1;
@@ -3639,6 +3690,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    animation: modal-fade-in 0.15s ease;
   }
   .modal-content {
     background: var(--bg-secondary);
@@ -3650,6 +3702,21 @@
     display: flex;
     flex-direction: column;
     max-height: 80vh;
+    animation: modal-pop-in 0.2s ease;
+  }
+  @keyframes modal-fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes modal-pop-in {
+    from { opacity: 0; transform: scale(0.96); }
+    to { opacity: 1; transform: scale(1); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .modal-overlay,
+    .modal-content {
+      animation: none;
+    }
   }
   .create-coll-modal { width: 520px; }
   .modal-header {
