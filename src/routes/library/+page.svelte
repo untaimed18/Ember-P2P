@@ -964,6 +964,14 @@
     const hash = selectedHash;
     commentSaveState = 'idle';
     commentSaveMessage = '';
+    // Reset the bound editor fields IMMEDIATELY on selection change so the
+    // textarea never shows — or, on Save/Ctrl+Enter, persists — the PREVIOUS
+    // file's comment during the debounced fetch window below. Without this,
+    // saving right after switching files wrote file A's text onto file B.
+    // `commentLoading` gates handleSaveComment so this reset can't wipe the
+    // new file's stored comment with an empty save before the fetch lands.
+    ourComment = '';
+    ourRating = 0;
     if (commentSaveTimer) {
       clearTimeout(commentSaveTimer);
       commentSaveTimer = null;
@@ -1045,6 +1053,10 @@
   async function handleSaveComment() {
     const hash = selectedHash;
     if (!hash) return;
+    // The editor fields are reset on selection change and only repopulated
+    // once the debounced fetch for THIS hash lands. Refuse to save until then,
+    // otherwise we'd persist empty/stale fields over the file's real comment.
+    if (commentLoading) return;
     commentSaveState = 'saving';
     commentSaveMessage = m.library_saving();
     try {

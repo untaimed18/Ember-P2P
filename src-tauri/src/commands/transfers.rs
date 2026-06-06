@@ -807,8 +807,14 @@ pub async fn open_transfer_file_location(
         (mgr.get_transfer(&transfer_id).cloned(), cfg.settings.download_folder.clone())
     };
     let transfer = transfer.ok_or_else(|| coded("transfers_transfer_not_found", "Transfer not found"))?;
-    let path = resolve_transfer_reveal_path(&transfer, &dl_folder)?;
-    tokio::task::spawn_blocking(move || reveal_in_file_manager(&path))
+    // `resolve_transfer_reveal_path` performs several `canonicalize()`/`is_file()`
+    // syscalls; run path resolution AND the reveal together on the blocking pool
+    // so a slow path (network/cloud/AV-locked) can't stall the async runtime and
+    // freeze unrelated IPC commands.
+    tokio::task::spawn_blocking(move || {
+        let path = resolve_transfer_reveal_path(&transfer, &dl_folder)?;
+        reveal_in_file_manager(&path)
+    })
         .await
         .map_err(|e| coded_ctx("transfers_reveal_task_failed", "Reveal task failed", e))??;
     Ok(())

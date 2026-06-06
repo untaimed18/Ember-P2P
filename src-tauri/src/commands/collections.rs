@@ -89,13 +89,24 @@ pub async fn create_collection(
     };
     let path = std::path::PathBuf::from(&output_path);
 
-    let canonical = path.canonicalize().or_else(|_| {
-        if let Some(parent) = path.parent() {
-            parent.canonicalize().map(|p| p.join(path.file_name().unwrap_or_default()))
-        } else {
-            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "invalid path"))
-        }
-    }).map_err(|e| coded_ctx("collections_invalid_output_path", "Invalid output path", e))?;
+    // `canonicalize` hits the filesystem and can block (network drives, AV,
+    // cloud-backed paths). This command is async, so run it on the blocking
+    // pool instead of stalling the Tokio worker (and with it unrelated IPC).
+    let canonical = {
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            path.canonicalize().or_else(|_| {
+                if let Some(parent) = path.parent() {
+                    parent.canonicalize().map(|p| p.join(path.file_name().unwrap_or_default()))
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "invalid path"))
+                }
+            })
+        })
+        .await
+        .map_err(|e| coded_ctx("collections_canonicalize_task", "Path resolution failed", e))?
+        .map_err(|e| coded_ctx("collections_invalid_output_path", "Invalid output path", e))?
+    };
 
     if canonical.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
         return Err(coded("collections_output_path_no_parent_dir", "Output path must not contain '..' components"));

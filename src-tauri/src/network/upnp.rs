@@ -6,8 +6,14 @@ pub struct UpnpMappings {
     gateway: Option<igd_next::aio::Gateway<igd_next::aio::tokio::Tokio>>,
     tcp_port: u16,
     udp_port: u16,
+    /// QUIC listens on its own UDP socket (often `tcp_port`, possibly a
+    /// fallback). It is learned at runtime after the endpoint binds, so it's
+    /// mapped separately via `map_quic_port` once known and then refreshed by
+    /// `renew`/removed by `teardown` alongside the others.
+    quic_port: Option<u16>,
     tcp_mapped: bool,
     udp_mapped: bool,
+    quic_mapped: bool,
 }
 
 impl UpnpMappings {
@@ -16,8 +22,10 @@ impl UpnpMappings {
             gateway: None,
             tcp_port,
             udp_port,
+            quic_port: None,
             tcp_mapped: false,
             udp_mapped: false,
+            quic_mapped: false,
         }
     }
 
@@ -48,6 +56,43 @@ impl UpnpMappings {
         };
 
         (tcp_ok, udp_ok)
+    }
+
+    async fn add_udp_mapping(
+        gateway: &igd_next::aio::Gateway<igd_next::aio::tokio::Tokio>,
+        local_ip: Ipv4Addr,
+        port: u16,
+        label: &str,
+    ) -> bool {
+        let local = SocketAddr::V4(SocketAddrV4::new(local_ip, port));
+        match gateway
+            .add_port(igd_next::PortMappingProtocol::UDP, port, local, 3600, label)
+            .await
+        {
+            Ok(()) => { info!("UPnP: mapped UDP port {port} ({label})"); true }
+            Err(e) => { warn!("UPnP: failed to map UDP port {port} ({label}): {e}"); false }
+        }
+    }
+
+    /// Map the QUIC UDP listen port. QUIC binds its own socket after `setup()`
+    /// (often on `tcp_port`, possibly a fallback), so without this the QUIC
+    /// listener — used for inbound relay targets and hole-punch accepts — is
+    /// never forwarded even when TCP/KAD show as "open". No-op when QUIC ended
+    /// up on the already-mapped KAD UDP port.
+    pub async fn map_quic_port(&mut self, quic_port: u16) -> bool {
+        if self.quic_port == Some(quic_port) && self.quic_mapped {
+            return true;
+        }
+        self.quic_port = Some(quic_port);
+        if quic_port == self.udp_port {
+            self.quic_mapped = self.udp_mapped;
+            return self.udp_mapped;
+        }
+        let Some(gateway) = &self.gateway else { return false; };
+        let Some(local_ip) = local_ipv4() else { return false; };
+        let ok = Self::add_udp_mapping(gateway, local_ip, quic_port, "Ember P2P QUIC").await;
+        self.quic_mapped = ok;
+        ok
     }
 
     pub async fn setup(&mut self) -> bool {
@@ -90,7 +135,15 @@ impl UpnpMappings {
         let (tcp_ok, udp_ok) = Self::map_ports_inner(gateway, local_ip, self.tcp_port, self.udp_port).await;
         self.tcp_mapped = tcp_ok;
         self.udp_mapped = udp_ok;
-        tcp_ok || udp_ok
+        // Refresh the QUIC mapping too (if known and distinct from KAD UDP).
+        if let Some(qp) = self.quic_port {
+            self.quic_mapped = if qp == self.udp_port {
+                udp_ok
+            } else {
+                Self::add_udp_mapping(gateway, local_ip, qp, "Ember P2P QUIC").await
+            };
+        }
+        tcp_ok || udp_ok || self.quic_mapped
     }
 
     pub async fn teardown(&mut self) {
@@ -101,13 +154,21 @@ impl UpnpMappings {
             if self.udp_mapped {
                 let _ = gateway.remove_port(igd_next::PortMappingProtocol::UDP, self.udp_port).await;
             }
-            if self.tcp_mapped || self.udp_mapped {
+            if self.quic_mapped {
+                if let Some(qp) = self.quic_port {
+                    if qp != self.udp_port {
+                        let _ = gateway.remove_port(igd_next::PortMappingProtocol::UDP, qp).await;
+                    }
+                }
+            }
+            if self.tcp_mapped || self.udp_mapped || self.quic_mapped {
                 info!("UPnP: removed port mappings");
             }
         }
         self.gateway = None;
         self.tcp_mapped = false;
         self.udp_mapped = false;
+        self.quic_mapped = false;
     }
 
     pub fn is_mapped(&self) -> bool {

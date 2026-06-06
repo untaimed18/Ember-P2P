@@ -4980,6 +4980,10 @@ pub async fn start_network(
         }
         if shutting_down {
             info!("Network shutting down");
+            // Stop the upload listener from accepting new connections (and let it
+            // terminate active sessions) during the multi-second shutdown save
+            // sequence, so it can't spawn work against state being torn down.
+            state.upload_disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
             break;
         }
 
@@ -5079,6 +5083,9 @@ pub async fn start_network(
                 match cmd {
                     Some(NetworkCommand::Shutdown) | None => {
                         info!("Network shutting down");
+                        // See the try_recv drain above: stop the upload listener
+                        // before the shutdown save sequence runs.
+                        state.upload_disconnected.store(true, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
                     // `UpdateSettings` mutates the loop-owned `settings` variable
@@ -5116,9 +5123,21 @@ pub async fn start_network(
                             state.uss_host = None;
                             state.pending_uss_pings.clear();
                         }
-                        // Same hot-reload as the try_recv arm above.
+                        // Same hot-reload as the try_recv arm above — including
+                        // load-on-enable: a session that started disabled never
+                        // read ipfilter.dat (boot only loads it when enabled), so
+                        // enabling here without loading would leave the filter
+                        // active but EMPTY (fail-open for every blocked range)
+                        // until the next restart.
                         if state.ip_filter.is_enabled() != new_settings.ip_filter_enabled {
                             state.ip_filter.set_enabled(new_settings.ip_filter_enabled);
+                            if new_settings.ip_filter_enabled && state.ip_filter.range_count() == 0 {
+                                let default_path = state.data_dir.join("ipfilter.dat");
+                                if default_path.exists() {
+                                    let n = state.ip_filter.load_from_file(&default_path);
+                                    info!("Loaded {n} IP filter entries on enable ({} ranges after merge)", state.ip_filter.range_count());
+                                }
+                            }
                             state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
                         }
                         if state.ip_filter.blocks_private() != new_settings.block_private_ips {
@@ -5252,15 +5271,32 @@ pub async fn start_network(
                             state.routing_table.release_contacts_in_use(&removed.in_use_ids);
                         }
                     }
-                    let mgr = transfer_manager.read().await;
-                    if let Some(t) = mgr.get_transfer(transfer_id) {
-                        if let Some((ip_str, port_str)) = t.peer_id.split_once(':') {
+                    // Snapshot only the fields we need, then release the
+                    // `transfer_manager` read lock immediately. The rest of
+                    // this handler runs several `.await`s (source_manager
+                    // read, local_index write/read, shared_files write, and a
+                    // server `offer_files` network round-trip). Holding the
+                    // read lock across them previously stalled the whole
+                    // network `select!` loop and blocked download workers that
+                    // need `transfer_manager.write()`.
+                    let completed_snapshot = {
+                        let mgr = transfer_manager.read().await;
+                        mgr.get_transfer(transfer_id).map(|t| (
+                            t.peer_id.clone(),
+                            t.file_hash.clone(),
+                            t.file_name.clone(),
+                            t.total_size,
+                            t.transferred,
+                        ))
+                    };
+                    if let Some((peer_id, file_hash, file_name, file_size, transferred)) = completed_snapshot {
+                        if let Some((ip_str, port_str)) = peer_id.split_once(':') {
                             if let (Ok(ip), Ok(port)) = (ip_str.parse::<Ipv4Addr>(), port_str.parse::<u16>()) {
                                 state.dead_sources.remove(0, u32::from(ip), port);
                             }
                         }
                         // Clear all per-file dead source entries for this completed file
-                        if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
+                        if let Ok(fh_bytes) = hex::decode(&file_hash) {
                             if fh_bytes.len() == 16 {
                                 let mut fh = [0u8; 16];
                                 fh.copy_from_slice(&fh_bytes);
@@ -5270,15 +5306,11 @@ pub async fn start_network(
                                 }
                             }
                         }
-                        let safe_name = crate::security::sanitize_filename(&t.file_name);
+                        let safe_name = crate::security::sanitize_filename(&file_name);
                         let completed_path = PathBuf::from(&settings.download_folder)
                             .join("Downloads")
                             .join(&safe_name);
                         let now = chrono::Utc::now().timestamp();
-                        let file_hash = t.file_hash.clone();
-                        let file_name = t.file_name.clone();
-                        let file_size = t.total_size;
-                        let transferred = t.transferred;
 
                         if let Ok(hash_bytes) = hex::decode(&file_hash) {
                             if hash_bytes.len() == 16 {
@@ -5407,7 +5439,6 @@ pub async fn start_network(
                             }
                         }
                     }
-                    drop(mgr);
                 }
                 if let DownloadEvent::Failed { ref transfer_id, ref error, ref failure_kind } = event {
                     state.active_source_senders.remove(transfer_id);
@@ -7998,8 +8029,15 @@ pub async fn start_network(
                             let now = chrono::Utc::now().timestamp();
                             let mut sent_any = false;
                             for (kw_hash, msg) in &kw_publishes {
+                                // Publish only to nodes that actually answered during
+                                // the lookup AND fall within the eMule search tolerance
+                                // of the keyword target (mirrors the StoreSource path).
+                                // Publishing to never-queried / out-of-tolerance nodes
+                                // just gets rejected remotely and wastes publish slots.
                                 for contact in search.closest.iter()
-                                    .filter(|c| !state.overloaded_nodes.contains_key(&c.ip))
+                                    .filter(|c| !state.overloaded_nodes.contains_key(&c.ip)
+                                        && search.responded_during_lookup.contains(&c.id)
+                                        && kad::search::within_search_tolerance_pub(&search.target, &c.id))
                                     .take(10)
                                 {
                                     let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
@@ -8104,7 +8142,16 @@ pub async fn start_network(
                             };
                             let now = chrono::Utc::now().timestamp();
                             let mut sent = 0;
-                            for contact in search.closest.iter().take(10) {
+                            // Same targeting as StoreSource/StoreKeyword: publish only
+                            // to nodes that answered during the lookup and lie within
+                            // the search tolerance of the target, skipping overloaded
+                            // nodes. Publishing to never-queried / far nodes is rejected
+                            // remotely and weakens note availability.
+                            for contact in search.closest.iter()
+                                .filter(|c| !state.overloaded_nodes.contains_key(&c.ip)
+                                    && search.responded_during_lookup.contains(&c.id)
+                                    && kad::search::within_search_tolerance_pub(&search.target, &c.id))
+                                .take(10) {
                                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                                 if let Ok(packet) = messages::encode_packet(&msg) {
                                     state.flood_protection.track_request(addr, kad_request_opcode(&msg).unwrap_or(0));
@@ -8655,6 +8702,19 @@ pub async fn start_network(
                                             quic_cb_tx,
                                         ));
                                         tracing::info!("QUIC accept loop spawned");
+
+                                        // Forward the QUIC UDP port via UPnP. QUIC binds
+                                        // its socket here — after the initial UPnP setup
+                                        // and on a port distinct from the KAD UDP port —
+                                        // so without this, inbound QUIC (relay target /
+                                        // hole-punch accept) stays unreachable behind NAT
+                                        // even when TCP/KAD are mapped. One-shot; mirrors
+                                        // the existing in-loop `upnp_mappings.renew()`.
+                                        if upnp_enabled && upnp_mappings.has_gateway() {
+                                            if upnp_mappings.map_quic_port(bound_port).await {
+                                                tracing::info!("UPnP: QUIC UDP port {bound_port} mapped");
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::warn!("Broker: failed to create QUIC endpoint: {e}");
@@ -20950,9 +21010,17 @@ async fn handle_upload_event(
             // `transfer-failed` event (matching eMule), keeping the
             // backend record around for 5s only created a window where
             // a poll could re-add the failed row to the store.
+            // Redact the raw upload error the same way the download path does
+            // (`summarize_error` only ever returns fixed, canned strings), so peer
+            // IPs / local paths from anyhow chains don't leak into the UI's
+            // `failure_reason` or upload history.
+            let upload_failure_summary = ed2k::transfer::summarize_error(
+                &error,
+                &ed2k::transfer::classify_error(&error),
+            );
             let promoted = match {
                 let mut mgr = transfer_manager.write().await;
-                let promoted = mgr.fail(&event.transfer_id, &error, None, None);
+                let promoted = mgr.fail(&event.transfer_id, &upload_failure_summary, None, None);
                 mgr.completed.retain(|t| t.id != event.transfer_id);
                 promoted
             } {

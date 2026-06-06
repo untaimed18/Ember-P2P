@@ -119,11 +119,20 @@ fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
             return Err(coded("settings_download_folder_parent_dir", "Download folder must not contain '..' path components"));
         }
-        for component in path.components() {
-            if let std::path::Component::Normal(seg) = component {
-                let seg_lower = seg.to_string_lossy().to_lowercase();
-                if blocked_segments.contains(&seg_lower.as_str()) {
-                    return Err(coded_ctx("settings_download_folder_system_dir", "Cannot use system directory as download folder", &settings.download_folder));
+        // Scan the literal path AND (best-effort) its canonical form. A
+        // junction/symlink can point a benign-looking folder at a blocked
+        // system directory; canonicalizing resolves the reparse point so the
+        // segment check can't be bypassed. A not-yet-created folder won't
+        // canonicalize — fall back to the literal check in that case.
+        let canonical = path.canonicalize().ok();
+        let scan_paths = std::iter::once(path.to_path_buf()).chain(canonical);
+        for scan_path in scan_paths {
+            for component in scan_path.components() {
+                if let std::path::Component::Normal(seg) = component {
+                    let seg_lower = seg.to_string_lossy().to_lowercase();
+                    if blocked_segments.contains(&seg_lower.as_str()) {
+                        return Err(coded_ctx("settings_download_folder_system_dir", "Cannot use system directory as download folder", &settings.download_folder));
+                    }
                 }
             }
         }
