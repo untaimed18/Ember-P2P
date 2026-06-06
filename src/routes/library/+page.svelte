@@ -39,6 +39,7 @@
 
   import { listen } from '@tauri-apps/api/event';
   import LibraryVirtualTable from '$lib/components/LibraryVirtualTable.svelte';
+  import IconX from '$lib/components/IconX.svelte';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
 
@@ -1801,7 +1802,7 @@
     <div class="modal-content create-coll-modal">
       <div class="modal-header">
         <span class="modal-title">{m.library_create_collection()}</span>
-        <button class="ghost modal-close" onclick={() => createCollectionOpen = false}>&times;</button>
+        <button class="ghost modal-close" onclick={() => createCollectionOpen = false} aria-label={m.common_close()}><IconX size={15} /></button>
       </div>
       <div class="modal-body">
         <div class="form-row">
@@ -3043,6 +3044,12 @@
     min-width: 180px;
     box-shadow: 0 4px 16px rgba(0,0,0,.35);
     font-size: 12px;
+    transform-origin: top left;
+    animation: ctx-menu-pop 0.12s ease;
+  }
+  @keyframes ctx-menu-pop {
+    from { opacity: 0; transform: scale(0.97); }
+    to { opacity: 1; transform: scale(1); }
   }
   .ctx-item {
     display: block;
@@ -3728,15 +3735,24 @@
   }
   .modal-title { font-weight: 600; font-size: 14px; }
   .modal-close {
-    font-size: 18px;
-    line-height: 1;
-    padding: 0 4px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
     cursor: pointer;
-    border: none;
+    border: 1px solid transparent;
+    border-radius: 7px;
     background: none;
     color: var(--text-muted);
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
   }
-  .modal-close:hover { color: var(--text-primary); }
+  .modal-close:hover {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+    background: color-mix(in srgb, var(--danger) 12%, transparent);
+  }
   .modal-body { padding: 16px; overflow-y: auto; flex: 1; }
   .modal-footer {
     display: flex;

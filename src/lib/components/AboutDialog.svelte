@@ -9,6 +9,9 @@
   // metadata. The package field stays as the source of truth for
   // npm/Tauri metadata where the app name appears outside the UI.
 
+  import { fade, scale } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
+
   let { open = $bindable(false) }: { open?: boolean } = $props();
 
   let panelEl: HTMLDivElement | undefined = $state(undefined);
@@ -61,8 +64,13 @@
     tabindex="-1"
     onkeydown={handleKeydown}
     onclick={handleOverlayClick}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
   >
-    <div class="about-panel" bind:this={panelEl}>
+    <div
+      class="about-panel"
+      bind:this={panelEl}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
       <div class="about-brand">
         <div class="about-mark" aria-hidden="true">
           <img src="/icon.png" alt="" width="48" height="48" />
@@ -93,7 +101,6 @@
     align-items: center;
     justify-content: center;
     z-index: 10000;
-    animation: fade-in 0.15s ease;
   }
 
   .about-panel {
@@ -104,7 +111,6 @@
     min-width: 300px;
     max-width: 380px;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.24);
-    animation: dialog-in 0.2s ease;
   }
 
   .about-brand {
@@ -190,25 +196,5 @@
   .about-close:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
-  }
-
-  @keyframes fade-in {
-    from {
-      opacity: 0;
-    }
-    to {
-      opacity: 1;
-    }
-  }
-
-  @keyframes dialog-in {
-    from {
-      opacity: 0;
-      transform: scale(0.96);
-    }
-    to {
-      opacity: 1;
-      transform: scale(1);
-    }
   }
 </style>

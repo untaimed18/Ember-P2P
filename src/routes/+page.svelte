@@ -224,7 +224,6 @@
     rechecking = true;
     try {
       await kadRecheckFirewall();
-      toastSuccess(m.kad_firewall_recheck_initiated());
     } catch (e: unknown) {
       toastError(toErrMsg(e, m.kad_firewall_recheck_failed()));
     } finally {
@@ -515,26 +514,6 @@
   <h2>{m.nav_kad_network()}</h2>
   <div class="header-actions">
     <button
-      class="ghost"
-      onclick={() => openBootstrap('ip')}
-      disabled={$networkStats.status === 'disconnected'}
-      title={m.kad_bootstrap_title()}
-    >
-      {m.kad_bootstrap_button()}
-    </button>
-    <button
-      class="ghost"
-      onclick={handleRecheckFirewall}
-      disabled={!isConnected || rechecking}
-      title={rechecking ? m.kad_firewall_in_progress() : m.kad_firewall_recheck_title()}
-    >
-      {#if rechecking}
-        <span class="spinner-inline" aria-hidden="true"></span> {m.kad_rechecking()}
-      {:else}
-        {m.kad_recheck_firewall()}
-      {/if}
-    </button>
-    <button
       class={$networkStats.status === 'connected' ? 'danger' : ''}
       onclick={handleConnect}
     >
@@ -804,6 +783,29 @@
                $networkStats.buddy_status}
             </span>
           </div>
+        </div>
+
+        <div class="stats-actions">
+          <button
+            class="ghost"
+            onclick={() => openBootstrap('ip')}
+            disabled={$networkStats.status === 'disconnected'}
+            title={m.kad_bootstrap_title()}
+          >
+            {m.kad_bootstrap_button()}
+          </button>
+          <button
+            class="ghost"
+            onclick={handleRecheckFirewall}
+            disabled={!isConnected || rechecking}
+            title={rechecking ? m.kad_firewall_in_progress() : m.kad_firewall_recheck_title()}
+          >
+            {#if rechecking}
+              <span class="spinner-inline" aria-hidden="true"></span> {m.kad_rechecking()}
+            {:else}
+              {m.kad_recheck_firewall()}
+            {/if}
+          </button>
         </div>
       </div>
     </div>
@@ -1386,6 +1388,25 @@
   .stat-group:last-of-type {
     padding-bottom: 0;
     border-bottom: none;
+  }
+
+  /* Action row at the foot of the Network Status panel (Bootstrap /
+     Recheck Firewall). */
+  .stats-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 14px;
+  }
+
+  .stats-actions button {
+    flex: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    font-size: 12px;
+    padding: 7px 10px;
+    white-space: nowrap;
   }
 
   .stat-group-grid {
