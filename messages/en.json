@@ -110,6 +110,7 @@
   "chat_loading_messages": "Loading messages...",
   "chat_no_messages": "No messages yet. Say hi!",
   "chat_failed_to_load": "Failed to load messages.",
+  "chat_live_unavailable": "Live updates unavailable — new messages won't appear until you retry.",
   "chat_failed_to_send": "Failed to send",
   "chat_offline_warning": "{name} appears to be offline. Messages will be delivered when they come online.",
   "chat_status_online": "Online",

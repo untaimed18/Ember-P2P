@@ -214,52 +214,58 @@ export async function closeSearchTab(tabId: string): Promise<void> {
   }
 }
 
+// search-results coalescing buffer + flush scheduling. Hoisted to module
+// scope (rather than living inside initSearchStore) so cleanupSearchStore can
+// cancel a scheduled flush — otherwise a stale rAF/timeout could merge a
+// buffered batch into the tabs we just cleared on teardown/re-init.
+const pendingByRequest = new Map<number, SearchResult[]>();
+let flushScheduled = false;
+let flushRaf: number | null = null;
+let flushTimeout: ReturnType<typeof setTimeout> | null = null;
+
+function flushSearchResults() {
+  flushScheduled = false;
+  flushRaf = null;
+  flushTimeout = null;
+  if (pendingByRequest.size === 0) return;
+  const batch = pendingByRequest;
+  searchTabs.update((tabs) => {
+    let next = tabs;
+    for (const [requestId, incoming] of batch) {
+      next = updateTabByRequestId(next, requestId, (t) => ({
+        ...t,
+        results: mergeSearchResults(t.results, incoming),
+      }));
+    }
+    return next;
+  });
+  batch.clear();
+}
+
+function scheduleFlush() {
+  if (flushScheduled) return;
+  flushScheduled = true;
+  if (typeof requestAnimationFrame === 'function' && typeof document !== 'undefined' && document.visibilityState === 'visible') {
+    flushRaf = requestAnimationFrame(flushSearchResults);
+  } else {
+    // Hidden tab or non-DOM host (SSR / tests): fall back to a macrotask so we
+    // still coalesce but don't hang the burst waiting for a visibilitychange
+    // that might never come.
+    flushTimeout = setTimeout(flushSearchResults, 32);
+  }
+}
+
 export async function initSearchStore() {
   if (initialized) return;
 
   initialized = true;
   const registered: UnlistenFn[] = [];
   try {
-    // Coalesce `search-results` events per request id across one animation
-    // frame. A global-phase KAD/server search commonly streams dozens of
-    // small result batches back-to-back; handling each synchronously meant
-    // rebuilding the tab's full results list (via `mergeSearchResults`,
-    // which spins up a Map over all existing rows) once per event — O(N·B)
-    // work where N is the tab's accumulated results and B is the burst
-    // size. Buffering incoming payloads and flushing once per frame folds
-    // that into a single merge per tab per frame, which is especially
-    // noticeable on large result sets (thousands of rows).
-    const pendingByRequest = new Map<number, SearchResult[]>();
-    let flushScheduled = false;
-    const flushSearchResults = () => {
-      flushScheduled = false;
-      if (pendingByRequest.size === 0) return;
-      const batch = pendingByRequest;
-      searchTabs.update((tabs) => {
-        let next = tabs;
-        for (const [requestId, incoming] of batch) {
-          next = updateTabByRequestId(next, requestId, (t) => ({
-            ...t,
-            results: mergeSearchResults(t.results, incoming),
-          }));
-        }
-        return next;
-      });
-      batch.clear();
-    };
-    const scheduleFlush = () => {
-      if (flushScheduled) return;
-      flushScheduled = true;
-      if (typeof requestAnimationFrame === 'function' && typeof document !== 'undefined' && document.visibilityState === 'visible') {
-        requestAnimationFrame(flushSearchResults);
-      } else {
-        // Hidden tab or non-DOM host (SSR / tests): fall back to a macrotask
-        // so we still coalesce but don't hang the burst waiting for a
-        // visibilitychange that might never come.
-        setTimeout(flushSearchResults, 32);
-      }
-    };
-
+    // `search-results` events are coalesced per request id across one
+    // animation frame via the module-level `pendingByRequest`/`scheduleFlush`
+    // (see above). A global-phase KAD/server search streams dozens of small
+    // batches back-to-back; buffering folds them into one merge per tab per
+    // frame instead of an O(N·B) rebuild per event.
     registered.push(await listen<{ request_id: number; results: SearchResult[] }>('search-results', (event) => {
       const requestId = event.payload.request_id;
       const incoming = event.payload.results;
@@ -340,6 +346,14 @@ export function cleanupSearchStore() {
   for (const unlisten of unlisteners) unlisten();
   unlisteners = [];
   initialized = false;
+  // Cancel any scheduled result flush so a stale rAF/timeout can't merge a
+  // buffered batch into the freshly-cleared tabs after teardown/re-init.
+  if (flushRaf !== null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(flushRaf);
+  if (flushTimeout !== null) clearTimeout(flushTimeout);
+  flushRaf = null;
+  flushTimeout = null;
+  flushScheduled = false;
+  pendingByRequest.clear();
   searchTabs.set([]);
   activeSearchTabId.set(null);
 }

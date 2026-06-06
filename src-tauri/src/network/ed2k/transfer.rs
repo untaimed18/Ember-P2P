@@ -483,17 +483,18 @@ impl Ed2kDownload {
             }
         }
         if let Some(ref filter) = self.ip_filter {
-            if let Ok(snap) = filter.read() {
-                if snap.is_blocked(*ip) {
-                    return true;
-                }
+            // Recover the guard if the lock is poisoned (a writer panicked)
+            // instead of skipping the check — silently bypassing the IP filter
+            // would let a banned/filtered peer through (fail-open security hole).
+            let snap = filter.read().unwrap_or_else(|e| e.into_inner());
+            if snap.is_blocked(*ip) {
+                return true;
             }
         }
         if let Some(ref banned) = self.banned_ips {
-            if let Ok(set) = banned.read() {
-                if set.contains(ip) {
-                    return true;
-                }
+            let set = banned.read().unwrap_or_else(|e| e.into_inner());
+            if set.contains(ip) {
+                return true;
             }
         }
         false

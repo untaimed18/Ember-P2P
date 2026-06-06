@@ -110,6 +110,7 @@
   "chat_loading_messages": "Cargando mensajes...",
   "chat_no_messages": "Aún no hay mensajes. ¡Saluda!",
   "chat_failed_to_load": "No se pudieron cargar los mensajes.",
+  "chat_live_unavailable": "Actualizaciones en vivo no disponibles: los mensajes nuevos no aparecerán hasta que reintentes.",
   "chat_failed_to_send": "Error al enviar",
   "chat_offline_warning": "{name} parece estar desconectado. Los mensajes se entregarán cuando vuelva a estar en línea.",
   "chat_status_online": "En línea",

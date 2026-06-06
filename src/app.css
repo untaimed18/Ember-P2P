@@ -369,6 +369,14 @@ td {
   transition: background-color var(--transition-fast) ease;
 }
 
+/* Virtualized lists reuse <tr> nodes across scroll and flip their zebra
+   (row-alt) parity on the reused row, so a background-color transition would
+   shimmer while scrolling. Opt those rows out — hover stays instant there
+   (fine for dense data tables) while normal tables keep the smooth fade. */
+tr.virtual-row td {
+  transition: none;
+}
+
 tr:hover td {
   background: var(--bg-hover);
 }

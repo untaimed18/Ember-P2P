@@ -950,6 +950,11 @@ impl CreditManager {
             };
             let pk_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
             offset += 2;
+            // Public keys are at most a few hundred bytes; an absurd length
+            // means a corrupt/hostile clients.met, so stop parsing the rest.
+            if pk_len > 4096 {
+                break;
+            }
             let public_key = if offset + pk_len <= data.len() {
                 let pk = data[offset..offset + pk_len].to_vec();
                 offset += pk_len;

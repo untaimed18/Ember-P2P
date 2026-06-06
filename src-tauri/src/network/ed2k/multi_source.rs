@@ -655,9 +655,10 @@ impl MultiSourceDownload {
         let tracker = Arc::new(RwLock::new(pt));
 
         if let Some(ref registry) = self.tracker_registry {
-            if let Ok(mut reg) = registry.lock() {
-                reg.insert(self.transfer_id.clone(), tracker.clone());
-            }
+            // Recover the guard on poisoning so the tracker is still registered
+            // (otherwise its .part.met may never be persisted on shutdown).
+            let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+            reg.insert(self.transfer_id.clone(), tracker.clone());
         }
 
         // If .part.met shows progress but the .part file is missing, the tracker
@@ -2810,9 +2811,10 @@ impl MultiSourceDownload {
         }
 
         if let Some(ref registry) = self.tracker_registry {
-            if let Ok(mut reg) = registry.lock() {
-                reg.remove(&self.transfer_id);
-            }
+            // Recover the guard on poisoning so the completed transfer's entry
+            // is still removed rather than leaking a stale tracker.
+            let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+            reg.remove(&self.transfer_id);
         }
 
         Ok(())
@@ -3002,17 +3004,18 @@ async fn download_parts_from_source(
             }
         }
         if let Some(ref filter) = sx_ip_filter {
-            if let Ok(snap) = filter.read() {
-                if snap.is_blocked(*ip) {
-                    return true;
-                }
+            // Recover the guard if the lock is poisoned (a writer panicked)
+            // instead of skipping the check — silently bypassing the IP filter
+            // would let a banned/filtered peer through (fail-open security hole).
+            let snap = filter.read().unwrap_or_else(|e| e.into_inner());
+            if snap.is_blocked(*ip) {
+                return true;
             }
         }
         if let Some(ref banned) = sx_banned_ips {
-            if let Ok(set) = banned.read() {
-                if set.contains(ip) {
-                    return true;
-                }
+            let set = banned.read().unwrap_or_else(|e| e.into_inner());
+            if set.contains(ip) {
+                return true;
             }
         }
         false
