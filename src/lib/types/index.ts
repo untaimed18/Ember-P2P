@@ -156,6 +156,12 @@ export interface SpamStats {
   spam_source_ips: number;
 }
 
+export interface DownloadHistoryStats {
+  completed: number;
+  cancelled: number;
+  total: number;
+}
+
 export interface SpamExplanation {
   score: number;
   threshold: number;

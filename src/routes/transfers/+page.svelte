@@ -3798,22 +3798,64 @@
 
   /* --- Splitter --- */
   .splitter-bar {
+    position: relative;
     appearance: none;
-    border: none;
+    display: block;
+    box-sizing: border-box;
     width: 100%;
     flex-shrink: 0;
-    height: 4px;
+    height: 6px;
+    margin: 0;
+    padding: 0;
+    border: none;
+    border-radius: 0;
     background: var(--border);
     cursor: row-resize;
+    color: inherit;
+    font: inherit;
+    font-weight: inherit;
+    transform: none;
+    box-shadow: none;
+    will-change: auto;
     transition: background 0.1s;
   }
-  .splitter-bar:hover, .splitter-bar.dragging {
+  .splitter-bar::after {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 10px;
+    height: 10px;
+    transform: translate(-50%, -50%);
+    background: var(--bg-secondary);
+    border: 1px solid color-mix(in srgb, var(--border) 70%, var(--text-muted));
+    border-radius: 2px;
+    box-sizing: border-box;
+    pointer-events: none;
+    transition: border-color 0.1s, background 0.1s;
+  }
+  .splitter-bar:hover,
+  .splitter-bar.dragging {
     background: var(--accent);
+    color: inherit;
+    transform: none;
+  }
+  .splitter-bar:hover::after,
+  .splitter-bar.dragging::after {
+    border-color: var(--accent);
+    background: var(--bg-primary);
   }
   .splitter-bar:focus-visible {
     background: var(--accent);
     outline: 2px solid var(--accent);
     outline-offset: -1px;
+    transform: none;
+  }
+  .splitter-bar:focus-visible::after {
+    border-color: var(--accent);
+  }
+  .splitter-bar:active:not(:disabled) {
+    transform: none;
   }
 
   /* --- Tables --- */
@@ -3985,7 +4027,8 @@
     font-size: 11px;
   }
   .progress-cell {
-    padding: 4px 6px;
+    padding: 2px 6px;
+    vertical-align: middle;
   }
   .bar-cell {
     padding: 4px 6px;
