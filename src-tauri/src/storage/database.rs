@@ -1643,6 +1643,22 @@ impl Database {
         conn.execute("DELETE FROM download_history WHERE status = ?1", params![status])?;
         Ok(())
     }
+
+    /// Count download-history rows by status for the settings summary.
+    pub fn get_download_history_counts(&self) -> anyhow::Result<(i64, i64)> {
+        let conn = self.conn.lock();
+        let completed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM download_history WHERE status = 'completed'",
+            [],
+            |row| row.get(0),
+        )?;
+        let cancelled: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM download_history WHERE status = 'cancelled'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((completed, cancelled))
+    }
 }
 
 #[cfg(test)]
