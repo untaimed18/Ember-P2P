@@ -17,6 +17,7 @@
   import { applyDocumentLang, translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
   import { getSettings, hideToTray, quitApp, setCloseBehavior } from '$lib/api/settings';
+  import { toastWarning } from '$lib/stores/toast';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -97,6 +98,24 @@
     showCloseDialog = true;
   }).catch((e) => {
     console.error('Failed to register close-requested listener:', e);
+    return (() => {}) as UnlistenFn;
+  });
+
+  // Surface a corrupt-config recovery (backend reset settings to defaults and
+  // preserved the original as a .bak). Registered at module scope so it's
+  // active before the backend's delayed emit fires.
+  const configCorruptListenerPromise: Promise<UnlistenFn> = listen<{ backup_path: string }>(
+    'config-corrupt-recovered',
+    (event) => {
+      const path = event.payload?.backup_path ?? '';
+      toastWarning(
+        path
+          ? m.layout_config_corrupt_backup({ path })
+          : m.layout_config_corrupt(),
+      );
+    },
+  ).catch((e) => {
+    console.error('Failed to register config-corrupt listener:', e);
     return (() => {}) as UnlistenFn;
   });
 
@@ -217,6 +236,7 @@
       cleanupSearchStore();
       cleanupFriendsStore();
       void closeListenerPromise.then((unlisten) => unlisten());
+      void configCorruptListenerPromise.then((unlisten) => unlisten());
     };
   });
 </script>

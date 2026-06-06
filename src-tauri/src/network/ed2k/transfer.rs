@@ -2460,21 +2460,25 @@ impl Ed2kDownload {
                             let piece_len = end - start;
                             self.acquire_download_bandwidth(piece_len).await;
 
-                            // Never overwrite bytes we already have. A duplicate
-                            // or malicious re-send of an already-filled (possibly
-                            // MD4-verified) range would otherwise replace
-                            // verified-good data on disk while `part_verified`
-                            // stays set, which the upload path then serves as
-                            // safe. Mirror the multi-source D21 gap guard; only
-                            // the disk write + gap fill are skipped, the transfer
-                            // counters below still account the bytes.
-                            if tracker.newly_fillable(start, end) > 0 {
+                            // Never overwrite bytes we already have. Write ONLY the
+                            // gap sub-ranges of this block, not the whole block: a
+                            // duplicate/overlapping (or cross-part) re-send must not
+                            // replace already-present, possibly MD4-verified, data on
+                            // disk while `part_verified` stays set (which the upload
+                            // path then serves as safe). The transfer counters below
+                            // still account the full piece.
+                            let fill_subranges = tracker.fillable_subranges(start, end);
+                            if !fill_subranges.is_empty() {
                                 // Per-file writer thread serializes the writes for
                                 // us; await is just an mpsc round-trip.
-                                output
-                                    .write(start, data.to_vec())
-                                    .await
-                                    .map_err(|e| anyhow::anyhow!("part write at {start}: {e}"))?;
+                                for &(gs, ge) in &fill_subranges {
+                                    let off = (gs - start) as usize;
+                                    let len = (ge - gs) as usize;
+                                    output
+                                        .write(gs, data[off..off + len].to_vec())
+                                        .await
+                                        .map_err(|e| anyhow::anyhow!("part write at {gs}: {e}"))?;
+                                }
 
                                 // Update byte-level gap tracker for mid-part resume
                                 tracker.fill_range(start, end);
@@ -2501,8 +2505,12 @@ impl Ed2kDownload {
                             blocks_received_in_current_req += 1;
                             speed_measure_bytes += piece_len;
 
-                            // D12: defer credit until the part verifies.
-                            pending_credit_bytes = pending_credit_bytes.saturating_add(piece_len);
+                            // D12: defer credit until the part verifies. Credit only
+                            // the bytes actually written (gap-overlap sub-ranges), not
+                            // the full wire piece — a duplicate/overlapping block adds
+                            // no new data and must not inflate the peer's credit.
+                            let newly_written: u64 = fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
+                            pending_credit_bytes = pending_credit_bytes.saturating_add(newly_written);
 
                             if last_progress_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
                                 let _ = event_tx
@@ -2573,14 +2581,20 @@ impl Ed2kDownload {
                             consecutive_bad_blocks = 0;
                             self.acquire_download_bandwidth(piece_len).await;
 
-                            // D21 (compressed): never overwrite already-present
-                            // (possibly verified) bytes — see the uncompressed
-                            // branch above.
-                            if tracker.newly_fillable(start, start + piece_len) > 0 {
-                                output
-                                    .write(start, decompressed)
-                                    .await
-                                    .map_err(|e| anyhow::anyhow!("part write at {start}: {e}"))?;
+                            // D21 (compressed): write ONLY the gap sub-ranges of the
+                            // decompressed block, never the whole block — see the
+                            // uncompressed branch above. Prevents an overlapping or
+                            // cross-part block from clobbering verified bytes.
+                            let fill_subranges = tracker.fillable_subranges(start, start + piece_len);
+                            if !fill_subranges.is_empty() {
+                                for &(gs, ge) in &fill_subranges {
+                                    let off = (gs - start) as usize;
+                                    let len = (ge - gs) as usize;
+                                    output
+                                        .write(gs, decompressed[off..off + len].to_vec())
+                                        .await
+                                        .map_err(|e| anyhow::anyhow!("part write at {gs}: {e}"))?;
+                                }
                                 tracker.fill_range(start, start + piece_len);
 
                                 if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
@@ -2605,8 +2619,12 @@ impl Ed2kDownload {
                             blocks_received_in_current_req += 1;
                             speed_measure_bytes += piece_len;
 
-                            // D12: defer credit until the part verifies.
-                            pending_credit_bytes = pending_credit_bytes.saturating_add(piece_len);
+                            // D12: defer credit until the part verifies. Credit only
+                            // the bytes actually written (gap-overlap sub-ranges), not
+                            // the full wire piece — a duplicate/overlapping block adds
+                            // no new data and must not inflate the peer's credit.
+                            let newly_written: u64 = fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
+                            pending_credit_bytes = pending_credit_bytes.saturating_add(newly_written);
 
                             if last_progress_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
                                 let _ = event_tx

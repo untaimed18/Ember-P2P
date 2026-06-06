@@ -220,6 +220,8 @@
   "layout_settings_load_error": "No se pudo cargar la configuración. Reinicia la aplicación.",
   "layout_settings_load_error_detail": "No se pudo cargar la configuración: {detail}. Reinicia la aplicación.",
   "layout_init_failed": "No se pudo iniciar. Reinicia la aplicación.",
+  "layout_config_corrupt": "Tu archivo de configuración estaba dañado y se ha restablecido a los valores predeterminados.",
+  "layout_config_corrupt_backup": "Tu archivo de configuración estaba dañado y se ha restablecido a los valores predeterminados. Se guardó una copia de seguridad del original en {path}.",
 
   "speed_input_unlimited": "Sin límite",
   "speed_input_unlimited_aria": "Sin límite — activa para fijar uno",

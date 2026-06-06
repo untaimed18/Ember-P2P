@@ -230,18 +230,30 @@ impl PartTracker {
     /// of 0 means every byte in the range is already on disk — writing it
     /// again would risk clobbering data in a part that another source may have
     /// already MD4-verified, so callers should skip the disk write.
-    pub fn newly_fillable(&self, start: u64, end: u64) -> u64 {
+    /// Return the sub-ranges of `[start, end)` that currently overlap gaps
+    /// (i.e. bytes we do NOT yet have). Callers write only these sub-ranges
+    /// from a received block so that bytes already present on disk —
+    /// including bytes belonging to an adjacent part that is already
+    /// complete and MD4-verified — are never clobbered by a later
+    /// (possibly malicious) block that overlaps both a gap and good data.
+    /// The trailing `fill_range(start, end)` is still idempotent over the
+    /// non-gap portions, so gap accounting is unchanged.
+    pub fn fillable_subranges(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
         if start >= end {
-            return 0;
+            return Vec::new();
         }
-        let mut fillable: u64 = 0;
+        let mut out = Vec::new();
         for &(gs, ge) in &self.gaps {
             if ge <= start || gs >= end {
                 continue;
             }
-            fillable += ge.min(end) - gs.max(start);
+            let s = gs.max(start);
+            let e = ge.min(end);
+            if s < e {
+                out.push((s, e));
+            }
         }
-        fillable
+        out
     }
 
     /// Record that bytes in [start, end) have been received.
