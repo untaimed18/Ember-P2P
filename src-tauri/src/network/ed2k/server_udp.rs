@@ -658,8 +658,14 @@ fn parse_media_length_str(s: &str) -> Option<u32> {
         .map(|p| p.trim().parse::<u32>().ok())
         .collect::<Option<Vec<u32>>>()?;
     match parts.as_slice() {
-        [h, m, sec] => Some(h * 3600 + m * 60 + sec),
-        [m, sec] => Some(m * 60 + sec),
+        // Saturating: a malicious/garbage wire string like "99999:99999:99999"
+        // would otherwise wrap in release and report a nonsense duration.
+        [h, m, sec] => Some(
+            h.saturating_mul(3600)
+                .saturating_add(m.saturating_mul(60))
+                .saturating_add(*sec),
+        ),
+        [m, sec] => Some(m.saturating_mul(60).saturating_add(*sec)),
         [sec] => Some(*sec),
         _ => None,
     }
@@ -740,7 +746,19 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
         let mut comment: Option<String> = None;
         let mut media = crate::types::MediaMetadata::default();
 
-        let applied_tags = tag_count.min(50);
+        // Consume up to MAX_APPLIED_TAGS tags. The old cap of 50 stopped parsing
+        // the WHOLE packet whenever a (benign) record declared >50 tags, because
+        // the surplus tag bytes were never consumed and the cursor desynced —
+        // dropping every subsequent result. Real search results carry well under
+        // a dozen tags, so 256 keeps the cursor aligned for any realistic record
+        // while still treating an absurd count as abusive (break below).
+        const MAX_APPLIED_TAGS: usize = 256;
+        // Cap a single tag-name length the same way the TCP parser does
+        // (read_tag_header's MAX_TAG_NAME_LEN). Otherwise a malicious reply could
+        // declare names up to the ~64 KiB UDP payload size, forcing large
+        // transient allocations (×tags ×results).
+        const MAX_UDP_TAG_NAME_LEN: usize = 256;
+        let applied_tags = tag_count.min(MAX_APPLIED_TAGS);
         let mut tags_in_sync = true;
         for _ in 0..applied_tags {
             let raw_type = cursor.read_u8().ok()?;
@@ -754,6 +772,9 @@ fn parse_search_results(payload: &[u8]) -> Option<ServerUdpResponse> {
                     let n = cursor.read_u8().ok()?;
                     (n, raw_type, None)
                 } else {
+                    if name_len > MAX_UDP_TAG_NAME_LEN {
+                        return None;
+                    }
                     // Bound the name allocation by the bytes actually left in
                     // the packet so a bogus length can't force a large transient
                     // buffer (the read would fail anyway).

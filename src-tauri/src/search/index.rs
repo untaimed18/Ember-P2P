@@ -238,12 +238,24 @@ impl LocalIndex {
         }
 
         if let Some((moved_path, moved_hash, moved_tokens)) = moved_key {
+            // The moved element previously lived at `last_idx`; repoint all of
+            // its index entries to `pos`. The removed-file cleanup above only
+            // stripped the *removed* file's hash/tokens (which usually differ
+            // from the moved file's), so we must explicitly remove the stale
+            // `last_idx` from the moved file's own buckets before adding `pos`.
+            // Without this, `hash_map`/`name_tokens` accumulate dangling indices
+            // (out-of-bounds, or pointing at an unrelated file once the slot is
+            // reused) until the next full `rebuild()`.
             self.path_map.insert(normalize_path_key(&moved_path), pos);
             if !moved_hash.is_empty() {
-                self.hash_map.entry(moved_hash).or_default().push(pos);
+                let v = self.hash_map.entry(moved_hash).or_default();
+                v.retain(|&i| i != last_idx && i != pos);
+                v.push(pos);
             }
             for token in moved_tokens {
-                self.name_tokens.entry(token).or_default().push(pos);
+                let v = self.name_tokens.entry(token).or_default();
+                v.retain(|&i| i != last_idx && i != pos);
+                v.push(pos);
             }
         }
 

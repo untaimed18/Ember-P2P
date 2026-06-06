@@ -5576,19 +5576,37 @@ async fn download_parts_from_source(
                     // gap; duplicate bytes still flow through the request-
                     // pipeline bookkeeping below (skipping it here could stall
                     // the pipeline refill that keys off blocks_received).
-                    let fillable = {
+                    // D21: write ONLY the gap sub-ranges of this block, never the
+                    // whole block. With several sources in flight (and cross-part
+                    // pipelining) a block can overlap bytes we already wrote — and
+                    // a malformed/hostile block can even span into an adjacent part
+                    // that is already complete and MD4-verified. Writing the whole
+                    // block would clobber that verified-good data on disk (which the
+                    // upload path then serves as "safe"), with corruption only caught
+                    // at the final whole-file hash. Trimming the write to actual gaps
+                    // preserves verified bytes; `fill_range` below stays idempotent.
+                    let fill_subranges = {
                         let t = tracker.read().await;
-                        t.newly_fillable(start, end)
+                        t.fillable_subranges(start, end)
                     };
-                    if fillable > 0 {
-                        // D20: only commit the fill_range to the tracker if the
-                        // disk write actually succeeded. The PartFileWriter
-                        // serializes the writes for us — this `await` is just
-                        // an mpsc round-trip, not a global file lock acquisition.
-                        if let Err(e) = output.write(start, data.to_vec()).await {
-                            tracing::warn!(
-                                "source {_src_idx}: disk write failed at start={start} ({piece_len} bytes): {e}"
-                            );
+                    if !fill_subranges.is_empty() {
+                        // D20: only commit the fill_range to the tracker if every
+                        // sub-range disk write actually succeeded. The PartFileWriter
+                        // serializes the writes for us — this `await` is just an mpsc
+                        // round-trip, not a global file lock acquisition.
+                        let mut write_ok = true;
+                        for &(gs, ge) in &fill_subranges {
+                            let off = (gs - start) as usize;
+                            let len = (ge - gs) as usize;
+                            if let Err(e) = output.write(gs, data[off..off + len].to_vec()).await {
+                                tracing::warn!(
+                                    "source {_src_idx}: disk write failed at start={gs} ({len} bytes): {e}"
+                                );
+                                write_ok = false;
+                                break;
+                            }
+                        }
+                        if !write_ok {
                             continue;
                         }
 
@@ -5629,8 +5647,14 @@ async fn download_parts_from_source(
                     // pre-pipelined next part — bucket by absolute
                     // offset so a Mismatch on part N doesn't wipe
                     // legitimate part N+1 credit.
+                    //
+                    // Credit only the bytes we actually WROTE (the gap-overlap
+                    // sub-ranges), never the full wire piece: a duplicate or
+                    // overlapping block contributes no new data and must not
+                    // inflate the peer's credit ledger.
+                    let newly_written: u64 = fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
                     let block_part = (start / PARTSIZE) as usize;
-                    *per_part_credit.entry(block_part).or_insert(0) += piece_len;
+                    *per_part_credit.entry(block_part).or_insert(0) += newly_written;
                     if block_part == part_idx {
                         bytes_received_this_part += piece_len;
                         chunks_received_this_part += 1;
@@ -5688,24 +5712,29 @@ async fn download_parts_from_source(
                     bw.acquire_download(piece_len).await;
 
                     // D21 (compressed): mirror the uncompressed gap guard above.
-                    // Never overwrite bytes we already have — a duplicate or
-                    // overlapping compressed block from another source can cover
-                    // a range we already wrote and possibly MD4-verified.
-                    // `fill_range` leaves `part_verified` set when a write adds no
-                    // new bytes, so re-writing would silently replace
-                    // verified-good data on disk (which the upload path then
-                    // serves as safe). Only write/record bytes that overlap a
-                    // gap; duplicate bytes still flow through the pipeline
-                    // bookkeeping below.
-                    let fillable = {
+                    // Write ONLY the gap sub-ranges of the decompressed block,
+                    // never the whole block — a duplicate/overlapping (or
+                    // cross-part) compressed block must not clobber bytes we
+                    // already have, including verified bytes of an adjacent part
+                    // (which the upload path would then serve as "safe").
+                    let fill_subranges = {
                         let t = tracker.read().await;
-                        t.newly_fillable(start, start + piece_len)
+                        t.fillable_subranges(start, start + piece_len)
                     };
-                    if fillable > 0 {
-                        if let Err(e) = output.write(start, decompressed).await {
-                            tracing::warn!(
-                                "source {_src_idx}: compressed disk write failed at start={start} ({piece_len} bytes): {e}"
-                            );
+                    if !fill_subranges.is_empty() {
+                        let mut write_ok = true;
+                        for &(gs, ge) in &fill_subranges {
+                            let off = (gs - start) as usize;
+                            let len = (ge - gs) as usize;
+                            if let Err(e) = output.write(gs, decompressed[off..off + len].to_vec()).await {
+                                tracing::warn!(
+                                    "source {_src_idx}: compressed disk write failed at start={gs} ({len} bytes): {e}"
+                                );
+                                write_ok = false;
+                                break;
+                            }
+                        }
+                        if !write_ok {
                             continue;
                         }
 
@@ -5739,9 +5768,11 @@ async fn download_parts_from_source(
                     blocks_received_in_current_req += 1;
                     speed_bytes += piece_len;
                     // Per-part credit bucket; see uncompressed branch
-                    // above for rationale.
+                    // above for rationale. Credit only the bytes actually
+                    // written (gap-overlap), not the full decompressed piece.
+                    let newly_written: u64 = fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
                     let block_part = (start / PARTSIZE) as usize;
-                    *per_part_credit.entry(block_part).or_insert(0) += piece_len;
+                    *per_part_credit.entry(block_part).or_insert(0) += newly_written;
                     if block_part == part_idx {
                         bytes_received_this_part += piece_len;
                         chunks_received_this_part += 1;

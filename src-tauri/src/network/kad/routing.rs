@@ -1095,10 +1095,27 @@ impl RoutingTable {
 
     pub fn mark_verified(&mut self, id: &KadId) {
         let distance = self.local_id.xor_distance(id);
-        let Some(bin) = self.root.find_bin_mut(&distance) else { return; };
-        if let Some(contact) = bin.get_contact_mut(id) {
-            contact.verified = true;
-            contact.update_type();
+        if let Some(bin) = self.root.find_bin_mut(&distance) {
+            if let Some(contact) = bin.get_contact_mut(id) {
+                contact.verified = true;
+                contact.update_type();
+                return;
+            }
+        }
+        // K12 fallback (see `remove`): after a zone split a contact can live in
+        // a leaf that no longer matches its XOR-distance fast path. Without this
+        // scan, HelloResAck verification would spuriously fail for such contacts
+        // and they'd never be marked verified (so never usable for lookups).
+        let mut leaves: Vec<&mut RoutingZone> = Vec::new();
+        collect_leaves_mut(&mut self.root, &mut leaves);
+        for zone in leaves {
+            if let Some(bin) = zone.bin.as_mut() {
+                if let Some(contact) = bin.get_contact_mut(id) {
+                    contact.verified = true;
+                    contact.update_type();
+                    return;
+                }
+            }
         }
     }
 
@@ -1218,12 +1235,43 @@ impl RoutingTable {
 
     pub fn get_contact(&self, id: &KadId) -> Option<&KadContact> {
         let distance = self.local_id.xor_distance(id);
-        self.root.find_bin(&distance)?.get_contact(id)
+        if let Some(bin) = self.root.find_bin(&distance) {
+            if let Some(c) = bin.get_contact(id) {
+                return Some(c);
+            }
+        }
+        // K12 fallback (see `remove`): a contact re-homed by a zone split may
+        // not be reachable via the XOR-distance fast path. Scan all leaves so
+        // lookups (publish-ack matching, is_acceptable_contact, etc.) don't
+        // spuriously miss a contact that is still in the table.
+        self.all_contacts().find(|c| c.id == *id)
     }
 
     pub fn get_contact_mut(&mut self, id: &KadId) -> Option<&mut KadContact> {
         let distance = self.local_id.xor_distance(id);
-        self.root.find_bin_mut(&distance)?.get_contact_mut(id)
+        // Two-phase to satisfy the borrow checker: probe the fast-path bin
+        // immutably, and only take the mutable borrow on the return path.
+        if self
+            .root
+            .find_bin(&distance)
+            .is_some_and(|b| b.get_contact(id).is_some())
+        {
+            return self
+                .root
+                .find_bin_mut(&distance)
+                .and_then(|b| b.get_contact_mut(id));
+        }
+        // K12 fallback (see `remove`): scan every leaf for a split-rehomed contact.
+        let mut leaves: Vec<&mut RoutingZone> = Vec::new();
+        collect_leaves_mut(&mut self.root, &mut leaves);
+        for zone in leaves {
+            if let Some(bin) = zone.bin.as_mut() {
+                if let Some(contact) = bin.get_contact_mut(id) {
+                    return Some(contact);
+                }
+            }
+        }
+        None
     }
 
     // K3: kept for future explicit-trust callers; see RoutingZone counterpart.

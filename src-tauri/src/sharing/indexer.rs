@@ -104,7 +104,11 @@ impl FileIndexer {
             .unwrap_or_default();
 
         let path_str = path.to_string_lossy().to_string();
-        let temp_id = format!("pending:{:x}", temp_hash(path_str.as_bytes()));
+        // Use the full path (not a 64-bit hash) so the temporary id is unique
+        // per file. A hashed id can collide for two distinct paths, and
+        // `remove_file_by_id` removes the first match — which could drop the
+        // wrong pending entry during concurrent hashing.
+        let temp_id = format!("pending:{path_str}");
 
         Ok(FileInfo {
             id: temp_id,
@@ -147,11 +151,4 @@ impl FileIndexer {
         hash_file_combined_cancellable(path, cancelled)
     }
 
-}
-
-fn temp_hash(data: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    data.hash(&mut h);
-    h.finish()
 }

@@ -188,7 +188,10 @@ pub async fn add_shared_folder(
     let canonical_str = canonical.to_string_lossy().to_string();
     let save_data = {
         let mut config = state.config.write().await;
-        if !config.settings.shared_folders.contains(&canonical_str) {
+        // Case-insensitive on Windows: `Vec::contains` is case-sensitive, so
+        // adding `C:\Media` then `c:\media` would store both, double-scan, and
+        // make later unshare/remove (which use paths_equal_ignore_case) inconsistent.
+        if !config.settings.shared_folders.iter().any(|f| paths_equal_ignore_case(f, &canonical_str)) {
             config.settings.shared_folders.push(canonical_str.clone());
             Some(config.prepare_save().map_err(|e| coded_ctx("sharing_config_save_error", "Config save error", e))?)
         } else {
@@ -201,7 +204,7 @@ pub async fn add_shared_folder(
     }
     {
         let mut live = state.upload_shared_folders.write().await;
-        if !live.contains(&canonical_str) {
+        if !live.iter().any(|f| paths_equal_ignore_case(f, &canonical_str)) {
             live.push(canonical_str.clone());
         }
     }
@@ -584,16 +587,30 @@ pub async fn get_file_media_metadata(
     state: tauri::State<'_, AppState>,
     file_path: String,
 ) -> Result<Option<crate::types::MediaMetadata>, String> {
-    {
+    if file_path.len() > MAX_PATH_LEN {
+        return Err(coded_ctx("sharing_file_path_too_long", format!("File path exceeds {MAX_PATH_LEN} bytes"), MAX_PATH_LEN));
+    }
+    let allowed_dirs = {
         let config = state.config.read().await;
-        if !file_in_shared_folders(&file_path, &config.settings.shared_folders) {
+        shared_access_dirs(&config)
+    };
+    tokio::task::spawn_blocking(move || {
+        // Canonicalize + containment-check (mirrors open_shared_file /
+        // delete_shared_file) rather than a string-prefix match. A path that
+        // normalizes under a shared folder but resolves via symlink/junction to
+        // an arbitrary location must not be probable through this IPC surface.
+        let path = std::path::Path::new(&file_path);
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| coded_ctx("sharing_invalid_path", "Invalid path", e))?;
+        if !crate::security::is_path_within_dirs(&canonical, &allowed_dirs) {
             return Err(coded("sharing_file_not_shared", "File is not in a shared folder"));
         }
-    }
-    let path = file_path;
-    tokio::task::spawn_blocking(move || extract_media_metadata(&path))
-        .await
-        .map_err(|e| coded_ctx("sharing_media_task_failed", "Media task failed", e))
+        let cstr = canonical.to_string_lossy();
+        Ok(extract_media_metadata(&cstr))
+    })
+    .await
+    .map_err(|e| coded_ctx("sharing_media_task_failed", "Media task failed", e))?
 }
 
 /// Current per-folder default upload priorities (folder path -> priority).
