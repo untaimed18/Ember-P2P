@@ -701,6 +701,36 @@ pub async fn get_download_history(
         .map_err(|e| e.to_string())
 }
 
+/// Download history row counts for the settings page summary.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DownloadHistoryStats {
+    pub completed: u64,
+    pub cancelled: u64,
+    pub total: u64,
+}
+
+/// Return completed / cancelled / total download-history counts.
+#[tauri::command]
+pub async fn get_download_history_stats(
+    state: tauri::State<'_, AppState>,
+) -> Result<DownloadHistoryStats, String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<DownloadHistoryStats> {
+        let (completed, cancelled) = db.get_download_history_counts()?;
+        let completed = completed.max(0) as u64;
+        let cancelled = cancelled.max(0) as u64;
+        Ok(DownloadHistoryStats {
+            completed,
+            cancelled,
+            total: completed + cancelled,
+        })
+    })
+    .await
+    .map_err(|e| coded_ctx("search_task_failed", "Task failed", e))?
+    .map_err(|e| e.to_string())
+}
+
 /// Clear download history entries by status ("completed", "cancelled", or "all").
 #[tauri::command]
 pub async fn clear_download_history(

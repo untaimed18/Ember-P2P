@@ -30,13 +30,17 @@
     class="progress-fill"
     style="width: {percentage}%; background: {resolvedColor};"
   ></div>
-  <span class="progress-text">{percentage.toFixed(1)}%</span>
+  <span class="progress-text progress-text-track">{percentage.toFixed(1)}%</span>
+  <span
+    class="progress-text progress-text-fill"
+    style="clip-path: inset(0 calc(100% - {percentage}%) 0 0);"
+  >{percentage.toFixed(1)}%</span>
 </div>
 
 <style>
   .progress-bar {
     position: relative;
-    height: 14px;
+    height: 16px;
     background: var(--bg-input);
     border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
     border-radius: 2px;
@@ -45,7 +49,10 @@
   }
 
   .progress-fill {
-    height: 100%;
+    position: absolute;
+    top: 0;
+    left: 0;
+    bottom: 0;
     border-radius: 1px;
     transition: width 0.3s ease;
   }
@@ -58,6 +65,17 @@
     justify-content: center;
     font-size: 11px;
     font-weight: 600;
+    pointer-events: none;
+  }
+
+  .progress-text-track {
     color: var(--text-primary);
+    z-index: 1;
+  }
+
+  .progress-text-fill {
+    color: #fff;
+    z-index: 2;
+    transition: clip-path 0.3s ease;
   }
 </style>

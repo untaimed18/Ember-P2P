@@ -1,6 +1,6 @@
 <script lang="ts">
   import { getSettings, updateSettings, downloadNodesDat, downloadIpfilter } from '$lib/api/settings';
-  import { getSpamStats, resetSpamFilter, clearDownloadHistory } from '$lib/api/search';
+  import { getSpamStats, resetSpamFilter, clearDownloadHistory, getDownloadHistoryStats } from '$lib/api/search';
   import {
     getAntileechPatterns,
     setAntileechPatterns,
@@ -10,7 +10,7 @@
   import type { AntiLeechSnapshot } from '$lib/types';
   import { invoke } from '@tauri-apps/api/core';
   import { relaunch } from '@tauri-apps/plugin-process';
-  import type { AppSettings, SpamStats } from '$lib/types';
+  import type { AppSettings, SpamStats, DownloadHistoryStats } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import { theme, applyTheme, type Theme } from '$lib/stores/theme';
   import {
@@ -79,6 +79,21 @@
   let pendingRestartReason = $state('');
 
   let historyClearMsg: string | null = $state(null);
+  let historyStats: DownloadHistoryStats | null = $state(null);
+  let historyStatsLoading = $state(false);
+  let historyStatsError: string | null = $state(null);
+
+  async function refreshHistoryStats() {
+    historyStatsLoading = true;
+    historyStatsError = null;
+    try {
+      historyStats = await getDownloadHistoryStats();
+    } catch (e) {
+      historyStatsError = translateError(e, m.settings_history_stats_failed());
+    } finally {
+      historyStatsLoading = false;
+    }
+  }
 
   async function handleClearHistory(status: string) {
     try {
@@ -89,6 +104,7 @@
           ? m.settings_history_cleared_completed()
           : m.settings_history_cleared_cancelled();
       trackedTimeout(() => { historyClearMsg = null; }, 3000);
+      await refreshHistoryStats();
     } catch (e) {
       historyClearMsg = m.settings_history_clear_failed({ error: translateError(e) });
     }
@@ -159,6 +175,7 @@
 
   onMount(() => {
     refreshSpamStats();
+    refreshHistoryStats();
     getSettings()
       .then((s) => {
         // Seed the antileech toggle baseline BEFORE assigning `settings`
@@ -985,11 +1002,38 @@
             <span class="field-hint">
               {m.settings_download_history_hint()}
             </span>
-            <div class="btn-row" style="margin-top: 6px; gap: 8px;">
-              <button class="ghost" onclick={() => handleClearHistory('completed')}>{m.settings_clear_completed()}</button>
-              <button class="ghost" onclick={() => handleClearHistory('cancelled')}>{m.settings_clear_cancelled()}</button>
-              <button class="ghost" onclick={() => handleClearHistory('all')}>{m.settings_clear_all_history()}</button>
+            <div class="history-grid">
+              <div class="history-card">
+                <div class="history-stat-body">
+                  <span class="history-stat-label">{m.settings_history_stat_completed()}</span>
+                  <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
+                    {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.completed ?? 0}
+                  </strong>
+                </div>
+                <button class="history-clear-btn" onclick={() => handleClearHistory('completed')}>{m.settings_clear_completed()}</button>
+              </div>
+              <div class="history-card">
+                <div class="history-stat-body">
+                  <span class="history-stat-label">{m.settings_history_stat_cancelled()}</span>
+                  <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
+                    {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.cancelled ?? 0}
+                  </strong>
+                </div>
+                <button class="history-clear-btn" onclick={() => handleClearHistory('cancelled')}>{m.settings_clear_cancelled()}</button>
+              </div>
+              <div class="history-card history-card-total">
+                <div class="history-stat-body">
+                  <span class="history-stat-label">{m.settings_history_stat_total()}</span>
+                  <strong class="history-stat-value" class:is-loading={historyStatsLoading}>
+                    {historyStatsLoading ? m.settings_history_stats_loading() : historyStatsError ? '—' : historyStats?.total ?? 0}
+                  </strong>
+                </div>
+                <button class="history-clear-btn" onclick={() => handleClearHistory('all')}>{m.settings_clear_all_history()}</button>
+              </div>
             </div>
+            {#if historyStatsError}
+              <span class="hint" style="margin-top: 4px; color: var(--danger);">{historyStatsError}</span>
+            {/if}
             {#if historyClearMsg}
               <span class="hint" style="margin-top: 4px;">{historyClearMsg}</span>
             {/if}
@@ -2229,6 +2273,81 @@
   .spam-stat strong {
     font-size: 15px;
     color: var(--text-primary);
+  }
+
+  .history-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 10px;
+    margin-top: 10px;
+  }
+
+  .history-card {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border);
+    border-top: 2px solid var(--accent);
+    border-radius: var(--radius-sm);
+    background: var(--bg-surface);
+    overflow: hidden;
+    min-width: 0;
+  }
+
+  .history-stat-body {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 12px 14px 10px;
+  }
+
+  .history-stat-label {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-muted);
+    letter-spacing: 0.01em;
+  }
+
+  .history-stat-value {
+    font-size: 24px;
+    font-weight: 700;
+    line-height: 1.1;
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .history-stat-value.is-loading {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-muted);
+  }
+
+  .history-clear-btn {
+    margin-top: auto;
+    width: 100%;
+    padding: 8px 12px;
+    border: none;
+    border-top: 1px solid var(--border);
+    border-radius: 0;
+    background: color-mix(in srgb, var(--bg-primary) 55%, transparent);
+    color: var(--text-secondary);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    text-align: left;
+    transition: background 0.15s, color 0.15s;
+  }
+
+  .history-clear-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .history-clear-btn:active:not(:disabled) {
+    transform: none;
+  }
+
+  .history-card-total .history-clear-btn:hover {
+    color: var(--danger);
   }
 
   @media (max-width: 980px) {

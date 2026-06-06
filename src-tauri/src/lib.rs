@@ -712,6 +712,7 @@ pub fn run() {
             commands::search::explain_spam_result,
             commands::search::reset_spam_filter,
             commands::search::get_download_history,
+            commands::search::get_download_history_stats,
             commands::search::clear_download_history,
             commands::search::remove_download_history_entry,
             commands::transfers::start_download,

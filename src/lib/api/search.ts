@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { SearchResult, SpamExplanation, SpamStats } from '$lib/types';
+import type { SearchResult, SpamExplanation, SpamStats, DownloadHistoryStats } from '$lib/types';
 
 export type SearchMethod = 'global' | 'server' | 'kad';
 
@@ -107,6 +107,10 @@ export async function explainSpamResult(
 
 export async function resetSpamFilter(): Promise<string> {
   return invoke('reset_spam_filter');
+}
+
+export async function getDownloadHistoryStats(): Promise<DownloadHistoryStats> {
+  return invoke('get_download_history_stats');
 }
 
 export async function getDownloadHistory(hashes: string[]): Promise<Record<string, string>> {
