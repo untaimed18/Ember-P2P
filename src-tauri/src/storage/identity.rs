@@ -75,11 +75,12 @@ impl NodeIdentity {
         let public_key = signing_key.verifying_key();
         let ember_hash = crypto::node_id_from_public_key(&public_key);
 
-        let noise_params: snow::params::NoiseParams =
-            "Noise_XX_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+        let noise_params: snow::params::NoiseParams = "Noise_XX_25519_ChaChaPoly_BLAKE2s"
+            .parse()
+            .expect("static Noise pattern string is always valid");
         let noise_keypair = snow::Builder::new(noise_params)
             .generate_keypair()
-            .unwrap();
+            .expect("Noise keypair generation requires a working OS RNG");
         let mut noise_private_key = [0u8; 32];
         let mut noise_public_key = [0u8; 32];
         noise_private_key.copy_from_slice(&noise_keypair.private);

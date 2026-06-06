@@ -749,6 +749,11 @@
     text-overflow: ellipsis;
     border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
     box-sizing: border-box;
+    /* Rows are virtualized: <tr> nodes are reused as you scroll and their
+       zebra (row-alt) parity flips on the reused node. A background-color
+       transition (e.g. the global `td` rule) would shimmer during scroll, so
+       keep cell background changes instant here. */
+    transition: none;
   }
   .lib-table tbody tr {
     cursor: pointer;

@@ -38,6 +38,10 @@
   let sending = $state(false);
   let sendError: string | null = $state(null);
   let loadError: string | null = $state(null);
+  // Non-blocking notice shown above the (successfully loaded) message list when
+  // the live `ember:chat-message` listener couldn't be registered, so the user
+  // knows new messages won't stream in until they retry.
+  let liveError = $state(false);
   let messagesEnd: HTMLDivElement | undefined = $state();
   let messagesContainerEl: HTMLDivElement | undefined = $state();
   let chatInputEl: HTMLTextAreaElement | undefined = $state();
@@ -57,9 +61,9 @@
   let oldestDbId: number | null = null;
 
   $effect(() => {
-    if (chatInputEl) {
-      requestAnimationFrame(() => chatInputEl?.focus());
-    }
+    if (!chatInputEl) return;
+    const raf = requestAnimationFrame(() => chatInputEl?.focus());
+    return () => cancelAnimationFrame(raf);
   });
 
   // Whenever the active conversation changes (mounted with new
@@ -96,6 +100,7 @@
       // is shown against the just-cleared (empty) message list during the
       // brief `await setupListener` window before `loadMessages` runs.
       loadError = null;
+      liveError = false;
       loading = true;
       loadingOlder = false;
       hasMoreHistory = false;
@@ -109,9 +114,10 @@
       // against any push events that landed in the meantime,
       // deduping by content tuple.
       (async () => {
-        await setupListener(gen);
+        const listenerOk = await setupListener(gen);
         if (gen !== loadGen) return;
         await loadMessages(gen);
+        if (gen === loadGen) liveError = !listenerOk;
       })();
       markAsRead();
     }
@@ -130,8 +136,8 @@
     };
   });
 
-  async function setupListener(gen: number) {
-    if (gen !== loadGen) return;
+  async function setupListener(gen: number): Promise<boolean> {
+    if (gen !== loadGen) return false;
     if (unlisten) { unlisten(); unlisten = null; }
     let fn: UnlistenFn;
     try {
@@ -159,10 +165,11 @@
       });
     } catch (e) {
       console.warn('ChatConversation: failed to register chat listener', e);
-      return;
+      return false;
     }
-    if (gen !== loadGen) { fn(); return; }
+    if (gen !== loadGen) { fn(); return false; }
     unlisten = fn;
+    return true;
   }
 
   async function loadMessages(gen: number) {
@@ -237,9 +244,11 @@
     if (!friendHash) return;
     const gen = ++loadGen;
     if (unlisten) { unlisten(); unlisten = null; }
-    await setupListener(gen);
+    liveError = false;
+    const listenerOk = await setupListener(gen);
     if (gen !== loadGen) return;
     await loadMessages(gen);
+    if (gen === loadGen) liveError = !listenerOk;
   }
 
   async function markAsRead() {
@@ -345,6 +354,12 @@
   </div>
 
   <div class="conv-messages" bind:this={messagesContainerEl}>
+    {#if liveError && !loading && !loadError}
+      <div class="conv-live-error" role="status">
+        <span>{m.chat_live_unavailable()}</span>
+        <button class="conv-load-retry" onclick={retryLoad} type="button">{m.common_retry()}</button>
+      </div>
+    {/if}
     {#if loading}
       <div class="conv-loading">{m.chat_loading_messages()}</div>
     {:else if loadError}
@@ -515,6 +530,22 @@
     text-align: center;
   }
 
+  /* Non-blocking inline notice (live listener unavailable) — sits above the
+     loaded history rather than replacing it like .conv-load-error. */
+  .conv-live-error {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+    padding: 6px 10px;
+    border: 1px solid color-mix(in srgb, var(--warning) 35%, var(--border));
+    background: color-mix(in srgb, var(--warning) 12%, transparent);
+    border-radius: var(--radius-sm);
+    color: color-mix(in srgb, var(--warning) 80%, var(--text-primary));
+    font-size: 12px;
+  }
+
   .conv-load-retry {
     padding: 6px 14px;
     border-radius: var(--radius-sm);
@@ -523,6 +554,7 @@
     color: var(--text-primary);
     font-size: 12px;
     cursor: pointer;
+    flex-shrink: 0;
   }
 
   .conv-load-retry:hover {

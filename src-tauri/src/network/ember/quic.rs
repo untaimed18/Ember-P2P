@@ -69,11 +69,12 @@ fn build_transport_config() -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(MAX_CONCURRENT_BIDI_STREAMS.into());
     transport.max_concurrent_uni_streams(MAX_CONCURRENT_UNI_STREAMS.into());
-    transport.max_idle_timeout(Some(
-        Duration::from_secs(IDLE_TIMEOUT_SECS)
-            .try_into()
-            .expect("IDLE_TIMEOUT fits VarInt"),
-    ));
+    // Fall back to a safe 30s idle timeout if the configured constant ever
+    // overflows a VarInt, rather than panicking at endpoint setup.
+    let idle_timeout = Duration::from_secs(IDLE_TIMEOUT_SECS)
+        .try_into()
+        .unwrap_or_else(|_| quinn::IdleTimeout::from(quinn::VarInt::from_u32(30_000)));
+    transport.max_idle_timeout(Some(idle_timeout));
     transport.keep_alive_interval(Some(Duration::from_secs(KEEP_ALIVE_SECS)));
     transport.stream_receive_window(STREAM_RECEIVE_WINDOW_BYTES.try_into().unwrap_or(quinn::VarInt::MAX));
     transport.receive_window(RECEIVE_WINDOW_BYTES.try_into().unwrap_or(quinn::VarInt::MAX));

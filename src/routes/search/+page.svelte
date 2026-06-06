@@ -131,6 +131,10 @@
   // completed/cancelled badge appears without a reload. A `completedHandled`
   // guard keeps this from re-firing on every transfers-store tick.
   const completedHandled = new Set<string>();
+  // Bound the dedupe set so a very long session with thousands of completed
+  // downloads can't grow it without limit. Sets preserve insertion order, so
+  // dropping the oldest entry evicts the least-recently-completed hash.
+  const COMPLETED_HANDLED_CAP = 2000;
   $effect(() => {
     const list = $transfers;
     if (destroyed) return;
@@ -138,6 +142,10 @@
       if (t.direction !== 'download' || t.status !== 'completed' || !t.file_hash) continue;
       if (completedHandled.has(t.file_hash)) continue;
       completedHandled.add(t.file_hash);
+      if (completedHandled.size > COMPLETED_HANDLED_CAP) {
+        const oldest = completedHandled.values().next().value;
+        if (oldest !== undefined) completedHandled.delete(oldest);
+      }
       invalidateHistory(t.file_hash);
       queueHistoryFetch([t.file_hash]);
     }

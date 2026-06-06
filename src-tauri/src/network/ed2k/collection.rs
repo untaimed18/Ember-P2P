@@ -54,6 +54,11 @@ impl Collection {
 
     fn load_binary(cursor: &mut Cursor<&Vec<u8>>, _version: u32) -> anyhow::Result<Self> {
         let header_tag_count = cursor.read_u32::<LittleEndian>()? as usize;
+        // A collection header has a handful of tags; an absurd count means a
+        // corrupt/hostile file, so reject it before the skip loop below spins.
+        if header_tag_count > 65_536 {
+            return Err(anyhow::anyhow!("Collection header tag count too large: {header_tag_count}"));
+        }
 
         let mut name = String::new();
         let mut author = String::new();
@@ -92,6 +97,9 @@ impl Collection {
 
         for _ in 0..file_count {
             let file_tag_count = cursor.read_u32::<LittleEndian>()? as usize;
+            if file_tag_count > 65_536 {
+                return Err(anyhow::anyhow!("Collection file tag count too large: {file_tag_count}"));
+            }
             let mut fname = String::new();
             let mut fsize: u64 = 0;
             let mut fhash = String::new();

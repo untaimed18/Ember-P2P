@@ -390,7 +390,11 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
             key.copy_from_slice(&data[..16]);
             let mut cursor = Cursor::new(&data[16..]);
             let record_count = cursor.read_u16::<LittleEndian>()? as usize;
-            let mut records = Vec::with_capacity(record_count);
+            // A peer can claim up to 65535 records in a packet that can't
+            // physically hold them. The loop below is bounded by the actual
+            // data length (each record needs >= 2 bytes), so only reserve what
+            // the remaining bytes could contain to avoid a large eager alloc.
+            let mut records = Vec::with_capacity(record_count.min(data.len() / 2 + 1));
             let mut offset = 18usize;
             for _ in 0..record_count {
                 if offset + 2 > data.len() {

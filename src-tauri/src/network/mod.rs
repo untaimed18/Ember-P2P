@@ -8701,29 +8701,34 @@ pub async fn start_network(
                     // rendezvous::register now requires a confirmed
                     // IPv4 (no client_ip fallback on the server) so we
                     // must never spawn this task without one.
-                    let rv_ip = state.external_ip
-                        .expect("friend_presence_initial gate guarantees external_ip is Some");
-                    let rv_pubkey = ed25519_pubkey;
-                    let rv_secret = ed25519_secret_key;
-                    let app_rv = app_handle.clone();
-                    tokio::spawn(async move {
-                        match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret).await {
-                            Ok(()) => {
-                                let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
-                                    "discoverable": true,
-                                }));
+                    // The outer gate already requires external_ip.is_some();
+                    // guard defensively so a future change there degrades to
+                    // "not discoverable yet" instead of panicking this task.
+                    if let Some(rv_ip) = state.external_ip {
+                        let rv_pubkey = ed25519_pubkey;
+                        let rv_secret = ed25519_secret_key;
+                        let app_rv = app_handle.clone();
+                        tokio::spawn(async move {
+                            match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret).await {
+                                Ok(()) => {
+                                    let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
+                                        "discoverable": true,
+                                    }));
+                                }
+                                Err(e) => {
+                                    warn!("Initial rendezvous register failed: {e}");
+                                    let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
+                                        "discoverable": false,
+                                        "reason": "rendezvous_error",
+                                    }));
+                                }
                             }
-                            Err(e) => {
-                                warn!("Initial rendezvous register failed: {e}");
-                                let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
-                                    "discoverable": false,
-                                    "reason": "rendezvous_error",
-                                }));
-                            }
-                        }
-                    });
-                    state.rendezvous_registered = true;
-                    state.rendezvous_last_register = Some(std::time::Instant::now());
+                        });
+                        state.rendezvous_registered = true;
+                        state.rendezvous_last_register = Some(std::time::Instant::now());
+                    } else {
+                        warn!("Initial rendezvous register skipped: external_ip unexpectedly None");
+                    }
                 }
 
                 // Initial friend search burst: look up all offline friends
