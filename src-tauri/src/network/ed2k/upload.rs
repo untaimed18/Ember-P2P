@@ -5910,9 +5910,20 @@ async fn read_packet_async_inner<R: AsyncReadExt + Unpin>(
     }
     let opcode = reader.read_u8().await?;
     let payload_len = length - 1;
-    let mut payload = vec![0u8; payload_len];
+    let mut payload = Vec::new();
     if payload_len > 0 {
-        reader.read_exact(&mut payload).await?;
+        // Grow as bytes arrive instead of eagerly allocating the full declared
+        // length (up to 512 KiB) so a slow/hostile peer can't pin that memory
+        // per upload slot before sending anything.
+        payload.reserve(payload_len.min(64 * 1024));
+        let mut remaining = payload_len;
+        let mut chunk = [0u8; 32 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(chunk.len());
+            reader.read_exact(&mut chunk[..want]).await?;
+            payload.extend_from_slice(&chunk[..want]);
+            remaining -= want;
+        }
     }
     if protocol == OP_PACKEDPROT {
         let mut decoder = flate2::read::ZlibDecoder::new(&payload[..]);
@@ -5976,9 +5987,20 @@ async fn read_packet_with_first_byte<R: AsyncReadExt + Unpin>(
     }
     let opcode = reader.read_u8().await?;
     let payload_len = length - 1;
-    let mut payload = vec![0u8; payload_len];
+    let mut payload = Vec::new();
     if payload_len > 0 {
-        reader.read_exact(&mut payload).await?;
+        // Grow as bytes arrive instead of eagerly allocating the full declared
+        // length (up to 512 KiB) so a slow/hostile peer can't pin that memory
+        // per upload slot before sending anything.
+        payload.reserve(payload_len.min(64 * 1024));
+        let mut remaining = payload_len;
+        let mut chunk = [0u8; 32 * 1024];
+        while remaining > 0 {
+            let want = remaining.min(chunk.len());
+            reader.read_exact(&mut chunk[..want]).await?;
+            payload.extend_from_slice(&chunk[..want]);
+            remaining -= want;
+        }
     }
     Ok((protocol, opcode, payload))
 }

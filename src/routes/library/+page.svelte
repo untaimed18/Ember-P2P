@@ -245,6 +245,12 @@
       searchDebounceTimer = null;
       debouncedQuery = q;
     }, 150);
+    return () => {
+      if (searchDebounceTimer) {
+        clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = null;
+      }
+    };
   });
   let searchInputEl: HTMLInputElement | undefined = $state(undefined);
   const typeFilterOptions = ['All', 'Audio', 'Video', 'Image', 'Archive', 'Document', 'CD/DVD'] as const;
@@ -988,6 +994,12 @@
         commentLoading = false;
       });
     }, 200);
+    return () => {
+      if (commentFetchTimer) {
+        clearTimeout(commentFetchTimer);
+        commentFetchTimer = null;
+      }
+    };
   });
 
   // Lazily probe media metadata (duration/bitrate/codec/tags) for the selected
@@ -1012,6 +1024,12 @@
         selectedMedia = null;
       });
     }, 200);
+    return () => {
+      if (mediaFetchTimer) {
+        clearTimeout(mediaFetchTimer);
+        mediaFetchTimer = null;
+      }
+    };
   });
 
   function formatMediaLength(seconds: number): string {
@@ -1063,10 +1081,14 @@
     await tick();
     if (!ctxMenu || !ctxMenuEl) return;
     const margin = 8;
-    const rect = ctxMenuEl.getBoundingClientRect();
-    const x = Math.min(ctxMenu.x, Math.max(margin, window.innerWidth - rect.width - margin));
-    const y = Math.min(ctxMenu.y, Math.max(margin, window.innerHeight - rect.height - margin));
-    ctxSubmenuLeft = x + rect.width * 2 > window.innerWidth - margin;
+    // Use offsetWidth/offsetHeight (untransformed layout size) rather than
+    // getBoundingClientRect(), whose width/height reflect the entrance scale
+    // animation mid-flight and would clamp the menu a few px off near edges.
+    const menuW = ctxMenuEl.offsetWidth;
+    const menuH = ctxMenuEl.offsetHeight;
+    const x = Math.min(ctxMenu.x, Math.max(margin, window.innerWidth - menuW - margin));
+    const y = Math.min(ctxMenu.y, Math.max(margin, window.innerHeight - menuH - margin));
+    ctxSubmenuLeft = x + menuW * 2 > window.innerWidth - margin;
     ctxSubmenuUp = y + 240 > window.innerHeight - margin;
     if (x !== ctxMenu.x || y !== ctxMenu.y) {
       ctxMenu = { ...ctxMenu, x, y };
@@ -1456,10 +1478,16 @@
     };
     const onUp = () => {
       if (mounted) sidebarDragging = false;
-      localStorage.setItem('library-sidebar-w', String(sidebarWidth));
+      // Remove listeners first so a localStorage failure (private mode /
+      // quota) can't strand the drag handlers and leave the page stuck.
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
       dragCleanup = null;
+      try {
+        localStorage.setItem('library-sidebar-w', String(sidebarWidth));
+      } catch (e) {
+        console.warn('library: failed to persist sidebar width', e);
+      }
     };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
@@ -1507,7 +1535,7 @@
     try {
       const saved = localStorage.getItem('library-sidebar-w');
       if (saved) {
-        const val = parseInt(saved);
+        const val = parseInt(saved, 10);
         if (!isNaN(val)) sidebarWidth = Math.max(120, Math.min(400, val));
       }
     } catch (e) {

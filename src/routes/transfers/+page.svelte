@@ -254,6 +254,7 @@
       queue_rank?: number; speed: number; transferred: number; client_software: string; peer_name: string;
       available_parts?: number; total_parts?: number; country_code?: string;
     }>('transfer-source-detail', (event) => {
+      if (!mounted) return;
       const d = event.payload;
       if (d.transfer_id !== expandedTransferId) return;
       const idx = expandedSources.findIndex((s) => s.ip === d.ip && s.port === d.port);
@@ -645,7 +646,9 @@
 
   async function refreshUploadQueue() {
     try {
-      uploadQueueClients = await getUploadQueue();
+      const data = await getUploadQueue();
+      if (!mounted) return;
+      uploadQueueClients = data;
       uploadQueueLoaded = true;
     } catch (e) {
       // Network task may be momentarily busy (try_send full). Leave the
@@ -655,7 +658,9 @@
   }
   async function refreshKnownClients() {
     try {
-      knownClients = await getKnownClients();
+      const data = await getKnownClients();
+      if (!mounted) return;
+      knownClients = data;
       knownClientsLoaded = true;
       // Kick off reputation refresh for the just-loaded roster. Runs
       // off-cycle because `get_peer_reputation` may return `null` for
@@ -704,6 +709,7 @@
         }
       }),
     );
+    if (!mounted) return;
     const next = { ...reputationMap };
     for (const [h, rep] of results) {
       next[h] = rep;
@@ -740,6 +746,7 @@
   async function refreshFriendHashes() {
     try {
       const list = await getFriends();
+      if (!mounted) return;
       const hashes = new Set<string>();
       const nicks: Record<string, string> = {};
       for (const f of list) {
@@ -1611,10 +1618,16 @@
     };
     const onUp = () => {
       dragging = false;
-      localStorage.setItem('transfers-split', String(splitPercent));
+      // Remove listeners first so a localStorage failure (private mode /
+      // quota) can't strand the drag handlers.
       window.removeEventListener('mousemove', onMove);
       window.removeEventListener('mouseup', onUp);
       dragCleanup = null;
+      try {
+        localStorage.setItem('transfers-split', String(splitPercent));
+      } catch (e) {
+        console.warn('transfers: failed to persist split position', e);
+      }
     };
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
