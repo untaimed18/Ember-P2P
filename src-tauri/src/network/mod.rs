@@ -764,8 +764,15 @@ fn active_download_kad_interval(search_count: u32) -> i64 {
 
 // Keep eDonkey UDP source lookups protocol-compatible while adapting fanout
 // to runtime conditions so we stay fast without looking like a flooder.
-// eMule: GetMaxSourcePerFileUDP() — skip UDP asks once we have enough sources
-const MAX_SOURCES_FOR_UDP: usize = 50;
+// eMule: GetMaxSourcePerFileUDP() — keep discovering (server UDP + active KAD
+// re-search) until a file knows this many sources, then stop asking. Raised
+// from 50 to feed the Path B "queue on many sources" model: a popular file is
+// queued on hundreds of peers (connectionless, UDP-reask maintained), so the
+// known-source pool must be allowed to grow well past the old held-connection
+// count. Still well under MAX_SOURCES_PER_FILE (500) / the user's
+// max_sources_per_file (default 400), and the per-channel reask INTERVALS
+// (KAD backoff, 30-min server UDP) remain the politeness gate — not this count.
+const MAX_SOURCES_FOR_UDP: usize = 300;
 
 const MAX_FAIL_COUNT_FOR_UDP: u32 = 3;
 
@@ -4265,6 +4272,11 @@ pub async fn start_network(
     let pending_kad_callbacks: upload_server::PendingKadCallbacks =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
+    // Install the machine-wide download-connection cap (eMule `maxconnections`)
+    // before any download tasks can spawn, so the raised per-file source
+    // budget stays globally bounded.
+    ed2k::multi_source::set_global_download_conn_limit(settings.max_connections as usize);
+
     let source_manager: Arc<RwLock<SourceManager>> = {
         let mut sm = SourceManager::new();
         sm.set_max_per_file(settings.max_sources_per_file);
@@ -4580,6 +4592,11 @@ pub async fn start_network(
     // which is cheap enough to run at this cadence.
     let mut credit_save_timer = tokio::time::interval(std::time::Duration::from_secs(60));
     credit_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Path B telemetry summary: connection-cap usage + detach/diversion/rotation
+    // counts, logged once a minute (only when non-idle) to validate and tune the
+    // queued-source model in the field.
+    let mut pathb_stats_timer = tokio::time::interval(std::time::Duration::from_secs(60));
+    pathb_stats_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut a4af_timer = tokio::time::interval(std::time::Duration::from_secs(480));
     a4af_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut server_timer = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -4890,6 +4907,13 @@ pub async fn start_network(
                     state.upload_max_slots.store(
                         new_settings.max_concurrent_uploads as usize,
                         std::sync::atomic::Ordering::Relaxed,
+                    );
+                    // Hot-reload the machine-wide download-connection cap so
+                    // the Settings page's "max connections" takes effect
+                    // without a restart (grows immediately; shrinks as live
+                    // connections free up).
+                    ed2k::multi_source::set_global_download_conn_limit(
+                        new_settings.max_connections as usize,
                     );
                     if !new_settings.uss_enabled {
                         state.uss_host = None;
@@ -10289,10 +10313,63 @@ pub async fn start_network(
             }
 
             // Retry source search for pending downloads (eMule: never auto-fail, search forever)
+            _ = pathb_stats_timer.tick() => {
+                if let Some((in_use, max, acquires, contended)) =
+                    ed2k::multi_source::global_dl_conn_stats()
+                {
+                    let (detaches, diversions, rotations) =
+                        ed2k::multi_source::pathb_event_counts();
+                    // Only log when something has actually happened, so an idle
+                    // client doesn't emit a heartbeat of zeros every minute.
+                    if in_use > 0
+                        || acquires > 0
+                        || detaches > 0
+                        || diversions > 0
+                        || rotations > 0
+                    {
+                        info!(
+                            "Path B stats: dl-conns {in_use}/{max} in use, {acquires} acquires \
+                             ({contended} contended), {detaches} detaches, {diversions} push-grant \
+                             diversions, {rotations} slow-source rotations",
+                        );
+                    }
+                }
+            }
             _ = source_retry_timer.tick() => {
                 let now = chrono::Utc::now().timestamp();
                 let kad_available = state.stats.status != NetworkStatus::Disconnected;
                 let server_connected = state.server_connected;
+
+                // Path B: refresh the inbound reconnect index from the current
+                // OnQueue source set of live downloads, so an uploader that
+                // connects back to grant a slot (HighID push-grant) is
+                // recognised on the upload path and its stream diverted into
+                // the waiting download. Rebuilt wholesale each tick (~5s) so
+                // stale entries self-heal. See `upload_server::ReconnectIndex`.
+                {
+                    let mut idx_map = upload_server::ReconnectIndex::new();
+                    for (tid, pfs) in &state.per_file_sources {
+                        let is_live = state.pending_downloads.contains_key(tid)
+                            || state.active_source_senders.contains_key(tid);
+                        if !is_live {
+                            continue;
+                        }
+                        for src in &pfs.sources {
+                            if matches!(
+                                src.state,
+                                ed2k::sources::DownloadSourceState::OnQueue { .. }
+                            ) {
+                                idx_map
+                                    .entry(src.ip)
+                                    .or_default()
+                                    .push((pfs.file_hash, src.source_user_hash));
+                            }
+                        }
+                    }
+                    if let Ok(mut guard) = upload_server::reconnect_index().write() {
+                        *guard = idx_map;
+                    }
+                }
 
                 // Expire stale KAD-callback placeholder rows. A placeholder
                 // sits in `Connecting` state until either (a) the LowID
@@ -14813,6 +14890,18 @@ pub async fn start_network(
 
     // Save all state on shutdown
     info!("Shutting down network");
+    // Final Path B tally so even a short test run (under the 60 s periodic
+    // cadence) always captures the queued-source-model counters.
+    if let Some((in_use, max, acquires, contended)) =
+        ed2k::multi_source::global_dl_conn_stats()
+    {
+        let (detaches, diversions, rotations) = ed2k::multi_source::pathb_event_counts();
+        info!(
+            "Path B final stats: dl-conns {in_use}/{max} in use at shutdown, {acquires} acquires \
+             ({contended} contended), {detaches} detaches, {diversions} push-grant diversions, \
+             {rotations} slow-source rotations",
+        );
+    }
     let contacts = state.routing_table.export_bootstrap_contacts(200);
     let nodes_path = state.data_dir.join("nodes.dat");
     if let Err(e) = bootstrap::save_nodes_dat(&nodes_path, &contacts) {
