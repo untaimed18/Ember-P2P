@@ -36,15 +36,72 @@
   let unmounted = false;
   let inFlightDiag = false;
 
+  // Diagnostics-health + join-progress state. `diagStale` raises a banner
+  // once polling has failed several times in a row (the service is down,
+  // not just a transient blip), so the numbers below aren't silently
+  // mistaken for live ones. The join timer flips `joinTimedOut` so the
+  // "joining…" spinner can't spin forever when no peers are reachable.
+  let diagStale = $state(false);
+  let joinTimedOut = $state(false);
+  let diagFailures = 0;
+  let activeSince: number | null = null;
+  let joinTimer: ReturnType<typeof setTimeout> | null = null;
+  const DIAG_FAILURE_THRESHOLD = 3;
+  const JOINING_TIMEOUT_MS = 30_000;
+
   async function refreshDiag() {
     if (unmounted || inFlightDiag) return;
     inFlightDiag = true;
     try {
       diag = await getEmberDiagnostics();
+      diagFailures = 0;
+      diagStale = false;
+      reconcileToggle();
+      recomputeJoinState();
     } catch {
-      // Non-fatal — keep the previous snapshot; the toggle still works.
+      // Tolerate transient blips (keep the previous snapshot; the toggle
+      // still works), but surface a banner once the service has been
+      // unreachable for several polls in a row.
+      diagFailures += 1;
+      if (diagFailures >= DIAG_FAILURE_THRESHOLD) diagStale = true;
     } finally {
       inFlightDiag = false;
+    }
+  }
+
+  // Keep the switch honest with the backend's *actual* state. Ember can
+  // also be flipped from the Settings page, and the backend can refuse or
+  // revert a change; when we're not mid-apply and the user has no pending
+  // move (switch matches last-applied), adopt whatever the live
+  // diagnostics report so the control never lies about reality.
+  function reconcileToggle() {
+    if (applying || !diag) return;
+    if (enabled !== lastAppliedEnabled) return;
+    const live = !!diag.ember_native_enabled;
+    if (live !== enabled) {
+      enabled = live;
+      lastAppliedEnabled = live;
+      if (settings) settings = { ...settings, ember_native_enabled: live };
+    }
+  }
+
+  // Drive the join-progress timer off each diagnostics snapshot (a plain
+  // function, not a reactive `$effect`, so there's no write-read feedback
+  // loop on `joinTimedOut`). While active with zero contacts we run a
+  // one-shot timer; finding a contact — or turning Ember off — resets it.
+  function recomputeJoinState() {
+    const active = !!diag?.ember_native_enabled;
+    const contacts = diag?.ember_dht_contacts ?? 0;
+    if (!active || contacts > 0) {
+      if (joinTimer) { clearTimeout(joinTimer); joinTimer = null; }
+      activeSince = null;
+      joinTimedOut = false;
+      return;
+    }
+    if (activeSince === null) {
+      activeSince = Date.now();
+      joinTimedOut = false;
+      joinTimer = setTimeout(() => { joinTimedOut = true; joinTimer = null; }, JOINING_TIMEOUT_MS);
     }
   }
 
@@ -91,7 +148,7 @@
   }
 
   let isActive = $derived(!!diag?.ember_native_enabled);
-  let joining = $derived(isActive && (diag?.ember_dht_contacts ?? 0) === 0);
+  let joining = $derived(isActive && (diag?.ember_dht_contacts ?? 0) === 0 && !joinTimedOut);
 
   onMount(() => {
     getSettings()
@@ -109,6 +166,7 @@
       unmounted = true;
       if (pollTimer) clearInterval(pollTimer);
       if (copyTimer) clearTimeout(copyTimer);
+      if (joinTimer) clearTimeout(joinTimer);
     };
   });
 </script>
@@ -155,6 +213,10 @@
     <div class="banner banner-error" role="alert">{toggleError}</div>
   {/if}
 
+  {#if diagStale}
+    <div class="banner banner-error" role="alert">{m.ember_stats_unavailable()}</div>
+  {/if}
+
   {#if !isActive}
     <div class="banner banner-muted" role="status">{m.ember_disabled_explainer()}</div>
   {:else if joining}
@@ -162,6 +224,8 @@
       <span class="spinner" aria-hidden="true"></span>
       {m.ember_joining_hint()}
     </div>
+  {:else if (diag?.ember_dht_contacts ?? 0) === 0}
+    <div class="banner banner-muted" role="status">{m.ember_no_contacts_hint()}</div>
   {/if}
 
   <!-- Live stats -->
@@ -183,10 +247,6 @@
       <div class="stat-label">{m.ember_stat_records()}</div>
     </div>
   </section>
-
-  {#if isActive && !joining && (diag?.ember_dht_contacts ?? 0) === 0}
-    <p class="hint muted soft-note">{m.ember_no_contacts_hint()}</p>
-  {/if}
 
   <!-- Local identity -->
   <section class="card">
@@ -338,14 +398,6 @@
     color: var(--text-muted);
     font-size: 13px;
     line-height: 1.5;
-  }
-
-  .hint.muted {
-    opacity: 0.85;
-  }
-
-  .soft-note {
-    margin: -4px 2px 0;
   }
 
   .stat-grid {

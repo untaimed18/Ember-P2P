@@ -195,6 +195,7 @@ pub async fn register(
     pubkey: &[u8; 32],
     secret_key: &[u8; 32],
     noise_pub: Option<&[u8; 32]>,
+    ember_port: Option<u16>,
 ) -> Result<(), String> {
     require_https(base_url)?;
     let url = format!("{}/register", base_url.trim_end_matches('/'));
@@ -219,6 +220,17 @@ pub async fn register(
     // is disabled so we don't advertise a contact that can't be dialled.
     if let Some(nk) = noise_pub {
         body["noise_pub"] = serde_json::Value::String(hex::encode(nk));
+    }
+    // Advertise the UDP port our Ember Noise transport listens on. The
+    // signed `port` above is our eMule TCP port (used for friend-presence
+    // dialling); Ember runs over the shared KAD UDP socket on a *different*
+    // port, so the `/bootstrap` pool must hand peers this value instead.
+    // Unsigned for the same reason as `noise_pub`: it only scopes a port on
+    // our own signed IP, and a wrong value just fails a handshake. Only sent
+    // alongside a Noise key (the two together make us bootstrap-eligible);
+    // a zero port is meaningless and dropped.
+    if let (Some(_), Some(ep)) = (noise_pub, ember_port.filter(|p| *p != 0)) {
+        body["ember_port"] = serde_json::Value::from(ep);
     }
     let resp = client()
         .post(&url)

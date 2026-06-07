@@ -196,6 +196,14 @@ struct PresenceEntry {
     /// unsigned value can't be weaponised. Entries that carry one are
     /// eligible for the `/bootstrap` pool.
     noise_pub: Option<[u8; 32]>,
+    /// Optional UDP port the client's Ember Noise transport listens on.
+    /// `port` above is the TCP friend-presence port returned by `/lookup`;
+    /// this is the UDP port `/bootstrap` advertises so cold-starting DHT
+    /// peers dial the right socket. Same unsigned trust model as
+    /// `noise_pub`: it only scopes a port on the client's own signed IP, so
+    /// at worst it points a dialer at a dead port on that same host. An
+    /// entry needs BOTH this and `noise_pub` to be bootstrap-eligible.
+    ember_port: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -306,6 +314,14 @@ struct RegisterRequest {
     /// rather than failing the registration. See `PresenceEntry::noise_pub`.
     #[serde(default)]
     noise_pub: Option<String>,
+    /// Optional UDP port the client's Ember Noise transport listens on.
+    /// The signed `port` above is the eMule TCP listener used for
+    /// friend-presence lookups; Ember runs over a separate UDP socket, so
+    /// `/bootstrap` must hand peers this port instead. Unsigned/best-effort
+    /// for the same reason as `noise_pub` (it only scopes a port on the
+    /// already-signed IP). See `PresenceEntry::ember_port`.
+    #[serde(default)]
+    ember_port: Option<u16>,
 }
 
 #[derive(Serialize)]
@@ -479,6 +495,11 @@ async fn register(
     // than failing an otherwise-valid registration.
     let noise_pub = body.noise_pub.as_deref().and_then(decode_hex_pubkey);
 
+    // Optional Ember UDP port — best-effort like `noise_pub`. A zero port is
+    // meaningless (no listener) so it's normalised to `None`, which keeps the
+    // entry out of the `/bootstrap` pool rather than advertising a dead addr.
+    let ember_port = body.ember_port.filter(|p| *p != 0);
+
     let entry = PresenceEntry {
         ip: presence_ip,
         port: body.port,
@@ -486,6 +507,7 @@ async fn register(
         expires_at: Instant::now() + ENTRY_TTL,
         pubkey,
         noise_pub,
+        ember_port,
     };
 
     let mut store = state.store.write().await;
@@ -1193,7 +1215,7 @@ async fn bootstrap(State(state): State<AppState>) -> Json<Vec<BootstrapNodeRespo
     let store = state.store.read().await;
     let eligible: Vec<&PresenceEntry> = store
         .values()
-        .filter(|e| e.expires_at > now && e.noise_pub.is_some())
+        .filter(|e| e.expires_at > now && e.noise_pub.is_some() && e.ember_port.is_some())
         .collect();
 
     let total = eligible.len();
@@ -1212,7 +1234,10 @@ async fn bootstrap(State(state): State<AppState>) -> Json<Vec<BootstrapNodeRespo
         .skip(offset)
         .take(total.min(MAX_BOOTSTRAP_RESPONSE))
         .map(|e| BootstrapNodeResponse {
-            addr: SocketAddr::new(e.ip, e.port).to_string(),
+            // `ember_port` is guaranteed `Some` by the eligibility filter
+            // above; advertise the UDP port (not the TCP `e.port`) so the
+            // peer dials the Ember Noise transport on the right socket.
+            addr: SocketAddr::new(e.ip, e.ember_port.unwrap_or_default()).to_string(),
             noise_pub: hex::encode(e.noise_pub.unwrap_or_default()),
             ed25519_pub: hex::encode(e.pubkey),
         })

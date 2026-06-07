@@ -34,11 +34,110 @@ const MAX_SESSIONS: usize = 4096;
 /// Maximum concurrent pending handshakes.
 const MAX_PENDING: usize = 512;
 
+/// How long a processed handshake-initiation packet's digest is remembered
+/// for verbatim-replay rejection.
+const HANDSHAKE_REPLAY_TTL: Duration = Duration::from_secs(30);
+
+/// Cap on the verbatim-replay digest cache so a flood of distinct
+/// initiations can't grow it without bound.
+const MAX_REPLAY_DIGESTS: usize = 8192;
+
+/// Size of the anti-replay sliding window (in nonces) for inbound transport
+/// packets.
+const REPLAY_WINDOW_BITS: u64 = 64;
+
 /// An established encrypted session with a remote peer.
+///
+/// Ember runs Noise transport over UDP, which can lose, reorder, and duplicate
+/// datagrams. A *stateful* `snow::TransportState` derives the nonce implicitly
+/// from a strictly-increasing counter, so a single lost/reordered packet
+/// desynchronises the counter and every subsequent packet fails to
+/// authenticate. We instead use [`snow::StatelessTransportState`] with an
+/// explicit per-packet nonce on the wire plus our own sliding replay window,
+/// the same approach WireGuard/IPsec use. This makes the session tolerant of
+/// loss and reordering and means a single forged/corrupt datagram is simply
+/// dropped rather than tearing the session down.
 struct NoiseSession {
-    transport: snow::TransportState,
+    transport: snow::StatelessTransportState,
     remote_noise_pub: [u8; 32],
     last_activity: Instant,
+    /// Next nonce to stamp on an outbound transport packet (monotonic).
+    send_nonce: u64,
+    /// Highest accepted inbound nonce.
+    recv_high: u64,
+    /// Bitmap of accepted nonces in `[recv_high - 63, recv_high]`; bit `i`
+    /// represents `recv_high - i`.
+    recv_window: u64,
+}
+
+impl NoiseSession {
+    fn new(transport: snow::StatelessTransportState, remote_noise_pub: [u8; 32]) -> Self {
+        Self {
+            transport,
+            remote_noise_pub,
+            last_activity: Instant::now(),
+            send_nonce: 0,
+            recv_high: 0,
+            recv_window: 0,
+        }
+    }
+
+    /// Frame + encrypt `message` as a transport packet, advancing the send
+    /// nonce. Returns the wire bytes (`magic | type | nonce(8 LE) | ciphertext`)
+    /// or `None` on an (unexpected) encrypt error.
+    fn seal(&mut self, message: &[u8]) -> Option<Vec<u8>> {
+        let nonce = self.send_nonce;
+        let mut buf = vec![0u8; HEADER_LEN + 8 + message.len() + 16];
+        buf[0] = EMBER_MAGIC[0];
+        buf[1] = EMBER_MAGIC[1];
+        buf[2] = PKT_TRANSPORT;
+        buf[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&nonce.to_le_bytes());
+        match self.transport.write_message(nonce, message, &mut buf[HEADER_LEN + 8..]) {
+            Ok(len) => {
+                self.send_nonce = self.send_nonce.wrapping_add(1);
+                buf.truncate(HEADER_LEN + 8 + len);
+                Some(buf)
+            }
+            Err(e) => {
+                warn!("Ember transport encrypt error: {e}");
+                None
+            }
+        }
+    }
+
+    /// Whether `nonce` is acceptable (not already seen, not older than the
+    /// window). Does **not** mutate state — the window is only advanced on a
+    /// successful decrypt via [`Self::replay_commit`] so a forged nonce that
+    /// fails AEAD verification can't block the genuine packet that bears it.
+    fn replay_precheck(&self, nonce: u64) -> bool {
+        if nonce > self.recv_high {
+            return true;
+        }
+        let diff = self.recv_high - nonce;
+        if diff >= REPLAY_WINDOW_BITS {
+            return false;
+        }
+        (self.recv_window & (1u64 << diff)) == 0
+    }
+
+    /// Record `nonce` as accepted, sliding the window forward if needed.
+    fn replay_commit(&mut self, nonce: u64) {
+        if nonce > self.recv_high {
+            let shift = nonce - self.recv_high;
+            if shift >= REPLAY_WINDOW_BITS {
+                self.recv_window = 0;
+            } else {
+                self.recv_window <<= shift;
+            }
+            self.recv_window |= 1;
+            self.recv_high = nonce;
+        } else {
+            let diff = self.recv_high - nonce;
+            if diff < REPLAY_WINDOW_BITS {
+                self.recv_window |= 1u64 << diff;
+            }
+        }
+    }
 }
 
 /// In-progress handshake awaiting a response.
@@ -178,6 +277,13 @@ pub struct EmberTransport {
     local_noise_pub: [u8; 32],
     sessions: HashMap<SocketAddr, NoiseSession>,
     pending: HashMap<SocketAddr, PendingHandshake>,
+    /// BLAKE3 digests of recently-processed handshake-initiation packets
+    /// (`IK_INIT`, `XX_MSG1`) with the time we first saw them. An attacker can
+    /// only replay handshake bytes verbatim (they lack the keys to forge a
+    /// *different* valid handshake), so rejecting exact duplicates closes the
+    /// "replayed init re-runs the handshake, re-emits its embedded payload, and
+    /// resets the live session" vector. Pruned in [`Self::cleanup`].
+    recent_handshakes: HashMap<[u8; 32], Instant>,
 }
 
 impl EmberTransport {
@@ -187,7 +293,34 @@ impl EmberTransport {
             local_noise_pub,
             sessions: HashMap::new(),
             pending: HashMap::new(),
+            recent_handshakes: HashMap::new(),
         }
+    }
+
+    /// Returns `true` if this exact handshake-initiation packet was processed
+    /// recently (a verbatim replay) and records its digest otherwise. See
+    /// [`Self::recent_handshakes`] for why a digest cache fully addresses the
+    /// replay threat for these packet types.
+    fn is_replayed_handshake(&mut self, data: &[u8]) -> bool {
+        let digest = *blake3::hash(data).as_bytes();
+        let now = Instant::now();
+        if let Some(seen) = self.recent_handshakes.get(&digest) {
+            if now.duration_since(*seen) < HANDSHAKE_REPLAY_TTL {
+                return true;
+            }
+        }
+        if self.recent_handshakes.len() >= MAX_REPLAY_DIGESTS {
+            if let Some(oldest) = self
+                .recent_handshakes
+                .iter()
+                .min_by_key(|(_, t)| **t)
+                .map(|(k, _)| *k)
+            {
+                self.recent_handshakes.remove(&oldest);
+            }
+        }
+        self.recent_handshakes.insert(digest, now);
+        false
     }
 
     /// Check if a raw UDP packet is an Ember-encrypted packet.
@@ -247,23 +380,22 @@ impl EmberTransport {
         message: &[u8],
     ) -> OutgoingResult {
         // Fast path: established session
-        if let Some(session) = self.sessions.get_mut(&peer) {
-            session.last_activity = Instant::now();
-            let mut buf = vec![0u8; HEADER_LEN + message.len() + 64]; // AEAD tag overhead
-            buf[0] = EMBER_MAGIC[0];
-            buf[1] = EMBER_MAGIC[1];
-            buf[2] = PKT_TRANSPORT;
-            match session.transport.write_message(message, &mut buf[HEADER_LEN..]) {
-                Ok(len) => {
-                    buf.truncate(HEADER_LEN + len);
-                    return OutgoingResult::Ready { packet: buf };
-                }
-                Err(e) => {
-                    warn!("Ember transport encrypt error for {peer}: {e}");
+        if self.sessions.contains_key(&peer) {
+            let sealed = {
+                let session = self
+                    .sessions
+                    .get_mut(&peer)
+                    .expect("checked contains_key above");
+                session.last_activity = Instant::now();
+                session.seal(message)
+            };
+            return match sealed {
+                Some(packet) => OutgoingResult::Ready { packet },
+                None => {
                     self.sessions.remove(&peer);
-                    return OutgoingResult::Error(format!("encrypt failed: {e}"));
+                    OutgoingResult::Error("encrypt failed".to_string())
                 }
-            }
+            };
         }
 
         // Queue behind in-progress handshake
@@ -312,6 +444,8 @@ impl EmberTransport {
             };
             now.duration_since(created) < Duration::from_secs(30)
         });
+        self.recent_handshakes
+            .retain(|_, t| now.duration_since(*t) < HANDSHAKE_REPLAY_TTL);
     }
 
     /// Remove an existing session for a peer (e.g., on disconnect).
@@ -328,6 +462,7 @@ impl EmberTransport {
     pub fn cleanup_all(&mut self) {
         self.sessions.clear();
         self.pending.clear();
+        self.recent_handshakes.clear();
     }
 
     /// Drive the Noise state machine for an inbound UDP packet and
@@ -460,6 +595,12 @@ impl EmberTransport {
     }
 
     fn handle_ik_init(&mut self, from: SocketAddr, data: &[u8]) -> IncomingResult {
+        // Reject verbatim replays before doing any crypto or, crucially, before
+        // re-emitting the embedded payload or replacing a live session.
+        if self.is_replayed_handshake(data) {
+            debug!("Dropping replayed IK_INIT from {from}");
+            return IncomingResult::Rejected;
+        }
         let params = match NOISE_PATTERN_IK.parse::<snow::params::NoiseParams>() {
             Ok(p) => p,
             Err(_) => return IncomingResult::Rejected,
@@ -523,7 +664,7 @@ impl EmberTransport {
             }
         }
 
-        let transport = match responder.into_transport_mode() {
+        let transport = match responder.into_stateless_transport_mode() {
             Ok(t) => t,
             Err(e) => {
                 debug!("IK into_transport failed for {from}: {e}");
@@ -534,14 +675,8 @@ impl EmberTransport {
         if self.sessions.len() >= MAX_SESSIONS {
             self.evict_oldest_session();
         }
-        self.sessions.insert(
-            from,
-            NoiseSession {
-                transport,
-                remote_noise_pub,
-                last_activity: Instant::now(),
-            },
-        );
+        self.sessions
+            .insert(from, NoiseSession::new(transport, remote_noise_pub));
         trace!("IK handshake completed (responder) with {from}");
 
         let decrypted = if payload_len > 0 {
@@ -589,38 +724,42 @@ impl EmberTransport {
                 return IncomingResult::Rejected;
             }
         };
-        let mut transport = match state.into_transport_mode() {
+
+        // Mirror the responder guard: never let a completing handshake replace a
+        // live session that belongs to a DIFFERENT Noise identity at the same
+        // address (session-takeover defense). Same-key completion is a refresh
+        // and allowed.
+        if let Some(existing) = self.sessions.get(&from) {
+            if existing.remote_noise_pub != remote_noise_pub {
+                debug!(
+                    "IK resp from {from} would replace a live session with a different static key; \
+                     rejecting to prevent session takeover"
+                );
+                return IncomingResult::Rejected;
+            }
+        }
+
+        let transport = match state.into_stateless_transport_mode() {
             Ok(t) => t,
             Err(e) => {
                 debug!("IK into_transport failed for {from}: {e}");
                 return IncomingResult::Rejected;
             }
         };
+        let mut session = NoiseSession::new(transport, remote_noise_pub);
 
         // Send queued messages
         let mut packets = Vec::new();
         for msg in &queued {
-            let mut buf = vec![0u8; HEADER_LEN + msg.len() + 64];
-            buf[0] = EMBER_MAGIC[0];
-            buf[1] = EMBER_MAGIC[1];
-            buf[2] = PKT_TRANSPORT;
-            if let Ok(len) = transport.write_message(msg, &mut buf[HEADER_LEN..]) {
-                buf.truncate(HEADER_LEN + len);
-                packets.push(buf);
+            if let Some(pkt) = session.seal(msg) {
+                packets.push(pkt);
             }
         }
 
         if self.sessions.len() >= MAX_SESSIONS {
             self.evict_oldest_session();
         }
-        self.sessions.insert(
-            from,
-            NoiseSession {
-                transport,
-                remote_noise_pub,
-                last_activity: Instant::now(),
-            },
-        );
+        self.sessions.insert(from, session);
         trace!("IK handshake completed (initiator) with {from}");
 
         IncomingResult::HandshakeComplete {
@@ -674,6 +813,24 @@ impl EmberTransport {
     }
 
     fn handle_xx_msg1(&mut self, from: SocketAddr, data: &[u8]) -> IncomingResult {
+        // Don't let an inbound XX msg1 clobber a handshake *we* initiated to the
+        // same address: an attacker spoofing the peer's source address could
+        // otherwise strand our in-flight connect attempts. A peer legitimately
+        // retransmitting msg1 (after a lost msg2) only ever has a responder-side
+        // pending here, which we still refresh below.
+        if matches!(
+            self.pending.get(&from),
+            Some(PendingHandshake::IkInitiator { .. } | PendingHandshake::XxInitiatorMsg1 { .. })
+        ) {
+            debug!("Ignoring XX msg1 from {from}: an initiator handshake is in flight");
+            return IncomingResult::Rejected;
+        }
+        // Reject verbatim replays (prevents repeated msg2 reflection from a
+        // single captured msg1).
+        if self.is_replayed_handshake(data) {
+            debug!("Dropping replayed XX msg1 from {from}");
+            return IncomingResult::Rejected;
+        }
         let params = match NOISE_PATTERN_XX.parse::<snow::params::NoiseParams>() {
             Ok(p) => p,
             Err(_) => return IncomingResult::Rejected,
@@ -773,23 +930,33 @@ impl EmberTransport {
                 return IncomingResult::Rejected;
             }
         };
-        let mut transport = match state.into_transport_mode() {
+
+        // Mirror the responder guard: a completing handshake must not replace a
+        // live session belonging to a DIFFERENT Noise identity at the same
+        // address (session-takeover defense).
+        if let Some(existing) = self.sessions.get(&from) {
+            if existing.remote_noise_pub != remote_noise_pub {
+                debug!(
+                    "XX msg2 from {from} would replace a live session with a different static key; \
+                     rejecting to prevent session takeover"
+                );
+                return IncomingResult::Rejected;
+            }
+        }
+
+        let transport = match state.into_stateless_transport_mode() {
             Ok(t) => t,
             Err(e) => {
                 debug!("XX into_transport failed for {from}: {e}");
                 return IncomingResult::Rejected;
             }
         };
+        let mut session = NoiseSession::new(transport, remote_noise_pub);
 
         // Send remaining queued messages (skip first, it was in msg3 payload)
         let mut packets = vec![resp_buf];
         for msg in queued.iter().skip(1) {
-            let mut pkt = vec![0u8; HEADER_LEN + msg.len() + 64];
-            pkt[0] = EMBER_MAGIC[0];
-            pkt[1] = EMBER_MAGIC[1];
-            pkt[2] = PKT_TRANSPORT;
-            if let Ok(len) = transport.write_message(msg, &mut pkt[HEADER_LEN..]) {
-                pkt.truncate(HEADER_LEN + len);
+            if let Some(pkt) = session.seal(msg) {
                 packets.push(pkt);
             }
         }
@@ -797,14 +964,7 @@ impl EmberTransport {
         if self.sessions.len() >= MAX_SESSIONS {
             self.evict_oldest_session();
         }
-        self.sessions.insert(
-            from,
-            NoiseSession {
-                transport,
-                remote_noise_pub,
-                last_activity: Instant::now(),
-            },
-        );
+        self.sessions.insert(from, session);
         trace!("XX handshake completed (initiator) with {from}");
 
         IncomingResult::HandshakeComplete {
@@ -861,13 +1021,14 @@ impl EmberTransport {
             }
         }
 
-        let mut transport = match state.into_transport_mode() {
+        let transport = match state.into_stateless_transport_mode() {
             Ok(t) => t,
             Err(e) => {
                 debug!("XX into_transport failed for {from}: {e}");
                 return IncomingResult::Rejected;
             }
         };
+        let mut session = NoiseSession::new(transport, remote_noise_pub);
 
         // Drain any application payloads that the local app tried to
         // send while we were still in the msg2→msg3 window. Each one
@@ -876,32 +1037,17 @@ impl EmberTransport {
         // dropped by `prepare_outgoing`'s queue case.
         let mut packets_to_send: Vec<Vec<u8>> = Vec::with_capacity(queued.len());
         for msg in &queued {
-            let mut pkt = vec![0u8; HEADER_LEN + msg.len() + 64];
-            pkt[0] = EMBER_MAGIC[0];
-            pkt[1] = EMBER_MAGIC[1];
-            pkt[2] = PKT_TRANSPORT;
-            match transport.write_message(msg, &mut pkt[HEADER_LEN..]) {
-                Ok(len) => {
-                    pkt.truncate(HEADER_LEN + len);
-                    packets_to_send.push(pkt);
-                }
-                Err(e) => {
-                    warn!("XX msg3: failed to encrypt queued message for {from}: {e}");
-                }
+            if let Some(pkt) = session.seal(msg) {
+                packets_to_send.push(pkt);
+            } else {
+                warn!("XX msg3: failed to encrypt queued message for {from}");
             }
         }
 
         if self.sessions.len() >= MAX_SESSIONS {
             self.evict_oldest_session();
         }
-        self.sessions.insert(
-            from,
-            NoiseSession {
-                transport,
-                remote_noise_pub,
-                last_activity: Instant::now(),
-            },
-        );
+        self.sessions.insert(from, session);
         trace!(
             "XX handshake completed (responder) with {from}; flushed {} queued message(s)",
             queued.len()
@@ -924,6 +1070,14 @@ impl EmberTransport {
     // ── Transport (post-handshake encrypted messages) ──
 
     fn handle_transport(&mut self, from: SocketAddr, data: &[u8]) -> IncomingResult {
+        // Wire layout: nonce(8 LE) || ciphertext.
+        if data.len() < 8 {
+            debug!("Ember transport packet from {from} too short for nonce");
+            return IncomingResult::Rejected;
+        }
+        let nonce = u64::from_le_bytes(data[..8].try_into().expect("8 bytes"));
+        let ciphertext = &data[8..];
+
         let session = match self.sessions.get_mut(&from) {
             Some(s) => s,
             None => {
@@ -932,9 +1086,18 @@ impl EmberTransport {
             }
         };
 
-        let mut payload_buf = vec![0u8; data.len()];
-        match session.transport.read_message(data, &mut payload_buf) {
+        // Reject stale/duplicate nonces before spending a decrypt on them.
+        if !session.replay_precheck(nonce) {
+            trace!("Ember transport replayed/stale nonce {nonce} from {from}");
+            return IncomingResult::Rejected;
+        }
+
+        let mut payload_buf = vec![0u8; ciphertext.len()];
+        match session.transport.read_message(nonce, ciphertext, &mut payload_buf) {
             Ok(len) => {
+                // Commit the nonce to the replay window only now that AEAD has
+                // authenticated it.
+                session.replay_commit(nonce);
                 session.last_activity = Instant::now();
                 IncomingResult::Message {
                     from,
@@ -943,8 +1106,10 @@ impl EmberTransport {
                 }
             }
             Err(e) => {
-                debug!("Ember transport decrypt failed from {from}: {e}");
-                self.sessions.remove(&from);
+                // Crucially, do NOT tear the session down: over UDP a single
+                // spoofed, corrupt, or stray datagram would otherwise kill a
+                // perfectly healthy session. Drop just this packet.
+                debug!("Ember transport decrypt failed from {from} (nonce {nonce}): {e}");
                 IncomingResult::Rejected
             }
         }
@@ -1075,6 +1240,124 @@ mod tests {
             }
             _ => panic!("expected Message"),
         }
+    }
+
+    /// Establish a live IK session between two transports and return them
+    /// with each side's view of the peer address.
+    fn established_pair() -> (EmberTransport, EmberTransport, SocketAddr, SocketAddr) {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"hi") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            _ => panic!("expected HandshakeStarted"),
+        };
+        let resp = match bob.process_incoming(&init, alice_addr) {
+            IncomingResult::HandshakeComplete { packets_to_send, .. } => packets_to_send,
+            _ => panic!("expected HandshakeComplete (responder)"),
+        };
+        match alice.process_incoming(&resp[0], bob_addr) {
+            IncomingResult::HandshakeComplete { .. } => {}
+            _ => panic!("expected HandshakeComplete (initiator)"),
+        }
+        (alice, bob, alice_addr, bob_addr)
+    }
+
+    fn seal_ready(t: &mut EmberTransport, peer: SocketAddr, msg: &[u8]) -> Vec<u8> {
+        match t.prepare_outgoing(peer, None, msg) {
+            OutgoingResult::Ready { packet } => packet,
+            _ => panic!("expected Ready on established session"),
+        }
+    }
+
+    #[test]
+    fn transport_tolerates_reorder_and_rejects_replay() {
+        let (mut alice, mut bob, alice_addr, bob_addr) = established_pair();
+        let p1 = seal_ready(&mut alice, bob_addr, b"one");
+        let p2 = seal_ready(&mut alice, bob_addr, b"two");
+        let p3 = seal_ready(&mut alice, bob_addr, b"three");
+
+        // Deliver out of order: p3, p1, p2 — the sliding window accepts all.
+        for (pkt, expect) in [
+            (&p3, &b"three"[..]),
+            (&p1, &b"one"[..]),
+            (&p2, &b"two"[..]),
+        ] {
+            match bob.process_incoming(pkt, alice_addr) {
+                IncomingResult::Message { payload, .. } => assert_eq!(payload, expect),
+                _ => panic!("expected Message for reordered packet"),
+            }
+        }
+
+        // A verbatim replay of an already-accepted packet is rejected…
+        assert!(matches!(
+            bob.process_incoming(&p1, alice_addr),
+            IncomingResult::Rejected
+        ));
+        // …yet the session stays healthy and a fresh packet still decrypts.
+        let p4 = seal_ready(&mut alice, bob_addr, b"four");
+        assert!(matches!(
+            bob.process_incoming(&p4, alice_addr),
+            IncomingResult::Message { .. }
+        ));
+    }
+
+    #[test]
+    fn forged_transport_packet_does_not_tear_down_session() {
+        let (mut alice, mut bob, alice_addr, bob_addr) = established_pair();
+        let good = seal_ready(&mut alice, bob_addr, b"legit");
+
+        // Corrupt the AEAD tag of a copy and deliver it first.
+        let mut forged = good.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 0xFF;
+        assert!(matches!(
+            bob.process_incoming(&forged, alice_addr),
+            IncomingResult::Rejected
+        ));
+        assert!(
+            bob.has_session(&alice_addr),
+            "a single forged/corrupt datagram must not tear down the session"
+        );
+
+        // The genuine packet (same nonce, untampered) still decrypts because the
+        // forged one never committed its nonce to the replay window.
+        match bob.process_incoming(&good, alice_addr) {
+            IncomingResult::Message { payload, .. } => assert_eq!(payload, b"legit"),
+            _ => panic!("expected Message after a forged packet was dropped"),
+        }
+    }
+
+    #[test]
+    fn replayed_ik_init_is_dropped() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"req") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            _ => panic!("expected HandshakeStarted"),
+        };
+        // First copy completes the handshake and surfaces the embedded payload.
+        match bob.process_incoming(&init, alice_addr) {
+            IncomingResult::HandshakeComplete {
+                decrypted_payload, ..
+            } => assert_eq!(decrypted_payload.as_deref(), Some(&b"req"[..])),
+            _ => panic!("expected HandshakeComplete"),
+        }
+        // A verbatim replay must be dropped — it must NOT re-emit the payload or
+        // reset the freshly-established session.
+        assert!(matches!(
+            bob.process_incoming(&init, alice_addr),
+            IncomingResult::Rejected
+        ));
     }
 
     #[test]

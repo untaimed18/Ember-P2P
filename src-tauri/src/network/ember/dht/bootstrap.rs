@@ -77,6 +77,10 @@ pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<EmberContact>> {
 
     let count = cursor.read_u16::<LittleEndian>()? as usize;
     let mut contacts = Vec::with_capacity(count);
+    // Contacts dropped because their persisted Ed25519 key was unusable. Tracked
+    // separately so the truncation check below doesn't misfire when we
+    // legitimately skip a corrupt entry mid-file.
+    let mut dropped = 0usize;
 
     for _ in 0..count {
         let mut node_id = [0u8; 16];
@@ -124,8 +128,21 @@ pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<EmberContact>> {
 
         let last_seen = cursor.read_i64::<LittleEndian>().unwrap_or(0);
 
+        // Re-derive the node id from the persisted Ed25519 key rather than
+        // trusting the on-disk `node_id`. If the file was tampered with (or
+        // corrupted), a mismatched id must not let a contact masquerade under
+        // an identity it doesn't control — the derived id is authoritative and
+        // matches what the first PING will re-verify.
+        let Some(derived) = crate::network::ember::crypto::node_id_from_ed25519_bytes(&ed25519_pub)
+        else {
+            warn!("Skipping nodes_ember.dat contact with invalid Ed25519 key");
+            dropped += 1;
+            continue;
+        };
+        let _ = node_id; // persisted id is advisory; derived id is authoritative
+
         contacts.push(EmberContact {
-            node_id: EmberNodeId(node_id),
+            node_id: EmberNodeId(derived),
             addr: SocketAddr::new(ip, port),
             noise_pub,
             ed25519_pub,
@@ -139,8 +156,10 @@ pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<EmberContact>> {
     // leaving us with fewer. Without this check, the next save would
     // silently overwrite the on-disk file with the truncated list,
     // permanently shrinking the persisted DHT bootstrap set.
-    // Mirrors `kad::bootstrap::backup_if_short_load`.
-    if contacts.len() < count {
+    // Mirrors `kad::bootstrap::backup_if_short_load`. `dropped` entries were
+    // parsed successfully but discarded for an invalid key, so they don't count
+    // as truncation.
+    if contacts.len() + dropped < count {
         warn!(
             "Ember DHT nodes file declared {count} contacts but only {} loaded; \
              likely a corrupted or truncated file. Backing up before next save.",
@@ -256,11 +275,16 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     fn make_contact(id: u8) -> EmberContact {
+        // `load_nodes` re-derives the node id from the Ed25519 key and drops
+        // contacts whose key isn't a valid curve point, so use a real keypair
+        // (any 32 bytes is a valid Ed25519 seed).
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[id; 32]);
+        let vk = sk.verifying_key();
         EmberContact {
-            node_id: EmberNodeId([id; 16]),
+            node_id: EmberNodeId(crate::network::ember::crypto::node_id_from_public_key(&vk)),
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(80, 1, 2, id)), 4662),
             noise_pub: [id; 32],
-            ed25519_pub: [id; 32],
+            ed25519_pub: vk.to_bytes(),
             last_seen: 1000 + id as i64,
             failed_queries: 0,
         }
@@ -292,14 +316,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("nodes_ember_v6.dat");
 
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0xCC; 32]);
+        let vk = sk.verifying_key();
         let contacts = vec![EmberContact {
-            node_id: EmberNodeId([0xAA; 16]),
+            node_id: EmberNodeId(crate::network::ember::crypto::node_id_from_public_key(&vk)),
             addr: SocketAddr::new(
                 IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
                 9999,
             ),
             noise_pub: [0xBB; 32],
-            ed25519_pub: [0xCC; 32],
+            ed25519_pub: vk.to_bytes(),
             last_seen: 42,
             failed_queries: 0,
         }];
@@ -307,6 +333,7 @@ mod tests {
         let loaded = load_nodes(&path).unwrap();
 
         assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].node_id, contacts[0].node_id);
         assert_eq!(
             loaded[0].addr,
             SocketAddr::new(

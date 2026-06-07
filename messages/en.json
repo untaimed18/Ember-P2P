@@ -90,6 +90,7 @@
   "ember_disabled_explainer": "The Ember Network is off. Enable it to join the encrypted peer-to-peer overlay.",
   "ember_toggle_failed": "Couldn't change the Ember Network setting: {error}",
   "ember_load_failed": "Failed to load Ember Network status: {error}",
+  "ember_stats_unavailable": "Live stats are unavailable — the network service isn't responding. The numbers below may be out of date.",
 
   "sidebar_aria_primary": "Primary",
   "sidebar_logo_title": "Go to KAD Network home",
