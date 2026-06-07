@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,6 +18,10 @@ pub struct TransferControl {
     cancelled: AtomicBool,
     paused: AtomicBool,
     preview_priority: AtomicBool,
+    /// Download priority ordinal (verylow=0 .. release=5; default normal=2),
+    /// mirrored from [`Transfer::priority`] so the multi-source download worker
+    /// can bias global connection-slot acquisition without a manager round-trip.
+    download_priority: AtomicU8,
 }
 
 impl std::fmt::Debug for TransferControl {
@@ -35,6 +39,7 @@ impl TransferControl {
             cancelled: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             preview_priority: AtomicBool::new(false),
+            download_priority: AtomicU8::new(2),
         })
     }
 
@@ -64,6 +69,14 @@ impl TransferControl {
 
     pub fn is_preview_priority(&self) -> bool {
         self.preview_priority.load(Ordering::Acquire)
+    }
+
+    pub fn set_download_priority_ordinal(&self, ord: u8) {
+        self.download_priority.store(ord, Ordering::Release);
+    }
+
+    pub fn download_priority_ordinal(&self) -> u8 {
+        self.download_priority.load(Ordering::Acquire)
     }
 }
 
@@ -108,6 +121,17 @@ impl TransferManager {
     }
 
     pub fn register_control(&mut self, id: &str, control: Arc<TransferControl>) {
+        // Seed download priority from the transfer (if already known) so a
+        // non-default priority chosen before the download started (e.g. restored
+        // from DB) is respected by slot allocation from the first connection.
+        let ord = self
+            .active
+            .get(id)
+            .or_else(|| self.queue.iter().find(|t| t.id == id))
+            .map(|t| Self::priority_ordinal(&t.priority));
+        if let Some(ord) = ord {
+            control.set_download_priority_ordinal(ord);
+        }
         self.controls.insert(id.to_string(), control);
     }
 
@@ -812,6 +836,11 @@ impl TransferManager {
             transfer.priority = priority.to_string();
         } else if let Some(transfer) = self.queue.iter_mut().find(|t| t.id == id) {
             transfer.priority = priority.to_string();
+        }
+        // Mirror onto the live control so an active download's connection-slot
+        // allocation priority takes effect immediately (no restart needed).
+        if let Some(control) = self.controls.get(id) {
+            control.set_download_priority_ordinal(Self::priority_ordinal(priority));
         }
     }
 
