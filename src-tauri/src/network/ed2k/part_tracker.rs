@@ -210,6 +210,21 @@ impl PartTracker {
         self.part_verified.clone()
     }
 
+    /// Cheap, in-memory mirror of [`super::preview::can_preview`] computed
+    /// from live tracker state (no `.part.met` re-read). Lets the download
+    /// worker publish preview-readiness onto the transfer control so the UI can
+    /// grey out the Preview action until a preview would actually succeed.
+    pub fn is_preview_ready(&self, file_name: &str, file_size: u64) -> bool {
+        super::preview::can_preview(
+            file_name,
+            file_size,
+            self.completed_bytes(),
+            !self.part_hashes.is_empty(),
+            &self.part_verified,
+            PARTSIZE,
+        )
+    }
+
     /// Mark every part as verified because the whole-file ed2k hash matched.
     /// Used for < PARTSIZE single-part files (no hashset) and as a
     /// belt-and-braces check after final file verification on any file.

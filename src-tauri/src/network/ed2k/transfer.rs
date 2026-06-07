@@ -2170,6 +2170,12 @@ impl Ed2kDownload {
             tracker.set_part_hashes(part_hashes.clone());
         }
 
+        // Publish initial preview-readiness onto the shared transfer control so
+        // the UI's Preview button is correct on resume (first part already
+        // verified on disk). Refreshed below as parts verify.
+        self.control
+            .set_preview_ready(tracker.is_preview_ready(&self.file_name, self.file_size));
+
         // Per-file writer: dedicated thread + bounded channel replaces the
         // previous `Arc<Mutex<File>>`-with-`spawn_blocking`-per-block pattern
         // that serialized all writes on a single mutex. See
@@ -3126,6 +3132,11 @@ impl Ed2kDownload {
                     // Flip the persistent verified flag so the upload path
                     // can safely serve this range.
                     tracker.set_part_verified(part_idx);
+                    // A newly verified part may make this download previewable
+                    // (first part done + media type) — refresh the UI flag.
+                    self.control.set_preview_ready(
+                        tracker.is_preview_ready(&self.file_name, self.file_size),
+                    );
                     // D12: flush the peer's pending credit bytes now that
                     // the part they contributed to actually verified.
                     if pending_credit_bytes > 0 {

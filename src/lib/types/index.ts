@@ -94,6 +94,9 @@ export interface Transfer {
   a4af_sources: number;
   max_sources: number;
   preview_priority: boolean;
+  /** True when a live preview would currently succeed (first part verified +
+   *  previewable media type). Drives the Preview action's enabled state. */
+  preview_ready: boolean;
   ember_sources: number;
   client_software?: string;
   country_code?: string;
@@ -420,6 +423,8 @@ export interface AppSettings {
   max_connections: number;
   add_downloads_paused: boolean;
   remove_finished_downloads: boolean;
+  /** Globally prioritize first/last part of every download for faster preview. */
+  preview_priority_all: boolean;
   skip_compress_video: boolean;
   /** When on, peers whose advertised client-software string matches any
    *  pattern in `<data_dir>/antileech.dat` are rejected at handshake. */

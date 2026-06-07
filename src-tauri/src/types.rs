@@ -151,6 +151,13 @@ pub struct Transfer {
     /// eMule-style preview priority: download first and last parts first
     #[serde(default)]
     pub preview_priority: bool,
+    /// True when this download has enough verified data for `preview_file` to
+    /// succeed right now: a previewable media type plus the first ED2K part
+    /// (covering the first 256 KB) fully downloaded and MD4-verified. Computed
+    /// live from tracker state; drives the UI's Preview-button enablement so
+    /// the action is greyed out until a preview would actually work.
+    #[serde(default)]
+    pub preview_ready: bool,
     /// Sources discovered via Ember Peer Exchange
     #[serde(default)]
     pub ember_sources: u32,
@@ -596,6 +603,13 @@ pub struct AppSettings {
     /// Automatically remove completed downloads from the list
     #[serde(default)]
     pub remove_finished_downloads: bool,
+    /// Globally prioritize the first and last part of every download so media
+    /// files become previewable as early as possible (eMule's global "preview
+    /// priority" preference). When on, every transfer behaves as if its
+    /// per-file preview-priority toggle were enabled, without mutating that
+    /// per-file flag. Off by default (rarest-first is best for swarm health).
+    #[serde(default)]
+    pub preview_priority_all: bool,
     /// Skip compressing video files during upload (eMule: dontcompressavi)
     #[serde(default)]
     pub skip_compress_video: bool,
@@ -970,6 +984,7 @@ impl Default for AppSettings {
             max_connections: 500,
             add_downloads_paused: false,
             remove_finished_downloads: false,
+            preview_priority_all: false,
             skip_compress_video: false,
             antileech_enabled: false,
             uss_enabled: false,

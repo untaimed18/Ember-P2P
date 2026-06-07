@@ -1377,6 +1377,14 @@
     return t.status === 'paused' || t.status === 'stopped' || t.status === 'insufficient';
   }
 
+  // Preview is only meaningful for downloads whose first part is downloaded +
+  // MD4-verified and that are a previewable media type. The backend reports
+  // this as `preview_ready`; we mirror it here to grey out the action until a
+  // preview would actually succeed (instead of failing after the user clicks).
+  function canPreview(t: Transfer): boolean {
+    return t.direction === 'download' && t.preview_ready === true;
+  }
+
   const archiveExts = ['zip', 'cbz', 'jar', 'rar', 'cbr', 'ace'];
   function isArchive(t: Transfer): boolean {
     const ext = t.file_name.split('.').pop()?.toLowerCase() ?? '';
@@ -2763,7 +2771,7 @@
           <button class="tb-btn" disabled={!canResume(selectedTransfer)} onclick={() => runSelectedAction('resume')}>{m.common_resume()}</button>
           <button class="tb-btn" disabled={!canStop(selectedTransfer)} onclick={() => runSelectedAction('stop')}>{m.common_stop()}</button>
           <button class="tb-btn" onclick={() => runSelectedAction('sources')}>{m.transfers_find_sources()}</button>
-          <button class="tb-btn" onclick={() => runSelectedAction('preview')}>{m.transfers_preview()}</button>
+          <button class="tb-btn" disabled={!canPreview(selectedTransfer)} title={canPreview(selectedTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => runSelectedAction('preview')}>{m.transfers_preview()}</button>
         </div>
       </div>
     {:else}
@@ -3493,7 +3501,7 @@
       {/if}
       <button class="ctx-item danger" onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
       <div class="ctx-sep"></div>
-      <button class="ctx-item" onclick={() => ctxAction('preview')}>{m.transfers_preview()}</button>
+      <button class="ctx-item" disabled={!canPreview(ctxTransfer)} title={canPreview(ctxTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => ctxAction('preview')}>{m.transfers_preview()}</button>
       <button class="ctx-item" onclick={() => ctxAction('toggle_preview_prio')}>
         {ctxTransfer.preview_priority ? '✓ ' : ''}{m.transfers_ctx_preview_priority()}
       </button>
@@ -4402,7 +4410,8 @@
     align-items: center;
     gap: 16px;
   }
-  .ctx-item:hover { background: var(--bg-hover); }
+  .ctx-item:hover:not(:disabled) { background: var(--bg-hover); }
+  .ctx-item:disabled { opacity: 0.5; cursor: default; }
   .ctx-item.danger { color: var(--danger, #e74c3c); }
   .ctx-item.has-sub { display: flex; justify-content: space-between; }
   .ctx-shortcut {
