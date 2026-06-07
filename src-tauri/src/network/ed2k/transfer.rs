@@ -3213,12 +3213,21 @@ impl Ed2kDownload {
         // Verify the final file hash BEFORE moving the .part file.
         // Fast path: if all parts were individually hash-verified during download,
         // compute the file hash from the known part hashes (no disk I/O needed).
-        // Fallback: re-read the entire file from disk if part hashes aren't available.
+        // Fallback: re-read the entire file from disk.
+        //
+        // The `all_parts_verified()` gate is load-bearing, not just an
+        // optimization guard: `ed2k_hash_from_parts` derives the hash from the
+        // (hashset-verified) part hashes, so it always equals `file_hash` and
+        // never reads the disk. Without the gate, a part that is complete-but-
+        // unverified (e.g. loaded from a resumed `.part`, or filled without a
+        // per-part MD4 check) would be published as verified. When any part is
+        // unverified we fall through to the full on-disk re-read instead.
         let expected_hash = hex::encode(self.file_hash);
         let num_parts = ((self.file_size + super::hash::PARTSIZE - 1) / super::hash::PARTSIZE) as usize;
         let can_use_fast_verify = self.file_size >= super::hash::PARTSIZE
             && !part_hashes.is_empty()
-            && part_hashes.len() >= num_parts;
+            && part_hashes.len() >= num_parts
+            && tracker.all_parts_verified();
 
         let verified_ok = if can_use_fast_verify {
             let actual_hash = super::hash::ed2k_hash_from_parts(&part_hashes, self.file_size);
