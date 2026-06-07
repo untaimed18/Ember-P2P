@@ -9,6 +9,7 @@
   } from '$lib/api/security';
   import type { AntiLeechSnapshot } from '$lib/types';
   import { invoke } from '@tauri-apps/api/core';
+  import { goto } from '$app/navigation';
   import { relaunch } from '@tauri-apps/plugin-process';
   import type { AppSettings, SpamStats, DownloadHistoryStats } from '$lib/types';
   import { onMount, untrack } from 'svelte';
@@ -1204,6 +1205,14 @@
 
           <div class="field toggle-row">
             <div class="toggle-info">
+              <span class="toggle-title">{m.settings_ember_native_label()} <span class="badge-experimental">{m.ember_experimental()}</span></span>
+              <span class="hint">{m.settings_ember_native_hint()} <a href="/ember" onclick={(e) => { e.preventDefault(); goto('/ember'); }}>{m.settings_ember_open_page()}</a></span>
+            </div>
+            <ToggleSwitch bind:checked={settings.ember_native_enabled} ariaLabel={m.settings_ember_native_label()} />
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
               <span class="toggle-title">{m.settings_auto_connect_kad()} <span class="restart-badge">{m.settings_restart_badge()}</span></span>
               <span class="hint">{m.settings_auto_connect_kad_hint()}</span>
             </div>
@@ -1754,6 +1763,20 @@
     border-radius: 8px;
     color: var(--warning);
     background: color-mix(in srgb, var(--warning) 14%, transparent);
+    vertical-align: middle;
+    line-height: 1.5;
+  }
+
+  .badge-experimental {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
     vertical-align: middle;
     line-height: 1.5;
   }

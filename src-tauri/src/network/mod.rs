@@ -3840,6 +3840,49 @@ fn antileech_reset_defaults(
     Ok(antileech_snapshot(state))
 }
 
+/// Kick a cold-start Ember DHT bootstrap if (and only if) it's warranted:
+/// the native transport is enabled, the routing table is empty (no warm
+/// `nodes_ember.dat`, or it failed to load), and a rendezvous URL is
+/// configured. The actual `/bootstrap` fetch is an HTTPS round trip, so it
+/// runs in a detached task and hands the parsed contacts back to the
+/// network loop over `boot_tx`; the `ember_boot_rx` arm there seeds them
+/// and fires a self-lookup. Safe to call when not warranted — it just
+/// no-ops. Used both at startup and when the user toggles the network on
+/// at runtime, so a fresh node joins the DHT without a restart.
+fn maybe_spawn_ember_cold_bootstrap(
+    settings: &AppSettings,
+    state: &NetworkState,
+    boot_tx: &mpsc::Sender<Vec<ember::dht::EmberContact>>,
+    trigger: &'static str,
+) {
+    if !(settings.ember_native_enabled
+        && state.ember_dht.contact_count() == 0
+        && !settings.rendezvous_url.trim().is_empty())
+    {
+        return;
+    }
+    let rv_url = settings.rendezvous_url.clone();
+    let boot_tx = boot_tx.clone();
+    tokio::spawn(async move {
+        match ember::dht::bootstrap::fetch_bootstrap_nodes(&rv_url).await {
+            Ok(nodes) => {
+                let contacts: Vec<ember::dht::EmberContact> =
+                    nodes.iter().filter_map(|n| n.to_contact()).collect();
+                if contacts.is_empty() {
+                    info!("Ember DHT cold bootstrap ({trigger}): rendezvous returned no usable nodes yet");
+                } else {
+                    info!(
+                        "Ember DHT cold bootstrap ({trigger}): fetched {} node(s) from rendezvous",
+                        contacts.len()
+                    );
+                    let _ = boot_tx.send(contacts).await;
+                }
+            }
+            Err(e) => debug!("Ember DHT cold bootstrap ({trigger}) fetch failed: {e}"),
+        }
+    });
+}
+
 pub async fn start_network(
     app_handle: tauri::AppHandle,
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
@@ -4412,34 +4455,13 @@ pub async fn start_network(
     // `/bootstrap` pool so we can join the DHT without any KAD involvement.
     // The fetch is an HTTPS round trip, so it runs in a background task and
     // hands the contacts back to the loop over `ember_boot_rx` instead of
-    // blocking startup. Warm starts skip this entirely.
+    // blocking startup. Warm starts skip this entirely. The same helper is
+    // reused when the user flips `ember_native_enabled` on at runtime (see
+    // the `UpdateSettings` handlers) so the toggle joins the DHT without a
+    // restart.
     let (ember_boot_tx, mut ember_boot_rx) =
         mpsc::channel::<Vec<ember::dht::EmberContact>>(1);
-    if settings.ember_native_enabled
-        && state.ember_dht.contact_count() == 0
-        && !settings.rendezvous_url.trim().is_empty()
-    {
-        let rv_url = settings.rendezvous_url.clone();
-        let boot_tx = ember_boot_tx.clone();
-        tokio::spawn(async move {
-            match ember::dht::bootstrap::fetch_bootstrap_nodes(&rv_url).await {
-                Ok(nodes) => {
-                    let contacts: Vec<ember::dht::EmberContact> =
-                        nodes.iter().filter_map(|n| n.to_contact()).collect();
-                    if contacts.is_empty() {
-                        info!("Ember DHT cold bootstrap: rendezvous returned no usable nodes yet");
-                    } else {
-                        info!(
-                            "Ember DHT cold bootstrap: fetched {} node(s) from rendezvous",
-                            contacts.len()
-                        );
-                        let _ = boot_tx.send(contacts).await;
-                    }
-                }
-                Err(e) => debug!("Ember DHT cold bootstrap fetch failed: {e}"),
-            }
-        });
-    }
+    maybe_spawn_ember_cold_bootstrap(&settings, &state, &ember_boot_tx, "startup");
 
     // Load known files for hash cache
     let known_met_path = data_dir.join("known.met");
@@ -5286,6 +5308,11 @@ pub async fn start_network(
                     // off, so sessions established during the "on" period
                     // cannot decrypt traffic if the user re-enables it later
                     // (different harness session, different intent).
+                    // Capture the off→on transition before `settings` is
+                    // overwritten below, so we can kick a cold bootstrap —
+                    // the toggle joins the DHT without needing a restart.
+                    let ember_turned_on =
+                        !settings.ember_native_enabled && new_settings.ember_native_enabled;
                     if settings.ember_native_enabled && !new_settings.ember_native_enabled {
                         state.ember_transport.cleanup_all();
                         state.ember_pending_pings.clear();
@@ -5302,6 +5329,14 @@ pub async fn start_network(
                         new_settings.ember_native_enabled,
                     );
                     settings = new_settings;
+                    if ember_turned_on {
+                        maybe_spawn_ember_cold_bootstrap(
+                            &settings,
+                            &state,
+                            &ember_boot_tx,
+                            "settings-toggle",
+                        );
+                    }
                 }
                 cmd => {
                     handle_command(
@@ -5503,6 +5538,8 @@ pub async fn start_network(
                             state.ip_filter.set_block_private(new_settings.block_private_ips);
                             state.ip_filter.update_shared_snapshot(&state.shared_ip_filter);
                         }
+                        let ember_turned_on =
+                            !settings.ember_native_enabled && new_settings.ember_native_enabled;
                         if settings.ember_native_enabled && !new_settings.ember_native_enabled {
                             state.ember_transport.cleanup_all();
                             state.ember_pending_pings.clear();
@@ -5519,6 +5556,14 @@ pub async fn start_network(
                             new_settings.ember_native_enabled,
                         );
                         settings = new_settings;
+                        if ember_turned_on {
+                            maybe_spawn_ember_cold_bootstrap(
+                                &settings,
+                                &state,
+                                &ember_boot_tx,
+                                "settings-toggle",
+                            );
+                        }
                     }
                     Some(cmd) => {
                         handle_command(

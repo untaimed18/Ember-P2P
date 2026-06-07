@@ -145,6 +145,7 @@ and eD2K network function the client depends on today.
 | 6 | Periodic timers — routing-table refresh (random target lookups), ping oldest contacts in each bucket, republish stored records on a schedule. | KAD maintenance loop | **Done** ([slice doc](./ember-dht-slice.md)) |
 | 7 | Persistent contacts — Ember `nodes.dat` equivalent saved on shutdown, loaded at startup. | KAD `nodes.dat` | **Done** ([slice doc](./ember-dht-slice.md)) |
 | 7+ | Cold-start rendezvous bootstrap — clients publish their Noise key on `/register` (DHT-on only); the server `/bootstrap` route serves a rotating pool; a fresh node (no `nodes_ember.dat`) fetches + seeds it, then self-looks-up. | KAD-fed Noise keys for first contact | **Done** ([slice doc](./ember-dht-slice.md)) |
+| 7++ | User-facing surface — a **Settings → Network** toggle and a dedicated **Ember Network** page (`/ember`, sidebar) drive `ember_native_enabled` through `update_settings`. The backend applies the off→on transition live: it tears down sessions on disable and, on enable, fires the same cold bootstrap as startup, so the toggle joins the DHT without a restart. Promotes Ember from a `config.json`-only flag to a one-click feature. | n/a (was config-file only) | **Done** |
 
 After phase 1, two Ember peers who know one common third peer can
 discover each other automatically and exchange signed records. With
