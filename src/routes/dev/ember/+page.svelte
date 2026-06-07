@@ -563,6 +563,18 @@
           <div class="counter-label">KAD-bridge pings</div>
           <div class="counter-value">{diag.ember_dht_kad_bridge_pings}</div>
         </div>
+        <div class="counter">
+          <div class="counter-label">Sources published</div>
+          <div class="counter-value">{diag.ember_dht_sources_published}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Source searches</div>
+          <div class="counter-value">{diag.ember_dht_source_searches}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Source records found</div>
+          <div class="counter-value">{diag.ember_dht_source_records_found}</div>
+        </div>
       </div>
 
       <div class="maint-row">

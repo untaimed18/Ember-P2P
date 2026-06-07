@@ -2743,6 +2743,29 @@ struct NetworkState {
     /// `EMBER_MAINT_PING_TIMEOUT`. Unlike `ember_dht_pending_pings` these
     /// have no waiter — they exist purely to drive eviction.
     ember_dht_maint_pings: HashMap<u32, (ember::dht::EmberNodeId, std::time::Instant)>,
+    /// Last time we (re)published an Ember DHT *source* record for each
+    /// shared file, keyed by its 16-byte eD2K hash (slice 9). The publish
+    /// tick republishes a file only after `EMBER_SOURCE_REPUBLISH` has
+    /// elapsed, mirroring KAD's per-file source-publish schedule but driven
+    /// independently of KAD connectivity so it works on a KAD-less network.
+    ember_source_publish_at: HashMap<[u8; 16], std::time::Instant>,
+    /// In-flight Ember DHT source lookups for active/pending downloads
+    /// (slice 9), keyed by `search_id`, mapping to the `(transfer_id,
+    /// file_hash)` the lookup is for so `FOUND_VALUE` records can be parsed
+    /// into sources and injected into the matching download.
+    ember_download_source_searches: HashMap<u32, (String, [u8; 16])>,
+    /// Per-download Ember DHT source-search throttle (slice 9), keyed by
+    /// `transfer_id` → `(last_search_unix, search_count)`. Mirrors
+    /// `active_kad_search_state`: the `search_count` drives the
+    /// `ember_source_search_interval` backoff so a long-running download
+    /// queries the DHT eagerly at first, then progressively less often.
+    ember_source_search_state: HashMap<String, (i64, u32)>,
+    /// Sources parsed from completed Ember DHT source lookups, awaiting
+    /// async injection into the matching downloads (slice 9). The
+    /// completion point (`maybe_finish_ember_search`) is synchronous, but
+    /// injection (`handle_epx_sources`) is async, so results are buffered
+    /// here and drained on the next `ember_search_timer` tick.
+    ember_pending_source_injections: Vec<([u8; 16], Vec<(Ipv4Addr, u16, u16, u8)>)>,
     /// Set while a cold-start `/bootstrap` fetch task is running, so rapid
     /// off→on toggles (or any future caller) can't dog-pile concurrent
     /// HTTPS fetches at the rendezvous. The detached task releases it on
@@ -2829,6 +2852,35 @@ const EMBER_KAD_BRIDGE_UNTIL_CONTACTS: usize = ember::dht::K_BUCKET_SIZE;
 /// Max KAD-bridge `PING`s per maintenance cycle, so even a large KAD-learned
 /// peer cache can't burst the DHT with handshakes in one tick.
 const EMBER_KAD_BRIDGE_MAX_PINGS: usize = 8;
+
+// ── DHT source publishing (slice 9) ──
+
+/// How often we re-announce an Ember DHT *source* record for each shared
+/// file. Source records are never relayed by other nodes (the publisher's
+/// IP is bound at store time), so the publisher must re-announce within the
+/// record TTL; 2 h mirrors KAD's source-publish cadence and sits well
+/// inside the 24 h record TTL.
+const EMBER_SOURCE_REPUBLISH: std::time::Duration = std::time::Duration::from_secs(2 * 3600);
+
+/// Max shared-file source records to (re)publish per `publish_timer` tick,
+/// so a large library can't fan out an unbounded burst of STOREs at once.
+const EMBER_SOURCE_PUBLISH_MAX_PER_TICK: usize = 5;
+
+/// How often a download re-queries the Ember DHT for sources, indexed by
+/// how many times it has already searched (slice 9). Mirrors the spirit of
+/// the KAD `active_download_kad_interval` backoff: eager at first, then
+/// progressively calmer so a long-running download isn't a steady DHT load.
+fn ember_source_search_interval(search_count: u32) -> std::time::Duration {
+    let secs = match search_count {
+        0 => 0,
+        1 => 30,
+        2 => 60,
+        3 => 300,
+        4 => 900,
+        _ => 1800,
+    };
+    std::time::Duration::from_secs(secs)
+}
 
 /// Hard cap on `aich_hash_sets` (full per-file recovery hash sets
 /// loaded from / persisted to `known2_64.met`). Each set is on the
@@ -3955,6 +4007,12 @@ fn ember_disable_cleanup(state: &mut NetworkState) {
     state.ember_dht_search_requests.clear();
     state.ember_dht_publish_requests.clear();
     state.ember_dht_maint_pings.clear();
+    state.ember_download_source_searches.clear();
+    state.ember_source_search_state.clear();
+    state.ember_pending_source_injections.clear();
+    // Forget the per-file publish schedule so a re-enable republishes every
+    // shared file promptly instead of waiting out the republish interval.
+    state.ember_source_publish_at.clear();
     state.ember_search = ember::dht::search::SearchManager::new();
     state.ember_publish = ember::dht::publish::PublishManager::new();
 
@@ -4602,6 +4660,10 @@ pub async fn start_network(
         ember_dht_publish_requests: HashMap::new(),
         ember_dht_pending_publishes: HashMap::new(),
         ember_dht_maint_pings: HashMap::new(),
+        ember_source_publish_at: HashMap::new(),
+        ember_download_source_searches: HashMap::new(),
+        ember_source_search_state: HashMap::new(),
+        ember_pending_source_injections: Vec::new(),
         ember_cold_bootstrap_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
@@ -9454,6 +9516,20 @@ pub async fn start_network(
 
             // Periodic publishing
             _ = publish_timer.tick() => {
+                // Ember DHT source publishing (slice 9) runs independently of
+                // KAD connectivity, so it must come before the KAD-status gate
+                // and the KAD-routing-table check below: it works on a
+                // KAD-less network as long as the Ember routing table is warm.
+                maybe_publish_ember_sources(
+                    &udp_socket,
+                    &mut state,
+                    &settings,
+                    &local_index,
+                    settings.tcp_port,
+                    udp_port,
+                )
+                .await;
+
                 if state.stats.status == NetworkStatus::Disconnected { continue; }
                 if state.routing_table.is_empty() {
                     debug!("Skipping publish cycle: routing table is empty");
@@ -11926,6 +12002,96 @@ pub async fn start_network(
                                 entry.1 += 1;
                                 debug!("Started KAD source search for active download {} (attempt {})", tid, entry.1);
                             }
+                        }
+                    }
+                }
+
+                // Ember DHT source discovery for downloads (slice 9). Gated on
+                // the Ember transport + a warm Ember routing table (NOT on KAD
+                // connectivity), so it pulls sources on a KAD-less network too.
+                // Covers BOTH active downloads (live source sender) and pending
+                // no-seed downloads still hunting for their first source (the
+                // "download by hash" case); results inject via handle_epx_sources.
+                if settings.ember_native_enabled && state.ember_dht.contact_count() > 0 {
+                    const MAX_EMBER_SOURCE_SEARCHES_PER_TICK: usize = 5;
+                    // Drop throttle state for downloads that are entirely gone
+                    // (neither active nor pending) so the map can't grow without
+                    // bound across a long session.
+                    let stale_ember: Vec<String> = state
+                        .ember_source_search_state
+                        .keys()
+                        .filter(|tid| {
+                            !state.active_source_senders.contains_key(*tid)
+                                && !state.pending_downloads.contains_key(*tid)
+                        })
+                        .cloned()
+                        .collect();
+                    for tid in stale_ember {
+                        state.ember_source_search_state.remove(&tid);
+                    }
+
+                    let ember_needing: Vec<(String, [u8; 16])> = {
+                        let mgr = transfer_manager.read().await;
+                        let sm = source_manager.read().await;
+                        let mut out: Vec<(String, [u8; 16])> = Vec::new();
+                        let mut seen: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+
+                        // (transfer_id, file_hash_hex) candidates: active
+                        // downloads (live source sender) first, then pending
+                        // no-seed downloads. Clone out so the map borrows drop
+                        // before the backoff/cap filtering below.
+                        let mut candidates: Vec<(String, String)> = Vec::new();
+                        for tid in state.active_source_senders.keys() {
+                            if let Some(t) = mgr.get_transfer(tid) {
+                                candidates.push((tid.clone(), t.file_hash.clone()));
+                            }
+                        }
+                        for (tid, pd) in &state.pending_downloads {
+                            candidates.push((tid.clone(), pd.file_hash.clone()));
+                        }
+
+                        for (tid, hash_hex) in candidates {
+                            if !seen.insert(tid.clone()) {
+                                continue;
+                            }
+                            let Some(fh) = hex::decode(&hash_hex)
+                                .ok()
+                                .and_then(|v| <[u8; 16]>::try_from(v).ok())
+                            else {
+                                continue;
+                            };
+                            let (last_at, count) = state
+                                .ember_source_search_state
+                                .get(&tid)
+                                .copied()
+                                .unwrap_or((0, 0));
+                            let interval = ember_source_search_interval(count).as_secs() as i64;
+                            if now.saturating_sub(last_at) < interval {
+                                continue;
+                            }
+                            // Already saturated with sources — don't spend a DHT
+                            // lookup we don't need.
+                            if sm.source_count(&fh) >= MAX_SOURCES_FOR_UDP {
+                                continue;
+                            }
+                            out.push((tid, fh));
+                        }
+                        out
+                    };
+                    let mut ember_started = 0usize;
+                    for (tid, fh) in ember_needing {
+                        if ember_started >= MAX_EMBER_SOURCE_SEARCHES_PER_TICK {
+                            break;
+                        }
+                        if start_ember_source_search(&udp_socket, &mut state, &tid, fh).await {
+                            let entry = state
+                                .ember_source_search_state
+                                .entry(tid)
+                                .or_insert((0, 0));
+                            entry.0 = now;
+                            entry.1 += 1;
+                            ember_started += 1;
                         }
                     }
                 }
@@ -14832,6 +14998,7 @@ pub async fn start_network(
                     && state.ember_dht_publish_requests.is_empty()
                     && state.ember_publish.active_count() == 0
                     && state.ember_dht_maint_pings.is_empty()
+                    && state.ember_pending_source_injections.is_empty()
                 {
                     continue;
                 }
@@ -14875,6 +15042,10 @@ pub async fn start_network(
                     if let Some(tx) = state.ember_dht_pending_value_lookups.remove(&search_id) {
                         let _ = tx.send(Vec::new());
                     }
+                    // A timed-out download source lookup just means "no sources
+                    // found this round"; drop its bookkeeping so the map can't
+                    // leak across a long-running download.
+                    state.ember_download_source_searches.remove(&search_id);
                     state
                         .ember_dht_search_requests
                         .retain(|_, r| r.search_id != search_id);
@@ -14939,6 +15110,97 @@ pub async fn start_network(
                             .ember_diagnostics
                             .ember_dht_contacts_evicted
                             .saturating_add(1);
+                    }
+                }
+
+                // 6) Inject sources discovered by completed download source
+                //    lookups (slice 9). Completion is detected synchronously
+                //    in `maybe_finish_ember_search`, which buffers the parsed
+                //    sources here for the async injection below.
+                if !state.ember_pending_source_injections.is_empty() {
+                    let entries = std::mem::take(&mut state.ember_pending_source_injections);
+
+                    // (a) Record every discovered source in the source manager.
+                    //     This is what lets a *pending* no-seed download (started
+                    //     purely by ed2k hash) get promoted below — there is no
+                    //     server/KAD here to drive promotion — and it stores the
+                    //     connect options so the eventual c2c dial can obfuscate
+                    //     when the source advertised it. The DHT record's IP is
+                    //     already bound to the publisher's observed sender IP by
+                    //     the storer's anti-reflection check, so a forged
+                    //     third-party/special-use address can't reach us here.
+                    {
+                        let mut sm = source_manager.write().await;
+                        for (fh, sources) in &entries {
+                            for &(ip, tcp_port, udp_port, flags) in sources {
+                                let connect_options =
+                                    if flags & ember::SOURCE_FLAG_OBFUSCATION != 0 {
+                                        0x02
+                                    } else {
+                                        0
+                                    };
+                                sm.register_source_full_opts(
+                                    *fh,
+                                    ip,
+                                    tcp_port,
+                                    udp_port,
+                                    [0u8; 16],
+                                    connect_options,
+                                );
+                            }
+                        }
+                    }
+
+                    // (b) Inject into already-active transfers. Reuses the
+                    //     EPX/KAD ingest (ipfilter, ban, dedup, caps,
+                    //     relay-candidate handling, per-transfer counters).
+                    handle_epx_sources(
+                        &mut state,
+                        &transfer_manager,
+                        &source_manager,
+                        &entries,
+                        &[],
+                        &[],
+                        "ember-dht",
+                    )
+                    .await;
+
+                    // (c) Promote any pending no-seed download for these hashes
+                    //     now that a live source exists for it.
+                    let pending_tids: Vec<String> = {
+                        let mut tids: Vec<String> = Vec::new();
+                        for (fh, _) in &entries {
+                            let hash_hex = hex::encode(fh);
+                            for (tid, pd) in &state.pending_downloads {
+                                if pd.file_hash == hash_hex && !tids.contains(tid) {
+                                    tids.push(tid.clone());
+                                }
+                            }
+                        }
+                        tids
+                    };
+                    for tid in pending_tids {
+                        let _ = try_start_pending_download_from_known_sources(
+                            &mut state,
+                            &tid,
+                            &transfer_manager,
+                            &source_manager,
+                            &credit_manager,
+                            &bandwidth_limiter,
+                            &dl_event_tx,
+                            &app_handle,
+                            &settings,
+                            &shared_ember_payload,
+                            &ember_payload_generation,
+                            &shared_banned_ips,
+                            &geoip,
+                            &friend_hashes,
+                            ember_hash,
+                            ed25519_pubkey,
+                            ed25519_secret_key,
+                            &stats_manager.sx_counters,
+                        )
+                        .await;
                     }
                 }
             }
@@ -16464,7 +16726,22 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                 .map(|s| s.results.iter().map(|r| r.data.clone()).collect::<Vec<_>>())
                 .unwrap_or_default();
             if let Some(tx) = state.ember_dht_pending_value_lookups.remove(&search_id) {
+                // Dev/command value lookup: hand the raw blobs to the waiter.
                 let _ = tx.send(records);
+            } else if let Some((_transfer_id, file_hash)) =
+                state.ember_download_source_searches.remove(&search_id)
+            {
+                // Download source lookup (slice 9): parse the gathered blobs
+                // into connectable sources and queue them for async injection
+                // into the matching download on the next sweep tick.
+                let self_ip = state.external_ip;
+                let sources =
+                    parse_ember_source_records(&records, file_hash, self_ip, &mut state.ember_diagnostics);
+                if !sources.is_empty() {
+                    state
+                        .ember_pending_source_injections
+                        .push((file_hash, sources));
+                }
             }
         }
     }
@@ -16473,6 +16750,47 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
     state
         .ember_dht_search_requests
         .retain(|_, r| r.search_id != search_id);
+}
+
+/// Parse the blobs returned by an Ember DHT source `FIND_VALUE` into
+/// connectable `(ip, tcp_port, udp_port, flags)` tuples (slice 9).
+///
+/// Each blob is re-verified (`from_value_blob` checks the publisher
+/// signature), filtered to source records whose embedded file hash matches
+/// the download we asked about, self-filtered against our own external IP,
+/// and counted for diagnostics. Dedup / ipfilter / ban / cap handling is
+/// left to `handle_epx_sources` downstream.
+fn parse_ember_source_records(
+    blobs: &[Vec<u8>],
+    file_hash: [u8; 16],
+    self_ip: Option<Ipv4Addr>,
+    diag: &mut crate::types::EmberDiagnostics,
+) -> Vec<(Ipv4Addr, u16, u16, u8)> {
+    let mut out = Vec::new();
+    for blob in blobs {
+        let Some(rec) = ember::dht::publish::SignedRecord::from_value_blob(blob) else {
+            continue;
+        };
+        if rec.record_type != ember::dht::publish::RECORD_TYPE_SOURCE {
+            continue;
+        }
+        // The record must actually be for the file we asked about; a peer
+        // can't smuggle unrelated sources under our key.
+        if rec.file_hash != file_hash {
+            continue;
+        }
+        let Some(sc) = rec.source_contact else {
+            continue;
+        };
+        diag.ember_dht_source_records_found =
+            diag.ember_dht_source_records_found.saturating_add(1);
+        // Never inject ourselves, and drop unusable contacts.
+        if Some(sc.ip) == self_ip || sc.tcp_port == 0 {
+            continue;
+        }
+        out.push((sc.ip, sc.tcp_port, sc.udp_port, sc.flags));
+    }
+    out
 }
 
 /// Push a publish forward: pull the targets not yet stored on, send each
@@ -16574,6 +16892,158 @@ fn maybe_finish_ember_publish(state: &mut NetworkState, publish_id: u32) {
     state
         .ember_dht_publish_requests
         .retain(|_, r| r.publish_id != publish_id);
+}
+
+/// Auto-publish Ember DHT source records for our shared files (slice 9).
+///
+/// Runs on the 60-second publish tick, gated only on `ember_native_enabled`
+/// plus a non-empty Ember routing table (NOT on KAD connectivity), so the
+/// DHT advertises us as a source even on a KAD-less network. Only HighID /
+/// reachable nodes self-publish — mirroring KAD's `build_source_publish`
+/// returning `None` when firewalled — because the record's claimed IP is
+/// bound to the observed sender IP at the storer (anti-reflection). The
+/// record format already carries firewalled/relay flags, so LowID
+/// self-publish + broker-dial is a clean follow-on with no wire change.
+async fn maybe_publish_ember_sources(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    settings: &AppSettings,
+    local_index: &Arc<RwLock<LocalIndex>>,
+    tcp_port: u16,
+    udp_port: u16,
+) {
+    if !settings.ember_native_enabled
+        || state.firewalled
+        || state.low_id
+        || tcp_port == 0
+        || state.ember_dht.contact_count() == 0
+    {
+        return;
+    }
+    let Some(external_ip) = state.external_ip else {
+        return;
+    };
+
+    // Select shared files whose source record is missing or past its
+    // republish interval, bounded per tick. Snapshot under a short read lock
+    // so it isn't held across the publish awaits below.
+    //
+    // Rank by staleness rather than index order: never-published files rank
+    // highest, then the oldest publish first. A library larger than the
+    // per-tick budget therefore republishes every file round-robin instead
+    // of starving everything past the first `MAX_PER_TICK` entries. Only the
+    // chosen few clone their name.
+    let now = std::time::Instant::now();
+    let due: Vec<([u8; 16], u64, String)> = {
+        let idx = local_index.read().await;
+        let files = idx.all_files();
+        let mut ranked: Vec<(u64, usize)> = Vec::new();
+        for (i, f) in files.iter().enumerate() {
+            if !f.shared || f.hash.is_empty() {
+                continue;
+            }
+            let Some(hash) = hex::decode(&f.hash)
+                .ok()
+                .and_then(|v| <[u8; 16]>::try_from(v).ok())
+            else {
+                continue;
+            };
+            let staleness = match state.ember_source_publish_at.get(&hash) {
+                None => u64::MAX,
+                Some(t) => {
+                    let elapsed = now.duration_since(*t);
+                    if elapsed < EMBER_SOURCE_REPUBLISH {
+                        continue;
+                    }
+                    elapsed.as_secs()
+                }
+            };
+            ranked.push((staleness, i));
+        }
+        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        ranked.truncate(EMBER_SOURCE_PUBLISH_MAX_PER_TICK);
+        ranked
+            .into_iter()
+            .filter_map(|(_, i)| {
+                let f = &files[i];
+                let hash = hex::decode(&f.hash)
+                    .ok()
+                    .and_then(|v| <[u8; 16]>::try_from(v).ok())?;
+                Some((hash, f.size, f.name.clone()))
+            })
+            .collect()
+    };
+    if due.is_empty() {
+        return;
+    }
+
+    let flags = if settings.obfuscation_enabled {
+        ember::SOURCE_FLAG_OBFUSCATION
+    } else {
+        0
+    };
+    let contact = ember::dht::publish::SourceContact {
+        ip: external_ip,
+        tcp_port,
+        udp_port,
+        flags,
+        noise_pub: *state.ember_transport.local_noise_public_key(),
+    };
+
+    for (file_hash, file_size, file_name) in due {
+        // `ember_file_hash` (content BLAKE3) is deferred for slice 9: discovery
+        // keys off the eD2K hash and the c2c transfer verifies integrity, so
+        // we publish zeros rather than re-hash the whole library.
+        let record = state.ember_dht.build_source_record(
+            file_hash,
+            [0u8; 32],
+            file_size,
+            &file_name,
+            contact,
+        );
+        if let Some(publish_id) = state
+            .ember_publish
+            .start_publish(record, state.ember_dht.routing())
+        {
+            state.ember_source_publish_at.insert(file_hash, now);
+            state.ember_diagnostics.ember_dht_sources_published = state
+                .ember_diagnostics
+                .ember_dht_sources_published
+                .saturating_add(1);
+            drive_ember_publish(socket, state, publish_id).await;
+        }
+    }
+}
+
+/// Start an Ember DHT `FIND_VALUE` for the sources of `file_hash` on behalf
+/// of a download (slice 9). Returns whether a search was started (`false`
+/// if the search-manager slot cap is hit). Results are delivered
+/// asynchronously: `maybe_finish_ember_search` parses them into
+/// `ember_pending_source_injections`, which the search-timer sweep drains
+/// through `handle_epx_sources` into the download.
+async fn start_ember_source_search(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    transfer_id: &str,
+    file_hash: [u8; 16],
+) -> bool {
+    let target = ember::dht::EmberNodeId(ember::dht::publish::source_key(&file_hash));
+    let Some(search_id) =
+        state
+            .ember_search
+            .start_find_value(target, Vec::new(), state.ember_dht.routing())
+    else {
+        return false;
+    };
+    state
+        .ember_download_source_searches
+        .insert(search_id, (transfer_id.to_string(), file_hash));
+    state.ember_diagnostics.ember_dht_source_searches = state
+        .ember_diagnostics
+        .ember_dht_source_searches
+        .saturating_add(1);
+    drive_ember_search(socket, state, search_id).await;
+    true
 }
 
 /// Run one Ember DHT maintenance cycle (slice 6): refresh stale buckets,
@@ -19699,6 +20169,23 @@ async fn handle_command_inner(
                     ),
                 );
 
+                // Ember DHT source discovery for the new download (slice 9):
+                // independent of KAD, so it fires even on a KAD-less network.
+                // Mirrors the KAD seed above so the periodic source-retry sweep
+                // schedules the next lookup on the normal backoff instead of
+                // re-firing immediately.
+                let initial_ember_search_started = if settings.ember_native_enabled
+                    && state.ember_dht.contact_count() > 0
+                {
+                    start_ember_source_search(socket, state, &transfer_id, hash_bytes).await
+                } else {
+                    false
+                };
+                state.ember_source_search_state.insert(
+                    transfer_id.clone(),
+                    (now_ts, if initial_ember_search_started { 1 } else { 0 }),
+                );
+
                 // Immediate TCP `OP_GETSOURCES` to the connected eD2K
                 // server. Mirrors the on-login batch and the periodic
                 // 4-minute batch.
@@ -19865,6 +20352,21 @@ async fn handle_command_inner(
                     last_search_at: if kad_search_started { now } else { 0 },
                     priority: pending_priority,
                 });
+
+                // Kick an immediate Ember DHT source search too (slice 9),
+                // mirroring the KAD seed above so a download started purely by
+                // hash can discover sources on a KAD-less network. The periodic
+                // sweep re-asks on the normal backoff afterwards.
+                if settings.ember_native_enabled && state.ember_dht.contact_count() > 0 {
+                    let mut fh = [0u8; 16];
+                    fh.copy_from_slice(&hash_bytes);
+                    let ember_started =
+                        start_ember_source_search(socket, state, &transfer_id, fh).await;
+                    state.ember_source_search_state.insert(
+                        transfer_id.clone(),
+                        (now, if ember_started { 1 } else { 0 }),
+                    );
+                }
 
                 // Request sources from the connected ed2k server (non-blocking)
                 if state.server_connected {

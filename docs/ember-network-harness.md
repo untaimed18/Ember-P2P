@@ -57,9 +57,14 @@ which returns:
 - Broker relay attempts / successes / failures
 - Ember-native: `ember_native_enabled`, session count, pings sent /
   received, pongs received, and the local Noise public key
+- Ember DHT source discovery (slice 9): `ember_dht_sources_published`
+  (source records we re-announced for shared files),
+  `ember_dht_source_searches` (source lookups started for downloads), and
+  `ember_dht_source_records_found` (verified source records returned)
 
 This is the right surface to watch for harness scenarios; the regular
-status bar continues to show only user-facing state.
+status bar continues to show only user-facing state. The same counters
+appear as cards on the in-app `/dev/ember` panel.
 
 ## Ember-native ping (feature-flagged)
 
@@ -105,6 +110,41 @@ state.
      `broker_relay_attempts` should increment, followed by either
      `broker_punch_successes` or `broker_relay_successes` before the
      source enters the transfer path.
+
+4. **Ember DHT source discovery (slice 9)**
+   - Set `"ember_native_enabled": true` on both A (HighID seeder) and B
+     (downloader). The lookups and stores themselves ride the Ember DHT
+     only — no per-search server/KAD traffic — but two prerequisites need
+     a one-time bootstrap (see the caveats below): each node's routing
+     table must be non-empty, and A must already know its external IP.
+   - External IP: a node only learns its public IP from a KAD firewall
+     check or an eD2K server HighID, and `maybe_publish_ember_sources`
+     refuses to publish without it (the storer's anti-reflection check
+     rejects a source record whose signed IP doesn't match the observed
+     sender, so A must sign its real address). Let A reach KAD or a server
+     once this session; the learned IP then persists, after which no
+     further KAD/server traffic is required.
+   - Peer the two in the Ember DHT so their routing tables are non-empty:
+     either let the rendezvous cold-bootstrap fold them in (rendezvous
+     registration also needs the external IP above), or seed
+     deterministically with `add_ember_dht_contact` (copy each node's
+     `ember_dht_node_id`, address, Noise key, and Ed25519 key from
+     `get_ember_diagnostics`), then confirm `ember_dht_contacts > 0`.
+   - Share a file on A. Within one publish tick (~60 s),
+     `get_ember_diagnostics` on A shows `ember_dht_sources_published`
+     advance (A is now advertised as a source on the DHT). Only HighID /
+     non-firewalled nodes self-publish.
+   - Start the same download on B by its eD2K hash. B's
+     `ember_dht_source_searches` advances immediately and
+     `ember_dht_source_records_found` ticks once A's record is returned. A
+     pending (no-seed) download is then promoted with A registered as a
+     source and the c2c transfer begins.
+   - Caveat for single-machine runs: a source whose address is loopback or
+     private (`127.0.0.1`, `192.168.x`, …) is dropped by the standard
+     special-use/ipfilter guards on the connect path — the same limitation
+     as scenario 1's EPX flow — so the discovery counters advance and the
+     source row appears, but the byte transfer only completes between
+     nodes that reach each other on routable addresses.
 
 ## Notes
 

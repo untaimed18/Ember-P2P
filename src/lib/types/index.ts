@@ -249,6 +249,12 @@ export interface EmberDiagnostics {
    *  is still sparse, KAD-learned Ember peers are DHT-pinged so their signed
    *  PONG folds them into the routing table. Self-disables once bootstrapped. */
   ember_dht_kad_bridge_pings: number;
+  /** Source records (re)published for our shared files this session (slice 9). */
+  ember_dht_sources_published: number;
+  /** Source lookups started for active/pending downloads this session (slice 9). */
+  ember_dht_source_searches: number;
+  /** Verified source records discovered via FIND_VALUE for downloads (slice 9). */
+  ember_dht_source_records_found: number;
 }
 
 /** Result of an `ember_ping_peer` harness round-trip. `rtt_ms` is set

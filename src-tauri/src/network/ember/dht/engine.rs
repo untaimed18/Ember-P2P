@@ -20,7 +20,7 @@ use ed25519_dalek::SigningKey;
 use tracing::trace;
 
 use super::messages::{self, DhtPayload};
-use super::publish::SignedRecord;
+use super::publish::{SignedRecord, SourceContact, RECORD_TYPE_SOURCE};
 use super::routing::{AddResult, RoutingTable};
 use super::store::DhtStore;
 use super::{EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE, MAX_CONTACTS_PER_RESPONSE};
@@ -237,6 +237,28 @@ impl EmberDht {
         )
     }
 
+    /// Sign a source record advertising `contact` as a source for
+    /// `file_hash`, ready to publish on the file's source key. The contact
+    /// is part of the signed payload, so a downloader can dial it after
+    /// verifying the signature.
+    pub fn build_source_record(
+        &self,
+        file_hash: [u8; 16],
+        ember_file_hash: [u8; 32],
+        file_size: u64,
+        file_name: &str,
+        contact: SourceContact,
+    ) -> SignedRecord {
+        SignedRecord::source(
+            file_hash,
+            ember_file_hash,
+            file_size,
+            file_name,
+            contact,
+            &self.signing_key,
+        )
+    }
+
     /// Local store stats `(distinct_keys, total_records)` for diagnostics.
     pub fn store_stats(&self) -> (usize, usize) {
         (self.store.key_count(), self.store.total_records())
@@ -439,7 +461,21 @@ impl EmberDht {
                 // verifies the Ed25519 signature; `DhtStore::store` checks
                 // it again (defence in depth) and enforces capacity.
                 if let Some(parsed) = SignedRecord::from_wire(&record, record_signature) {
+                    // Anti-reflection for source records: the publisher's
+                    // self-reported IP must match the observed Noise sender IP,
+                    // so a peer cannot publish a record that points downloaders
+                    // at a third-party victim. Honest publishers store their own
+                    // source record from their own address, and source records
+                    // are deliberately not relayed by other nodes (see
+                    // `DhtStore::take_republish_batch`), so this binding always
+                    // holds for legitimate stores. Non-source records carry no
+                    // address and are unaffected.
+                    let source_ip_ok = match parsed.source_contact {
+                        Some(sc) => from.ip() == std::net::IpAddr::V4(sc.ip),
+                        None => parsed.record_type != RECORD_TYPE_SOURCE,
+                    };
                     if key == parsed.keyword_hash
+                        && source_ip_ok
                         && self.store_proximity_ok(&key)
                         && self.store.store(
                             key,
@@ -455,8 +491,9 @@ impl EmberDht {
                             .push(messages::encode_message(&ack, &self.signing_key, true));
                     }
                 }
-                // A record that fails to parse/verify, or whose key does
-                // not match its content, is dropped with no ACK so the
+                // A record that fails to parse/verify, whose key does not
+                // match its content, or (for a source record) whose claimed
+                // IP doesn't match the sender, is dropped with no ACK so the
                 // publisher's success count reflects only real storage.
             }
             DhtPayload::FindValue { keys } => {
@@ -669,6 +706,67 @@ mod tests {
         assert_eq!(parsed.file_name, "ubuntu.iso");
         assert_eq!(parsed.file_size, 4096);
         assert_eq!(parsed.keyword_hash, key);
+    }
+
+    fn source_contact_at(last: u8) -> SourceContact {
+        SourceContact {
+            ip: std::net::Ipv4Addr::new(10, 0, 0, last),
+            tcp_port: 4662,
+            udp_port: 4672,
+            flags: 0,
+            noise_pub: [0x44; 32],
+        }
+    }
+
+    #[test]
+    fn source_store_then_find_value_round_trip() {
+        let mut a = dht(60); // publisher (the source itself)
+        let mut b = dht(61); // storer
+        let a_noise = [0xAA; 32];
+        let b_noise = [0xBB; 32];
+        let a_addr = addr(20, 4672); // 10.0.0.20 — matches the claimed contact IP
+        let b_addr = addr(21, 4672);
+
+        // A advertises itself as a source. The claimed contact IP matches the
+        // address B observes A storing from, so the anti-reflection check
+        // passes (honest self-publish).
+        let contact = source_contact_at(20);
+        let record = a.build_source_record([7u8; 16], [0u8; 32], 1234, "movie.mkv", contact);
+        let key = record.keyword_hash;
+        let (_rid, store_bytes) = a.build_store(key, record.data.clone(), record.signature);
+        let on_b = b.handle_message(&store_bytes, a_addr, a_noise, 1000);
+        assert!(on_b.stored_record, "B should accept a source record from A's own IP");
+        assert_eq!(b.store_stats(), (1, 1));
+
+        // B serves it back on FIND_VALUE and the embedded contact survives the
+        // end-to-end round trip and re-verification.
+        let (_frid, find_bytes) = a.build_find_value(vec![key]);
+        let on_b2 = b.handle_message(&find_bytes, a_addr, a_noise, 1002);
+        let on_a2 = a.handle_message(&on_b2.responses[0], b_addr, b_noise, 1003);
+        let (_grid, blobs) = on_a2.found_value.expect("A should see a FOUND_VALUE");
+        assert_eq!(blobs.len(), 1);
+        let parsed = SignedRecord::from_value_blob(&blobs[0]).expect("record verifies");
+        assert_eq!(parsed.record_type, RECORD_TYPE_SOURCE);
+        assert_eq!(parsed.source_contact, Some(contact));
+    }
+
+    #[test]
+    fn source_store_rejected_on_ip_mismatch() {
+        let mut a = dht(62);
+        let mut b = dht(63);
+        let a_noise = [0xAA; 32];
+        let a_addr = addr(30, 4672); // 10.0.0.30
+
+        // The record claims a *different* IP (10.0.0.99) than the address B
+        // observes the STORE arriving from — a third-party reflection attempt.
+        let contact = source_contact_at(99);
+        let record = a.build_source_record([8u8; 16], [0u8; 32], 10, "x", contact);
+        let key = record.keyword_hash;
+        let (_rid, store_bytes) = a.build_store(key, record.data.clone(), record.signature);
+        let on_b = b.handle_message(&store_bytes, a_addr, a_noise, 1000);
+        assert!(!on_b.stored_record, "claimed IP != sender IP must be rejected");
+        assert!(on_b.responses.is_empty(), "no STORE_ACK on reflection rejection");
+        assert_eq!(b.store_stats(), (0, 0));
     }
 
     #[test]
