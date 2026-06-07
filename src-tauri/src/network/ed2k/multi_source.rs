@@ -5199,7 +5199,11 @@ async fn download_parts_from_source(
     if early_upload_accept {
         active_count.fetch_add(1, Ordering::Relaxed);
         _active_guard.armed = true;
-        emit_source!("transferring", None, 0u64);
+        // Slot granted but no block has arrived yet — show "stalled", not
+        // "transferring", so the UI never claims data is flowing when it isn't.
+        // Flips to "transferring" the instant the first byte lands (see the
+        // `got_any_data` gate in the receive loop).
+        emit_source!("stalled", None, 0u64);
     } else {
         // Request upload slot
         let upload_req = build_file_request(file_hash);
@@ -5277,7 +5281,11 @@ async fn download_parts_from_source(
                 active_count.fetch_add(1, Ordering::Relaxed);
                 _active_guard.armed = true;
                 info!("Source {} ({}) accepted upload request — entering transfer (obfuscated={})", _src_idx, addr, connection_is_obfuscated);
-                emit_source!("transferring", None, 0u64);
+                // Don't claim "transferring" yet: the peer granted a slot but
+                // hasn't sent a byte. Some uploaders (overloaded / anti-leech)
+                // accept then send nothing and FIN. Show "stalled" until the
+                // first block actually arrives (`got_any_data` gate below).
+                emit_source!("stalled", None, 0u64);
                 break;
             }
             if proto == OP_EMULEPROT && opcode == OP_QUEUEFULL && payload.is_empty() {
@@ -5813,7 +5821,7 @@ async fn download_parts_from_source(
                                 speed_bytes = 0;
                                 speed_start = std::time::Instant::now();
                                 emit_source!(
-                                    "transferring",
+                                    if got_any_data { "transferring" } else { "stalled" },
                                     None,
                                     measured_speed
                                 );
@@ -6070,6 +6078,10 @@ async fn download_parts_from_source(
                     if !got_any_data {
                         info!("Source {} ({}) first data received for part {} ({} bytes)", _src_idx, addr, part_idx, piece_len);
                         got_any_data = true;
+                        // First real byte: now it's genuinely transferring.
+                        // Flip the status immediately (the periodic speed emit
+                        // below only fires every 2s, too laggy for the badge).
+                        emit_source!("transferring", None, measured_speed);
                     }
                     src_transferred += piece_len;
                     blocks_received_in_current_req += 1;
@@ -6743,7 +6755,11 @@ async fn download_parts_from_source(
                     (speed_bytes as u128 * 1000 / elapsed.as_millis().max(1)) as u64;
                 speed_bytes = 0;
                 speed_start = std::time::Instant::now();
-                emit_source!("transferring", None, measured_speed);
+                emit_source!(
+                    if got_any_data { "transferring" } else { "stalled" },
+                    None,
+                    measured_speed
+                );
             }
 
             if last_periodic_save.elapsed() >= PERIODIC_SAVE_INTERVAL {
