@@ -38,6 +38,13 @@ It stays narrow, in the same spirit as the
 
 - Off by default (`AppSettings::ember_native_enabled = false`). With the
   flag off, Ember-magic packets are dropped before they reach the DHT.
+- Toggled from the UI: **Settings → Network** has an "Ember Network" switch,
+  and the dedicated **Ember Network** page (`/ember` in the sidebar) is a
+  one-click power switch + live status read-out. Both drive
+  `ember_native_enabled` through `update_settings`; the network loop applies
+  the off→on transition live (it kicks the same cold bootstrap as startup, so
+  enabling joins the DHT without a restart) and tears sessions down on
+  disable. `config.json` still works for headless/harness nodes.
 - No new sockets or ports — DHT frames ride the existing KAD UDP socket
   inside the Noise session, exactly like the control Ping/Pong.
 - DHT frames are distinguished from the 10-byte control frame purely by

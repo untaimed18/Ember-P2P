@@ -71,6 +71,7 @@
     { href: '/transfers', label: () => m.nav_transfers(), id: 'transfers' },
     { href: '/library', label: () => m.nav_library(), id: 'library' },
     { href: '/friends', label: () => m.nav_friends(), id: 'friends' },
+    { href: '/ember', label: () => m.nav_ember_network(), id: 'ember' },
     { href: '/statistics', label: () => m.nav_statistics(), id: 'statistics' },
     { href: '/security', label: () => m.nav_security(), id: 'security' },
     { href: '/settings', label: () => m.nav_settings(), id: 'settings' },
@@ -223,6 +224,11 @@
                 <circle cx="14" cy="7" r="2.5"/>
                 <path d="M1 17c0-3.3 2.7-6 6-6s6 2.7 6 6"/>
                 <path d="M13 11.5c2.5 0 4.5 2 4.5 4.5"/>
+              </svg>
+            {:else if item.id === 'ember'}
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10 2.5C11.5 5.5 14.5 6.5 14.5 11a4.5 4.5 0 0 1-9 0c0-1.6.7-2.8 1.6-3.7C8.3 6.2 8.8 5 8 3.5c1 .4 1.6 1 2 2z"/>
+                <path d="M10 16.3a2 2 0 0 0 2-2c0-1.2-1-1.9-2-3.1-1 1.2-2 1.9-2 3.1a2 2 0 0 0 2 2z"/>
               </svg>
             {:else if item.id === 'statistics'}
               <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
