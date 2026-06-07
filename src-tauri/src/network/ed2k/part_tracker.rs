@@ -175,6 +175,18 @@ impl PartTracker {
         }
     }
 
+    /// True iff every part has been individually MD4-verified (the real
+    /// integrity gate). Unlike `all_complete()` — which is purely gap-based
+    /// (every byte present) — this is false for a part whose bytes were
+    /// filled but never hash-checked, e.g. a part completed via cross-part
+    /// pipelining and then race-skipped, or a complete-but-unverified part
+    /// loaded from a resumed `.part`. The download finalizer requires this
+    /// before trusting the no-disk-read "fast verify" (which recomputes the
+    /// hash from the hashset and so can't detect corrupt on-disk bytes).
+    pub fn all_parts_verified(&self) -> bool {
+        !self.part_verified.is_empty() && self.part_verified.iter().all(|&v| v)
+    }
+
     /// Return true iff every part overlapping `[start, end)` is both
     /// complete and verified — the gate the upload path uses before
     /// serving bytes back to peers.

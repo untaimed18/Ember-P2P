@@ -156,27 +156,37 @@ fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
             return Err(coded_ctx("settings_shared_folder_parent_dir", "Shared folder must not contain '..' path components", folder));
         }
-        for component in path.components() {
-            if let std::path::Component::Normal(seg) = component {
-                let seg_lower = seg.to_string_lossy().to_lowercase();
-                if blocked_segments.contains(&seg_lower.as_str()) {
-                    return Err(coded_ctx("settings_shared_folder_system_dir", "Cannot share system directory", folder));
-                }
-                if seg_lower == "appdata" {
-                    let rest: String = path.components()
-                        .skip_while(|c| {
-                            if let std::path::Component::Normal(s) = c {
-                                s.to_string_lossy().to_lowercase() != "appdata"
-                            } else {
-                                true
-                            }
-                        })
-                        .skip(1)
-                        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    if rest.starts_with("local/temp") || rest.starts_with("local\\temp") {
+        // Scan the literal path AND (best-effort) its canonical form. A
+        // junction/symlink can point a benign-looking folder at a blocked
+        // system directory; canonicalizing resolves the reparse point so the
+        // segment check can't be bypassed (mirrors the download_folder branch
+        // above and the canonicalize-first check in `add_shared_folder`). A
+        // not-yet-created folder won't canonicalize — fall back to literal.
+        let canonical = path.canonicalize().ok();
+        let scan_paths = std::iter::once(path.to_path_buf()).chain(canonical);
+        for scan_path in scan_paths {
+            for component in scan_path.components() {
+                if let std::path::Component::Normal(seg) = component {
+                    let seg_lower = seg.to_string_lossy().to_lowercase();
+                    if blocked_segments.contains(&seg_lower.as_str()) {
                         return Err(coded_ctx("settings_shared_folder_system_dir", "Cannot share system directory", folder));
+                    }
+                    if seg_lower == "appdata" {
+                        let rest: String = scan_path.components()
+                            .skip_while(|c| {
+                                if let std::path::Component::Normal(s) = c {
+                                    s.to_string_lossy().to_lowercase() != "appdata"
+                                } else {
+                                    true
+                                }
+                            })
+                            .skip(1)
+                            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        if rest.starts_with("local/temp") || rest.starts_with("local\\temp") {
+                            return Err(coded_ctx("settings_shared_folder_system_dir", "Cannot share system directory", folder));
+                        }
                     }
                 }
             }
