@@ -1177,6 +1177,7 @@
   "transfers_src_wait_callback": "Waiting for callback",
   "transfers_src_queue_rank": "Queued (QR: {rank})",
   "transfers_src_queued": "Queued",
+  "transfers_src_stalled": "Stalled",
   "transfers_src_queue_full": "Queue full",
   "transfers_src_no_needed_parts": "No needed parts",
   "transfers_src_transferring": "Transferring",
