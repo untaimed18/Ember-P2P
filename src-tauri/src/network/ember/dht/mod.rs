@@ -1,4 +1,5 @@
 pub mod bootstrap;
+pub mod engine;
 pub mod messages;
 pub mod publish;
 pub mod routing;

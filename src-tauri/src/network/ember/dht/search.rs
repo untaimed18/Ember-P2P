@@ -251,6 +251,17 @@ impl IterativeSearch {
         self.check_complete();
     }
 
+    /// Re-evaluate and return the completion state. Unlike the internal
+    /// [`Self::check_complete`] (only run on a response or failure), the
+    /// driver calls this after dispatching a batch so a search that has
+    /// nothing left to query — e.g. started against an empty routing
+    /// table, or already exhausted — is recognised as complete
+    /// immediately instead of stalling until the overall timeout.
+    pub fn poll_complete(&mut self) -> bool {
+        self.check_complete();
+        self.complete
+    }
+
     fn check_complete(&mut self) {
         if self.complete {
             return;
@@ -510,6 +521,66 @@ mod tests {
 
         // No more pending, no in-flight → complete
         assert!(search.complete);
+    }
+
+    #[test]
+    fn search_discovers_closer_node_multi_hop() {
+        // We only know B at the start; B points us at a much closer C;
+        // the search must hop to C and then converge with both responded.
+        let local = make_id(0x00);
+        let mut rt = RoutingTable::new(local);
+        rt.add_contact(make_contact(0x80)); // B
+
+        let target = make_id(0x01);
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(target, &rt).expect("search slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        // Round 1: the only pending node is B.
+        let batch = search.next_to_query();
+        assert_eq!(batch.len(), 1);
+        let (b_contact, b_req) = batch.into_iter().next().unwrap();
+        assert_eq!(b_contact.node_id, make_id(0x80));
+
+        // B answers with a closer node C (dist 0x02 < B's 0x81).
+        let c = make_contact(0x03);
+        let progressed = search.process_response(b_req, &make_id(0x80), vec![c], vec![]);
+        assert!(progressed, "C is closer than B → search continues");
+        assert!(!search.complete, "C is still pending");
+
+        // Round 2: hop to C.
+        let batch2 = search.next_to_query();
+        assert_eq!(batch2.len(), 1);
+        let (c_contact, c_req) = batch2.into_iter().next().unwrap();
+        assert_eq!(c_contact.node_id, make_id(0x03));
+
+        // C knows no one closer → search converges.
+        search.process_response(c_req, &make_id(0x03), vec![], vec![]);
+        assert!(search.complete);
+
+        let responded = search.closest_responded();
+        assert_eq!(
+            responded.first().map(|x| x.node_id),
+            Some(make_id(0x03)),
+            "closest responded node should be C"
+        );
+        assert!(responded.iter().any(|x| x.node_id == make_id(0x80)));
+    }
+
+    #[test]
+    fn poll_complete_finishes_empty_search() {
+        // A search seeded from an empty routing table has nothing to
+        // query; the driver relies on poll_complete to recognise this
+        // instead of stalling until the overall timeout.
+        let local = make_id(0x00);
+        let rt = RoutingTable::new(local);
+        let mut sm = SearchManager::new();
+        let sid = sm.start_find_node(make_id(0xFF), &rt).expect("search slot");
+        let search = sm.get_mut(sid).unwrap();
+
+        assert!(search.next_to_query().is_empty());
+        assert!(search.poll_complete(), "empty search must complete on poll");
+        assert!(search.closest_responded().is_empty());
     }
 
     #[test]

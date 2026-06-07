@@ -1,9 +1,28 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getEmberDiagnostics, emberPingPeer } from '$lib/api/ember';
+  import {
+    getEmberDiagnostics,
+    emberPingPeer,
+    getEmberDhtContacts,
+    addEmberDhtContact,
+    emberDhtPingPeer,
+    emberDhtFindNode,
+    emberDhtIterativeFindNode,
+    emberDhtPublishKeyword,
+    emberDhtFindValue,
+    emberDhtRunMaintenance,
+  } from '$lib/api/ember';
   import { getSettings } from '$lib/api/settings';
   import { translateError } from '$lib/i18n';
-  import type { EmberDiagnostics, EmberPingResult } from '$lib/types';
+  import type {
+    EmberDiagnostics,
+    EmberDhtContact,
+    EmberDhtFindResult,
+    EmberDhtFindValueResult,
+    EmberDhtMaintenanceResult,
+    EmberDhtPublishResult,
+    EmberPingResult,
+  } from '$lib/types';
 
   /**
    * Dev-only panel for the Ember-native transport. Shows live
@@ -53,6 +72,16 @@
     }
   }
 
+  let dhtContacts = $state<EmberDhtContact[]>([]);
+
+  async function refreshDhtContacts() {
+    try {
+      dhtContacts = await getEmberDhtContacts();
+    } catch {
+      // Non-fatal — keep the previous snapshot.
+    }
+  }
+
   // Ping form state.
   let formIp = $state('127.0.0.1');
   let formPort = $state<number | ''>(4772);
@@ -87,25 +116,235 @@
     }
   }
 
-  let copyState = $state<'idle' | 'copied' | 'error'>('idle');
+  // Keyed copy indicator so each copyable value (Noise key, Ed25519
+  // key) shows its own "Copied" feedback.
+  let copiedKey = $state<string | null>(null);
   let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
 
-  async function copyLocalPubkey() {
-    if (!diag?.local_noise_public_key) return;
+  async function copyText(value: string, key: string) {
+    if (!value) return;
     try {
-      await navigator.clipboard.writeText(diag.local_noise_public_key);
-      copyState = 'copied';
+      await navigator.clipboard.writeText(value);
+      copiedKey = key;
     } catch {
-      copyState = 'error';
+      copiedKey = `${key}:error`;
     }
     if (copyResetTimer) clearTimeout(copyResetTimer);
-    copyResetTimer = setTimeout(() => { copyState = 'idle'; }, 1500);
+    copyResetTimer = setTimeout(() => { copiedKey = null; }, 1500);
+  }
+
+  // Seed-contact form.
+  let addIp = $state('127.0.0.1');
+  let addPort = $state<number | ''>(4772);
+  let addEd25519 = $state('');
+  let addNoise = $state('');
+  let adding = $state(false);
+  let addResult = $state<{ ok: boolean; message: string } | null>(null);
+
+  async function submitAddContact(e: Event) {
+    e.preventDefault();
+    if (adding) return;
+    if (!addIp.trim() || addPort === '' || addPort <= 0) return;
+    adding = true;
+    addResult = null;
+    try {
+      await addEmberDhtContact({
+        peerIp: addIp.trim(),
+        peerPort: Number(addPort),
+        ed25519PubkeyHex: addEd25519.trim(),
+        noisePubkeyHex: addNoise.trim(),
+      });
+      addResult = { ok: true, message: 'Contact added to the routing table.' };
+      refreshDiag();
+      refreshDhtContacts();
+    } catch (err) {
+      addResult = { ok: false, message: translateError(err) };
+    } finally {
+      adding = false;
+    }
+  }
+
+  // DHT ping form (distinct from the control ping above).
+  let dhtIp = $state('127.0.0.1');
+  let dhtPort = $state<number | ''>(4772);
+  let dhtPubkeyHex = $state('');
+  let dhtTimeoutMs = $state<number | ''>(5000);
+  let dhtPinging = $state(false);
+  let dhtPingResult = $state<EmberPingResult | null>(null);
+
+  async function submitDhtPing(e: Event) {
+    e.preventDefault();
+    if (dhtPinging) return;
+    if (!dhtIp.trim()) return;
+    if (dhtPort === '' || dhtPort <= 0) return;
+    dhtPinging = true;
+    dhtPingResult = null;
+    try {
+      dhtPingResult = await emberDhtPingPeer({
+        peerIp: dhtIp.trim(),
+        peerPort: Number(dhtPort),
+        peerPubkeyHex: dhtPubkeyHex.trim() || undefined,
+        timeoutMs: dhtTimeoutMs === '' ? undefined : Number(dhtTimeoutMs),
+      });
+    } catch (err) {
+      dhtPingResult = { success: false, error: translateError(err) };
+    } finally {
+      dhtPinging = false;
+      refreshDiag();
+      refreshDhtContacts();
+    }
+  }
+
+  // DHT find-node form (single hop): ask one peer for its k closest
+  // contacts to a target ID. Blank target ⇒ the backend picks a random
+  // one, so the operator just sees "what does this peer know".
+  let findIp = $state('127.0.0.1');
+  let findPort = $state<number | ''>(4772);
+  let findTargetHex = $state('');
+  let findPubkeyHex = $state('');
+  let findTimeoutMs = $state<number | ''>(5000);
+  let finding = $state(false);
+  let findResult = $state<EmberDhtFindResult | null>(null);
+
+  async function submitFindNode(e: Event) {
+    e.preventDefault();
+    if (finding) return;
+    if (!findIp.trim()) return;
+    if (findPort === '' || findPort <= 0) return;
+    finding = true;
+    findResult = null;
+    try {
+      findResult = await emberDhtFindNode({
+        peerIp: findIp.trim(),
+        peerPort: Number(findPort),
+        targetHex: findTargetHex.trim() || undefined,
+        peerPubkeyHex: findPubkeyHex.trim() || undefined,
+        timeoutMs: findTimeoutMs === '' ? undefined : Number(findTimeoutMs),
+      });
+    } catch (err) {
+      findResult = { success: false, contacts: [], error: translateError(err) };
+    } finally {
+      finding = false;
+      // A FIND_NODE seeds our table with the returned contacts (and the
+      // responder), so refresh both views.
+      refreshDiag();
+      refreshDhtContacts();
+    }
+  }
+
+  // Iterative (multi-hop) lookup form. No peer address — it seeds from
+  // the local routing table and walks the network.
+  let lookupTargetHex = $state('');
+  let lookupTimeoutMs = $state<number | ''>(30000);
+  let lookingUp = $state(false);
+  let lookupResult = $state<EmberDhtFindResult | null>(null);
+
+  async function submitLookup(e: Event) {
+    e.preventDefault();
+    if (lookingUp) return;
+    lookingUp = true;
+    lookupResult = null;
+    try {
+      lookupResult = await emberDhtIterativeFindNode({
+        targetHex: lookupTargetHex.trim() || undefined,
+        timeoutMs: lookupTimeoutMs === '' ? undefined : Number(lookupTimeoutMs),
+      });
+    } catch (err) {
+      lookupResult = { success: false, contacts: [], error: translateError(err) };
+    } finally {
+      lookingUp = false;
+      // The lookup populates our routing table along the way.
+      refreshDiag();
+      refreshDhtContacts();
+    }
+  }
+
+  // Publish a signed keyword record onto the closest nodes we know.
+  let publishKeyword = $state('');
+  let publishFileName = $state('');
+  let publishFileSize = $state<number | ''>(0);
+  let publishFileHashHex = $state('');
+  let publishTimeoutMs = $state<number | ''>(30000);
+  let publishing = $state(false);
+  let publishResult = $state<EmberDhtPublishResult | null>(null);
+
+  async function submitPublish(e: Event) {
+    e.preventDefault();
+    if (publishing) return;
+    publishing = true;
+    publishResult = null;
+    try {
+      publishResult = await emberDhtPublishKeyword({
+        keyword: publishKeyword.trim(),
+        fileName: publishFileName.trim(),
+        fileSize: publishFileSize === '' ? 0 : Number(publishFileSize),
+        fileHashHex: publishFileHashHex.trim() || undefined,
+        timeoutMs: publishTimeoutMs === '' ? undefined : Number(publishTimeoutMs),
+      });
+    } catch (err) {
+      publishResult = { success: false, key: '', stored_on: 0, targets: 0, error: translateError(err) };
+    } finally {
+      publishing = false;
+      refreshDiag();
+    }
+  }
+
+  // Iterative FIND_VALUE for a keyword — returns the verified records.
+  let findValueKeyword = $state('');
+  let findValueTimeoutMs = $state<number | ''>(30000);
+  let findingValue = $state(false);
+  let findValueResult = $state<EmberDhtFindValueResult | null>(null);
+
+  async function submitFindValue(e: Event) {
+    e.preventDefault();
+    if (findingValue) return;
+    findingValue = true;
+    findValueResult = null;
+    try {
+      findValueResult = await emberDhtFindValue({
+        keyword: findValueKeyword.trim(),
+        timeoutMs: findValueTimeoutMs === '' ? undefined : Number(findValueTimeoutMs),
+      });
+    } catch (err) {
+      findValueResult = { success: false, records: [], error: translateError(err) };
+    } finally {
+      findingValue = false;
+      refreshDiag();
+      refreshDhtContacts();
+    }
+  }
+
+  // Force one DHT maintenance cycle (slice 6): refresh stale buckets,
+  // liveness-ping stale contacts, republish stored records.
+  let runningMaintenance = $state(false);
+  let maintenanceResult = $state<EmberDhtMaintenanceResult | null>(null);
+
+  async function runMaintenance() {
+    if (runningMaintenance) return;
+    runningMaintenance = true;
+    maintenanceResult = null;
+    try {
+      maintenanceResult = await emberDhtRunMaintenance();
+    } catch (err) {
+      maintenanceResult = {
+        success: false,
+        buckets_refreshed: 0,
+        liveness_pings_sent: 0,
+        records_republished: 0,
+        error: translateError(err),
+      };
+    } finally {
+      runningMaintenance = false;
+      refreshDiag();
+      refreshDhtContacts();
+    }
   }
 
   onMount(() => {
     refreshDiag();
+    refreshDhtContacts();
     refreshLocalSettings();
-    refreshTimer = setInterval(refreshDiag, 2000);
+    refreshTimer = setInterval(() => { refreshDiag(); refreshDhtContacts(); }, 2000);
     return () => {
       unmounted = true;
       if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
@@ -166,10 +405,10 @@
             <button
               type="button"
               class="copy-btn"
-              onclick={copyLocalPubkey}
+              onclick={() => copyText(diag?.local_noise_public_key ?? '', 'noise')}
               title="Copy to clipboard"
             >
-              {#if copyState === 'copied'}Copied{:else if copyState === 'error'}Failed{:else}Copy{/if}
+              {#if copiedKey === 'noise'}Copied{:else if copiedKey === 'noise:error'}Failed{:else}Copy{/if}
             </button>
           {/if}
         </div>
@@ -229,6 +468,505 @@
       <p class="hint muted">Auto-refreshes every 2s.</p>
     {:else}
       <p class="hint muted">Loading…</p>
+    {/if}
+  </section>
+
+  <section class="card">
+    <h2>Ember DHT</h2>
+    {#if diag}
+      <div class="kv">
+        <div class="k">Node ID</div>
+        <div class="v"><code class="pubkey">{diag.ember_dht_node_id || '—'}</code></div>
+        <div class="k">Ed25519 key</div>
+        <div class="v pubkey-row">
+          <code class="pubkey">{diag.local_ed25519_public_key || '—'}</code>
+          {#if diag.local_ed25519_public_key}
+            <button
+              type="button"
+              class="copy-btn"
+              onclick={() => copyText(diag?.local_ed25519_public_key ?? '', 'ed')}
+              title="Copy to clipboard"
+            >
+              {#if copiedKey === 'ed'}Copied{:else if copiedKey === 'ed:error'}Failed{:else}Copy{/if}
+            </button>
+          {/if}
+        </div>
+      </div>
+      <div class="counters">
+        <div class="counter">
+          <div class="counter-label">Routing contacts</div>
+          <div class="counter-value">{diag.ember_dht_contacts}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">DHT pings sent</div>
+          <div class="counter-value">{diag.ember_dht_pings_sent}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">DHT pings received</div>
+          <div class="counter-value">{diag.ember_dht_pings_received}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">DHT pongs received</div>
+          <div class="counter-value">{diag.ember_dht_pongs_received}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Find-node sent</div>
+          <div class="counter-value">{diag.ember_dht_find_nodes_sent}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Find-node received</div>
+          <div class="counter-value">{diag.ember_dht_find_nodes_received}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Active lookups</div>
+          <div class="counter-value">{diag.ember_dht_active_searches}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Stored records</div>
+          <div class="counter-value">{diag.ember_dht_stored_records}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Stored keys</div>
+          <div class="counter-value">{diag.ember_dht_stored_keys}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Stores received</div>
+          <div class="counter-value">{diag.ember_dht_stores_received}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Find-value received</div>
+          <div class="counter-value">{diag.ember_dht_find_values_received}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Active publishes</div>
+          <div class="counter-value">{diag.ember_dht_active_publishes}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Bucket refreshes</div>
+          <div class="counter-value">{diag.ember_dht_refreshes}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Liveness pings sent</div>
+          <div class="counter-value">{diag.ember_dht_liveness_pings_sent}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Contacts evicted</div>
+          <div class="counter-value">{diag.ember_dht_contacts_evicted}</div>
+        </div>
+        <div class="counter">
+          <div class="counter-label">Records republished</div>
+          <div class="counter-value">{diag.ember_dht_records_republished}</div>
+        </div>
+      </div>
+
+      <div class="maint-row">
+        <button class="maint-btn" onclick={runMaintenance} disabled={runningMaintenance}>
+          {runningMaintenance ? 'Running…' : 'Run maintenance'}
+        </button>
+        <span class="hint muted">
+          Forces one cycle: refresh stale buckets, liveness-ping stale
+          contacts, republish stored records. Runs automatically every 60 s.
+        </span>
+      </div>
+      {#if maintenanceResult}
+        {#if maintenanceResult.success}
+          <div class="result result-ok">
+            <strong>OK</strong>
+            <span class="rtt">
+              {maintenanceResult.buckets_refreshed} bucket{maintenanceResult.buckets_refreshed === 1 ? '' : 's'} refreshed,
+              {maintenanceResult.liveness_pings_sent} ping{maintenanceResult.liveness_pings_sent === 1 ? '' : 's'} sent,
+              {maintenanceResult.records_republished} record{maintenanceResult.records_republished === 1 ? '' : 's'} republished
+            </span>
+          </div>
+        {:else}
+          <div class="result result-fail">
+            <strong>Failed</strong>
+            <span class="err">{maintenanceResult.error ?? 'Unknown error'}</span>
+          </div>
+        {/if}
+      {/if}
+
+      <h3 class="subhead">Routing table ({dhtContacts.length})</h3>
+      {#if dhtContacts.length === 0}
+        <p class="hint muted">
+          No contacts yet. Seed one below, or DHT-ping a peer — a
+          successful round trip adds both ends automatically.
+        </p>
+      {:else}
+        <div class="contacts">
+          <table>
+            <thead>
+              <tr><th>Node ID</th><th>Address</th><th>Last seen</th><th>Fails</th></tr>
+            </thead>
+            <tbody>
+              {#each dhtContacts as c (c.node_id)}
+                <tr>
+                  <td><code>{c.node_id.slice(0, 16)}…</code></td>
+                  <td>{c.addr}</td>
+                  <td>{c.last_seen > 0 ? new Date(c.last_seen * 1000).toLocaleTimeString() : '—'}</td>
+                  <td>{c.failed_queries}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+    {:else}
+      <p class="hint muted">Loading…</p>
+    {/if}
+  </section>
+
+  <section class="card">
+    <h2>Seed a DHT contact</h2>
+    <p class="hint">
+      Paste the other node's address and the two keys from its
+      <em>Local identity</em> and <em>Ember DHT</em> cards. The node ID
+      is derived from the Ed25519 key.
+    </p>
+    <form onsubmit={submitAddContact} class="ping-form">
+      <label>
+        <span>Peer IP</span>
+        <input type="text" bind:value={addIp} placeholder="127.0.0.1" required autocomplete="off" />
+      </label>
+      <label>
+        <span>Peer UDP port</span>
+        <input type="number" bind:value={addPort} min="1" max="65535" required />
+      </label>
+      <label class="full">
+        <span>Ed25519 pubkey (hex)</span>
+        <input type="text" bind:value={addEd25519} placeholder="64 hex chars" autocomplete="off" spellcheck="false" required />
+      </label>
+      <label class="full">
+        <span>Noise pubkey (hex)</span>
+        <input type="text" bind:value={addNoise} placeholder="64 hex chars" autocomplete="off" spellcheck="false" required />
+      </label>
+      <div class="form-actions">
+        <button type="submit" disabled={adding || !addIp || addPort === ''}>
+          {adding ? 'Adding…' : 'Add contact'}
+        </button>
+      </div>
+    </form>
+    {#if addResult}
+      <div class="result {addResult.ok ? 'result-ok' : 'result-fail'}">
+        <strong>{addResult.ok ? 'OK' : 'Failed'}</strong>
+        <span class="err">{addResult.message}</span>
+      </div>
+    {/if}
+  </section>
+
+  <section class="card">
+    <h2>DHT ping a peer</h2>
+    <p class="hint">
+      Sends a signed DHT <code>PING</code> over the Noise transport.
+      Unlike the control ping below, a successful round trip <em>also</em>
+      seeds both nodes' routing tables. The pubkey is the peer's Noise
+      key; leave blank to use the KAD-fed cache.
+    </p>
+    <form onsubmit={submitDhtPing} class="ping-form">
+      <label>
+        <span>Peer IP</span>
+        <input type="text" bind:value={dhtIp} placeholder="127.0.0.1" required autocomplete="off" />
+      </label>
+      <label>
+        <span>Peer UDP port</span>
+        <input type="number" bind:value={dhtPort} min="1" max="65535" required />
+      </label>
+      <label class="full">
+        <span>Peer Noise pubkey (hex) <span class="optional">— optional</span></span>
+        <input type="text" bind:value={dhtPubkeyHex} placeholder="64 hex chars, or leave blank" autocomplete="off" spellcheck="false" />
+      </label>
+      <label>
+        <span>Timeout (ms)</span>
+        <input type="number" bind:value={dhtTimeoutMs} min="100" max="60000" step="100" />
+      </label>
+      <div class="form-actions">
+        <button type="submit" disabled={dhtPinging || !dhtIp || dhtPort === ''}>
+          {dhtPinging ? 'Pinging…' : 'Send DHT Ping'}
+        </button>
+      </div>
+    </form>
+    {#if dhtPingResult}
+      <div class="result {dhtPingResult.success ? 'result-ok' : 'result-fail'}">
+        {#if dhtPingResult.success}
+          <strong>OK</strong>
+          {#if dhtPingResult.rtt_ms !== undefined && dhtPingResult.rtt_ms !== null}
+            <span class="rtt">{dhtPingResult.rtt_ms.toFixed(2)} ms</span>
+          {/if}
+        {:else}
+          <strong>Failed</strong>
+          <span class="err">{dhtPingResult.error ?? 'Unknown error'}</span>
+        {/if}
+      </div>
+    {/if}
+  </section>
+
+  <section class="card">
+    <h2>Find node on a peer</h2>
+    <p class="hint">
+      Sends a single signed <code>FIND_NODE</code> and shows the
+      <code>k</code> contacts that peer returns closest to the target —
+      one hop of Kademlia lookup. Leave the target blank to use a random
+      ID (just see what the peer knows). Returned contacts are also
+      merged into <em>this</em> node's routing table. The pubkey is the
+      peer's Noise key; leave blank to use the KAD-fed cache.
+    </p>
+    <form onsubmit={submitFindNode} class="ping-form">
+      <label>
+        <span>Peer IP</span>
+        <input type="text" bind:value={findIp} placeholder="127.0.0.1" required autocomplete="off" />
+      </label>
+      <label>
+        <span>Peer UDP port</span>
+        <input type="number" bind:value={findPort} min="1" max="65535" required />
+      </label>
+      <label class="full">
+        <span>Target node ID (hex) <span class="optional">— optional, 32 hex chars; blank = random</span></span>
+        <input type="text" bind:value={findTargetHex} placeholder="32 hex chars, or leave blank" autocomplete="off" spellcheck="false" />
+      </label>
+      <label class="full">
+        <span>Peer Noise pubkey (hex) <span class="optional">— optional</span></span>
+        <input type="text" bind:value={findPubkeyHex} placeholder="64 hex chars, or leave blank" autocomplete="off" spellcheck="false" />
+      </label>
+      <label>
+        <span>Timeout (ms)</span>
+        <input type="number" bind:value={findTimeoutMs} min="100" max="60000" step="100" />
+      </label>
+      <div class="form-actions">
+        <button type="submit" disabled={finding || !findIp || findPort === ''}>
+          {finding ? 'Finding…' : 'Send FIND_NODE'}
+        </button>
+      </div>
+    </form>
+    {#if findResult}
+      {#if findResult.success}
+        <div class="result result-ok">
+          <strong>OK</strong>
+          <span class="rtt">
+            {findResult.contacts.length} contact{findResult.contacts.length === 1 ? '' : 's'}
+            {#if findResult.rtt_ms !== undefined && findResult.rtt_ms !== null}
+              · ~{findResult.rtt_ms.toFixed(0)} ms
+            {/if}
+          </span>
+        </div>
+        {#if findResult.contacts.length > 0}
+          <div class="contacts">
+            <table>
+              <thead>
+                <tr><th>Node ID</th><th>Address</th><th>Last seen</th><th>Fails</th></tr>
+              </thead>
+              <tbody>
+                {#each findResult.contacts as c (c.node_id)}
+                  <tr>
+                    <td><code>{c.node_id.slice(0, 16)}…</code></td>
+                    <td>{c.addr}</td>
+                    <td>{c.last_seen > 0 ? new Date(c.last_seen * 1000).toLocaleTimeString() : '—'}</td>
+                    <td>{c.failed_queries}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {:else}
+          <p class="hint muted">The peer returned no contacts (its routing table is empty for that target).</p>
+        {/if}
+      {:else}
+        <div class="result result-fail">
+          <strong>Failed</strong>
+          <span class="err">{findResult.error ?? 'Unknown error'}</span>
+        </div>
+      {/if}
+    {/if}
+  </section>
+
+  <section class="card">
+    <h2>Iterative lookup</h2>
+    <p class="hint">
+      Multi-hop discovery: seeds from <em>this</em> node's routing table
+      and loops <code>FIND_NODE</code> across the closest contacts it
+      learns until the search converges, then lists the closest contacts
+      that responded. Needs at least one contact to start — seed or
+      DHT-ping a peer first. Leave the target blank for a random
+      self-style probe that broadens the table.
+    </p>
+    <form onsubmit={submitLookup} class="ping-form">
+      <label class="full">
+        <span>Target node ID (hex) <span class="optional">— optional, 32 hex chars; blank = random</span></span>
+        <input type="text" bind:value={lookupTargetHex} placeholder="32 hex chars, or leave blank" autocomplete="off" spellcheck="false" />
+      </label>
+      <label>
+        <span>Timeout (ms)</span>
+        <input type="number" bind:value={lookupTimeoutMs} min="100" max="60000" step="100" />
+      </label>
+      <div class="form-actions">
+        <button type="submit" disabled={lookingUp}>
+          {lookingUp ? 'Looking up…' : 'Run lookup'}
+        </button>
+      </div>
+    </form>
+    {#if lookupResult}
+      {#if lookupResult.success}
+        <div class="result result-ok">
+          <strong>OK</strong>
+          <span class="rtt">
+            {lookupResult.contacts.length} contact{lookupResult.contacts.length === 1 ? '' : 's'} responded
+            {#if lookupResult.rtt_ms !== undefined && lookupResult.rtt_ms !== null}
+              · {lookupResult.rtt_ms.toFixed(0)} ms
+            {/if}
+          </span>
+        </div>
+        {#if lookupResult.contacts.length > 0}
+          <div class="contacts">
+            <table>
+              <thead>
+                <tr><th>Node ID</th><th>Address</th><th>Last seen</th><th>Fails</th></tr>
+              </thead>
+              <tbody>
+                {#each lookupResult.contacts as c (c.node_id)}
+                  <tr>
+                    <td><code>{c.node_id.slice(0, 16)}…</code></td>
+                    <td>{c.addr}</td>
+                    <td>{c.last_seen > 0 ? new Date(c.last_seen * 1000).toLocaleTimeString() : '—'}</td>
+                    <td>{c.failed_queries}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {:else}
+          <p class="hint muted">
+            No contacts responded. With an empty routing table there's
+            nothing to query — seed or DHT-ping a peer, then retry.
+          </p>
+        {/if}
+      {:else}
+        <div class="result result-fail">
+          <strong>Failed</strong>
+          <span class="err">{lookupResult.error ?? 'Unknown error'}</span>
+        </div>
+      {/if}
+    {/if}
+  </section>
+
+  <section class="card">
+    <h2>Publish keyword record</h2>
+    <p class="hint">
+      Sign a keyword record with <em>this</em> node's identity and
+      <code>STORE</code> it on the closest contacts we know. Returns the
+      DHT key it landed under (re-use it from another node's
+      <strong>Find value</strong> form) and how many nodes acked. Needs at
+      least one contact — seed or DHT-ping a peer first.
+    </p>
+    <form onsubmit={submitPublish} class="ping-form">
+      <label>
+        <span>Keyword</span>
+        <input type="text" bind:value={publishKeyword} placeholder="e.g. ubuntu" autocomplete="off" spellcheck="false" maxlength="128" required />
+      </label>
+      <label>
+        <span>File name</span>
+        <input type="text" bind:value={publishFileName} placeholder="e.g. ubuntu-24.04.iso" autocomplete="off" spellcheck="false" maxlength="255" />
+      </label>
+      <label>
+        <span>File size (bytes)</span>
+        <input type="number" bind:value={publishFileSize} min="0" step="1" />
+      </label>
+      <label class="full">
+        <span>File hash (hex) <span class="optional">— optional, 32 hex chars; blank = random</span></span>
+        <input type="text" bind:value={publishFileHashHex} placeholder="32 hex chars, or leave blank" autocomplete="off" spellcheck="false" />
+      </label>
+      <label>
+        <span>Timeout (ms)</span>
+        <input type="number" bind:value={publishTimeoutMs} min="100" max="60000" step="100" />
+      </label>
+      <div class="form-actions">
+        <button type="submit" disabled={publishing}>
+          {publishing ? 'Publishing…' : 'Publish'}
+        </button>
+      </div>
+    </form>
+    {#if publishResult}
+      {#if publishResult.success}
+        <div class="result result-ok">
+          <strong>OK</strong>
+          <span class="rtt">stored on {publishResult.stored_on} / {publishResult.targets} node{publishResult.targets === 1 ? '' : 's'}</span>
+        </div>
+        <p class="hint muted">Key: <code>{publishResult.key}</code></p>
+      {:else}
+        <div class="result result-fail">
+          <strong>Failed</strong>
+          <span class="err">{publishResult.error ?? 'Unknown error'}</span>
+        </div>
+        {#if publishResult.key}
+          <p class="hint muted">Key: <code>{publishResult.key}</code></p>
+        {/if}
+      {/if}
+    {/if}
+  </section>
+
+  <section class="card">
+    <h2>Find value</h2>
+    <p class="hint">
+      Iterative <code>FIND_VALUE</code> for a keyword: seeds from this
+      node's routing table and walks toward the keyword's key, gathering
+      signed records and surfacing the ones whose publisher signature
+      verifies. Seed or DHT-ping a peer first.
+    </p>
+    <form onsubmit={submitFindValue} class="ping-form">
+      <label class="full">
+        <span>Keyword</span>
+        <input type="text" bind:value={findValueKeyword} placeholder="e.g. ubuntu" autocomplete="off" spellcheck="false" maxlength="128" required />
+      </label>
+      <label>
+        <span>Timeout (ms)</span>
+        <input type="number" bind:value={findValueTimeoutMs} min="100" max="60000" step="100" />
+      </label>
+      <div class="form-actions">
+        <button type="submit" disabled={findingValue}>
+          {findingValue ? 'Searching…' : 'Find value'}
+        </button>
+      </div>
+    </form>
+    {#if findValueResult}
+      {#if findValueResult.success}
+        <div class="result result-ok">
+          <strong>OK</strong>
+          <span class="rtt">
+            {findValueResult.records.length} record{findValueResult.records.length === 1 ? '' : 's'}
+            {#if findValueResult.rtt_ms !== undefined && findValueResult.rtt_ms !== null}
+              · {findValueResult.rtt_ms.toFixed(0)} ms
+            {/if}
+          </span>
+        </div>
+        {#if findValueResult.records.length > 0}
+          <div class="contacts">
+            <table>
+              <thead>
+                <tr><th>File name</th><th>Size</th><th>File hash</th><th>Publisher</th></tr>
+              </thead>
+              <tbody>
+                {#each findValueResult.records as r (r.publisher + r.file_hash)}
+                  <tr>
+                    <td>{r.file_name || '—'}</td>
+                    <td>{r.file_size}</td>
+                    <td><code>{r.file_hash.slice(0, 16)}…</code></td>
+                    <td><code>{r.publisher.slice(0, 16)}…</code></td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {:else}
+          <p class="hint muted">
+            No records found for that keyword. Publish one (from this or
+            another node), then retry — the search needs contacts that
+            hold the record.
+          </p>
+        {/if}
+      {:else}
+        <div class="result result-fail">
+          <strong>Failed</strong>
+          <span class="err">{findValueResult.error ?? 'Unknown error'}</span>
+        </div>
+      {/if}
     {/if}
   </section>
 
@@ -421,6 +1159,41 @@
     gap: 2px;
   }
   .counter-wide { grid-column: span 2; }
+
+  .subhead {
+    margin: 6px 0 0;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--text-muted);
+    font-weight: 600;
+  }
+  .contacts { overflow-x: auto; }
+  .contacts table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .contacts th {
+    text-align: left;
+    color: var(--text-muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    font-size: 11px;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .contacts td {
+    padding: 5px 8px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+  }
+  .contacts td code {
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 11px;
+  }
   .counter-label { color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.8px; }
   .counter-value {
     color: var(--accent);
@@ -500,4 +1273,32 @@
     color: var(--text-primary);
   }
   .err { color: var(--text-primary); }
+
+  .maint-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 14px;
+    flex-wrap: wrap;
+  }
+  .maint-btn {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 8px 18px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .maint-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .maint-row .hint {
+    flex: 1;
+    min-width: 220px;
+    margin: 0;
+  }
 </style>

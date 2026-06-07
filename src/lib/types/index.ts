@@ -223,6 +223,28 @@ export interface EmberDiagnostics {
   ember_pings_received: number;
   ember_pongs_received: number;
   local_noise_public_key: string;
+  /** Our 128-bit Ember DHT node ID (hex), equal to the ember_hash. */
+  ember_dht_node_id: string;
+  /** Our Ed25519 public key (hex) — peers need it to add us as a contact. */
+  local_ed25519_public_key: string;
+  /** Live contacts in the Ember DHT routing table. */
+  ember_dht_contacts: number;
+  ember_dht_pings_sent: number;
+  ember_dht_pings_received: number;
+  ember_dht_pongs_received: number;
+  ember_dht_find_nodes_sent: number;
+  ember_dht_find_nodes_received: number;
+  ember_dht_active_searches: number;
+  ember_dht_stored_keys: number;
+  ember_dht_stored_records: number;
+  ember_dht_stores_received: number;
+  ember_dht_find_values_received: number;
+  ember_dht_active_publishes: number;
+  /** Maintenance loop (slice 6) counters. */
+  ember_dht_refreshes: number;
+  ember_dht_liveness_pings_sent: number;
+  ember_dht_contacts_evicted: number;
+  ember_dht_records_republished: number;
 }
 
 /** Result of an `ember_ping_peer` harness round-trip. `rtt_ms` is set
@@ -232,6 +254,66 @@ export interface EmberDiagnostics {
 export interface EmberPingResult {
   success: boolean;
   rtt_ms?: number;
+  error?: string;
+}
+
+/** One Ember DHT routing-table contact, as returned by
+ *  `get_ember_dht_contacts`. All key/id fields are hex-encoded. */
+export interface EmberDhtContact {
+  node_id: string;
+  addr: string;
+  noise_pub: string;
+  ed25519_pub: string;
+  last_seen: number;
+  failed_queries: number;
+}
+
+/** Result of a single-hop `ember_dht_find_node`: the contacts a peer
+ *  answered with for a target ID, or the reason the lookup failed. */
+export interface EmberDhtFindResult {
+  success: boolean;
+  contacts: EmberDhtContact[];
+  rtt_ms?: number;
+  error?: string;
+}
+
+/** Result of `ember_dht_publish_keyword`: the DHT key the signed record
+ *  landed under and how many nodes acknowledged storing it. */
+export interface EmberDhtPublishResult {
+  success: boolean;
+  key: string;
+  stored_on: number;
+  targets: number;
+  error?: string;
+}
+
+/** One signed record returned by `ember_dht_find_value`. Only records
+ *  whose publisher signature verified are surfaced. */
+export interface EmberDhtRecordInfo {
+  record_type: number;
+  file_name: string;
+  file_size: number;
+  file_hash: string;
+  publisher: string;
+  timestamp: number;
+}
+
+/** Result of an iterative `ember_dht_find_value`: the verified records
+ *  discovered for a keyword, or the reason the lookup failed. */
+export interface EmberDhtFindValueResult {
+  success: boolean;
+  records: EmberDhtRecordInfo[];
+  rtt_ms?: number;
+  error?: string;
+}
+
+/** Result of `ember_dht_run_maintenance` (slice 6): how much work the
+ *  forced maintenance cycle kicked off. */
+export interface EmberDhtMaintenanceResult {
+  success: boolean;
+  buckets_refreshed: number;
+  liveness_pings_sent: number;
+  records_republished: number;
   error?: string;
 }
 

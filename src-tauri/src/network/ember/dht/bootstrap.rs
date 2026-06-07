@@ -200,10 +200,11 @@ pub async fn fetch_bootstrap_nodes(
     Ok(nodes.into_iter().take(MAX_BOOTSTRAP_NODES).collect())
 }
 
-/// A bootstrap node returned by the rendezvous server.
+/// A bootstrap node returned by the rendezvous server. The node id is
+/// **not** carried on the wire — it's derived from `ed25519_pub` (see
+/// [`BootstrapNode::to_contact`]).
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct BootstrapNode {
-    pub node_id: String,
     pub addr: String,
     pub noise_pub: String,
     pub ed25519_pub: String,
@@ -211,14 +212,13 @@ pub struct BootstrapNode {
 
 impl BootstrapNode {
     /// Parse into an EmberContact, returning None if any field is invalid.
+    ///
+    /// The 128-bit node id is **derived** from `ed25519_pub`
+    /// (`BLAKE3(ed25519_pub)[..16]`) rather than read from the wire: the
+    /// DHT requires `node_id == BLAKE3(ed25519_pub)` and re-checks that
+    /// binding on the first PING, so trusting a server-supplied id would be
+    /// redundant at best and a poisoning vector at worst.
     pub fn to_contact(&self) -> Option<EmberContact> {
-        let node_id_bytes = hex::decode(&self.node_id).ok()?;
-        if node_id_bytes.len() != 16 {
-            return None;
-        }
-        let mut node_id = [0u8; 16];
-        node_id.copy_from_slice(&node_id_bytes);
-
         let addr: SocketAddr = self.addr.parse().ok()?;
 
         let noise_bytes = hex::decode(&self.noise_pub).ok()?;
@@ -235,8 +235,12 @@ impl BootstrapNode {
         let mut ed25519_pub = [0u8; 32];
         ed25519_pub.copy_from_slice(&ed_bytes);
 
+        // Reject keys that aren't valid Ed25519 points, then derive the id.
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&ed25519_pub).ok()?;
+        let node_id = EmberNodeId(crate::network::ember::crypto::node_id_from_public_key(&vk));
+
         Some(EmberContact {
-            node_id: EmberNodeId(node_id),
+            node_id,
             addr,
             noise_pub,
             ed25519_pub,
@@ -316,25 +320,43 @@ mod tests {
 
     #[test]
     fn bootstrap_node_to_contact() {
+        // Use a real Ed25519 keypair so the derived node id matches the
+        // engine's `node_id_from_public_key` (and the key passes the
+        // on-curve check).
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let ed_pub = sk.verifying_key().to_bytes();
+        let expected_id =
+            EmberNodeId(crate::network::ember::crypto::node_id_from_public_key(&sk.verifying_key()));
+
         let bn = BootstrapNode {
-            node_id: hex::encode([1u8; 16]),
             addr: "1.2.3.4:4662".to_string(),
             noise_pub: hex::encode([2u8; 32]),
-            ed25519_pub: hex::encode([3u8; 32]),
+            ed25519_pub: hex::encode(ed_pub),
         };
         let c = bn.to_contact().unwrap();
-        assert_eq!(c.node_id, EmberNodeId([1u8; 16]));
+        // node_id is derived from ed25519_pub, never trusted from the wire.
+        assert_eq!(c.node_id, expected_id);
         assert_eq!(c.addr, "1.2.3.4:4662".parse::<SocketAddr>().unwrap());
         assert_eq!(c.noise_pub, [2u8; 32]);
+        assert_eq!(c.ed25519_pub, ed_pub);
     }
 
     #[test]
     fn rejects_invalid_bootstrap_node() {
+        // Unparseable address ⇒ no contact.
         let bn = BootstrapNode {
-            node_id: "too_short".to_string(),
-            addr: "1.2.3.4:4662".to_string(),
+            addr: "not-an-addr".to_string(),
             noise_pub: hex::encode([0u8; 32]),
             ed25519_pub: hex::encode([0u8; 32]),
+        };
+        assert!(bn.to_contact().is_none());
+
+        // Wrong-length Noise key ⇒ no contact.
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let bn = BootstrapNode {
+            addr: "1.2.3.4:4662".to_string(),
+            noise_pub: hex::encode([0u8; 16]),
+            ed25519_pub: hex::encode(sk.verifying_key().to_bytes()),
         };
         assert!(bn.to_contact().is_none());
     }

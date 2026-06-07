@@ -55,19 +55,24 @@ This document captures two things:
 | **Ember authentication challenge-response** — fresh-nonce signature scheme separate from eMule SecIdent. | [`src-tauri/src/network/ed2k/ember_auth.rs`](../src-tauri/src/network/ed2k/ember_auth.rs) | Live |
 | **Reputation tracker** — per-peer scoring based on success/failure events; persisted to `reputation.json`; consulted for ban decisions. | [`src-tauri/src/network/ember/reputation.rs`](../src-tauri/src/network/ember/reputation.rs) | Live |
 
+### Partially wired
+
+| Module | Source | Status |
+| --- | --- | --- |
+| **Ember-native DHT** — routing, store, search, publish, bootstrap, messages | [`src-tauri/src/network/ember/dht/`](../src-tauri/src/network/ember/dht/) | All of Phase 1 (slices 1–7, flagged) is live over the Noise transport: routing table, signed `PING`/`PONG`, single-hop `FIND_NODE`/`FOUND_NODE`, the iterative multi-hop lookup driver, signed `STORE`/`FIND_VALUE` (publish a keyword record on the k closest nodes; retrieve it via iterative `FIND_VALUE`, verifying ed25519 signatures on receive), the maintenance loop (bucket refresh + liveness-ping/evict + record republish), and persistent contacts (`nodes_ember.dat` saved periodically + on shutdown, reloaded at startup). The **cold-start rendezvous bootstrap is now wired too**: clients publish their Noise key on `/register` (DHT-on only), the server `/bootstrap` route serves a rotating pool, and a fresh node with no `nodes_ember.dat` fetches + seeds it then self-looks-up — so both warm *and* cold starts are KAD-free. What remains: a signed, load-weighted bootstrap pool, plus Phase 2 (multi-keyword search, real-file publishing). See [`ember-dht-slice.md`](./ember-dht-slice.md). |
+
 ### Scaffolded but not yet wired
 
 | Module | Source | Lines |
 | --- | --- | --- |
-| **Ember-native DHT** — routing, store, search, publish, bootstrap, messages | [`src-tauri/src/network/ember/dht/`](../src-tauri/src/network/ember/dht/) | ~2,500 |
 | **Ember-native chunk transfer** — BLAKE3 hash tree, 256 KiB chunk requests | [`src-tauri/src/network/ember/transfer.rs`](../src-tauri/src/network/ember/transfer.rs) | ~430 |
 
 ### Observability & tooling
 
 | Capability | Source | Status |
 | --- | --- | --- |
-| **`EmberDiagnostics`** — counters for EPX events, broker outcomes, native-transport sessions, ping/pong success, mesh-peer cache size, local Noise pubkey. Surfaced via `get_ember_diagnostics`. | [`src-tauri/src/types.rs`](../src-tauri/src/types.rs), [`src-tauri/src/commands/peers.rs`](../src-tauri/src/commands/peers.rs) | Live |
-| **Dev panel** at `/dev/ember` — live diagnostics, copy-pubkey button, ping form, port-mismatch warning. | [`src/routes/dev/ember/+page.svelte`](../src/routes/dev/ember/+page.svelte) | Live |
+| **`EmberDiagnostics`** — counters for EPX events, broker outcomes, native-transport sessions, ping/pong success, mesh-peer cache size, local Noise pubkey, DHT node ID / Ed25519 key / contact count / DHT ping-pong / find-node counters, the active-search gauge, the slice-5 store gauges/counters (stored keys & records, stores received, find-values received, active publishes), and the slice-6 maintenance counters (bucket refreshes, liveness pings sent, contacts evicted, records republished). Surfaced via `get_ember_diagnostics`. | [`src-tauri/src/types.rs`](../src-tauri/src/types.rs), [`src-tauri/src/commands/peers.rs`](../src-tauri/src/commands/peers.rs) | Live |
+| **Dev panel** at `/dev/ember` — live diagnostics, copy-pubkey button, control + DHT ping forms, single-hop `FIND_NODE` form and iterative multi-hop lookup form (both with returned-contacts view), `STORE` (publish keyword record) and `FIND_VALUE` (find value) forms, a **Run maintenance** button (force a slice-6 cycle), DHT routing-table view, manual "seed contact" form, port-mismatch warning. | [`src/routes/dev/ember/+page.svelte`](../src/routes/dev/ember/+page.svelte) | Live |
 | **Local multi-node harness** — `EMBER_DATA_DIR` override + single-instance gating + harness PowerShell script. | [`scripts/harness.ps1`](../scripts/harness.ps1), [`src-tauri/src/storage/paths.rs`](../src-tauri/src/storage/paths.rs) | Live |
 | **`harness` cargo feature** — enables Tauri devtools in release builds for harness use only. | [`src-tauri/Cargo.toml`](../src-tauri/Cargo.toml) | Live |
 
@@ -128,21 +133,27 @@ The Ember-native DHT (already scaffolded under
 is the central piece. Once it functions, Ember can replace every KAD
 and eD2K network function the client depends on today.
 
-#### Phase 1 — Make the Ember DHT functional
+#### Phase 1 — Make the Ember DHT functional — **complete** (slices 1–7, flagged)
 
-| # | Slice | Replaces |
-| --- | --- | --- |
-| 1 | Spawn `RoutingTable` in `NetworkState`. Surface contacts in the dev panel. Add a manual "Add Ember Contact" command for harness work. | KAD routing table |
-| 2 | Wire DHT message dispatch through `EmberTransport`. Implement DHT-level `PING` → `PONG` to populate the routing table on incoming traffic. | KAD `KADEMLIA2_PING` / `PONG` |
-| 3 | Implement `FIND_NODE` → `FOUND_NODES`: receivers return their k closest contacts to a target ID. | KAD `KADEMLIA2_REQ` |
-| 4 | Iterative-lookup driver in `search.rs::SearchManager`. Multi-hop discovery via intermediate peers. Drive from a "Find Node" dev-panel button. | KAD search engine |
-| 5 | `STORE` / `FIND_VALUE` for signed records. Verify ed25519 signatures on receive. | KAD source/keyword publishes |
-| 6 | Periodic timers — routing-table refresh (random target lookups), ping oldest contacts in each bucket, republish stored records on a schedule. | KAD maintenance loop |
-| 7 | Persistent contacts — Ember `nodes.dat` equivalent saved on shutdown, loaded at startup. | KAD `nodes.dat` |
+| # | Slice | Replaces | Status |
+| --- | --- | --- | --- |
+| 1 | Spawn `RoutingTable` in `NetworkState`. Surface contacts in the dev panel. Add a manual "Add Ember Contact" command for harness work. | KAD routing table | **Done** ([slice doc](./ember-dht-slice.md)) |
+| 2 | Wire DHT message dispatch through `EmberTransport`. Implement DHT-level `PING` → `PONG` to populate the routing table on incoming traffic. | KAD `KADEMLIA2_PING` / `PONG` | **Done** ([slice doc](./ember-dht-slice.md)) |
+| 3 | Implement `FIND_NODE` → `FOUND_NODES`: receivers return their k closest contacts to a target ID. Single-hop "Find node" dev-panel trigger. | KAD `KADEMLIA2_REQ` | **Done** ([slice doc](./ember-dht-slice.md)) |
+| 4 | Iterative-lookup driver in `search.rs::SearchManager`: loop the slice-3 `FIND_NODE` across the closest returned contacts for multi-hop discovery via intermediate peers. | KAD search engine | **Done** ([slice doc](./ember-dht-slice.md)) |
+| 5 | `STORE` / `FIND_VALUE` for signed records. Verify ed25519 signatures on receive. | KAD source/keyword publishes | **Done** ([slice doc](./ember-dht-slice.md)) |
+| 6 | Periodic timers — routing-table refresh (random target lookups), ping oldest contacts in each bucket, republish stored records on a schedule. | KAD maintenance loop | **Done** ([slice doc](./ember-dht-slice.md)) |
+| 7 | Persistent contacts — Ember `nodes.dat` equivalent saved on shutdown, loaded at startup. | KAD `nodes.dat` | **Done** ([slice doc](./ember-dht-slice.md)) |
+| 7+ | Cold-start rendezvous bootstrap — clients publish their Noise key on `/register` (DHT-on only); the server `/bootstrap` route serves a rotating pool; a fresh node (no `nodes_ember.dat`) fetches + seeds it, then self-looks-up. | KAD-fed Noise keys for first contact | **Done** ([slice doc](./ember-dht-slice.md)) |
 
 After phase 1, two Ember peers who know one common third peer can
-discover each other automatically and exchange signed records. This
-is a working DHT.
+discover each other automatically and exchange signed records. With
+persistent contacts (slice 7) a node rejoins the DHT after a restart on
+its own; the cold-start rendezvous bootstrap (slice 7+) lets even a
+brand-new install find its first peers without KAD; and the maintenance
+loop (slice 6) keeps the table and stored records healthy as peers churn.
+This is a working, self-sustaining DHT that bootstraps — warm or cold —
+with no eD2K/KAD involvement.
 
 #### Phase 2 — Replace eD2K search semantics
 
@@ -193,9 +204,11 @@ Ember network.
   it would feel rougher than KAD on day one.
 - **Bootstrap is the long-term sustainability question.** The protocol
   can be perfect, but if no one is running an Ember bootstrap node,
-  new installs have nothing to dial. The KAD-bridge bootstrap (slice
-  13) buys time; hardcoded + DNS seeds (slices 11–12) are the
-  permanent answer.
+  new installs have nothing to dial. The **rendezvous `/bootstrap` pool**
+  (slice 7+) now covers cold start today — every DHT-on client we already
+  run for friend presence doubles as a seed — and the KAD-bridge
+  bootstrap (slice 13) is the transition crutch; hardcoded + DNS seeds
+  (slices 11–12) remain the permanent, rendezvous-independent answer.
 - **Migration story matters.** Today every Ember client is also an
   eMule KAD client. The transition to a self-sufficient network does
   not have to be all-or-nothing — Ember can run on both networks

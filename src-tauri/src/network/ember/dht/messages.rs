@@ -249,6 +249,80 @@ pub fn build_found_node(
     }
 }
 
+/// Build a STORE_RECORD request. `record` is the publisher-signed record
+/// bytes ([`super::publish::SignedRecord::data`]) and `record_signature`
+/// is that publisher's Ed25519 signature over it — distinct from the
+/// per-frame signature `encode_message` adds with the sender's key.
+pub fn build_store_record(
+    sender_id: EmberNodeId,
+    request_id: u32,
+    key: [u8; 16],
+    record: Vec<u8>,
+    record_signature: [u8; 64],
+) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_STORE_RECORD,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::StoreRecord {
+            key,
+            record,
+            record_signature,
+        },
+        signature: [0u8; 64],
+    }
+}
+
+/// Build a STORE_ACK response (echoes the stored key).
+pub fn build_store_ack(sender_id: EmberNodeId, request_id: u32, key: [u8; 16]) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_STORE_ACK,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::StoreAck { key },
+        signature: [0u8; 64],
+    }
+}
+
+/// Build a FIND_VALUE request for one or more keys.
+pub fn build_find_value(
+    sender_id: EmberNodeId,
+    request_id: u32,
+    keys: Vec<[u8; 16]>,
+) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_FIND_VALUE,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::FindValue { keys },
+        signature: [0u8; 64],
+    }
+}
+
+/// Build a FOUND_VALUE response carrying the records held for `key`.
+pub fn build_found_value(
+    sender_id: EmberNodeId,
+    request_id: u32,
+    key: [u8; 16],
+    records: Vec<Vec<u8>>,
+) -> DhtMessage {
+    DhtMessage {
+        version: EMBER_DHT_VERSION,
+        msg_type: MSG_FOUND_VALUE,
+        request_id,
+        sender_id,
+        sender_pub_key: None,
+        payload: DhtPayload::FoundValue { key, records },
+        signature: [0u8; 64],
+    }
+}
+
 // ── Payload encoding ──
 
 fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
@@ -504,17 +578,22 @@ fn decode_contact_list(data: &[u8]) -> anyhow::Result<Vec<EmberContact>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::ember::crypto;
     use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
 
-    fn test_node_id() -> EmberNodeId {
-        EmberNodeId([1u8; 16])
+    /// A signing key paired with the node ID it actually binds to
+    /// (`node_id == BLAKE3(pubkey)[..16]`). `decode_message` enforces
+    /// that binding, so tests must use a consistent (key, id) pair
+    /// rather than an arbitrary placeholder id.
+    fn test_keypair() -> (SigningKey, EmberNodeId) {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let id = EmberNodeId(crypto::node_id_from_public_key(&sk.verifying_key()));
+        (sk, id)
     }
 
     #[test]
     fn ping_pong_round_trip() {
-        let sk = SigningKey::generate(&mut OsRng);
-        let id = test_node_id();
+        let (sk, id) = test_keypair();
 
         let ping = build_ping(id, 42);
         let encoded = encode_message(&ping, &sk, true);
@@ -534,8 +613,7 @@ mod tests {
 
     #[test]
     fn find_node_round_trip() {
-        let sk = SigningKey::generate(&mut OsRng);
-        let id = test_node_id();
+        let (sk, id) = test_keypair();
         let target = EmberNodeId([0xAA; 16]);
 
         let msg = build_find_node(id, 99, target);
@@ -552,8 +630,7 @@ mod tests {
 
     #[test]
     fn found_node_with_contacts_round_trip() {
-        let sk = SigningKey::generate(&mut OsRng);
-        let id = test_node_id();
+        let (sk, id) = test_keypair();
 
         let contacts = vec![
             EmberContact {
@@ -592,8 +669,8 @@ mod tests {
 
     #[test]
     fn signature_verification_fails_on_tamper() {
-        let sk = SigningKey::generate(&mut OsRng);
-        let msg = build_ping(test_node_id(), 1);
+        let (sk, id) = test_keypair();
+        let msg = build_ping(id, 1);
         let mut encoded = encode_message(&msg, &sk, true);
 
         // Tamper with the request_id

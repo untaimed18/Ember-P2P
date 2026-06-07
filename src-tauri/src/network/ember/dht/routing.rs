@@ -279,6 +279,26 @@ impl RoutingTable {
             .collect()
     }
 
+    /// Pick non-empty bucket indices to refresh, stalest first, capped at
+    /// `max`. With `force` the staleness threshold is ignored (used by the
+    /// on-demand maintenance command so a refresh can be exercised even on
+    /// a freshly-active table); otherwise only buckets idle for longer than
+    /// `threshold_secs` are returned.
+    pub fn buckets_for_refresh(&self, threshold_secs: i64, max: usize, force: bool) -> Vec<usize> {
+        let now = chrono::Utc::now().timestamp();
+        let mut candidates: Vec<(usize, i64)> = self
+            .buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| {
+                !b.contacts.is_empty() && (force || (now - b.last_activity) > threshold_secs)
+            })
+            .map(|(i, b)| (i, b.last_activity))
+            .collect();
+        candidates.sort_by_key(|(_, last_activity)| *last_activity);
+        candidates.into_iter().take(max).map(|(i, _)| i).collect()
+    }
+
     /// All contacts, for persistence.
     pub fn all_contacts(&self) -> Vec<EmberContact> {
         self.buckets

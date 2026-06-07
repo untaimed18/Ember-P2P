@@ -194,6 +194,7 @@ pub async fn register(
     external_ip: Ipv4Addr,
     pubkey: &[u8; 32],
     secret_key: &[u8; 32],
+    noise_pub: Option<&[u8; 32]>,
 ) -> Result<(), String> {
     require_https(base_url)?;
     let url = format!("{}/register", base_url.trim_end_matches('/'));
@@ -202,7 +203,7 @@ pub async fn register(
     let ts = current_timestamp();
     let signed_ip4 = external_ip.octets();
     let sig = sign_register(secret_key, pubkey, &id_raw, port, signed_ip4, ts);
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "id": id,
         "port": port,
         "ip": external_ip.to_string(),
@@ -210,6 +211,15 @@ pub async fn register(
         "ts": ts,
         "sig": hex::encode(sig.to_bytes()),
     });
+    // Publish our X25519 Noise key so DHT-enabled peers can bootstrap
+    // from us via `/bootstrap`. Deliberately NOT part of the signed
+    // message: it's our own key, and the DHT re-verifies every contact's
+    // Ed25519 binding on first PING, so an unsigned value is safe (a wrong
+    // key only fails a handshake). Callers pass `None` when the Ember DHT
+    // is disabled so we don't advertise a contact that can't be dialled.
+    if let Some(nk) = noise_pub {
+        body["noise_pub"] = serde_json::Value::String(hex::encode(nk));
+    }
     let resp = client()
         .post(&url)
         .json(&body)

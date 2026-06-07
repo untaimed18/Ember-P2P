@@ -386,6 +386,68 @@ pub struct EmberDiagnostics {
     /// without needing a separate identity command.
     #[serde(default)]
     pub local_noise_public_key: String,
+    /// Our 128-bit Ember DHT node ID (`BLAKE3(ed25519_pub)[..16]`),
+    /// hex-encoded. Equal to the `ember_hash`.
+    #[serde(default)]
+    pub ember_dht_node_id: String,
+    /// Our Ed25519 public key, hex-encoded. A peer needs this (plus our
+    /// address and Noise key) to seed us into their DHT routing table.
+    #[serde(default)]
+    pub local_ed25519_public_key: String,
+    /// Live contacts in the Ember DHT routing table.
+    #[serde(default)]
+    pub ember_dht_contacts: u32,
+    /// Ember DHT `PING` frames we sent this session.
+    #[serde(default)]
+    pub ember_dht_pings_sent: u32,
+    /// Ember DHT `PING` frames we received and answered this session.
+    #[serde(default)]
+    pub ember_dht_pings_received: u32,
+    /// Ember DHT `PONG` frames we received in response to our pings.
+    #[serde(default)]
+    pub ember_dht_pongs_received: u32,
+    /// Ember DHT `FIND_NODE` queries we sent this session (includes the
+    /// per-hop queries fanned out by iterative lookups).
+    #[serde(default)]
+    pub ember_dht_find_nodes_sent: u32,
+    /// Ember DHT `FIND_NODE` queries we received and answered this session.
+    #[serde(default)]
+    pub ember_dht_find_nodes_received: u32,
+    /// Iterative Ember DHT lookups currently running (gauge, not a
+    /// counter).
+    #[serde(default)]
+    pub ember_dht_active_searches: u32,
+    /// Distinct keys held in the local Ember DHT record store (gauge).
+    #[serde(default)]
+    pub ember_dht_stored_keys: u32,
+    /// Total signed records held in the local Ember DHT store (gauge).
+    #[serde(default)]
+    pub ember_dht_stored_records: u32,
+    /// `STORE_RECORD` frames we accepted (verified + stored) this session.
+    #[serde(default)]
+    pub ember_dht_stores_received: u32,
+    /// `FIND_VALUE` queries we received and answered this session.
+    #[serde(default)]
+    pub ember_dht_find_values_received: u32,
+    /// Keyword/source publishes currently in flight (gauge, not a
+    /// counter).
+    #[serde(default)]
+    pub ember_dht_active_publishes: u32,
+    /// Bucket-refresh lookups launched by the maintenance loop this
+    /// session (slice 6).
+    #[serde(default)]
+    pub ember_dht_refreshes: u32,
+    /// Maintenance liveness `PING`s sent to stale contacts this session.
+    #[serde(default)]
+    pub ember_dht_liveness_pings_sent: u32,
+    /// Contacts evicted after failing repeated liveness pings this
+    /// session.
+    #[serde(default)]
+    pub ember_dht_contacts_evicted: u32,
+    /// Stored records re-published (replicated) to the closest nodes by
+    /// the maintenance loop this session.
+    #[serde(default)]
+    pub ember_dht_records_republished: u32,
 }
 
 /// Serializable KAD contact info for the frontend (mirrors eMule KadContactListCtrl columns)

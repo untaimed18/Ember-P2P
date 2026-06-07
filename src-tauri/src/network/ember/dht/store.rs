@@ -26,6 +26,11 @@ pub struct DhtRecord {
     pub stored_at: Instant,
     /// When this record expires.
     pub expires_at: Instant,
+    /// When we last (re)published this record to the closest nodes. Used by
+    /// the maintenance loop to replicate records on a schedule so they
+    /// survive node churn. Initialised to the store time so a freshly
+    /// stored record isn't immediately republished.
+    pub last_republished: Instant,
 }
 
 /// Local DHT key-value store for Ember DHT.
@@ -80,6 +85,7 @@ impl DhtStore {
             publisher_key,
             stored_at: now,
             expires_at: now + DEFAULT_RECORD_TTL,
+            last_republished: now,
         };
 
         let records = self.entries.entry(key).or_insert_with(Vec::new);
@@ -120,6 +126,35 @@ impl DhtStore {
             debug!("Expired {total_removed} DHT records");
         }
         total_removed
+    }
+
+    /// Collect records due for republish — those not (re)published within
+    /// `interval` (or all of them when `force`) — and mark the returned
+    /// ones as republished now. `max` bounds the batch so one maintenance
+    /// cycle can't fan out an unbounded number of publishes. Returns each
+    /// record's `(data, signature)`; the caller reconstructs the
+    /// `SignedRecord` and re-stores it on the current closest nodes.
+    pub fn take_republish_batch(
+        &mut self,
+        interval: Duration,
+        max: usize,
+        force: bool,
+    ) -> Vec<(Vec<u8>, [u8; 64])> {
+        let now = Instant::now();
+        let mut out = Vec::new();
+        for records in self.entries.values_mut() {
+            for r in records.iter_mut() {
+                if out.len() >= max {
+                    return out;
+                }
+                let due = force || now.duration_since(r.last_republished) >= interval;
+                if due {
+                    r.last_republished = now;
+                    out.push((r.data.clone(), r.signature));
+                }
+            }
+        }
+        out
     }
 
     /// Total number of records across all keys.
@@ -233,6 +268,30 @@ mod tests {
     }
 
     #[test]
+    fn republish_batch_respects_interval_and_force() {
+        let mut store = DhtStore::new();
+        let (sk, pk) = keypair();
+        let d = vec![7u8];
+        assert!(store.store([1u8; 16], d.clone(), sign(&sk, &d), pk));
+
+        // Freshly stored ⇒ not due within a long interval.
+        let due = store.take_republish_batch(Duration::from_secs(3600), 10, false);
+        assert!(due.is_empty(), "a just-stored record is not due for republish");
+
+        // `force` overrides the interval and returns it.
+        let forced = store.take_republish_batch(Duration::from_secs(3600), 10, true);
+        assert_eq!(forced.len(), 1);
+        assert_eq!(forced[0].0, d);
+
+        // A zero interval makes everything due (and `max` bounds the batch).
+        let d2 = vec![8u8];
+        let (sk2, pk2) = keypair();
+        assert!(store.store([2u8; 16], d2.clone(), sign(&sk2, &d2), pk2));
+        let all_due = store.take_republish_batch(Duration::from_secs(0), 1, false);
+        assert_eq!(all_due.len(), 1, "max bounds the batch to 1");
+    }
+
+    #[test]
     fn expire_removes_old_records() {
         let mut store = DhtStore::new();
         let key = [1u8; 16];
@@ -248,6 +307,7 @@ mod tests {
             expires_at: Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(Instant::now),
+            last_republished: Instant::now(),
         };
         store.entries.entry(key).or_default().push(record);
 
