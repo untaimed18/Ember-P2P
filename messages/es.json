@@ -1209,6 +1209,7 @@
   "transfers_src_wait_callback": "Esperando devolución de llamada",
   "transfers_src_queue_rank": "En cola (Pos: {rank})",
   "transfers_src_queued": "En cola",
+  "transfers_src_stalled": "Estancado",
   "transfers_src_queue_full": "Cola llena",
   "transfers_src_no_needed_parts": "Sin partes necesarias",
   "transfers_src_transferring": "Transfiriendo",

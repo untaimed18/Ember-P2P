@@ -470,6 +470,7 @@
       case 'connecting': return m.transfers_src_connecting();
       case 'wait_callback': return m.transfers_src_wait_callback();
       case 'queued': return s.queue_rank != null && s.queue_rank > 0 ? m.transfers_src_queue_rank({ rank: s.queue_rank }) : m.transfers_src_queued();
+      case 'stalled': return m.transfers_src_stalled();
       case 'queue_full': return m.transfers_src_queue_full();
       case 'no_needed_parts': return m.transfers_src_no_needed_parts();
       case 'transferring': return m.transfers_src_transferring();
