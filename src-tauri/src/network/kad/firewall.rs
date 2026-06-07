@@ -42,7 +42,10 @@ pub struct FirewallChecker {
     udp_requests_sent: u32,
     last_check_start: i64,
     external_udp_port: Option<u16>,
-    udp_port_votes: HashMap<u16, u32>,
+    /// Per-reported-UDP-port: set of /24 networks of the voters who reported
+    /// it. Same distinct-/24 weighting as `external_ip_votes` (K7) so a
+    /// single-subnet Sybil cluster can't bias our perceived external UDP port.
+    udp_port_votes: HashMap<u16, HashSet<[u8; 3]>>,
     checking: bool,
     /// IPs we sent FirewalledReq to (eMule: IsKadFirewallCheckIP).
     /// Only accept FirewalledRes from these IPs to prevent spoofing.
@@ -154,7 +157,7 @@ impl FirewallChecker {
         let reporter_net: [u8; 3] = [reporter_octets[0], reporter_octets[1], reporter_octets[2]];
         self.external_ip_votes
             .entry(reported_ip)
-            .or_insert_with(HashSet::new)
+            .or_default()
             .insert(reporter_net);
 
         let best_ip = self
@@ -229,11 +232,18 @@ impl FirewallChecker {
     }
 
     /// Handle KADEMLIA2_PONG: peer reports what UDP port it sees us on.
-    pub fn handle_pong(&mut self, reported_udp_port: u16) {
-        *self.udp_port_votes.entry(reported_udp_port).or_insert(0) += 1;
+    /// `reporter` is the responding contact's source IP; votes are weighted by
+    /// distinct /24 (K7) so a single-subnet cluster can't bias the result.
+    pub fn handle_pong(&mut self, reported_udp_port: u16, reporter: Ipv4Addr) {
+        let o = reporter.octets();
+        let reporter_net: [u8; 3] = [o[0], o[1], o[2]];
+        self.udp_port_votes
+            .entry(reported_udp_port)
+            .or_default()
+            .insert(reporter_net);
 
         let best_port = self.udp_port_votes.iter()
-            .max_by_key(|(_, &count)| count)
+            .max_by_key(|(_, nets)| nets.len())
             .map(|(&port, _)| port);
 
         if let Some(port) = best_port {

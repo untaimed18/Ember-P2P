@@ -1643,9 +1643,10 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<Vec<ServerSearchResult>
             for _ in tag_limit..tag_count {
                 let (name_id, tag_type, name) = match read_tag_header(&mut cursor) {
                     Some(v) => v,
-                    None => break,
+                    None => { in_sync = false; break; }
                 };
                 if !read_tag_value(&mut cursor, tag_type, name_id, name.as_deref(), &mut discard) {
+                    in_sync = false;
                     break;
                 }
             }
@@ -1663,6 +1664,15 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<Vec<ServerSearchResult>
             comment: tags.comment,
             media: tags.media,
         });
+
+        // If a tag failed to decode mid-record the cursor is no longer aligned
+        // to the next result; stop rather than decoding subsequent entries from
+        // a mid-tag offset (which would emit garbage rows). The surplus-tag
+        // path above keeps us aligned on success, so only a desync forces the
+        // break. Mirrors the UDP sibling in `server_udp.rs`.
+        if !in_sync {
+            break;
+        }
     }
 
     Ok(results)

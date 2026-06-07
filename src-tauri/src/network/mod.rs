@@ -12298,11 +12298,28 @@ pub async fn start_network(
                     info!("A4AF: {} swap actions to execute", swaps.len());
                     for swap in &swaps {
                         debug!("A4AF swap: {} -> {}", hex::encode(swap.from_file), hex::encode(swap.to_file));
-                        let mut sm = source_manager.write().await;
-                        if let std::net::IpAddr::V4(v4) = swap.peer_addr.ip() {
-                            sm.remove_source(&swap.from_file, &v4, swap.peer_addr.port());
-                            sm.register_source(swap.to_file, v4, swap.peer_addr.port());
-                        }
+                        // Canonical lock order is transfer_manager before
+                        // source_manager. Do all source_manager mutations and
+                        // extract the data we need up front, then RELEASE the
+                        // source write guard before acquiring transfer_manager
+                        // below — never hold the exclusive source lock across
+                        // the transfer read await. (Previously `sm` was held
+                        // across that await, inverting the documented order and
+                        // stalling upload/download tasks that need the source
+                        // lock for the duration of each swap.)
+                        let (uh, co) = {
+                            let mut sm = source_manager.write().await;
+                            if let std::net::IpAddr::V4(v4) = swap.peer_addr.ip() {
+                                sm.remove_source(&swap.from_file, &v4, swap.peer_addr.port());
+                                sm.register_source(swap.to_file, v4, swap.peer_addr.port());
+                                (
+                                    sm.get_user_hash(&swap.to_file, v4, swap.peer_addr.port()),
+                                    sm.get_connect_options(&swap.to_file, v4, swap.peer_addr.port()),
+                                )
+                            } else {
+                                (None, None)
+                            }
+                        };
 
                         // Inject source into active download if one exists for the target file
                         let target_hex = hex::encode(swap.to_file);
@@ -12311,12 +12328,6 @@ pub async fn start_network(
                             matching_active_transfer_ids_for_hash(&state, &mgr, &target_hex)
                         };
                         if !matching_transfer_ids.is_empty() {
-                            let uh = if let std::net::IpAddr::V4(v4) = swap.peer_addr.ip() {
-                                sm.get_user_hash(&swap.to_file, v4, swap.peer_addr.port())
-                            } else { None };
-                            let co = if let std::net::IpAddr::V4(v4) = swap.peer_addr.ip() {
-                                sm.get_connect_options(&swap.to_file, v4, swap.peer_addr.port())
-                            } else { None };
                             let new_source = ed2k::multi_source::DownloadSource {
                                 peer_ip: swap.peer_addr.ip().to_string(),
                                 peer_port: swap.peer_addr.port(),
@@ -18760,11 +18771,16 @@ async fn handle_udp_packet_inner(
         KadMessage::Pong { udp_port } => {
             debug!("Pong from {from} (reported udp_port={})", udp_port);
             if udp_port > 0 {
-                state.firewall_checker.handle_pong(udp_port);
-                if let Some(ext_port) = state.firewall_checker.external_udp_port() {
-                    state.external_udp_port = Some(ext_port);
+                // Weight the external-UDP-port vote by the reporter's /24
+                // (handle_pong, K7). KAD is IPv4-only, so a non-V4 source here
+                // would be anomalous — skip it rather than guess a subnet.
+                if let std::net::IpAddr::V4(reporter) = from.ip() {
+                    state.firewall_checker.handle_pong(udp_port, reporter);
+                    if let Some(ext_port) = state.firewall_checker.external_udp_port() {
+                        state.external_udp_port = Some(ext_port);
+                    }
+                    dispatch_udp_firewall_probe_requests(state, settings);
                 }
-                dispatch_udp_firewall_probe_requests(state, settings);
             }
             // K22: only promote a contact to verified when the Pong
             // carried our correct per-receiver UDP key (proves the sender
