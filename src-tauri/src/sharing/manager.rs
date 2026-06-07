@@ -14,10 +14,34 @@ const ACTIVE_STALLED_SECS: i64 = 60;
 const SEARCHING_DEGRADED_SECS: i64 = 45;
 const QUEUED_DEGRADED_SECS: i64 = 300;
 
+/// Global "preview priority for all downloads" preference (eMule's global
+/// preview option). When set, [`TransferControl::is_preview_priority`] reports
+/// `true` for every transfer regardless of its per-file toggle, so the
+/// chunk selector front-loads each download's first and last part. Mutated
+/// from the network task when settings load / change; read on the hot
+/// chunk-selection path, hence a lock-free atomic.
+static GLOBAL_PREVIEW_PRIORITY: AtomicBool = AtomicBool::new(false);
+
+/// Set the global preview-priority preference. Takes effect immediately for
+/// all in-flight and future downloads (next chunk selection).
+pub fn set_global_preview_priority(enabled: bool) {
+    GLOBAL_PREVIEW_PRIORITY.store(enabled, Ordering::Release);
+}
+
+/// Current global preview-priority preference.
+#[allow(dead_code)]
+pub fn global_preview_priority() -> bool {
+    GLOBAL_PREVIEW_PRIORITY.load(Ordering::Acquire)
+}
+
 pub struct TransferControl {
     cancelled: AtomicBool,
     paused: AtomicBool,
     preview_priority: AtomicBool,
+    /// Set by the download worker once `preview_file` would succeed for this
+    /// transfer (first part verified + previewable media type). Read by
+    /// [`TransferManager::get_all`] to drive the UI's Preview-button state.
+    preview_ready: AtomicBool,
     /// Download priority ordinal (verylow=0 .. release=5; default normal=2),
     /// mirrored from [`Transfer::priority`] so the multi-source download worker
     /// can bias global connection-slot acquisition without a manager round-trip.
@@ -39,6 +63,7 @@ impl TransferControl {
             cancelled: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             preview_priority: AtomicBool::new(false),
+            preview_ready: AtomicBool::new(false),
             download_priority: AtomicU8::new(2),
         })
     }
@@ -67,8 +92,22 @@ impl TransferControl {
         self.preview_priority.store(enabled, Ordering::Release);
     }
 
+    /// True when first/last-part prioritization should apply to this transfer:
+    /// either its own per-file toggle is on, or the global "preview priority
+    /// for all downloads" preference is enabled.
     pub fn is_preview_priority(&self) -> bool {
         self.preview_priority.load(Ordering::Acquire)
+            || GLOBAL_PREVIEW_PRIORITY.load(Ordering::Acquire)
+    }
+
+    /// Mark whether a live preview would currently succeed (set by the worker
+    /// as parts verify). Drives the UI Preview-button enablement.
+    pub fn set_preview_ready(&self, ready: bool) {
+        self.preview_ready.store(ready, Ordering::Release);
+    }
+
+    pub fn is_preview_ready(&self) -> bool {
+        self.preview_ready.load(Ordering::Acquire)
     }
 
     pub fn set_download_priority_ordinal(&self, ord: u8) {
@@ -1011,6 +1050,15 @@ impl TransferManager {
         let mut all: Vec<Transfer> = self.active.values().cloned().collect();
         all.extend(self.queue.iter().cloned());
         all.extend(self.completed.iter().cloned());
+        // Overlay live preview-readiness from each transfer's control. The
+        // stored `Transfer` snapshot doesn't track verification; the worker
+        // publishes it onto the control as parts verify, so we read it here at
+        // snapshot time to keep the UI's Preview button in sync.
+        for t in &mut all {
+            if let Some(control) = self.controls.get(&t.id) {
+                t.preview_ready = control.is_preview_ready();
+            }
+        }
         all
     }
 

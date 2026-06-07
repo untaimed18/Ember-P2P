@@ -1335,6 +1335,7 @@
   "transfers_src_suffix": "fnt",
   "transfers_epx_count": "({count} EPX)",
   "transfers_preview": "Vista previa",
+  "transfers_preview_not_ready": "La vista previa estar\u00e1 disponible cuando se descargue y verifique la primera parte (solo archivos multimedia).",
   "transfers_selection_hint": "Clic para seleccionar · Mayús+clic para rango · Ctrl/Cmd+clic para alternar · Doble clic para fuentes",
   "transfers_status_label_aria": "Estado: {label}. {tooltip}",
 
@@ -1485,6 +1486,8 @@
   "settings_add_paused_hint": "Las descargas nuevas comienzan pausadas hasta reanudarlas manualmente.",
   "settings_auto_remove": "Eliminar autom\u00e1ticamente las completadas",
   "settings_auto_remove_hint": "Eliminar autom\u00e1ticamente las descargas finalizadas de la lista de transferencias.",
+  "settings_preview_priority_all": "Prioridad de vista previa para todas las descargas",
+  "settings_preview_priority_all_hint": "Descarga primero la primera y la \u00faltima parte de cada archivo para poder previsualizar antes. Algo m\u00e1s lento en total; si est\u00e1 desactivado se usa el m\u00e1s raro primero.",
   "settings_skip_compress_video": "Omitir compresi\u00f3n de v\u00eddeo",
   "settings_skip_compress_video_hint": "No comprimir AVI/MKV/MP4 durante las subidas (ya est\u00e1n comprimidos).",
   "settings_download_history": "Historial de descargas",
