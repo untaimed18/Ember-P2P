@@ -4,6 +4,14 @@ use zeroize::ZeroizeOnDrop;
 const MAX_CREDIT_RATIO: f64 = 10.0;
 const MIN_CREDIT_RATIO: f64 = 1.0;
 
+/// Hard ceiling on per-peer credit records held in memory. The 90-day
+/// `cleanup_stale` sweep is the primary reaper; this cap is a backstop so a
+/// peer churning `user_hash` (or Ember pubkey) across reconnects — each
+/// OP_PUBLICKEY seeds a record via `get_or_create` — can't grow the maps
+/// without bound between sweeps. At capacity, inserting a new record evicts
+/// the least-recently-seen one, mirroring the bounded DHT store / comment maps.
+const MAX_CREDIT_RECORDS: usize = 50_000;
+
 // --- Ember credit scoring constants ---
 //
 // The Ember credit system layers three multiplicative factors on top of the
@@ -448,6 +456,20 @@ impl CreditManager {
         // Known Clients tab as months-old "Unknown" rows for peers we
         // actually still talked to recently.
         let now = chrono::Utc::now().timestamp();
+        // Backstop the table size before inserting a brand-new record (see
+        // MAX_CREDIT_RECORDS): when full, evict the least-recently-seen entry.
+        // Only runs on genuine inserts — updating an existing record can't grow
+        // the map, so it never evicts.
+        if !self.credits.contains_key(&user_hash) && self.credits.len() >= MAX_CREDIT_RECORDS {
+            if let Some(oldest) = self
+                .credits
+                .iter()
+                .min_by_key(|(_, r)| r.last_seen)
+                .map(|(k, _)| *k)
+            {
+                self.credits.remove(&oldest);
+            }
+        }
         let record = self
             .credits
             .entry(user_hash)
@@ -722,6 +744,18 @@ impl CreditManager {
     /// and deliberately do NOT bump the timestamp.
     pub fn get_or_create_ember(&mut self, pub_key: [u8; 32]) -> &mut EmberCreditRecord {
         let now = chrono::Utc::now().timestamp();
+        // Same backstop as `get_or_create` (see MAX_CREDIT_RECORDS): evict the
+        // least-recently-seen Ember record when inserting a new one at capacity.
+        if !self.ember_credits.contains_key(&pub_key) && self.ember_credits.len() >= MAX_CREDIT_RECORDS {
+            if let Some(oldest) = self
+                .ember_credits
+                .iter()
+                .min_by_key(|(_, r)| r.last_seen)
+                .map(|(k, _)| *k)
+            {
+                self.ember_credits.remove(&oldest);
+            }
+        }
         let record = self
             .ember_credits
             .entry(pub_key)
@@ -1344,6 +1378,25 @@ mod tests {
         cm.cleanup_stale(90);
         assert!(cm.get_record(&fresh).is_some(), "fresh record must survive 90d cutoff");
         assert!(cm.get_record(&stale).is_none(), "100d-old record must be pruned");
+    }
+
+    /// The credit map must stay bounded under user_hash churn (a peer
+    /// rotating its hash across reconnects, seeding one record per OP_PUBLICKEY)
+    /// even between 90-day cleanup sweeps. See MAX_CREDIT_RECORDS.
+    #[test]
+    fn credits_map_is_bounded() {
+        let mut cm = CreditManager::new();
+        for i in 0..(MAX_CREDIT_RECORDS as u64 + 50) {
+            let mut h = [0u8; 16];
+            h[..8].copy_from_slice(&i.to_le_bytes());
+            cm.get_or_create(h);
+        }
+        assert!(
+            cm.credits.len() <= MAX_CREDIT_RECORDS,
+            "credit map ({}) must stay within MAX_CREDIT_RECORDS ({})",
+            cm.credits.len(),
+            MAX_CREDIT_RECORDS,
+        );
     }
 
     // ---- Ember credit tests ----

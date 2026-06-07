@@ -2673,14 +2673,37 @@ impl MultiSourceDownload {
                 })
                 .await;
 
-            // Fast path: compute the file hash from already-verified part hashes
-            // (no disk I/O). Falls back to full re-read if part hashes aren't available.
+            // Durability: the per-file writer is shared (Arc) across every
+            // source and is only fsynced when its last clone drops, so flush
+            // it now — before we verify and rename — so an OS/power crash
+            // between the rename and that drop can't leave a "Completed" file
+            // with unflushed tail blocks. Mirrors the single-source fsync in
+            // transfer.rs; best-effort so a sync error doesn't strand the file.
+            if let Err(e) = shared_part_file.sync_data().await {
+                warn!("Pre-finalize fsync failed for {}: {e}", self.file_name);
+            }
+
+            // Fast path: recompute the file hash from the part hashes (no disk
+            // I/O). Crucially this is only sound when EVERY part was actually
+            // MD4-verified during download: `ed2k_hash_from_parts` derives the
+            // hash from the already-hashset-verified part hashes, so it always
+            // equals `file_hash` and reads nothing from disk — it does NOT
+            // check the on-disk bytes. A part whose gaps were filled by
+            // cross-part pipelining (then race-skipped) or loaded complete-but-
+            // unverified from a resumed `.part` would otherwise sail through.
+            // Gate on `all_parts_verified()` and fall back to a full disk
+            // re-read so corrupt bytes can't be published as a verified file.
             let expected = hex::encode(self.file_hash);
             let num_parts = ((self.file_size + super::hash::PARTSIZE - 1) / super::hash::PARTSIZE) as usize;
+            let all_parts_verified = {
+                let t = tracker.read().await;
+                t.all_parts_verified()
+            };
             let ph = part_hashes.read().await;
             let can_use_fast_verify = self.file_size >= super::hash::PARTSIZE
                 && !ph.is_empty()
-                && ph.len() >= num_parts;
+                && ph.len() >= num_parts
+                && all_parts_verified;
 
             let verified_ok = if can_use_fast_verify {
                 let actual = super::hash::ed2k_hash_from_parts(&ph, self.file_size);

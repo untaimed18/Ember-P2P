@@ -511,10 +511,20 @@ mod tests {
         EmberNodeId([1u8; 16])
     }
 
+    /// A signing key paired with the node ID it actually backs.
+    ///
+    /// `decode_message` enforces `sender_id == BLAKE3(pubkey)[..16]`, so any
+    /// round-trip test must use an id derived from the same key it signs with —
+    /// a fixed dummy id (e.g. `test_node_id`) is rejected by that binding check.
+    fn signed_identity() -> (SigningKey, EmberNodeId) {
+        let sk = SigningKey::generate(&mut OsRng);
+        let id = EmberNodeId(crypto::node_id_from_public_key(&sk.verifying_key()));
+        (sk, id)
+    }
+
     #[test]
     fn ping_pong_round_trip() {
-        let sk = SigningKey::generate(&mut OsRng);
-        let id = test_node_id();
+        let (sk, id) = signed_identity();
 
         let ping = build_ping(id, 42);
         let encoded = encode_message(&ping, &sk, true);
@@ -534,8 +544,7 @@ mod tests {
 
     #[test]
     fn find_node_round_trip() {
-        let sk = SigningKey::generate(&mut OsRng);
-        let id = test_node_id();
+        let (sk, id) = signed_identity();
         let target = EmberNodeId([0xAA; 16]);
 
         let msg = build_find_node(id, 99, target);
@@ -552,8 +561,7 @@ mod tests {
 
     #[test]
     fn found_node_with_contacts_round_trip() {
-        let sk = SigningKey::generate(&mut OsRng);
-        let id = test_node_id();
+        let (sk, id) = signed_identity();
 
         let contacts = vec![
             EmberContact {
