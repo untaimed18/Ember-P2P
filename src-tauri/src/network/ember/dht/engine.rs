@@ -23,7 +23,7 @@ use super::messages::{self, DhtPayload};
 use super::publish::SignedRecord;
 use super::routing::{AddResult, RoutingTable};
 use super::store::DhtStore;
-use super::{EmberContact, EmberNodeId, ID_BITS, MAX_CONTACTS_PER_RESPONSE};
+use super::{EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE, MAX_CONTACTS_PER_RESPONSE};
 use crate::network::ember::crypto;
 
 /// What the engine produced from one inbound DHT frame.
@@ -66,6 +66,13 @@ pub struct DhtInbound {
     pub found_value: Option<(u32, Vec<Vec<u8>>)>,
     /// We learned (added) a new contact from this frame's signed sender.
     pub learned_contact: bool,
+    /// Full-bucket liveness checks the caller should perform: each is the
+    /// current oldest contact `(addr, node_id, noise_pub)` of a bucket that
+    /// just rejected a newcomer into its replacement cache. The caller pings
+    /// the contact and, if it stays silent, calls
+    /// [`EmberDht::evict_contact`] to promote the cached newcomer
+    /// (Kademlia's least-recently-seen eviction rule).
+    pub ping_oldest: Vec<(SocketAddr, EmberNodeId, [u8; 32])>,
     /// Decode / signature / identity-binding failure. The caller should
     /// drop the frame; the string is for debug logging only.
     pub error: Option<String>,
@@ -135,6 +142,23 @@ impl EmberDht {
     /// subnet-diversity limit) or only cached behind a full bucket.
     pub fn add_contact(&mut self, contact: EmberContact) -> bool {
         matches!(self.routing.add_contact(contact), AddResult::Added)
+    }
+
+    /// Whether we should accept a `STORE_RECORD` for `key`.
+    ///
+    /// On a sparse routing table we cannot tell whether we are among the k
+    /// nodes closest to `key`, so we accept — the per-key / global capacity
+    /// caps in [`DhtStore`] bound abuse, and rejecting here would break
+    /// publishing on a young network where the publisher's "k closest" set
+    /// necessarily includes far-away nodes. Once the table is large enough to
+    /// be selective (`>= K_BUCKET_SIZE` known contacts), we only store keys we
+    /// are plausibly close to, so a spammer cannot push unrelated records onto
+    /// nodes that have no business holding them.
+    fn store_proximity_ok(&self, key: &[u8; 16]) -> bool {
+        if self.routing.total_contacts() < K_BUCKET_SIZE {
+            return true;
+        }
+        DhtStore::should_store(&self.local_id, key)
     }
 
     fn next_request_id(&mut self) -> u32 {
@@ -352,8 +376,14 @@ impl EmberDht {
                 last_seen: now,
                 failed_queries: 0,
             };
-            if matches!(self.routing.add_contact(contact), AddResult::Added) {
-                out.learned_contact = true;
+            match self.routing.add_contact(contact) {
+                AddResult::Added => out.learned_contact = true,
+                AddResult::PingOldest {
+                    addr,
+                    node_id,
+                    noise_pub,
+                } => out.ping_oldest.push((addr, node_id, noise_pub)),
+                AddResult::Rejected => {}
             }
         }
 
@@ -387,7 +417,14 @@ impl EmberDht {
                 // enters with the `last_seen` the wire carried (0) and
                 // will be pinged before later slices trust it.
                 for contact in &contacts {
-                    let _ = self.routing.add_contact(contact.clone());
+                    if let AddResult::PingOldest {
+                        addr,
+                        node_id,
+                        noise_pub,
+                    } = self.routing.add_contact(contact.clone())
+                    {
+                        out.ping_oldest.push((addr, node_id, noise_pub));
+                    }
                 }
                 out.found_node = Some((msg.request_id, contacts));
             }
@@ -403,9 +440,14 @@ impl EmberDht {
                 // it again (defence in depth) and enforces capacity.
                 if let Some(parsed) = SignedRecord::from_wire(&record, record_signature) {
                     if key == parsed.keyword_hash
-                        && self
-                            .store
-                            .store(key, record, record_signature, parsed.publisher_key)
+                        && self.store_proximity_ok(&key)
+                        && self.store.store(
+                            key,
+                            record,
+                            record_signature,
+                            parsed.publisher_key,
+                            parsed.timestamp,
+                        )
                     {
                         out.stored_record = true;
                         let ack = messages::build_store_ack(self.local_id, msg.request_id, key);
@@ -424,32 +466,34 @@ impl EmberDht {
                 // searcher can keep walking toward a node that has it.
                 let mut answered = false;
                 for key in &keys {
-                    if let Some(records) = self.store.get(key) {
-                        if !records.is_empty() {
-                            // Each FOUND_VALUE blob is `record_data ||
-                            // 64-byte publisher signature` so the searcher
-                            // can re-verify it end-to-end (the wire frame's
-                            // own signature only proves *we* relayed it).
-                            let blobs: Vec<Vec<u8>> = records
-                                .iter()
-                                .map(|r| {
-                                    let mut b = Vec::with_capacity(r.data.len() + 64);
-                                    b.extend_from_slice(&r.data);
-                                    b.extend_from_slice(&r.signature);
-                                    b
-                                })
-                                .collect();
-                            let fv = messages::build_found_value(
-                                self.local_id,
-                                msg.request_id,
-                                *key,
-                                blobs,
-                            );
-                            out.responses
-                                .push(messages::encode_message(&fv, &self.signing_key, true));
-                            answered = true;
-                            break;
-                        }
+                    // Serve only live records — an expired record that the
+                    // periodic sweep hasn't reaped yet must never satisfy a
+                    // lookup.
+                    let records = self.store.get_live(key);
+                    if !records.is_empty() {
+                        // Each FOUND_VALUE blob is `record_data ||
+                        // 64-byte publisher signature` so the searcher
+                        // can re-verify it end-to-end (the wire frame's
+                        // own signature only proves *we* relayed it).
+                        let blobs: Vec<Vec<u8>> = records
+                            .iter()
+                            .map(|r| {
+                                let mut b = Vec::with_capacity(r.data.len() + 64);
+                                b.extend_from_slice(&r.data);
+                                b.extend_from_slice(&r.signature);
+                                b
+                            })
+                            .collect();
+                        let fv = messages::build_found_value(
+                            self.local_id,
+                            msg.request_id,
+                            *key,
+                            blobs,
+                        );
+                        out.responses
+                            .push(messages::encode_message(&fv, &self.signing_key, true));
+                        answered = true;
+                        break;
                     }
                 }
                 if !answered {

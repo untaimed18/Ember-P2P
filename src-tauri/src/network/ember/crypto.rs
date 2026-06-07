@@ -12,6 +12,20 @@ pub fn node_id_from_public_key(public_key: &VerifyingKey) -> [u8; 16] {
     id
 }
 
+/// Derive the 16-byte Ember node ID directly from raw Ed25519 public-key
+/// bytes, returning `None` if the bytes are not a valid curve point.
+///
+/// This is the canonical way to (re)derive a contact's identity from material
+/// that arrived over the wire (`FOUND_NODE` contact lists) or off disk
+/// (`nodes_ember.dat`). Because the node ID is `BLAKE3(ed25519_pub)[..16]`, a
+/// peer-supplied `node_id` is always redundant and must never be trusted — we
+/// recompute it here so a malicious or corrupt source cannot inject a contact
+/// under an ID it does not actually control (routing-table poisoning / eclipse
+/// defense).
+pub fn node_id_from_ed25519_bytes(bytes: &[u8; 32]) -> Option<[u8; 16]> {
+    verifying_key_from_bytes(bytes).map(|vk| node_id_from_public_key(&vk))
+}
+
 /// Verify the identity-binding claim `BLAKE3(pubkey)[0..16] == advertised_hash`.
 ///
 /// This is the cheap, offline half of full Ember identity verification: it

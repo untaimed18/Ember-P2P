@@ -90,6 +90,7 @@
   "ember_disabled_explainer": "La Red Ember está desactivada. Actívala para unirte a la red superpuesta entre pares cifrada.",
   "ember_toggle_failed": "No se pudo cambiar el ajuste de la Red Ember: {error}",
   "ember_load_failed": "No se pudo cargar el estado de la Red Ember: {error}",
+  "ember_stats_unavailable": "Las estadísticas en vivo no están disponibles: el servicio de red no responde. Los valores de abajo pueden estar desactualizados.",
 
   "sidebar_aria_primary": "Principal",
   "sidebar_logo_title": "Ir al inicio de la red KAD",

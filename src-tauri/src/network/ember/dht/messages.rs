@@ -479,13 +479,17 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
             let mut records = Vec::with_capacity(record_count.min(data.len() / 2 + 1));
             let mut offset = 18usize;
             for _ in 0..record_count {
+                // A declared record count that the buffer can't satisfy is a
+                // framing error, not a partial list to be silently accepted —
+                // reject the whole frame so a peer can't smuggle a truncated
+                // payload that we'd misinterpret.
                 if offset + 2 > data.len() {
-                    break;
+                    anyhow::bail!("FOUND_VALUE truncated (declared {record_count} records)");
                 }
                 let rlen = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
                 offset += 2;
                 if offset + rlen > data.len() {
-                    break;
+                    anyhow::bail!("FOUND_VALUE record length {rlen} exceeds buffer");
                 }
                 records.push(data[offset..offset + rlen].to_vec());
                 offset += rlen;
@@ -510,11 +514,14 @@ fn decode_contact_list(data: &[u8]) -> anyhow::Result<Vec<EmberContact>> {
 
     for _ in 0..count {
         // node_id (16) + addr_type (1) + ip (4 or 16) + port (2) + noise_pub (32) + ed25519_pub (32)
+        // A declared count the buffer can't satisfy is a framing error: reject
+        // the whole frame instead of returning a silently-truncated prefix.
         if offset + 16 + 1 > data.len() {
-            break;
+            anyhow::bail!("contact list truncated (declared {count} contacts)");
         }
-        let mut node_id = [0u8; 16];
-        node_id.copy_from_slice(&data[offset..offset + 16]);
+        // The wire still carries a node_id for format stability, but we never
+        // trust it — a contact's identity is re-derived from its Ed25519 key
+        // below. Consume the bytes to keep the cursor aligned.
         offset += 16;
 
         let addr_type = data[offset];
@@ -523,7 +530,7 @@ fn decode_contact_list(data: &[u8]) -> anyhow::Result<Vec<EmberContact>> {
         let (ip, ip_len) = match addr_type {
             ADDR_IPV4 => {
                 if offset + 4 > data.len() {
-                    break;
+                    anyhow::bail!("contact list truncated (ipv4 address)");
                 }
                 let ip = IpAddr::V4(Ipv4Addr::new(
                     data[offset],
@@ -535,7 +542,7 @@ fn decode_contact_list(data: &[u8]) -> anyhow::Result<Vec<EmberContact>> {
             }
             ADDR_IPV6 => {
                 if offset + 16 > data.len() {
-                    break;
+                    anyhow::bail!("contact list truncated (ipv6 address)");
                 }
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&data[offset..offset + 16]);
@@ -549,7 +556,7 @@ fn decode_contact_list(data: &[u8]) -> anyhow::Result<Vec<EmberContact>> {
         offset += ip_len;
 
         if offset + 2 + 32 + 32 > data.len() {
-            break;
+            anyhow::bail!("contact list truncated (port/keys)");
         }
         let port = u16::from_be_bytes([data[offset], data[offset + 1]]);
         offset += 2;
@@ -562,8 +569,19 @@ fn decode_contact_list(data: &[u8]) -> anyhow::Result<Vec<EmberContact>> {
         ed25519_pub.copy_from_slice(&data[offset..offset + 32]);
         offset += 32;
 
+        // Re-derive the node ID from the Ed25519 key rather than trusting the
+        // wire-supplied value. This mirrors the identity binding `decode_message`
+        // enforces for direct senders and `BootstrapNode::to_contact` applies to
+        // rendezvous peers: an indirectly-learned contact cannot be injected
+        // under an ID it doesn't control. A contact whose key isn't a valid
+        // Ed25519 point can never be dialed or verified, so drop it silently
+        // (one bad entry must not void the rest of an otherwise honest list).
+        let Some(derived_id) = crypto::node_id_from_ed25519_bytes(&ed25519_pub) else {
+            continue;
+        };
+
         contacts.push(EmberContact {
-            node_id: EmberNodeId(node_id),
+            node_id: EmberNodeId(derived_id),
             addr: SocketAddr::new(ip, port),
             noise_pub,
             ed25519_pub,
@@ -589,6 +607,23 @@ mod tests {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let id = EmberNodeId(crypto::node_id_from_public_key(&sk.verifying_key()));
         (sk, id)
+    }
+
+    /// Build a contact whose `node_id` is correctly derived from a real
+    /// Ed25519 key. `decode_contact_list` re-derives the ID from the key and
+    /// drops contacts with non-curve-valid keys, so tests must use genuine
+    /// keypairs rather than placeholder bytes.
+    fn test_contact(seed: u8, addr: &str, noise: u8) -> EmberContact {
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let vk = sk.verifying_key();
+        EmberContact {
+            node_id: EmberNodeId(crypto::node_id_from_public_key(&vk)),
+            addr: addr.parse().unwrap(),
+            noise_pub: [noise; 32],
+            ed25519_pub: vk.to_bytes(),
+            last_seen: 0,
+            failed_queries: 0,
+        }
     }
 
     #[test]
@@ -633,22 +668,8 @@ mod tests {
         let (sk, id) = test_keypair();
 
         let contacts = vec![
-            EmberContact {
-                node_id: EmberNodeId([2; 16]),
-                addr: "1.2.3.4:4662".parse().unwrap(),
-                noise_pub: [0xAA; 32],
-                ed25519_pub: [0xBB; 32],
-                last_seen: 0,
-                failed_queries: 0,
-            },
-            EmberContact {
-                node_id: EmberNodeId([3; 16]),
-                addr: "[::1]:4663".parse().unwrap(),
-                noise_pub: [0xCC; 32],
-                ed25519_pub: [0xDD; 32],
-                last_seen: 0,
-                failed_queries: 0,
-            },
+            test_contact(11, "1.2.3.4:4662", 0xAA),
+            test_contact(12, "[::1]:4663", 0xCC),
         ];
 
         let msg = build_found_node(id, 100, contacts.clone());
@@ -658,13 +679,55 @@ mod tests {
         match decoded.payload {
             DhtPayload::FoundNode { contacts: decoded_contacts } => {
                 assert_eq!(decoded_contacts.len(), 2);
+                // node_id is re-derived from the Ed25519 key on decode and
+                // must match the (correctly derived) id we encoded.
                 assert_eq!(decoded_contacts[0].node_id, contacts[0].node_id);
                 assert_eq!(decoded_contacts[0].addr, contacts[0].addr);
                 assert_eq!(decoded_contacts[0].noise_pub, contacts[0].noise_pub);
+                assert_eq!(decoded_contacts[0].ed25519_pub, contacts[0].ed25519_pub);
+                assert_eq!(decoded_contacts[1].node_id, contacts[1].node_id);
                 assert_eq!(decoded_contacts[1].addr, contacts[1].addr);
             }
             _ => panic!("expected FoundNode"),
         }
+    }
+
+    #[test]
+    fn contact_list_drops_invalid_ed25519_keys() {
+        use ed25519_dalek::VerifyingKey;
+        // Find a 32-byte value that is NOT a valid Ed25519 point encoding
+        // (roughly half of all y-coordinates fail to decompress).
+        let bad_ed = (1u8..=255)
+            .map(|i| [i; 32])
+            .find(|c| VerifyingKey::from_bytes(c).is_err())
+            .expect("an invalid Ed25519 encoding should exist");
+
+        // A contact whose Ed25519 key isn't a valid curve point can't be
+        // verified or dialed; decode must drop it rather than admit a contact
+        // under an unverifiable identity.
+        let good = test_contact(21, "9.9.9.9:1111", 0x01);
+        let mut encoded = encode_contact_list(&[good.clone()]);
+        // Append a second hand-rolled contact with the invalid key.
+        encoded[0] = 2; // bump declared count
+        encoded.extend_from_slice(&[0u8; 16]); // node_id (ignored on decode)
+        encoded.push(ADDR_IPV4);
+        encoded.extend_from_slice(&[8, 8, 8, 8]);
+        encoded.extend_from_slice(&2000u16.to_be_bytes());
+        encoded.extend_from_slice(&[0x02; 32]); // noise_pub
+        encoded.extend_from_slice(&bad_ed); // invalid ed25519_pub
+
+        let decoded = decode_contact_list(&encoded).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].node_id, good.node_id);
+    }
+
+    #[test]
+    fn contact_list_rejects_truncation() {
+        let good = test_contact(22, "9.9.9.9:1111", 0x01);
+        let mut encoded = encode_contact_list(&[good]);
+        // Claim two contacts but provide bytes for only one.
+        encoded[0] = 2;
+        assert!(decode_contact_list(&encoded).is_err());
     }
 
     #[test]
@@ -683,22 +746,8 @@ mod tests {
     #[test]
     fn contact_list_ipv4_and_ipv6() {
         let contacts = vec![
-            EmberContact {
-                node_id: EmberNodeId([1; 16]),
-                addr: "10.0.0.1:1000".parse().unwrap(),
-                noise_pub: [0; 32],
-                ed25519_pub: [0; 32],
-                last_seen: 0,
-                failed_queries: 0,
-            },
-            EmberContact {
-                node_id: EmberNodeId([2; 16]),
-                addr: "[2001:db8::1]:2000".parse().unwrap(),
-                noise_pub: [0; 32],
-                ed25519_pub: [0; 32],
-                last_seen: 0,
-                failed_queries: 0,
-            },
+            test_contact(31, "10.0.0.1:1000", 0x10),
+            test_contact(32, "[2001:db8::1]:2000", 0x20),
         ];
 
         let encoded = encode_contact_list(&contacts);
@@ -706,9 +755,11 @@ mod tests {
 
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].addr, "10.0.0.1:1000".parse::<SocketAddr>().unwrap());
+        assert_eq!(decoded[0].node_id, contacts[0].node_id);
         assert_eq!(
             decoded[1].addr,
             "[2001:db8::1]:2000".parse::<SocketAddr>().unwrap()
         );
+        assert_eq!(decoded[1].node_id, contacts[1].node_id);
     }
 }

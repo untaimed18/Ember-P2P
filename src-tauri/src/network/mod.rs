@@ -2743,6 +2743,11 @@ struct NetworkState {
     /// `EMBER_MAINT_PING_TIMEOUT`. Unlike `ember_dht_pending_pings` these
     /// have no waiter — they exist purely to drive eviction.
     ember_dht_maint_pings: HashMap<u32, (ember::dht::EmberNodeId, std::time::Instant)>,
+    /// Set while a cold-start `/bootstrap` fetch task is running, so rapid
+    /// off→on toggles (or any future caller) can't dog-pile concurrent
+    /// HTTPS fetches at the rendezvous. The detached task releases it on
+    /// completion via an RAII guard; shared with that task by `Arc`.
+    ember_cold_bootstrap_in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One in-flight iterative-lookup `FIND_NODE`, tracked by the network
@@ -3922,6 +3927,52 @@ fn antileech_reset_defaults(
     Ok(antileech_snapshot(state))
 }
 
+/// Tear down Ember-native runtime state when the feature flag flips off.
+///
+/// Sessions established while "on" must not survive into a later re-enable
+/// (different intent, and the peer's Noise key may have rotated), and the
+/// mesh caches / in-flight operation maps would otherwise leak memory and
+/// strand `oneshot` waiters that can no longer be answered. Dropping the
+/// pending-operation senders also lets any blocked command return promptly
+/// instead of waiting out its full timeout.
+///
+/// The DHT engine itself (routing table + record store) is deliberately
+/// *kept*: it's small, it's the warm state that lets a re-enable rejoin
+/// instantly without a cold bootstrap, and it's re-persisted to
+/// `nodes_ember.dat` on shutdown regardless. Only the volatile session and
+/// discovery state tied to a live transport is cleared here.
+fn ember_disable_cleanup(state: &mut NetworkState) {
+    // Encrypted sessions + their control-ping waiters.
+    state.ember_transport.cleanup_all();
+    state.ember_pending_pings.clear();
+
+    // In-flight DHT operations and their waiters.
+    state.ember_dht_pending_pings.clear();
+    state.ember_dht_pending_finds.clear();
+    state.ember_dht_pending_lookups.clear();
+    state.ember_dht_pending_value_lookups.clear();
+    state.ember_dht_pending_publishes.clear();
+    state.ember_dht_search_requests.clear();
+    state.ember_dht_publish_requests.clear();
+    state.ember_dht_maint_pings.clear();
+    state.ember_search = ember::dht::search::SearchManager::new();
+    state.ember_publish = ember::dht::publish::PublishManager::new();
+
+    // KAD-bridge discovery caches: only meaningful while the transport is
+    // live, and the attempted-set in particular would otherwise grow
+    // unbounded across the session.
+    state.ember_noise_keys.clear();
+    state.ember_kad_bridge_attempted.clear();
+    state.known_ember_peers.clear();
+
+    // Cumulative dev-console counters: start each enable-session clean
+    // (matching the session reset above). The live fields — session count,
+    // contact count, etc. — are recomputed from state on each read.
+    state.ember_diagnostics = EmberDiagnostics::default();
+
+    info!("Ember-native transport disabled — cleared sessions, caches, and in-flight DHT state");
+}
+
 /// Kick a cold-start Ember DHT bootstrap if (and only if) it's warranted:
 /// the native transport is enabled, the routing table is empty (no warm
 /// `nodes_ember.dat`, or it failed to load), and a rendezvous URL is
@@ -3955,8 +4006,31 @@ fn maybe_spawn_ember_cold_bootstrap(
         return;
     }
 
+    // In-flight guard, taken only after the cheap no-op checks above so an
+    // early return can never strand the flag set. `swap` is the atomic
+    // test-and-set: if it was already true, another fetch is running.
+    use std::sync::atomic::Ordering;
+    if state
+        .ember_cold_bootstrap_in_flight
+        .swap(true, Ordering::AcqRel)
+    {
+        debug!("Ember DHT cold bootstrap ({trigger}) skipped: one already in flight");
+        return;
+    }
+    let in_flight = state.ember_cold_bootstrap_in_flight.clone();
+
     let boot_tx = boot_tx.clone();
     tokio::spawn(async move {
+        // RAII release: clears the guard on every exit path (normal return,
+        // early return, or panic) so a future toggle can bootstrap again.
+        struct InFlightGuard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _guard = InFlightGuard(in_flight);
+
         if !seeds.is_empty() {
             info!(
                 "Ember DHT cold bootstrap ({trigger}): seeding {} hardcoded peer(s)",
@@ -4528,6 +4602,7 @@ pub async fn start_network(
         ember_dht_publish_requests: HashMap::new(),
         ember_dht_pending_publishes: HashMap::new(),
         ember_dht_maint_pings: HashMap::new(),
+        ember_cold_bootstrap_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     // Seed the Ember DHT routing table from the last session's persisted
@@ -5419,9 +5494,7 @@ pub async fn start_network(
                     let ember_turned_on =
                         !settings.ember_native_enabled && new_settings.ember_native_enabled;
                     if settings.ember_native_enabled && !new_settings.ember_native_enabled {
-                        state.ember_transport.cleanup_all();
-                        state.ember_pending_pings.clear();
-                        info!("Ember-native transport disabled — cleared all sessions");
+                        ember_disable_cleanup(&mut state);
                     }
                     info!(
                         "Network settings updated: obfuscation={}, uss={}, nickname={}, max_uploads={}, ip_filter={}, block_private={}, ember_native={}",
@@ -5505,12 +5578,17 @@ pub async fn start_network(
                         if settings.ember_native_enabled
                             && ember::transport::EmberTransport::is_ember_packet(&udp_buf[..len])
                         {
-                            handle_ember_native_udp(
-                                &udp_socket,
-                                &udp_buf[..len],
-                                from,
-                                &mut state,
-                            ).await;
+                            // Ember rides the KAD socket but skips
+                            // `handle_udp_packet`, so the shared
+                            // IP-filter/ban/rate-limit gate must run here.
+                            if ember_udp_recv_allowed(&mut state, from) {
+                                handle_ember_native_udp(
+                                    &udp_socket,
+                                    &udp_buf[..len],
+                                    from,
+                                    &mut state,
+                                ).await;
+                            }
                         } else if state.stats.status != NetworkStatus::Disconnected {
                             last_kad_activity_at = chrono::Utc::now().timestamp();
                             stats_manager.add_overhead(
@@ -5544,12 +5622,17 @@ pub async fn start_network(
                             if settings.ember_native_enabled
                                 && ember::transport::EmberTransport::is_ember_packet(&udp_buf[..len])
                             {
-                                handle_ember_native_udp(
-                                    &udp_socket,
-                                    &udp_buf[..len],
-                                    from,
-                                    &mut state,
-                                ).await;
+                                // See the gate rationale on the first
+                                // recv branch above — same fast-path
+                                // bypass of `handle_udp_packet`.
+                                if ember_udp_recv_allowed(&mut state, from) {
+                                    handle_ember_native_udp(
+                                        &udp_socket,
+                                        &udp_buf[..len],
+                                        from,
+                                        &mut state,
+                                    ).await;
+                                }
                             } else if state.stats.status != NetworkStatus::Disconnected {
                                 last_kad_activity_at = chrono::Utc::now().timestamp();
                                 stats_manager.add_overhead(
@@ -5646,9 +5729,7 @@ pub async fn start_network(
                         let ember_turned_on =
                             !settings.ember_native_enabled && new_settings.ember_native_enabled;
                         if settings.ember_native_enabled && !new_settings.ember_native_enabled {
-                            state.ember_transport.cleanup_all();
-                            state.ember_pending_pings.clear();
-                            info!("Ember-native transport disabled — cleared all sessions");
+                            ember_disable_cleanup(&mut state);
                         }
                         info!(
                             "Network settings updated (recv): obfuscation={}, uss={}, nickname={}, max_uploads={}, ip_filter={}, block_private={}, ember_native={}",
@@ -7400,13 +7481,22 @@ pub async fn start_network(
                                     {
                                         state.ember_capable_peers.insert((s.ip, s.tcp_port));
                                     }
+                                    // Cache the Noise key under the peer's UDP
+                                    // port: Ember's Noise transport runs over
+                                    // UDP (the shared KAD socket), so every
+                                    // bridge/dial path must target udp_port,
+                                    // not the eMule TCP port. A peer that
+                                    // advertised no UDP port can't be Ember-
+                                    // dialed, so skip caching it.
                                     if let Some(npub) = s.ember_noise_pub {
-                                        record_ember_noise_key(
-                                            &mut state.ember_noise_keys,
-                                            s.ip,
-                                            s.tcp_port,
-                                            npub,
-                                        );
+                                        if s.udp_port != 0 {
+                                            record_ember_noise_key(
+                                                &mut state.ember_noise_keys,
+                                                s.ip,
+                                                s.udp_port,
+                                                npub,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -7485,13 +7575,22 @@ pub async fn start_network(
                                     {
                                         state.ember_capable_peers.insert((s.ip, s.tcp_port));
                                     }
+                                    // Cache the Noise key under the peer's UDP
+                                    // port: Ember's Noise transport runs over
+                                    // UDP (the shared KAD socket), so every
+                                    // bridge/dial path must target udp_port,
+                                    // not the eMule TCP port. A peer that
+                                    // advertised no UDP port can't be Ember-
+                                    // dialed, so skip caching it.
                                     if let Some(npub) = s.ember_noise_pub {
-                                        record_ember_noise_key(
-                                            &mut state.ember_noise_keys,
-                                            s.ip,
-                                            s.tcp_port,
-                                            npub,
-                                        );
+                                        if s.udp_port != 0 {
+                                            record_ember_noise_key(
+                                                &mut state.ember_noise_keys,
+                                                s.ip,
+                                                s.udp_port,
+                                                npub,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -9284,9 +9383,15 @@ pub async fn start_network(
                         } else {
                             None
                         };
+                        // The Ember Noise transport shares the KAD UDP socket,
+                        // so the `/bootstrap` pool must advertise the *actual
+                        // bound* UDP port (which may differ from the configured
+                        // one if it was taken). Only meaningful with a Noise key.
+                        let rv_ember_port =
+                            if settings.ember_native_enabled { Some(udp_port) } else { None };
                         let app_rv = app_handle.clone();
                         tokio::spawn(async move {
-                            match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret, rv_noise.as_ref()).await {
+                            match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret, rv_noise.as_ref(), rv_ember_port).await {
                                 Ok(()) => {
                                     let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
                                         "discoverable": true,
@@ -9407,9 +9512,13 @@ pub async fn start_network(
                             } else {
                                 None
                             };
+                            // Keep the bootstrap pool's UDP port for us fresh on
+                            // every heartbeat (see initial-register rationale).
+                            let rv_ember_port =
+                                if settings.ember_native_enabled { Some(udp_port) } else { None };
                             let app_rv = app_handle.clone();
                             tokio::spawn(async move {
-                                match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret, rv_noise.as_ref()).await {
+                                match rendezvous::register(&rv_url, &rv_hash, rv_port, rv_ip, &rv_pubkey, &rv_secret, rv_noise.as_ref(), rv_ember_port).await {
                                     Ok(()) => {
                                         let _ = app_rv.emit("ember:friend-discoverable", serde_json::json!({
                                             "discoverable": true,
@@ -14666,6 +14775,14 @@ pub async fn start_network(
                 let pruned_before = state.known_ember_peers.len();
                 prune_stale_ember_peers(&mut state.known_ember_peers);
                 prune_stale_ember_noise_keys(&mut state.ember_noise_keys);
+                // The KAD-bridge "already attempted" set has no TTL of its
+                // own; bound it to the Noise-key cache it mirrors. Once a
+                // peer's key ages out (and is later re-learned) we want to
+                // be able to bridge-ping it again, and this also stops the
+                // set growing without limit over a long session.
+                state
+                    .ember_kad_bridge_attempted
+                    .retain(|key| state.ember_noise_keys.contains_key(key));
                 let pruned_after = state.known_ember_peers.len();
                 if pruned_after != pruned_before {
                     state.stats.ember_peers = pruned_after as u32;
@@ -16092,6 +16209,56 @@ async fn write_ed2k_packet_simple(
     Ok(())
 }
 
+/// Security gate for inbound Ember-native UDP, mirroring the IP-filter +
+/// ban-list + per-IP rate-limit checks `handle_udp_packet` applies to
+/// KAD/eD2K traffic. The event loop's Ember fast-path dispatches *above*
+/// `handle_udp_packet` (so Ember keeps working while KAD is disconnected),
+/// so without running these checks here a peer could drive unbounded Noise
+/// handshakes — pure CPU for us — straight past flood protection.
+///
+/// Returns `true` if the packet may be processed, `false` if it should be
+/// dropped. Takes `&mut NetworkState` because the rate limiter records the
+/// hit. IP-filter and ban-list are IPv4 structures: they're enforced for
+/// any v4 / v4-mapped source, while a genuinely v6-only Ember peer skips
+/// those two (they can't represent it) but is still rate-limited.
+fn ember_udp_recv_allowed(state: &mut NetworkState, from: SocketAddr) -> bool {
+    if let Some(v4) = match from.ip() {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+    } {
+        if state.ip_filter.is_blocked_readonly(v4) {
+            debug!("Dropping Ember UDP from blocked IP {from}");
+            return false;
+        }
+        if state.banned_ips.contains(&v4) {
+            debug!("Dropping Ember UDP from banned peer {from}");
+            return false;
+        }
+    }
+
+    // Same global per-IP UDP rate limit KAD gets. `opcode_hint = 0xFF`
+    // selects the global cap only (the per-opcode Layer-1 limits are
+    // KAD-specific and meaningless for Noise frames). A contact already in
+    // the routing table — or one we've recently exchanged UDP with — is
+    // treated as "known" so the limiter gives it the higher steady-state
+    // budget instead of the stricter stranger cap.
+    let known_peer = match from.ip() {
+        std::net::IpAddr::V4(v4) => {
+            state.routing_table.has_contact_ip(v4)
+                || state.flood_protection.has_recent_ip(from.ip())
+        }
+        _ => state.flood_protection.has_recent_ip(from.ip()),
+    };
+    if state
+        .flood_protection
+        .check_rate_limit_with_opcode(from.ip(), known_peer, 0xFF)
+    {
+        debug!("Rate limit exceeded for Ember UDP from {from}, dropping packet");
+        return false;
+    }
+    true
+}
+
 /// Drive `EmberTransport` for an inbound Ember-magic UDP packet,
 /// send any side-effect packets back over the same socket, and
 /// update diagnostics + the pending-ping registry. Pure transport
@@ -16663,6 +16830,60 @@ async fn handle_ember_dht_message(
         }
     }
 
+    // Kademlia bucket pressure: learning the sender (or a FOUND_NODE
+    // contact) hit a full bucket, so the engine asks us to ping the
+    // *oldest* contact there. The newcomer is already parked in that
+    // bucket's replacement cache. If the oldest answers it keeps its
+    // slot (proven-live contacts win — the newcomer ages out of the
+    // cache); if it stays silent past EMBER_MAINT_PING_TIMEOUT the
+    // 1-second sweep faults and evicts it, promoting the newcomer. We
+    // register these probes in the same `ember_dht_maint_pings` map the
+    // liveness sweep already drains, so that fault/evict/promote path
+    // fires for free.
+    for (oldest_addr, oldest_id, oldest_noise) in &inbound.ping_oldest {
+        // One probe per contact: if a liveness or earlier bucket-pressure
+        // ping to it is already outstanding, that one already decides its
+        // fate — piling on would over-count failures and waste packets.
+        if state
+            .ember_dht_maint_pings
+            .values()
+            .any(|(id, _)| id == oldest_id)
+        {
+            continue;
+        }
+        let (wire_req_id, frame) = state.ember_dht.build_ping();
+        let sent = match state.ember_transport.prepare_outgoing(
+            *oldest_addr,
+            Some(oldest_noise),
+            &frame,
+        ) {
+            ember::transport::OutgoingResult::Ready { packet }
+            | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                match socket.send_to(&packet, *oldest_addr).await {
+                    Ok(_) => true,
+                    Err(e) => {
+                        debug!("Ember DHT: bucket-pressure ping to {oldest_addr} failed: {e}");
+                        false
+                    }
+                }
+            }
+            ember::transport::OutgoingResult::Queued => true,
+            ember::transport::OutgoingResult::Error(e) => {
+                debug!("Ember DHT: transport error pinging oldest {oldest_addr}: {e}");
+                false
+            }
+        };
+        if sent {
+            state
+                .ember_dht_maint_pings
+                .insert(wire_req_id, (*oldest_id, std::time::Instant::now()));
+            state.ember_diagnostics.ember_dht_liveness_pings_sent = state
+                .ember_diagnostics
+                .ember_dht_liveness_pings_sent
+                .saturating_add(1);
+        }
+    }
+
     if inbound.pong_received {
         state.ember_diagnostics.ember_dht_pongs_received = state
             .ember_diagnostics
@@ -16844,25 +17065,15 @@ async fn handle_udp_packet_inner(
     // warnings and waste cycles parsing garbage).
     if ember::transport::EmberTransport::is_ember_packet(data) {
         if settings.ember_native_enabled {
-            // Apply the same global per-IP UDP rate limit KAD traffic
-            // gets (opcode_hint 0xFF selects the global cap only — the
-            // per-opcode Layer-1 limits are KAD-specific). Without this,
-            // Ember-native UDP bypassed flood protection entirely and a
-            // peer could drive Noise handshakes at full line rate, which
-            // is pure CPU for us. The IP-filter + ban checks above already
-            // ran, so this only adds the rate gate.
-            let known_peer = match from.ip() {
-                std::net::IpAddr::V4(v4) => {
-                    state.routing_table.has_contact_ip(v4)
-                        || state.flood_protection.has_recent_ip(from.ip())
-                }
-                _ => state.flood_protection.has_recent_ip(from.ip()),
-            };
-            if state.flood_protection.check_rate_limit_with_opcode(from.ip(), known_peer, 0xFF) {
-                debug!("Rate limit exceeded for Ember UDP from {from}, dropping packet");
-                return;
+            // Defense-in-depth: in practice the event loop's Ember
+            // fast-path intercepts these packets before `handle_udp_packet`,
+            // but if that ever changes, the shared gate (IP-filter + ban +
+            // per-IP rate limit) still runs here. The IP-filter/ban checks
+            // above already ran for KAD's sake; re-running them is two cheap
+            // set lookups against a path that's normally unreached.
+            if ember_udp_recv_allowed(state, from) {
+                handle_ember_native_udp(socket, data, from, state).await;
             }
-            handle_ember_native_udp(socket, data, from, state).await;
         } else {
             debug!("Dropping Ember-magic UDP packet from {from}: ember_native_enabled=false");
         }

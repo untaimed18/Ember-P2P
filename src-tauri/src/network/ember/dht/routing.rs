@@ -53,8 +53,14 @@ pub enum AddResult {
     /// Contact was added or updated.
     Added,
     /// Bucket is full; the caller should ping this contact to see if it's alive.
-    /// If the ping fails, call `evict_and_replace` to swap it out.
-    PingOldest { addr: SocketAddr, node_id: EmberNodeId },
+    /// If the ping fails, call `evict_and_replace` to swap it out. `noise_pub`
+    /// is carried so the caller can open a Noise session to the oldest contact
+    /// without a separate routing-table lookup.
+    PingOldest {
+        addr: SocketAddr,
+        node_id: EmberNodeId,
+        noise_pub: [u8; 32],
+    },
     /// Contact was rejected (duplicate subnet, etc.).
     Rejected,
 }
@@ -145,11 +151,13 @@ impl RoutingTable {
         let oldest = bucket.oldest_contact().unwrap();
         let ping_addr = oldest.addr;
         let ping_id = oldest.node_id;
+        let ping_noise = oldest.noise_pub;
         self.add_to_cache(bucket_idx, contact);
 
         AddResult::PingOldest {
             addr: ping_addr,
             node_id: ping_id,
+            noise_pub: ping_noise,
         }
     }
 
@@ -180,19 +188,47 @@ impl RoutingTable {
             }
         }
 
-        // Promote from replacement cache
-        if let Some(replacement) = bucket.replacement_cache.pop_back() {
-            let new_subnet = replacement.subnet_key();
-            *self.global_subnet_count.entry(new_subnet).or_insert(0) += 1;
-            debug!(
-                "Evicted dead contact {}, replaced with {}",
-                removed.node_id, replacement.node_id
-            );
-            bucket.contacts.push_back(replacement);
-            true
-        } else {
-            debug!("Evicted dead contact {}, no replacement available", removed.node_id);
-            false
+        // Promote the newest replacement-cache entry that still satisfies the
+        // subnet-diversity limits. Blindly promoting the newest entry (the old
+        // behaviour) let a bucket fill up with contacts from one subnet via the
+        // cache, defeating the eclipse-resistance the `add_contact` checks
+        // provide. We scan newest→oldest so the freshest eligible contact wins.
+        let bucket = &mut self.buckets[bucket_idx];
+        let mut chosen: Option<usize> = None;
+        for i in (0..bucket.replacement_cache.len()).rev() {
+            let cand_subnet = bucket.replacement_cache[i].subnet_key();
+            let per_bucket_ok = bucket.subnet_count(cand_subnet) < MAX_PER_SUBNET_PER_BUCKET;
+            let global_ok = self
+                .global_subnet_count
+                .get(&cand_subnet)
+                .copied()
+                .unwrap_or(0)
+                < MAX_PER_SUBNET_GLOBAL;
+            if per_bucket_ok && global_ok {
+                chosen = Some(i);
+                break;
+            }
+        }
+
+        match chosen {
+            Some(i) => {
+                let replacement = self.buckets[bucket_idx].replacement_cache.remove(i).unwrap();
+                let new_subnet = replacement.subnet_key();
+                *self.global_subnet_count.entry(new_subnet).or_insert(0) += 1;
+                debug!(
+                    "Evicted dead contact {}, replaced with {}",
+                    removed.node_id, replacement.node_id
+                );
+                self.buckets[bucket_idx].contacts.push_back(replacement);
+                true
+            }
+            None => {
+                debug!(
+                    "Evicted dead contact {}, no subnet-eligible replacement available",
+                    removed.node_id
+                );
+                false
+            }
         }
     }
 
@@ -208,9 +244,17 @@ impl RoutingTable {
 
         let bucket = &mut self.buckets[bucket_idx];
         if let Some(pos) = bucket.find(node_id) {
-            let contact = &mut bucket.contacts[pos];
-            contact.last_seen = chrono::Utc::now().timestamp();
+            // Move the contact to the back of the deque so it becomes the
+            // most-recently-seen entry. Kademlia's liveness rule relies on the
+            // front being the least-recently-seen (the one we ping when the
+            // bucket is full); without this touch a freshly-confirmed contact
+            // could still be picked as the "oldest" eviction candidate.
+            let mut contact = bucket.contacts.remove(pos).unwrap();
+            let now = chrono::Utc::now().timestamp();
+            contact.last_seen = now;
             contact.failed_queries = 0;
+            bucket.contacts.push_back(contact);
+            bucket.last_activity = now;
         }
     }
 
@@ -227,7 +271,10 @@ impl RoutingTable {
 
         let bucket = &mut self.buckets[bucket_idx];
         if let Some(pos) = bucket.find(node_id) {
-            bucket.contacts[pos].failed_queries += 1;
+            // Saturating so a contact stuck at u8::MAX can't wrap back to 0 and
+            // dodge eviction forever.
+            bucket.contacts[pos].failed_queries =
+                bucket.contacts[pos].failed_queries.saturating_add(1);
             bucket.contacts[pos].failed_queries >= super::MAX_FAILED_QUERIES
         } else {
             false
@@ -471,6 +518,65 @@ mod tests {
         // The replacement should now be in the table
         assert!(rt.get_contact(&make_id(replacement_id)).is_some());
         assert!(rt.get_contact(&dead_id).is_none());
+    }
+
+    fn contact_at(id: u8, a: u8, b: u8, c: u8, d: u8) -> EmberContact {
+        EmberContact {
+            node_id: make_id(id),
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), 4662),
+            noise_pub: [id; 32],
+            ed25519_pub: [id; 32],
+            last_seen: chrono::Utc::now().timestamp(),
+            failed_queries: 0,
+        }
+    }
+
+    #[test]
+    fn mark_alive_moves_contact_to_back() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local);
+        // Fill bucket 127 with distinct-subnet contacts.
+        for i in 0x80..0x80 + K_BUCKET_SIZE as u8 {
+            assert!(matches!(
+                rt.add_contact(contact_at(i, 80, i, 1, 1)),
+                AddResult::Added
+            ));
+        }
+        // Refresh the current oldest (0x80); it must no longer be the eviction
+        // candidate once it moves to the back of the LRU deque.
+        rt.mark_alive(&make_id(0x80));
+        // The next add overflows the bucket — the ping target is the new oldest.
+        match rt.add_contact(contact_at(0x80 + K_BUCKET_SIZE as u8, 80, 200, 1, 1)) {
+            AddResult::PingOldest { node_id, .. } => assert_eq!(node_id, make_id(0x81)),
+            _ => panic!("expected PingOldest with 0x81 as the new oldest"),
+        }
+    }
+
+    #[test]
+    fn evict_promotes_subnet_eligible_replacement() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local);
+        // 3 contacts in subnet 80.1.1.x — hits MAX_PER_SUBNET_PER_BUCKET (3).
+        rt.add_contact(contact_at(0x80, 80, 1, 1, 1));
+        rt.add_contact(contact_at(0x81, 80, 1, 1, 2));
+        rt.add_contact(contact_at(0x82, 80, 1, 1, 3));
+        // Fill the rest of the 20-slot bucket with distinct subnets.
+        for k in 0..(K_BUCKET_SIZE as u8 - 3) {
+            rt.add_contact(contact_at(0x83 + k, 80, 10 + k, 1, 1));
+        }
+        assert_eq!(rt.total_contacts(), K_BUCKET_SIZE);
+
+        // Cache a fresh-subnet contact, then an over-limit subnet-A contact so
+        // the over-limit one is the *newest* cache entry.
+        rt.add_contact(contact_at(0x95, 80, 50, 1, 1)); // subnet B → cached
+        rt.add_contact(contact_at(0x94, 80, 1, 1, 4)); // subnet A (full) → cached
+
+        // Evicting a distinct-subnet live contact must promote the eligible
+        // entry (0x95), skipping the subnet-saturated newest (0x94).
+        assert!(rt.evict_and_replace(&make_id(0x83)));
+        assert!(rt.get_contact(&make_id(0x95)).is_some());
+        assert!(rt.get_contact(&make_id(0x94)).is_none());
+        assert_eq!(rt.total_contacts(), K_BUCKET_SIZE);
     }
 
     #[test]
