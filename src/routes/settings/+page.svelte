@@ -14,6 +14,7 @@
   import type { AppSettings, SpamStats, DownloadHistoryStats } from '$lib/types';
   import { onMount, untrack } from 'svelte';
   import { theme, applyTheme, type Theme } from '$lib/stores/theme';
+  import { emberDevToolsEnabled } from '$lib/stores/devTools';
   import {
     locales,
     getLocale,
@@ -300,6 +301,9 @@
     try {
       const result = await updateSettings(settings);
       originalSettings = snapshot;
+      // Reflect the dev-console preference immediately so the sidebar link
+      // appears/disappears without waiting for a reload.
+      emberDevToolsEnabled.set(!!settings.ember_dev_tools_enabled);
       const isWarn = result.toLowerCase().includes('restart');
       showSaveMsg(result, isWarn, isWarn ? 8000 : 3000);
 
@@ -1209,6 +1213,14 @@
               <span class="hint">{m.settings_ember_native_hint()} <a href="/ember" onclick={(e) => { e.preventDefault(); goto('/ember'); }}>{m.settings_ember_open_page()}</a></span>
             </div>
             <ToggleSwitch bind:checked={settings.ember_native_enabled} ariaLabel={m.settings_ember_native_label()} />
+          </div>
+
+          <div class="field toggle-row">
+            <div class="toggle-info">
+              <span class="toggle-title">{m.settings_ember_devtools_label()} <span class="badge-experimental">{m.settings_advanced_badge()}</span></span>
+              <span class="hint">{m.settings_ember_devtools_hint()}</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.ember_dev_tools_enabled} ariaLabel={m.settings_ember_devtools_label()} />
           </div>
 
           <div class="field toggle-row">

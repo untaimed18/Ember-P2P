@@ -72,7 +72,7 @@ This document captures two things:
 | Capability | Source | Status |
 | --- | --- | --- |
 | **`EmberDiagnostics`** — counters for EPX events, broker outcomes, native-transport sessions, ping/pong success, mesh-peer cache size, local Noise pubkey, DHT node ID / Ed25519 key / contact count / DHT ping-pong / find-node counters, the active-search gauge, the slice-5 store gauges/counters (stored keys & records, stores received, find-values received, active publishes), and the slice-6 maintenance counters (bucket refreshes, liveness pings sent, contacts evicted, records republished). Surfaced via `get_ember_diagnostics`. | [`src-tauri/src/types.rs`](../src-tauri/src/types.rs), [`src-tauri/src/commands/peers.rs`](../src-tauri/src/commands/peers.rs) | Live |
-| **Dev panel** at `/dev/ember` — live diagnostics, copy-pubkey button, control + DHT ping forms, single-hop `FIND_NODE` form and iterative multi-hop lookup form (both with returned-contacts view), `STORE` (publish keyword record) and `FIND_VALUE` (find value) forms, a **Run maintenance** button (force a slice-6 cycle), DHT routing-table view, manual "seed contact" form, port-mismatch warning. | [`src/routes/dev/ember/+page.svelte`](../src/routes/dev/ember/+page.svelte) | Live |
+| **Dev panel** at `/dev/ember` — live diagnostics, copy-pubkey button, control + DHT ping forms, single-hop `FIND_NODE` form and iterative multi-hop lookup form (both with returned-contacts view), `STORE` (publish keyword record) and `FIND_VALUE` (find value) forms, a **Run maintenance** button (force a slice-6 cycle), DHT routing-table view, manual "seed contact" form, port-mismatch warning. **Opt-in**: the sidebar link and the `/ember` "Advanced" button appear only when the user enables **Settings → Network → Ember developer console** (`AppSettings::ember_dev_tools_enabled`, off by default), surfaced live via the `emberDevToolsEnabled` store; the route itself always works by direct URL. | [`src/routes/dev/ember/+page.svelte`](../src/routes/dev/ember/+page.svelte) | Live |
 | **Local multi-node harness** — `EMBER_DATA_DIR` override + single-instance gating + harness PowerShell script. | [`scripts/harness.ps1`](../scripts/harness.ps1), [`src-tauri/src/storage/paths.rs`](../src-tauri/src/storage/paths.rs) | Live |
 | **`harness` cargo feature** — enables Tauri devtools in release builds for harness use only. | [`src-tauri/Cargo.toml`](../src-tauri/Cargo.toml) | Live |
 
@@ -171,9 +171,9 @@ Ember network.
 
 | # | Slice | Why |
 | --- | --- | --- |
-| 11 | **Hardcoded seed peers** — a small list of known-good Ember bootstrap addresses + pubkeys baked into the build (similar to eMule's hardcoded server list). Updateable via a signed manifest. | New installs with zero prior peers need to start somewhere. |
+| 11 | **Hardcoded seed peers** — a small list of known-good Ember bootstrap addresses + pubkeys baked into the build (similar to eMule's hardcoded server list). Updateable via a signed manifest. **Done**: [`dht/seeds.rs`](../src-tauri/src/network/ember/dht/seeds.rs) embeds [`seeds.txt`](../src-tauri/src/network/ember/dht/seeds.txt) (one `host:port ed25519 noise` peer per line) and feeds the cold-start path before the rendezvous fetch; the list ships empty until seed nodes are deployed. (Signed-manifest auto-update is the remaining follow-on.) | New installs with zero prior peers need to start somewhere. |
 | 12 | **Optional DNS seed list** — `_ember._udp.<domain>` SRV records pointing at a rotating set of bootstrap nodes. Falls back to hardcoded seeds. | Lets the seed list be updated without client releases. |
-| 13 | **KAD-bridge bootstrap** — for as long as KAD still exists, use the existing `EMBER_NOISE_PUB_TAG` distribution to learn Ember peers from the eMule network. Already partially in place. | Free, smooth migration during the transition. |
+| 13 | **KAD-bridge bootstrap** — for as long as KAD still exists, use the existing `EMBER_NOISE_PUB_TAG` distribution to learn Ember peers from the eMule network. **Done**: while the DHT table holds fewer than a k-bucket's worth of contacts, the maintenance loop DHT-pings peers from the KAD-fed `ember_noise_keys` cache (`kad_bridge_candidates` in [`network/mod.rs`](../src-tauri/src/network/mod.rs)); the signed `PONG` carries the Ed25519 key that turns each into a verified contact. Self-disables once bootstrapped; counted by `ember_dht_kad_bridge_pings`. | Free, smooth migration during the transition. |
 | 14 | **Spam / flood protection** — per-IP rate limits on DHT messages, malformed-message rejection, signature replay protection. | The DHT will be hostile-Internet-facing. |
 | 15 | **DHT-level firewall awareness** — detect when our own UDP is unreachable; surface to the user; consider a "buddy"-equivalent (could reuse the existing rendezvous server). | Firewalled peers can't host DHT records otherwise. |
 
@@ -206,10 +206,12 @@ Ember network.
 - **Bootstrap is the long-term sustainability question.** The protocol
   can be perfect, but if no one is running an Ember bootstrap node,
   new installs have nothing to dial. The **rendezvous `/bootstrap` pool**
-  (slice 7+) now covers cold start today — every DHT-on client we already
+  (slice 7+) covers cold start today — every DHT-on client we already
   run for friend presence doubles as a seed — and the KAD-bridge
-  bootstrap (slice 13) is the transition crutch; hardcoded + DNS seeds
-  (slices 11–12) remain the permanent, rendezvous-independent answer.
+  bootstrap (slice 13) is the transition crutch. **Hardcoded seeds
+  (slice 11) are now wired** as the permanent, rendezvous-independent
+  floor (the baked-in `seeds.txt` ships empty until seed nodes exist);
+  DNS seeds (slice 12) will let that list rotate without a client release.
 - **Migration story matters.** Today every Ember client is also an
   eMule KAD client. The transition to a self-sufficient network does
   not have to be all-or-nothing — Ember can run on both networks

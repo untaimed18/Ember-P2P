@@ -331,6 +331,7 @@
         buckets_refreshed: 0,
         liveness_pings_sent: 0,
         records_republished: 0,
+        kad_bridge_pings_sent: 0,
         error: translateError(err),
       };
     } finally {
@@ -367,17 +368,18 @@
 
 <svelte:head><title>Ember Dev — Ember</title></svelte:head>
 
-<div class="page">
-  <header class="page-header">
-    <div>
-      <h1>Ember Dev</h1>
-      <p class="subtitle">
-        Live diagnostics for the Ember-native Noise transport. Use this
-        page to verify the harness flow without devtools.
-      </p>
-    </div>
-  </header>
+<header class="page-header">
+  <div>
+    <h1>Ember Dev</h1>
+    <p class="subtitle">
+      Live diagnostics for the Ember-native Noise transport. Use this
+      page to verify the harness flow without devtools.
+    </p>
+  </div>
+</header>
 
+<div class="page-content">
+  <div class="dev-inner">
   {#if diag && !diag.ember_native_enabled}
     <div class="banner banner-warn" role="status">
       <strong>Ember-native transport is disabled.</strong>
@@ -557,6 +559,10 @@
           <div class="counter-label">Records republished</div>
           <div class="counter-value">{diag.ember_dht_records_republished}</div>
         </div>
+        <div class="counter">
+          <div class="counter-label">KAD-bridge pings</div>
+          <div class="counter-value">{diag.ember_dht_kad_bridge_pings}</div>
+        </div>
       </div>
 
       <div class="maint-row">
@@ -575,7 +581,8 @@
             <span class="rtt">
               {maintenanceResult.buckets_refreshed} bucket{maintenanceResult.buckets_refreshed === 1 ? '' : 's'} refreshed,
               {maintenanceResult.liveness_pings_sent} ping{maintenanceResult.liveness_pings_sent === 1 ? '' : 's'} sent,
-              {maintenanceResult.records_republished} record{maintenanceResult.records_republished === 1 ? '' : 's'} republished
+              {maintenanceResult.records_republished} record{maintenanceResult.records_republished === 1 ? '' : 's'} republished,
+              {maintenanceResult.kad_bridge_pings_sent} KAD-bridge ping{maintenanceResult.kad_bridge_pings_sent === 1 ? '' : 's'}
             </span>
           </div>
         {:else}
@@ -616,6 +623,7 @@
     {/if}
   </section>
 
+  <div class="forms-grid">
   <section class="card">
     <h2>Seed a DHT contact</h2>
     <p class="hint">
@@ -1054,17 +1062,41 @@
       </div>
     {/if}
   </section>
+  </div>
+  </div>
 </div>
 
 <style>
-  .page {
-    padding: 24px;
-    max-width: 980px;
+  /*
+   * The page root is now the global fixed `.page-header` + scrollable
+   * `.page-content` pair (matching every other route). `.dev-inner`
+   * is the centered, padded column inside the scroll area — without a
+   * scroll container the lower cards were clipped by the layout's
+   * `overflow: hidden` page wrapper and could not be reached.
+   */
+  .dev-inner {
+    max-width: 1040px;
     margin: 0 auto;
+    padding: 20px 20px 48px;
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    gap: 16px;
   }
+  /*
+   * The read-out cards (identity, counters, DHT + routing table) stay
+   * full width; the action forms flow into a responsive grid so the
+   * page is a compact dashboard instead of one very tall column.
+   */
+  .forms-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+    gap: 16px;
+    align-items: start;
+  }
+  /* Let grid cards shrink below their content width so wide result
+     tables scroll inside the card (`.contacts` is overflow-x: auto)
+     rather than forcing the whole track wider. */
+  .forms-grid > .card { min-width: 0; }
   .page-header h1 {
     margin: 0;
     font-size: 22px;

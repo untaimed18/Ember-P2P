@@ -245,6 +245,56 @@ The trust anchor throughout is the DHT's own PING-time verification, so the
 pool stays unsigned and best-effort; a signed, load-weighted pool can come
 later without changing the client.
 
+### Hardcoded seed peers (slice 11)
+
+A second, rendezvous-independent cold-start source: a small list of
+known-good bootstrap peers baked into the build, the Ember equivalent of
+eMule's hardcoded server list.
+
+- **Where it lives.** [`dht/seeds.txt`](../src-tauri/src/network/ember/dht/seeds.txt)
+  — one peer per line, `host:port ed25519_pub_hex noise_pub_hex`,
+  `#` comments and blank lines ignored — is embedded at compile time via
+  `include_str!` in [`dht/seeds.rs`](../src-tauri/src/network/ember/dht/seeds.rs).
+  Each line is parsed into a `BootstrapNode` and validated through the same
+  `to_contact` path as a rendezvous node (so the node ID is derived from
+  the Ed25519 key and re-verified on the first PING — a baked-in seed is no
+  more trusted than any other contact).
+- **How it's wired.** `maybe_spawn_ember_cold_bootstrap` now seeds the
+  hardcoded peers first (no I/O, available even when the rendezvous URL is
+  empty or down), then runs the `/bootstrap` fetch; both flow through the
+  same `ember_boot_rx` seed-and-self-lookup arm. The helper no longer
+  requires a rendezvous URL — hardcoded seeds alone are enough to start.
+- **Ships empty.** The list is intentionally empty until long-lived Ember
+  seed nodes are deployed; populating it is a one-line *data* change to
+  `seeds.txt`. An `embedded_seeds_are_all_valid` test fails the build if a
+  baked-in line is malformed, so a typo'd seed can never ship.
+
+### KAD-bridge bootstrap (slice 13)
+
+A third cold-start source that costs nothing while the eMule KAD network is
+still up: every Ember client is also a KAD client, and KAD source publishes
+already carry the publisher's Noise key (`EMBER_NOISE_PUB_TAG`), cached in
+`ember_noise_keys` (`(ip, port) → noise_pub`). That cache previously only
+fed `ember_ping_peer`; slice 13 folds it into the DHT.
+
+- **Ping, don't insert.** A KAD entry has the peer's *Noise* key but not its
+  *Ed25519* key — and the DHT node ID is `BLAKE3(ed25519_pub)`. So we can't
+  synthesise a contact; instead the maintenance loop sends a DHT `PING` to
+  `(addr, noise_pub)` and the peer's signed `PONG` carries the Ed25519 key,
+  which the normal inbound path verifies and learns as a contact.
+- **Only while sparse.** The bridge runs only while the table holds fewer
+  than `EMBER_KAD_BRIDGE_UNTIL_CONTACTS` (one k-bucket) contacts, capped at
+  `EMBER_KAD_BRIDGE_MAX_PINGS` per cycle. `kad_bridge_candidates` returns
+  freshest-first peers not yet in `ember_kad_bridge_attempted`, so the bridge
+  walks the whole cache (one ping per peer) and self-disables once the DHT is
+  bootstrapped — steady-state KAD traffic never sprays DHT pings.
+- **Empty-table tick.** The periodic maintenance gate now also fires when the
+  table is empty but `ember_noise_keys` is non-empty, so the bridge can seed
+  a brand-new table (the other maintenance steps no-op with zero contacts).
+- **Observability.** `ember_dht_kad_bridge_pings` (diagnostics) and the
+  `kad_bridge_pings_sent` field on the maintenance result / dev-panel "Run
+  maintenance" output count the bridge pings.
+
 ### Transport plumbing
 
 - `DispatchOutcome` now carries `app_payload` (a decrypted, non-control
@@ -409,7 +459,16 @@ and `ember_native_enabled: true` in each `config.json`:
 
 ## Follow-on order
 
-1. A **signed, load-weighted** rendezvous `/bootstrap` pool (the current
+1. ~~Hardcoded seed peers (slice 11).~~ **Done** — see "Hardcoded seed
+   peers" above. Baked-in `seeds.txt`, wired into the cold-start path.
+2. ~~KAD-bridge bootstrap (slice 13).~~ **Done** — see "KAD-bridge
+   bootstrap" above. KAD-learned Ember peers are DHT-pinged into the table
+   while it's sparse.
+3. **DNS seed list** (slice 12, deferred) — `_ember._udp.<domain>` SRV/TXT
+   records so the seed set can rotate without a client release; falls back
+   to the hardcoded list. Deferred until a seed domain actually exists
+   (needs a DNS-resolver dependency, inert until then).
+4. A **signed, load-weighted** rendezvous `/bootstrap` pool (the current
    pool is unsigned + best-effort, leaning on the DHT's PING-time
    verification as the trust anchor).
-2. Multi-keyword search + real shared-file publishing (Phase 2).
+5. Multi-keyword search + real shared-file publishing (Phase 2).

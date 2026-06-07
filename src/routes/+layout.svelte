@@ -18,6 +18,7 @@
   import * as m from '$lib/paraglide/messages';
   import { getSettings, hideToTray, quitApp, setCloseBehavior } from '$lib/api/settings';
   import { toastWarning } from '$lib/stores/toast';
+  import { emberDevToolsEnabled } from '$lib/stores/devTools';
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
@@ -195,6 +196,9 @@
           if (!mounted) return;
 
           if (settings) {
+            // Seed the dev-console visibility store so the sidebar link
+            // reflects the saved preference from first paint.
+            emberDevToolsEnabled.set(!!settings.ember_dev_tools_enabled);
             if (!settings.setup_complete) {
               wizardSettings = settings;
               showWizard = true;

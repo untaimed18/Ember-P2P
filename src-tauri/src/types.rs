@@ -448,6 +448,12 @@ pub struct EmberDiagnostics {
     /// the maintenance loop this session.
     #[serde(default)]
     pub ember_dht_records_republished: u32,
+    /// KAD-bridge bootstrap `PING`s sent this session (slice 13): while the
+    /// DHT table is still sparse, the maintenance loop DHT-pings Ember peers
+    /// learned from KAD source publishes so their signed `PONG` folds them
+    /// into the routing table. Self-disables once the table is bootstrapped.
+    #[serde(default)]
+    pub ember_dht_kad_bridge_pings: u32,
 }
 
 /// Serializable KAD contact info for the frontend (mirrors eMule KadContactListCtrl columns)
@@ -648,6 +654,16 @@ pub struct AppSettings {
     /// validation, not a replacement for any user-facing feature.
     #[serde(default)]
     pub ember_native_enabled: bool,
+    /// Reveal the Ember developer console (`/dev/ember`) in the UI: the
+    /// sidebar link and the "Advanced" button on the Ember Network page.
+    /// Off by default — the console exposes raw DHT harness forms (manual
+    /// `PING`/`FIND_NODE`/`STORE`/`FIND_VALUE`, seed-contact, run-maintenance)
+    /// and a routing-table view that ordinary users don't need. A curious
+    /// user (or us, for multi-node testing) can opt in from Settings →
+    /// Network without a special build. The `/dev/ember` route itself
+    /// always exists; this only governs whether the UI links to it.
+    #[serde(default)]
+    pub ember_dev_tools_enabled: bool,
     /// What to do when the user closes the main window via the title-bar X.
     ///
     /// - `"ask"` (default): emit a dialog asking the user to choose.
@@ -960,6 +976,7 @@ impl Default for AppSettings {
             max_friends: default_max_friends(),
             rendezvous_url: default_rendezvous_url(),
             ember_native_enabled: false,
+            ember_dev_tools_enabled: false,
             close_to_tray_behavior: default_close_to_tray_behavior(),
         }
     }

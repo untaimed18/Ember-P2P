@@ -284,6 +284,34 @@ fn lookup_ember_noise_key_at(
     }
 }
 
+/// Pick KAD-learned Ember peers to fold into the DHT via a bridge `PING`
+/// (slice 13). Returns up to `max` `(ip, port, noise_pub)` entries from the
+/// `ember_noise_keys` cache that we haven't bridge-pinged yet (`attempted`),
+/// freshest first so the most recently KAD-advertised peers are tried
+/// before stale cache entries. The caller sends each a DHT `PING`; the
+/// signed `PONG` carries the peer's Ed25519 key, which is what actually
+/// turns it into a verified routing-table contact.
+fn kad_bridge_candidates(
+    noise_keys: &HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
+    attempted: &HashSet<(Ipv4Addr, u16)>,
+    max: usize,
+) -> Vec<(Ipv4Addr, u16, [u8; 32])> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let mut candidates: Vec<(Ipv4Addr, u16, [u8; 32], std::time::Instant)> = noise_keys
+        .iter()
+        .filter(|(key, _)| !attempted.contains(*key))
+        .map(|(key, (noise_pub, seen))| (key.0, key.1, *noise_pub, *seen))
+        .collect();
+    candidates.sort_by(|a, b| b.3.cmp(&a.3));
+    candidates
+        .into_iter()
+        .take(max)
+        .map(|(ip, port, noise_pub, _)| (ip, port, noise_pub))
+        .collect()
+}
+
 /// Drop expired entries from the noise-key cache. Called next to
 /// `prune_stale_ember_peers` so the two Ember-mesh caches stay in
 /// step on the same TTL.
@@ -1281,6 +1309,40 @@ mod tests {
     }
 
     #[test]
+    fn kad_bridge_candidates_skips_attempted_and_prefers_freshest() {
+        let mut map: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)> = HashMap::new();
+        // Insert three peers oldest-first so their timestamps strictly
+        // increase; peer C is the freshest.
+        let a = (Ipv4Addr::new(10, 0, 0, 1), 4772u16);
+        let b = (Ipv4Addr::new(10, 0, 0, 2), 4772u16);
+        let c = (Ipv4Addr::new(10, 0, 0, 3), 4772u16);
+        record_ember_noise_key(&mut map, a.0, a.1, [0xAA; 32]);
+        std::thread::sleep(std::time::Duration::from_micros(50));
+        record_ember_noise_key(&mut map, b.0, b.1, [0xBB; 32]);
+        std::thread::sleep(std::time::Duration::from_micros(50));
+        record_ember_noise_key(&mut map, c.0, c.1, [0xCC; 32]);
+
+        // Nothing attempted yet → freshest-first, capped at `max`.
+        let empty: HashSet<(Ipv4Addr, u16)> = HashSet::new();
+        let picked = kad_bridge_candidates(&map, &empty, 2);
+        assert_eq!(picked.len(), 2);
+        assert_eq!((picked[0].0, picked[0].1), c); // freshest first
+        assert_eq!(picked[0].2, [0xCC; 32]);
+        assert_eq!((picked[1].0, picked[1].1), b);
+
+        // Mark C attempted → it drops out, leaving B then A.
+        let mut attempted = HashSet::new();
+        attempted.insert(c);
+        let picked = kad_bridge_candidates(&map, &attempted, 8);
+        assert_eq!(picked.len(), 2);
+        assert_eq!((picked[0].0, picked[0].1), b);
+        assert_eq!((picked[1].0, picked[1].1), a);
+
+        // max == 0 → no work.
+        assert!(kad_bridge_candidates(&map, &empty, 0).is_empty());
+    }
+
+    #[test]
     fn record_ember_noise_key_evicts_oldest_at_capacity() {
         let mut map = HashMap::new();
         // Fill to the cap with sequentially-aged entries so the first
@@ -2059,6 +2121,9 @@ pub struct EmberMaintenanceResult {
     pub liveness_pings_sent: usize,
     /// Locally-stored records re-published to the closest nodes.
     pub records_republished: usize,
+    /// KAD-bridge bootstrap `PING`s sent to KAD-learned Ember peers (slice
+    /// 13). Non-zero only while the table is still sparse.
+    pub kad_bridge_pings_sent: usize,
 }
 
 /// Returned by the network task when an iterative `FIND_VALUE` lookup has
@@ -2534,6 +2599,12 @@ struct NetworkState {
     /// `KNOWN_EMBER_PEER_TTL` so a long session can't unboundedly
     /// retain stale keys for peers that have rotated.
     ember_noise_keys: HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
+    /// KAD-bridge bootstrap bookkeeping (slice 13): `(ip, port)` of every
+    /// KAD-learned Ember peer the maintenance loop has already DHT-pinged
+    /// this session, so the bridge moves through the `ember_noise_keys`
+    /// cache (one ping per peer) instead of re-pinging the same freshest
+    /// few every cycle. Only consulted while the table is still sparse.
+    ember_kad_bridge_attempted: HashSet<(Ipv4Addr, u16)>,
     /// Diagnostic counters surfaced via `get_ember_diagnostics`. Increment
     /// from inside `network/mod.rs` (EPX events, peer-count snapshots) or
     /// from `ConnectionBroker::stats()` for broker-owned counters.
@@ -2742,6 +2813,17 @@ const EMBER_RECORD_REPUBLISH_SECS: u64 = 3600;
 const EMBER_MAINT_MAX_REFRESH: usize = 3;
 const EMBER_MAINT_MAX_PINGS: usize = 8;
 const EMBER_MAINT_MAX_REPUBLISH: usize = 5;
+
+/// KAD-bridge bootstrap (slice 13). While the Ember DHT routing table holds
+/// fewer than this many contacts, the maintenance loop folds in Ember peers
+/// learned from the live KAD network by DHT-pinging them; once the table
+/// reaches this size it's self-sustaining and the bridge goes quiet. One
+/// k-bucket's worth is plenty to seed iterative lookups + ongoing refresh.
+const EMBER_KAD_BRIDGE_UNTIL_CONTACTS: usize = ember::dht::K_BUCKET_SIZE;
+
+/// Max KAD-bridge `PING`s per maintenance cycle, so even a large KAD-learned
+/// peer cache can't burst the DHT with handshakes in one tick.
+const EMBER_KAD_BRIDGE_MAX_PINGS: usize = 8;
 
 /// Hard cap on `aich_hash_sets` (full per-file recovery hash sets
 /// loaded from / persisted to `known2_64.met`). Each set is on the
@@ -3855,15 +3937,37 @@ fn maybe_spawn_ember_cold_bootstrap(
     boot_tx: &mpsc::Sender<Vec<ember::dht::EmberContact>>,
     trigger: &'static str,
 ) {
-    if !(settings.ember_native_enabled
-        && state.ember_dht.contact_count() == 0
-        && !settings.rendezvous_url.trim().is_empty())
-    {
+    // Only warranted when the transport is on and the table is empty.
+    if !(settings.ember_native_enabled && state.ember_dht.contact_count() == 0) {
         return;
     }
-    let rv_url = settings.rendezvous_url.clone();
+
+    // Two cold-start sources, tried in order of cost:
+    //   1. Hardcoded seed peers (slice 11) — baked into the build, no I/O,
+    //      and available even when the rendezvous URL is empty/unreachable.
+    //   2. The rendezvous `/bootstrap` pool (slice 7+) — an HTTPS round trip.
+    // Both feed the same `boot_tx` channel; the `ember_boot_rx` arm seeds
+    // whatever arrives and self-looks-up. Seeds go first so the node has
+    // something to dial immediately while the rendezvous fetch is in flight.
+    let seeds = ember::dht::seeds::hardcoded_contacts();
+    let rv_url = settings.rendezvous_url.trim().to_string();
+    if seeds.is_empty() && rv_url.is_empty() {
+        return;
+    }
+
     let boot_tx = boot_tx.clone();
     tokio::spawn(async move {
+        if !seeds.is_empty() {
+            info!(
+                "Ember DHT cold bootstrap ({trigger}): seeding {} hardcoded peer(s)",
+                seeds.len()
+            );
+            let _ = boot_tx.send(seeds).await;
+        }
+
+        if rv_url.is_empty() {
+            return;
+        }
         match ember::dht::bootstrap::fetch_bootstrap_nodes(&rv_url).await {
             Ok(nodes) => {
                 let contacts: Vec<ember::dht::EmberContact> =
@@ -4385,6 +4489,7 @@ pub async fn start_network(
         ember_payload_dirty: true,
         known_ember_peers: HashMap::new(),
         ember_noise_keys: HashMap::new(),
+        ember_kad_bridge_attempted: HashSet::new(),
         ember_diagnostics: EmberDiagnostics::default(),
         antileech: shared_antileech.clone(),
         aich_root_map: HashMap::new(),
@@ -14726,7 +14831,14 @@ pub async fn start_network(
                 // is off or the table is empty (nothing to refresh, ping,
                 // or republish). `force = false`: honour the staleness
                 // gates so steady-state churn stays low.
-                if settings.ember_native_enabled && state.ember_dht.contact_count() > 0 {
+                // Run when we have contacts to maintain, OR when the table is
+                // empty but we've learned Ember peers from KAD that the
+                // KAD-bridge (slice 13) can fold in to bootstrap it. Skipping
+                // an empty table with no KAD peers keeps idle nodes quiet.
+                if settings.ember_native_enabled
+                    && (state.ember_dht.contact_count() > 0
+                        || !state.ember_noise_keys.is_empty())
+                {
                     let _ = run_ember_maintenance(&udp_socket, &mut state, false).await;
                 }
             }
@@ -16312,6 +16424,66 @@ async fn run_ember_maintenance(
     force: bool,
 ) -> EmberMaintenanceResult {
     let mut result = EmberMaintenanceResult::default();
+
+    // 0) KAD-bridge bootstrap (slice 13). While the table is still sparse,
+    //    fold in Ember peers learned from the live KAD network. KAD source
+    //    publishes carry the peer's Noise key but not its Ed25519 key /
+    //    node ID, so we can't build a contact directly — instead we DHT-PING
+    //    (addr, noise_pub) and let the signed PONG teach us the verified
+    //    contact through the normal inbound path. Self-disables once the
+    //    table is bootstrapped, so steady-state KAD traffic doesn't spray
+    //    DHT pings. `force` (the dev-panel button) bypasses the size gate so
+    //    the bridge can be exercised on demand.
+    if force || state.ember_dht.contact_count() < EMBER_KAD_BRIDGE_UNTIL_CONTACTS {
+        let candidates = kad_bridge_candidates(
+            &state.ember_noise_keys,
+            &state.ember_kad_bridge_attempted,
+            EMBER_KAD_BRIDGE_MAX_PINGS,
+        );
+        for (ip, port, noise_pub) in candidates {
+            let addr = SocketAddr::new(IpAddr::V4(ip), port);
+            let (_wire_req_id, frame) = state.ember_dht.build_ping();
+            let sent = match state.ember_transport.prepare_outgoing(
+                addr,
+                Some(&noise_pub),
+                &frame,
+            ) {
+                ember::transport::OutgoingResult::Ready { packet }
+                | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                    match socket.send_to(&packet, addr).await {
+                        Ok(_) => true,
+                        Err(e) => {
+                            debug!("Ember KAD-bridge: ping to {addr} failed: {e}");
+                            false
+                        }
+                    }
+                }
+                ember::transport::OutgoingResult::Queued => true,
+                ember::transport::OutgoingResult::Error(e) => {
+                    debug!("Ember KAD-bridge: transport error pinging {addr}: {e}");
+                    false
+                }
+            };
+            // Mark attempted regardless of send outcome: a peer we couldn't
+            // reach now is unlikely to become reachable within the same
+            // bootstrap window, and this guarantees the bridge advances
+            // through the cache instead of retrying the same few each tick.
+            state.ember_kad_bridge_attempted.insert((ip, port));
+            if sent {
+                result.kad_bridge_pings_sent += 1;
+                state.ember_diagnostics.ember_dht_kad_bridge_pings = state
+                    .ember_diagnostics
+                    .ember_dht_kad_bridge_pings
+                    .saturating_add(1);
+            }
+        }
+        if result.kad_bridge_pings_sent > 0 {
+            debug!(
+                "Ember KAD-bridge: pinged {} KAD-learned peer(s) to seed the DHT",
+                result.kad_bridge_pings_sent
+            );
+        }
+    }
 
     // 1) Bucket refresh — a random-target FIND_NODE per stale bucket keeps
     //    the table broad and current. The launched searches have no
