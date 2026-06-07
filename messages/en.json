@@ -1335,6 +1335,7 @@
   "transfers_src_suffix": "src",
   "transfers_epx_count": "({count} EPX)",
   "transfers_preview": "Preview",
+  "transfers_preview_not_ready": "Preview available once the first part is downloaded and verified (media files only).",
   "transfers_selection_hint": "Click to select · Shift+click for range · Ctrl/Cmd+click to toggle · Double-click for sources",
   "transfers_status_label_aria": "Status: {label}. {tooltip}",
 
@@ -1485,6 +1486,8 @@
   "settings_add_paused_hint": "New downloads start paused until manually resumed.",
   "settings_auto_remove": "Auto-Remove Completed",
   "settings_auto_remove_hint": "Automatically remove finished downloads from the transfer list.",
+  "settings_preview_priority_all": "Preview Priority for All Downloads",
+  "settings_preview_priority_all_hint": "Download the first and last part of every file first so media becomes previewable sooner. Slightly slower overall; off uses rarest-first.",
   "settings_skip_compress_video": "Skip Compress Video",
   "settings_skip_compress_video_hint": "Don't compress AVI/MKV/MP4 during uploads (already compressed).",
   "settings_download_history": "Download History",

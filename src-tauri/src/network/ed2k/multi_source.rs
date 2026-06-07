@@ -1024,6 +1024,14 @@ impl MultiSourceDownload {
             file_name: self.file_name.clone(),
         }).await;
 
+        // Publish initial preview-readiness so the UI's Preview button is
+        // correct on resume (when the first part is already verified on disk)
+        // before any new block arrives. The progress aggregator keeps it fresh
+        // as parts verify during the download.
+        self.control.set_preview_ready(
+            tracker.read().await.is_preview_ready(&self.file_name, self.file_size),
+        );
+
         // Shared rarest-first chunk selector for dynamic part assignment
         let part_count = {
             let t = tracker.read().await;
@@ -1197,6 +1205,8 @@ impl MultiSourceDownload {
         let agg_queued = queued_count.clone();
         let agg_total = total_sources.clone();
         let agg_tracker = tracker.clone();
+        let agg_control = self.control.clone();
+        let agg_file_name = self.file_name.clone();
 
         // Coalesce Progress / SourcesUpdate emissions to a fixed cadence
         // (~200 ms). The previous design fired one `transfer-progress`
@@ -1237,6 +1247,12 @@ impl MultiSourceDownload {
                         if pending_progress || sources_changed {
                             let capped = {
                                 let t = agg_tracker.read().await;
+                                // Refresh preview-readiness while we hold the
+                                // lock: cheap, and this is the cadence at which
+                                // the first part finishes + verifies mid-download.
+                                agg_control.set_preview_ready(
+                                    t.is_preview_ready(&agg_file_name, file_size),
+                                );
                                 t.completed_bytes().min(file_size)
                             };
                             // Skip the Progress emit when nothing actually
@@ -1277,6 +1293,9 @@ impl MultiSourceDownload {
             // last source closes.
             let capped = {
                 let t = agg_tracker.read().await;
+                agg_control.set_preview_ready(
+                    t.is_preview_ready(&agg_file_name, file_size),
+                );
                 t.completed_bytes().min(file_size)
             };
             if capped != last_emitted_bytes {
