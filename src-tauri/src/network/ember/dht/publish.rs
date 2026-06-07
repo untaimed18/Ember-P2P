@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::time::Instant;
 
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -23,6 +24,35 @@ const MIN_STORE_NODES: usize = 5;
 pub const RECORD_TYPE_KEYWORD: u8 = 0x01;
 pub const RECORD_TYPE_SOURCE: u8 = 0x02;
 
+/// Wire size of the trailing contact block a source record appends after
+/// its file name: ip(4) + tcp_port(2) + udp_port(2) + flags(1) + noise_pub(32).
+const SOURCE_CONTACT_WIRE_LEN: usize = 4 + 2 + 2 + 1 + 32;
+
+/// DHT key under which a file's source records live: `BLAKE3(file_hash)[..16]`.
+///
+/// Publish (`SignedRecord::source`) and find (the download source-lookup
+/// driver) MUST agree on this derivation, so it lives in one place.
+pub fn source_key(file_hash: &[u8; 16]) -> [u8; 16] {
+    let hash = blake3::hash(file_hash);
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&hash.as_bytes()[..16]);
+    key
+}
+
+/// The publisher's self-reported reachable contact, carried inside a
+/// signed `RECORD_TYPE_SOURCE` record (and therefore covered by the
+/// publisher's signature). A downloader uses `ip` + `tcp_port` to dial the
+/// source over the existing eD2K client-to-client path; `noise_pub` is
+/// stashed for future native (Noise) dialing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceContact {
+    pub ip: Ipv4Addr,
+    pub tcp_port: u16,
+    pub udp_port: u16,
+    pub flags: u8,
+    pub noise_pub: [u8; 32],
+}
+
 /// A signed record ready for DHT storage.
 #[derive(Debug, Clone)]
 pub struct SignedRecord {
@@ -38,6 +68,9 @@ pub struct SignedRecord {
     pub data: Vec<u8>,
     /// Ed25519 signature over `data`.
     pub signature: [u8; 64],
+    /// Present only for `RECORD_TYPE_SOURCE`: the publisher's reachable
+    /// contact, appended to `data` after the file name and thus signed.
+    pub source_contact: Option<SourceContact>,
 }
 
 impl SignedRecord {
@@ -58,31 +91,30 @@ impl SignedRecord {
             ember_file_hash,
             file_size,
             file_name,
+            None,
             signing_key,
         )
     }
 
-    /// Create a source record: announces that we are a source for a file.
+    /// Create a source record: announces that `contact` is a source for the
+    /// file identified by `file_hash`. The contact is part of the signed
+    /// payload, so a downloader can dial it after verifying the signature.
     pub fn source(
         file_hash: [u8; 16],
         ember_file_hash: [u8; 32],
         file_size: u64,
         file_name: &str,
+        contact: SourceContact,
         signing_key: &SigningKey,
     ) -> Self {
-        let file_key = {
-            let hash = blake3::hash(&file_hash);
-            let mut key = [0u8; 16];
-            key.copy_from_slice(&hash.as_bytes()[..16]);
-            key
-        };
         Self::build(
             RECORD_TYPE_SOURCE,
-            file_key,
+            source_key(&file_hash),
             file_hash,
             ember_file_hash,
             file_size,
             file_name,
+            Some(contact),
             signing_key,
         )
     }
@@ -94,13 +126,16 @@ impl SignedRecord {
         ember_file_hash: [u8; 32],
         file_size: u64,
         file_name: &str,
+        source_contact: Option<SourceContact>,
         signing_key: &SigningKey,
     ) -> Self {
         let publisher_key = signing_key.verifying_key().to_bytes();
         let timestamp = chrono::Utc::now().timestamp();
         let name_bytes = file_name.as_bytes();
+        let name_len = name_bytes.len().min(u16::MAX as usize);
 
-        let mut data = Vec::with_capacity(1 + 16 + 16 + 32 + 8 + 32 + 8 + 2 + name_bytes.len());
+        let mut data =
+            Vec::with_capacity(1 + 16 + 16 + 32 + 8 + 32 + 8 + 2 + name_len + SOURCE_CONTACT_WIRE_LEN);
         data.push(record_type);
         data.extend_from_slice(&keyword_hash);
         data.extend_from_slice(&file_hash);
@@ -108,9 +143,19 @@ impl SignedRecord {
         data.write_u64::<LittleEndian>(file_size).unwrap();
         data.extend_from_slice(&publisher_key);
         data.write_i64::<LittleEndian>(timestamp).unwrap();
-        data.write_u16::<LittleEndian>(name_bytes.len().min(u16::MAX as usize) as u16)
-            .unwrap();
-        data.extend_from_slice(&name_bytes[..name_bytes.len().min(u16::MAX as usize)]);
+        data.write_u16::<LittleEndian>(name_len as u16).unwrap();
+        data.extend_from_slice(&name_bytes[..name_len]);
+
+        // Source records append a fixed-size contact block after the name; it
+        // is signed along with everything above so a relayed record can't have
+        // its address rewritten.
+        if let Some(sc) = source_contact {
+            data.extend_from_slice(&sc.ip.octets());
+            data.write_u16::<LittleEndian>(sc.tcp_port).unwrap();
+            data.write_u16::<LittleEndian>(sc.udp_port).unwrap();
+            data.push(sc.flags);
+            data.extend_from_slice(&sc.noise_pub);
+        }
 
         let signature = crypto::sign(signing_key, &data);
 
@@ -125,6 +170,7 @@ impl SignedRecord {
             timestamp,
             data,
             signature,
+            source_contact,
         }
     }
 
@@ -177,6 +223,31 @@ impl SignedRecord {
         }
         let file_name = String::from_utf8_lossy(&data[115..115 + name_len]).to_string();
 
+        // Source records carry a fixed-size trailing contact block. Reject a
+        // source record that doesn't carry it (truncated/forged) rather than
+        // silently treating it as contactless.
+        let source_contact = if record_type == RECORD_TYPE_SOURCE {
+            let off = 115 + name_len;
+            if data.len() < off + SOURCE_CONTACT_WIRE_LEN {
+                return None;
+            }
+            let ip = Ipv4Addr::new(data[off], data[off + 1], data[off + 2], data[off + 3]);
+            let tcp_port = u16::from_le_bytes([data[off + 4], data[off + 5]]);
+            let udp_port = u16::from_le_bytes([data[off + 6], data[off + 7]]);
+            let flags = data[off + 8];
+            let mut noise_pub = [0u8; 32];
+            noise_pub.copy_from_slice(&data[off + 9..off + 41]);
+            Some(SourceContact {
+                ip,
+                tcp_port,
+                udp_port,
+                flags,
+                noise_pub,
+            })
+        } else {
+            None
+        };
+
         // Verify signature
         let pk = crypto::verifying_key_from_bytes(&publisher_key)?;
         if !crypto::verify(&pk, data, &signature) {
@@ -194,6 +265,7 @@ impl SignedRecord {
             timestamp,
             data: data.to_vec(),
             signature,
+            source_contact,
         })
     }
 }
@@ -416,19 +488,86 @@ mod tests {
         assert!(parsed.verify());
     }
 
+    fn test_contact() -> SourceContact {
+        SourceContact {
+            ip: Ipv4Addr::new(88, 1, 2, 3),
+            tcp_port: 4662,
+            udp_port: 4672,
+            flags: 0x05,
+            noise_pub: [0x33; 32],
+        }
+    }
+
     #[test]
     fn signed_source_record_round_trip() {
         let sk = SigningKey::generate(&mut OsRng);
+        let contact = test_contact();
         let record = SignedRecord::source(
             [0xAA; 16],
             [0xBB; 32],
             99999,
             "source_file.mp3",
+            contact,
             &sk,
         );
 
         assert!(record.verify());
         assert_eq!(record.record_type, RECORD_TYPE_SOURCE);
+        // The DHT key is derived from the file hash, identical to find side.
+        assert_eq!(record.keyword_hash, source_key(&[0xAA; 16]));
+        assert_eq!(record.source_contact, Some(contact));
+
+        // The contact survives a full wire round-trip (and the blob form
+        // returned by FIND_VALUE).
+        let parsed = SignedRecord::from_wire(&record.data, record.signature).unwrap();
+        assert_eq!(parsed.source_contact, Some(contact));
+        let mut blob = record.data.clone();
+        blob.extend_from_slice(&record.signature);
+        let from_blob = SignedRecord::from_value_blob(&blob).unwrap();
+        assert_eq!(from_blob.source_contact, Some(contact));
+    }
+
+    #[test]
+    fn keyword_record_carries_no_contact() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let record = SignedRecord::keyword("test", [1u8; 16], [2u8; 32], 1, "f.txt", &sk);
+        assert_eq!(record.source_contact, None);
+        let parsed = SignedRecord::from_wire(&record.data, record.signature).unwrap();
+        assert_eq!(parsed.source_contact, None);
+    }
+
+    #[test]
+    fn truncated_source_contact_is_rejected() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let record = SignedRecord::source([0xAA; 16], [0xBB; 32], 10, "x", test_contact(), &sk);
+        // Drop a byte from the trailing contact block: the length guard in
+        // from_wire must reject it rather than admit a malformed source record.
+        let truncated = &record.data[..record.data.len() - 1];
+        assert!(SignedRecord::from_wire(truncated, record.signature).is_none());
+    }
+
+    #[test]
+    fn tampered_source_contact_fails_verify() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let record = SignedRecord::source([0xAA; 16], [0xBB; 32], 10, "x", test_contact(), &sk);
+        // Flip a byte inside the trailing (signed) contact block; the
+        // publisher signature must no longer verify.
+        let mut data = record.data.clone();
+        let last = data.len() - 1;
+        data[last] ^= 0xFF;
+        assert!(SignedRecord::from_wire(&data, record.signature).is_none());
+    }
+
+    #[test]
+    fn keyword_record_layout_is_stable() {
+        let sk = SigningKey::generate(&mut OsRng);
+        let name = "ubuntu-24.04.iso";
+        let record = SignedRecord::keyword("ubuntu", [1u8; 16], [2u8; 32], 4096, name, &sk);
+        // Keyword records must NOT grow a trailing contact block: the layout
+        // stays the 115-byte fixed header + the UTF-8 name, byte-for-byte as
+        // before slice 9, so existing keyword records remain valid.
+        assert_eq!(record.data.len(), 115 + name.len());
+        assert!(record.verify());
     }
 
     #[test]

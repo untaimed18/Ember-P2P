@@ -454,6 +454,20 @@ pub struct EmberDiagnostics {
     /// into the routing table. Self-disables once the table is bootstrapped.
     #[serde(default)]
     pub ember_dht_kad_bridge_pings: u32,
+    /// Ember DHT *source* records (re)published for our shared files this
+    /// session (slice 9): one per STORE attempt fanned out by the publish
+    /// tick, so a non-zero value means we are advertising ourselves as a
+    /// source on the DHT.
+    #[serde(default)]
+    pub ember_dht_sources_published: u32,
+    /// Ember DHT source lookups started for active/pending downloads this
+    /// session (slice 9).
+    #[serde(default)]
+    pub ember_dht_source_searches: u32,
+    /// Verified source records discovered via Ember DHT `FIND_VALUE` for our
+    /// downloads this session (slice 9), before dedup/injection filtering.
+    #[serde(default)]
+    pub ember_dht_source_records_found: u32,
 }
 
 /// Serializable KAD contact info for the frontend (mirrors eMule KadContactListCtrl columns)

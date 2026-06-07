@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use tracing::debug;
 
+use super::publish::RECORD_TYPE_SOURCE;
 use super::EmberNodeId;
 
 /// Maximum records per key (anti-spam).
@@ -194,6 +195,16 @@ impl DhtStore {
                 if out.len() >= max {
                     return out;
                 }
+                // Source records are never relayed by a third party: their
+                // signed payload binds an address to the original publisher, so
+                // a re-STORE from us (a different IP) is correctly rejected by
+                // the receiver's anti-reflection check. The original publisher
+                // re-announces its own source records on its publish tick, so
+                // they stay alive without storer-side replication. Only
+                // address-free records (e.g. keyword) replicate here.
+                if r.data.first() == Some(&RECORD_TYPE_SOURCE) {
+                    continue;
+                }
                 let due = force || now.duration_since(r.last_republished) >= interval;
                 if due {
                     r.last_republished = now;
@@ -342,6 +353,29 @@ mod tests {
         assert!(store.store([2u8; 16], d2.clone(), sign(&sk2, &d2), pk2, now_ts()));
         let all_due = store.take_republish_batch(Duration::from_secs(0), 1, false);
         assert_eq!(all_due.len(), 1, "max bounds the batch to 1");
+    }
+
+    #[test]
+    fn source_records_are_not_republished() {
+        let mut store = DhtStore::new();
+        // A "source" record is any blob whose first byte is RECORD_TYPE_SOURCE;
+        // its address is bound to the original publisher, so a re-STORE from us
+        // (a different IP) would be rejected — we must not relay it.
+        let (sk, pk) = keypair();
+        let mut src = vec![RECORD_TYPE_SOURCE];
+        src.extend_from_slice(&[1u8; 32]);
+        assert!(store.store([1u8; 16], src.clone(), sign(&sk, &src), pk, now_ts()));
+
+        // A non-source (keyword) record stays eligible for replication.
+        let (sk2, pk2) = keypair();
+        let mut kw = vec![0x01u8];
+        kw.extend_from_slice(&[2u8; 32]);
+        assert!(store.store([2u8; 16], kw.clone(), sign(&sk2, &kw), pk2, now_ts()));
+
+        // Even with `force`, only the non-source record is handed back.
+        let batch = store.take_republish_batch(Duration::from_secs(0), 10, true);
+        assert_eq!(batch.len(), 1, "source records must be excluded from republish");
+        assert_eq!(batch[0].0, kw);
     }
 
     #[test]
