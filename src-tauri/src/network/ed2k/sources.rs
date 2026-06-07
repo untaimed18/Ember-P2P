@@ -820,8 +820,28 @@ impl SourceManager {
         self.sources.retain(|_, v| !v.is_empty());
     }
 
+    /// Number of **currently-known** sources for a file: entries whose
+    /// `last_seen` is within `SOURCE_EXPIRY_SECS`. Expired entries are
+    /// deliberately retained in the map (they still serve user-hash /
+    /// connect-option lookups so we can obfuscate to crypt-required peers
+    /// immediately after a restart — `save_to_disk` keeps them for 6×expiry),
+    /// but they must NOT be counted as live sources. Counting raw `len()` made
+    /// the UI's "known sources" figure climb every session — stale entries
+    /// reloaded from `sources.met` accumulated on top of the live swarm and
+    /// the per-download total latched monotonically — so the number grew on
+    /// each close/reopen. Filtering by expiry here keeps the count honest and
+    /// also stops discovery gates (`MAX_SOURCES_FOR_UDP`) from tripping on
+    /// stale entries.
     pub fn source_count(&self, file_hash: &[u8; 16]) -> usize {
-        self.sources.get(file_hash).map(|v| v.len()).unwrap_or(0)
+        let now = chrono::Utc::now().timestamp();
+        self.sources
+            .get(file_hash)
+            .map(|v| {
+                v.iter()
+                    .filter(|e| now.saturating_sub(e.last_seen) < SOURCE_EXPIRY_SECS)
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     /// Return non-expired sources that have UDP ports (without reask gating).
@@ -1428,6 +1448,37 @@ mod tests {
 
         assert_eq!(pfs.sources.len(), 1);
         assert_eq!(pfs.sources[0].ip, keep_ip);
+    }
+
+    #[test]
+    fn source_count_excludes_expired_but_keeps_them_stored() {
+        // Regression: the per-download "known sources" figure climbed on every
+        // close/reopen because `source_count` returned the raw vec length,
+        // counting stale entries that `sources.met` retains (6×expiry) for
+        // crypt/user-hash lookups and reloads on startup. The count must
+        // reflect only live (non-expired) sources, while expired entries stay
+        // in the map for their hash-lookup purpose.
+        let hash = [0x55; 16];
+        let mut sm = SourceManager::new();
+        let live = Ipv4Addr::new(7, 7, 7, 7);
+        let stale = Ipv4Addr::new(8, 8, 8, 8);
+        sm.register_source(hash, live, 4662);
+        sm.register_source(hash, stale, 4663);
+        assert_eq!(sm.source_count(&hash), 2);
+
+        let now = chrono::Utc::now().timestamp();
+        for e in sm.sources.get_mut(&hash).unwrap().iter_mut() {
+            if e.ip == stale {
+                e.last_seen = now - (SOURCE_EXPIRY_SECS + 60);
+            }
+        }
+
+        assert_eq!(sm.source_count(&hash), 1, "expired source must not be counted");
+        assert_eq!(
+            sm.sources.get(&hash).map(|v| v.len()),
+            Some(2),
+            "expired source must remain stored for crypt/user-hash lookups"
+        );
     }
 
     #[test]
