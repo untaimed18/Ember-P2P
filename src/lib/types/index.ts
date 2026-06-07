@@ -245,6 +245,10 @@ export interface EmberDiagnostics {
   ember_dht_liveness_pings_sent: number;
   ember_dht_contacts_evicted: number;
   ember_dht_records_republished: number;
+  /** KAD-bridge bootstrap pings sent this session (slice 13): while the DHT
+   *  is still sparse, KAD-learned Ember peers are DHT-pinged so their signed
+   *  PONG folds them into the routing table. Self-disables once bootstrapped. */
+  ember_dht_kad_bridge_pings: number;
 }
 
 /** Result of an `ember_ping_peer` harness round-trip. `rtt_ms` is set
@@ -314,6 +318,7 @@ export interface EmberDhtMaintenanceResult {
   buckets_refreshed: number;
   liveness_pings_sent: number;
   records_republished: number;
+  kad_bridge_pings_sent: number;
   error?: string;
 }
 
@@ -444,6 +449,8 @@ export interface AppSettings {
   rendezvous_url: string;
   /** Experimental: enable the Ember-native Noise-encrypted UDP transport. */
   ember_native_enabled: boolean;
+  /** Advanced: reveal the Ember developer console (`/dev/ember`) links in the UI. */
+  ember_dev_tools_enabled: boolean;
   /** What to do when the user closes the main window via the title-bar X.
    *
    *  - `'ask'` (default): show a dialog letting the user pick.

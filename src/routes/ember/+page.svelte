@@ -12,6 +12,7 @@
   import { goto } from '$app/navigation';
   import { getSettings, updateSettings } from '$lib/api/settings';
   import { getEmberDiagnostics } from '$lib/api/ember';
+  import { emberDevToolsEnabled } from '$lib/stores/devTools';
   import type { AppSettings, EmberDiagnostics } from '$lib/types';
   import { translateError } from '$lib/i18n';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
@@ -98,6 +99,8 @@
         settings = s;
         enabled = s.ember_native_enabled;
         lastAppliedEnabled = s.ember_native_enabled;
+        // Keep the shared store in step with the freshest settings read.
+        emberDevToolsEnabled.set(!!s.ember_dev_tools_enabled);
       })
       .catch((e) => { loadError = m.ember_load_failed({ error: translateError(e) }); });
     refreshDiag();
@@ -112,17 +115,18 @@
 
 <svelte:head><title>{m.nav_ember_network()} — Ember</title></svelte:head>
 
-<div class="page">
-  <header class="page-header">
-    <div>
-      <h1>
-        {m.nav_ember_network()}
-        <span class="badge-experimental">{m.ember_experimental()}</span>
-      </h1>
-      <p class="subtitle">{m.ember_page_subtitle()}</p>
-    </div>
-  </header>
+<header class="page-header">
+  <div>
+    <h1>
+      {m.nav_ember_network()}
+      <span class="badge-experimental">{m.ember_experimental()}</span>
+    </h1>
+    <p class="subtitle">{m.ember_page_subtitle()}</p>
+  </div>
+</header>
 
+<div class="page-content">
+  <div class="ember-inner">
   {#if loadError}
     <div class="banner banner-error" role="alert">{loadError}</div>
   {/if}
@@ -215,20 +219,28 @@
     <p class="about-text">{m.ember_about_text()}</p>
   </section>
 
-  <!-- Advanced -->
-  <section class="card advanced">
-    <div>
-      <h2>{m.ember_advanced_title()}</h2>
-      <p class="hint">{m.ember_advanced_desc()}</p>
-    </div>
-    <button type="button" class="ghost-btn" onclick={() => goto('/dev/ember')}>
-      {m.ember_advanced_link()}
-    </button>
-  </section>
+  <!-- Advanced (developer console) — shown only when opted in via Settings -->
+  {#if $emberDevToolsEnabled}
+    <section class="card advanced">
+      <div>
+        <h2>{m.ember_advanced_title()}</h2>
+        <p class="hint">{m.ember_advanced_desc()}</p>
+      </div>
+      <button type="button" class="ghost-btn" onclick={() => goto('/dev/ember')}>
+        {m.ember_advanced_link()}
+      </button>
+    </section>
+  {/if}
+  </div>
 </div>
 
 <style>
-  .page {
+  /*
+   * Fixed `.page-header` + scrollable `.page-content` (the app-wide
+   * pattern); `.ember-inner` is the centered column inside the scroll
+   * area so content is never clipped by the layout's `overflow: hidden`.
+   */
+  .ember-inner {
     padding: 24px;
     max-width: 880px;
     margin: 0 auto;

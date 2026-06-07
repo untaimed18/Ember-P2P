@@ -99,6 +99,7 @@ pub struct EmberDhtMaintenanceResult {
     pub buckets_refreshed: usize,
     pub liveness_pings_sent: usize,
     pub records_republished: usize,
+    pub kad_bridge_pings_sent: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1520,11 +1521,13 @@ pub async fn ember_dht_run_maintenance(
             buckets_refreshed,
             liveness_pings_sent,
             records_republished,
+            kad_bridge_pings_sent,
         }) => Ok(EmberDhtMaintenanceResult {
             success: true,
             buckets_refreshed,
             liveness_pings_sent,
             records_republished,
+            kad_bridge_pings_sent,
             error: None,
         }),
         Err(e) => Ok(EmberDhtMaintenanceResult {
@@ -1532,6 +1535,7 @@ pub async fn ember_dht_run_maintenance(
             buckets_refreshed: 0,
             liveness_pings_sent: 0,
             records_republished: 0,
+            kad_bridge_pings_sent: 0,
             error: Some(e),
         }),
     }

@@ -1,0 +1,27 @@
+# Ember DHT hardcoded seed peers (slice 11).
+#
+# A brand-new install with no nodes_ember.dat and an empty or unreachable
+# rendezvous /bootstrap pool still needs somewhere to dial. The peers
+# listed here are baked into the build and seeded into the routing table on
+# a cold start, then a self-lookup expands from them. This is the Ember
+# equivalent of eMule's hardcoded server list.
+#
+# Format (one peer per line, whitespace-separated):
+#
+#   <host:port> <ed25519_pub_hex(64)> <noise_pub_hex(64)>
+#
+#   - host:port      UDP socket address, e.g. 203.0.113.10:4772
+#   - ed25519_pub    64 hex chars (32 bytes). The 128-bit node ID is
+#                    DERIVED from this key, so it is not listed separately.
+#   - noise_pub      64 hex chars (32 bytes), the X25519 static key used to
+#                    open the Noise session.
+#
+# Blank lines and lines beginning with '#' are ignored. A line with the
+# wrong field count, bad hex, or an invalid key is skipped (and the test
+# suite fails, so a typo'd seed never ships).
+#
+# This list is intentionally EMPTY until long-lived Ember seed nodes are
+# deployed. Populating it later is a pure data change — add one line per
+# deployed seed below this comment block. Example (placeholder, do NOT use):
+#
+#   seed1.ember.example:4772 1111111111111111111111111111111111111111111111111111111111111111 2222222222222222222222222222222222222222222222222222222222222222
