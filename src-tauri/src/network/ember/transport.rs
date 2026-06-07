@@ -118,6 +118,18 @@ pub struct DispatchOutcome {
     /// Decoded control message embedded in the packet. `None` for
     /// pure handshake-progress packets and rejected packets.
     pub control: Option<EmberControlMessage>,
+    /// Decrypted application payload that was *not* a 10-byte control
+    /// frame — i.e. an Ember DHT message (or a future Ember-native
+    /// frame) the caller is expected to route. Control frames are
+    /// exactly 10 bytes (`version`+`kind`+`nonce`); every DHT frame is
+    /// far larger (its Ed25519 signature alone is 64 bytes), so frame
+    /// length disambiguates the two without a dedicated channel byte.
+    pub app_payload: Option<Vec<u8>>,
+    /// The peer's Noise static public key, present whenever the packet
+    /// carried a decrypted payload (control or app) or completed a
+    /// handshake. Lets the caller dial the peer back over the
+    /// established session and bind the DHT identity to the transport.
+    pub remote_noise_pub: Option<[u8; 32]>,
     /// `true` when the transport rejected the packet (bad magic,
     /// unknown handshake state). The caller should drop it.
     pub rejected: bool,
@@ -343,7 +355,14 @@ impl EmberTransport {
         let result = self.process_incoming(data, from);
 
         let payload = match result {
-            IncomingResult::Message { payload, .. } => Some(payload),
+            IncomingResult::Message {
+                payload,
+                remote_noise_pub,
+                ..
+            } => {
+                outcome.remote_noise_pub = Some(remote_noise_pub);
+                Some(payload)
+            }
             IncomingResult::HandshakeResponse { packets, .. } => {
                 outcome.responses = packets;
                 None
@@ -351,9 +370,11 @@ impl EmberTransport {
             IncomingResult::HandshakeComplete {
                 packets_to_send,
                 decrypted_payload,
+                remote_noise_pub,
                 ..
             } => {
                 outcome.responses = packets_to_send;
+                outcome.remote_noise_pub = Some(remote_noise_pub);
                 decrypted_payload
             }
             IncomingResult::Rejected => {
@@ -367,9 +388,11 @@ impl EmberTransport {
         };
 
         let Some(message) = EmberControlMessage::decode(&payload) else {
-            // Unknown control payload. We still hand back the
-            // handshake responses (if any) and let the caller log /
-            // ignore the unknown message.
+            // Not a 10-byte control frame — hand the raw decrypted
+            // bytes back as an application payload (DHT message, future
+            // Ember-native frame). The caller routes it; the handshake
+            // responses (if any) still ride along in `responses`.
+            outcome.app_payload = Some(payload);
             return outcome;
         };
 
@@ -1158,6 +1181,42 @@ mod tests {
             }
             _ => panic!("expected Message"),
         }
+    }
+
+    /// A decrypted payload that is *not* a 10-byte control frame (e.g. a
+    /// signed DHT message) must surface via `app_payload` with the
+    /// peer's Noise key attached, so the caller can route it and reply
+    /// over the established session. The control path stays `None`.
+    #[test]
+    fn dispatch_surfaces_non_control_payload_as_app_payload() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        // DHT frames are always larger than the 10-byte control frame
+        // (the Ed25519 signature alone is 64 bytes); 90 bytes stands in
+        // for one here.
+        let dht_like = vec![0x01u8; 90];
+
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), &dht_like) {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+
+        let outcome = bob.dispatch_incoming(&init, alice_addr);
+        assert!(!outcome.rejected);
+        assert_eq!(outcome.control, None, "payload is not a control frame");
+        assert_eq!(outcome.app_payload.as_deref(), Some(dht_like.as_slice()));
+        assert_eq!(
+            outcome.remote_noise_pub,
+            Some(alice_pub),
+            "app payload must carry the peer's Noise key for the reply path"
+        );
+        // The IK responder still emits message 2.
+        assert_eq!(outcome.responses.len(), 1);
     }
 
     /// Regression: Bob (XX responder) calls `prepare_outgoing` while

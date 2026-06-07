@@ -137,6 +137,20 @@ impl SignedRecord {
         }
     }
 
+    /// Parse a record from a `FOUND_VALUE` blob, whose layout is
+    /// `record_data || 64-byte publisher signature` (see the engine's
+    /// `FIND_VALUE` responder). Verifies the signature; returns `None`
+    /// on any malformed/forged input.
+    pub fn from_value_blob(blob: &[u8]) -> Option<Self> {
+        if blob.len() < 64 {
+            return None;
+        }
+        let split = blob.len() - 64;
+        let (data, sig_bytes) = blob.split_at(split);
+        let signature: [u8; 64] = sig_bytes.try_into().ok()?;
+        Self::from_wire(data, signature)
+    }
+
     /// Parse a signed record from raw data + signature.
     pub fn from_wire(data: &[u8], signature: [u8; 64]) -> Option<Self> {
         // Minimum: type(1) + kw_hash(16) + file_hash(16) + ember_hash(32) +
@@ -270,6 +284,14 @@ impl PublishOperation {
         if self.pending_requests.is_empty() {
             self.complete = true;
         }
+    }
+
+    /// Re-evaluate completion and report it. Lets the driver finish a
+    /// publish that had zero reachable targets (nothing to ack), mirroring
+    /// `IterativeSearch::poll_complete`.
+    pub fn poll_complete(&mut self) -> bool {
+        self.check_complete();
+        self.complete
     }
 }
 

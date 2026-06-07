@@ -1,7 +1,11 @@
 use std::net::{IpAddr, SocketAddr};
 
 use crate::app_state::AppState;
-use crate::network::{NetworkCommand, PeerReputationInfo, ReputationStatsInfo};
+use crate::network::ember::dht::publish::SignedRecord;
+use crate::network::{
+    EmberDhtContactInfo, EmberMaintenanceResult, EmberPublishResult, NetworkCommand,
+    PeerReputationInfo, ReputationStatsInfo,
+};
 use crate::storage::identity::NodeIdentity;
 use crate::types::*;
 use crate::types::EmberDiagnostics;
@@ -19,12 +23,85 @@ pub struct EmberPingResult {
     pub error: Option<String>,
 }
 
+/// Result returned by the `ember_dht_find_node` harness command — the
+/// contacts a single peer answered with for a target ID, or the reason
+/// the lookup failed. `rtt_ms` is an approximate round trip measured
+/// across the IPC + network hop (dev signal, not a precise metric).
+#[derive(serde::Serialize)]
+pub struct EmberDhtFindResult {
+    pub success: bool,
+    pub contacts: Vec<EmberDhtContactInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Default round-trip timeout in milliseconds for `ember_ping_peer`.
 /// Matches what the harness defaults the TS side to; explicit value
 /// here so the backend has a sane bound even if the caller omits it.
 const DEFAULT_EMBER_PING_TIMEOUT_MS: u64 = 5_000;
 const MIN_EMBER_PING_TIMEOUT_MS: u64 = 100;
 const MAX_EMBER_PING_TIMEOUT_MS: u64 = 60_000;
+
+/// Default timeout for an iterative lookup — longer than a single-hop
+/// find because it runs several `FIND_NODE` rounds across the network.
+const DEFAULT_EMBER_LOOKUP_TIMEOUT_MS: u64 = 30_000;
+
+/// Result of the `ember_dht_publish_keyword` harness command: the DHT key
+/// the record landed under and how many nodes acknowledged storing it.
+#[derive(serde::Serialize)]
+pub struct EmberDhtPublishResult {
+    pub success: bool,
+    /// Hex of the 16-byte DHT key the record was published under.
+    pub key: String,
+    /// Nodes that acked the `STORE_RECORD`.
+    pub stored_on: usize,
+    /// Nodes the record was sent to.
+    pub targets: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// One signed record returned by `ember_dht_find_value`, flattened for
+/// IPC. Only records whose publisher signature verified are surfaced.
+#[derive(serde::Serialize)]
+pub struct EmberDhtRecordInfo {
+    /// Record type byte (`0x01` keyword, `0x02` source).
+    pub record_type: u8,
+    pub file_name: String,
+    pub file_size: u64,
+    /// Hex of the 16-byte legacy/ed2k file hash carried by the record.
+    pub file_hash: String,
+    /// Hex of the publisher's Ed25519 public key.
+    pub publisher: String,
+    /// Publisher's Unix timestamp on the record.
+    pub timestamp: i64,
+}
+
+/// Result of the `ember_dht_find_value` harness command: the verified
+/// records discovered for a keyword, or the reason the lookup failed.
+#[derive(serde::Serialize)]
+pub struct EmberDhtFindValueResult {
+    pub success: bool,
+    pub records: Vec<EmberDhtRecordInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Result of the `ember_dht_run_maintenance` harness command: how much
+/// work the forced maintenance cycle kicked off (slice 6).
+#[derive(serde::Serialize)]
+pub struct EmberDhtMaintenanceResult {
+    pub success: bool,
+    pub buckets_refreshed: usize,
+    pub liveness_pings_sent: usize,
+    pub records_republished: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
 
 /// Maximum stored friend nickname size. L18: aligned with the
 /// frontend `maxlength="64"` constraints in `+page.svelte` so a
@@ -921,6 +998,541 @@ pub async fn ember_ping_peer(
             success: false,
             rtt_ms: None,
             error: Some(format!("Timed out after {timeout} ms")),
+        }),
+    }
+}
+
+/// Parse a 64-char hex string into a 32-byte key (Ed25519 / X25519).
+fn parse_key32(label: &str, hex_str: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| coded_ctx("peers_pubkey_invalid_hex", format!("{label} is not valid hex"), e))?;
+    if bytes.len() != 32 {
+        return Err(coded_ctx(
+            "peers_pubkey_wrong_length",
+            format!("{label} must decode to 32 bytes, got {}", bytes.len()),
+            bytes.len(),
+        ));
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&bytes);
+    Ok(k)
+}
+
+/// Parse a 32-char hex string into a 16-byte Ember node ID / lookup
+/// target.
+fn parse_node_id16(label: &str, hex_str: &str) -> Result<[u8; 16], String> {
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| coded_ctx("peers_target_invalid_hex", format!("{label} is not valid hex"), e))?;
+    if bytes.len() != 16 {
+        return Err(coded_ctx(
+            "peers_target_wrong_length",
+            format!("{label} must decode to 16 bytes, got {}", bytes.len()),
+            bytes.len(),
+        ));
+    }
+    let mut k = [0u8; 16];
+    k.copy_from_slice(&bytes);
+    Ok(k)
+}
+
+/// Snapshot the Ember DHT routing table. Developer/harness surface for
+/// the `/dev/ember` panel — shows which contacts the node has learned
+/// (from signed PING/PONG traffic) or been seeded with.
+#[tauri::command]
+pub async fn get_ember_dht_contacts(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<EmberDhtContactInfo>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::GetEmberDhtContacts { tx })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    await_reply(rx, "peers_no_response", "No response").await
+}
+
+/// Manually seed an Ember DHT contact (harness/dev). Lets two nodes
+/// bootstrap each other before any live DHT traffic by pasting the
+/// peer's address, Ed25519 public key, and Noise public key (all
+/// shown on the other node's `/dev/ember` panel). The node ID is
+/// derived from the Ed25519 key.
+#[tauri::command]
+pub async fn add_ember_dht_contact(
+    state: tauri::State<'_, AppState>,
+    peer_ip: String,
+    peer_port: u16,
+    ed25519_pubkey_hex: String,
+    noise_pubkey_hex: String,
+) -> Result<(), String> {
+    if peer_port == 0 {
+        return Err(coded("peers_peer_port_must_be_positive", "peer_port must be > 0"));
+    }
+    let ip: IpAddr = peer_ip
+        .parse()
+        .map_err(|e| coded_ctx("peers_invalid_peer_ip", format!("Invalid peer_ip '{peer_ip}'"), e))?;
+    let ed25519_pub = parse_key32("ed25519_pubkey_hex", ed25519_pubkey_hex.trim())?;
+    let noise_pub = parse_key32("noise_pubkey_hex", noise_pubkey_hex.trim())?;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::AddEmberDhtContact {
+            addr: SocketAddr::new(ip, peer_port),
+            ed25519_pub,
+            noise_pub,
+            tx,
+        })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    await_reply(rx, "peers_no_response", "No response").await?
+}
+
+/// Send an Ember DHT `PING` to a peer over the Noise transport and wait
+/// for the matching `PONG`. Mirrors [`ember_ping_peer`] but exercises
+/// the DHT PING/PONG path, so a successful round trip also seeds both
+/// nodes' routing tables. `peer_pubkey_hex` is the peer's **Noise**
+/// key; when omitted it is resolved from the KAD-fed cache.
+#[tauri::command]
+pub async fn ember_dht_ping_peer(
+    state: tauri::State<'_, AppState>,
+    peer_ip: String,
+    peer_port: u16,
+    peer_pubkey_hex: Option<String>,
+    timeout_ms: Option<u64>,
+) -> Result<EmberPingResult, String> {
+    let timeout = timeout_ms
+        .unwrap_or(DEFAULT_EMBER_PING_TIMEOUT_MS)
+        .clamp(MIN_EMBER_PING_TIMEOUT_MS, MAX_EMBER_PING_TIMEOUT_MS);
+
+    if peer_port == 0 {
+        return Err(coded("peers_peer_port_must_be_positive", "peer_port must be > 0"));
+    }
+
+    let ip: IpAddr = peer_ip
+        .parse()
+        .map_err(|e| coded_ctx("peers_invalid_peer_ip", format!("Invalid peer_ip '{peer_ip}'"), e))?;
+    let addr = SocketAddr::new(ip, peer_port);
+
+    let peer_pubkey: Option<[u8; 32]> = match peer_pubkey_hex.as_deref() {
+        Some(s) if !s.is_empty() => Some(parse_key32("peer_pubkey_hex", s)?),
+        _ => None,
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::SendEmberDhtPing {
+            addr,
+            peer_pubkey,
+            tx,
+        })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+
+    let scheduled = match await_reply(rx, "peers_no_response_from_network", "No response from network").await? {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(EmberPingResult {
+                success: false,
+                rtt_ms: None,
+                error: Some(e),
+            })
+        }
+    };
+
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout),
+        scheduled.pong_rx,
+    )
+    .await
+    {
+        Ok(Ok(rtt)) => Ok(EmberPingResult {
+            success: true,
+            rtt_ms: Some(rtt.as_secs_f64() * 1_000.0),
+            error: None,
+        }),
+        Ok(Err(_)) => Ok(EmberPingResult {
+            success: false,
+            rtt_ms: None,
+            error: Some("Network task dropped pong oneshot".into()),
+        }),
+        Err(_) => Ok(EmberPingResult {
+            success: false,
+            rtt_ms: None,
+            error: Some(format!("Timed out after {timeout} ms")),
+        }),
+    }
+}
+
+/// Send a single Ember DHT `FIND_NODE` to a peer and return the contacts
+/// it answers with (its k closest to `target_hex`). This is one hop —
+/// the iterative, multi-hop lookup driver that loops this primitive
+/// lands in a later slice. `target_hex` is an optional 32-char (16-byte)
+/// node ID; when blank the network task picks a random target so the
+/// caller just sees "what does this peer know". `peer_pubkey_hex` is the
+/// peer's **Noise** key; when omitted it is resolved from the KAD-fed
+/// cache.
+#[tauri::command]
+pub async fn ember_dht_find_node(
+    state: tauri::State<'_, AppState>,
+    peer_ip: String,
+    peer_port: u16,
+    target_hex: Option<String>,
+    peer_pubkey_hex: Option<String>,
+    timeout_ms: Option<u64>,
+) -> Result<EmberDhtFindResult, String> {
+    let timeout = timeout_ms
+        .unwrap_or(DEFAULT_EMBER_PING_TIMEOUT_MS)
+        .clamp(MIN_EMBER_PING_TIMEOUT_MS, MAX_EMBER_PING_TIMEOUT_MS);
+
+    if peer_port == 0 {
+        return Err(coded("peers_peer_port_must_be_positive", "peer_port must be > 0"));
+    }
+
+    let ip: IpAddr = peer_ip
+        .parse()
+        .map_err(|e| coded_ctx("peers_invalid_peer_ip", format!("Invalid peer_ip '{peer_ip}'"), e))?;
+    let addr = SocketAddr::new(ip, peer_port);
+
+    let peer_pubkey: Option<[u8; 32]> = match peer_pubkey_hex.as_deref() {
+        Some(s) if !s.is_empty() => Some(parse_key32("peer_pubkey_hex", s)?),
+        _ => None,
+    };
+
+    let target: Option<[u8; 16]> = match target_hex.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => Some(parse_node_id16("target_hex", s)?),
+        _ => None,
+    };
+
+    let started = std::time::Instant::now();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::SendEmberDhtFindNode {
+            addr,
+            peer_pubkey,
+            target,
+            tx,
+        })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+
+    let scheduled = match await_reply(rx, "peers_no_response_from_network", "No response from network").await? {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(EmberDhtFindResult {
+                success: false,
+                contacts: Vec::new(),
+                rtt_ms: None,
+                error: Some(e),
+            })
+        }
+    };
+
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout),
+        scheduled.contacts_rx,
+    )
+    .await
+    {
+        Ok(Ok(contacts)) => Ok(EmberDhtFindResult {
+            success: true,
+            contacts,
+            rtt_ms: Some(started.elapsed().as_secs_f64() * 1_000.0),
+            error: None,
+        }),
+        Ok(Err(_)) => Ok(EmberDhtFindResult {
+            success: false,
+            contacts: Vec::new(),
+            rtt_ms: None,
+            error: Some("Network task dropped contacts oneshot".into()),
+        }),
+        Err(_) => Ok(EmberDhtFindResult {
+            success: false,
+            contacts: Vec::new(),
+            rtt_ms: None,
+            error: Some(format!("Timed out after {timeout} ms")),
+        }),
+    }
+}
+
+/// Run an **iterative** Ember DHT lookup for `target_hex` — the
+/// multi-hop discovery that loops `FIND_NODE` across the closest
+/// contacts it learns until it converges, returning the closest
+/// contacts that responded. Unlike `ember_dht_find_node` (one peer, one
+/// hop) this needs no peer address: it seeds from the local routing
+/// table, so DHT-ping or seed at least one contact first. `target_hex`
+/// is an optional 32-char (16-byte) node ID; blank ⇒ a random target
+/// (a self-style probe that broadens the routing table).
+#[tauri::command]
+pub async fn ember_dht_iterative_find_node(
+    state: tauri::State<'_, AppState>,
+    target_hex: Option<String>,
+    timeout_ms: Option<u64>,
+) -> Result<EmberDhtFindResult, String> {
+    let timeout = timeout_ms
+        .unwrap_or(DEFAULT_EMBER_LOOKUP_TIMEOUT_MS)
+        .clamp(MIN_EMBER_PING_TIMEOUT_MS, MAX_EMBER_PING_TIMEOUT_MS);
+
+    let target: Option<[u8; 16]> = match target_hex.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => Some(parse_node_id16("target_hex", s)?),
+        _ => None,
+    };
+
+    let started = std::time::Instant::now();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::SendEmberDhtIterativeFindNode { target, tx })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+
+    let scheduled = match await_reply(rx, "peers_no_response_from_network", "No response from network").await? {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(EmberDhtFindResult {
+                success: false,
+                contacts: Vec::new(),
+                rtt_ms: None,
+                error: Some(e),
+            })
+        }
+    };
+
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout),
+        scheduled.contacts_rx,
+    )
+    .await
+    {
+        Ok(Ok(contacts)) => Ok(EmberDhtFindResult {
+            success: true,
+            contacts,
+            rtt_ms: Some(started.elapsed().as_secs_f64() * 1_000.0),
+            error: None,
+        }),
+        Ok(Err(_)) => Ok(EmberDhtFindResult {
+            success: false,
+            contacts: Vec::new(),
+            rtt_ms: None,
+            error: Some("Network task dropped lookup oneshot".into()),
+        }),
+        Err(_) => Ok(EmberDhtFindResult {
+            success: false,
+            contacts: Vec::new(),
+            rtt_ms: None,
+            error: Some(format!("Lookup timed out after {timeout} ms")),
+        }),
+    }
+}
+
+/// Publish a signed keyword record into the Ember DHT: the network task
+/// signs the record with our identity and `STORE`s it on the closest
+/// contacts it knows, returning how many acknowledged. `file_hash_hex` is
+/// an optional 32-char (16-byte) hash; blank ⇒ a random one (handy for
+/// dev-publishing distinct test records). Seed/ping at least one contact
+/// first or there will be no nodes to store on.
+#[tauri::command]
+pub async fn ember_dht_publish_keyword(
+    state: tauri::State<'_, AppState>,
+    keyword: String,
+    file_name: String,
+    file_size: u64,
+    file_hash_hex: Option<String>,
+    timeout_ms: Option<u64>,
+) -> Result<EmberDhtPublishResult, String> {
+    let keyword = keyword.trim().to_string();
+    if keyword.is_empty() {
+        return Err(coded("peers_keyword_empty", "Keyword must not be empty"));
+    }
+
+    let timeout = timeout_ms
+        .unwrap_or(DEFAULT_EMBER_LOOKUP_TIMEOUT_MS)
+        .clamp(MIN_EMBER_PING_TIMEOUT_MS, MAX_EMBER_PING_TIMEOUT_MS);
+
+    let file_hash: [u8; 16] = match file_hash_hex.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => parse_node_id16("file_hash_hex", s)?,
+        _ => rand::random(),
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::PublishEmberKeyword {
+            keyword,
+            file_name,
+            file_size,
+            file_hash,
+            tx,
+        })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+
+    let scheduled = match await_reply(rx, "peers_no_response_from_network", "No response from network").await? {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(EmberDhtPublishResult {
+                success: false,
+                key: String::new(),
+                stored_on: 0,
+                targets: 0,
+                error: Some(e),
+            })
+        }
+    };
+
+    let key = scheduled.key.clone();
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout),
+        scheduled.result_rx,
+    )
+    .await
+    {
+        Ok(Ok(EmberPublishResult { stored_on, targets })) => Ok(EmberDhtPublishResult {
+            success: stored_on > 0,
+            key,
+            stored_on,
+            targets,
+            error: if stored_on == 0 {
+                Some("No node acknowledged storing the record".into())
+            } else {
+                None
+            },
+        }),
+        Ok(Err(_)) => Ok(EmberDhtPublishResult {
+            success: false,
+            key,
+            stored_on: 0,
+            targets: 0,
+            error: Some("Network task dropped publish oneshot".into()),
+        }),
+        Err(_) => Ok(EmberDhtPublishResult {
+            success: false,
+            key,
+            stored_on: 0,
+            targets: 0,
+            error: Some(format!("Publish timed out after {timeout} ms")),
+        }),
+    }
+}
+
+/// Run an iterative Ember DHT `FIND_VALUE` lookup for `keyword`: the
+/// network task drives a multi-hop search that gathers signed records
+/// for the keyword's key, returning the ones whose publisher signature
+/// verifies. Seeds from the local routing table, so DHT-ping or seed at
+/// least one contact first.
+#[tauri::command]
+pub async fn ember_dht_find_value(
+    state: tauri::State<'_, AppState>,
+    keyword: String,
+    timeout_ms: Option<u64>,
+) -> Result<EmberDhtFindValueResult, String> {
+    let keyword = keyword.trim().to_string();
+    if keyword.is_empty() {
+        return Err(coded("peers_keyword_empty", "Keyword must not be empty"));
+    }
+
+    let timeout = timeout_ms
+        .unwrap_or(DEFAULT_EMBER_LOOKUP_TIMEOUT_MS)
+        .clamp(MIN_EMBER_PING_TIMEOUT_MS, MAX_EMBER_PING_TIMEOUT_MS);
+
+    let started = std::time::Instant::now();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::FindEmberValue { keyword, tx })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+
+    let scheduled = match await_reply(rx, "peers_no_response_from_network", "No response from network").await? {
+        Ok(p) => p,
+        Err(e) => {
+            return Ok(EmberDhtFindValueResult {
+                success: false,
+                records: Vec::new(),
+                rtt_ms: None,
+                error: Some(e),
+            })
+        }
+    };
+
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout),
+        scheduled.records_rx,
+    )
+    .await
+    {
+        Ok(Ok(blobs)) => {
+            // Re-verify each blob's publisher signature and dedupe by
+            // (publisher, file_hash) so the same record relayed by
+            // several nodes shows once.
+            let mut seen: std::collections::HashSet<([u8; 32], [u8; 16])> =
+                std::collections::HashSet::new();
+            let mut records = Vec::new();
+            for blob in &blobs {
+                if let Some(rec) = SignedRecord::from_value_blob(blob) {
+                    if seen.insert((rec.publisher_key, rec.file_hash)) {
+                        records.push(EmberDhtRecordInfo {
+                            record_type: rec.record_type,
+                            file_name: rec.file_name,
+                            file_size: rec.file_size,
+                            file_hash: hex::encode(rec.file_hash),
+                            publisher: hex::encode(rec.publisher_key),
+                            timestamp: rec.timestamp,
+                        });
+                    }
+                }
+            }
+            Ok(EmberDhtFindValueResult {
+                success: true,
+                records,
+                rtt_ms: Some(started.elapsed().as_secs_f64() * 1_000.0),
+                error: None,
+            })
+        }
+        Ok(Err(_)) => Ok(EmberDhtFindValueResult {
+            success: false,
+            records: Vec::new(),
+            rtt_ms: None,
+            error: Some("Network task dropped value-lookup oneshot".into()),
+        }),
+        Err(_) => Ok(EmberDhtFindValueResult {
+            success: false,
+            records: Vec::new(),
+            rtt_ms: None,
+            error: Some(format!("Lookup timed out after {timeout} ms")),
+        }),
+    }
+}
+
+/// Force one Ember DHT maintenance cycle (slice 6): refresh stale buckets,
+/// liveness-ping stale contacts, and republish locally-stored records. The
+/// network task runs the same cycle automatically on a timer; this dev
+/// command triggers it on demand (ignoring staleness gates) so the
+/// behaviour can be observed immediately. The returned tally is what the
+/// cycle *initiated* — evictions and refresh results land asynchronously
+/// and surface in `get_ember_diagnostics`.
+#[tauri::command]
+pub async fn ember_dht_run_maintenance(
+    state: tauri::State<'_, AppState>,
+) -> Result<EmberDhtMaintenanceResult, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state
+        .network_tx
+        .try_send(NetworkCommand::RunEmberMaintenance { tx })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+
+    match await_reply(rx, "peers_no_response_from_network", "No response from network").await? {
+        Ok(EmberMaintenanceResult {
+            buckets_refreshed,
+            liveness_pings_sent,
+            records_republished,
+        }) => Ok(EmberDhtMaintenanceResult {
+            success: true,
+            buckets_refreshed,
+            liveness_pings_sent,
+            records_republished,
+            error: None,
+        }),
+        Err(e) => Ok(EmberDhtMaintenanceResult {
+            success: false,
+            buckets_refreshed: 0,
+            liveness_pings_sent: 0,
+            records_republished: 0,
+            error: Some(e),
         }),
     }
 }

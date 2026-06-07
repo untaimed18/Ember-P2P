@@ -188,6 +188,14 @@ struct PresenceEntry {
     /// let any network actor compute a victim's id and POST a fake
     /// address for it.
     pubkey: [u8; 32],
+    /// Optional X25519 Noise static public key, supplied by clients that
+    /// run the Ember-native DHT (`ember_native_enabled`). It is NOT part
+    /// of the signed registration message: a client only ever publishes
+    /// its own key, and the DHT verifies every contact's Ed25519 binding
+    /// on first PING — a wrong Noise key just fails the handshake, so an
+    /// unsigned value can't be weaponised. Entries that carry one are
+    /// eligible for the `/bootstrap` pool.
+    noise_pub: Option<[u8; 32]>,
 }
 
 #[derive(Clone)]
@@ -292,6 +300,12 @@ struct RegisterRequest {
     /// Hex-encoded Ed25519 signature over
     /// `RDV_DOMAIN || OP_REGISTER || sha256_id_raw || port_le || ipv4 || pubkey || ts_le`.
     sig: String,
+    /// Optional X25519 Noise static public key (64 hex chars), published
+    /// by Ember-DHT-enabled clients so they can serve in the `/bootstrap`
+    /// pool. Unsigned and best-effort: an unparseable value is dropped
+    /// rather than failing the registration. See `PresenceEntry::noise_pub`.
+    #[serde(default)]
+    noise_pub: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -460,12 +474,18 @@ async fn register(
         return StatusCode::FORBIDDEN;
     }
 
+    // Optional DHT Noise key — decoded best-effort. A malformed value is
+    // simply dropped (the entry just won't be bootstrap-eligible) rather
+    // than failing an otherwise-valid registration.
+    let noise_pub = body.noise_pub.as_deref().and_then(decode_hex_pubkey);
+
     let entry = PresenceEntry {
         ip: presence_ip,
         port: body.port,
         conn_ip: client_ip,
         expires_at: Instant::now() + ENTRY_TTL,
         pubkey,
+        noise_pub,
     };
 
     let mut store = state.store.write().await;
@@ -1136,22 +1156,69 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// L12: DHT bootstrap stub.
+/// One node in the `/bootstrap` pool. The client derives the 128-bit DHT
+/// node id itself from `ed25519_pub` (`BLAKE3(ed25519_pub)[..16]`) — it
+/// never trusts a server-supplied id — so we don't send one.
+#[derive(Serialize)]
+struct BootstrapNodeResponse {
+    /// "ip:port" the peer is reachable at for the Ember Noise transport.
+    addr: String,
+    /// X25519 Noise static public key (64 hex chars).
+    noise_pub: String,
+    /// Ed25519 public key (64 hex chars).
+    ed25519_pub: String,
+}
+
+/// Max nodes returned per `/bootstrap` GET. The client caps its own
+/// intake at 200; 50 is plenty to seed a routing table while bounding
+/// response size and the per-node bootstrap load.
+const MAX_BOOTSTRAP_RESPONSE: usize = 50;
+
+/// DHT bootstrap pool (replaces the earlier empty stub now that the Ember
+/// DHT is live).
 ///
-/// `ember/dht/bootstrap.rs::fetch_bootstrap_nodes` GETs
-/// `<rendezvous>/bootstrap` and expects a JSON array of
-/// `BootstrapNode { node_id, addr, noise_pub, ed25519_pub }`. The
-/// V1 client never actually consumes the result (DHT is dormant
-/// behind `ember_native_enabled = false`), but until L12 the route
-/// didn't exist on the server side and every probe returned 404,
-/// which the client logs as a warning. We return an empty array
-/// so the client's "no peers known yet" branch fires cleanly. When
-/// the Ember DHT goes live, replace the empty body with a
-/// signed-and-pinned bootstrap pool — until then there's no value
-/// in publishing addresses for a network that nothing is talking
-/// to yet.
-async fn bootstrap_stub() -> Json<Vec<serde_json::Value>> {
-    Json(Vec::new())
+/// Returns a rotating sample of currently-registered nodes that published
+/// a Noise key (i.e. run the Ember-native DHT). The client
+/// (`ember/dht/bootstrap.rs::fetch_bootstrap_nodes`) seeds its routing
+/// table from this on a cold start — no warm `nodes_ember.dat` — so a
+/// brand-new install joins the DHT without any KAD involvement.
+///
+/// Trust model: the pool is unsigned and best-effort. It can at worst
+/// hand out unreachable/stale contacts — it cannot poison a routing table,
+/// because the DHT verifies each contact's Ed25519 signature and the
+/// `node_id == BLAKE3(ed25519_pub)` binding on the first PING, and a wrong
+/// Noise key just fails the handshake.
+async fn bootstrap(State(state): State<AppState>) -> Json<Vec<BootstrapNodeResponse>> {
+    let now = Instant::now();
+    let store = state.store.read().await;
+    let eligible: Vec<&PresenceEntry> = store
+        .values()
+        .filter(|e| e.expires_at > now && e.noise_pub.is_some())
+        .collect();
+
+    let total = eligible.len();
+    if total == 0 {
+        return Json(Vec::new());
+    }
+
+    // Rotate the window by server uptime so successive callers don't all
+    // get the same head-of-map slice (which would concentrate bootstrap
+    // traffic on a few nodes). Dependency-free; good enough until a
+    // signed, load-weighted pool lands.
+    let offset = (state.started_at.elapsed().as_secs() as usize) % total;
+    let out: Vec<BootstrapNodeResponse> = eligible
+        .iter()
+        .cycle()
+        .skip(offset)
+        .take(total.min(MAX_BOOTSTRAP_RESPONSE))
+        .map(|e| BootstrapNodeResponse {
+            addr: SocketAddr::new(e.ip, e.port).to_string(),
+            noise_pub: hex::encode(e.noise_pub.unwrap_or_default()),
+            ed25519_pub: hex::encode(e.pubkey),
+        })
+        .collect();
+
+    Json(out)
 }
 
 async fn sweep_expired(state: AppState) {
@@ -1262,18 +1329,11 @@ async fn main() {
         .route("/relay/{session_id}", get(relay_ws))
         .route("/relay-invite", post(relay_invite_post))
         .route("/relay-invites/{id}", get(relay_invite_poll))
-        // L12: DHT bootstrap stub. The Ember DHT (`ember/dht/*`) is
-        // dormant in V1 (`ember_native_enabled=false`), but the
-        // bootstrap module probes `/bootstrap` proactively whenever
-        // the runtime hands it a rendezvous URL. Returning an empty
-        // 200 OK keeps that probe quiet — the client treats an
-        // empty list as "no peers known yet" and falls back to its
-        // local cache, which is the correct V1 behaviour. When the
-        // DHT goes live in a later version this handler can grow
-        // into a real bootstrap-node serializer; for now an empty
-        // array keeps the wire contract honest without adding any
-        // attack surface.
-        .route("/bootstrap", get(bootstrap_stub))
+        // DHT bootstrap pool. Now that the Ember DHT is live, this serves
+        // a rotating sample of registered nodes that published a Noise key
+        // so a cold-start client (no warm `nodes_ember.dat`) can join the
+        // DHT without KAD. See `bootstrap()` for the trust model.
+        .route("/bootstrap", get(bootstrap))
         .route("/health", get(health))
         .route("/stats", get(stats_handler))
         .with_state(state);
