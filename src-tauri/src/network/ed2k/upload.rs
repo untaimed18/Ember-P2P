@@ -138,6 +138,41 @@ pub struct KadCallbackParts {
     pub peer_caps: PeerCapabilities,
 }
 
+/// Path B (eMule queued-source model) inbound reconnect index.
+///
+/// Maps a queued-source peer's IPv4 → the set of `(file_hash, optional user
+/// hash)` an *active download* is currently queued on that peer for. The
+/// network loop rebuilds it every few seconds from `per_file_sources` (sources
+/// in the `OnQueue` state of live downloads); the inbound `handle_connection`
+/// reads it so an uploader that *connects back to us* to grant a slot (a HighID
+/// push-grant — eMule reconnects to deep-queued HighID downloaders from
+/// `CUploadQueue::AddUpNextClient` instead of waiting for the next re-ask) is
+/// recognised and its freshly-handshaked stream is diverted straight into the
+/// waiting download, via the same adoption channel a LowID/KAD callback uses,
+/// rather than being mishandled as an upload request.
+///
+/// The map is empty whenever no download has queued sources, so the inbound
+/// path is a no-op for ordinary peers. It is rebuilt wholesale (not mutated
+/// incrementally) so stale entries self-heal: a source no longer `OnQueue`, or
+/// a finished download, simply vanishes on the next rebuild, bounding a
+/// mismatched divert to one rebuild interval (and even then the adoption side
+/// safely drops a stream that has no matching active download).
+pub type ReconnectIndex =
+    std::collections::HashMap<std::net::Ipv4Addr, Vec<([u8; 16], Option<[u8; 16]>)>>;
+
+static RECONNECT_INDEX: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<ReconnectIndex>>> =
+    std::sync::OnceLock::new();
+
+/// Shared handle to the Path B reconnect index (lazily created on first use).
+/// The network loop holds one clone and overwrites its contents each rebuild;
+/// `handle_connection` reads it per inbound connection. The guard is cheap and
+/// is never held across an `.await`.
+pub fn reconnect_index() -> std::sync::Arc<std::sync::RwLock<ReconnectIndex>> {
+    RECONNECT_INDEX
+        .get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(ReconnectIndex::new())))
+        .clone()
+}
+
 /// How eMule keys a firewalled KAD callback source before the peer connects.
 /// Type 3/5 publishes buddy IP in `TAG_SERVERIP` but usually omits
 /// `TAG_SOURCEIP`, so the publisher's ED2K user hash is the stable identity.
@@ -2115,6 +2150,75 @@ impl UploadHandler {
                     let _ = self.kad_callback_tx.send(parts).await;
                     return Ok(());
                 }
+            }
+        }
+
+        // Path B (eMule queued-source model): if this inbound connection comes
+        // from a peer we are currently *queued on* for an active download, it
+        // is the uploader connecting back to grant us a slot (a HighID
+        // push-grant — eMule reconnects to deep-queued HighID downloaders from
+        // `CUploadQueue::AddUpNextClient` rather than waiting for them to
+        // re-ask). Divert the freshly-handshaked stream straight into the
+        // waiting download via the same adoption channel the KAD/server
+        // callbacks use above, instead of treating it as an upload request.
+        //
+        // Gated strictly on (peer IP [+ user hash when we know it]) matching a
+        // source in our `OnQueue` set, so it is a no-op for ordinary
+        // downloaders (the index is empty unless a download has queued
+        // sources). Done BEFORE recording an upload request for abuse tracking
+        // so a legitimate reconnect is never counted against the peer.
+        if let std::net::IpAddr::V4(peer_v4) = peer_addr.ip() {
+            let divert_file: Option<[u8; 16]> = {
+                let idx = reconnect_index();
+                let guard = idx.read().unwrap_or_else(|e| e.into_inner());
+                guard.get(&peer_v4).and_then(|entries| {
+                    // Prefer an entry whose stored user hash matches the peer's
+                    // Hello identity; otherwise accept an entry we only know by
+                    // IP (user hash not yet learned). Never match an entry whose
+                    // known user hash differs — that's a different client at the
+                    // same address and must not be diverted.
+                    entries
+                        .iter()
+                        .find(|(_, uh)| *uh == Some(peer_user_hash))
+                        .or_else(|| entries.iter().find(|(_, uh)| uh.is_none()))
+                        .map(|(fh, _)| *fh)
+                })
+            };
+            if let Some(file_hash) = divert_file {
+                info!(
+                    "Inbound reconnect from {peer_addr} (user={}) matches a queued source for file {} — diverting to active download (Path B push-grant)",
+                    crate::security::short_hash(&peer_user_hash),
+                    hex::encode(file_hash),
+                );
+                crate::network::ed2k::multi_source::note_push_grant_diversion();
+                let (dyn_reader, dyn_writer, emule_done): (
+                    Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                    Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                    bool,
+                ) = match (reader, writer) {
+                    (StreamReader::Plain(r), StreamWriter::Plain(w)) => {
+                        (Box::new(r), Box::new(w), false)
+                    }
+                    (StreamReader::Obfuscated(r), StreamWriter::Obfuscated(w)) => {
+                        (Box::new(r), Box::new(w), true)
+                    }
+                    _ => {
+                        warn!("Mismatched reader/writer types for Path B reconnect diversion");
+                        return Ok(());
+                    }
+                };
+                let parts = KadCallbackParts {
+                    peer_ip: peer_v4,
+                    peer_port: peer_addr.port(),
+                    peer_user_hash,
+                    file_hash,
+                    reader: dyn_reader,
+                    writer: dyn_writer,
+                    emule_info_done: emule_done,
+                    peer_caps: hello_caps.clone(),
+                };
+                let _ = self.kad_callback_tx.send(parts).await;
+                return Ok(());
             }
         }
 
