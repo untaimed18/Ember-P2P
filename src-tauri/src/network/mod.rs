@@ -4889,6 +4889,10 @@ pub async fn start_network(
     // budget stays globally bounded.
     ed2k::multi_source::set_global_download_conn_limit(settings.max_connections as usize);
 
+    // Install the global "preview priority for all downloads" preference so the
+    // chunk selector front-loads first/last parts from the very first task.
+    crate::sharing::manager::set_global_preview_priority(settings.preview_priority_all);
+
     let source_manager: Arc<RwLock<SourceManager>> = {
         let mut sm = SourceManager::new();
         sm.set_max_per_file(settings.max_sources_per_file);
@@ -5321,6 +5325,15 @@ pub async fn start_network(
                     transfer.completed_size = transfer.transferred;
                     transfer.progress = ((transfer.transferred as f64 / transfer.total_size as f64) * 100.0)
                         .min(100.0);
+                    // Publish preview-readiness from the resumed on-disk state.
+                    // Paused/stopped/queued downloads have no running worker to
+                    // compute this, so without it the UI's Preview action would
+                    // be greyed out after a restart even when the first part is
+                    // already verified and a preview would succeed. Active
+                    // downloads get this refreshed by their worker once it spawns.
+                    control.set_preview_ready(
+                        tracker.is_preview_ready(&transfer.file_name, transfer.total_size),
+                    );
                 }
 
                 // If the app crashed during Verifying/Completing, handle locally
@@ -5537,6 +5550,12 @@ pub async fn start_network(
                     // connections free up).
                     ed2k::multi_source::set_global_download_conn_limit(
                         new_settings.max_connections as usize,
+                    );
+                    // Hot-reload the global preview-priority preference so the
+                    // Settings toggle takes effect immediately for all
+                    // in-flight downloads (next chunk selection).
+                    crate::sharing::manager::set_global_preview_priority(
+                        new_settings.preview_priority_all,
                     );
                     if !new_settings.uss_enabled {
                         state.uss_host = None;
@@ -20404,6 +20423,7 @@ async fn handle_command_inner(
                                 a4af_sources: 0,
                                 max_sources: 0,
                                 preview_priority: false,
+                                preview_ready: false,
                                 ember_sources: 0,
                                 client_software: String::new(),
                                 country_code: None,
@@ -23365,6 +23385,7 @@ async fn handle_upload_event(
                 a4af_sources: 0,
                 max_sources: 0,
                 preview_priority: false,
+                preview_ready: false,
                 ember_sources: 0,
                 client_software,
                 country_code,

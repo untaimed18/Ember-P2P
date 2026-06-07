@@ -737,6 +737,7 @@ impl Database {
                     a4af_sources: 0,
                     max_sources: 0,
                     preview_priority: false,
+                    preview_ready: false,
                     ember_sources: 0,
                     client_software: String::new(),
                     country_code: None,

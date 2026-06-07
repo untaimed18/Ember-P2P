@@ -993,6 +993,13 @@
           </div>
           <div class="field toggle-row">
             <div class="toggle-info">
+              <span class="toggle-title">{m.settings_preview_priority_all()}</span>
+              <span class="hint">{m.settings_preview_priority_all_hint()}</span>
+            </div>
+            <ToggleSwitch bind:checked={settings.preview_priority_all} ariaLabel={m.settings_preview_priority_all()} />
+          </div>
+          <div class="field toggle-row">
+            <div class="toggle-info">
               <span class="toggle-title">{m.settings_skip_compress_video()}</span>
               <span class="hint">{m.settings_skip_compress_video_hint()}</span>
             </div>
