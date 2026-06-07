@@ -115,14 +115,301 @@ fn spawn_save_snapshot(snap: super::part_tracker::SaveSnapshot) {
     });
 }
 
-/// Maximum simultaneous source connections per download.
-///
-/// This permit count gates connecting + queued + transferring sources (the
-/// permit is held for the whole `download_parts_from_source` lifetime). Raised
-/// from 10 so live sources aren't starved while slots are tied up dialing
-/// dead/slow peers — eMule keeps a much larger connection pool per file.
-const MAX_CONCURRENT_SOURCES: usize = 20;
+/// Per-download cap on simultaneously *held* source connections
+/// (connecting + actively-queued + transferring). The permit is held for
+/// the whole `download_parts_from_source` lifetime — EXCEPT that a source
+/// which detaches to a connectionless `OnQueue` state (Path B, under permit
+/// pressure) releases its permit so a waiting source can take it. That is
+/// how a popular file ends up *queued* on far more peers than it holds open
+/// sockets to, mirroring eMule (which keeps a large per-file source pool but
+/// only a bounded number of live connections). The machine-wide ceiling is
+/// `GLOBAL_DL_CONN_LIMITER` (eMule `maxconnections`).
+const MAX_CONCURRENT_SOURCES: usize = 50;
 const SOURCE_INJECTION_WAIT_SECS: u64 = 10;
+
+/// Global cap on simultaneously held outbound download-source connections
+/// across *all* active downloads, wired from `AppSettings::max_connections`
+/// (eMule's machine-wide `maxconnections`). Installed at network start and
+/// resized on settings change. A held connection takes one permit for its
+/// lifetime; detaching to `OnQueue` releases it. This is the safety bound
+/// that keeps the raised per-file budget from exhausting the OS connection
+/// table when many downloads run concurrently.
+static GLOBAL_DL_CONN_LIMITER: std::sync::OnceLock<GlobalConnLimiter> = std::sync::OnceLock::new();
+
+struct GlobalConnLimiter {
+    sem: Arc<tokio::sync::Semaphore>,
+    current_max: std::sync::atomic::AtomicUsize,
+    resize_lock: std::sync::Mutex<()>,
+}
+
+impl GlobalConnLimiter {
+    fn new(max: usize) -> Self {
+        let max = max.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
+        Self {
+            sem: Arc::new(tokio::sync::Semaphore::new(max)),
+            current_max: std::sync::atomic::AtomicUsize::new(max),
+            resize_lock: std::sync::Mutex::new(()),
+        }
+    }
+
+    fn set_max(&self, new_max: usize) {
+        use std::sync::atomic::Ordering;
+        let new_max = new_max.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
+        // Recover a poisoned resize lock rather than skip the resize — the
+        // guarded region only touches the semaphore + counter, both of which
+        // stay consistent regardless of where a previous panic landed.
+        let _g = self.resize_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let cur = self.current_max.load(Ordering::SeqCst);
+        if new_max > cur {
+            self.sem.add_permits(new_max - cur);
+            self.current_max.store(new_max, Ordering::SeqCst);
+        } else if new_max < cur {
+            // Best-effort shrink: only reclaim permits that are free right
+            // now. A permit backing a live connection keeps it alive; the cap
+            // re-tightens naturally as those connections end and re-acquire.
+            let want = cur - new_max;
+            let mut removed = 0;
+            while removed < want {
+                match self.sem.try_acquire() {
+                    Ok(p) => {
+                        p.forget();
+                        removed += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            self.current_max.store(cur - removed, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Install or resize the global download-connection cap. Idempotent; safe to
+/// call from the network-start path and the settings-update arm.
+pub fn set_global_download_conn_limit(max: usize) {
+    match GLOBAL_DL_CONN_LIMITER.get() {
+        Some(l) => l.set_max(max),
+        None => {
+            let _ = GLOBAL_DL_CONN_LIMITER.set(GlobalConnLimiter::new(max));
+        }
+    }
+}
+
+// --- Path B telemetry -------------------------------------------------------
+//
+// Lightweight machine-wide counters so a real run can confirm the queued-source
+// model is behaving and the constants are tuned right. Read by the network
+// loop's periodic summary (`pathb_event_counts` / `global_dl_conn_stats`).
+// Monotonic since process start; cheap relaxed atomics on hot-ish paths.
+static QUEUE_DETACH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PUSH_GRANT_DIVERSION_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static SLOW_ROTATE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GLOBAL_DL_ACQUIRE_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static GLOBAL_DL_CONTENDED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A deep-queued source detached under connection pressure (Stage 3).
+pub(crate) fn note_queue_detach() {
+    QUEUE_DETACH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// An inbound uploader reconnect was diverted into an active download (Stage 4
+/// push-grant). Called from the upload listener.
+pub fn note_push_grant_diversion() {
+    PUSH_GRANT_DIVERSION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A slow-but-alive source was rotated out to free a contended slot.
+fn note_slow_rotate() {
+    SLOW_ROTATE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(detaches, push-grant diversions, slow-source rotations)` since start.
+pub fn pathb_event_counts() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        QUEUE_DETACH_COUNT.load(Relaxed),
+        PUSH_GRANT_DIVERSION_COUNT.load(Relaxed),
+        SLOW_ROTATE_COUNT.load(Relaxed),
+    )
+}
+
+/// Snapshot of the global download-connection cap for telemetry:
+/// `(in_use, max, total_acquires, contended_acquires)`. `None` before the
+/// limiter is installed (pre-network-start).
+pub fn global_dl_conn_stats() -> Option<(usize, usize, u64, u64)> {
+    use std::sync::atomic::Ordering;
+    let l = GLOBAL_DL_CONN_LIMITER.get()?;
+    let max = l.current_max.load(Ordering::SeqCst);
+    let in_use = max.saturating_sub(l.sem.available_permits());
+    Some((
+        in_use,
+        max,
+        GLOBAL_DL_ACQUIRE_COUNT.load(Ordering::Relaxed),
+        GLOBAL_DL_CONTENDED_COUNT.load(Ordering::Relaxed),
+    ))
+}
+
+/// Whether the global cap currently has zero free permits (every download
+/// connection slot is in use). Used by trickle-source rotation to confirm the
+/// slot it would free is actually contended before dropping a slow source.
+fn global_dl_conn_contended() -> bool {
+    GLOBAL_DL_CONN_LIMITER
+        .get()
+        .map_or(false, |l| l.sem.available_permits() == 0)
+}
+
+/// Acquire one global download-connection permit, waiting if the cap is hit.
+/// Returns `None` only if the limiter was never installed (pre-startup), in
+/// which case the caller proceeds uncapped rather than stalling.
+///
+/// `priority_ord` is the download's eMule priority ordinal (see
+/// `TransferManager::priority_ordinal`: verylow=0 .. release=5). It implements
+/// the documented "downloads: relative source-slot allocation across our own
+/// transfers": lower-priority downloads must leave a reserve of free permits so
+/// a higher-priority download always finds a slot under contention. `high`/
+/// `release` reserve nothing (may use every permit); `normal`/`auto` leave a
+/// small reserve; `low`/`verylow` leave a larger one. A bounded max-wait keeps
+/// low-priority downloads from being starved forever when pressure persists —
+/// they still make progress, just yield slots to higher-priority files first.
+async fn acquire_global_dl_conn(priority_ord: u8) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    use std::sync::atomic::Ordering;
+    let l = GLOBAL_DL_CONN_LIMITER.get()?;
+    GLOBAL_DL_ACQUIRE_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    let max = l.current_max.load(Ordering::SeqCst);
+    let reserve = match priority_ord {
+        4 | 5 => 0,                                    // high / release
+        2 | 3 => (max / 5).min(max.saturating_sub(1)), // normal / auto (~20%)
+        _ => (max * 2 / 5).min(max.saturating_sub(1)), // low / verylow (~40%)
+    };
+    if reserve > 0 {
+        const MAX_RESERVE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+        let start = std::time::Instant::now();
+        let mut counted = false;
+        while l.sem.available_permits() <= reserve && start.elapsed() < MAX_RESERVE_WAIT {
+            if !counted {
+                GLOBAL_DL_CONTENDED_COUNT.fetch_add(1, Ordering::Relaxed);
+                counted = true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    } else if l.sem.available_permits() == 0 {
+        GLOBAL_DL_CONTENDED_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    l.sem.clone().acquire_owned().await.ok()
+}
+
+/// Trickle-source rotation floor. A source that has delivered data but then
+/// sits below this rate for `TRICKLE_SLOW_WINDOW` while connections are
+/// contended is occupying a scarce slot a fresh candidate could use, so we
+/// rotate it out (same warm-keep path as a Path B queue detach). Deliberately
+/// conservative: eMule keeps slow sources when it has spare connections, so we
+/// only rotate when the slot is genuinely contended (per-file at budget or the
+/// machine-wide cap saturated).
+const TRICKLE_SLOW_FLOOR_BPS: u64 = 2 * 1024;
+const TRICKLE_SLOW_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Minimum spacing between new outbound source dials, machine-wide. Paces
+/// connection attempts so bursty source injection and the Path B
+/// detach/re-dial cycle can't trigger a connection storm (eMule similarly
+/// rations new connection attempts per control tick).
+const OUTBOUND_DIAL_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+static OUTBOUND_DIAL_GATE: std::sync::OnceLock<tokio::sync::Mutex<std::time::Instant>> =
+    std::sync::OnceLock::new();
+
+/// Block until this task may open a new outbound connection, spacing dials by
+/// `OUTBOUND_DIAL_MIN_INTERVAL`. The gate lock is never held across the sleep
+/// — each caller reserves its slot, releases the lock, then waits.
+async fn throttle_outbound_dial() {
+    let gate = OUTBOUND_DIAL_GATE.get_or_init(|| {
+        tokio::sync::Mutex::new(std::time::Instant::now() - OUTBOUND_DIAL_MIN_INTERVAL)
+    });
+    let wait = {
+        let mut last = gate.lock().await;
+        let now = std::time::Instant::now();
+        let scheduled = (*last + OUTBOUND_DIAL_MIN_INTERVAL).max(now);
+        *last = scheduled;
+        scheduled.saturating_duration_since(now)
+    };
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Identity of a peer we currently hold a live download connection to, used to
+/// suppress futile duplicate dials. The user hash is preferred — it is stable
+/// across the peer's listening port and reachable route, so a LowID source
+/// adopted through a KAD/server callback (on its ephemeral inbound port) and
+/// that same peer's stale direct list entry (on its advertised port) resolve to
+/// one identity. We fall back to the dotted IP only when the source metadata
+/// carries no hash yet.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum LivePeerId {
+    Hash([u8; 16]),
+    Ip(String),
+}
+
+fn live_peer_id(user_hash: &[u8; 16], peer_ip: &str) -> LivePeerId {
+    if *user_hash != [0u8; 16] {
+        LivePeerId::Hash(*user_hash)
+    } else {
+        LivePeerId::Ip(peer_ip.to_string())
+    }
+}
+
+/// Per-transfer set of peer identities that have a live source connection.
+/// Keyed by transfer id so concurrent downloads can't cross-suppress each
+/// other; entries are added once a source's handshake converges and removed via
+/// `LivePeerGuard` when the source task ends, so a peer that drops becomes
+/// dialable again. This is what stops the retry loop from re-dialing (and
+/// timing out on) a LowID peer we already reach via an adopted callback stream.
+type LivePeerSet = std::collections::HashMap<String, std::collections::HashSet<LivePeerId>>;
+static LIVE_PEER_IDS: std::sync::OnceLock<std::sync::Mutex<LivePeerSet>> =
+    std::sync::OnceLock::new();
+
+fn live_peer_ids() -> &'static std::sync::Mutex<LivePeerSet> {
+    LIVE_PEER_IDS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// True if some source for `transfer_id` already holds a live connection to the
+/// peer identified by `id`.
+fn is_live_peer(transfer_id: &str, id: &LivePeerId) -> bool {
+    let map = live_peer_ids().lock().unwrap_or_else(|p| p.into_inner());
+    map.get(transfer_id).is_some_and(|s| s.contains(id))
+}
+
+/// Claim `id` as live for `transfer_id`. Returns `true` if we are the first
+/// claimant (caller owns the slot and must hold a `LivePeerGuard` to release
+/// it), `false` if another source is already connected to this peer (caller is
+/// a duplicate and should bail without releasing anything).
+fn claim_live_peer(transfer_id: &str, id: LivePeerId) -> bool {
+    let mut map = live_peer_ids().lock().unwrap_or_else(|p| p.into_inner());
+    map.entry(transfer_id.to_string()).or_default().insert(id)
+}
+
+fn release_live_peer(transfer_id: &str, id: &LivePeerId) {
+    let mut map = live_peer_ids().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(set) = map.get_mut(transfer_id) {
+        set.remove(id);
+        if set.is_empty() {
+            map.remove(transfer_id);
+        }
+    }
+}
+
+/// RAII release of a claimed `LivePeerId`, covering every task exit path
+/// (`?`, `bail!`, early `return`, normal completion).
+struct LivePeerGuard {
+    transfer_id: String,
+    id: LivePeerId,
+}
+impl Drop for LivePeerGuard {
+    fn drop(&mut self) {
+        release_live_peer(&self.transfer_id, &self.id);
+    }
+}
 
 /// Max *silence* tolerated on a single handshake-phase packet read
 /// (hello / emule-info / file-status / hashset). The timer resets whenever a
@@ -3107,6 +3394,10 @@ async fn download_parts_from_source(
     let mut peer_supports_aich: bool;
     let mut peer_ember_hash: Option<[u8; 16]>;
     let mut deferred_packet: Option<(u8, u8, Vec<u8>)> = None;
+    // Held for the whole outbound source lifetime; dropped on return (or on
+    // a Path B detach) to release the machine-wide connection slot. Stays
+    // `None` for adopted inbound streams, which open no outbound connection.
+    let mut _global_conn_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
 
     if let Some(es) = pre_established {
         // Pre-established (KAD/server callback) path: the upload-side
@@ -3170,6 +3461,32 @@ async fn download_parts_from_source(
         }
         hello_caps = caps;
     } else {
+        // Skip dialing a peer we already hold a live connection to by another
+        // route, before spending a global connection slot or a dial-pacing
+        // token on it. The clearest win: a LowID source adopted via a
+        // KAD/server callback (a separate injected task) whose stale direct
+        // list entry would otherwise be re-dialed on every retry round and
+        // always time out, since LowID peers can't accept inbound TCP. Keyed on
+        // the peer's user hash when the source metadata carries one, else its
+        // IP; the live connection itself claims the authoritative hash below.
+        let predial_id = live_peer_id(
+            &source.peer_user_hash.unwrap_or([0u8; 16]),
+            &source.peer_ip,
+        );
+        if is_live_peer(&transfer_id, &predial_id) {
+            debug!(
+                "Source {} ({}) skip dial: already connected to this peer via another route",
+                _src_idx, addr,
+            );
+            return Ok(());
+        }
+        // Global connection cap + dial pacing apply to outbound dials only.
+        // Reserve the machine-wide slot first (waits here if we're already at
+        // eMule's `maxconnections`), then pace the actual TCP connect so a
+        // burst of source starts can't storm the network.
+        _global_conn_permit = acquire_global_dl_conn(control.download_priority_ordinal()).await;
+        throttle_outbound_dial().await;
+
         // Build the Hello payload once; it's identical across attempts.
         // (Include buddy tags if we have a buddy.)
         let buddy = match &buddy_info {
@@ -3489,6 +3806,27 @@ async fn download_parts_from_source(
             }
         }
     }
+
+    // Now that the handshake has converged (dialed or adopted) we know the
+    // peer's authoritative user hash. Claim it as the live identity for this
+    // transfer so any other source task for the same peer — typically a stale
+    // direct list entry duplicating a callback-adopted LowID source — skips its
+    // own dial. If another source is already connected to this peer we are the
+    // duplicate (e.g. we dialed just before the callback was adopted): drop this
+    // connection cleanly. We never claimed the slot, so there is nothing to
+    // release, and the `_global_conn_permit` (if any) frees as we return.
+    let live_id = live_peer_id(&peer_user_hash, &source.peer_ip);
+    if !claim_live_peer(&transfer_id, live_id.clone()) {
+        debug!(
+            "Source {} ({}) dropping duplicate connection: peer already live via another source",
+            _src_idx, addr,
+        );
+        return Ok(());
+    }
+    let _live_guard = LivePeerGuard {
+        transfer_id: transfer_id.clone(),
+        id: live_id,
+    };
 
     // Proactive SecIdent kick-off for paths that didn't already fire one.
     // Covers the modern-eMule fast path where the peer's HelloAnswer
@@ -4874,17 +5212,53 @@ async fn download_parts_from_source(
         // uploaders push OP_ACCEPTUPLOADREQ when a slot opens.
         let queue_start = std::time::Instant::now();
         emit_source!("queued", None, 0u64);
+        // Path B (eMule queued-source model): we don't need to hold the TCP
+        // connection open just to keep a remote queue slot — eMule keeps the
+        // slot alive via UDP reask and lets the uploader reconnect (sending
+        // OP_ACCEPTUPLOADREQ) when our turn comes. So under connection
+        // pressure (this download's held-connection budget is exhausted) we
+        // DETACH a deep-queued OUTBOUND source: close the socket and free the
+        // permit for a source we haven't reached yet, leaving this one as
+        // OnQueue. The `stage:queue_detached` classification (used here and
+        // for a peer-initiated drop) cools the source for FILEREASKTIME, keeps
+        // it in `per_file_sources`, and the persistent reask loop maintains
+        // the slot (UDP) + re-dials it later; the inbound path lets the
+        // uploader push-grant earlier. We keep holding NEAR-FRONT positions
+        // (rank <= threshold) so an imminent slot is granted instantly, and we
+        // only detach genuine outbound HighID sources (`_global_conn_permit`
+        // is `Some`) — never adopted LowID callbacks, which we can't re-dial.
+        const QUEUE_DETACH_GRACE_SECS: u64 = 20;
+        const QUEUE_DETACH_RANK_THRESHOLD: u32 = 30;
+        let mut last_rank: Option<u32> = None;
         loop {
             check_control(&control).await?;
-            if queue_start.elapsed().as_secs() > queue_wait_secs {
+            let elapsed = queue_start.elapsed().as_secs();
+            if elapsed > queue_wait_secs {
                 emit_source!("failed", None, 0u64);
                 anyhow::bail!("timed out waiting for upload slot");
             }
-            let remaining = queue_wait_secs
-                .saturating_sub(queue_start.elapsed().as_secs())
-                .max(60);
+            if _global_conn_permit.is_some()
+                && elapsed >= QUEUE_DETACH_GRACE_SECS
+                && (active_count.load(Ordering::Relaxed) + queued_count.load(Ordering::Relaxed))
+                    >= MAX_CONCURRENT_SOURCES as u32
+                && last_rank.map_or(false, |r| r > QUEUE_DETACH_RANK_THRESHOLD)
+            {
+                debug!(
+                    "Source {} ({}) detaching under connection pressure at queue rank {:?} — keeping slot warm via reask",
+                    _src_idx, addr, last_rank
+                );
+                note_queue_detach();
+                anyhow::bail!(
+                    "stage:queue_detached detached under connection pressure (rank {last_rank:?})"
+                );
+            }
+            // Poll on a short tick so the pressure/detach check and the
+            // overall queue-wait timeout are both evaluated while we wait. A
+            // tick expiry with no packet is NORMAL while queued (it is NOT the
+            // timeout — that is the `elapsed > queue_wait_secs` check above).
+            let poll_secs = queue_wait_secs.saturating_sub(elapsed).min(5).max(1);
             let result = tokio::time::timeout(
-                std::time::Duration::from_secs(remaining),
+                std::time::Duration::from_secs(poll_secs),
                 read_packet_async_ms(&mut *reader),
             )
             .await;
@@ -4894,8 +5268,7 @@ async fn download_parts_from_source(
                     anyhow::bail!("stage:queue_detached connection lost while queued: {e}");
                 }
                 Err(_) => {
-                    emit_source!("failed", None, 0u64);
-                    anyhow::bail!("timed out waiting for upload slot");
+                    continue;
                 }
             };
             if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
@@ -4917,9 +5290,11 @@ async fn download_parts_from_source(
             }
             if proto == OP_EMULEPROT && opcode == OP_QUEUERANKING && payload.len() >= 2 {
                 let rank = u16::from_le_bytes([payload[0], payload[1]]);
+                last_rank = Some(rank as u32);
                 emit_source!("queued", Some(rank as u32), 0u64);
             } else if proto == OP_EDONKEYHEADER && opcode == OP_QUEUERANK && payload.len() >= 4 {
                 let rank = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                last_rank = Some(rank);
                 emit_source!("queued", Some(rank), 0u64);
             } else if proto == OP_EMULEPROT && opcode == OP_FILEDESC && payload.len() >= 5 {
                 let rating = payload[0];
@@ -5226,6 +5601,10 @@ async fn download_parts_from_source(
         const MAX_CONSECUTIVE_BAD_BLOCKS: u32 = 5;
         let mut data_loop_start = std::time::Instant::now();
         let mut got_any_data = false;
+        // Trickle-source rotation: timestamp since which this source has been
+        // continuously below `TRICKLE_SLOW_FLOOR_BPS`. Cleared whenever it
+        // recovers. See the rotation check at the top of the receive loop.
+        let mut slow_since: Option<std::time::Instant> = None;
         // eMule uses DOWNLOADTIMEOUT (100s) as a single timeout for both initial
         // and mid-transfer stalls.  We use 60s for the initial wait as a
         // compromise: gives slow uploaders (disk I/O, throttling, busy queue)
@@ -5307,6 +5686,37 @@ async fn download_parts_from_source(
                 if t.is_part_complete(part_idx) {
                     exit_reason = "is_part_complete";
                     break;
+                }
+            }
+
+            // Trickle-source rotation: a source that delivered data but has now
+            // sat below TRICKLE_SLOW_FLOOR_BPS for TRICKLE_SLOW_WINDOW is wasting
+            // a connection slot. Under genuine contention (this file at its
+            // per-file budget, or the machine-wide cap saturated) rotate it out
+            // via the Path B warm-keep detach so a fresh candidate can take the
+            // slot; the source stays known, gets UDP-reasked, and is re-dialed
+            // later. Gated on holding a global permit so we never drop adopted
+            // inbound / LowID streams (which carry no outbound permit).
+            if got_any_data && _global_conn_permit.is_some() {
+                if measured_speed < TRICKLE_SLOW_FLOOR_BPS {
+                    let since = *slow_since.get_or_insert_with(std::time::Instant::now);
+                    let file_at_budget =
+                        active_count.load(Ordering::Relaxed) >= MAX_CONCURRENT_SOURCES as u32;
+                    if since.elapsed() >= TRICKLE_SLOW_WINDOW
+                        && (file_at_budget || global_dl_conn_contended())
+                    {
+                        note_slow_rotate();
+                        debug!(
+                            "Source {} ({}) rotating out: {} B/s for {}s under connection pressure — freeing slot for a fresh candidate",
+                            _src_idx, addr, measured_speed, since.elapsed().as_secs()
+                        );
+                        emit_source!("queued", None, 0u64);
+                        anyhow::bail!(
+                            "stage:queue_detached slow source rotated ({measured_speed} B/s under pressure)"
+                        );
+                    }
+                } else {
+                    slow_since = None;
                 }
             }
 
