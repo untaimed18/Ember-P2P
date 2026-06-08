@@ -169,8 +169,11 @@
 <nav class="sidebar" class:collapsed={isCollapsed} aria-label={m.sidebar_aria_primary()}>
   <div class="sidebar-header">
     <a href="/" class="logo" onclick={(e) => navigate(e, '/')} title={m.sidebar_logo_title()}>
-      <span class="logo-text">EMBER</span>
-      <span class="logo-sub">{m.app_tagline()}</span>
+      <img class="logo-icon" src="/icon.png" alt="" width="38" height="38" draggable="false" />
+      <span class="logo-wordmark">
+        <span class="logo-text">EMBER</span>
+        <span class="logo-sub">{m.app_tagline()}</span>
+      </span>
     </a>
   </div>
 
@@ -404,9 +407,11 @@
   }
 
   .logo {
-    padding: 20px 16px;
+    padding: 16px;
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
+    align-items: center;
+    gap: 11px;
     text-decoration: none;
     cursor: pointer;
     overflow: hidden;
@@ -415,20 +420,35 @@
     min-width: 0;
   }
 
+  .logo-icon {
+    width: 38px;
+    height: 38px;
+    flex-shrink: 0;
+    border-radius: 9px;
+    display: block;
+    user-select: none;
+    /* Crisp 1px ring + soft drop shadow so the badge reads as a
+       discrete app icon against the sidebar panel. */
+    box-shadow:
+      0 0 0 1px var(--border),
+      0 2px 6px rgba(0, 0, 0, 0.28);
+  }
+
+  .logo-wordmark {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  /* Collapsed: center the icon badge and drop the wordmark entirely. */
   .sidebar.collapsed .logo {
-    padding: 20px 8px;
-    align-items: center;
+    padding: 16px 0;
+    justify-content: center;
+    gap: 0;
   }
 
-  /* Scale transform instead of font-size so the shrink animation
-     doesn't reflow every frame. Origin is the left edge so the logo
-     glyphs collapse in-place toward the icon column. */
-  .sidebar.collapsed .logo-text {
-    transform: scale(0.65);
-    letter-spacing: 1px;
-  }
-
-  .sidebar.collapsed .logo-sub {
+  .sidebar.collapsed .logo-wordmark {
     display: none;
   }
 
@@ -441,9 +461,8 @@
     font-size: 22px;
     font-weight: 800;
     letter-spacing: 3px;
+    line-height: 1.1;
     color: var(--accent);
-    transform-origin: center;
-    transition: transform var(--transition-normal) ease, letter-spacing var(--transition-normal) ease;
   }
 
   .logo-sub {
@@ -451,7 +470,7 @@
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 1px;
-    margin-top: 2px;
+    margin-top: 1px;
   }
 
   .nav-list {
