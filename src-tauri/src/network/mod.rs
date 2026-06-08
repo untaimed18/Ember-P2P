@@ -13937,7 +13937,7 @@ pub async fn start_network(
                 // row on the Statistics page shows only server-based
                 // source-asking and reads zero on KAD/Ember-only runs.
                 stats_manager.drain_sx_counters();
-                stats_manager.record_rate();
+                stats_manager.record_rate(chrono::Utc::now().timestamp());
                 state.ip_filter.collect_shared_hits(&shared_ip_filter);
                 for (transfer_id, injected, remaining) in drain_active_source_overflow(&mut state) {
                     debug!(
@@ -13965,7 +13965,7 @@ pub async fn start_network(
                 }
             }
 
-            // Periodic statistics save (every 5 minutes)
+            // Periodic statistics save (every 60s — see stats_save_timer)
             _ = stats_save_timer.tick() => {
                 stats_manager.save_cumulative(&db);
             }

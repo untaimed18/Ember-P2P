@@ -166,8 +166,11 @@ impl StatsManager {
         }
     }
 
-    pub fn record_rate(&mut self) {
-        let now = chrono::Utc::now().timestamp();
+    /// Snapshot the session byte counters and recompute the smoothed
+    /// download/upload rates. `now` is the current unix timestamp in
+    /// seconds (injected rather than read internally so the rate math is
+    /// unit-testable); production callers pass `chrono::Utc::now().timestamp()`.
+    pub fn record_rate(&mut self, now: i64) {
         let down = self.session_down_counter.load(Ordering::Relaxed);
         let up = self.session_up_counter.load(Ordering::Relaxed);
 
@@ -189,23 +192,31 @@ impl StatsManager {
             self.up_rate_history.pop_front();
         }
 
-        let window = 10.min(self.down_rate_history.len());
+        self.stats.session_down_rate = Self::windowed_rate(&self.down_rate_history, now);
+        self.stats.session_up_rate = Self::windowed_rate(&self.up_rate_history, now);
+    }
+
+    /// Moving-average rate (bytes/sec) over the most recent samples of
+    /// `history` (each entry is `(timestamp_secs, bytes_since_prev_tick)`).
+    ///
+    /// The bytes transferred between the oldest sample in the window and
+    /// `now` equal the sum of the `window - 1` most recent deltas — the
+    /// oldest sample's own delta belongs to the interval *before* the
+    /// window begins. Summing all `window` deltas while dividing by the
+    /// `(window - 1)`-interval time span overestimated the rate: ≈2× with
+    /// only two samples (right after a transfer starts) and ≈11% at steady
+    /// state with a full 10-sample window.
+    fn windowed_rate(history: &VecDeque<(i64, u64)>, now: i64) -> f64 {
+        let window = 10.min(history.len());
         if window > 1 {
-            let sum: u64 = self.down_rate_history.iter().rev().take(window).map(|(_, v)| v).sum();
-            let oldest_ts = self.down_rate_history.iter().rev().nth(window - 1).map(|(t, _)| *t).unwrap_or(now);
+            let sum: u64 = history.iter().rev().take(window - 1).map(|(_, v)| v).sum();
+            let oldest_ts = history.iter().rev().nth(window - 1).map(|(t, _)| *t).unwrap_or(now);
             let elapsed = now.saturating_sub(oldest_ts).max(1) as f64;
-            self.stats.session_down_rate = sum as f64 / elapsed;
+            sum as f64 / elapsed
         } else if window == 1 {
-            self.stats.session_down_rate = self.down_rate_history.back().map(|(_, v)| *v as f64).unwrap_or(0.0);
-        }
-        let window = 10.min(self.up_rate_history.len());
-        if window > 1 {
-            let sum: u64 = self.up_rate_history.iter().rev().take(window).map(|(_, v)| v).sum();
-            let oldest_ts = self.up_rate_history.iter().rev().nth(window - 1).map(|(t, _)| *t).unwrap_or(now);
-            let elapsed = now.saturating_sub(oldest_ts).max(1) as f64;
-            self.stats.session_up_rate = sum as f64 / elapsed;
-        } else if window == 1 {
-            self.stats.session_up_rate = self.up_rate_history.back().map(|(_, v)| *v as f64).unwrap_or(0.0);
+            history.back().map(|(_, v)| *v as f64).unwrap_or(0.0)
+        } else {
+            0.0
         }
     }
 
@@ -247,4 +258,60 @@ pub enum OverheadCategory {
 pub enum OverheadDirection {
     Download,
     Upload,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Steady 100 B/s for a full window must report exactly 100 B/s — not
+    /// the old `window / (window - 1)` (~111 B/s) overestimate.
+    #[test]
+    fn rate_steady_state_is_accurate() {
+        let mut mgr = StatsManager::new();
+        for t in 0..=10i64 {
+            mgr.session_down_counter.store((t as u64) * 100, Ordering::Relaxed);
+            mgr.record_rate(t);
+        }
+        assert!(
+            (mgr.stats.session_down_rate - 100.0).abs() < 1e-6,
+            "expected 100 B/s steady-state, got {}",
+            mgr.stats.session_down_rate
+        );
+    }
+
+    /// With only two samples spanning one 1-second interval, the rate must
+    /// be the single interval's delta — the old code summed the priming
+    /// first-tick delta into the same 1s span and roughly doubled it.
+    #[test]
+    fn rate_two_samples_not_doubled() {
+        let mut mgr = StatsManager::new();
+        // First tick carries a non-zero priming delta (bytes already moved
+        // before the first record_rate call): 500 B.
+        mgr.session_down_counter.store(500, Ordering::Relaxed);
+        mgr.record_rate(0);
+        // Second tick: +100 B over 1 second => 100 B/s.
+        mgr.session_down_counter.store(600, Ordering::Relaxed);
+        mgr.record_rate(1);
+        assert!(
+            (mgr.stats.session_down_rate - 100.0).abs() < 1e-6,
+            "expected 100 B/s from two samples, got {} (priming delta leaked in?)",
+            mgr.stats.session_down_rate
+        );
+    }
+
+    /// Upload path shares the same helper; verify it is wired up too.
+    #[test]
+    fn upload_rate_uses_same_window() {
+        let mut mgr = StatsManager::new();
+        for t in 0..=10i64 {
+            mgr.session_up_counter.store((t as u64) * 2048, Ordering::Relaxed);
+            mgr.record_rate(t);
+        }
+        assert!(
+            (mgr.stats.session_up_rate - 2048.0).abs() < 1e-6,
+            "expected 2048 B/s steady-state upload, got {}",
+            mgr.stats.session_up_rate
+        );
+    }
 }
