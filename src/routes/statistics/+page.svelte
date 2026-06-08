@@ -21,6 +21,7 @@
   let repStats = $state<ReputationStatsInfo | null>(null);
 
   let statsTimeoutId: ReturnType<typeof setTimeout> | undefined;
+  let repTimeoutId: ReturnType<typeof setTimeout> | undefined;
 
   async function loadStats() {
     if (refreshBusy || unmounted) return;
@@ -40,7 +41,19 @@
             statsTimeoutId = setTimeout(() => reject(new Error('timeout')), 4000);
           }),
         ]),
-        getReputationStats(),
+        // Reputation rides the same watchdog as stats. Unlike
+        // getStatistics() (a direct cached-snapshot read), this round-trips
+        // through the network task's command channel, whose reply timeout
+        // is 10s. Because both fetches share the `refreshBusy` gate, a
+        // briefly-busy network loop would otherwise stall the entire
+        // dashboard refresh for up to 10s even though the transfer stats
+        // themselves resolved instantly. Bound it independently.
+        Promise.race([
+          getReputationStats(),
+          new Promise<ReputationStatsInfo>((_, reject) => {
+            repTimeoutId = setTimeout(() => reject(new Error('timeout')), 4000);
+          }),
+        ]),
       ]);
       if (unmounted) return;
       if (repResult.status === 'fulfilled') repStats = repResult.value;
@@ -62,6 +75,10 @@
       if (statsTimeoutId) {
         clearTimeout(statsTimeoutId);
         statsTimeoutId = undefined;
+      }
+      if (repTimeoutId) {
+        clearTimeout(repTimeoutId);
+        repTimeoutId = undefined;
       }
       if (!unmounted) loading = false;
       refreshBusy = false;
