@@ -472,8 +472,8 @@
     return `nohash:${result.result_origin}:${result.file.name}:${result.file.size}`;
   }
 
-  function inferSearchTypeFromExtension(extension: string): string {
-    const ext = extension.toLowerCase();
+  function inferSearchTypeFromExtension(extension: string | null | undefined): string {
+    const ext = (extension ?? '').toLowerCase();
     if (['mp3', 'ogg', 'wav', 'flac', 'aac', 'm4a', 'wma', 'opus'].includes(ext)) return 'Audio';
     if (['avi', 'mkv', 'mp4', 'wmv', 'mov', 'mpeg', 'mpg', 'webm', 'flv'].includes(ext)) return 'Video';
     if (['jpg', 'jpeg', 'png', 'gif', 'bmp', 'svg', 'webp'].includes(ext)) return 'Image';
@@ -692,7 +692,7 @@
       if (spamHidden && r.is_spam) continue;
       if (isLocalOnlySearchResult(r)) continue;
       if (hasType && resultType(r) !== filterType) continue;
-      if (hasExt && r.file.extension.toLowerCase() !== ext) continue;
+      if (hasExt && (r.file.extension ?? '').toLowerCase() !== ext) continue;
       if (minBytes > 0 && r.file.size < minBytes) continue;
       if (maxBytes > 0 && r.file.size > maxBytes) continue;
       if (minSrc > 0 && r.availability < minSrc) continue;

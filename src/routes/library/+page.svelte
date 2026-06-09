@@ -1539,6 +1539,24 @@
     }
   }
 
+  // A collection opened from the OS (double-clicked .emulecollection) is
+  // parsed by the deep-link handler, which stashes it in `incomingCollection`
+  // and routes us to this page. Consume it via an effect rather than only in
+  // onMount: when we are ALREADY on /library, navigating to the current route
+  // does not remount the component, so onMount would never fire again and the
+  // collection would be dropped. The effect runs on mount and on every later
+  // set, then clears the store so a future navigation doesn't re-open a stale
+  // collection. Resetting the store re-runs the effect with `null`, which is a
+  // no-op (no infinite loop).
+  $effect(() => {
+    const incoming = $incomingCollection;
+    if (incoming) {
+      loadedCollection = incoming;
+      collectionsOpen = true;
+      incomingCollection.set(null);
+    }
+  });
+
   onMount(() => {
     mounted = true;
     // localStorage can throw in private mode / quota-exceeded; wrap
@@ -1558,19 +1576,6 @@
     filtersRestored = true;
 
     refresh();
-
-    // A collection opened from the OS (double-clicked .emulecollection) is
-    // parsed by the deep-link handler, which stashes it here and routes us to
-    // this page. Adopt it into the normal collection viewer, then clear the
-    // store so navigating back later doesn't re-open a stale collection.
-    {
-      const incoming = $incomingCollection;
-      if (incoming) {
-        loadedCollection = incoming;
-        collectionsOpen = true;
-        incomingCollection.set(null);
-      }
-    }
 
     // Poll every 3s: detect scan completion and refresh data while scanning.
     // The poll never INITIATES the scanning UI state -- only progress events do that.

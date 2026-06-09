@@ -1361,34 +1361,36 @@ impl UploadHandler {
         } {
             let path = PathBuf::from(&file.path);
             let is_partial = path.extension().map(|e| e == "part").unwrap_or(false);
-            if !is_partial {
-                // Always enforce containment: the served file must canonicalize
-                // to a location inside a shared folder or a download root.
-                // Previously this check was skipped when `shared_folders` was
-                // empty, which meant a stale index entry could still be served
-                // after the user cleared all shares. The index is only ever
-                // populated by scanning shared folders, so when no folders are
-                // configured the only legitimately-servable files are download
-                // partials/completed under the download roots.
-                let folders = self.shared_folders.read().await;
-                let mut allowed: Vec<String> = folders.clone();
-                allowed.push(self.download_folder.to_string_lossy().to_string());
-                allowed.push(
-                    self.download_folder
-                        .join("Downloads")
-                        .to_string_lossy()
-                        .to_string(),
+            // Always enforce containment, including for `.part` entries: the
+            // served file must canonicalize to a location inside a shared
+            // folder or a download root. Previously this check was skipped
+            // when `shared_folders` was empty, which meant a stale index entry
+            // could still be served after the user cleared all shares; it was
+            // also skipped entirely for `.part` index entries, so a stale or
+            // tampered index row pointing at an out-of-root partial could be
+            // served. The indexer never indexes `*.part`, so a legitimate
+            // partial inside a shared/download root still passes this check —
+            // enforcing it for partials is pure hardening with no impact on
+            // serving real in-root partials. Download partials served from the
+            // transfer manager use the `Temp/{id}.part` path below.
+            let folders = self.shared_folders.read().await;
+            let mut allowed: Vec<String> = folders.clone();
+            allowed.push(self.download_folder.to_string_lossy().to_string());
+            allowed.push(
+                self.download_folder
+                    .join("Downloads")
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            let in_allowed = std::fs::canonicalize(&path)
+                .map(|canon| crate::security::is_path_within_dirs(&canon, &allowed))
+                .unwrap_or(false);
+            if !in_allowed {
+                tracing::debug!(
+                    "Rejecting resolve for file not within shared/download roots: {}",
+                    hash_hex
                 );
-                let in_allowed = std::fs::canonicalize(&path)
-                    .map(|canon| crate::security::is_path_within_dirs(&canon, &allowed))
-                    .unwrap_or(false);
-                if !in_allowed {
-                    tracing::debug!(
-                        "Rejecting resolve for file not within shared/download roots: {}",
-                        hash_hex
-                    );
-                    return None;
-                }
+                return None;
             }
             return Some(ResolvedUploadFile {
                 name: file.name,
