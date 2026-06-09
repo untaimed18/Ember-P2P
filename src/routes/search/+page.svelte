@@ -489,6 +489,7 @@
   }
 
   let searchTimeoutSecs = $state(120);
+  let emberEnabled = $state(false);
 
   onMount(() => {
     loadPersistedPrefs();
@@ -497,6 +498,7 @@
       .then((s) => {
         searchTimeoutSecs = s.search_timeout_secs;
         spamProfile = s.spam_filter_profile ?? 'balanced';
+        emberEnabled = !!s.ember_native_enabled;
       })
       .catch(() => {});
   });
@@ -1582,6 +1584,9 @@
     <option value="global">{m.search_method_global()}</option>
     <option value="kad">{m.search_method_kad_only()}</option>
     <option value="server">{m.search_method_server_only()}</option>
+    {#if emberEnabled}
+      <option value="ember">{m.search_method_ember_only()}</option>
+    {/if}
   </select>
   <select class="type-select" bind:value={searchFileType} title={m.search_filter_by_filetype()}>
     {#each FILE_TYPES as ft}

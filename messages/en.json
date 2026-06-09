@@ -949,6 +949,7 @@
   "search_method_global": "Global",
   "search_method_kad_only": "KAD Only",
   "search_method_server_only": "Server Only",
+  "search_method_ember_only": "Ember Only",
   "search_filter_by_filetype": "Filter by file type",
   "search_sessions_aria": "Search sessions",
   "search_in_progress_aria": "Search in progress",
