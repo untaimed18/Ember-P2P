@@ -1243,6 +1243,101 @@ mod tests {
         );
     }
 
+    /// Build a `FOUND_VALUE`-shaped keyword blob (`record_data || signature`)
+    /// signed by `sk`, matching what `build_ember_keyword_results` parses.
+    fn ember_kw_blob(
+        sk: &ed25519_dalek::SigningKey,
+        keyword: &str,
+        file_hash: [u8; 16],
+        size: u64,
+        name: &str,
+    ) -> Vec<u8> {
+        let rec = ember::dht::publish::SignedRecord::keyword(
+            keyword, file_hash, [0u8; 32], size, name, sk,
+        );
+        let mut blob = rec.data.clone();
+        blob.extend_from_slice(&rec.signature);
+        blob
+    }
+
+    #[test]
+    fn ember_keyword_results_dedup_counts_distinct_publishers() {
+        let sk1 = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let sk2 = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+        let hash_a = [0xAAu8; 16];
+        let hash_b = [0xBBu8; 16];
+        // File A published by two distinct keypairs, file B by one.
+        let blobs = vec![
+            ember_kw_blob(&sk1, "ubuntu", hash_a, 100, "ubuntu-24.iso"),
+            ember_kw_blob(&sk2, "ubuntu", hash_a, 100, "ubuntu-24.iso"),
+            ember_kw_blob(&sk1, "ubuntu", hash_b, 200, "ubuntu-server.iso"),
+        ];
+        let results = build_ember_keyword_results(&blobs, &["ubuntu".to_string()]);
+        assert_eq!(results.len(), 2, "two distinct files");
+        let a = results
+            .iter()
+            .find(|r| r.file.hash == hex::encode(hash_a))
+            .expect("file A present");
+        assert_eq!(a.availability, 2, "two distinct publishers for file A");
+        assert_eq!(a.result_origin, crate::search::merge::ORIGIN_EMBER);
+        assert_eq!(a.file.size, 100);
+        assert_eq!(a.file.extension, "iso");
+        assert!(a.source_addresses.is_empty(), "keyword hits carry no sources");
+        let b = results
+            .iter()
+            .find(|r| r.file.hash == hex::encode(hash_b))
+            .expect("file B present");
+        assert_eq!(b.availability, 1);
+    }
+
+    #[test]
+    fn ember_keyword_results_multi_word_and_filter() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let hash_a = [0x11u8; 16];
+        let hash_b = [0x22u8; 16];
+        // Both stored under the primary keyword "ubuntu", but only file A's
+        // name also contains "server"; the multi-word AND-filter drops B.
+        let blobs = vec![
+            ember_kw_blob(&sk, "ubuntu", hash_a, 1, "ubuntu server amd64"),
+            ember_kw_blob(&sk, "ubuntu", hash_b, 1, "ubuntu desktop amd64"),
+        ];
+        let results = build_ember_keyword_results(
+            &blobs,
+            &["ubuntu".to_string(), "server".to_string()],
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].file.hash, hex::encode(hash_a));
+    }
+
+    #[test]
+    fn ember_keyword_results_ignore_source_and_garbage_blobs() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]);
+        let hash_a = [0x33u8; 16];
+        let source = ember::dht::publish::SignedRecord::source(
+            hash_a,
+            [0u8; 32],
+            1,
+            "ubuntu.iso",
+            ember::dht::publish::SourceContact {
+                ip: std::net::Ipv4Addr::new(1, 2, 3, 4),
+                tcp_port: 4662,
+                udp_port: 4672,
+                flags: 0,
+                noise_pub: [0u8; 32],
+            },
+            &sk,
+        );
+        let mut source_blob = source.data.clone();
+        source_blob.extend_from_slice(&source.signature);
+        // A source record (wrong type) and an undersized garbage blob.
+        let blobs = vec![source_blob, vec![0u8; 8]];
+        let results = build_ember_keyword_results(&blobs, &["ubuntu".to_string()]);
+        assert!(
+            results.is_empty(),
+            "source records and garbage must not become keyword hits"
+        );
+    }
+
     #[test]
     fn record_known_ember_peer_returns_true_for_new_entries() {
         let mut map = HashMap::new();
@@ -1717,6 +1812,7 @@ pub enum SearchMethod {
     Global,
     Server,
     Kad,
+    Ember,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -2265,6 +2361,11 @@ struct ActiveSearchRequest {
     server_pending: bool,
     kad_pending: bool,
     udp_pending: bool,
+    /// True while an Ember DHT keyword `FIND_VALUE` for this request is in
+    /// flight (slice 10). Like the other `*_pending` flags it gates
+    /// `search-complete`; cleared when the Ember results are emitted or the
+    /// lookup expires.
+    ember_pending: bool,
     file_type_filter: Option<String>,
     /// Keywords extracted from the original query, used by the spam-filter
     /// scorer when streamed results arrive from the network event loop.
@@ -2756,6 +2857,23 @@ struct NetworkState {
     /// elapsed, mirroring KAD's per-file source-publish schedule but driven
     /// independently of KAD connectivity so it works on a KAD-less network.
     ember_source_publish_at: HashMap<[u8; 16], std::time::Instant>,
+    /// Last time we (re)published Ember DHT *keyword* records for each
+    /// shared file, keyed by its 16-byte eD2K hash (slice 8). The publish
+    /// tick republishes a file's keywords only after
+    /// `EMBER_KEYWORD_REPUBLISH` has elapsed.
+    ember_keyword_publish_at: HashMap<[u8; 16], std::time::Instant>,
+    /// In-flight Ember DHT *keyword* searches started for a user search
+    /// (slice 10), keyed by `search_id` -> the originating search context.
+    /// Distinct from the dev value-lookup waiters
+    /// (`ember_dht_pending_value_lookups`): completion feeds the streaming
+    /// search-results pipeline rather than a oneshot.
+    ember_keyword_searches: HashMap<u32, EmberKeywordSearch>,
+    /// Keyword-search result batches gathered by completed Ember DHT
+    /// lookups (slice 10), awaiting async emit. Completion is detected
+    /// synchronously in `maybe_finish_ember_search`, but emitting needs the
+    /// async enrich pipeline + app_handle, so batches are buffered here and
+    /// drained on the next `ember_search_timer` tick.
+    ember_pending_keyword_results: Vec<EmberKeywordResultBatch>,
     /// In-flight Ember DHT source lookups for active/pending downloads
     /// (slice 9), keyed by `search_id`, mapping to the `(transfer_id,
     /// file_hash)` the lookup is for so `FOUND_VALUE` records can be parsed
@@ -2806,6 +2924,27 @@ struct EmberPublishRequest {
     per_pub_req_id: u32,
     /// When the store went out, for the staleness sweep.
     sent_at: std::time::Instant,
+}
+
+/// Context for an in-flight Ember DHT keyword search started on behalf of
+/// a user search (slice 10). Carries everything the completion path needs
+/// to build and emit `SearchResult`s into the streaming pipeline.
+struct EmberKeywordSearch {
+    /// The user-facing search request this lookup belongs to.
+    request_id: u64,
+    /// All query keywords, used for the multi-word local AND-filter (the
+    /// DHT key only matched the primary keyword).
+    keywords: Vec<String>,
+    /// Optional file-type filter applied at emit time.
+    file_type_filter: Option<String>,
+}
+
+/// A batch of Ember DHT keyword results ready to emit (slice 10).
+struct EmberKeywordResultBatch {
+    request_id: u64,
+    keywords: Vec<String>,
+    file_type_filter: Option<String>,
+    results: Vec<SearchResult>,
 }
 
 /// Maximum concurrent pending Ember pings tracked in `NetworkState`.
@@ -2872,6 +3011,21 @@ const EMBER_SOURCE_REPUBLISH: std::time::Duration = std::time::Duration::from_se
 /// Max shared-file source records to (re)publish per `publish_timer` tick,
 /// so a large library can't fan out an unbounded burst of STOREs at once.
 const EMBER_SOURCE_PUBLISH_MAX_PER_TICK: usize = 5;
+
+// ── DHT keyword publishing (slice 8) ──
+
+/// How often we re-announce Ember DHT *keyword* records for each shared
+/// file. Unlike source records, keyword records are replicated by other
+/// nodes (`take_republish_batch`), so the publisher's own re-announce
+/// cadence can be slower; 12 h matches the KAD keyword-republish spirit
+/// and sits inside the 24 h record TTL.
+const EMBER_KEYWORD_REPUBLISH: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
+
+/// Max shared files whose keyword records are (re)published per
+/// `publish_timer` tick. Each file fans out one STORE per extracted
+/// keyword to the k closest nodes, so this is kept small to bound the
+/// per-tick STORE burst on a large library.
+const EMBER_KEYWORD_PUBLISH_MAX_PER_TICK: usize = 2;
 
 /// How often a download re-queries the Ember DHT for sources, indexed by
 /// how many times it has already searched (slice 9). Mirrors the spirit of
@@ -3068,6 +3222,7 @@ fn maybe_finish_active_search(
             && !active.server_pending
             && !active.kad_pending
             && !active.udp_pending
+            && !active.ember_pending
     });
     if should_complete {
         state.active_search_request = None;
@@ -3085,6 +3240,18 @@ fn cancel_search_request(
     app_handle: &tauri::AppHandle,
     request_id: u64,
 ) {
+    // Drop any in-flight Ember DHT keyword lookup bookkeeping and buffered
+    // results for this request (slice 10) so a superseded/cancelled search
+    // can't later emit stale Ember hits. The underlying `ember_search`
+    // entries are harmless once unmapped: completion finds no entry and is
+    // dropped.
+    state
+        .ember_keyword_searches
+        .retain(|_, kw| kw.request_id != request_id);
+    state
+        .ember_pending_keyword_results
+        .retain(|b| b.request_id != request_id);
+
     let cancelled: Vec<SearchId> = state
         .pending_keyword_searches
         .iter()
@@ -4017,9 +4184,12 @@ fn ember_disable_cleanup(state: &mut NetworkState) {
     state.ember_download_source_searches.clear();
     state.ember_source_search_state.clear();
     state.ember_pending_source_injections.clear();
+    state.ember_keyword_searches.clear();
+    state.ember_pending_keyword_results.clear();
     // Forget the per-file publish schedule so a re-enable republishes every
     // shared file promptly instead of waiting out the republish interval.
     state.ember_source_publish_at.clear();
+    state.ember_keyword_publish_at.clear();
     state.ember_search = ember::dht::search::SearchManager::new();
     state.ember_publish = ember::dht::publish::PublishManager::new();
 
@@ -4668,6 +4838,9 @@ pub async fn start_network(
         ember_dht_pending_publishes: HashMap::new(),
         ember_dht_maint_pings: HashMap::new(),
         ember_source_publish_at: HashMap::new(),
+        ember_keyword_publish_at: HashMap::new(),
+        ember_keyword_searches: HashMap::new(),
+        ember_pending_keyword_results: Vec::new(),
         ember_download_source_searches: HashMap::new(),
         ember_source_search_state: HashMap::new(),
         ember_pending_source_injections: Vec::new(),
@@ -9570,6 +9743,16 @@ pub async fn start_network(
                     &local_index,
                     settings.tcp_port,
                     udp_port,
+                )
+                .await;
+
+                // Ember DHT keyword publishing (slice 8), same independence
+                // from KAD connectivity as source publishing above.
+                maybe_publish_ember_keywords(
+                    &udp_socket,
+                    &mut state,
+                    &settings,
+                    &local_index,
                 )
                 .await;
 
@@ -15153,6 +15336,17 @@ pub async fn start_network(
                     // found this round"; drop its bookkeeping so the map can't
                     // leak across a long-running download.
                     state.ember_download_source_searches.remove(&search_id);
+                    // A timed-out user keyword lookup (slice 10) must still
+                    // clear `ember_pending` and re-check `search-complete`, or
+                    // the UI would spin forever waiting on the Ember leg.
+                    if let Some(kw) = state.ember_keyword_searches.remove(&search_id) {
+                        if let Some(active) = state.active_search_request.as_mut() {
+                            if active.request_id == kw.request_id {
+                                active.ember_pending = false;
+                            }
+                        }
+                        maybe_finish_active_search(&mut state, &app_handle, kw.request_id);
+                    }
                     state
                         .ember_dht_search_requests
                         .retain(|_, r| r.search_id != search_id);
@@ -15308,6 +15502,45 @@ pub async fn start_network(
                             &stats_manager.sx_counters,
                         )
                         .await;
+                    }
+                }
+
+                // 7) Emit keyword search results gathered by completed Ember
+                //    DHT keyword lookups (slice 10). Completion is detected
+                //    synchronously in `maybe_finish_ember_search`; emitting
+                //    needs the async enrich pipeline + app_handle, so batches
+                //    are buffered and drained here. Each batch clears its
+                //    request's `ember_pending` and re-checks `search-complete`
+                //    after emitting, so results always precede completion.
+                if !state.ember_pending_keyword_results.is_empty() {
+                    let batches = std::mem::take(&mut state.ember_pending_keyword_results);
+                    for batch in batches {
+                        let EmberKeywordResultBatch {
+                            request_id,
+                            keywords,
+                            file_type_filter,
+                            results,
+                        } = batch;
+                        if !results.is_empty() {
+                            enrich_and_emit_search_results(
+                                &app_handle,
+                                &spam_filter,
+                                &comment_manager,
+                                &settings,
+                                request_id,
+                                results,
+                                &file_type_filter,
+                                &keywords,
+                                None,
+                            )
+                            .await;
+                        }
+                        if let Some(active) = state.active_search_request.as_mut() {
+                            if active.request_id == request_id {
+                                active.ember_pending = false;
+                            }
+                        }
+                        maybe_finish_active_search(&mut state, &app_handle, request_id);
                     }
                 }
             }
@@ -16861,6 +17094,19 @@ fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32) {
                         .ember_pending_source_injections
                         .push((file_hash, sources));
                 }
+            } else if let Some(kw) = state.ember_keyword_searches.remove(&search_id) {
+                // User keyword search (slice 10): build SearchResults from
+                // the gathered keyword records and buffer them for the async
+                // emit on the next sweep tick (which has the enrich pipeline
+                // + app_handle). Always queued -- even when empty -- so the
+                // sweep clears `ember_pending` and `search-complete` fires.
+                let results = build_ember_keyword_results(&records, &kw.keywords);
+                state.ember_pending_keyword_results.push(EmberKeywordResultBatch {
+                    request_id: kw.request_id,
+                    keywords: kw.keywords,
+                    file_type_filter: kw.file_type_filter,
+                    results,
+                });
             }
         }
     }
@@ -16910,6 +17156,98 @@ fn parse_ember_source_records(
         out.push((sc.ip, sc.tcp_port, sc.udp_port, sc.flags));
     }
     out
+}
+
+/// Build `SearchResult`s from the blobs returned by an Ember DHT keyword
+/// `FIND_VALUE` (slice 10).
+///
+/// Each blob is re-verified (`from_value_blob` checks the publisher
+/// signature), kept only if it is a keyword record, and -- for multi-word
+/// queries -- AND-filtered so every query keyword appears in the file name
+/// (the DHT key only matched the primary keyword). Records are deduped by
+/// eD2K file hash, with `availability` reflecting the number of distinct
+/// publishers seen for that file. Sources are intentionally empty: a
+/// keyword hit identifies the file, and source discovery runs separately
+/// via the slice-9 source lookup when a download starts.
+fn build_ember_keyword_results(blobs: &[Vec<u8>], keywords: &[String]) -> Vec<SearchResult> {
+    use crate::search::index::infer_file_type;
+
+    let kw_lower: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
+    // file_hash -> (result, set of distinct publisher keys)
+    let mut dedup: HashMap<[u8; 16], (SearchResult, HashSet<[u8; 32]>)> = HashMap::new();
+
+    for blob in blobs {
+        let Some(rec) = ember::dht::publish::SignedRecord::from_value_blob(blob) else {
+            continue;
+        };
+        if rec.record_type != ember::dht::publish::RECORD_TYPE_KEYWORD {
+            continue;
+        }
+        // Multi-word AND-filter, mirroring the KAD keyword path.
+        if kw_lower.len() > 1 {
+            let name_lower = rec.file_name.to_lowercase();
+            if !kw_lower.iter().all(|k| name_lower.contains(k)) {
+                continue;
+            }
+        }
+
+        match dedup.get_mut(&rec.file_hash) {
+            Some((existing, publishers)) => {
+                publishers.insert(rec.publisher_key);
+                existing.availability = publishers.len() as u32;
+            }
+            None => {
+                let extension = rec
+                    .file_name
+                    .rsplit_once('.')
+                    .map(|(_, e)| e.to_string())
+                    .unwrap_or_default();
+                let file_type = infer_file_type(&extension);
+                let hash_hex = hex::encode(rec.file_hash);
+                let mut publishers = HashSet::new();
+                publishers.insert(rec.publisher_key);
+                let sr = SearchResult {
+                    file: FileInfo {
+                        id: hash_hex.clone(),
+                        name: rec.file_name.clone(),
+                        path: String::new(),
+                        size: rec.file_size,
+                        hash: hash_hex,
+                        aich_hash: String::new(),
+                        extension,
+                        modified_at: 0,
+                        priority: "normal".to_string(),
+                        requests: 0,
+                        accepted: 0,
+                        bytes_transferred: 0,
+                        alltime_requests: 0,
+                        alltime_accepted: 0,
+                        alltime_transferred: 0,
+                        complete_sources: 0,
+                        folder: String::new(),
+                        shared: false,
+                        shared_kad: false,
+                        shared_ed2k: false,
+                    },
+                    peer_id: String::new(),
+                    peer_name: String::new(),
+                    availability: 1,
+                    file_type,
+                    source_addresses: Vec::new(),
+                    rating: None,
+                    comment: None,
+                    media: None,
+                    spam_rating: 0,
+                    is_spam: false,
+                    clean_name: String::new(),
+                    result_origin: crate::search::merge::ORIGIN_EMBER.to_string(),
+                };
+                dedup.insert(rec.file_hash, (sr, publishers));
+            }
+        }
+    }
+
+    dedup.into_values().map(|(sr, _)| sr).collect()
 }
 
 /// Push a publish forward: pull the targets not yet stored on, send each
@@ -17130,6 +17468,95 @@ async fn maybe_publish_ember_sources(
                 .ember_dht_sources_published
                 .saturating_add(1);
             drive_ember_publish(socket, state, publish_id).await;
+        }
+    }
+}
+
+/// Publish Ember DHT *keyword* records for shared files (slice 8) so a
+/// keyword search can find them on a KAD-less network. Mirrors
+/// `maybe_publish_ember_sources`, but keys off each filename keyword and
+/// (unlike source records) does NOT require us to be reachable: the record
+/// is stored on other nodes, so our firewall / LowID status is irrelevant.
+/// Selection is staleness-ranked and bounded per tick so a large library
+/// republishes round-robin instead of starving everything past the budget.
+async fn maybe_publish_ember_keywords(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    settings: &AppSettings,
+    local_index: &Arc<RwLock<LocalIndex>>,
+) {
+    if !settings.ember_native_enabled || state.ember_dht.contact_count() == 0 {
+        return;
+    }
+
+    let now = std::time::Instant::now();
+    let due: Vec<([u8; 16], u64, String)> = {
+        let idx = local_index.read().await;
+        let files = idx.all_files();
+        let mut ranked: Vec<(u64, usize)> = Vec::new();
+        for (i, f) in files.iter().enumerate() {
+            if !f.shared || f.hash.is_empty() {
+                continue;
+            }
+            let Some(hash) = hex::decode(&f.hash)
+                .ok()
+                .and_then(|v| <[u8; 16]>::try_from(v).ok())
+            else {
+                continue;
+            };
+            let staleness = match state.ember_keyword_publish_at.get(&hash) {
+                None => u64::MAX,
+                Some(t) => {
+                    let elapsed = now.duration_since(*t);
+                    if elapsed < EMBER_KEYWORD_REPUBLISH {
+                        continue;
+                    }
+                    elapsed.as_secs()
+                }
+            };
+            ranked.push((staleness, i));
+        }
+        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        ranked.truncate(EMBER_KEYWORD_PUBLISH_MAX_PER_TICK);
+        ranked
+            .into_iter()
+            .filter_map(|(_, i)| {
+                let f = &files[i];
+                let hash = hex::decode(&f.hash)
+                    .ok()
+                    .and_then(|v| <[u8; 16]>::try_from(v).ok())?;
+                Some((hash, f.size, f.name.clone()))
+            })
+            .collect()
+    };
+    if due.is_empty() {
+        return;
+    }
+
+    for (file_hash, file_size, file_name) in due {
+        // Same tokenization as KAD keyword publishing/search so an Ember
+        // search hashes the identical keyword set.
+        let keywords = kad::publish::extract_keywords(&file_name);
+        // Mark attempted regardless so a file with no usable keywords (or a
+        // momentarily target-less publish) doesn't get re-selected every
+        // tick and starve the rest of the library.
+        state.ember_keyword_publish_at.insert(file_hash, now);
+        for keyword in keywords {
+            // `ember_file_hash` (content BLAKE3) is deferred (see
+            // `maybe_publish_ember_sources`); keyword lookup doesn't use it.
+            let record = state.ember_dht.build_keyword_record(
+                &keyword,
+                file_hash,
+                [0u8; 32],
+                file_size,
+                &file_name,
+            );
+            if let Some(publish_id) = state
+                .ember_publish
+                .start_publish(record, state.ember_dht.routing())
+            {
+                drive_ember_publish(socket, state, publish_id).await;
+            }
         }
     }
 }
@@ -19726,6 +20153,7 @@ async fn handle_command_inner(
                 server_pending: false,
                 kad_pending: false,
                 udp_pending: false,
+                ember_pending: false,
                 file_type_filter: file_type_filter.clone(),
                 keywords: Vec::new(),
                 server_ip: state.server_addr.map(|a| a.ip().to_string()),
@@ -19764,6 +20192,7 @@ async fn handle_command_inner(
             let run_server = matches!(method, SearchMethod::Global | SearchMethod::Server);
             let run_udp    = matches!(method, SearchMethod::Global);
             let run_kad    = matches!(method, SearchMethod::Global | SearchMethod::Kad);
+            let run_ember  = matches!(method, SearchMethod::Global | SearchMethod::Ember);
 
             if run_server && state.server_connected {
                 if let Some(mut conn) = state.server_connection.take() {
@@ -19862,11 +20291,47 @@ async fn handle_command_inner(
                 true
             };
 
+            // --- Ember DHT keyword search (slice 10) ---
+            // Streaming-only: it never touches the invoke oneshot (`tx`); its
+            // hits arrive via `search-results` events and it gates
+            // `search-complete` through `ember_pending`. Uses the longest
+            // (most selective) keyword as the DHT key, mirroring KAD; the
+            // remaining words are AND-filtered locally at emit time.
+            if run_ember
+                && settings.ember_native_enabled
+                && state.ember_dht.contact_count() > 0
+            {
+                if let Some(primary_keyword) =
+                    active_request.keywords.iter().max_by_key(|k| k.len())
+                {
+                    let kw_hash = ember::dht::search::keyword_hash(primary_keyword);
+                    if let Some(search_id) = state.ember_search.start_find_value(
+                        ember::dht::EmberNodeId(kw_hash),
+                        Vec::new(),
+                        state.ember_dht.routing(),
+                    ) {
+                        state.ember_keyword_searches.insert(
+                            search_id,
+                            EmberKeywordSearch {
+                                request_id,
+                                keywords: active_request.keywords.clone(),
+                                file_type_filter: active_request.file_type_filter.clone(),
+                            },
+                        );
+                        active_request.ember_pending = true;
+                        drive_ember_search(socket, state, search_id).await;
+                    }
+                }
+            }
+
             if !kad_started {
                 if let Some(tx) = tx.take() {
                     let _ = tx.send(local_results.take().unwrap_or_default());
                 }
-                if !active_request.server_pending && !active_request.udp_pending {
+                if !active_request.server_pending
+                    && !active_request.udp_pending
+                    && !active_request.ember_pending
+                {
                     let _ = app_handle.emit(
                         "search-complete",
                         SearchCompleteEvent { request_id },

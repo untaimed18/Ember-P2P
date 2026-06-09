@@ -9,6 +9,7 @@ pub const ORIGIN_SERVER_TCP: &str = "Server";
 pub const ORIGIN_SERVER_UDP: &str = "UDP";
 pub const ORIGIN_LOCAL: &str = "Local";
 pub const ORIGIN_NOTES: &str = "Notes";
+pub const ORIGIN_EMBER: &str = "Ember";
 
 fn result_key(r: &SearchResult) -> String {
     if !r.file.hash.is_empty() {
@@ -115,4 +116,24 @@ pub fn sort_search_results(v: &mut [SearchResult]) {
                 an.to_lowercase().cmp(&bn.to_lowercase())
             })
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combine_origin_merges_ember_and_kad_sorted() {
+        // Combined origins are de-duped and sorted alphabetically, so an
+        // Ember+KAD hit renders deterministically.
+        assert_eq!(combine_origin(ORIGIN_KAD, ORIGIN_EMBER), "Ember · KAD");
+        assert_eq!(combine_origin(ORIGIN_EMBER, ORIGIN_KAD), "Ember · KAD");
+    }
+
+    #[test]
+    fn combine_origin_handles_empty_and_identical_ember() {
+        assert_eq!(combine_origin(ORIGIN_EMBER, ""), "Ember");
+        assert_eq!(combine_origin("", ORIGIN_EMBER), "Ember");
+        assert_eq!(combine_origin(ORIGIN_EMBER, ORIGIN_EMBER), "Ember");
+    }
 }

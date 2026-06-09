@@ -949,6 +949,7 @@
   "search_method_global": "Global",
   "search_method_kad_only": "Solo KAD",
   "search_method_server_only": "Solo servidor",
+  "search_method_ember_only": "Solo Ember",
   "search_filter_by_filetype": "Filtrar por tipo de archivo",
   "search_sessions_aria": "Sesiones de búsqueda",
   "search_in_progress_aria": "Búsqueda en curso",

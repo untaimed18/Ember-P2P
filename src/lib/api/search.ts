@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { SearchResult, SpamExplanation, SpamStats, DownloadHistoryStats } from '$lib/types';
 
-export type SearchMethod = 'global' | 'server' | 'kad';
+export type SearchMethod = 'global' | 'server' | 'kad' | 'ember';
 
 export interface SearchFilters {
   fileType?: string;
