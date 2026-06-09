@@ -3658,8 +3658,17 @@ pub(crate) async fn maybe_send_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
         std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| u32::from_be_bytes(v4.octets())).unwrap_or(0),
     };
-    let cm = cm.read().await;
-    let Some(state) = cm.secident_request_state(&peer_user_hash, peer_ip_u32, peer_secident_level) else {
+    // Read the request state under a short-lived guard and drop it before the
+    // socket write. Holding the `CreditManager` read guard across
+    // `write_packet_async().await` would block every `credit_manager.write()`
+    // caller (and, since tokio's RwLock makes new readers queue behind a
+    // pending writer, later readers too) for as long as the peer's socket is
+    // backpressured. `handle_secident_signature` already scopes its guard the
+    // same way.
+    let Some(state) = ({
+        let cm = cm.read().await;
+        cm.secident_request_state(&peer_user_hash, peer_ip_u32, peer_secident_level)
+    }) else {
         return Ok(None);
     };
     let challenge = rand::RngCore::next_u32(&mut rand::rngs::OsRng).wrapping_add(1);
@@ -3687,16 +3696,6 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
         std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| u32::from_be_bytes(v4.octets())).unwrap_or(0),
     };
-    let cm = cm.read().await;
-    if state >= 2 {
-        let pub_key = cm.our_public_key().to_vec();
-        if !pub_key.is_empty() {
-            let mut key_pkt = Vec::with_capacity(1 + pub_key.len());
-            key_pkt.push(pub_key.len() as u8);
-            key_pkt.extend_from_slice(&pub_key);
-            write_packet_async(writer, OP_EMULEPROT, OP_PUBLICKEY, &key_pkt).await?;
-        }
-    }
     let (challenge_ip_kind, challenge_ip, add_trailer) = if (peer_secident_level & 1) != 0 {
         (None, 0u32, false)
     } else {
@@ -3707,7 +3706,23 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
             (Some(super::credits::CRYPT_CIP_LOCALCLIENT), our_client_id, true)
         }
     };
-    let sig = cm.create_signature_for_peer(&peer_user_hash, challenge, challenge_ip, challenge_ip_kind);
+    // Pull the public key and signature bytes out of the credit manager under a
+    // short-lived read guard, then drop it BEFORE any socket write. Holding the
+    // read guard across `write_packet_async().await` would stall all
+    // `credit_manager.write()` callers (and later readers) for the duration of
+    // a backpressured peer socket. Mirrors `handle_secident_signature`.
+    let (pub_key, sig) = {
+        let cm = cm.read().await;
+        let pub_key = if state >= 2 { cm.our_public_key().to_vec() } else { Vec::new() };
+        let sig = cm.create_signature_for_peer(&peer_user_hash, challenge, challenge_ip, challenge_ip_kind);
+        (pub_key, sig)
+    };
+    if state >= 2 && !pub_key.is_empty() {
+        let mut key_pkt = Vec::with_capacity(1 + pub_key.len());
+        key_pkt.push(pub_key.len() as u8);
+        key_pkt.extend_from_slice(&pub_key);
+        write_packet_async(writer, OP_EMULEPROT, OP_PUBLICKEY, &key_pkt).await?;
+    }
     if !sig.is_empty() {
         let mut sig_pkt = Vec::with_capacity(2 + sig.len() + usize::from(add_trailer));
         sig_pkt.push(sig.len() as u8);
