@@ -67,6 +67,10 @@ tauri-plugin-single-instance = "2.4.0"
 tauri-plugin-deep-link = "2"
 
 tauri-plugin-process = "2"
+# In-app auto-update: fetches the signed `latest.json` manifest from
+# GitHub Releases, verifies the bundle against the minisign `pubkey` in
+# tauri.conf.json, downloads, and relaunches via tauri-plugin-process.
+tauri-plugin-updater = "2"
 rsa = "0.9"
 signature = "2"
 num-bigint-dig = "0.8"
