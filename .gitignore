@@ -29,6 +29,17 @@ src-tauri/gen/schemas
 *.key
 *.key.pub
 
+# Code-signing certificates / private keys (OS-level installer signing,
+# separate from the Tauri updater key above). Preemptive: none are committed
+# today, but a stray cert in a public repo is permanent. Use `git add -f` if
+# you ever legitimately need to commit a public certificate.
+*.pfx
+*.p12
+*.pem
+
+# Tauri keys if ever generated into a project-local dir (default is ~/.tauri).
+.tauri/
+
 # Lockfiles (keep package-lock.json, ignore Cargo.lock for apps is optional)
 # Cargo.lock is typically committed for applications, so it stays
 
