@@ -3802,7 +3802,10 @@ pub async fn start_network(
 
     let upnp_enabled = settings.upnp_enabled;
 
-    // Run UPnP setup and IP filter load concurrently since they're independent
+    // Run UPnP setup and IP filter load concurrently since they're
+    // independent. Gateway discovery is bounded to ~5s inside `setup()`, so a
+    // UPnP-less network can't stall startup for the full SSDP default (10s);
+    // a missed gateway is retried by the periodic `maintain` tick.
     let mut upnp_mappings = upnp::UpnpMappings::new(tcp_port, udp_port);
     let ipfilter_path = data_dir.join("ipfilter.dat");
     let ipf_enabled = settings.ip_filter_enabled;
@@ -4634,7 +4637,10 @@ pub async fn start_network(
     // lost on hard-kill.
     let mut known_met_save_timer = tokio::time::interval(std::time::Duration::from_secs(120));
     known_met_save_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut upnp_renew_timer = tokio::time::interval(std::time::Duration::from_secs(50 * 60));
+    // UPnP maintenance cadence. `UpnpMappings::maintain` decides what work is
+    // actually due on each tick (lease renewal at 45 min, discovery retry with
+    // backoff, stale-gateway re-discovery), so the tick itself can be short.
+    let mut upnp_renew_timer = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
     upnp_renew_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut dead_source_timer = tokio::time::interval(std::time::Duration::from_secs(300));
     dead_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -8751,9 +8757,11 @@ pub async fn start_network(
                                         // and on a port distinct from the KAD UDP port —
                                         // so without this, inbound QUIC (relay target /
                                         // hole-punch accept) stays unreachable behind NAT
-                                        // even when TCP/KAD are mapped. One-shot; mirrors
-                                        // the existing in-loop `upnp_mappings.renew()`.
-                                        if upnp_enabled && upnp_mappings.has_gateway() {
+                                        // even when TCP/KAD are mapped. Called even when
+                                        // no gateway is known yet: `map_quic_port` then
+                                        // just records the port so the periodic
+                                        // `maintain` maps it once discovery succeeds.
+                                        if upnp_enabled {
                                             if upnp_mappings.map_quic_port(bound_port).await {
                                                 tracing::info!("UPnP: QUIC UDP port {bound_port} mapped");
                                             }
@@ -13919,10 +13927,29 @@ pub async fn start_network(
                 }
             }
 
-            // Renew UPnP port mappings before the 1-hour lease expires
+            // UPnP maintenance: renew leases before expiry, retry gateway
+            // discovery (with backoff) if it failed at startup, re-discover
+            // after a router reboot — and keep the mapped status in sync so
+            // the dashboard doesn't show a stale value for the rest of the
+            // session.
             _ = upnp_renew_timer.tick() => {
-                if upnp_enabled && upnp_mappings.has_gateway() {
-                    upnp_mappings.renew().await;
+                if upnp_enabled {
+                    let was_mapped = state.upnp_mapped;
+                    let mapped = upnp_mappings.maintain().await;
+                    if mapped != was_mapped {
+                        state.upnp_mapped = mapped;
+                        state.stats.upnp_mapped = mapped;
+                        if mapped {
+                            // Same semantics as startup (`firewalled:
+                            // !upnp_success`): a fresh mapping means inbound
+                            // TCP should now reach us. The shared atomic is
+                            // only ever allowed to clear the firewalled flag
+                            // (see the sweep that consumes it), never assert
+                            // it, so this can't override a FirewallChecker
+                            // determination in the other direction.
+                            state.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                 }
             }
 
@@ -14986,7 +15013,15 @@ pub async fn start_network(
     let _ = state.server_list.save_server_met(&server_met_path);
 
     if upnp_enabled {
-        upnp_mappings.teardown().await;
+        // Best-effort removal; don't let an unresponsive gateway stall app
+        // shutdown on TCP connect timeouts. Timed leases expire on their own
+        // within the hour, and permanent-lease mappings (the error-725
+        // fallback) are reclaimed by the next session's conflict handling.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            upnp_mappings.teardown(),
+        )
+        .await;
     }
 
     Ok(())
