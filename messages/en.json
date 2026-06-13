@@ -1962,5 +1962,30 @@
   "error_transfers_reveal_task_failed": "Reveal task failed: {detail}",
   "error_transfers_start_download_failed": "Failed to start download: {detail}",
   "error_transfers_transfer_not_found": "Transfer not found",
-  "error_transfers_upload_queue_failed": "Failed to get upload queue"
+  "error_transfers_upload_queue_failed": "Failed to get upload queue",
+
+  "settings_section_about": "About",
+  "settings_about_desc": "Version and updates",
+  "settings_about_version_label": "Version",
+  "settings_about_check_btn": "Check for updates",
+  "settings_about_check_hint": "Ember checks for updates automatically on launch. You can also check manually.",
+
+  "updater_available_title": "Update available",
+  "updater_available_body": "Ember {version} is available to install.",
+  "updater_available_status": "Ember {version} is available.",
+  "updater_whats_new": "What's new",
+  "updater_install": "Install",
+  "updater_later": "Later",
+  "updater_downloading": "Downloading update…",
+  "updater_downloading_pct": "Downloading update… {pct}%",
+  "updater_installing": "Installing…",
+  "updater_ready_title": "Update ready",
+  "updater_ready_body": "Restart Ember to finish updating to {version}.",
+  "updater_restart_now": "Restart now",
+  "updater_checking": "Checking…",
+  "updater_uptodate": "You're on the latest version.",
+  "updater_error_title": "Update failed",
+  "updater_error_body": "Couldn't complete the update: {detail}",
+  "updater_retry": "Retry",
+  "updater_dismiss_aria": "Dismiss update notification"
 }

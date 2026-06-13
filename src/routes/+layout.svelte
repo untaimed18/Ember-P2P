@@ -8,6 +8,7 @@
   import CloseAppDialog from '$lib/components/CloseAppDialog.svelte';
   import DeepLinkHandler from '$lib/components/DeepLinkHandler.svelte';
   import ChatDock from '$lib/components/ChatDock.svelte';
+  import UpdateNotice from '$lib/components/UpdateNotice.svelte';
 
   import { initNetworkStore, cleanupNetworkStore, startStatsPoll } from '$lib/stores/network';
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
@@ -17,6 +18,7 @@
   import { applyDocumentLang, translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
   import { getSettings, hideToTray, quitApp, setCloseBehavior } from '$lib/api/settings';
+  import { checkForUpdates } from '$lib/stores/updater';
   import { toastWarning } from '$lib/stores/toast';
   import { emberDevToolsEnabled } from '$lib/stores/devTools';
   import type { AppSettings } from '$lib/types';
@@ -135,6 +137,7 @@
     let mounted = true;
     let revealTimer: number | undefined;
     let hideTimer: number | undefined;
+    let updateCheckTimer: number | undefined;
 
     const revealApp = () => {
       if (!mounted || !splashVisible) return;
@@ -211,6 +214,18 @@
           }
 
           releaseSplashWhenReady();
+
+          // Silent background update check, deferred so it never competes
+          // with first paint or store init. Production only: in a dev build
+          // the running version is the dev version and the GitHub manifest
+          // would spuriously report an "update". Any failure (offline,
+          // unreachable manifest) is swallowed by the store's silent mode,
+          // and a result surfaces non-blockingly via <UpdateNotice />.
+          if (!import.meta.env.DEV) {
+            updateCheckTimer = window.setTimeout(() => {
+              if (mounted) void checkForUpdates({ silent: true });
+            }, 4000);
+          }
         } else {
           cleanupNetworkStore();
           cleanupTransferStore();
@@ -232,6 +247,7 @@
       mounted = false;
       if (revealTimer !== undefined) window.clearTimeout(revealTimer);
       if (hideTimer !== undefined) window.clearTimeout(hideTimer);
+      if (updateCheckTimer !== undefined) window.clearTimeout(updateCheckTimer);
       if (stopPoll) stopPoll();
       if (stopTransferPoll) stopTransferPoll();
       cleanupTheme();
@@ -281,6 +297,8 @@
   </div>
   <Toast />
   {#if initialized && !initError && !showWizard}
+    <!-- Non-blocking auto-update banner, driven by the shared updater store. -->
+    <UpdateNotice />
     <!-- Headless: routes OS-delivered ed2k:// links and .emulecollection
     files into the app once the shell is ready (settings loaded, no wizard). -->
     <DeepLinkHandler />

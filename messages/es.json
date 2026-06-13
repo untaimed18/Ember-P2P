@@ -1962,5 +1962,30 @@
   "error_transfers_reveal_task_failed": "Falló la tarea de mostrar: {detail}",
   "error_transfers_start_download_failed": "No se pudo iniciar la descarga: {detail}",
   "error_transfers_transfer_not_found": "Transferencia no encontrada",
-  "error_transfers_upload_queue_failed": "No se pudo obtener la cola de subida"
+  "error_transfers_upload_queue_failed": "No se pudo obtener la cola de subida",
+
+  "settings_section_about": "Acerca de",
+  "settings_about_desc": "Versión y actualizaciones",
+  "settings_about_version_label": "Versión",
+  "settings_about_check_btn": "Buscar actualizaciones",
+  "settings_about_check_hint": "Ember busca actualizaciones automáticamente al iniciar. También puedes buscarlas manualmente.",
+
+  "updater_available_title": "Actualización disponible",
+  "updater_available_body": "Ember {version} está disponible para instalar.",
+  "updater_available_status": "Ember {version} está disponible.",
+  "updater_whats_new": "Novedades",
+  "updater_install": "Instalar",
+  "updater_later": "Más tarde",
+  "updater_downloading": "Descargando actualización…",
+  "updater_downloading_pct": "Descargando actualización… {pct}%",
+  "updater_installing": "Instalando…",
+  "updater_ready_title": "Actualización lista",
+  "updater_ready_body": "Reinicia Ember para terminar de actualizar a la versión {version}.",
+  "updater_restart_now": "Reiniciar ahora",
+  "updater_checking": "Buscando…",
+  "updater_uptodate": "Tienes la última versión.",
+  "updater_error_title": "Error de actualización",
+  "updater_error_body": "No se pudo completar la actualización: {detail}",
+  "updater_retry": "Reintentar",
+  "updater_dismiss_aria": "Descartar notificación de actualización"
 }
