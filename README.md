@@ -122,7 +122,7 @@ Ember is a first-class citizen of the eMule network:
 
 ### For users
 
-1. Download the latest release from the [Releases page](https://github.com/untaimed18/Ember-KAD/releases).
+1. Download the latest release from the [Releases page](https://github.com/untaimed18/Ember-P2P/releases).
 2. Run the installer (`.exe` on Windows).
 3. On first launch, the **Setup Wizard** walks you through essential settings — nickname, download folder, ports, speed limits, KAD auto-connect, and theme.
 4. Ember connects to the KAD network automatically. You can enable eD2K server connections later in Settings.
@@ -142,7 +142,7 @@ These are configurable in **Settings > Network**. For best performance (HighID),
 
 #### Prerequisites
 
-- [Rust](https://rustup.rs/) (1.80+ — `str::floor_char_boundary` is used in the collection parser and was stabilized in 1.80)
+- [Rust](https://rustup.rs/) (1.91+ — `str::floor_char_boundary`, used in the eD2K collection parser and comment store, was stabilized in 1.91)
 - [Node.js](https://nodejs.org/) (18+)
 - **Windows**: Visual Studio Build Tools with C++ workload
 
