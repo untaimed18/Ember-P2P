@@ -23,6 +23,12 @@ src-tauri/gen/schemas
 # Never commit a literal "~" folder (mistaken path for ~/.tauri signing keys)
 /~/
 
+# Tauri updater signing keys — the PRIVATE key must NEVER be committed.
+# It signs release artifacts (provided to CI via the TAURI_SIGNING_PRIVATE_KEY
+# secret); losing it means you can never update already-installed apps.
+*.key
+*.key.pub
+
 # Lockfiles (keep package-lock.json, ignore Cargo.lock for apps is optional)
 # Cargo.lock is typically committed for applications, so it stays
 

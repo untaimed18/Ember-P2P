@@ -30,6 +30,15 @@
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import SpeedInput from '$lib/components/SpeedInput.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import { updater, checkForUpdates, installUpdate, restartToUpdate } from '$lib/stores/updater';
+
+  const appVersion = import.meta.env.VITE_APP_VERSION;
+  // Download progress percent for the About card, when a content length is known.
+  let aboutPercent = $derived(
+    $updater.total && $updater.total > 0
+      ? Math.min(100, Math.round(($updater.downloaded / $updater.total) * 100))
+      : null,
+  );
 
   // Active locale, kept in component state so the radio group has
   // a reactive `selected` source. Updating this state goes through
@@ -147,7 +156,7 @@
   let spamStatsLoading = $state(false);
   let spamStatsError: string | null = $state(null);
   let spamResetting = $state(false);
-  type SettingsSection = 'general' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'search';
+  type SettingsSection = 'general' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'search' | 'about';
   let activeSection: SettingsSection = $state('general');
 
   const sections: SettingsSection[] = [
@@ -158,6 +167,7 @@
     'security',
     'friends',
     'search',
+    'about',
   ];
 
   function sectionLabel(id: SettingsSection): string {
@@ -169,6 +179,7 @@
       case 'security': return m.settings_section_security();
       case 'friends': return m.settings_section_friends();
       case 'search': return m.settings_section_search();
+      case 'about': return m.settings_section_about();
     }
   }
 
@@ -759,6 +770,12 @@
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <circle cx="8.5" cy="8.5" r="5.5"/>
                   <line x1="12.5" y1="12.5" x2="17" y2="17"/>
+                </svg>
+              {:else if section === 'about'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="10" cy="10" r="7.5"/>
+                  <line x1="10" y1="9" x2="10" y2="14"/>
+                  <circle cx="10" cy="6.5" r="0.6" fill="currentColor"/>
                 </svg>
               {/if}
             </span>
@@ -1475,6 +1492,63 @@
         </div>
       </section>
 
+      <!-- About & Updates -->
+      <section class="card" class:hidden={activeSection !== 'about'}>
+        <div class="card-header">
+          <span class="card-icon">&#9432;</span>
+          <div>
+            <h3>{m.settings_section_about()}</h3>
+            <p class="card-desc">{m.settings_about_desc()}</p>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="field">
+            <span class="field-label">{m.settings_about_version_label()}</span>
+            <p class="about-value">Ember {appVersion}</p>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="field nested">
+            <div class="action-row">
+              <button
+                class="action-btn"
+                onclick={() => void checkForUpdates()}
+                disabled={$updater.phase === 'checking' || $updater.phase === 'downloading' || $updater.phase === 'installing'}
+              >
+                {$updater.phase === 'checking' ? m.updater_checking() : m.settings_about_check_btn()}
+              </button>
+
+              {#if $updater.phase === 'available'}
+                <button class="action-btn primary" onclick={() => void installUpdate()}>
+                  {m.updater_install()}
+                </button>
+              {:else if $updater.phase === 'ready'}
+                <button class="action-btn primary" onclick={() => void restartToUpdate()}>
+                  {m.updater_restart_now()}
+                </button>
+              {/if}
+            </div>
+
+            {#if $updater.phase === 'uptodate'}
+              <span class="feedback success">{m.updater_uptodate()}</span>
+            {:else if $updater.phase === 'available'}
+              <span class="feedback success">{m.updater_available_status({ version: $updater.version ?? '' })}</span>
+            {:else if $updater.phase === 'downloading'}
+              <span class="hint">{aboutPercent !== null ? m.updater_downloading_pct({ pct: aboutPercent }) : m.updater_downloading()}</span>
+            {:else if $updater.phase === 'installing'}
+              <span class="hint">{m.updater_installing()}</span>
+            {:else if $updater.phase === 'ready'}
+              <span class="feedback success">{m.updater_ready_body({ version: $updater.version ?? '' })}</span>
+            {:else if $updater.phase === 'error'}
+              <span class="feedback error">{m.updater_error_body({ detail: $updater.error ?? '' })}</span>
+            {:else}
+              <span class="hint">{m.settings_about_check_hint()}</span>
+            {/if}
+          </div>
+        </div>
+      </section>
+
       </div>
     </div>
   {/if}
@@ -1915,6 +1989,24 @@
     background: var(--bg-hover);
     color: var(--accent);
     border-color: var(--accent);
+  }
+
+  .action-btn.primary {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+  }
+
+  .action-btn.primary:hover {
+    filter: brightness(1.06);
+    color: #fff;
+  }
+
+  .about-value {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
   }
 
   .feedback {
