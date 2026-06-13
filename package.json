@@ -10,6 +10,7 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",
+    "bump-version": "node scripts/bump-version.mjs",
     "postinstall": "node -e \"const fs=require('fs'),p=require('path'),s=p.join('node_modules','circle-flags','flags'),d=p.join('static','flags');if(!fs.existsSync(s)){process.exit(0);}fs.mkdirSync(d,{recursive:true});fs.readdirSync(s).filter(f=>f.endsWith('.svg')).forEach(f=>fs.copyFileSync(p.join(s,f),p.join(d,f)));console.log('Copied flag SVGs to static/flags/');\""
   },
   "license": "GPL-3.0-only",
@@ -17,6 +18,7 @@
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "circle-flags": "^2.8.2"
   },
   "devDependencies": {

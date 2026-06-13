@@ -1,0 +1,60 @@
+name: Release
+
+# Cuts a signed release when a version tag is pushed. The flow is:
+#   1. Bump the version in all three files (`node scripts/bump-version.mjs X.Y.Z`).
+#   2. Commit, then `git tag vX.Y.Z && git push --tags`.
+#   3. This workflow builds + signs the installers, then creates a DRAFT
+#      GitHub Release with the installers and `latest.json` attached.
+#   4. Review the draft, add notes, and Publish. Publishing is what makes
+#      `releases/latest/download/latest.json` resolve, so installed apps only
+#      see the update once you've deliberately published.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   TAURI_SIGNING_PRIVATE_KEY           contents of ember-updater.key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  the password set during key generation
+# (GITHUB_TOKEN is provided automatically.)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build, sign, and draft release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Ember ${{ github.ref_name }}
+          releaseBody: See the assets below to download and install this version.
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
