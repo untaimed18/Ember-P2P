@@ -522,6 +522,19 @@ pub async fn get_shared_files(
     Ok(cached.clone())
 }
 
+/// Count of files the user is *actively sharing* (the `shared` flag is set),
+/// which is distinct from the total number of files indexed in the library
+/// (the latter includes files the user has unshared). Returns just the
+/// number so the always-mounted status bar can show "Files Shared" without
+/// shipping the whole `Vec<FileInfo>` over IPC on every refresh.
+#[tauri::command]
+pub async fn get_shared_file_count(
+    state: tauri::State<'_, AppState>,
+) -> Result<usize, String> {
+    let cached = state.cached_shared_files.read().await;
+    Ok(cached.iter().filter(|f| f.shared).count())
+}
+
 #[tauri::command]
 pub async fn get_shared_folders(
     state: tauri::State<'_, AppState>,
@@ -834,6 +847,7 @@ pub async fn batch_set_priority(
 /// paths contribute 0).
 #[tauri::command]
 pub async fn batch_share(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     file_paths: Vec<String>,
 ) -> Result<u32, String> {
@@ -859,6 +873,7 @@ pub async fn batch_share(
         if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
             warn!("Failed to queue SharedFilesChanged after batch share: {e}");
         }
+        let _ = app.emit("shared-files-changed", serde_json::json!({ "shared": count }));
         info!("Batch shared {count}/{} files", file_paths.len());
     }
     Ok(count)
@@ -868,6 +883,7 @@ pub async fn batch_share(
 /// files actually flipped to unshared.
 #[tauri::command]
 pub async fn batch_unshare(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     file_paths: Vec<String>,
 ) -> Result<u32, String> {
@@ -893,6 +909,7 @@ pub async fn batch_unshare(
         if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
             warn!("Failed to queue SharedFilesChanged after batch unshare: {e}");
         }
+        let _ = app.emit("shared-files-changed", serde_json::json!({ "unshared": count }));
         info!("Batch unshared {count}/{} files", file_paths.len());
     }
     Ok(count)
@@ -1184,6 +1201,7 @@ pub async fn resume_hashing(
 
 #[tauri::command]
 pub async fn unshare_file(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     file_path: String,
     file_hash: Option<String>,
@@ -1206,6 +1224,7 @@ pub async fn unshare_file(
         if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
             warn!("Failed to queue SharedFilesChanged after unshare: {e}");
         }
+        let _ = app.emit("shared-files-changed", serde_json::json!({ "unshared": 1 }));
         info!(
             "Unshared file {}{}",
             file_path,
@@ -1220,6 +1239,7 @@ pub async fn unshare_file(
 
 #[tauri::command]
 pub async fn share_file(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     file_path: String,
 ) -> Result<(), String> {
@@ -1238,6 +1258,7 @@ pub async fn share_file(
         if let Err(e) = state.network_tx.try_send(NetworkCommand::SharedFilesChanged) {
             warn!("Failed to queue SharedFilesChanged after share: {e}");
         }
+        let _ = app.emit("shared-files-changed", serde_json::json!({ "shared": 1 }));
         info!("Shared file {}", file_path);
     }
     Ok(())

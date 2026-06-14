@@ -13,6 +13,15 @@ export async function getSharedFiles(): Promise<FileInfo[]> {
   return invoke('get_shared_files');
 }
 
+/**
+ * Count of files the user is actively sharing (the `shared` flag is set),
+ * not the total number of files in the library. Lightweight alternative to
+ * `getSharedFiles().length` for the status bar.
+ */
+export async function getSharedFileCount(): Promise<number> {
+  return invoke('get_shared_file_count');
+}
+
 export async function getSharedFolders(): Promise<string[]> {
   return invoke('get_shared_folders');
 }
