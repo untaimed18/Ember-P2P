@@ -1,6 +1,6 @@
 {
   "name": "ember-p2p",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Decentralized P2P file sharing application",
   "type": "module",
   "scripts": {
