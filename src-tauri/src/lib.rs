@@ -742,6 +742,7 @@ pub fn run() {
             commands::sharing::add_shared_folder,
             commands::sharing::remove_shared_folder,
             commands::sharing::get_shared_files,
+            commands::sharing::get_shared_file_count,
             commands::sharing::get_shared_folders,
             commands::sharing::get_file_media_metadata,
             commands::sharing::get_folder_priorities,
