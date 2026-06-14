@@ -413,9 +413,15 @@ impl SearchState {
         if self.lookup_reask_more_target == Some(*from) {
             self.lookup_reask_more_target = None;
         }
-        if self.phase == SearchPhase::Lookup {
-            self.responded_during_lookup.insert(*from);
-        }
+        // Record every responder, not only those that reply while still in the
+        // Lookup phase. A KADEMLIA2_RES whose REQ was sent during lookup but
+        // that lands just after we converged and switched to Fetch would
+        // otherwise never be eligible as a fetch candidate
+        // (`is_fetch_candidate` requires membership here), so that node would
+        // never be queried for keyword/source/note results. This is bounded by
+        // the set of nodes we actually queried, and re-entering
+        // `check_phase_transition` from Fetch is a no-op.
+        self.responded_during_lookup.insert(*from);
 
         let from_distance = self.target.xor_distance(from);
         let old_best = self.closest.first().map(|c| self.target.xor_distance(&c.id));

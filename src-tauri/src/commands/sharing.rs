@@ -268,6 +268,19 @@ pub async fn add_shared_folder(
 
         {
             let mut index = local_index.write().await;
+            // Re-check cancellation after the lock-free known.met read above.
+            // `remove_shared_folder` may have flipped our cancel flag (and
+            // cleared the index for this folder) in that window; adding the
+            // discovered set now would re-index a folder the user just
+            // unshared. The cancel flag is set before the config/index are
+            // mutated by removal, so this load closes the TOCTOU window.
+            if cancel_flag.load(Ordering::Relaxed) {
+                drop(index);
+                info!("Hashing cancelled before indexing for {path}");
+                cancel_flags.write().await.remove(&cancel_key);
+                let _ = app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
+                return;
+            }
             index.add_files(discovered);
         }
         refresh_file_cache(&local_index, &file_cache).await;
@@ -370,7 +383,10 @@ pub async fn add_shared_folder(
         {
             let mut index = local_index.write().await;
             if was_cancelled {
-                index.remove_pending_files();
+                // Scope the pending cleanup to THIS folder so a concurrent scan
+                // of another folder keeps its in-progress entries (the global
+                // `remove_pending_files` would drop them too).
+                index.remove_pending_files_under(std::slice::from_ref(&canonical_str));
             }
             index.rebuild();
         }
@@ -1097,7 +1113,9 @@ pub async fn reload_shared_files(
         {
             let mut index = local_index.write().await;
             if was_cancelled {
-                index.remove_pending_files();
+                // Scope the pending cleanup to the folders this reload owns so a
+                // concurrent folder-add scan keeps its in-progress entries.
+                index.remove_pending_files_under(&reloaded_folders);
             }
             index.rebuild();
         }

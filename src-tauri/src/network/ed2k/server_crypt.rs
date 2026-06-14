@@ -102,11 +102,27 @@ impl ObfuscatedServerStream {
         let opcode = dec_header[5];
         let payload_len = length - 1;
 
-        let mut payload = vec![0u8; payload_len];
+        // Grow + decrypt as bytes actually arrive rather than allocating the
+        // full declared length (up to ~5 MiB) twice (cipher input + output)
+        // up front. A slow/hostile server (or MITM on this connection) could
+        // otherwise pin ~10 MiB per session by announcing a large length then
+        // stalling. RC4 is a stateful stream cipher, so chunked `process`
+        // produces byte-identical output to a single call. The encrypted
+        // chunk lives on the heap (not the stack) since this read runs inside
+        // the server connection future.
+        let mut payload = Vec::new();
         if payload_len > 0 {
-            let mut enc_payload = vec![0u8; payload_len];
-            self.reader.read_exact(&mut enc_payload).await?;
-            self.recv_key.process(&enc_payload, &mut payload);
+            payload.reserve(payload_len.min(64 * 1024));
+            let mut remaining = payload_len;
+            let mut enc_chunk = vec![0u8; payload_len.min(32 * 1024)];
+            while remaining > 0 {
+                let want = remaining.min(enc_chunk.len());
+                self.reader.read_exact(&mut enc_chunk[..want]).await?;
+                let start = payload.len();
+                payload.resize(start + want, 0);
+                self.recv_key.process(&enc_chunk[..want], &mut payload[start..start + want]);
+                remaining -= want;
+            }
         }
 
         if protocol == 0xD4 {

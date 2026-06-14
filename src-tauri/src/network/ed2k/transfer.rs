@@ -1039,7 +1039,13 @@ impl Ed2kDownload {
                     early_upload_accept = true;
                     debug!("Received early AcceptUploadReq before file status");
                 }
-                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION => {
+                // EPX is an Ember-only extension; gate reception on
+                // `peer_is_ember` exactly as the upload side does
+                // (`upload.rs` OP_EMBER_SOURCEEXCHANGE arm). Without this a
+                // non-Ember (or hostile) peer we're downloading from could
+                // inject crafted source/peer hints into our mesh
+                // (`known_ember_peers`, broker relay candidates).
+                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if peer_is_ember && epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION => {
                     self.sx_overhead.record_download((6 + pl.len()) as u64);
                     epx_packets_received += 1;
                     info!("Received early EPX from {} during pre-control ({} bytes)", self.source_addr, pl.len());
@@ -1580,7 +1586,8 @@ impl Ed2kDownload {
                         }
                     }
                 }
-                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) => {
+                // Ember-only; gated on `peer_is_ember` (see upload.rs).
+                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if peer_is_ember => {
                     self.sx_overhead.record_download((6 + payload.len()) as u64);
                     if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
                         debug!("Ignoring excess EPX packet from {}", self.source_addr);
@@ -2382,10 +2389,20 @@ impl Ed2kDownload {
                             let epx_data = self.ember_payload.read().await.clone();
                             if !epx_data.is_empty() {
                                 debug!("Re-sending EPX to {} (gen {}->{}, {} bytes)", self.source_addr, last_epx_generation, current_gen, epx_data.len());
-                                let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await;
-                                self.sx_overhead.record_upload((6 + epx_data.len()) as u64);
+                                // Only advance the generation marker on a
+                                // successful write; otherwise a failed/back-
+                                // pressured send would suppress the retry on
+                                // the next interval (mirrors upload.rs).
+                                if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await.is_ok() {
+                                    last_epx_generation = current_gen;
+                                    self.sx_overhead.record_upload((6 + epx_data.len()) as u64);
+                                }
+                            } else {
+                                // Empty payload is terminal for this generation
+                                // (nothing to send); advance so we don't re-check
+                                // the same empty gen every interval.
+                                last_epx_generation = current_gen;
                             }
-                            last_epx_generation = current_gen;
                         }
                         last_epx_resend = std::time::Instant::now();
                     }
@@ -2760,7 +2777,8 @@ impl Ed2kDownload {
                                 }
                             }
                         }
-                        (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) => {
+                        // Ember-only; gated on `peer_is_ember` (see upload.rs).
+                        (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if peer_is_ember => {
                             self.sx_overhead.record_download((6 + payload.len()) as u64);
                             if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
                                 debug!("Ignoring excess EPX packet during download from {}", self.source_addr);
