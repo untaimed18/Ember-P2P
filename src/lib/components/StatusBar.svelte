@@ -1,7 +1,49 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import { networkStats, serverStatus } from '$lib/stores/network';
+  import { getSharedFileCount } from '$lib/api/sharing';
   import { formatBytes, formatSpeed } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
+
+  // Count of files the user is actively sharing (the `shared` flag is set),
+  // which is intentionally distinct from the total number of files in the
+  // Library — unshared files are indexed but not counted here.
+  let sharedCount = $state(0);
+
+  function sharedTitle(count: number): string {
+    return count === 1
+      ? m.statusbar_shared_title_one()
+      : m.statusbar_shared_title_other({ count: count.toLocaleString() });
+  }
+
+  onMount(() => {
+    let active = true;
+
+    async function refreshSharedCount() {
+      try {
+        const count = await getSharedFileCount();
+        if (active) sharedCount = count;
+      } catch {
+        // Backend not ready / transient IPC failure — the next
+        // shared-files-changed event (or remount) will reconcile.
+      }
+    }
+
+    void refreshSharedCount();
+
+    // The library indexer emits this whenever files are shared, unshared,
+    // added, removed, or finish hashing, so the bottom-bar count stays in
+    // sync without polling.
+    const unlistenPromise = listen('shared-files-changed', () => {
+      void refreshSharedCount();
+    }).catch(() => () => {});
+
+    return () => {
+      active = false;
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  });
 
   function epxStatus(stats: typeof $networkStats): 'active' | 'idle' | 'inactive' {
     if (stats.status === 'disconnected') return 'inactive';
@@ -56,6 +98,10 @@
     <span class="status-label" title={epxTitle($networkStats)}>
       {m.statusbar_epx_label()}
       <span class="dot {epxStatus($networkStats)}" aria-label={epxStatus($networkStats)}></span>
+    </span>
+    <span class="status-label" title={sharedTitle(sharedCount)}>
+      {m.statusbar_shared_label()}
+      <span class="shared-count">{sharedCount.toLocaleString()}</span>
     </span>
   </div>
 
@@ -116,6 +162,11 @@
     border-radius: 50%;
     display: inline-block;
     flex-shrink: 0;
+  }
+
+  .shared-count {
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
   }
 
   .dot.connected {
