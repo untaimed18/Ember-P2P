@@ -146,6 +146,12 @@
   });
 
   let loadStatsSeq = 0;
+  // Number of optimistic enable/block-private toggles whose backend write is
+  // still in flight. While > 0, a refresh that raced the toggle could carry a
+  // pre-toggle snapshot of the switch fields and silently revert the UI, so we
+  // preserve the optimistic switch state and let the toggle's own post-write
+  // reload reconcile the authoritative value.
+  let togglesInFlight = 0;
   async function loadStats() {
     if (unmounted) return;
     // Only the latest invocation commits, so overlapping refreshes (mount plus
@@ -156,7 +162,11 @@
     try {
       const result = await getIpFilterStats();
       if (unmounted || seq !== loadStatsSeq) return;
-      stats = result;
+      if (togglesInFlight > 0 && stats) {
+        stats = { ...result, enabled: stats.enabled, block_private: stats.block_private };
+      } else {
+        stats = result;
+      }
     } catch (e: unknown) {
       if (unmounted || seq !== loadStatsSeq) return;
       error = toErrorMsg(e);
@@ -180,11 +190,14 @@
     if (!stats) return;
     const prev = stats.enabled;
     stats.enabled = !prev;
+    togglesInFlight++;
     try {
       await setIpFilterEnabled(stats.enabled);
     } catch (e: unknown) {
       stats.enabled = prev;
       error = toErrorMsg(e);
+    } finally {
+      togglesInFlight--;
     }
   }
 
@@ -192,11 +205,14 @@
     if (!stats) return;
     const prev = stats.block_private;
     stats.block_private = !prev;
+    togglesInFlight++;
     try {
       await setBlockPrivateIps(stats.block_private);
     } catch (e: unknown) {
       stats.block_private = prev;
       error = toErrorMsg(e);
+    } finally {
+      togglesInFlight--;
     }
   }
 

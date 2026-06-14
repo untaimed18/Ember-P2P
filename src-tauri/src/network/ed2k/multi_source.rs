@@ -4092,7 +4092,11 @@ async fn download_parts_from_source(
                 early_upload_accept = true;
                 debug!("Received early AcceptUploadReq from source {}", _src_idx);
             }
-            (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION => {
+            // EPX is Ember-only; gate reception on `hello_caps.is_ember` as
+            // the upload side and the documented intent require (see the
+            // OP_EMBER_HELLO arm comment below). Otherwise a non-Ember peer
+            // we're downloading from could inject crafted source/peer hints.
+            (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if hello_caps.is_ember && epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION => {
                 sx_overhead.record_download((6 + payload.len()) as u64);
                 epx_packets_received += 1;
                 info!("Received early EPX from source {} during pre-file-control ({} bytes)", _src_idx, payload.len());
@@ -4627,7 +4631,8 @@ async fn download_parts_from_source(
             }
             continue;
         }
-        if proto == OP_EMULEPROT && opcode == OP_EMBER_SOURCEEXCHANGE && epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
+        // Ember-only; gated on `hello_caps.is_ember` (see upload.rs).
+        if proto == OP_EMULEPROT && opcode == OP_EMBER_SOURCEEXCHANGE && hello_caps.is_ember && epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
             sx_overhead.record_download((6 + _payload.len()) as u64);
             epx_packets_received += 1;
             info!("Received EPX from source {} during file-status-wait ({} bytes)", _src_idx, _payload.len());
@@ -5754,10 +5759,16 @@ async fn download_parts_from_source(
                     let epx_data = ember_payload.read().await.clone();
                     if !epx_data.is_empty() {
                         debug!("Re-sending EPX to multi-source peer {} (gen {}->{}, {} bytes)", _src_idx, last_epx_generation, current_gen, epx_data.len());
-                        let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await;
-                        sx_overhead.record_upload((6 + epx_data.len()) as u64);
+                        // Only advance the generation marker on a successful
+                        // write so a failed send is retried next interval
+                        // (mirrors upload.rs).
+                        if write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await.is_ok() {
+                            last_epx_generation = current_gen;
+                            sx_overhead.record_upload((6 + epx_data.len()) as u64);
+                        }
+                    } else {
+                        last_epx_generation = current_gen;
                     }
-                    last_epx_generation = current_gen;
                 }
                 last_epx_resend = std::time::Instant::now();
             }
@@ -6462,7 +6473,8 @@ async fn download_parts_from_source(
                         Err(e) => debug!("Failed to parse OP_ANSWERSOURCES2 from multi-source peer {}: {e}", _src_idx),
                     }
                 }
-                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) => {
+                // Ember-only; gated on `hello_caps.is_ember` (see upload.rs).
+                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if hello_caps.is_ember => {
                     sx_overhead.record_download((6 + payload.len()) as u64);
                     if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
                         debug!("Ignoring excess EPX packet from multi-source peer {}", _src_idx);
