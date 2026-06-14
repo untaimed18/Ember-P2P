@@ -52,6 +52,12 @@ export const updater = writable<UpdaterState>({ ...INITIAL });
 // it's a non-serializable Tauri `Resource` (and we only ever need the latest).
 let pending: Update | null = null;
 
+// Guards against a second `installUpdate()` entering before the first has
+// flipped the phase to `downloading`. A Tauri `Update` resource is not safe to
+// `downloadAndInstall` concurrently, so a double-click on "Install" could
+// otherwise corrupt the download / surface a spurious error.
+let installInFlight = false;
+
 async function disposePending(): Promise<void> {
   if (!pending) return;
   const stale = pending;
@@ -115,7 +121,8 @@ export async function checkForUpdates(opts: { silent?: boolean } = {}): Promise<
  * banner) then triggers {@link restartToUpdate}.
  */
 export async function installUpdate(): Promise<void> {
-  if (!pending) return;
+  if (!pending || installInFlight) return;
+  installInFlight = true;
   updater.update((s) => ({ ...s, phase: 'downloading', downloaded: 0, total: null, error: null }));
   let downloaded = 0;
   let total: number | null = null;
@@ -138,6 +145,8 @@ export async function installUpdate(): Promise<void> {
     updater.update((s) => ({ ...s, phase: 'ready' }));
   } catch (e) {
     updater.update((s) => ({ ...s, phase: 'error', error: toMessage(e) }));
+  } finally {
+    installInFlight = false;
   }
 }
 
