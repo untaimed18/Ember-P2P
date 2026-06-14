@@ -5,6 +5,8 @@ use std::path::Path;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use tracing::{info, warn};
 
+use crate::search::index::normalize_path_key;
+
 const MET_HEADER: u8 = 0x0E;
 const MET_HEADER_I64TAGS: u8 = 0x0F;
 
@@ -109,7 +111,10 @@ impl KnownFileList {
                     let path = record.file_path.clone();
                     self.files.insert(hash, record);
                     if !path.is_empty() {
-                        self.path_index.insert(path, hash);
+                        // Normalize the key so Windows path-casing differences
+                        // between sessions still hit on lookup (the record keeps
+                        // the original-case `file_path`).
+                        self.path_index.insert(normalize_path_key(&path), hash);
                     }
                 }
                 Err(e) => {
@@ -272,7 +277,7 @@ impl KnownFileList {
 
     /// Look up a known file by path, size, and mtime to skip re-hashing.
     pub fn find_by_path_and_meta(&self, path: &str, size: u64, mtime: i64) -> Option<&KnownFileRecord> {
-        if let Some(hash) = self.path_index.get(path) {
+        if let Some(hash) = self.path_index.get(&normalize_path_key(path)) {
             if let Some(record) = self.files.get(hash) {
                 if record.file_size == size && record.modified_at == mtime {
                     return Some(record);
@@ -381,10 +386,15 @@ impl KnownFileList {
         let hash = record.file_hash;
         let new_path = record.file_path.clone();
         if !new_path.is_empty() {
-            if let Some(&old_hash) = self.path_index.get(&new_path) {
+            // `path_index` keys are normalized (case-folded on Windows); compare
+            // and mutate via the normalized form throughout so a re-share with
+            // different path casing updates the same entry instead of
+            // accumulating a stale duplicate.
+            let new_key = normalize_path_key(&new_path);
+            if let Some(&old_hash) = self.path_index.get(&new_key) {
                 if old_hash != hash {
                     let other_refs = self.path_index.iter()
-                        .any(|(p, h)| *h == old_hash && *p != new_path);
+                        .any(|(p, h)| *h == old_hash && *p != new_key);
                     if !other_refs {
                         self.files.remove(&old_hash);
                     }
@@ -393,13 +403,14 @@ impl KnownFileList {
             // Remove stale path_index entry if this hash was previously at a different path
             if let Some(existing) = self.files.get(&hash) {
                 let old_path = &existing.file_path;
-                if !old_path.is_empty() && *old_path != new_path {
-                    if self.path_index.get(old_path) == Some(&hash) {
-                        self.path_index.remove(old_path);
+                if !old_path.is_empty() {
+                    let old_key = normalize_path_key(old_path);
+                    if old_key != new_key && self.path_index.get(&old_key) == Some(&hash) {
+                        self.path_index.remove(&old_key);
                     }
                 }
             }
-            self.path_index.insert(new_path, hash);
+            self.path_index.insert(new_key, hash);
         }
         self.files.insert(hash, record);
         self.dirty = true;
@@ -598,7 +609,7 @@ impl KnownFileList {
                 if record.file_path.is_empty() {
                     record.file_path = fp.clone();
                 }
-                self.path_index.insert(fp, hash);
+                self.path_index.insert(normalize_path_key(&fp), hash);
                 loaded += 1;
             }
         }
@@ -616,7 +627,16 @@ impl KnownFileList {
         buf.write_u8(2)?;
         buf.write_u64::<LittleEndian>(known_mtime_ns)?;
         buf.write_u32::<LittleEndian>(self.path_index.len() as u32)?;
-        for (file_path, hash) in &self.path_index {
+        for (norm_key, hash) in &self.path_index {
+            // Persist the record's ORIGINAL-case path (not the normalized index
+            // key) so a reload restores the real path for display/use; the
+            // index key is re-normalized on load.
+            let file_path = self
+                .files
+                .get(hash)
+                .map(|r| r.file_path.as_str())
+                .filter(|p| !p.is_empty())
+                .unwrap_or(norm_key.as_str());
             let pb = file_path.as_bytes();
             let len = pb.len().min(u16::MAX as usize);
             buf.write_u16::<LittleEndian>(len as u16)?;

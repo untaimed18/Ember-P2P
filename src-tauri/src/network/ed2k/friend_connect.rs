@@ -471,8 +471,20 @@ async fn read_packet_inner<R: AsyncReadExt + Unpin + ?Sized>(
     }
     let opcode = reader.read_u8().await?;
     let payload_len = (len - 1) as usize;
-    let mut payload = vec![0u8; payload_len];
-    reader.read_exact(&mut payload).await?;
+    // Grow the buffer as bytes actually arrive rather than allocating the full
+    // declared length (up to ~5 MiB) before reading. A peer that announces a
+    // large packet then stalls would otherwise pin that allocation per
+    // friend-connect session (mirrors `read_packet_async` in transfer.rs).
+    let mut payload = Vec::new();
+    let mut remaining = payload_len;
+    const READ_STEP: usize = 65536;
+    while remaining > 0 {
+        let want = remaining.min(READ_STEP);
+        let start = payload.len();
+        payload.resize(start + want, 0);
+        reader.read_exact(&mut payload[start..start + want]).await?;
+        remaining -= want;
+    }
     Ok((protocol, opcode, payload))
 }
 

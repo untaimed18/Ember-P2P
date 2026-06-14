@@ -501,7 +501,13 @@
     try {
       await reloadSharedFiles();
     } catch (e: unknown) {
-      if (mounted) error = toErr(e);
+      // The success path clears `scanning` via the background hash-progress
+      // "done" event, but on an invoke failure no such event fires — clear it
+      // here so the scanning banner doesn't linger until the 3s status poll.
+      if (mounted) {
+        scanning = false;
+        error = toErr(e);
+      }
     }
   }
 

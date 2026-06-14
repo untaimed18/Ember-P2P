@@ -17,7 +17,7 @@ pub struct LocalIndex {
 /// in another would spuriously miss. Lowercase the path on Windows; preserve
 /// it exactly on other platforms where case matters.
 #[inline]
-fn normalize_path_key(path: &str) -> String {
+pub(crate) fn normalize_path_key(path: &str) -> String {
     if cfg!(windows) {
         path.to_lowercase()
     } else {
@@ -185,6 +185,27 @@ impl LocalIndex {
     pub fn remove_pending_files(&mut self) {
         let before = self.files.len();
         self.files.retain(|f| !f.id.starts_with("pending:"));
+        if self.files.len() != before {
+            self.rebuild_indices();
+        }
+    }
+
+    /// Remove only the pending (unhashed) entries that fall under one of
+    /// `prefixes`. Used when a single folder's scan is cancelled: the global
+    /// `remove_pending_files` would also drop the in-progress entries of other
+    /// folders that are still being scanned concurrently, making their files
+    /// vanish from the library until the next reload.
+    pub fn remove_pending_files_under(&mut self, prefixes: &[String]) {
+        if prefixes.is_empty() {
+            return;
+        }
+        let before = self.files.len();
+        self.files.retain(|f| {
+            !(f.id.starts_with("pending:")
+                && prefixes
+                    .iter()
+                    .any(|p| crate::security::path_matches_dir(&f.path, p)))
+        });
         if self.files.len() != before {
             self.rebuild_indices();
         }
