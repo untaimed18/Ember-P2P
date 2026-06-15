@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getSettings, updateSettings, downloadNodesDat, downloadIpfilter } from '$lib/api/settings';
+  import { setAppSettings } from '$lib/stores/settings';
   import { getSpamStats, resetSpamFilter, clearDownloadHistory, getDownloadHistoryStats } from '$lib/api/search';
   import {
     getAntileechPatterns,
@@ -311,6 +312,10 @@
     const snapshot = JSON.stringify(settings);
     try {
       const result = await updateSettings(settings);
+      // Keep the process-wide settings cache in step with the just-saved
+      // values so runtime consumers (friend online-notification toast, chat
+      // "disabled" state) react immediately instead of next launch.
+      setAppSettings($state.snapshot(settings));
       originalSettings = snapshot;
       // Reflect the dev-console preference immediately so the sidebar link
       // appears/disappears without waiting for a reload.

@@ -90,6 +90,13 @@ export async function isFriendDiscoverable(): Promise<boolean> {
   return invoke('is_friend_discoverable');
 }
 
+/** Hex hashes of friends the backend currently considers online. Used to seed
+ *  the online set at startup so friends don't all show offline until the next
+ *  `ember:friend-online` transition. */
+export async function getOnlineFriends(): Promise<string[]> {
+  return invoke('get_online_friends');
+}
+
 export async function browseFriend(userHashHex: string): Promise<void> {
   return invoke('browse_friend', { userHashHex });
 }

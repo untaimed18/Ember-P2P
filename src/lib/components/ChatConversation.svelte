@@ -3,9 +3,20 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { getChatMessages, sendChatMessage, markMessagesRead, type ChatMessage } from '$lib/api/friends';
   import { activeChatHash, clearUnread, onlineFriends } from '$lib/stores/friends';
+  import { appSettings } from '$lib/stores/settings';
   import { getDraft, setDraft, clearDraft } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+
+  // The backend rejects chat messages whose UTF-8 encoding exceeds this many
+  // bytes (`peers.rs`); the textarea `maxlength` only bounds characters, so we
+  // mirror the byte check here to give a clear error instead of a generic
+  // "send failed" on multi-byte/emoji-heavy text.
+  const MAX_MESSAGE_BYTES = 4096;
+  // Upper bound on messages held in memory at once. "Load older" stops past
+  // this so a very long history can't grow the array (and the rendered DOM)
+  // without bound; the rest stays in the DB and on disk.
+  const MAX_LOADED_MESSAGES = 2000;
 
   interface Props {
     friendHash: string;
@@ -23,6 +34,11 @@
   // a peer that hasn't been re-authenticated since this session
   // opened.
   let isOnline = $derived(friendHash ? $onlineFriends.has(friendHash) : false);
+
+  // The user can disable chat entirely in Settings; when off, the backend
+  // drops inbound and refuses outbound chat, so reflect that in the UI rather
+  // than letting the user type into a textarea whose sends will be rejected.
+  let chatDisabled = $derived($appSettings?.friend_chat_disabled === true);
 
   /**
    * Hard cap on in-memory chat messages per conversation. Old messages beyond
@@ -52,6 +68,7 @@
   const PAGE_SIZE = 100;
   let loadingOlder = $state(false);
   let hasMoreHistory = $state(false);
+  let olderError = $state(false);
   // Pagination cursor: the smallest (oldest) DB row id we've loaded. Tracked
   // separately from `messages` because live messages use negative ids and the
   // MAX_LIVE_MESSAGES trim drops oldest-first — in a busy session that can
@@ -144,6 +161,16 @@
       fn = await listen<{ user_hash: string; message: string; direction: string; timestamp: number }>('ember:chat-message', (event) => {
         if (gen !== loadGen) return;
         if (event.payload.user_hash === friendHash) {
+          // Dedup duplicate backend emits: inbound chat can be delivered on
+          // both the download and upload event loops for the same logical
+          // message. Compare the content tuple against the recent tail (a
+          // small window avoids wrongly collapsing two genuinely-identical
+          // messages sent seconds apart).
+          const sig = `${event.payload.timestamp}|${event.payload.direction}|${event.payload.message}`;
+          const isDuplicate = messages
+            .slice(-5)
+            .some((mm) => `${mm.timestamp}|${mm.direction}|${mm.message}` === sig);
+          if (isDuplicate) return;
           const wasPinned = isPinnedToBottom();
           const next = [...messages, {
             id: --msgIdCounter,
@@ -206,7 +233,15 @@
 
   async function loadOlderMessages() {
     if (loadingOlder || !hasMoreHistory || !friendHash) return;
+    // Bound in-memory history. The rest stays in the DB; stopping here keeps
+    // both the array and the rendered DOM from growing without limit on a very
+    // long conversation.
+    if (messages.length >= MAX_LOADED_MESSAGES) {
+      hasMoreHistory = false;
+      return;
+    }
     loadingOlder = true;
+    olderError = false;
     const gen = loadGen;
     try {
       const cursor = oldestDbId;
@@ -220,7 +255,6 @@
         hasMoreHistory = false;
         return;
       }
-      hasMoreHistory = rows.length >= PAGE_SIZE;
       const olderPage = rows.reverse();
       // Advance the cursor to the new oldest loaded id (ascending order).
       if (olderPage.length > 0) oldestDbId = olderPage[0].id;
@@ -228,13 +262,20 @@
       const prevScrollHeight = el?.scrollHeight ?? 0;
       const prevScrollTop = el?.scrollTop ?? 0;
       messages = [...olderPage, ...messages];
+      // More history exists only if this page was full AND we're still under
+      // the in-memory cap; otherwise hide the button.
+      hasMoreHistory = rows.length >= PAGE_SIZE && messages.length < MAX_LOADED_MESSAGES;
       requestAnimationFrame(() => {
         if (!messagesContainerEl) return;
         const delta = messagesContainerEl.scrollHeight - prevScrollHeight;
         messagesContainerEl.scrollTop = prevScrollTop + delta;
       });
     } catch (e) {
+      if (gen !== loadGen) return;
+      // Surface the failure so the user knows the button did nothing and can
+      // retry, instead of it silently re-enabling.
       console.warn('loadOlderMessages failed:', e);
+      olderError = true;
     } finally {
       if (gen === loadGen) loadingOlder = false;
     }
@@ -280,6 +321,14 @@
   async function handleSend() {
     const text = inputText.trim();
     if (!text || sending) return;
+    // Guard on UTF-8 byte length to match the backend's limit. `maxlength`
+    // only caps characters, so a message of multi-byte glyphs (emoji, CJK)
+    // can be under 4096 chars yet over 4096 bytes and be rejected server-side
+    // with a generic error.
+    if (new TextEncoder().encode(text).length > MAX_MESSAGE_BYTES) {
+      sendError = m.chat_message_too_long({ max: MAX_MESSAGE_BYTES });
+      return;
+    }
     sending = true;
     sendError = null;
     try {
@@ -335,11 +384,11 @@
         <span class="sr-only">{m.chat_friend_with_prefix()} </span><bdi>{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi>
       </span>
       {#if isOnline}
-        <span class="conv-status verified" title={m.chat_verified_title()} aria-label={m.chat_verified_aria()}>
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M3 8l3 3 7-7"/>
+        <span class="conv-status online" title={m.chat_online_title()} aria-label={m.chat_online_aria()}>
+          <svg viewBox="0 0 16 16" fill="currentColor" stroke="none" aria-hidden="true">
+            <circle cx="8" cy="8" r="4"/>
           </svg>
-          <span>{m.chat_verified_label()}</span>
+          <span>{m.chat_online_label()}</span>
         </span>
       {:else}
         <span class="conv-status offline" title={m.chat_offline_title()} aria-label={m.chat_offline_aria()}>
@@ -379,8 +428,11 @@
             disabled={loadingOlder}
             aria-label={m.chat_load_older()}
           >
-            {loadingOlder ? m.chat_loading_short() : m.chat_load_older()}
+            {loadingOlder ? m.chat_loading_short() : (olderError ? m.common_retry() : m.chat_load_older())}
           </button>
+          {#if olderError}
+            <span class="conv-load-older-error" role="alert">{m.chat_load_older_failed()}</span>
+          {/if}
         </div>
       {/if}
       {#each messages as msg (msg.id)}
@@ -404,23 +456,27 @@
     <div class="conv-error">{sendError}</div>
   {/if}
 
-  <div class="conv-input-area">
-    <textarea
-      class="conv-input"
-      bind:value={inputText}
-      bind:this={chatInputEl}
-      onkeydown={handleKeydown}
-      placeholder={m.chat_input_placeholder()}
-      maxlength="4096"
-      rows="2"
-      disabled={sending}
-    ></textarea>
-    <button class="conv-send" onclick={handleSend} disabled={!inputText.trim() || sending} title={m.chat_send_title_short()} aria-label={m.chat_send_aria()}>
-      <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M3 10l14-7-7 14-2-5z"/><line x1="10" y1="17" x2="17" y2="3"/>
-      </svg>
-    </button>
-  </div>
+  {#if chatDisabled}
+    <div class="conv-disabled" role="status">{m.chat_disabled_notice()}</div>
+  {:else}
+    <div class="conv-input-area">
+      <textarea
+        class="conv-input"
+        bind:value={inputText}
+        bind:this={chatInputEl}
+        onkeydown={handleKeydown}
+        placeholder={m.chat_input_placeholder()}
+        maxlength="4096"
+        rows="2"
+        disabled={sending}
+      ></textarea>
+      <button class="conv-send" onclick={handleSend} disabled={!inputText.trim() || sending} title={m.chat_send_title_short()} aria-label={m.chat_send_aria()}>
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 10l14-7-7 14-2-5z"/><line x1="10" y1="17" x2="17" y2="3"/>
+        </svg>
+      </button>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -492,7 +548,7 @@
     height: 11px;
   }
 
-  .conv-status.verified {
+  .conv-status.online {
     background: color-mix(in srgb, var(--success, #2eb56d) 16%, transparent);
     color: var(--success, #2eb56d);
   }
@@ -563,8 +619,15 @@
 
   .conv-load-older {
     display: flex;
-    justify-content: center;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
     margin-bottom: 8px;
+  }
+
+  .conv-load-older-error {
+    font-size: 11px;
+    color: var(--danger);
   }
 
   .conv-load-older-btn {
@@ -629,6 +692,16 @@
     color: var(--danger);
     font-size: 12px;
     text-align: center;
+  }
+
+  .conv-disabled {
+    padding: 12px 14px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-surface);
+    color: var(--text-muted);
+    font-size: 12.5px;
+    text-align: center;
+    flex-shrink: 0;
   }
 
   .conv-input-area {

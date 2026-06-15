@@ -14,6 +14,7 @@
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
+  import { loadAppSettings, clearAppSettings } from '$lib/stores/settings';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { applyDocumentLang, translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
@@ -92,6 +93,7 @@
     initTransferStore(),
     initSearchStore(),
     initFriendsStore(),
+    loadAppSettings(),
   ]);
 
   // Register the close-requested listener at the top of the module so it's
@@ -255,6 +257,7 @@
       cleanupTransferStore();
       cleanupSearchStore();
       cleanupFriendsStore();
+      clearAppSettings();
       void closeListenerPromise.then((unlisten) => unlisten());
       void configCorruptListenerPromise.then((unlisten) => unlisten());
     };

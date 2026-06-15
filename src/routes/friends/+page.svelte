@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { getFriends, addFriend, removeFriend, updateFriendNickname, getMyEmberHash, acceptFriendRequest, rejectFriendRequest, type FriendInfo, type FriendRequestInfo } from '$lib/api/friends';
+  import { getFriends, addFriend, removeFriend, updateFriendNickname, getMyEmberHash, acceptFriendRequest, rejectFriendRequest, retryFriendSearch, type FriendInfo, type FriendRequestInfo } from '$lib/api/friends';
   import { getNetworkStats, kadRecheckFirewall } from '$lib/api/kad';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import BrowseFriendDialog from '$lib/components/BrowseFriendDialog.svelte';
@@ -112,6 +112,10 @@
 
   let onlineFiltered = $derived(filtered.filter(f => onlineFriends.has(f.user_hash)));
   let offlineFiltered = $derived(filtered.filter(f => !onlineFriends.has(f.user_hash)));
+  // Count only friends that are online — `onlineFriends` (the raw store set)
+  // can momentarily hold a hash that isn't in the current friend list, which
+  // would inflate the header count.
+  let onlineFriendCount = $derived(friends.filter(f => onlineFriends.has(f.user_hash)).length);
 
   function openChat(f: FriendInfo) {
     // Delegate to the global multi-conversation dock. It opens the
@@ -156,7 +160,11 @@
       const { getFriendRequests } = await import('$lib/api/friends');
       const reqs = await getFriendRequests();
       friendRequestsStore.set(reqs);
-    } catch (_) { /* best-effort */ }
+    } catch (e) {
+      // Non-fatal: the optimistic update already adjusted the list. Log so a
+      // persistent reconciliation failure is visible in devtools.
+      console.warn('reloadFriendRequests failed:', e);
+    }
   }
 
   async function handleAcceptRequest(req: FriendRequestInfo) {
@@ -165,14 +173,33 @@
     processingRequests = new Set(processingRequests);
     try {
       await acceptFriendRequest(req.sender_hash);
+      // Optimistically drop the accepted row so it disappears immediately even
+      // if the follow-up reconciliation fetch fails.
+      friendRequestsStore.update(reqs => reqs.filter(r => r.sender_hash !== req.sender_hash));
       flash(m.friends_accepted_request({ name: req.sender_nickname || req.sender_hash.slice(0, 8) + '\u2026' }));
       await reloadFriendRequests();
       await loadFriends();
     } catch (e: unknown) {
       error = toErr(e);
+      // Accept can fail because the request no longer exists (withdrawn, or
+      // handled in another window). Resync so a stale row doesn't linger.
+      await reloadFriendRequests();
     } finally {
       processingRequests.delete(req.sender_hash);
       processingRequests = new Set(processingRequests);
+    }
+  }
+
+  async function handleRetrySearch(f: FriendInfo) {
+    // Re-trigger a rendezvous/DHT search for an offline friend. The backend
+    // emits `ember:friend-searching` (which drives the row's "Searching…"
+    // state) and then a terminal online/failed event, so no extra local
+    // spinner state is needed here.
+    if (searchingFriends.has(f.user_hash)) return;
+    try {
+      await retryFriendSearch(f.user_hash);
+    } catch (e: unknown) {
+      error = toErr(e);
     }
   }
 
@@ -211,7 +238,7 @@
     loadMyHash();
     getNetworkStats()
       .then(s => { if (!destroyed) isFirewalled = s.firewalled; })
-      .catch(() => {});
+      .catch((e) => { console.warn('friends: initial getNetworkStats failed:', e); });
 
     const unlistenFns: (() => void)[] = [];
 
@@ -633,8 +660,8 @@
       {/if}
       <span class="inline-stat">
         {friends.length === 1
-          ? m.friends_online_count_one({ online: onlineFriends.size })
-          : m.friends_online_count_other({ online: onlineFriends.size, total: friends.length })}
+          ? m.friends_online_count_one({ online: onlineFriendCount })
+          : m.friends_online_count_other({ online: onlineFriendCount, total: friends.length })}
       </span>
     </div>
   </div>
@@ -815,6 +842,20 @@
             </svg>
             {m.friends_action_browse()}
           </button>
+          {#if f.mutual && !isOnline}
+            <button
+              class="action-btn reconnect-action"
+              onclick={() => handleRetrySearch(f)}
+              disabled={searchingFriends.has(f.user_hash)}
+              title={m.friends_action_reconnect_title()}
+            >
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/>
+                <polyline points="13.5 2 13.5 5 10.5 5"/>
+              </svg>
+              {searchingFriends.has(f.user_hash) ? m.friends_status_searching() : m.friends_action_reconnect()}
+            </button>
+          {/if}
         </div>
       </div>
     {/snippet}

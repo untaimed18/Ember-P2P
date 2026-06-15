@@ -1426,10 +1426,18 @@ impl Database {
             .ok()
         };
 
-        let nickname = request_data
-            .as_ref()
-            .map(|(n, _, _)| n.clone())
-            .unwrap_or_default();
+        // Refuse to "accept" a request that no longer exists. Without this a
+        // stale accept (the row was withdrawn, rejected in another window, or
+        // aged out of the 100-row cap) would still INSERT a `mutual = 1`
+        // friend with an empty nickname and no address — a "ghost" friend the
+        // user never knowingly added. The caller surfaces this as a "request
+        // no longer exists" error and drops the row from the UI.
+        let request_data = match request_data {
+            Some(data) => data,
+            None => anyhow::bail!("friend request not found"),
+        };
+
+        let nickname = request_data.0.clone();
         let now = chrono::Utc::now().timestamp();
 
         // Insert the friend with `mutual = 1` directly (matches the
@@ -1444,7 +1452,8 @@ impl Database {
             params![sender_hash, nickname, now],
         )?;
 
-        if let Some((_, ref ip, port)) = request_data {
+        {
+            let (_, ref ip, port) = request_data;
             if !ip.is_empty() && port > 0 {
                 tx.execute(
                     "UPDATE friends SET last_ip = ?2, last_port = ?3, last_seen = ?4 WHERE user_hash = ?1",
@@ -1458,7 +1467,31 @@ impl Database {
             params![sender_hash],
         )?;
         tx.commit()?;
-        Ok(request_data)
+        Ok(Some(request_data))
+    }
+
+    /// Promote an existing friend to mutual and refresh their last-known
+    /// address. Used by the auto-confirm path: an inbound friend request from
+    /// a peer we already added, when the user has turned off "require
+    /// approval". Unlike `accept_friend_request` this does not touch the
+    /// `friend_requests` table (no queued row exists in that flow). Returns
+    /// the number of friend rows updated — 0 means the peer wasn't actually in
+    /// the friend list, so the caller should fall back to queuing.
+    pub fn set_friend_mutual(&self, user_hash: &str, ip: &str, port: u16) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().timestamp();
+        let updated = if !ip.is_empty() && port > 0 {
+            conn.execute(
+                "UPDATE friends SET mutual = 1, last_ip = ?2, last_port = ?3, last_seen = ?4 WHERE user_hash = ?1",
+                params![user_hash, ip, port as i64, now],
+            )?
+        } else {
+            conn.execute(
+                "UPDATE friends SET mutual = 1 WHERE user_hash = ?1",
+                params![user_hash],
+            )?
+        };
+        Ok(updated)
     }
 
     pub fn insert_chat_message(&self, friend_hash: &str, direction: &str, message: &str) -> anyhow::Result<i64> {
