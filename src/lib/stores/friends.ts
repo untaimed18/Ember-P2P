@@ -1,12 +1,17 @@
-import { writable } from 'svelte/store';
+import { writable, get } from 'svelte/store';
 import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import {
   getFriendRequests,
+  getFriends,
+  getOnlineFriends,
   getUnreadMessageCounts,
   isFriendDiscoverable,
   type FriendRequestInfo,
 } from '$lib/api/friends';
+import { appSettings } from '$lib/stores/settings';
+import { toast } from '$lib/stores/toast';
+import * as m from '$lib/paraglide/messages';
 
 export const onlineFriends = writable<Set<string>>(new Set());
 export const unreadCounts = writable<Map<string, number>>(new Map());
@@ -61,6 +66,33 @@ export const activeChatHash = writable<string | null>(null);
 let activeChatHashSnapshot: string | null = null;
 activeChatHash.subscribe((v) => { activeChatHashSnapshot = v; });
 
+// Best-effort hash → nickname map, used only to name a friend in the
+// "came online" toast. Populated from `get_friends` on init and refreshed when
+// a friendship is confirmed. A rename made elsewhere may briefly show a stale
+// name until the next confirm/init — acceptable for a transient toast.
+let friendNames = new Map<string, string>();
+async function refreshFriendNames(): Promise<void> {
+  try {
+    const list = await getFriends();
+    friendNames = new Map(list.map((f) => [f.user_hash, f.nickname]));
+  } catch {
+    // Keep whatever we had; the toast falls back to a short hash.
+  }
+}
+
+function shortHash(hash: string): string {
+  return hash.length > 8 ? hash.slice(0, 8) + '\u2026' : hash;
+}
+
+// Toast a friend coming online, gated on the user preference. Called only on a
+// genuine offline→online transition (see the listener) so re-emitted online
+// signals for an already-online friend don't spam, and never for the initial
+// startup snapshot (seeded with `.update`, bypassing this).
+function notifyFriendOnline(hash: string): void {
+  if (!get(appSettings)?.friend_online_notifications) return;
+  toast(m.friend_online_toast({ name: friendNames.get(hash) || shortHash(hash) }));
+}
+
 let initialized = false;
 let unlisteners: UnlistenFn[] = [];
 
@@ -103,9 +135,17 @@ export async function initFriendsStore() {
     registered.push(
       await listen<{ user_hash: string }>('ember:friend-online', (event) => {
         const hash = event.payload.user_hash;
-        onlineFriends.update((s) => new Set([...s, hash]));
+        let wasOffline = false;
+        onlineFriends.update((s) => {
+          if (s.has(hash)) return s;
+          wasOffline = true;
+          return new Set([...s, hash]);
+        });
         searchingFriends.update((s) => { const next = new Set(s); next.delete(hash); return next; });
         clearSearchTimer(hash);
+        // Only notify on a real transition — repeated online signals for an
+        // already-online friend (the backend can emit several) must not toast.
+        if (wasOffline) notifyFriendOnline(hash);
       }),
     );
     registered.push(
@@ -178,6 +218,10 @@ export async function initFriendsStore() {
       await listen<{ user_hash: string }>('ember:friend-confirmed', (event) => {
         searchingFriends.update((s) => { const next = new Set(s); next.delete(event.payload.user_hash); return next; });
         clearSearchTimer(event.payload.user_hash);
+        // A confirm (manual accept or auto-confirm) can introduce a brand-new
+        // mutual friend; refresh the name map so a later online toast can name
+        // them.
+        void refreshFriendNames();
       }),
     );
     registered.push(
@@ -229,6 +273,19 @@ export async function initFriendsStore() {
     const discoverable = await isFriendDiscoverable();
     isDiscoverable.set(discoverable);
   } catch { /* backend not ready yet */ }
+
+  // Seed the name map used by online toasts.
+  await refreshFriendNames();
+
+  // Seed the online set from the backend's current view so friends don't all
+  // show offline (chat/browse disabled) until the next `ember:friend-online`
+  // transition. Merge rather than replace so any online event that landed
+  // during init isn't dropped. Seeding via the store (not the listener) means
+  // these pre-online friends don't trigger "came online" toasts.
+  try {
+    const online = await getOnlineFriends();
+    onlineFriends.update((s) => new Set([...s, ...online]));
+  } catch { /* backend not ready yet */ }
 }
 
 export function clearUnread(friendHash: string) {
@@ -253,4 +310,5 @@ export function cleanupFriendsStore() {
   searchingFriends.set(new Set());
   isDiscoverable.set(false);
   activeChatHash.set(null);
+  friendNames = new Map();
 }

@@ -11,7 +11,7 @@
     kadCancelSearch,
   } from '$lib/api/kad';
   import { getSettings } from '$lib/api/settings';
-  import { networkError, networkStats } from '$lib/stores/network';
+  import { networkError, networkStats, upnpAutoDisabled } from '$lib/stores/network';
   import { toastSuccess, toastError, toast as toastInfo } from '$lib/stores/toast';
   import { goto } from '$app/navigation';
   import { passiveScroll } from '$lib/actions/passiveScroll';
@@ -781,7 +781,7 @@
           </div>
           <div class="stat-tile">
             <span class="stat-label">{m.kad_stat_upnp()}</span>
-            {#if !upnpEnabled}
+            {#if !upnpEnabled || $upnpAutoDisabled}
               <button
                 type="button"
                 class="stat-link"

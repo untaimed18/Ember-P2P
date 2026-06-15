@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getSettings, updateSettings, downloadNodesDat, downloadIpfilter } from '$lib/api/settings';
+  import { setAppSettings } from '$lib/stores/settings';
   import { getSpamStats, resetSpamFilter, clearDownloadHistory, getDownloadHistoryStats } from '$lib/api/search';
   import {
     getAntileechPatterns,
@@ -163,8 +164,7 @@
     'bandwidth',
     'network',
     'security',
-    // Hidden until developer decides to introduce the feature.
-    // 'friends',
+    'friends',
     'search',
     'about',
   ];
@@ -310,6 +310,10 @@
     const snapshot = JSON.stringify(settings);
     try {
       const result = await updateSettings(settings);
+      // Keep the process-wide settings cache in step with the just-saved
+      // values so runtime consumers (friend online-notification toast, chat
+      // "disabled" state) react immediately instead of next launch.
+      setAppSettings($state.snapshot(settings));
       originalSettings = snapshot;
       const isWarn = result.toLowerCase().includes('restart');
       showSaveMsg(result, isWarn, isWarn ? 8000 : 3000);
@@ -755,7 +759,6 @@
                   <path d="M10 2L3 6v4c0 4.4 3 8.5 7 10 4-1.5 7-5.6 7-10V6l-7-4z"/>
                   <polyline points="7,10 9.5,12.5 13.5,7.5"/>
                 </svg>
-              <!-- Hidden until developer decides to introduce the feature.
               {:else if section === 'friends'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <circle cx="7" cy="6" r="3"/>
@@ -763,7 +766,6 @@
                   <path d="M1 17c0-3.3 2.7-6 6-6s6 2.7 6 6"/>
                   <path d="M13 11.5c2.5 0 4.5 2 4.5 4.5"/>
                 </svg>
-              -->
               {:else if section === 'search'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <circle cx="8.5" cy="8.5" r="5.5"/>
@@ -1415,8 +1417,7 @@
         </div>
       </section>
 
-      <!-- Hidden until developer decides to introduce the feature.
-      Friends
+      <!-- Friends -->
       <section class="card" class:hidden={activeSection !== 'friends'}>
         <div class="card-header">
           <span class="card-icon">&#128101;</span>
@@ -1474,7 +1475,6 @@
 
         </div>
       </section>
-      -->
 
       <!-- About & Updates -->
       <section class="card" class:hidden={activeSection !== 'about'}>

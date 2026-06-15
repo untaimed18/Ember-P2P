@@ -1907,6 +1907,13 @@ pub enum NetworkCommand {
     IsFriendDiscoverable {
         tx: oneshot::Sender<bool>,
     },
+    /// Snapshot of friends currently considered online (hex hashes). Lets the
+    /// UI seed its online set at startup instead of waiting for the next
+    /// `ember:friend-online` transition, which otherwise leaves every friend
+    /// showing offline (chat/browse disabled) until a fresh session forms.
+    GetOnlineFriends {
+        tx: oneshot::Sender<Vec<String>>,
+    },
     GetPeerReputation {
         user_hash: [u8; 16],
         tx: oneshot::Sender<Option<PeerReputationInfo>>,
@@ -3800,7 +3807,10 @@ pub async fn start_network(
 
     let _ = app_handle.emit("network-status", NetworkStatus::Connecting);
 
-    let upnp_enabled = settings.upnp_enabled;
+    // Mutable: a failed startup mapping auto-disables UPnP for the rest of
+    // this session (see the emission below), which gates off the maintenance
+    // retries, the QUIC port mapping, and the shutdown teardown.
+    let mut upnp_enabled = settings.upnp_enabled;
 
     // Run UPnP setup and IP filter load concurrently since they're
     // independent. Gateway discovery is bounded to ~5s inside `setup()`, so a
@@ -3834,6 +3844,39 @@ pub async fn start_network(
             filter
         },
     );
+
+    // Tell the UI the outcome of the initial UPnP attempt so it can warn the
+    // user (with actionable advice) when automatic port forwarding didn't
+    // work. Only emitted when UPnP is enabled — there's nothing to report
+    // when the user opted out. `gateway_found` lets the frontend distinguish
+    // "no UPnP router" from "router rejected the mapping".
+    //
+    // When the attempt failed we auto-disable UPnP: turning off the loop-owned
+    // flag stops the maintenance retries, the QUIC mapping, and the teardown
+    // from running for the rest of the session, and `auto_disabled: true` tells
+    // the frontend to persist the setting as off (the user is shown how to
+    // forward ports manually / via VPN and can re-enable it later). A
+    // mid-session loss is handled differently — see the `maintain` tick, which
+    // keeps retrying rather than disabling, since a router reboot usually
+    // recovers on its own.
+    if upnp_enabled {
+        let auto_disabled = !upnp_success;
+        if auto_disabled {
+            warn!("UPnP enabled but initial port mapping failed; disabling UPnP for this session");
+            upnp_enabled = false;
+        }
+        let _ = app_handle.emit(
+            "upnp-status",
+            serde_json::json!({
+                "mapped": upnp_success,
+                "gateway_found": upnp_mappings.has_gateway(),
+                "auto_disabled": auto_disabled,
+                "tcp_port": tcp_port,
+                "udp_port": udp_port,
+            }),
+        );
+    }
+
     let shared_ip_filter = ip_filter.create_shared_snapshot();
     routing_table.set_ip_filter(shared_ip_filter.clone());
 
@@ -5791,16 +5834,44 @@ pub async fn start_network(
                     // accept.
                     let db_q = db.clone();
                     let h_q = hash_hex.clone();
-                    let already_mutual = tokio::task::spawn_blocking(move || {
+                    let (is_friend, already_mutual) = tokio::task::spawn_blocking(move || {
                         db_q.get_friends_full()
                             .ok()
-                            .and_then(|rows| rows.into_iter().find(|(h, ..)| h == &h_q).map(|(_, _, _, _, _, _, mutual)| mutual))
-                            .unwrap_or(false)
+                            .and_then(|rows| rows.into_iter()
+                                .find(|(h, ..)| h == &h_q)
+                                .map(|(_, _, _, _, _, _, mutual)| (true, mutual)))
+                            .unwrap_or((false, false))
                     })
                     .await
-                    .unwrap_or(false);
+                    .unwrap_or((false, false));
                     if already_mutual {
                         info!("Friend {} already mutual — ignoring redundant EmberFriendRequest", hash_hex);
+                    } else if is_friend && !settings.friend_require_approval {
+                        // Auto-confirm: the user already added this peer and has
+                        // turned off "require approval", so a reciprocal request
+                        // upgrades the friendship to mutual without prompting.
+                        // Strangers (not already in our list) still fall through
+                        // to the approval queue below — we never auto-add an
+                        // unknown peer regardless of this setting.
+                        info!("Auto-confirming friend {} (already added; approval not required)", hash_hex);
+                        let db2 = db.clone();
+                        let h2 = hash_hex.clone();
+                        let ip2 = peer_ip.clone();
+                        let promoted = tokio::task::spawn_blocking(move || db2.set_friend_mutual(&h2, &ip2, peer_port))
+                            .await
+                            .unwrap_or(Ok(0))
+                            .unwrap_or(0);
+                        if promoted > 0 {
+                            if !state.online_friends.contains_key(&req_hash) {
+                                state.online_friends.insert(req_hash, chrono::Utc::now().timestamp());
+                                let _ = app_handle.emit("ember:friend-online", serde_json::json!({
+                                    "user_hash": hash_hex,
+                                }));
+                            }
+                            let _ = app_handle.emit("ember:friend-confirmed", serde_json::json!({
+                                "user_hash": hash_hex,
+                            }));
+                        }
                     } else {
                         info!("Queuing friend request from {} for user approval", hash_hex);
                         let db2 = db.clone();
@@ -6398,16 +6469,42 @@ pub async fn start_network(
                     // still required regardless.
                     let db_q = db.clone();
                     let h_q = hash_hex.clone();
-                    let already_mutual = tokio::task::spawn_blocking(move || {
+                    let (is_friend, already_mutual) = tokio::task::spawn_blocking(move || {
                         db_q.get_friends_full()
                             .ok()
-                            .and_then(|rows| rows.into_iter().find(|(h, ..)| h == &h_q).map(|(_, _, _, _, _, _, mutual)| mutual))
-                            .unwrap_or(false)
+                            .and_then(|rows| rows.into_iter()
+                                .find(|(h, ..)| h == &h_q)
+                                .map(|(_, _, _, _, _, _, mutual)| (true, mutual)))
+                            .unwrap_or((false, false))
                     })
                     .await
-                    .unwrap_or(false);
+                    .unwrap_or((false, false));
                     if already_mutual {
                         info!("Friend {} already mutual — ignoring redundant EmberFriendRequest", hash_hex);
+                    } else if is_friend && !settings.friend_require_approval {
+                        // Auto-confirm (see the download-side handler): a
+                        // reciprocal request from a peer we already added is
+                        // promoted to mutual without prompting when the user has
+                        // disabled "require approval". Strangers still queue.
+                        info!("Auto-confirming friend {} (already added; approval not required)", hash_hex);
+                        let db2 = db.clone();
+                        let h2 = hash_hex.clone();
+                        let ip2 = peer_ip.clone();
+                        let promoted = tokio::task::spawn_blocking(move || db2.set_friend_mutual(&h2, &ip2, peer_port))
+                            .await
+                            .unwrap_or(Ok(0))
+                            .unwrap_or(0);
+                        if promoted > 0 {
+                            if !state.online_friends.contains_key(&req_hash) {
+                                state.online_friends.insert(req_hash, chrono::Utc::now().timestamp());
+                                let _ = app_handle.emit("ember:friend-online", serde_json::json!({
+                                    "user_hash": hash_hex,
+                                }));
+                            }
+                            let _ = app_handle.emit("ember:friend-confirmed", serde_json::json!({
+                                "user_hash": hash_hex,
+                            }));
+                        }
                     } else {
                         info!("Queuing friend request from {} for user approval", hash_hex);
                         let db2 = db.clone();
@@ -13949,6 +14046,22 @@ pub async fn start_network(
                             // determination in the other direction.
                             state.firewalled_shared.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
+                        // Mirror the startup emission so the UI can toast a
+                        // recovery ("forwarding restored") or a loss ("mapping
+                        // lost, peers may not reach you") without waiting for
+                        // the next stats poll. `auto_disabled` is always false
+                        // here: a mid-session change keeps UPnP enabled so
+                        // `maintain` can recover it (router reboots usually do).
+                        let _ = app_handle.emit(
+                            "upnp-status",
+                            serde_json::json!({
+                                "mapped": mapped,
+                                "gateway_found": upnp_mappings.has_gateway(),
+                                "auto_disabled": false,
+                                "tcp_port": state.tcp_port,
+                                "udp_port": state.udp_port,
+                            }),
+                        );
                     }
                 }
             }
@@ -18935,6 +19048,11 @@ async fn handle_command_inner(
 
         NetworkCommand::IsFriendDiscoverable { tx } => {
             let _ = tx.send(state.rendezvous_registered);
+        }
+
+        NetworkCommand::GetOnlineFriends { tx } => {
+            let online: Vec<String> = state.online_friends.keys().map(hex::encode).collect();
+            let _ = tx.send(online);
         }
 
         NetworkCommand::FindNotes { file_hash, file_size, tx } => {
