@@ -783,6 +783,7 @@ pub fn run() {
             commands::peers::browse_friend,
             commands::peers::retry_friend_search,
             commands::peers::is_friend_discoverable,
+            commands::peers::get_online_friends,
             commands::peers::kad_connect,
             commands::peers::kad_disconnect,
             commands::peers::kad_bootstrap_ip,

@@ -224,13 +224,7 @@ impl UpnpMappings {
 
     fn note_discovery_failure(&mut self) {
         self.discovery_failures = self.discovery_failures.saturating_add(1);
-        // 10 → 20 → 40 → 60 min (capped); `maintain` ticks every 10 min.
-        let mins = match self.discovery_failures {
-            0 | 1 => 10,
-            2 => 20,
-            3 => 40,
-            _ => 60,
-        };
+        let mins = discovery_backoff_mins(self.discovery_failures);
         self.next_discovery_at = Some(Instant::now() + Duration::from_secs(mins * 60));
     }
 
@@ -298,6 +292,26 @@ impl UpnpMappings {
     pub fn is_mapped(&self) -> bool {
         self.tcp_mapped || self.udp_mapped
     }
+
+    /// Whether a gateway is currently cached. Lets the caller distinguish
+    /// "no IGD/UPnP router found (or it's unreachable)" from "gateway found
+    /// but it refused the mapping" when surfacing a failure to the user —
+    /// the two cases need different remediation advice.
+    pub fn has_gateway(&self) -> bool {
+        self.gateway.is_some()
+    }
+}
+
+/// Backoff (in minutes) before retrying gateway discovery after `failures`
+/// consecutive failures. `maintain` ticks every 10 min, so the schedule is
+/// expressed in multiples of that tick: 10 → 20 → 40 → 60 (capped).
+fn discovery_backoff_mins(failures: u32) -> u64 {
+    match failures {
+        0 | 1 => 10,
+        2 => 20,
+        3 => 40,
+        _ => 60,
+    }
 }
 
 /// Local IPv4 on the interface that routes to the gateway. A mapping must
@@ -318,5 +332,102 @@ fn route_local_ipv4(target: SocketAddr) -> Option<Ipv4Addr> {
     match socket.local_addr().ok()? {
         SocketAddr::V4(v4) => Some(*v4.ip()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_starts_unmapped_with_no_gateway() {
+        let m = UpnpMappings::new(4662, 4672);
+        assert!(!m.is_mapped(), "fresh instance must not report a mapping");
+        assert!(!m.has_gateway(), "fresh instance has no cached gateway");
+        assert_eq!(m.quic_port, None);
+    }
+
+    #[test]
+    fn is_mapped_tracks_tcp_or_udp_only() {
+        let mut m = UpnpMappings::new(4662, 4672);
+        // QUIC alone is not enough to count as "mapped": the dashboard /
+        // firewall-clear logic keys off the TCP + KAD-UDP reachability path.
+        m.quic_mapped = true;
+        assert!(!m.is_mapped());
+        m.tcp_mapped = true;
+        assert!(m.is_mapped());
+        m.tcp_mapped = false;
+        m.udp_mapped = true;
+        assert!(m.is_mapped());
+    }
+
+    #[test]
+    fn discovery_backoff_follows_capped_schedule() {
+        // 10 → 20 → 40 → 60, then held at 60 for every further failure.
+        assert_eq!(discovery_backoff_mins(0), 10);
+        assert_eq!(discovery_backoff_mins(1), 10);
+        assert_eq!(discovery_backoff_mins(2), 20);
+        assert_eq!(discovery_backoff_mins(3), 40);
+        assert_eq!(discovery_backoff_mins(4), 60);
+        assert_eq!(discovery_backoff_mins(100), 60);
+    }
+
+    #[test]
+    fn note_discovery_failure_increments_and_arms_backoff() {
+        let mut m = UpnpMappings::new(4662, 4672);
+        assert!(m.next_discovery_at.is_none());
+        m.note_discovery_failure();
+        assert_eq!(m.discovery_failures, 1);
+        let first = m.next_discovery_at.expect("backoff armed after first failure");
+        // A later failure schedules its retry no earlier than the first
+        // (the schedule is monotonically non-decreasing).
+        m.note_discovery_failure();
+        assert_eq!(m.discovery_failures, 2);
+        let second = m.next_discovery_at.expect("backoff armed after second failure");
+        assert!(second >= first);
+    }
+
+    #[tokio::test]
+    async fn map_quic_port_without_gateway_records_port_and_reports_failure() {
+        let mut m = UpnpMappings::new(4662, 4672);
+        // Distinct from the KAD UDP port → needs its own mapping, but no
+        // gateway has been discovered yet, so it can't be mapped right now.
+        assert!(!m.map_quic_port(5000).await);
+        assert_eq!(m.quic_port, Some(5000), "port is recorded for a later maintain()");
+        assert!(!m.quic_mapped);
+    }
+
+    #[tokio::test]
+    async fn map_quic_port_sharing_udp_port_inherits_udp_state() {
+        let mut m = UpnpMappings::new(4662, 4672);
+        // QUIC landed on the KAD UDP port: it's covered by that mapping, so
+        // its state mirrors udp_mapped (false here — nothing mapped yet).
+        assert!(!m.map_quic_port(4672).await);
+        assert_eq!(m.quic_port, Some(4672));
+        assert_eq!(m.quic_mapped, m.udp_mapped);
+
+        // With the shared UDP port already mapped, QUIC is reported mapped
+        // without issuing a second, redundant IGD call.
+        m.udp_mapped = true;
+        assert!(m.map_quic_port(4672).await);
+        assert!(m.quic_mapped);
+    }
+
+    #[tokio::test]
+    async fn teardown_clears_all_state() {
+        let mut m = UpnpMappings::new(4662, 4672);
+        m.tcp_mapped = true;
+        m.udp_mapped = true;
+        m.quic_mapped = true;
+        m.quic_port = Some(5000);
+        m.last_map_attempt = Some(Instant::now());
+        // No gateway is set, so teardown does no network I/O but must still
+        // reset every flag so a later re-setup starts from a clean slate.
+        m.teardown().await;
+        assert!(!m.is_mapped());
+        assert!(!m.quic_mapped);
+        assert!(!m.has_gateway());
+        assert!(m.last_map_attempt.is_none());
+        assert!(m.next_discovery_at.is_none());
     }
 }

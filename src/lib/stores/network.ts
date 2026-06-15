@@ -3,7 +3,9 @@ import { listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 import type { DegradedReason, NetworkStats } from '$lib/types';
 import { getNetworkStats } from '$lib/api/kad';
-import { toastError, toastWarning } from '$lib/stores/toast';
+import { getSettings, updateSettings } from '$lib/api/settings';
+import { addToast, removeToast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
+import * as m from '$lib/paraglide/messages';
 
 const STALE_NETWORK_MS = 12_000;
 
@@ -35,10 +37,58 @@ export const networkError = writable<string | null>(null);
 export type ServerStatus = 'connected' | 'connecting' | 'disconnected';
 export const serverStatus = writable<ServerStatus>('disconnected');
 
+// True once UPnP has been auto-disabled this session after a failed start-up
+// mapping. Lets UI (e.g. the KAD-page UPnP tile) show "Disabled" immediately,
+// without waiting for the persisted setting to round-trip back through
+// `getSettings`. Reset on store teardown.
+export const upnpAutoDisabled = writable<boolean>(false);
+
 let initialized = false;
 let unlisteners: UnlistenFn[] = [];
 let lastEventUpdate = 0;
 let lastPollOkAt = 0;
+// Last UPnP mapped state we surfaced, so we only toast on transitions.
+// `null` until the backend's startup `upnp-status` event arrives: that first
+// event sets the baseline (warning if it failed, silence if it succeeded —
+// working UPnP is the expected case and shouldn't pop a toast). Subsequent
+// events are real changes (recovery / loss) and are always toasted.
+let lastUpnpMapped: boolean | null = null;
+// Id of the current sticky UPnP failure toast (if any). UPnP-failure toasts
+// don't auto-dismiss — port forwarding is broken until the user acts, so the
+// warning must persist until they close it. We track the id so we can retract
+// the stale warning ourselves once the mapping recovers, instead of leaving a
+// permanent "UPnP failed" toast next to a "restored" one.
+let upnpToastId: number | null = null;
+
+function clearUpnpToast() {
+  if (upnpToastId !== null) {
+    removeToast(upnpToastId);
+    upnpToastId = null;
+  }
+}
+
+// Guard so we persist the auto-disable at most once per session even if the
+// backend somehow re-reports the failure. Reset on store teardown.
+let upnpAutoDisablePersisted = false;
+
+// Persist `upnp_enabled = false` after the backend auto-disabled UPnP for a
+// failed mapping. The network task has already stopped using UPnP for this
+// session; this just makes the choice stick (and reflects it in the Settings
+// UI) so the next launch doesn't retry a setup the router can't satisfy. The
+// user can re-enable it in Settings once they've fixed forwarding.
+async function persistUpnpDisabled() {
+  if (upnpAutoDisablePersisted) return;
+  upnpAutoDisablePersisted = true;
+  try {
+    const current = await getSettings();
+    if (current.upnp_enabled) {
+      await updateSettings({ ...current, upnp_enabled: false });
+    }
+  } catch {
+    // Let a later event retry — the on-disk setting wasn't changed.
+    upnpAutoDisablePersisted = false;
+  }
+}
 
 function syncServerStatus(stats: NetworkStats) {
   const s = stats.server_status;
@@ -111,6 +161,61 @@ export async function initNetworkStore() {
           udp_status: event.payload.udp_status ?? s.udp_status,
         }),
       }));
+    }));
+    // UPnP port-mapping outcome. Emitted once at network start-up and again
+    // whenever the mapped state flips during the periodic maintenance tick
+    // (recovery after a retry, or loss after a router reboot). We keep
+    // `upnp_mapped` in the store fresh from here so the KAD-page tile updates
+    // immediately, and toast the user when automatic forwarding isn't working
+    // so they can set up manual port forwarding if peers can't reach them.
+    // `auto_disabled` is set when the backend turned UPnP off after a failed
+    // start-up mapping; we then persist the setting so it stays off.
+    registered.push(await listen<{
+      mapped: boolean;
+      gateway_found: boolean;
+      auto_disabled: boolean;
+      tcp_port: number;
+      udp_port: number;
+    }>('upnp-status', (event) => {
+      lastEventUpdate = Date.now();
+      lastNetworkUpdate = lastEventUpdate;
+      const { mapped, gateway_found, auto_disabled, tcp_port, udp_port } = event.payload;
+      networkStats.update((s) => withDerivedNetworkState({ ...s, upnp_mapped: mapped }));
+
+      if (auto_disabled) {
+        upnpAutoDisabled.set(true);
+        void persistUpnpDisabled();
+      }
+
+      // Failure toasts are sticky (duration 0): they stay until the user
+      // dismisses them with the X. Only one is ever live at a time — replace
+      // any previous one so the message always reflects the latest state.
+      const showStickyWarning = (message: string) => {
+        clearUpnpToast();
+        upnpToastId = addToast('warning', message, 0);
+      };
+
+      if (lastUpnpMapped === null) {
+        // First report this session establishes the baseline. A failure here
+        // is also where the backend auto-disables UPnP, so the message tells
+        // the user it's been turned off and how to re-enable it.
+        if (!mapped) {
+          showStickyWarning(
+            gateway_found
+              ? m.upnp_alert_failed_rejected({ tcp: tcp_port, udp: udp_port })
+              : m.upnp_alert_failed_no_gateway({ tcp: tcp_port, udp: udp_port })
+          );
+        }
+      } else if (mapped !== lastUpnpMapped) {
+        if (mapped) {
+          // Recovered: retract the lingering failure warning and confirm.
+          clearUpnpToast();
+          toastSuccess(m.upnp_alert_restored());
+        } else {
+          showStickyWarning(m.upnp_alert_lost({ tcp: tcp_port, udp: udp_port }));
+        }
+      }
+      lastUpnpMapped = mapped;
     }));
     registered.push(await listen<{ message: string }>('network-error', (event) => {
       lastEventUpdate = Date.now();
@@ -185,6 +290,10 @@ export function cleanupNetworkStore() {
   lastEventUpdate = 0;
   lastPollOkAt = 0;
   lastNetworkUpdate = 0;
+  clearUpnpToast();
+  lastUpnpMapped = null;
+  upnpAutoDisablePersisted = false;
+  upnpAutoDisabled.set(false);
   if (statsPollInterval !== null) {
     clearInterval(statsPollInterval);
     statsPollInterval = null;
