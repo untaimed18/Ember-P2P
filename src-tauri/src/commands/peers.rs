@@ -279,7 +279,7 @@ pub async fn send_chat_message(
     // L20: strip control / bidi-override / zero-width / variation
     // selector code points from outbound chat. Inbound chat is
     // already protected from visual reordering by the `<bdi>`
-    // wrapping in `ChatSidebar.svelte` (M14), but the underlying
+    // wrapping in `ChatConversation.svelte` (M14), but the underlying
     // text would still carry the override characters across the
     // wire and into the recipient's database. Sanitising on
     // egress means our peers see only the visible content and
@@ -480,6 +480,16 @@ pub async fn is_friend_discoverable(
 ) -> Result<bool, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state.network_tx.try_send(NetworkCommand::IsFriendDiscoverable { tx })
+        .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
+    await_reply(rx, "peers_no_response", "No response").await
+}
+
+#[tauri::command]
+pub async fn get_online_friends(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    state.network_tx.try_send(NetworkCommand::GetOnlineFriends { tx })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
     await_reply(rx, "peers_no_response", "No response").await
 }

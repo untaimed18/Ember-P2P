@@ -8,13 +8,13 @@
   import CloseAppDialog from '$lib/components/CloseAppDialog.svelte';
   import DeepLinkHandler from '$lib/components/DeepLinkHandler.svelte';
   import UpdateNotice from '$lib/components/UpdateNotice.svelte';
-  // Hidden until developer decides to introduce the feature.
-  // import ChatDock from '$lib/components/ChatDock.svelte';
+  import ChatDock from '$lib/components/ChatDock.svelte';
 
   import { initNetworkStore, cleanupNetworkStore, startStatsPoll } from '$lib/stores/network';
   import { initTransferStore, cleanupTransferStore, startTransferPoll } from '$lib/stores/transfers';
   import { initSearchStore, cleanupSearchStore } from '$lib/stores/search';
   import { initFriendsStore, cleanupFriendsStore } from '$lib/stores/friends';
+  import { loadAppSettings, clearAppSettings } from '$lib/stores/settings';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { applyDocumentLang, translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
@@ -92,6 +92,7 @@
     initTransferStore(),
     initSearchStore(),
     initFriendsStore(),
+    loadAppSettings(),
   ]);
 
   // Register the close-requested listener at the top of the module so it's
@@ -252,6 +253,7 @@
       cleanupTransferStore();
       cleanupSearchStore();
       cleanupFriendsStore();
+      clearAppSettings();
       void closeListenerPromise.then((unlisten) => unlisten());
       void configCorruptListenerPromise.then((unlisten) => unlisten());
     };
@@ -300,14 +302,14 @@
     files into the app once the shell is ready (settings loaded, no wizard). -->
     <DeepLinkHandler />
   {/if}
-  <!-- Hidden until developer decides to introduce the feature.
-  Multi-conversation chat dock. Mounted at the app shell so chats
-  persist across route changes — the user can answer a message from
-  /transfers or /library without losing their place. Internally
-  keyed off the `chatTabs` store, so opening a chat from any page
-  just calls `chatTabs.openChat(hash, name)`.
-  <ChatDock />
+  <!--
+    Multi-conversation chat dock. Mounted at the app shell so chats
+    persist across route changes — the user can answer a message from
+    /transfers or /library without losing their place. Internally
+    keyed off the `chatTabs` store, so opening a chat from any page
+    just calls `chatTabs.openChat(hash, name)`.
   -->
+  <ChatDock />
 </div>
 
 <CloseAppDialog

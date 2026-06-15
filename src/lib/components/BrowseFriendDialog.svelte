@@ -111,7 +111,12 @@
         // errors for that browse are discarded as expected.
         if (currentBrowseGen === 0) return;
         clearTimeout(browseTimeout);
-        error = event.payload.reason || m.browse_failed_offline();
+        // Run the backend reason through `translateError` so a coded error is
+        // localized; a plain string falls through unchanged, and an empty
+        // reason uses the friendly offline fallback.
+        error = event.payload.reason
+          ? translateError(event.payload.reason, m.browse_failed_offline())
+          : m.browse_failed_offline();
         loading = false;
         currentBrowseGen = 0;
       });

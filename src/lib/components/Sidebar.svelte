@@ -5,9 +5,8 @@
   import KeyboardShortcutsDialog from '$lib/components/KeyboardShortcutsDialog.svelte';
   import { transfers } from '$lib/stores/transfers';
   import { networkStats } from '$lib/stores/network';
-  // Hidden until developer decides to introduce the feature.
-  // import { friendRequests } from '$lib/stores/friends';
-  // import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
+  import { friendRequests } from '$lib/stores/friends';
+  import { totalUnread, toggleDock as toggleChatDock, chatDockOpen } from '$lib/stores/chatTabs';
   import * as m from '$lib/paraglide/messages';
   import { onMount } from 'svelte';
 
@@ -36,9 +35,8 @@
     $transfers.filter(t => t.direction === 'download' && t.status !== 'completed' && t.status !== 'failed').length
   );
 
-  // Hidden until developer decides to introduce the feature.
-  // let pendingFriendRequestCount = $derived($friendRequests.length);
-  // let totalUnreadChats = $derived($totalUnread);
+  let pendingFriendRequestCount = $derived($friendRequests.length);
+  let totalUnreadChats = $derived($totalUnread);
 
   type NavItem = {
     href: string;
@@ -63,8 +61,7 @@
     { href: '/search', label: () => m.nav_search(), id: 'search' },
     { href: '/transfers', label: () => m.nav_transfers(), id: 'transfers' },
     { href: '/library', label: () => m.nav_library(), id: 'library' },
-    // Hidden until developer decides to introduce the feature.
-    // { href: '/friends', label: () => m.nav_friends(), id: 'friends' },
+    { href: '/friends', label: () => m.nav_friends(), id: 'friends' },
     { href: '/statistics', label: () => m.nav_statistics(), id: 'statistics' },
     { href: '/security', label: () => m.nav_security(), id: 'security' },
     { href: '/settings', label: () => m.nav_settings(), id: 'settings' },
@@ -127,13 +124,14 @@
       toggleCollapsed();
       return;
     }
-    // Hidden until developer decides to introduce the feature.
-    // if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key === '/') {
-    //   if (isTypingTarget(e.target)) return;
-    //   e.preventDefault();
-    //   toggleChatDock();
-    //   return;
-    // }
+    // Ctrl/Cmd+/ toggles the chat dock. Blocked while typing so it
+    // doesn't fight with in-field "/" input.
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key === '/') {
+      if (isTypingTarget(e.target)) return;
+      e.preventDefault();
+      toggleChatDock();
+      return;
+    }
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     if (isTypingTarget(e.target)) return;
     const n = Number.parseInt(e.key, 10);
@@ -247,7 +245,6 @@
           {#if item.id === 'transfers' && activeDownloadCount > 0}
             <span class="nav-badge">{activeDownloadCount}</span>
           {/if}
-          <!-- Hidden until developer decides to introduce the feature.
           {#if item.id === 'friends' && pendingFriendRequestCount > 0}
             <span
               class="nav-badge nav-badge-attention"
@@ -256,14 +253,12 @@
                 : m.sidebar_friend_requests_title_other({ count: pendingFriendRequestCount })}
             >{pendingFriendRequestCount}</span>
           {/if}
-          -->
         </a>
       </li>
     {/each}
   </ul>
 
   <div class="sidebar-footer">
-    <!-- Hidden until developer decides to introduce the feature.
     <button
       type="button"
       class="about-btn chats-btn"
@@ -290,7 +285,6 @@
         >{totalUnreadChats > 99 ? '99+' : totalUnreadChats}</span>
       {/if}
     </button>
-    -->
     <button
       type="button"
       class="about-btn"
