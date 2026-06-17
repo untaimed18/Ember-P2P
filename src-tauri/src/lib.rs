@@ -984,8 +984,29 @@ pub fn run() {
                         });
                     }
 
-                    if let Ok(mut filter) = state.spam_filter.try_write() {
-                        filter.save();
+                    // Flush any learned spam signals not yet persisted by the
+                    // periodic flush (e.g. an auto-not-spam that landed since
+                    // the last tick). Wait briefly for the lock rather than the
+                    // old non-blocking `try_write`, which silently skipped the
+                    // save under contention. The network task has already shut
+                    // down here, so the lock is normally free; the timeout is a
+                    // safety net so shutdown can't hang.
+                    {
+                        let rt = tauri::async_runtime::handle();
+                        let spam = state.spam_filter.clone();
+                        rt.block_on(async move {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                spam.write(),
+                            )
+                            .await
+                            {
+                                Ok(mut filter) => filter.save(),
+                                Err(_) => tracing::warn!(
+                                    "Spam filter save skipped on shutdown: lock busy"
+                                ),
+                            }
+                        });
                     }
                 }
             }

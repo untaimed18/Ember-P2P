@@ -175,6 +175,12 @@ pub enum DownloadEvent {
     },
     Completed {
         transfer_id: String,
+        /// Absolute path the finished file was actually written to. May
+        /// differ from `Downloads/<name>` when `move_part_to_final`
+        /// deduplicated against a pre-existing file. `None` for completion
+        /// paths that don't move a `.part` (e.g. zero-byte files) — the
+        /// handler then falls back to reconstructing the path.
+        final_path: Option<String>,
     },
     Failed {
         transfer_id: String,
@@ -514,14 +520,14 @@ impl Ed2kDownload {
     }
 
     /// Zero-byte ed2k files: no P2P; hash must be MD4 of empty payload ([`super::hash::empty_ed2k_file_md4`]).
-    async fn complete_zero_byte_local(&self, event_tx: &mpsc::Sender<DownloadEvent>) -> anyhow::Result<()> {
+    async fn complete_zero_byte_local(&self, event_tx: &mpsc::Sender<DownloadEvent>) -> anyhow::Result<std::path::PathBuf> {
         self.emit_source_detail(event_tx, "connecting", None, 0, 0, "", "").await;
         let _ = event_tx
             .send(DownloadEvent::Verifying {
                 transfer_id: self.transfer_id.clone(),
             })
             .await;
-        finalize_zero_ed2k_file(
+        let final_path = finalize_zero_ed2k_file(
             &self.transfer_id,
             &self.file_name,
             self.file_hash,
@@ -536,7 +542,7 @@ impl Ed2kDownload {
                 total: 0,
             })
             .await;
-        Ok(())
+        Ok(final_path)
     }
 
     async fn emit_source_detail(
@@ -630,10 +636,11 @@ impl Ed2kDownload {
         );
 
         if self.file_size == 0 {
-            self.complete_zero_byte_local(&event_tx).await?;
+            let zero_final = self.complete_zero_byte_local(&event_tx).await?;
             let _ = event_tx
                 .send(DownloadEvent::Completed {
                     transfer_id: self.transfer_id.clone(),
+                    final_path: Some(zero_final.to_string_lossy().into_owned()),
                 })
                 .await;
             return Ok(());
@@ -648,6 +655,7 @@ impl Ed2kDownload {
             }
         }
 
+        let mut completed_path_out: Option<String> = None;
         match self.download_from_streams(
             &mut *reader,
             &mut *writer,
@@ -655,11 +663,13 @@ impl Ed2kDownload {
             PeerCapabilities::default(),
             &event_tx,
             emule_info_done,
+            &mut completed_path_out,
         ).await {
             Ok(_) => {
                 let _ = event_tx
                     .send(DownloadEvent::Completed {
                         transfer_id: self.transfer_id.clone(),
+                        final_path: completed_path_out,
                     })
                     .await;
                 Ok(())
@@ -687,6 +697,11 @@ impl Ed2kDownload {
         initial_caps: PeerCapabilities,
         event_tx: &mpsc::Sender<DownloadEvent>,
         skip_emule_info: bool,
+        // Set to the real on-disk destination once the `.part` is moved to
+        // its final location, so the caller's `Completed` event can carry
+        // the deduplicated path instead of letting Open/Reveal reconstruct
+        // (and mis-resolve) it from the file name.
+        completed_path_out: &mut Option<String>,
     ) -> anyhow::Result<()> {
         let mut peer_supports_large_files = initial_caps.supports_large_files;
         let mut peer_supports_multipacket = initial_caps.supports_multi_packet;
@@ -3327,9 +3342,10 @@ impl Ed2kDownload {
         {
             let pp = part_path.clone();
             let fp = final_path.clone();
-            tokio::task::spawn_blocking(move || move_part_to_final(&pp, &fp))
+            let actual_final = tokio::task::spawn_blocking(move || move_part_to_final(&pp, &fp))
                 .await
                 .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+            *completed_path_out = Some(actual_final.to_string_lossy().into_owned());
         }
         tracker.delete_met();
 
@@ -3515,7 +3531,7 @@ pub(super) async fn finalize_zero_ed2k_file(
     file_name: &str,
     file_hash: [u8; 16],
     download_dir: &std::path::Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<std::path::PathBuf> {
     if file_hash != super::hash::empty_ed2k_file_md4() {
         anyhow::bail!(
             "zero-byte ed2k file requires file hash {}",
@@ -3544,10 +3560,10 @@ pub(super) async fn finalize_zero_ed2k_file(
     }
     let pp = part_path.clone();
     let fp = final_path.clone();
-    tokio::task::spawn_blocking(move || move_part_to_final(&pp, &fp))
+    let actual_final = tokio::task::spawn_blocking(move || move_part_to_final(&pp, &fp))
         .await
         .map_err(|e| anyhow::anyhow!("rename task: {e}"))??;
-    Ok(())
+    Ok(actual_final)
 }
 
 fn is_cross_device_error(e: &std::io::Error) -> bool {

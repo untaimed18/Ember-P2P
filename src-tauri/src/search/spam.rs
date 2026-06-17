@@ -339,6 +339,12 @@ pub struct SpamFilter {
     db: SpamDatabase,
     data_path: std::path::PathBuf,
     dirty: bool,
+    /// Monotonic mutation counter. Bumped on every change that sets `dirty`.
+    /// `take_save_data` captures the value at snapshot time so `mark_saved`
+    /// can refuse to clear the dirty flag if a concurrent mutation landed
+    /// between the snapshot and the post-write acknowledgement (otherwise that
+    /// mutation would be silently dropped from the next save).
+    gen: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -370,6 +376,13 @@ const MAX_SERVER_RATIOS: usize = 500;
 /// At >50 MB of `search_spam.json` something is broken or malicious.
 const LOAD_MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
 
+/// Maximum byte length of a single learned filename / similar-name entry on
+/// load. Runtime inserts are already bounded (similar names to
+/// `MAX_LEVENSHTEIN_LEN`), but a hand-edited or corrupted file could contain
+/// pathologically long entries that make the per-result `token_set` / Jaccard
+/// / edit-distance scan expensive. Over-length entries are dropped on load.
+const MAX_NAME_ENTRY_BYTES: usize = 1024;
+
 impl SpamFilter {
     pub fn load(data_dir: &Path) -> Self {
         let data_path = data_dir.join("search_spam.json");
@@ -392,6 +405,12 @@ impl SpamFilter {
                             // larger than `mark_spam` would ever produce.
                             db.spam_hashes.truncate_oldest(MAX_SPAM_HASHES);
                             db.not_spam_hashes.truncate_oldest(NOT_SPAM_HASHES_CAP);
+                            // Drop pathologically long entries before the
+                            // count-based truncation so a hand-edited file
+                            // can't load megabyte-sized names that bog down
+                            // every search's similarity scan.
+                            db.spam_filenames.retain(|s| s.len() <= MAX_NAME_ENTRY_BYTES);
+                            db.spam_similar_names.retain(|s| s.len() <= MAX_NAME_ENTRY_BYTES);
                             if db.spam_filenames.len() > MAX_SPAM_FILENAMES {
                                 db.spam_filenames.truncate(MAX_SPAM_FILENAMES);
                             }
@@ -439,7 +458,15 @@ impl SpamFilter {
             db,
             data_path,
             dirty: false,
+            gen: 0,
         }
+    }
+
+    /// Mark the database dirty and advance the mutation counter so an
+    /// in-flight save can detect that newer changes have landed.
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.gen = self.gen.wrapping_add(1);
     }
 
     pub fn save(&mut self) {
@@ -459,13 +486,17 @@ impl SpamFilter {
         }
     }
 
-    pub fn take_save_data(&mut self) -> Option<(String, std::path::PathBuf)> {
+    /// Snapshot the current database for an off-lock write. Returns the
+    /// serialized JSON, the destination path, and the mutation generation the
+    /// snapshot reflects. Pass that generation back to `mark_saved` so a
+    /// mutation that lands while the write is in flight isn't marked clean.
+    pub fn take_save_data(&mut self) -> Option<(String, std::path::PathBuf, u64)> {
         if !self.dirty {
             return None;
         }
         match serde_json::to_string_pretty(&self.db) {
             Ok(data) => {
-                Some((data, self.data_path.clone()))
+                Some((data, self.data_path.clone(), self.gen))
             }
             Err(e) => {
                 warn!("Failed to serialize spam filter: {e}");
@@ -474,8 +505,14 @@ impl SpamFilter {
         }
     }
 
-    pub fn clear_dirty(&mut self) {
-        self.dirty = false;
+    /// Clear the dirty flag, but only if no mutation occurred since the
+    /// snapshot identified by `gen` was taken. If the database changed while
+    /// the corresponding write was in flight, the flag stays set so the newer
+    /// state is persisted on the next save.
+    pub fn mark_saved(&mut self, gen: u64) {
+        if self.gen == gen {
+            self.dirty = false;
+        }
     }
 
     pub fn stats(&self) -> SpamStats {
@@ -488,10 +525,12 @@ impl SpamFilter {
         }
     }
 
+    /// Clear all learned data. Does not write to disk — callers persist via
+    /// `take_save_data` + `mark_saved` so the (blocking) file write happens on
+    /// a blocking thread rather than under the async lock.
     pub fn reset(&mut self) {
         self.db = SpamDatabase::default();
-        self.dirty = true;
-        self.save();
+        self.mark_dirty();
         info!("Spam filter database reset");
     }
 
@@ -781,7 +820,7 @@ impl SpamFilter {
             }
         }
 
-        self.dirty = true;
+        self.mark_dirty();
         info!("Marked as spam: {} ({})", name, result.file.hash);
     }
 
@@ -789,7 +828,7 @@ impl SpamFilter {
         let file_hash = normalize_hash(file_hash);
         self.db.not_spam_hashes.insert(file_hash.clone(), NOT_SPAM_HASHES_CAP);
         self.db.spam_hashes.remove(&file_hash);
-        self.dirty = true;
+        self.mark_dirty();
         info!("Marked as not spam: {file_hash}");
     }
 
@@ -802,7 +841,7 @@ impl SpamFilter {
         }
         self.db.not_spam_hashes.insert(file_hash.clone(), NOT_SPAM_HASHES_CAP);
         self.db.spam_hashes.remove(&file_hash);
-        self.dirty = true;
+        self.mark_dirty();
         debug!("Auto-marked completed download as not spam: {file_hash}");
     }
 
@@ -844,7 +883,7 @@ impl SpamFilter {
             changed = true;
         }
         if changed {
-            self.dirty = true;
+            self.mark_dirty();
         }
     }
 
