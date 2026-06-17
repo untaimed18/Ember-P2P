@@ -437,6 +437,15 @@ impl TransferManager {
         }
     }
 
+    /// Record the actual on-disk destination of a finished download so the
+    /// Open/Reveal commands can target it directly. Call this while the row is
+    /// still in `active`/`queue` (before [`complete`](Self::complete) moves it).
+    pub fn set_completed_path(&mut self, id: &str, path: String) {
+        if let Some(t) = self.get_transfer_mut(id) {
+            t.completed_path = Some(path);
+        }
+    }
+
     pub fn complete(&mut self, id: &str) -> Option<Vec<Transfer>> {
         let mut transfer = self.active.remove(id);
         if transfer.is_none() {
