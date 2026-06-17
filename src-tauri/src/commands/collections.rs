@@ -237,6 +237,7 @@ pub async fn download_collection_files(
             client_software: String::new(),
             country_code: None,
             user_hash: None,
+            completed_path: None,
         };
 
         let (active_now, persisted_transfer) = {

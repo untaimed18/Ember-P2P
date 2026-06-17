@@ -894,7 +894,7 @@ impl MultiSourceDownload {
                     transfer_id: self.transfer_id.clone(),
                 })
                 .await;
-            super::transfer::finalize_zero_ed2k_file(
+            let zero_final = super::transfer::finalize_zero_ed2k_file(
                 &self.transfer_id,
                 &self.file_name,
                 self.file_hash,
@@ -911,6 +911,7 @@ impl MultiSourceDownload {
             let _ = event_tx
                 .send(DownloadEvent::Completed {
                     transfer_id: self.transfer_id.clone(),
+                    final_path: Some(zero_final.to_string_lossy().into_owned()),
                 })
                 .await;
             return Ok(());
@@ -3073,7 +3074,7 @@ impl MultiSourceDownload {
                 let final_path = self.download_dir.join("Downloads").join(&safe_name);
                 let pp = part_path.clone();
                 let fp = final_path.clone();
-                tokio::task::spawn_blocking(move || super::transfer::move_part_to_final(&pp, &fp))
+                let actual_final = tokio::task::spawn_blocking(move || super::transfer::move_part_to_final(&pp, &fp))
                     .await
                     .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
                 {
@@ -3083,6 +3084,7 @@ impl MultiSourceDownload {
                 let _ = event_tx
                     .send(DownloadEvent::Completed {
                         transfer_id: self.transfer_id.clone(),
+                        final_path: Some(actual_final.to_string_lossy().into_owned()),
                     })
                     .await;
             } else {

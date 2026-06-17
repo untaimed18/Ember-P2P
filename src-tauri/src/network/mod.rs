@@ -4772,19 +4772,51 @@ pub async fn start_network(
                     let final_path = PathBuf::from(&dl_folder).join("Downloads").join(&safe_name);
 
                     if !part_path.exists() && final_path.exists() {
-                        info!(
-                            "Restored download {} was Verifying but .part is gone and final file exists — marking completed",
-                            transfer.id
-                        );
-                        transfer.status = TransferStatus::Completed;
-                        transfer.progress = 100.0;
-                        transfer.speed = 0;
-                        if let Err(e) = db.save_transfer(&transfer) {
-                            warn!("DB save_transfer failed for completed transfer {}: {e}", transfer.id);
+                        // The .part is gone and a file with the target name
+                        // exists. That usually means completion already moved
+                        // the verified file and the app crashed before writing
+                        // the terminal status. But a *pre-existing, unrelated*
+                        // file of the same name would also satisfy this check,
+                        // so re-hash the file and confirm it matches this
+                        // transfer's ed2k hash before recording success —
+                        // otherwise we'd mark a download complete against the
+                        // wrong content (and Open/Reveal would point at it).
+                        let expected = transfer.file_hash.clone();
+                        let verify_path = final_path.clone();
+                        let hash_matches = tokio::task::spawn_blocking(move || {
+                            ed2k::hash::ed2k_hash_file(&verify_path).ok()
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|h| h.eq_ignore_ascii_case(&expected))
+                        .unwrap_or(false);
+
+                        if hash_matches {
+                            info!(
+                                "Restored download {} was Verifying; final file verified against expected hash — marking completed",
+                                transfer.id
+                            );
+                            transfer.status = TransferStatus::Completed;
+                            transfer.progress = 100.0;
+                            transfer.speed = 0;
+                            transfer.completed_path = Some(final_path.to_string_lossy().into_owned());
+                            if let Err(e) = db.save_transfer(&transfer) {
+                                warn!("DB save_transfer failed for completed transfer {}: {e}", transfer.id);
+                            }
+                            let mut mgr = transfer_manager.write().await;
+                            mgr.completed.push(transfer);
+                            continue;
                         }
-                        let mut mgr = transfer_manager.write().await;
-                        mgr.completed.push(transfer);
-                        continue;
+
+                        warn!(
+                            "Restored download {} has no .part and the file at {} does not match the expected hash; \
+                             not marking complete — will re-acquire sources",
+                            transfer.id,
+                            final_path.display()
+                        );
+                        // Fall through to the normal restore path below so the
+                        // download is re-attempted rather than silently claimed.
                     }
 
                     if part_path.exists() && transfer.total_size > 0 {
@@ -4824,8 +4856,11 @@ pub async fn start_network(
                                     &dl_tid, &file_hash, &file_name, file_size, &dl_dir,
                                 ).await;
                                 match result {
-                                    Ok(()) => {
-                                        let _ = tx.send(DownloadEvent::Completed { transfer_id: dl_tid }).await;
+                                    Ok(final_path) => {
+                                        let _ = tx.send(DownloadEvent::Completed {
+                                            transfer_id: dl_tid,
+                                            final_path: Some(final_path.to_string_lossy().into_owned()),
+                                        }).await;
                                     }
                                     Err(e) => {
                                         warn!("Re-verification of restored download failed: {e}");
@@ -5320,7 +5355,7 @@ pub async fn start_network(
                         complete_sources: 0,
                     });
                 }
-                if let DownloadEvent::Completed { ref transfer_id } = event {
+                if let DownloadEvent::Completed { ref transfer_id, .. } = event {
                     {
                         let mgr_snap = transfer_manager.read().await;
                         if let Some(t) = mgr_snap.get_transfer(transfer_id) {
@@ -6202,7 +6237,7 @@ pub async fn start_network(
                         }
                     }
                 }
-                if let DownloadEvent::Completed { ref transfer_id } | DownloadEvent::Failed { ref transfer_id, .. } = event {
+                if let DownloadEvent::Completed { ref transfer_id, .. } | DownloadEvent::Failed { ref transfer_id, .. } = event {
                     let mgr = transfer_manager.read().await;
                     if let Some(t) = mgr.get_transfer(transfer_id) {
                         if let Ok(fh_bytes) = hex::decode(&t.file_hash) {
@@ -6218,7 +6253,7 @@ pub async fn start_network(
                     }
                     drop(mgr);
                 }
-                let completed_file_hash = if let DownloadEvent::Completed { ref transfer_id } = event {
+                let completed_file_hash = if let DownloadEvent::Completed { ref transfer_id, .. } = event {
                     let mgr = transfer_manager.read().await;
                     mgr.get_transfer(transfer_id).map(|t| t.file_hash.clone())
                 } else {
@@ -14108,6 +14143,30 @@ pub async fn start_network(
             // Periodic statistics save (every 60s — see stats_save_timer)
             _ = stats_save_timer.tick() => {
                 stats_manager.save_cumulative(&db);
+
+                // Flush the spam filter's learned signals on the same cadence.
+                // `auto_mark_not_spam` (completed downloads) and
+                // `record_server_clean_batch` (server-reputation decay) set the
+                // dirty flag but have no save path of their own; without this
+                // periodic flush they'd persist only on the next user-driven
+                // mark or at shutdown, and be lost on a crash. The serialize
+                // happens under the lock; the write is offloaded so the loop
+                // isn't parked on disk I/O, and `mark_saved(gen)` only clears
+                // dirty if no newer change landed meanwhile.
+                let spam_save = {
+                    let mut sf = spam_filter.write().await;
+                    sf.take_save_data()
+                };
+                if let Some((data, path, gen)) = spam_save {
+                    let ok = tokio::task::spawn_blocking(move || {
+                        crate::security::atomic_write(&path, data.as_bytes(), false).is_ok()
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if ok {
+                        spam_filter.write().await.mark_saved(gen);
+                    }
+                }
             }
 
             // Periodic reputation maintenance (every 60s: lift expired
@@ -15017,19 +15076,42 @@ pub async fn start_network(
     }
 
     // Persist .part.met for any downloads that were in progress when aborted.
-    if let Ok(reg) = state.tracker_registry.lock() {
-        let count = reg.len();
-        if count > 0 {
-            for (tid, tracker) in reg.iter() {
-                if let Ok(t) = tracker.try_read() {
-                    t.save();
+    //
+    // Snapshot the registry's Arc handles, then release the registry lock
+    // BEFORE awaiting each tracker's read lock. The previous non-blocking
+    // `try_read()` silently skipped (and lost the resume metadata for) any
+    // tracker whose worker hadn't fully released its write lock yet — the
+    // download tasks are aborted just above, but an abort that landed mid
+    // write-guard could still be releasing it. A short bounded `read().await`
+    // waits for that hand-off instead of dropping the save, while the timeout
+    // still guarantees shutdown can't hang on a genuinely stuck tracker.
+    let trackers: Vec<_> = match state.tracker_registry.lock() {
+        Ok(reg) => reg.iter().map(|(tid, t)| (tid.clone(), t.clone())).collect(),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .iter()
+            .map(|(tid, t)| (tid.clone(), t.clone()))
+            .collect(),
+    };
+    if !trackers.is_empty() {
+        let count = trackers.len();
+        for (tid, tracker) in trackers {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tracker.read(),
+            )
+            .await
+            {
+                Ok(guard) => {
+                    guard.save();
                     debug!("Saved .part.met for aborted download {tid}");
-                } else {
-                    warn!("Could not lock tracker for {tid} to save .part.met on shutdown");
+                }
+                Err(_) => {
+                    warn!("Timed out acquiring tracker lock for {tid}; .part.met not saved on shutdown");
                 }
             }
-            info!("Saved {count} download tracker(s) on shutdown");
         }
+        info!("Saved {count} download tracker(s) on shutdown");
     }
     state.active_source_senders.clear();
     // Lockstep — every download is dead at shutdown, both sender
@@ -15037,15 +15119,6 @@ pub async fn start_network(
     state.active_established_senders.clear();
     state.active_source_overflow.clear();
     state.active_kad_search_state.clear();
-
-    // Unregister from the rendezvous server on graceful shutdown
-    if state.rendezvous_registered {
-        let rv_url = settings.rendezvous_url.clone();
-        let rv_hash = ember_hash;
-        if let Err(e) = rendezvous::unregister(&rv_url, &rv_hash, &ed25519_secret_key).await {
-            warn!("Failed to unregister from rendezvous server: {e}");
-        }
-    }
 
     // Save all state on shutdown
     info!("Shutting down network");
@@ -15124,6 +15197,28 @@ pub async fn start_network(
 
     let server_met_path = state.data_dir.join("server.met");
     let _ = state.server_list.save_server_met(&server_met_path);
+
+    // Unregister from the rendezvous server LAST and with a short bound.
+    // This is a best-effort courtesy call to a remote host that may be slow
+    // or unreachable; running it before the local saves above (with the
+    // client's full 10s request timeout) could exhaust the app's ~12s
+    // shutdown budget and cut off nodes.dat / known.met / credit / reputation
+    // persistence. All local state is already on disk by this point, so a slow
+    // unregister can no longer cost us durability.
+    if state.rendezvous_registered {
+        let rv_url = settings.rendezvous_url.clone();
+        let rv_hash = ember_hash;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            rendezvous::unregister(&rv_url, &rv_hash, &ed25519_secret_key),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Failed to unregister from rendezvous server: {e}"),
+            Err(_) => warn!("Rendezvous unregister timed out on shutdown; skipping"),
+        }
+    }
 
     if upnp_enabled {
         // Best-effort removal; don't let an unresponsive gateway stall app
@@ -18584,6 +18679,7 @@ async fn handle_command_inner(
                                 client_software: String::new(),
                                 country_code: None,
                                 user_hash: None,
+                                completed_path: None,
                             };
                             let _ = db_ref.save_transfer(&db_transfer);
                         }
@@ -20726,7 +20822,7 @@ async fn reverify_complete_part_file(
     file_name: &str,
     file_size: u64,
     download_dir: &std::path::Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<std::path::PathBuf> {
     let part_path = download_dir
         .join("Temp")
         .join(format!("{transfer_id}.part"));
@@ -20748,7 +20844,7 @@ async fn reverify_complete_part_file(
         .map_err(|e| anyhow::anyhow!("Failed to create Downloads dir: {e}"))?;
     let final_target = completed_dir.join(&safe_name);
     let pp = part_path.clone();
-    tokio::task::spawn_blocking(move || {
+    let actual_final = tokio::task::spawn_blocking(move || {
         ed2k::transfer::move_part_to_final(&pp, &final_target)
     })
     .await
@@ -20761,7 +20857,7 @@ async fn reverify_complete_part_file(
     info!(
         "Re-verified and completed restored download {transfer_id} ({file_name}, {file_size} bytes)"
     );
-    Ok(())
+    Ok(actual_final)
 }
 
 async fn handle_download_event(
@@ -20857,11 +20953,34 @@ async fn handle_download_event(
             active,
             queued,
         } => {
-            let payload = {
+            let (payload, promoted_active) = {
                 let mut mgr = transfer_manager.write().await;
                 mgr.update_source_live(&transfer_id, active, queued);
                 mgr.update_source_total(&transfer_id, total);
-                mgr.source_counts(&transfer_id)
+                // Reflect live download activity in the overall status. The
+                // status is only set to Active when the multi-source worker
+                // first starts, so a download that began while every source was
+                // queued (or whose start path left it Queued/Searching) keeps
+                // showing "Queued" in the Status column even once one or more
+                // sources are actively transferring. `active > 0` is the
+                // worker's authoritative "a source is sending us bytes" signal,
+                // so promote the row to Active the moment that becomes true.
+                // Terminal / user-controlled states (Paused, Stopped, Verifying,
+                // etc.) are deliberately left untouched.
+                let current_status = mgr.active.get(&transfer_id).map(|t| t.status.clone());
+                let promoted_active = if active > 0
+                    && matches!(
+                        current_status,
+                        Some(crate::types::TransferStatus::Queued)
+                            | Some(crate::types::TransferStatus::Searching)
+                    )
+                {
+                    mgr.update_status(&transfer_id, crate::types::TransferStatus::Active);
+                    true
+                } else {
+                    false
+                };
+                let payload = mgr.source_counts(&transfer_id)
                     .map(|(sources, active_sources, queued_sources)| {
                         crate::types::TransferSourcesPayload {
                             id: transfer_id.as_str(),
@@ -20875,8 +20994,20 @@ async fn handle_download_event(
                         sources: total,
                         active_sources: active,
                         queued_sources: queued,
-                    })
+                    });
+                (payload, promoted_active)
             };
+            // Emit the status change first so the Status column updates in the
+            // same tick the Sources column does.
+            if promoted_active {
+                let _ = app_handle.emit("transfer-status", serde_json::json!({
+                    "id": transfer_id.as_str(),
+                    "status": "active",
+                    "sources": payload.sources,
+                    "active_sources": payload.active_sources,
+                    "queued_sources": payload.queued_sources,
+                }));
+            }
             let _ = app_handle.emit("transfer-sources", &payload);
         }
         DownloadEvent::SourceDetail {
@@ -21003,7 +21134,7 @@ async fn handle_download_event(
                 }),
             );
         }
-        DownloadEvent::Completed { transfer_id } => {
+        DownloadEvent::Completed { transfer_id, final_path } => {
             stats_manager.record_completed_download();
             // A download reaches Completed only after every part is present
             // and hash-verified, so the terminal row represents the whole
@@ -21023,6 +21154,13 @@ async fn handle_download_event(
             db_progress_last_persist.remove(&transfer_id);
             if let Some(promoted) = {
                 let mut mgr = transfer_manager.write().await;
+                // Record the real on-disk path (possibly deduplicated by
+                // `move_part_to_final`) BEFORE `complete()` moves the row out
+                // of the active set, so Open/Reveal can target the exact file
+                // we wrote rather than reconstructing it from the file name.
+                if let Some(ref fp) = final_path {
+                    mgr.set_completed_path(&transfer_id, fp.clone());
+                }
                 mgr.complete(&transfer_id)
             } {
                 for t in &promoted {
@@ -21203,6 +21341,7 @@ async fn handle_upload_event(
                 client_software,
                 country_code,
                 user_hash,
+                completed_path: None,
             };
             {
                 let mut mgr = transfer_manager.write().await;

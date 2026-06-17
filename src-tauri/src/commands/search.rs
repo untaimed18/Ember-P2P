@@ -524,7 +524,7 @@ pub async fn mark_spam(
         spam.mark_spam(&result, &search_keywords, server_ip.as_deref());
         spam.take_save_data()
     };
-    if let Some((data, path)) = save_data {
+    if let Some((data, path, gen)) = save_data {
         let ok = tokio::task::spawn_blocking(move || {
             match crate::security::atomic_write(&path, data.as_bytes(), false) {
                 Ok(()) => true,
@@ -535,7 +535,7 @@ pub async fn mark_spam(
             }
         }).await.unwrap_or(false);
         if ok {
-            state.spam_filter.write().await.clear_dirty();
+            state.spam_filter.write().await.mark_saved(gen);
         }
     }
     Ok(())
@@ -554,7 +554,7 @@ pub async fn mark_not_spam(
         spam.mark_not_spam(&file_hash);
         spam.take_save_data()
     };
-    if let Some((data, path)) = save_data {
+    if let Some((data, path, gen)) = save_data {
         let ok = tokio::task::spawn_blocking(move || {
             match crate::security::atomic_write(&path, data.as_bytes(), false) {
                 Ok(()) => true,
@@ -565,7 +565,7 @@ pub async fn mark_not_spam(
             }
         }).await.unwrap_or(false);
         if ok {
-            state.spam_filter.write().await.clear_dirty();
+            state.spam_filter.write().await.mark_saved(gen);
         }
     }
     Ok(())
@@ -670,8 +670,27 @@ pub async fn explain_spam_result(
 pub async fn reset_spam_filter(
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
-    let mut spam = state.spam_filter.write().await;
-    spam.reset();
+    let save_data = {
+        let mut spam = state.spam_filter.write().await;
+        spam.reset();
+        spam.take_save_data()
+    };
+    if let Some((data, path, gen)) = save_data {
+        let ok = tokio::task::spawn_blocking(move || {
+            match crate::security::atomic_write(&path, data.as_bytes(), false) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("Failed to save spam filter after reset: {e}");
+                    false
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if ok {
+            state.spam_filter.write().await.mark_saved(gen);
+        }
+    }
     Ok("Spam filter learning data cleared.".to_string())
 }
 

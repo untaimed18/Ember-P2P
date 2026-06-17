@@ -170,6 +170,16 @@ pub struct Transfer {
     /// ED2K user hash of the peer (uploads only, 32 hex chars)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_hash: Option<String>,
+    /// Absolute path of the finished file on disk (downloads only).
+    ///
+    /// Completion moves the `.part` to `Downloads/<name>`, but
+    /// `move_part_to_final` deduplicates against a pre-existing file by
+    /// appending ` (n)` to the stem. Reconstructing the path from
+    /// `file_name` alone therefore points at the wrong file whenever a
+    /// name collision occurred. We capture the real destination here so
+    /// Open/Reveal target exactly the file we wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_path: Option<String>,
 }
 
 fn default_priority() -> String {
