@@ -742,6 +742,7 @@ impl Database {
                     client_software: String::new(),
                     country_code: None,
                     user_hash: None,
+                    completed_path: None,
                 })
             })?
             .filter_map(|r| match r {

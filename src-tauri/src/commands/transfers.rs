@@ -387,6 +387,7 @@ pub async fn start_download(
         client_software: String::new(),
         country_code: None,
         user_hash: None,
+        completed_path: None,
     };
 
     let active_now = {
@@ -718,7 +719,12 @@ fn resolve_transfer_reveal_path(transfer: &Transfer, download_folder: &str) -> R
     let completed_dir = root.join("Downloads");
     let temp_dir = root.join("Temp");
     let safe_name = crate::security::sanitize_filename(&transfer.file_name);
-    let final_path = completed_dir.join(&safe_name);
+    // Prefer the exact destination recorded at completion (handles the
+    // dedup-suffix case); otherwise reconstruct from the file name.
+    let final_path = match transfer.completed_path.as_deref() {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => completed_dir.join(&safe_name),
+    };
     let part_path = temp_dir.join(format!("{}.part", transfer.id));
 
     let (candidate, base_dir) = if final_path.is_file() {
@@ -840,7 +846,14 @@ pub async fn open_file(
     }
     let download_dir = std::path::PathBuf::from(&dl_folder)
         .join("Downloads");
-    let file_path = download_dir.join(&safe_name);
+    // Prefer the exact path recorded at completion time. Falling back to
+    // `Downloads/<name>` is only correct when no dedup suffix was applied;
+    // the canonical-containment check below still confines either choice to
+    // the Downloads directory.
+    let file_path = match transfer.completed_path.as_deref() {
+        Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => download_dir.join(&safe_name),
+    };
     tokio::task::spawn_blocking(move || {
         if !file_path.exists() {
             return Err(coded("transfers_download_not_finished", "Download has not finished yet"));
