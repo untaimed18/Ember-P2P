@@ -109,7 +109,10 @@ fn random_non_protocol_marker() -> u8 {
 /// not yet replied to a status ping (so we don't have its `BaseKey`),
 /// the caller must send the packet plaintext instead.
 pub fn encrypt_send_server(payload: &[u8], base_key: u32) -> Vec<u8> {
-    debug_assert!(base_key != 0, "encrypt_send_server requires a non-zero BaseKey");
+    debug_assert!(
+        base_key != 0,
+        "encrypt_send_server requires a non-zero BaseKey"
+    );
 
     use rand::RngCore;
     let mut rng = rand::thread_rng();
@@ -397,7 +400,10 @@ mod tests {
 
         let mut decoded = vec![0u8; wire.len() - 8 - padding_len];
         rc4.process(&wire[8 + padding_len..], &mut decoded);
-        assert_eq!(decoded, plain, "encrypt-then-server-decrypt did not round-trip");
+        assert_eq!(
+            decoded, plain,
+            "encrypt-then-server-decrypt did not round-trip"
+        );
     }
 
     fn outcome_label(o: &DecryptOutcome<'_>) -> &'static str {

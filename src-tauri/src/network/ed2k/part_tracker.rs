@@ -83,7 +83,11 @@ impl PartTracker {
         let mut tracker = PartTracker {
             file_size,
             part_count,
-            gaps: if file_size > 0 { vec![(0, file_size)] } else { Vec::new() },
+            gaps: if file_size > 0 {
+                vec![(0, file_size)]
+            } else {
+                Vec::new()
+            },
             in_progress: vec![false; part_count],
             met_path,
             file_hash: [0u8; 16],
@@ -109,7 +113,11 @@ impl PartTracker {
         PartTracker {
             file_size,
             part_count,
-            gaps: if file_size > 0 { vec![(0, file_size)] } else { Vec::new() },
+            gaps: if file_size > 0 {
+                vec![(0, file_size)]
+            } else {
+                Vec::new()
+            },
             in_progress: vec![false; part_count],
             met_path,
             file_hash: [0u8; 16],
@@ -287,7 +295,9 @@ impl PartTracker {
     /// Returns the number of bytes that were actually newly filled (excluding
     /// overlap with already-filled regions).
     pub fn fill_range(&mut self, start: u64, end: u64) -> u64 {
-        if start >= end { return 0; }
+        if start >= end {
+            return 0;
+        }
         let mut newly_filled: u64 = 0;
         let mut new_gaps = Vec::with_capacity(self.gaps.len());
         for &(gs, ge) in &self.gaps {
@@ -313,10 +323,14 @@ impl PartTracker {
         // under the cap. The coalesced bytes will be re-requested and any
         // affected parts lose their `verified` flag, which is correct.
         while self.gaps.len() > MAX_GAP_ENTRIES {
-            let Some(merge_idx) = self.find_smallest_coalesce_candidate() else { break };
+            let Some(merge_idx) = self.find_smallest_coalesce_candidate() else {
+                break;
+            };
             let filled_start = self.gaps[merge_idx].1;
             let filled_end = self.gaps[merge_idx + 1].0;
-            if filled_start >= filled_end { break; }
+            if filled_start >= filled_end {
+                break;
+            }
             self.invalidate_range(filled_start, filled_end);
         }
         newly_filled
@@ -327,7 +341,9 @@ impl PartTracker {
     /// two gaps into one with the smallest possible re-download cost.
     /// Returns `None` if there are fewer than two gaps (nothing to merge).
     fn find_smallest_coalesce_candidate(&self) -> Option<usize> {
-        if self.gaps.len() < 2 { return None; }
+        if self.gaps.len() < 2 {
+            return None;
+        }
         let mut best: Option<(usize, u64)> = None;
         for i in 0..self.gaps.len() - 1 {
             let gap_between = self.gaps[i + 1].0.saturating_sub(self.gaps[i].1);
@@ -342,7 +358,9 @@ impl PartTracker {
 
     /// Add a gap (mark bytes in [start, end) as missing). Merges with adjacent gaps.
     fn add_gap(&mut self, start: u64, end: u64) {
-        if start >= end { return; }
+        if start >= end {
+            return;
+        }
         let mut merged_start = start;
         let mut merged_end = end;
         let mut new_gaps = Vec::with_capacity(self.gaps.len() + 1);
@@ -364,7 +382,9 @@ impl PartTracker {
     }
 
     pub fn completed_count(&self) -> usize {
-        (0..self.part_count).filter(|&i| self.is_part_complete(i)).count()
+        (0..self.part_count)
+            .filter(|&i| self.is_part_complete(i))
+            .count()
     }
 
     pub fn needed_parts(&self, available: &[bool]) -> Vec<usize> {
@@ -406,7 +426,9 @@ impl PartTracker {
 
     /// Return a boolean bitmap of completed parts (for OP_FILESTATUS compatibility).
     pub fn completed_parts(&self) -> Vec<bool> {
-        (0..self.part_count).map(|i| self.is_part_complete(i)).collect()
+        (0..self.part_count)
+            .map(|i| self.is_part_complete(i))
+            .collect()
     }
 
     /// Parts that are BOTH gap-complete AND MD4-verified — i.e. the parts we
@@ -479,7 +501,11 @@ impl PartTracker {
             let mut cur = std::io::Cursor::new(&mut buf);
 
             let use_large = self.file_size > 0xFFFF_FFFF;
-            let version = if use_large { PARTFILE_VERSION_LARGEFILE } else { PARTFILE_VERSION };
+            let version = if use_large {
+                PARTFILE_VERSION_LARGEFILE
+            } else {
+                PARTFILE_VERSION
+            };
             cur.write_u8(version)?;
 
             let date = chrono::Utc::now().timestamp().min(u32::MAX as i64) as u32;
@@ -490,7 +516,8 @@ impl PartTracker {
             if part_hash_count > u16::MAX as usize {
                 tracing::warn!(
                     "part.met: {} part hashes exceeds u16 limit, clamping to {}",
-                    part_hash_count, u16::MAX
+                    part_hash_count,
+                    u16::MAX
                 );
             }
             cur.write_u16::<LittleEndian>(part_hash_count.min(u16::MAX as usize) as u16)?;
@@ -563,7 +590,11 @@ impl PartTracker {
                     self.met_path.display()
                 );
             }
-            self.gaps = if self.file_size > 0 { vec![(0, self.file_size)] } else { Vec::new() };
+            self.gaps = if self.file_size > 0 {
+                vec![(0, self.file_size)]
+            } else {
+                Vec::new()
+            };
         }
         self.in_progress = vec![false; self.part_count];
     }
@@ -575,10 +606,7 @@ impl PartTracker {
         }
 
         let version = data[0];
-        if version == PARTFILE_VERSION
-            || version == PARTFILE_VERSION_LARGEFILE
-            || version == 0xE1
-        {
+        if version == PARTFILE_VERSION || version == PARTFILE_VERSION_LARGEFILE || version == 0xE1 {
             return self.load_emule_format(&data, version);
         }
 
@@ -662,13 +690,15 @@ impl PartTracker {
         if raw_tag_count > MAX_TAG_COUNT {
             tracing::warn!(
                 "part.met tag_count {} exceeds safety limit {}, clamping",
-                raw_tag_count, MAX_TAG_COUNT
+                raw_tag_count,
+                MAX_TAG_COUNT
             );
         }
         let tag_count = raw_tag_count.min(MAX_TAG_COUNT);
 
         let use_large = version == PARTFILE_VERSION_LARGEFILE;
-        let mut gap_starts: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+        let mut gap_starts: std::collections::HashMap<usize, u64> =
+            std::collections::HashMap::new();
         let mut gap_ends: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
         let mut file_size_from_tags: Option<u64> = None;
         let mut verified_bitmap_bytes: Option<Vec<u8>> = None;
@@ -682,8 +712,12 @@ impl PartTracker {
                 Ok(tag) => {
                     tags_parsed += 1;
                     match tag {
-                        MetTag::FileSize(s) => { file_size_from_tags = Some(s); }
-                        MetTag::FileName(n) => { self.file_name = n; }
+                        MetTag::FileSize(s) => {
+                            file_size_from_tags = Some(s);
+                        }
+                        MetTag::FileName(n) => {
+                            self.file_name = n;
+                        }
                         MetTag::GapStart(idx, val) => {
                             if let Some(prev) = gap_starts.insert(idx, val) {
                                 tracing::warn!("part.met: duplicate gap start index {idx} (was {prev}, now {val})");
@@ -694,10 +728,12 @@ impl PartTracker {
                                 tracing::warn!("part.met: duplicate gap end index {idx} (was {prev}, now {val})");
                             }
                         }
-                        MetTag::VerifiedBitmap(bytes) => { verified_bitmap_bytes = Some(bytes); }
+                        MetTag::VerifiedBitmap(bytes) => {
+                            verified_bitmap_bytes = Some(bytes);
+                        }
                         MetTag::Unknown => {}
                     }
-                },
+                }
                 Err(e) => {
                     tracing::warn!("Error reading tag in part.met: {e}");
                     break;
@@ -709,7 +745,8 @@ impl PartTracker {
             if s != self.file_size && self.file_size > 0 {
                 tracing::warn!(
                     "File size mismatch: part.met says {} but expected {} — ignoring stored gaps",
-                    s, self.file_size
+                    s,
+                    self.file_size
                 );
                 self.gaps = vec![(0, self.file_size)];
                 return Ok(());
@@ -748,7 +785,9 @@ impl PartTracker {
         for (&idx, &start) in &gap_starts {
             // eMule writes inclusive end; convert to our exclusive end by adding 1
             let inclusive_end = gap_ends.get(&idx).copied().unwrap_or_else(|| {
-                tracing::warn!("Orphaned gap start at index {idx} (offset {start}), extending to file_size");
+                tracing::warn!(
+                    "Orphaned gap start at index {idx} (offset {start}), extending to file_size"
+                );
                 self.file_size.saturating_sub(1)
             });
             let end = inclusive_end.saturating_add(1).min(self.file_size);
@@ -805,10 +844,7 @@ impl PartTracker {
 
     /// Sum of gap lengths: bytes still missing (same as `file_size - completed_bytes()` when consistent).
     pub fn remaining_gap_bytes(&self) -> u64 {
-        self.gaps
-            .iter()
-            .map(|&(s, e)| e.saturating_sub(s))
-            .sum()
+        self.gaps.iter().map(|&(s, e)| e.saturating_sub(s)).sum()
     }
 
     pub fn set_in_progress(&mut self, part_idx: usize, value: bool) {
@@ -846,7 +882,11 @@ impl SaveSnapshot {
             let mut cur = std::io::Cursor::new(&mut buf);
 
             let use_large = self.file_size > 0xFFFF_FFFF;
-            let version = if use_large { PARTFILE_VERSION_LARGEFILE } else { PARTFILE_VERSION };
+            let version = if use_large {
+                PARTFILE_VERSION_LARGEFILE
+            } else {
+                PARTFILE_VERSION
+            };
             cur.write_u8(version)?;
 
             let date = chrono::Utc::now().timestamp().min(u32::MAX as i64) as u32;
@@ -857,7 +897,8 @@ impl SaveSnapshot {
             if part_hash_count > u16::MAX as usize {
                 tracing::warn!(
                     "part.met: {} part hashes exceeds u16 limit, clamping to {}",
-                    part_hash_count, u16::MAX
+                    part_hash_count,
+                    u16::MAX
                 );
             }
             cur.write_u16::<LittleEndian>(part_hash_count.min(u16::MAX as usize) as u16)?;
@@ -991,7 +1032,8 @@ fn read_emule_tag(cursor: &mut Cursor<&[u8]>, _use_large: bool) -> anyhow::Resul
         0x07 => {
             let blen = cursor.read_u32::<LittleEndian>()? as u64;
             let start_pos = cursor.position();
-            let new_pos = start_pos.checked_add(blen)
+            let new_pos = start_pos
+                .checked_add(blen)
                 .filter(|&p| p <= cursor.get_ref().len() as u64)
                 .ok_or_else(|| anyhow::anyhow!("blob tag length exceeds data boundary"))?;
             // Recognize the Ember-private verified-bitmap blob tag here so
@@ -1031,7 +1073,9 @@ fn read_emule_tag(cursor: &mut Cursor<&[u8]>, _use_large: bool) -> anyhow::Resul
             return Ok(MetTag::Unknown);
         }
         _ => {
-            anyhow::bail!("Unknown part.met tag type 0x{tag_type:02X}, cannot determine value size");
+            anyhow::bail!(
+                "Unknown part.met tag type 0x{tag_type:02X}, cannot determine value size"
+            );
         }
     };
 
@@ -1213,7 +1257,10 @@ mod tests {
         // Advertise predicate (what OP_FILESTATUS uses post-fix).
         let advertised = |p: usize| tracker.is_part_complete(p) && tracker.is_part_verified(p);
         assert!(advertised(0), "verified+complete part must advertise");
-        assert!(!advertised(1), "complete-but-unverified part must NOT advertise");
+        assert!(
+            !advertised(1),
+            "complete-but-unverified part must NOT advertise"
+        );
         assert!(!advertised(2), "incomplete part must NOT advertise");
 
         // Serve gate: every advertised part must be safe for its

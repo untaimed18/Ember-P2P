@@ -76,9 +76,7 @@ impl SharedFoldersWatcher {
                         break;
                     }
                     match tokio::time::timeout(COALESCE_COOLDOWN, reload_rx.recv()).await {
-                        Ok(Some(_)) => {
-                            while reload_rx.try_recv().is_ok() {}
-                        }
+                        Ok(Some(_)) => while reload_rx.try_recv().is_ok() {},
                         _ => break,
                     }
                 }
@@ -130,9 +128,7 @@ impl SharedFoldersWatcher {
         let debouncer = match debouncer_result {
             Ok(d) => d,
             Err(e) => {
-                warn!(
-                    "FS watcher: failed to initialise ({e}); live folder tracking disabled"
-                );
+                warn!("FS watcher: failed to initialise ({e}); live folder tracking disabled");
                 return None;
             }
         };

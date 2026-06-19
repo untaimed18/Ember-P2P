@@ -68,7 +68,8 @@ impl ObfuscatedServerStream {
         let mut encrypted_payload = vec![0u8; login_payload.len()];
         self.send_key.process(login_payload, &mut encrypted_payload);
 
-        let mut combined = Vec::with_capacity(self.pending_handshake.len() + encrypted_payload.len());
+        let mut combined =
+            Vec::with_capacity(self.pending_handshake.len() + encrypted_payload.len());
         combined.extend_from_slice(&self.pending_handshake);
         combined.extend_from_slice(&encrypted_payload);
         self.pending_handshake.clear();
@@ -92,7 +93,9 @@ impl ObfuscatedServerStream {
                 format!("unexpected encrypted server protocol byte: 0x{protocol:02X} (dec_header={:02X?})", dec_header),
             ));
         }
-        let length = u32::from_le_bytes([dec_header[1], dec_header[2], dec_header[3], dec_header[4]]) as usize;
+        let length =
+            u32::from_le_bytes([dec_header[1], dec_header[2], dec_header[3], dec_header[4]])
+                as usize;
         if length == 0 || length > 5 * 1024 * 1024 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -120,7 +123,8 @@ impl ObfuscatedServerStream {
                 self.reader.read_exact(&mut enc_chunk[..want]).await?;
                 let start = payload.len();
                 payload.resize(start + want, 0);
-                self.recv_key.process(&enc_chunk[..want], &mut payload[start..start + want]);
+                self.recv_key
+                    .process(&enc_chunk[..want], &mut payload[start..start + want]);
                 remaining -= want;
             }
         }
@@ -143,9 +147,14 @@ fn decompress_payload(compressed: &[u8]) -> io::Result<Vec<u8>> {
     let mut buf = [0u8; 8192];
     loop {
         let n = decoder.read(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         if out.len() + n > MAX_DECOMPRESSED {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "decompressed packet too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decompressed packet too large",
+            ));
         }
         out.extend_from_slice(&buf[..n]);
     }
@@ -156,13 +165,14 @@ fn decompress_payload(compressed: &[u8]) -> io::Result<Vec<u8>> {
 pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServerStream> {
     info!("Connecting to server obfuscation port {addr}");
 
-    let stream = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        TcpStream::connect(addr),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "server obfuscation connect timed out"))?
-    ?;
+    let stream = tokio::time::timeout(std::time::Duration::from_secs(10), TcpStream::connect(addr))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "server obfuscation connect timed out",
+            )
+        })??;
     let _ = stream.set_nodelay(true);
 
     let (reader, writer) = stream.into_split();
@@ -187,11 +197,16 @@ pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServer
     msg1.push(semi_random_marker());
     msg1.extend_from_slice(&g_a_bytes);
     msg1.push(pad_len as u8);
-    for _ in 0..pad_len { msg1.push(rand::random()); }
+    for _ in 0..pad_len {
+        msg1.push(rand::random());
+    }
 
     writer.write_all(&msg1).await?;
     writer.flush().await?;
-    info!("Server DH: sent g^a ({} bytes + {} padding)", PRIMESIZE_BYTES, pad_len);
+    info!(
+        "Server DH: sent g^a ({} bytes + {} padding)",
+        PRIMESIZE_BYTES, pad_len
+    );
 
     // --- Message 2: Server -> Client ---
     // Step 1: Read g^b (96 bytes, plaintext)
@@ -201,14 +216,16 @@ pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServer
         reader.read_exact(&mut g_b_bytes),
     )
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "server DH answer timed out"))?
-    ?;
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "server DH answer timed out"))??;
 
     let g_b = BigUint::from_bytes_be(&g_b_bytes);
 
     let one = BigUint::from(1u32);
     if g_b <= one || g_b >= (&p - &one) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "server DH: invalid g^b value (small subgroup)"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "server DH: invalid g^b value (small subgroup)",
+        ));
     }
 
     // Step 2: Compute shared secret S = (g^b)^a mod p
@@ -267,7 +284,9 @@ pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServer
     resp_plain.extend_from_slice(&MAGICVALUE_SYNC.to_le_bytes());
     resp_plain.push(ENM_OBFUSCATION);
     resp_plain.push(resp_pad_len as u8);
-    for _ in 0..resp_pad_len { resp_plain.push(rand::random()); }
+    for _ in 0..resp_pad_len {
+        resp_plain.push(rand::random());
+    }
 
     let mut resp_encrypted = vec![0u8; resp_plain.len()];
     send_key.process(&resp_plain, &mut resp_encrypted);

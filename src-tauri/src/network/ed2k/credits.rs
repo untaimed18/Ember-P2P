@@ -357,9 +357,14 @@ impl CreditManager {
                     let pub_key = data[4..4 + pub_len].to_vec();
                     let priv_off = 4 + pub_len;
                     let priv_len = u32::from_le_bytes([
-                        data[priv_off], data[priv_off + 1], data[priv_off + 2], data[priv_off + 3],
+                        data[priv_off],
+                        data[priv_off + 1],
+                        data[priv_off + 2],
+                        data[priv_off + 3],
                     ]) as usize;
-                    let priv_end = priv_off.checked_add(4).and_then(|o| o.checked_add(priv_len));
+                    let priv_end = priv_off
+                        .checked_add(4)
+                        .and_then(|o| o.checked_add(priv_len));
                     if priv_end.is_some_and(|end| data.len() >= end) {
                         let priv_key = data[priv_off + 4..priv_off + 4 + priv_len].to_vec();
                         if !pub_key.is_empty() && !priv_key.is_empty() {
@@ -371,7 +376,8 @@ impl CreditManager {
                             // If re-encoding changes the bytes, rewrite the
                             // keyfile atomically so the next launch starts
                             // clean.
-                            let (final_pub, migrated) = match normalize_public_key_to_spki(&pub_key) {
+                            let (final_pub, migrated) = match normalize_public_key_to_spki(&pub_key)
+                            {
                                 Some(n) => {
                                     let migrated = n != pub_key;
                                     (n, migrated)
@@ -387,13 +393,19 @@ impl CreditManager {
                             // wrapped with DPAPI at-rest protection).
                             if migrated || !was_protected {
                                 let mut out = Vec::new();
-                                out.extend_from_slice(&(self.our_public_key.len() as u32).to_le_bytes());
+                                out.extend_from_slice(
+                                    &(self.our_public_key.len() as u32).to_le_bytes(),
+                                );
                                 out.extend_from_slice(&self.our_public_key);
-                                out.extend_from_slice(&(self.our_private_key.len() as u32).to_le_bytes());
+                                out.extend_from_slice(
+                                    &(self.our_private_key.len() as u32).to_le_bytes(),
+                                );
                                 out.extend_from_slice(&self.our_private_key);
                                 match crate::storage::secret_store::protect(&out) {
                                     Ok(protected) => {
-                                        if let Err(e) = crate::security::atomic_write(&key_path, &protected, true) {
+                                        if let Err(e) = crate::security::atomic_write(
+                                            &key_path, &protected, true,
+                                        ) {
                                             tracing::warn!(
                                                 "Failed to persist protected/normalised keypair: {e}"
                                             );
@@ -403,9 +415,7 @@ impl CreditManager {
                                             );
                                         }
                                     }
-                                    Err(e) => tracing::error!(
-                                        "Not persisting cryptkey.dat: {e}"
-                                    ),
+                                    Err(e) => tracing::error!("Not persisting cryptkey.dat: {e}"),
                                 }
                             }
                             return;
@@ -429,7 +439,10 @@ impl CreditManager {
             out.extend_from_slice(&self.our_private_key);
             match crate::storage::secret_store::protect(&out) {
                 Ok(protected) => match crate::security::atomic_write(&key_path, &protected, true) {
-                    Ok(()) => tracing::info!("Generated and saved new RSA keypair to {}", key_path.display()),
+                    Ok(()) => tracing::info!(
+                        "Generated and saved new RSA keypair to {}",
+                        key_path.display()
+                    ),
                     Err(e) => tracing::warn!("Failed to save RSA keypair: {e}"),
                 },
                 Err(e) => tracing::error!("Not persisting RSA keypair: {e}"),
@@ -568,7 +581,12 @@ impl CreditManager {
             None => return MIN_CREDIT_RATIO,
         };
         let ident = self.get_current_ident_state(user_hash, current_ip);
-        if self.crypto_available && matches!(ident, IdentState::Failed | IdentState::BadGuy | IdentState::Needed) {
+        if self.crypto_available
+            && matches!(
+                ident,
+                IdentState::Failed | IdentState::BadGuy | IdentState::Needed
+            )
+        {
             return MIN_CREDIT_RATIO;
         }
 
@@ -589,12 +607,22 @@ impl CreditManager {
             MAX_CREDIT_RATIO
         };
 
-        ratio1.min(ratio2).min(ratio3).min(MAX_CREDIT_RATIO).max(MIN_CREDIT_RATIO)
+        ratio1
+            .min(ratio2)
+            .min(ratio3)
+            .min(MAX_CREDIT_RATIO)
+            .max(MIN_CREDIT_RATIO)
     }
 
     /// Queue score for upload slot selection.
     /// Matches eMule CUpDownClient::GetScore: wait_seconds * credit_ratio * (file_prio / 10)
-    pub fn get_queue_score(&self, user_hash: &[u8; 16], wait_secs: u64, file_priority: f64, current_ip: u32) -> f64 {
+    pub fn get_queue_score(
+        &self,
+        user_hash: &[u8; 16],
+        wait_secs: u64,
+        file_priority: f64,
+        current_ip: u32,
+    ) -> f64 {
         let ident = self.get_current_ident_state(user_hash, current_ip);
         if matches!(ident, IdentState::BadGuy) {
             return 0.0;
@@ -608,7 +636,12 @@ impl CreditManager {
         &self.our_public_key
     }
 
-    pub fn secident_request_state(&self, user_hash: &[u8; 16], current_ip: u32, peer_level: u8) -> Option<u8> {
+    pub fn secident_request_state(
+        &self,
+        user_hash: &[u8; 16],
+        current_ip: u32,
+        peer_level: u8,
+    ) -> Option<u8> {
         if !self.crypto_available {
             return None;
         }
@@ -616,23 +649,33 @@ impl CreditManager {
             return None;
         }
         match self.credits.get(user_hash) {
-            Some(record) if !record.public_key.is_empty()
-                && record.ident_state == IdentState::Verified
-                && record.ident_ip == current_ip => None,
+            Some(record)
+                if !record.public_key.is_empty()
+                    && record.ident_state == IdentState::Verified
+                    && record.ident_ip == current_ip =>
+            {
+                None
+            }
             Some(record) if !record.public_key.is_empty() => Some(1),
             _ => Some(2),
         }
     }
 
     pub fn has_public_key(&self, user_hash: &[u8; 16]) -> bool {
-        self.credits.get(user_hash).map(|r| !r.public_key.is_empty()).unwrap_or(false)
+        self.credits
+            .get(user_hash)
+            .map(|r| !r.public_key.is_empty())
+            .unwrap_or(false)
     }
 
     /// Returns true if this peer has uploaded significant data to us (>1 MB),
     /// meaning we're actively benefiting from their uploads and they deserve
     /// a queue score bonus (eMule download-bonus equivalent).
     pub fn has_download_bonus(&self, user_hash: &[u8; 16]) -> bool {
-        self.credits.get(user_hash).map(|r| r.downloaded > 1_048_576).unwrap_or(false)
+        self.credits
+            .get(user_hash)
+            .map(|r| r.downloaded > 1_048_576)
+            .unwrap_or(false)
     }
 
     pub fn create_signature_for_peer(
@@ -681,7 +724,11 @@ impl CreditManager {
 
     pub fn set_public_key(&mut self, user_hash: [u8; 16], key: Vec<u8>) {
         if key.len() > 4096 {
-            tracing::warn!("Rejecting oversized public key ({} bytes) from {}", key.len(), crate::security::short_hash(&user_hash));
+            tracing::warn!(
+                "Rejecting oversized public key ({} bytes) from {}",
+                key.len(),
+                crate::security::short_hash(&user_hash)
+            );
             return;
         }
         let record = self.get_or_create(user_hash);
@@ -746,7 +793,9 @@ impl CreditManager {
         let now = chrono::Utc::now().timestamp();
         // Same backstop as `get_or_create` (see MAX_CREDIT_RECORDS): evict the
         // least-recently-seen Ember record when inserting a new one at capacity.
-        if !self.ember_credits.contains_key(&pub_key) && self.ember_credits.len() >= MAX_CREDIT_RECORDS {
+        if !self.ember_credits.contains_key(&pub_key)
+            && self.ember_credits.len() >= MAX_CREDIT_RECORDS
+        {
             if let Some(oldest) = self
                 .ember_credits
                 .iter()
@@ -911,7 +960,11 @@ impl CreditManager {
     /// count and load nothing rather than misparsing — see `load_from_file`.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        let records: Vec<_> = self.credits.values().filter(|r| r.uploaded > 0 || r.downloaded > 0).collect();
+        let records: Vec<_> = self
+            .credits
+            .values()
+            .filter(|r| r.uploaded > 0 || r.downloaded > 0)
+            .collect();
         buf.extend_from_slice(&CLIENTS_MET_MAGIC.to_le_bytes());
         buf.push(CLIENTS_MET_VERSION);
         buf.extend_from_slice(&(records.len() as u32).to_le_bytes());
@@ -936,44 +989,69 @@ impl CreditManager {
             return Ok(0);
         }
         let data = std::fs::read(path)?;
-        if data.len() < 4 { return Ok(0); }
+        if data.len() < 4 {
+            return Ok(0);
+        }
 
         // Format detection. The versioned (v1) cache leads with CLIENTS_MET_MAGIC
         // followed by a version byte and the record count; the original layout
         // started straight with the count. We branch on the magic and, for v1,
         // read the two extra per-record fields (ident_ip + ident_state).
-        let versioned = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == CLIENTS_MET_MAGIC;
+        let versioned =
+            u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == CLIENTS_MET_MAGIC;
         let (count, mut offset) = if versioned {
-            if data.len() < 9 { return Ok(0); }
-            (u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize, 9usize)
+            if data.len() < 9 {
+                return Ok(0);
+            }
+            (
+                u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize,
+                9usize,
+            )
         } else {
-            (u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize, 4usize)
+            (
+                u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize,
+                4usize,
+            )
         };
         // Fixed-size prefix preceding the variable-length public key.
-        let fixed_prefix = if versioned { 16 + 8 + 8 + 8 + 4 + 1 + 2 } else { 16 + 8 + 8 + 8 + 2 };
+        let fixed_prefix = if versioned {
+            16 + 8 + 8 + 8 + 4 + 1 + 2
+        } else {
+            16 + 8 + 8 + 8 + 2
+        };
 
         let read_err = || std::io::Error::new(std::io::ErrorKind::InvalidData, "bad credit record");
         let mut loaded = 0;
         for _ in 0..count.min(50000) {
-            if offset + fixed_prefix > data.len() { break; }
+            if offset + fixed_prefix > data.len() {
+                break;
+            }
             let mut user_hash = [0u8; 16];
             user_hash.copy_from_slice(&data[offset..offset + 16]);
             offset += 16;
             let uploaded = u64::from_le_bytes(
-                data[offset..offset + 8].try_into().map_err(|_| read_err())?,
+                data[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| read_err())?,
             );
             offset += 8;
             let downloaded = u64::from_le_bytes(
-                data[offset..offset + 8].try_into().map_err(|_| read_err())?,
+                data[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| read_err())?,
             );
             offset += 8;
             let last_seen = i64::from_le_bytes(
-                data[offset..offset + 8].try_into().map_err(|_| read_err())?,
+                data[offset..offset + 8]
+                    .try_into()
+                    .map_err(|_| read_err())?,
             );
             offset += 8;
             let (ident_ip, ident_state) = if versioned {
                 let ip = u32::from_le_bytes(
-                    data[offset..offset + 4].try_into().map_err(|_| read_err())?,
+                    data[offset..offset + 4]
+                        .try_into()
+                        .map_err(|_| read_err())?,
                 );
                 offset += 4;
                 let st = IdentState::from_u8(data[offset]);
@@ -1129,19 +1207,18 @@ fn verify_challenge(
     local_ip_for_remoteclient: u32,
     signature: &[u8],
 ) -> bool {
-    use rsa::pkcs1v15::{Signature, VerifyingKey};
     use rsa::pkcs1::DecodeRsaPublicKey;
+    use rsa::pkcs1v15::{Signature, VerifyingKey};
     use rsa::signature::Verifier;
     use rsa::RsaPublicKey;
     use sha1::Sha1;
 
     // eMule sends raw PKCS#1 RSA public key DER {n, e}. Try PKCS#1 first,
     // then fall back to SPKI for forward compatibility.
-    let key = match RsaPublicKey::from_pkcs1_der(public_key_der)
-        .or_else(|_| {
-            use rsa::pkcs8::DecodePublicKey;
-            RsaPublicKey::from_public_key_der(public_key_der)
-        }) {
+    let key = match RsaPublicKey::from_pkcs1_der(public_key_der).or_else(|_| {
+        use rsa::pkcs8::DecodePublicKey;
+        RsaPublicKey::from_public_key_der(public_key_der)
+    }) {
         Ok(k) => k,
         Err(_) => return false,
     };
@@ -1220,7 +1297,11 @@ mod tests {
              we probably regressed to PKCS#1 output",
             pub_der[algid_pos]
         );
-        assert_eq!(pub_der[algid_pos + 2], 0x06, "AlgorithmIdentifier must start with OID");
+        assert_eq!(
+            pub_der[algid_pos + 2],
+            0x06,
+            "AlgorithmIdentifier must start with OID"
+        );
 
         // A round-trip through the decoder we actually use on verify must work:
         // this is the same path eMule takes before it tries to crypto-verify us.
@@ -1253,8 +1334,7 @@ mod tests {
         );
 
         let spki = normalize_public_key_to_spki(&pkcs1).expect("normalisation returned None");
-        rsa::RsaPublicKey::from_public_key_der(&spki)
-            .expect("normalised key must parse as SPKI");
+        rsa::RsaPublicKey::from_public_key_der(&spki).expect("normalised key must parse as SPKI");
         assert_ne!(spki, pkcs1, "normalisation must actually re-encode the key");
 
         // A key that's already SPKI should come back byte-identical.
@@ -1376,8 +1456,14 @@ mod tests {
         cm.get_or_create(stale).last_seen = now - 100 * 86400;
 
         cm.cleanup_stale(90);
-        assert!(cm.get_record(&fresh).is_some(), "fresh record must survive 90d cutoff");
-        assert!(cm.get_record(&stale).is_none(), "100d-old record must be pruned");
+        assert!(
+            cm.get_record(&fresh).is_some(),
+            "fresh record must survive 90d cutoff"
+        );
+        assert!(
+            cm.get_record(&stale).is_none(),
+            "100d-old record must be pruned"
+        );
     }
 
     /// The credit map must stay bounded under user_hash churn (a peer
@@ -1411,9 +1497,18 @@ mod tests {
         let mut cm = CreditManager::new();
         let pk = [0xEBu8; 32];
 
-        assert!(!cm.add_ember_uploaded(pk, 4096, false), "unverified upload must be rejected");
-        assert!(!cm.add_ember_downloaded(pk, 4096, false), "unverified download must be rejected");
-        assert!(cm.get_ember_record(&pk).is_none(), "rejected writes must not create a record");
+        assert!(
+            !cm.add_ember_uploaded(pk, 4096, false),
+            "unverified upload must be rejected"
+        );
+        assert!(
+            !cm.add_ember_downloaded(pk, 4096, false),
+            "unverified download must be rejected"
+        );
+        assert!(
+            cm.get_ember_record(&pk).is_none(),
+            "rejected writes must not create a record"
+        );
 
         assert!(cm.add_ember_uploaded(pk, 4096, true));
         assert!(cm.add_ember_downloaded(pk, 2048, true));
@@ -1439,7 +1534,10 @@ mod tests {
         assert_eq!(r.total_sessions, 1);
         assert_eq!(r.completed_sessions, 1);
         let expected = (1_048_576u64 as f64 / 10.0).round() as u64;
-        assert_eq!(r.avg_upload_speed, expected, "first sample must seed EWMA without prior-zero mixing");
+        assert_eq!(
+            r.avg_upload_speed, expected,
+            "first sample must seed EWMA without prior-zero mixing"
+        );
     }
 
     /// Subsequent sessions smooth with `EMBER_SPEED_EWMA_ALPHA` so a
@@ -1478,8 +1576,14 @@ mod tests {
         cm.record_ember_session(pk, 99_999, 1, false, true);
         let r = cm.get_ember_record(&pk).unwrap();
         assert_eq!(r.total_sessions, 1);
-        assert_eq!(r.completed_sessions, 0, "aborted session must NOT count completed");
-        assert_eq!(r.avg_upload_speed, 0, "sub-threshold sessions must NOT touch EWMA");
+        assert_eq!(
+            r.completed_sessions, 0,
+            "aborted session must NOT count completed"
+        );
+        assert_eq!(
+            r.avg_upload_speed, 0,
+            "sub-threshold sessions must NOT touch EWMA"
+        );
     }
 
     /// Reliability multiplier is neutral (1.0) with no history, grows
@@ -1501,7 +1605,8 @@ mod tests {
 
         // 50% completion lands halfway in the band.
         r.completed_sessions = 5;
-        let expected = EMBER_RELIABILITY_MIN + 0.5 * (EMBER_RELIABILITY_MAX - EMBER_RELIABILITY_MIN);
+        let expected =
+            EMBER_RELIABILITY_MIN + 0.5 * (EMBER_RELIABILITY_MAX - EMBER_RELIABILITY_MIN);
         assert!((r.reliability_multiplier() - expected).abs() < 1e-9);
     }
 
@@ -1558,8 +1663,7 @@ mod tests {
         }
         let now = chrono::Utc::now().timestamp();
         cm.get_or_create_ember(fresh).last_download_time = now;
-        cm.get_or_create_ember(aged).last_download_time =
-            now - EMBER_DECAY_HALF_LIFE_SECS as i64;
+        cm.get_or_create_ember(aged).last_download_time = now - EMBER_DECAY_HALF_LIFE_SECS as i64;
 
         let fresh_ratio = cm.get_ember_score_ratio(&fresh);
         let aged_ratio = cm.get_ember_score_ratio(&aged);
@@ -1679,13 +1783,19 @@ mod tests {
         std::fs::write(&path, &bytes).expect("write temp clients.met");
 
         let mut loaded = CreditManager::new();
-        let n = loaded.load_from_file(&path).expect("load versioned clients.met");
+        let n = loaded
+            .load_from_file(&path)
+            .expect("load versioned clients.met");
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(n, 1);
         let rec = loaded.get_record(&hash).expect("record must load");
         assert_eq!(rec.ident_ip, 0x0102_0304, "ident_ip must survive restart");
-        assert_eq!(rec.ident_state, IdentState::Verified, "ident_state must survive restart");
+        assert_eq!(
+            rec.ident_state,
+            IdentState::Verified,
+            "ident_state must survive restart"
+        );
         assert_eq!(rec.uploaded, 4096);
         assert_eq!(rec.downloaded, 8192);
         assert_eq!(rec.last_seen, 1_700_000_123);
@@ -1726,6 +1836,10 @@ mod tests {
         assert_eq!(rec.last_seen, 1_699_999_999);
         assert_eq!(rec.public_key, public_key);
         assert_eq!(rec.ident_ip, 0, "legacy rows default ident_ip to 0");
-        assert_eq!(rec.ident_state, IdentState::Unknown, "legacy rows default to Unknown");
+        assert_eq!(
+            rec.ident_state,
+            IdentState::Unknown,
+            "legacy rows default to Unknown"
+        );
     }
 }

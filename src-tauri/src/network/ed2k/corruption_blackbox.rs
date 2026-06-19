@@ -212,7 +212,6 @@ impl CorruptionBlackBox {
     pub fn remove_file(&mut self, file_hash: &[u8; 16]) {
         self.records.remove(file_hash);
     }
-
 }
 
 #[cfg(test)]

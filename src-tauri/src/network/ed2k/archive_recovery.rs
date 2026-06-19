@@ -180,12 +180,14 @@ fn recover_zip(
             // ZIP64 entries use 0xFFFFFFFF as sentinel — skip them since the
             // struct uses u32 and >4GB individual entries are out of scope.
             if compressed_size == 0xFFFFFFFF || uncompressed_size == 0xFFFFFFFF {
-                let data_offset = pos + ZIP_LOCAL_HEADER_SIZE as u64 + name_len as u64 + extra_len as u64;
+                let data_offset =
+                    pos + ZIP_LOCAL_HEADER_SIZE as u64 + name_len as u64 + extra_len as u64;
                 pos = data_offset;
                 continue;
             }
 
-            let data_offset = pos + ZIP_LOCAL_HEADER_SIZE as u64 + name_len as u64 + extra_len as u64;
+            let data_offset =
+                pos + ZIP_LOCAL_HEADER_SIZE as u64 + name_len as u64 + extra_len as u64;
             let entry_end = data_offset + compressed_size as u64;
 
             if entry_end > file_size {
@@ -285,7 +287,10 @@ fn recover_zip(
             let to_read = (remaining as usize).min(copy_buf.len());
             let n = input.read(&mut copy_buf[..to_read])?;
             if n == 0 {
-                anyhow::bail!("short read during archive recovery: {} bytes remaining", remaining);
+                anyhow::bail!(
+                    "short read during archive recovery: {} bytes remaining",
+                    remaining
+                );
             }
             output.write_all(&copy_buf[..n])?;
             remaining -= n as u64;
@@ -388,8 +393,8 @@ fn sanitize_archive_name_in_place(name: &mut [u8]) {
 /// surprisingly on Windows.
 fn is_windows_reserved_base(base: &[u8]) -> bool {
     const RESERVED: &[&str] = &[
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     let Ok(s) = std::str::from_utf8(base) else {
         return false;
@@ -420,7 +425,9 @@ fn sanitize_zip_entry_name(raw: &[u8]) -> Vec<u8> {
             .chars()
             .filter(|c| *c != '\0' && !c.is_control() && *c != ':')
             .collect();
-        if cleaned.is_empty() { continue; }
+        if cleaned.is_empty() {
+            continue;
+        }
         // Neutralize Windows reserved device names per path component so the
         // extracted tree can't contain a CON/PRN/NUL/COM1… entry.
         let base_end = cleaned.find('.').unwrap_or(cleaned.len());
@@ -452,7 +459,9 @@ fn validate_zip_crc(
     while remaining > 0 {
         let to_read = (remaining as usize).min(buf.len());
         let n = input.read(&mut buf[..to_read])?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
         remaining -= n as u64;
     }
@@ -492,12 +501,19 @@ fn recover_rar(
 
     // Write minimal main archive header
     let main_header: [u8; 13] = [
-        0x73, 0x00,             // HEAD_CRC (placeholder)
-        RAR_HEAD_MAIN,          // HEAD_TYPE
-        0x00, 0x00,             // HEAD_FLAGS
-        0x0D, 0x00,             // HEAD_SIZE (13)
-        0x00, 0x00,             // HighPosAv
-        0x00, 0x00, 0x00, 0x00, // PosAv
+        0x73,
+        0x00,          // HEAD_CRC (placeholder)
+        RAR_HEAD_MAIN, // HEAD_TYPE
+        0x00,
+        0x00, // HEAD_FLAGS
+        0x0D,
+        0x00, // HEAD_SIZE (13)
+        0x00,
+        0x00, // HighPosAv
+        0x00,
+        0x00,
+        0x00,
+        0x00, // PosAv
     ];
     output.write_all(&main_header)?;
 
@@ -542,7 +558,12 @@ fn recover_rar(
                 continue;
             }
 
-            let pack_size = u32::from_le_bytes([header_data[7], header_data[8], header_data[9], header_data[10]]) as u64;
+            let pack_size = u32::from_le_bytes([
+                header_data[7],
+                header_data[8],
+                header_data[9],
+                header_data[10],
+            ]) as u64;
             let method = header_data[25];
             let name_size = u16::from_le_bytes([header_data[26], header_data[27]]) as usize;
 
@@ -559,7 +580,12 @@ fn recover_rar(
 
             // High part of packed size for large files
             let high_pack = if (head_flags & RAR_LONG_BLOCK) != 0 && header_data.len() >= 36 {
-                u32::from_le_bytes([header_data[32], header_data[33], header_data[34], header_data[35]]) as u64
+                u32::from_le_bytes([
+                    header_data[32],
+                    header_data[33],
+                    header_data[34],
+                    header_data[35],
+                ]) as u64
             } else {
                 0
             };
@@ -603,7 +629,10 @@ fn recover_rar(
                     let to_read = (remaining as usize).min(copy_buf.len());
                     let n = input.read(&mut copy_buf[..to_read])?;
                     if n == 0 {
-                        anyhow::bail!("short read during RAR recovery: {} bytes remaining", remaining);
+                        anyhow::bail!(
+                            "short read during RAR recovery: {} bytes remaining",
+                            remaining
+                        );
                     }
                     output.write_all(&copy_buf[..n])?;
                     remaining -= n as u64;
@@ -638,7 +667,13 @@ fn recover_ace(
         let mut probe = [0u8; 14];
         if input.read_exact(&mut probe).is_ok() && probe.len() >= 14 {
             let head_size = u16::from_le_bytes([probe[2], probe[3]]) as u64;
-            if head_size > 0 && head_size < 4096 && probe.get(7..14).map(|s| s == ACE_SIGNATURE).unwrap_or(false) {
+            if head_size > 0
+                && head_size < 4096
+                && probe
+                    .get(7..14)
+                    .map(|s| s == ACE_SIGNATURE)
+                    .unwrap_or(false)
+            {
                 let total = 4 + head_size;
                 input.seek(SeekFrom::Start(0))?;
                 let mut header = vec![0u8; total as usize];
@@ -694,7 +729,10 @@ fn recover_ace(
             }
 
             let pack_size = u32::from_le_bytes([
-                header_body[3], header_body[4], header_body[5], header_body[6],
+                header_body[3],
+                header_body[4],
+                header_body[5],
+                header_body[6],
             ]) as u64;
 
             let data_start = pos + 4 + head_size;
@@ -716,8 +754,7 @@ fn recover_ace(
             // one) followed by the filename. As with RAR above, we
             // mutate in place to keep all surrounding offsets valid.
             if header_body.len() >= 31 {
-                let fname_size =
-                    u16::from_le_bytes([header_body[29], header_body[30]]) as usize;
+                let fname_size = u16::from_le_bytes([header_body[29], header_body[30]]) as usize;
                 let fname_start = 31usize;
                 let fname_end = fname_start.saturating_add(fname_size);
                 if fname_size > 0 && fname_end <= header_body.len() {
@@ -735,7 +772,10 @@ fn recover_ace(
                     let to_read = (remaining as usize).min(copy_buf.len());
                     let n = input.read(&mut copy_buf[..to_read])?;
                     if n == 0 {
-                        anyhow::bail!("short read during ACE recovery: {} bytes remaining", remaining);
+                        anyhow::bail!(
+                            "short read during ACE recovery: {} bytes remaining",
+                            remaining
+                        );
                     }
                     output.write_all(&copy_buf[..n])?;
                     remaining -= n as u64;

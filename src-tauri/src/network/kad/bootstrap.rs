@@ -1,4 +1,4 @@
-﻿use std::io::Cursor;
+use std::io::Cursor;
 use std::net::Ipv4Addr;
 use std::path::Path;
 
@@ -119,7 +119,10 @@ pub fn load_nodes_dat_with_format(
                         }
                     }
                 }
-                info!("Loaded {} valid contacts from bootstrap nodes.dat", contacts.len());
+                info!(
+                    "Loaded {} valid contacts from bootstrap nodes.dat",
+                    contacts.len()
+                );
                 backup_if_short_load(path, contacts.len(), expected_count);
                 return Ok((contacts, NodesDatFormat::LegacyNoVerified));
             }
@@ -138,7 +141,9 @@ pub fn load_nodes_dat_with_format(
                 }
             }
         } else if version == 2 || version == 1 {
-            if version == 2 { format = NodesDatFormat::WithVerifiedBit; }
+            if version == 2 {
+                format = NodesDatFormat::WithVerifiedBit;
+            }
             let count = (cursor.read_u32::<LittleEndian>()? as usize).min(50_000);
             expected_count = count;
             info!("Loading {count} contacts from nodes.dat v{version}");
@@ -287,7 +292,11 @@ fn read_contact_v2(cursor: &mut Cursor<&[u8]>) -> anyhow::Result<KadContact> {
         version,
         last_seen: 0,
         verified: verified_byte != 0,
-        contact_type: if verified_byte != 0 { CONTACT_TYPE_VERIFIED } else { CONTACT_TYPE_NEW },
+        contact_type: if verified_byte != 0 {
+            CONTACT_TYPE_VERIFIED
+        } else {
+            CONTACT_TYPE_NEW
+        },
         udp_key,
         kad_options: 0,
         created_at: 0,
@@ -325,7 +334,9 @@ pub fn save_nodes_dat(path: &Path, contacts: &[KadContact]) -> anyhow::Result<()
         buf.write_u16::<LittleEndian>(c.udp_port)?;
         buf.write_u16::<LittleEndian>(c.tcp_port)?;
         buf.write_u8(c.version)?;
-        let key_val = c.udp_key.map_or(0u64, |k| (k.key as u64) << 32 | k.ip as u64);
+        let key_val = c
+            .udp_key
+            .map_or(0u64, |k| (k.key as u64) << 32 | k.ip as u64);
         buf.write_u64::<LittleEndian>(key_val)?;
         buf.write_u8(if c.verified { 1 } else { 0 })?;
     }
@@ -351,4 +362,3 @@ pub fn save_nodes_dat(path: &Path, contacts: &[KadContact]) -> anyhow::Result<()
     info!("Saved {} contacts to nodes.dat", contacts.len());
     Ok(())
 }
-

@@ -20,7 +20,13 @@ enum AddRuleOutcome {
 
 fn firewall_rule_exists(rule_name: &str) -> bool {
     Command::new("netsh")
-        .args(["advfirewall", "firewall", "show", "rule", &format!("name={rule_name}")])
+        .args([
+            "advfirewall",
+            "firewall",
+            "show",
+            "rule",
+            &format!("name={rule_name}"),
+        ])
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .output()
         .map(|o| o.status.success())
@@ -29,7 +35,13 @@ fn firewall_rule_exists(rule_name: &str) -> bool {
 
 fn firewall_rule_has_port(rule_name: &str, port: u16) -> bool {
     let output = Command::new("netsh")
-        .args(["advfirewall", "firewall", "show", "rule", &format!("name={rule_name}")])
+        .args([
+            "advfirewall",
+            "firewall",
+            "show",
+            "rule",
+            &format!("name={rule_name}"),
+        ])
         .creation_flags(0x08000000)
         .output();
     match output {
@@ -56,7 +68,13 @@ fn firewall_rule_has_port(rule_name: &str, port: u16) -> bool {
 
 fn delete_firewall_rule(rule_name: &str) {
     let _ = Command::new("netsh")
-        .args(["advfirewall", "firewall", "delete", "rule", &format!("name={rule_name}")])
+        .args([
+            "advfirewall",
+            "firewall",
+            "delete",
+            "rule",
+            &format!("name={rule_name}"),
+        ])
         .creation_flags(0x08000000)
         .output();
 }
@@ -70,7 +88,10 @@ fn add_firewall_rule(rule_name: &str, protocol: &str, port: u16) -> AddRuleOutco
         }
     };
     let args = vec![
-        "advfirewall".to_string(), "firewall".to_string(), "add".to_string(), "rule".to_string(),
+        "advfirewall".to_string(),
+        "firewall".to_string(),
+        "add".to_string(),
+        "rule".to_string(),
         format!("name={rule_name}"),
         "dir=in".to_string(),
         "action=allow".to_string(),
@@ -113,7 +134,9 @@ fn add_firewall_rule(rule_name: &str, protocol: &str, port: u16) -> AddRuleOutco
                 );
                 AddRuleOutcome::NeedsElevation
             } else {
-                let detail = format!("{} {}", stdout.trim(), stderr.trim()).trim().to_string();
+                let detail = format!("{} {}", stdout.trim(), stderr.trim())
+                    .trim()
+                    .to_string();
                 warn!("Failed to add firewall rule {rule_name}: {detail}");
                 AddRuleOutcome::Other
             }

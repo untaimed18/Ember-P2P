@@ -41,8 +41,7 @@ pub type SharedTrackerRegistry = Arc<std::sync::Mutex<HashMap<String, Arc<RwLock
 /// the peer is confirmed not to hold part `i`. Entries are only ever
 /// added to — we never upgrade a `false` back to "might have it"
 /// within a transfer because the failure was already observed.
-pub(crate) type SharedPeerMissingParts =
-    Arc<std::sync::Mutex<HashMap<(String, u16), Vec<bool>>>>;
+pub(crate) type SharedPeerMissingParts = Arc<std::sync::Mutex<HashMap<(String, u16), Vec<bool>>>>;
 
 /// Test whether `peers_missing_parts` is known to say peer `(ip, port)`
 /// does NOT have part `part_idx`. Returns `false` for unknown peers
@@ -204,8 +203,7 @@ static QUEUE_DETACH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 static PUSH_GRANT_DIVERSION_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static SLOW_ROTATE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static GLOBAL_DL_ACQUIRE_COUNT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static GLOBAL_DL_ACQUIRE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GLOBAL_DL_CONTENDED_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -559,7 +557,10 @@ struct InProgressGuard {
 
 impl InProgressGuard {
     fn new(tracker: Arc<RwLock<PartTracker>>) -> Self {
-        Self { tracker, active: Vec::new() }
+        Self {
+            tracker,
+            active: Vec::new(),
+        }
     }
 
     fn mark(&mut self, part_idx: usize) {
@@ -776,7 +777,9 @@ where
     use super::messages::*;
 
     let upload_req = build_file_request(file_hash);
-    if let Err(e) = write_packet_async_ms(writer, OP_EDONKEYHEADER, OP_STARTUPLOADREQ, &upload_req).await {
+    if let Err(e) =
+        write_packet_async_ms(writer, OP_EDONKEYHEADER, OP_STARTUPLOADREQ, &upload_req).await
+    {
         return InSessionRequeueResult::Disconnected(format!("send OP_STARTUPLOADREQ: {e:#}"));
     }
 
@@ -787,7 +790,9 @@ where
         }
         let elapsed = queue_start.elapsed().as_secs();
         if elapsed >= timeout_secs {
-            return InSessionRequeueResult::Timeout(format!("no OP_ACCEPTUPLOADREQ within {timeout_secs}s"));
+            return InSessionRequeueResult::Timeout(format!(
+                "no OP_ACCEPTUPLOADREQ within {timeout_secs}s"
+            ));
         }
         let remaining = timeout_secs.saturating_sub(elapsed).max(5);
         let result = tokio::time::timeout(
@@ -798,7 +803,9 @@ where
         let (proto, opcode, _payload) = match result {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => {
-                return InSessionRequeueResult::Disconnected(format!("read failed during re-queue: {e:#}"));
+                return InSessionRequeueResult::Disconnected(format!(
+                    "read failed during re-queue: {e:#}"
+                ));
             }
             Err(_) => {
                 return InSessionRequeueResult::Timeout(format!("read timeout during re-queue"));
@@ -1039,19 +1046,24 @@ impl MultiSourceDownload {
             .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
         }
 
-        let _ = event_tx.send(DownloadEvent::PartFileReady {
-            transfer_id: self.transfer_id.clone(),
-            file_hash: self.file_hash,
-            file_size: self.file_size,
-            file_name: self.file_name.clone(),
-        }).await;
+        let _ = event_tx
+            .send(DownloadEvent::PartFileReady {
+                transfer_id: self.transfer_id.clone(),
+                file_hash: self.file_hash,
+                file_size: self.file_size,
+                file_name: self.file_name.clone(),
+            })
+            .await;
 
         // Publish initial preview-readiness so the UI's Preview button is
         // correct on resume (when the first part is already verified on disk)
         // before any new block arrives. The progress aggregator keeps it fresh
         // as parts verify during the download.
         self.control.set_preview_ready(
-            tracker.read().await.is_preview_ready(&self.file_name, self.file_size),
+            tracker
+                .read()
+                .await
+                .is_preview_ready(&self.file_name, self.file_size),
         );
 
         // Shared rarest-first chunk selector for dynamic part assignment
@@ -1093,7 +1105,11 @@ impl MultiSourceDownload {
             let preview_prio = self.control.is_preview_priority();
             let (endgame_prefer_avail, gap_bytes, tracker_in_progress) = {
                 let t = tracker.read().await;
-                (t.remaining_count() <= 3 && part_count > 1, t.part_gap_bytes_vec(), t.in_progress.clone())
+                (
+                    t.remaining_count() <= 3 && part_count > 1,
+                    t.part_gap_bytes_vec(),
+                    t.in_progress.clone(),
+                )
             };
 
             // First pass: unique part per source where possible (rarest-first).
@@ -1121,8 +1137,7 @@ impl MultiSourceDownload {
 
                 let chosen_part = if src_is_unknown {
                     (0..part_count).find(|&p| {
-                        !assigned[p]
-                            && !tracker_in_progress.get(p).copied().unwrap_or(false)
+                        !assigned[p] && !tracker_in_progress.get(p).copied().unwrap_or(false)
                     })
                 } else {
                     cs.select_part(
@@ -1315,9 +1330,7 @@ impl MultiSourceDownload {
             // last source closes.
             let capped = {
                 let t = agg_tracker.read().await;
-                agg_control.set_preview_ready(
-                    t.is_preview_ready(&agg_file_name, file_size),
-                );
+                agg_control.set_preview_ready(t.is_preview_ready(&agg_file_name, file_size));
                 t.completed_bytes().min(file_size)
             };
             if capped != last_emitted_bytes {
@@ -1421,12 +1434,12 @@ impl MultiSourceDownload {
             let tid_clone = self.transfer_id.clone();
             let bi_clone = self.shared_buddy_info.clone();
             let ctrl_clone = self.control.clone();
-                let obf_enabled = self.obfuscation_enabled;
-                let hello_server = self.server_addr;
-                let src_ember_hash = self.ember_hash;
-                let src_ember_pubkey = self.ed25519_public_key;
-                let src_ember_secret = self.ed25519_secret_key;
-                let nick_for_src = self.nickname.clone();
+            let obf_enabled = self.obfuscation_enabled;
+            let hello_server = self.server_addr;
+            let src_ember_hash = self.ember_hash;
+            let src_ember_pubkey = self.ed25519_public_key;
+            let src_ember_secret = self.ed25519_secret_key;
+            let nick_for_src = self.nickname.clone();
             let sem_clone = conn_semaphore.clone();
             let qw = queue_wait_secs;
             let shared_out = shared_part_file.clone();
@@ -1450,21 +1463,23 @@ impl MultiSourceDownload {
             let init_src_port = source.peer_port;
             let handle = tokio::spawn(async move {
                 if sem_clone.available_permits() == 0 {
-                    let _ = fail_etx.send(DownloadEvent::SourceDetail {
-                        transfer_id: fail_tid.clone(),
-                        ip: fail_ip.clone(),
-                        port: fail_port,
-                        status: "too_many_conns".to_string(),
-                        queue_rank: None,
-                        speed: 0,
-                        transferred: 0,
-                        client_software: String::new(),
-                        peer_name: String::new(),
-                        failure_kind: None,
-                        available_parts: None,
-                        total_parts: None,
-                        country_code: None,
-                    }).await;
+                    let _ = fail_etx
+                        .send(DownloadEvent::SourceDetail {
+                            transfer_id: fail_tid.clone(),
+                            ip: fail_ip.clone(),
+                            port: fail_port,
+                            status: "too_many_conns".to_string(),
+                            queue_rank: None,
+                            speed: 0,
+                            transferred: 0,
+                            client_software: String::new(),
+                            peer_name: String::new(),
+                            failure_kind: None,
+                            available_parts: None,
+                            total_parts: None,
+                            country_code: None,
+                        })
+                        .await;
                 }
                 let _permit = match sem_clone.acquire().await {
                     Ok(p) => p,
@@ -1541,8 +1556,7 @@ impl MultiSourceDownload {
                     // longer cooldown for next dial. See
                     // `SOURCE_RETRY_COOLDOWN_SECS` for the full
                     // rationale.
-                    let is_queue_related =
-                        super::transfer::is_queue_detached_error(&err_str)
+                    let is_queue_related = super::transfer::is_queue_detached_error(&err_str)
                         || err_str.contains("peer queue is full")
                         || err_str.contains("timed out waiting for upload slot")
                         || err_str.contains("OutOfPartReqs");
@@ -1568,21 +1582,23 @@ impl MultiSourceDownload {
                         info!("Source {} ({}): stopped by user", src_idx, fail_ip);
                     } else {
                         warn!("Source {} ({}) failed: {e:#}", src_idx, fail_ip);
-                        let _ = fail_etx.send(DownloadEvent::SourceDetail {
-                            transfer_id: fail_tid,
-                            ip: fail_ip,
-                            port: fail_port,
-                            status: "failed".to_string(),
-                            queue_rank: None,
-                            speed: 0,
-                            transferred: 0,
-                            client_software: String::new(),
-                            peer_name: String::new(),
-                            failure_kind: Some(super::transfer::classify_error(&err_str)),
-                            available_parts: None,
-                            total_parts: None,
-                            country_code: None,
-                        }).await;
+                        let _ = fail_etx
+                            .send(DownloadEvent::SourceDetail {
+                                transfer_id: fail_tid,
+                                ip: fail_ip,
+                                port: fail_port,
+                                status: "failed".to_string(),
+                                queue_rank: None,
+                                speed: 0,
+                                transferred: 0,
+                                client_software: String::new(),
+                                peer_name: String::new(),
+                                failure_kind: Some(super::transfer::classify_error(&err_str)),
+                                available_parts: None,
+                                total_parts: None,
+                                country_code: None,
+                            })
+                            .await;
                     }
                 }
                 (src_idx, parts, result)
@@ -1624,8 +1640,11 @@ impl MultiSourceDownload {
             // `std::future::pending()` sentinel below makes the
             // select! arm uncostly when the channel doesn't exist.
             let mut new_established_rx = self.new_established_rx.take();
-            let abort_handles: Vec<tokio::task::AbortHandle> = handles.iter().map(|h| h.abort_handle()).collect();
-            let mut pending_futs: FuturesUnordered<tokio::task::JoinHandle<(usize, Vec<usize>, anyhow::Result<()>)>> = handles.into_iter().collect();
+            let abort_handles: Vec<tokio::task::AbortHandle> =
+                handles.iter().map(|h| h.abort_handle()).collect();
+            let mut pending_futs: FuturesUnordered<
+                tokio::task::JoinHandle<(usize, Vec<usize>, anyhow::Result<()>)>,
+            > = handles.into_iter().collect();
             let mut injected_abort_handles: Vec<tokio::task::AbortHandle> = Vec::new();
             // Concurrent loop: wait for handles to complete while accepting new sources.
             // When all initial sources finish but parts remain, keep listening for
@@ -2121,8 +2140,12 @@ impl MultiSourceDownload {
                 t.all_complete()
             };
             if all_parts_done {
-                for ah in &abort_handles { ah.abort(); }
-                for ah in &injected_abort_handles { ah.abort(); }
+                for ah in &abort_handles {
+                    ah.abort();
+                }
+                for ah in &injected_abort_handles {
+                    ah.abort();
+                }
             }
             while let Some(_) = pending_futs.next().await {}
 
@@ -2210,15 +2233,12 @@ impl MultiSourceDownload {
         // `HELLO_FAIL_COOLDOWN_SECS` — see the cooldown-lookup logic
         // below. We only want the 29 min patience for peers that
         // actually queued us.
-        const SOURCE_RETRY_COOLDOWN_SECS: u64 =
-            super::dead_sources::FILEREASKTIME_SECS as u64;
+        const SOURCE_RETRY_COOLDOWN_SECS: u64 = super::dead_sources::FILEREASKTIME_SECS as u64;
         const HELLO_FAIL_COOLDOWN_SECS: u64 = 60;
         let retry_round_min_interval =
             std::time::Duration::from_secs(RETRY_ROUND_MIN_INTERVAL_SECS);
-        let source_retry_cooldown =
-            std::time::Duration::from_secs(SOURCE_RETRY_COOLDOWN_SECS);
-        let hello_fail_cooldown =
-            std::time::Duration::from_secs(HELLO_FAIL_COOLDOWN_SECS);
+        let source_retry_cooldown = std::time::Duration::from_secs(SOURCE_RETRY_COOLDOWN_SECS);
+        let hello_fail_cooldown = std::time::Duration::from_secs(HELLO_FAIL_COOLDOWN_SECS);
 
         let max_retry_rounds = self.ed2k_limits.multisource_retry_rounds;
         let mut source_dial_history: HashMap<(String, u16), (std::time::Instant, CooldownKind)> =
@@ -2378,10 +2398,20 @@ impl MultiSourceDownload {
                         source.available_parts.clone()
                     };
                     let pp = self.control.is_preview_priority();
-                    let active: Vec<usize> = in_prog.iter().enumerate()
-                        .filter(|(_, &ip)| ip).map(|(i, _)| i).collect();
+                    let active: Vec<usize> = in_prog
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &ip)| ip)
+                        .map(|(i, _)| i)
+                        .collect();
                     if let Some(p) = cs.select_part(
-                        &completed, &in_prog, &avail, &active, &gap_bytes, pp, endgame_prefer,
+                        &completed,
+                        &in_prog,
+                        &avail,
+                        &active,
+                        &gap_bytes,
+                        pp,
+                        endgame_prefer,
                     ) {
                         vec![p]
                     } else {
@@ -2419,7 +2449,9 @@ impl MultiSourceDownload {
                 }
                 info!(
                     "Retry round {}: adopting inbound callback stream {}:{} (idx {src_idx})",
-                    retry_round + 1, source.peer_ip, source.peer_port,
+                    retry_round + 1,
+                    source.peer_ip,
+                    source.peer_port,
                 );
 
                 let src = source.clone();
@@ -2524,7 +2556,9 @@ impl MultiSourceDownload {
                 }));
             }
 
-            let all_sources: Vec<DownloadSource> = self.sources.iter()
+            let all_sources: Vec<DownloadSource> = self
+                .sources
+                .iter()
                 .chain(injected_sources.iter())
                 .cloned()
                 .collect();
@@ -2558,10 +2592,12 @@ impl MultiSourceDownload {
             let now = std::time::Instant::now();
             let eligible: Vec<bool> = all_sources
                 .iter()
-                .map(|s| match source_dial_history.get(&(s.peer_ip.clone(), s.peer_port)) {
-                    Some((t, kind)) => now.duration_since(*t) >= cooldown_for(*kind),
-                    None => true,
-                })
+                .map(
+                    |s| match source_dial_history.get(&(s.peer_ip.clone(), s.peer_port)) {
+                        Some((t, kind)) => now.duration_since(*t) >= cooldown_for(*kind),
+                        None => true,
+                    },
+                )
                 .collect();
 
             let mut retry_assignments: Vec<Vec<usize>> = vec![Vec::new(); all_sources.len()];
@@ -2570,9 +2606,8 @@ impl MultiSourceDownload {
             let mut sorted_incomplete = incomplete.clone();
             {
                 let cs = chunk_selector.read().await;
-                sorted_incomplete.sort_by_key(|&p| {
-                    cs.part_frequency.get(p).copied().unwrap_or(u16::MAX)
-                });
+                sorted_incomplete
+                    .sort_by_key(|&p| cs.part_frequency.get(p).copied().unwrap_or(u16::MAX));
             }
             for &part_idx in &sorted_incomplete {
                 // Split candidates into three priority tiers:
@@ -2608,7 +2643,12 @@ impl MultiSourceDownload {
                     }
                     if source.available_parts.is_empty() {
                         unknown.push(src_idx);
-                    } else if source.available_parts.get(part_idx).copied().unwrap_or(false) {
+                    } else if source
+                        .available_parts
+                        .get(part_idx)
+                        .copied()
+                        .unwrap_or(false)
+                    {
                         known_has.push(src_idx);
                     }
                 }
@@ -2630,8 +2670,7 @@ impl MultiSourceDownload {
             // consuming a retry round. (The retry budget exists to bound
             // genuine retry attempts, not to be spent waiting on
             // cooldowns.)
-            let assigned_count: usize =
-                retry_assignments.iter().map(|v| v.len()).sum();
+            let assigned_count: usize = retry_assignments.iter().map(|v| v.len()).sum();
             if assigned_count == 0 {
                 // Find the soonest cooldown expiry among sources that
                 // actually have at least one needed part AND haven't
@@ -3065,7 +3104,8 @@ impl MultiSourceDownload {
             // Gate on `all_parts_verified()` and fall back to a full disk
             // re-read so corrupt bytes can't be published as a verified file.
             let expected = hex::encode(self.file_hash);
-            let num_parts = ((self.file_size + super::hash::PARTSIZE - 1) / super::hash::PARTSIZE) as usize;
+            let num_parts =
+                ((self.file_size + super::hash::PARTSIZE - 1) / super::hash::PARTSIZE) as usize;
             let all_parts_verified = {
                 let t = tracker.read().await;
                 t.all_parts_verified()
@@ -3080,7 +3120,10 @@ impl MultiSourceDownload {
                 let actual = super::hash::ed2k_hash_from_parts(&ph, self.file_size);
                 drop(ph);
                 if actual == expected {
-                    info!("Multi-source download verified from part hashes (no re-read): {}", self.file_name);
+                    info!(
+                        "Multi-source download verified from part hashes (no re-read): {}",
+                        self.file_name
+                    );
                     true
                 } else {
                     warn!(
@@ -3090,21 +3133,41 @@ impl MultiSourceDownload {
                     let verify_path = part_path.clone();
                     match tokio::task::spawn_blocking(move || {
                         super::hash::ed2k_hash_file(&verify_path)
-                    }).await {
-                        Ok(Ok(h)) if h == expected => { info!("Full rehash matched for {}", self.file_name); true }
-                        Ok(Ok(h)) => { warn!("Full rehash also mismatched for {}: got={}", self.file_name, h); false }
-                        Ok(Err(e)) => { warn!("Full rehash failed for {}: {e}", self.file_name); false }
-                        Err(e) => { warn!("Full rehash task failed for {}: {e}", self.file_name); false }
+                    })
+                    .await
+                    {
+                        Ok(Ok(h)) if h == expected => {
+                            info!("Full rehash matched for {}", self.file_name);
+                            true
+                        }
+                        Ok(Ok(h)) => {
+                            warn!(
+                                "Full rehash also mismatched for {}: got={}",
+                                self.file_name, h
+                            );
+                            false
+                        }
+                        Ok(Err(e)) => {
+                            warn!("Full rehash failed for {}: {e}", self.file_name);
+                            false
+                        }
+                        Err(e) => {
+                            warn!("Full rehash task failed for {}: {e}", self.file_name);
+                            false
+                        }
                     }
                 }
             } else {
                 drop(ph);
                 let verify_path = part_path.clone();
-                match tokio::task::spawn_blocking(move || {
-                    super::hash::ed2k_hash_file(&verify_path)
-                }).await {
+                match tokio::task::spawn_blocking(move || super::hash::ed2k_hash_file(&verify_path))
+                    .await
+                {
                     Ok(Ok(actual)) if actual == expected => {
-                        info!("Multi-source download complete and verified: {}", self.file_name);
+                        info!(
+                            "Multi-source download complete and verified: {}",
+                            self.file_name
+                        );
                         true
                     }
                     Ok(Ok(actual)) => {
@@ -3115,11 +3178,17 @@ impl MultiSourceDownload {
                         false
                     }
                     Ok(Err(e)) => {
-                        warn!("Could not verify hash for {}: {e} — treating as failed", self.file_name);
+                        warn!(
+                            "Could not verify hash for {}: {e} — treating as failed",
+                            self.file_name
+                        );
                         false
                     }
                     Err(e) => {
-                        warn!("Hash verification task failed for {}: {e} — treating as failed", self.file_name);
+                        warn!(
+                            "Hash verification task failed for {}: {e} — treating as failed",
+                            self.file_name
+                        );
                         false
                     }
                 }
@@ -3138,9 +3207,11 @@ impl MultiSourceDownload {
                 let final_path = self.download_dir.join("Downloads").join(&safe_name);
                 let pp = part_path.clone();
                 let fp = final_path.clone();
-                let actual_final = tokio::task::spawn_blocking(move || super::transfer::move_part_to_final(&pp, &fp))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+                let actual_final = tokio::task::spawn_blocking(move || {
+                    super::transfer::move_part_to_final(&pp, &fp)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
                 {
                     let t = tracker.read().await;
                     t.delete_met();
@@ -3181,7 +3252,8 @@ impl MultiSourceDownload {
                 let _ = event_tx
                     .send(DownloadEvent::Failed {
                         transfer_id: self.transfer_id.clone(),
-                        error: "Final hash verification failed — .part preserved for retry".to_string(),
+                        error: "Final hash verification failed — .part preserved for retry"
+                            .to_string(),
                         failure_kind: super::transfer::SourceFailureKind::Permanent,
                     })
                     .await;
@@ -3248,10 +3320,12 @@ fn append_compressed_chunk_ms(
             MAX_PENDING_COMPRESSED_BLOCKS
         );
     }
-    let entry = pending.entry(start).or_insert_with(|| PendingCompressedBlock {
-        compressed_total_size: total_packed_size,
-        compressed: Vec::with_capacity(total_packed),
-    });
+    let entry = pending
+        .entry(start)
+        .or_insert_with(|| PendingCompressedBlock {
+            compressed_total_size: total_packed_size,
+            compressed: Vec::with_capacity(total_packed),
+        });
     if entry.compressed_total_size != total_packed_size {
         let old_size = entry.compressed_total_size;
         let _ = entry;
@@ -3554,10 +3628,7 @@ async fn download_parts_from_source(
         // always time out, since LowID peers can't accept inbound TCP. Keyed on
         // the peer's user hash when the source metadata carries one, else its
         // IP; the live connection itself claims the authoritative hash below.
-        let predial_id = live_peer_id(
-            &source.peer_user_hash.unwrap_or([0u8; 16]),
-            &source.peer_ip,
-        );
+        let predial_id = live_peer_id(&source.peer_user_hash.unwrap_or([0u8; 16]), &source.peer_ip);
         if is_live_peer(&transfer_id, &predial_id) {
             debug!(
                 "Source {} ({}) skip dial: already connected to this peer via another route",
@@ -3578,10 +3649,12 @@ async fn download_parts_from_source(
             Some(bi) => bi.read().await.clone(),
             None => None,
         };
-        let server_ip = server_addr.and_then(|addr| match addr.ip() {
-            std::net::IpAddr::V4(v4) => Some(u32::from_le_bytes(v4.octets())),
-            _ => None,
-        }).unwrap_or(0);
+        let server_ip = server_addr
+            .and_then(|addr| match addr.ip() {
+                std::net::IpAddr::V4(v4) => Some(u32::from_le_bytes(v4.octets())),
+                _ => None,
+            })
+            .unwrap_or(0);
         let server_port = server_addr.map(|addr| addr.port()).unwrap_or(0);
         let hello_options = HelloOptions {
             udp_port,
@@ -3636,8 +3709,7 @@ async fn download_parts_from_source(
         // bits imply support via eMule's hello masking. Crypt-*required* peers
         // RST a plaintext hello (`os error 10054`), so obfuscating here is what
         // unblocks the common server-HighID-source case.
-        let prefer_obf =
-            peer_hash_opt.is_some() && obfuscation_enabled && (peer_opts & 0x07) != 0;
+        let prefer_obf = peer_hash_opt.is_some() && obfuscation_enabled && (peer_opts & 0x07) != 0;
         if peer_hash_opt.is_none() && (peer_opts & 0x07) != 0 {
             info!(
                 "Source {} ({}) advertises crypt (opts=0x{:02X}) but no user hash known — connecting plaintext; crypt-required peers will reset us (10054)",
@@ -3662,7 +3734,10 @@ async fn download_parts_from_source(
             )
             .await
             {
-                Ok(Ok(s)) => { tune_peer_stream(&s); s },
+                Ok(Ok(s)) => {
+                    tune_peer_stream(&s);
+                    s
+                }
                 Ok(Err(e)) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout {e}")),
                 Err(_) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout timeout")),
             };
@@ -3681,11 +3756,15 @@ async fn download_parts_from_source(
                 && peer_hash_opt.is_some()
             {
                 let peer_hash = peer_hash_opt.unwrap();
-                debug!("Source {} attempting obfuscated handshake (attempt {})", _src_idx, attempt);
+                debug!(
+                    "Source {} attempting obfuscated handshake (attempt {})",
+                    _src_idx, attempt
+                );
                 let (raw_r, raw_w) = stream.into_split();
                 let mut buf_r = tokio::io::BufReader::new(raw_r);
                 let mut buf_w = tokio::io::BufWriter::new(raw_w);
-                match tcp_obfuscation::negotiate_outgoing(&mut buf_r, &mut buf_w, &peer_hash).await {
+                match tcp_obfuscation::negotiate_outgoing(&mut buf_r, &mut buf_w, &peer_hash).await
+                {
                     Ok((recv_key, send_key)) => {
                         conn_is_obf = true;
                         (
@@ -3699,16 +3778,26 @@ async fn download_parts_from_source(
                                 "stage:tcp_obfuscation peer requires crypt and obfuscation failed: {e}"
                             ));
                         }
-                        debug!("Outgoing obfuscation failed for source {}: {e}; reconnecting plain", _src_idx);
+                        debug!(
+                            "Outgoing obfuscation failed for source {}: {e}; reconnecting plain",
+                            _src_idx
+                        );
                         let plain_stream = match tokio::time::timeout(
                             std::time::Duration::from_secs(PEER_CONNECT_TIMEOUT_SECS),
                             TcpStream::connect(addr),
                         )
                         .await
                         {
-                            Ok(Ok(s)) => { tune_peer_stream(&s); s },
-                            Ok(Err(err)) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout {err}")),
-                            Err(_) => return Err(anyhow::anyhow!("stage:tcp_connect_timeout timeout")),
+                            Ok(Ok(s)) => {
+                                tune_peer_stream(&s);
+                                s
+                            }
+                            Ok(Err(err)) => {
+                                return Err(anyhow::anyhow!("stage:tcp_connect_timeout {err}"))
+                            }
+                            Err(_) => {
+                                return Err(anyhow::anyhow!("stage:tcp_connect_timeout timeout"))
+                            }
                         };
                         let (r, w) = plain_stream.into_split();
                         (
@@ -3743,15 +3832,18 @@ async fn download_parts_from_source(
                 && attempt == 0
                 && peer_hash_opt.is_some()
                 && (peer_opts & 0x07) != 0;
-            let retry_plain_eligible = conn_is_obf
-                && !plain_retry_used
-                && attempt == 0
-                && (peer_opts & 0x04) == 0;
+            let retry_plain_eligible =
+                conn_is_obf && !plain_retry_used && attempt == 0 && (peer_opts & 0x04) == 0;
 
-            if let Err(e) = write_packet_async_ms(&mut *ww, OP_EDONKEYHEADER, OP_HELLO, &hello_payload).await {
+            if let Err(e) =
+                write_packet_async_ms(&mut *ww, OP_EDONKEYHEADER, OP_HELLO, &hello_payload).await
+            {
                 let e = anyhow::Error::new(e).context("stage:hello_wait");
                 if retry_obf_eligible && is_connection_reset(&e) {
-                    debug!("Source {}: plain Hello send reset; retrying with obfuscation", _src_idx);
+                    debug!(
+                        "Source {}: plain Hello send reset; retrying with obfuscation",
+                        _src_idx
+                    );
                     obf_retry_used = true;
                     force_obf = true;
                     force_plain = false;
@@ -3759,7 +3851,10 @@ async fn download_parts_from_source(
                     continue;
                 }
                 if retry_plain_eligible && is_connection_reset(&e) {
-                    debug!("Source {}: obfuscated Hello send reset; retrying plain", _src_idx);
+                    debug!(
+                        "Source {}: obfuscated Hello send reset; retrying plain",
+                        _src_idx
+                    );
                     plain_retry_used = true;
                     force_plain = true;
                     force_obf = false;
@@ -3769,7 +3864,10 @@ async fn download_parts_from_source(
                 return Err(e);
             }
 
-            match read_packet_timeout_ms(&mut *rr).await.context("stage:hello_wait") {
+            match read_packet_timeout_ms(&mut *rr)
+                .await
+                .context("stage:hello_wait")
+            {
                 Ok((h_proto, h_opcode, data)) => {
                     if h_proto != OP_EDONKEYHEADER || h_opcode != OP_HELLOANSWER {
                         anyhow::bail!("source {}: expected HelloAnswer, got proto=0x{h_proto:02X} op=0x{h_opcode:02X}", _src_idx);
@@ -3778,7 +3876,10 @@ async fn download_parts_from_source(
                 }
                 Err(e) => {
                     if retry_obf_eligible && is_connection_reset(&e) {
-                        debug!("Source {}: plain Hello reset at hello_wait; retrying with obfuscation", _src_idx);
+                        debug!(
+                            "Source {}: plain Hello reset at hello_wait; retrying with obfuscation",
+                            _src_idx
+                        );
                         obf_retry_used = true;
                         force_obf = true;
                         force_plain = false;
@@ -3786,7 +3887,10 @@ async fn download_parts_from_source(
                         continue;
                     }
                     if retry_plain_eligible && is_connection_reset(&e) {
-                        debug!("Source {}: obfuscated Hello reset at hello_wait; retrying plain", _src_idx);
+                        debug!(
+                            "Source {}: obfuscated Hello reset at hello_wait; retrying plain",
+                            _src_idx
+                        );
                         plain_retry_used = true;
                         force_plain = true;
                         force_obf = false;
@@ -3827,7 +3931,8 @@ async fn download_parts_from_source(
         peer_supports_aich = hello_caps.supports_aich;
         peer_ember_hash = hello_caps.ember_hash;
 
-        let emule_payload = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
+        let emule_payload =
+            build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
         write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
 
         match read_packet_timeout_ms(&mut *reader)
@@ -3835,7 +3940,8 @@ async fn download_parts_from_source(
             .context("stage:emule_info_wait")
         {
             Ok((proto, opcode, payload)) => {
-                if proto == OP_EMULEPROT && (opcode == OP_EMULEINFOANSWER || opcode == OP_EMULEINFO) {
+                if proto == OP_EMULEPROT && (opcode == OP_EMULEINFOANSWER || opcode == OP_EMULEINFO)
+                {
                     merge_caps(&mut hello_caps, parse_emule_info(&payload));
                     let peer_udp = hello_caps.udp_port;
                     peer_supports_multipacket = hello_caps.supports_multi_packet;
@@ -3864,14 +3970,34 @@ async fn download_parts_from_source(
                         if let Some(sm) = &source_mgr {
                             let mut sm = sm.write().await;
                             if let std::net::IpAddr::V4(v4) = addr.ip() {
-                                sm.register_source_full(*file_hash, v4, addr.port(), peer_udp, peer_user_hash);
+                                sm.register_source_full(
+                                    *file_hash,
+                                    v4,
+                                    addr.port(),
+                                    peer_udp,
+                                    peer_user_hash,
+                                );
                             }
                         }
                     }
                     if opcode == OP_EMULEINFO {
-                        let emule_answer = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
-                        let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_answer).await;
-                        debug!("Received peer OP_EMULEINFO from source {}, replied", _src_idx);
+                        let emule_answer = build_emule_info(
+                            udp_port,
+                            obfuscation_enabled,
+                            Some(&ember_hash),
+                            None,
+                        );
+                        let _ = write_packet_async_ms(
+                            &mut *writer,
+                            OP_EMULEPROT,
+                            OP_EMULEINFOANSWER,
+                            &emule_answer,
+                        )
+                        .await;
+                        debug!(
+                            "Received peer OP_EMULEINFO from source {}, replied",
+                            _src_idx
+                        );
                     } else {
                         debug!("Got EmuleInfoAnswer from source {}", _src_idx);
                     }
@@ -3881,7 +4007,8 @@ async fn download_parts_from_source(
                         peer_user_hash,
                         addr,
                         peer_secure_ident_level,
-                    ).await?;
+                    )
+                    .await?;
                 } else {
                     deferred_packet = Some((proto, opcode, payload));
                 }
@@ -3935,7 +4062,8 @@ async fn download_parts_from_source(
             peer_user_hash,
             addr,
             peer_secure_ident_level,
-        ).await?;
+        )
+        .await?;
     }
 
     // Tracks whether we've already shipped our `OP_EMBER_HELLO` /
@@ -4069,7 +4197,8 @@ async fn download_parts_from_source(
                         peer_user_hash,
                         peer_secure_ident_level,
                         our_client_id,
-                    ).await?;
+                    )
+                    .await?;
                     debug!("Responded to SecIdent challenge from source {}", _src_idx);
                 }
             }
@@ -4093,20 +4222,23 @@ async fn download_parts_from_source(
                             peer_user_hash,
                             peer_secure_ident_level,
                             our_client_id,
-                        ).await?;
+                        )
+                        .await?;
                         debug!(
                             "Replayed deferred SecIdent response to source {} after receiving their public key",
                             _src_idx
                         );
                     }
                     if pending_secident_challenge.is_none() {
-                        pending_secident_challenge = super::transfer::maybe_send_secident_challenge(
-                            &mut *writer,
-                            credit_mgr.as_ref(),
-                            peer_user_hash,
-                            addr,
-                            peer_secure_ident_level,
-                        ).await?;
+                        pending_secident_challenge =
+                            super::transfer::maybe_send_secident_challenge(
+                                &mut *writer,
+                                credit_mgr.as_ref(),
+                                peer_user_hash,
+                                addr,
+                                peer_secure_ident_level,
+                            )
+                            .await?;
                     }
                 }
             }
@@ -4119,7 +4251,8 @@ async fn download_parts_from_source(
                     peer_secure_ident_level,
                     &payload,
                     our_client_id,
-                ).await;
+                )
+                .await;
             }
             (OP_EMULEPROT, OP_EMULEINFOANSWER) | (OP_EMULEPROT, OP_EMULEINFO) => {
                 merge_caps(&mut hello_caps, parse_emule_info(&payload));
@@ -4142,14 +4275,30 @@ async fn download_parts_from_source(
                     if let Some(sm) = &source_mgr {
                         let mut sm = sm.write().await;
                         if let std::net::IpAddr::V4(v4) = addr.ip() {
-                            sm.register_source_full(*file_hash, v4, addr.port(), peer_udp, peer_user_hash);
+                            sm.register_source_full(
+                                *file_hash,
+                                v4,
+                                addr.port(),
+                                peer_udp,
+                                peer_user_hash,
+                            );
                         }
                     }
                 }
                 if opcode == OP_EMULEINFO {
-                    let emule_answer = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
-                    let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_answer).await;
-                    debug!("Received delayed peer OP_EMULEINFO from source {}, replied", _src_idx);
+                    let emule_answer =
+                        build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
+                    let _ = write_packet_async_ms(
+                        &mut *writer,
+                        OP_EMULEPROT,
+                        OP_EMULEINFOANSWER,
+                        &emule_answer,
+                    )
+                    .await;
+                    debug!(
+                        "Received delayed peer OP_EMULEINFO from source {}, replied",
+                        _src_idx
+                    );
                 } else {
                     debug!("Got delayed EmuleInfoAnswer from source {}", _src_idx);
                 }
@@ -4162,21 +4311,36 @@ async fn download_parts_from_source(
             // the upload side and the documented intent require (see the
             // OP_EMBER_HELLO arm comment below). Otherwise a non-Ember peer
             // we're downloading from could inject crafted source/peer hints.
-            (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if hello_caps.is_ember && epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION => {
+            (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
+                if hello_caps.is_ember
+                    && epx_packets_received
+                        < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION =>
+            {
                 sx_overhead.record_download((6 + payload.len()) as u64);
                 epx_packets_received += 1;
-                info!("Received early EPX from source {} during pre-file-control ({} bytes)", _src_idx, payload.len());
+                info!(
+                    "Received early EPX from source {} during pre-file-control ({} bytes)",
+                    _src_idx,
+                    payload.len()
+                );
                 match crate::network::ember::parse_exchange_payload(&payload) {
                     Ok(result) if !result.files.is_empty() || !result.peers.is_empty() => {
-                        let (epx_entries, aich_roots) = super::transfer::epx_result_to_entries(&result);
-                        let epx_peers = result.peers.into_iter().map(|p| (p.ip, p.tcp_port)).collect();
+                        let (epx_entries, aich_roots) =
+                            super::transfer::epx_result_to_entries(&result);
+                        let epx_peers = result
+                            .peers
+                            .into_iter()
+                            .map(|p| (p.ip, p.tcp_port))
+                            .collect();
                         if let Some(ref etx) = event_tx {
-                            let _ = etx.send(DownloadEvent::EmberSources {
-                                transfer_id: transfer_id.clone(),
-                                entries: epx_entries,
-                                aich_roots,
-                                ember_peers: epx_peers,
-                            }).await;
+                            let _ = etx
+                                .send(DownloadEvent::EmberSources {
+                                    transfer_id: transfer_id.clone(),
+                                    entries: epx_entries,
+                                    aich_roots,
+                                    ember_peers: epx_peers,
+                                })
+                                .await;
                         }
                     }
                     Ok(_) => {}
@@ -4202,13 +4366,15 @@ async fn download_parts_from_source(
                     // is still logged for diagnostics.
                     let verified = ember_auth_verified;
                     info!("Received early friend request from source {} (nick='{}', verified={verified}, pop={}, binding={ember_hash_binding_verified})", _src_idx, nick, ember_auth_verified);
-                    let _ = etx.send(DownloadEvent::EmberFriendRequest {
-                        ember_hash: eh,
-                        nickname: nick,
-                        peer_ip: addr.ip().to_string(),
-                        peer_port: addr.port(),
-                        verified,
-                    }).await;
+                    let _ = etx
+                        .send(DownloadEvent::EmberFriendRequest {
+                            ember_hash: eh,
+                            nickname: nick,
+                            peer_ip: addr.ip().to_string(),
+                            peer_port: addr.port(),
+                            verified,
+                        })
+                        .await;
                 }
             }
             // Authoritative Ember peer detection. Replaces the old in-band
@@ -4230,14 +4396,12 @@ async fn download_parts_from_source(
                     // the new key while the session still claims to
                     // be `Verified`).
                     let identity_changed = ember_auth_verified
-                        && (
-                            (ident.ed25519_pubkey.is_some()
-                                && hello_caps.ember_pubkey.is_some()
-                                && ident.ed25519_pubkey != hello_caps.ember_pubkey)
+                        && ((ident.ed25519_pubkey.is_some()
+                            && hello_caps.ember_pubkey.is_some()
+                            && ident.ed25519_pubkey != hello_caps.ember_pubkey)
                             || (ident.ember_hash != [0u8; 16]
                                 && hello_caps.ember_hash.is_some()
-                                && Some(ident.ember_hash) != hello_caps.ember_hash)
-                        );
+                                && Some(ident.ember_hash) != hello_caps.ember_hash));
                     if identity_changed {
                         tracing::warn!(
                             "Ember identity-swap rejected from source {} at {}: peer already PoP-verified",
@@ -4261,14 +4425,26 @@ async fn download_parts_from_source(
                         }
                     }
                     src_client_software = client_software_from_caps(&hello_caps);
-                    debug!("Source {} identified as Ember via OP_EMBER_HELLO (mod='{}', nick='{}')",
-                        _src_idx, ident.mod_version, ident.nickname);
+                    debug!(
+                        "Source {} identified as Ember via OP_EMBER_HELLO (mod='{}', nick='{}')",
+                        _src_idx, ident.mod_version, ident.nickname
+                    );
                     if opcode == OP_EMBER_HELLO && !sent_ember_hello {
                         // Advertise our pubkey so the peer can verify
                         // the BLAKE3 identity binding on us; see upload.rs
                         // for the matching rationale on the inbound side.
-                        let payload = build_ember_hello(&ember_hash, &our_nickname, Some(&ed25519_public_key));
-                        let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &payload).await;
+                        let payload = build_ember_hello(
+                            &ember_hash,
+                            &our_nickname,
+                            Some(&ed25519_public_key),
+                        );
+                        let _ = write_packet_async_ms(
+                            &mut *writer,
+                            OP_EMULEPROT,
+                            OP_EMBER_HELLOANSWER,
+                            &payload,
+                        )
+                        .await;
                         sent_ember_hello = true;
                     }
 
@@ -4277,8 +4453,12 @@ async fn download_parts_from_source(
                     // spoofers before we invest in a full
                     // challenge-response round trip.
                     if !ember_hash_binding_verified {
-                        if let (Some(ref peer_pk), Some(ref peer_eh)) = (hello_caps.ember_pubkey, hello_caps.ember_hash) {
-                            if crate::network::ember::crypto::verify_ember_hash_binding(peer_pk, peer_eh) {
+                        if let (Some(ref peer_pk), Some(ref peer_eh)) =
+                            (hello_caps.ember_pubkey, hello_caps.ember_hash)
+                        {
+                            if crate::network::ember::crypto::verify_ember_hash_binding(
+                                peer_pk, peer_eh,
+                            ) {
                                 ember_hash_binding_verified = true;
                                 info!("Ember binding: source {} at {} pubkey BLAKE3-binds to advertised hash", _src_idx, addr);
                             } else {
@@ -4310,7 +4490,9 @@ async fn download_parts_from_source(
                     // (`DownloadEvent::EmberFriendRequest.verified`)
                     // reflect the binding-only signal.
                     if !ember_auth_verified && ember_hash_binding_verified {
-                        if let (Some(peer_pk), Some(peer_eh)) = (hello_caps.ember_pubkey, hello_caps.ember_hash) {
+                        if let (Some(peer_pk), Some(peer_eh)) =
+                            (hello_caps.ember_pubkey, hello_caps.ember_hash)
+                        {
                             match super::friend_connect::perform_ember_auth_buffered(
                                 &mut *reader,
                                 &mut *writer,
@@ -4320,7 +4502,9 @@ async fn download_parts_from_source(
                                 Some(&peer_eh),
                                 addr,
                                 &mut auth_deferred,
-                            ).await {
+                            )
+                            .await
+                            {
                                 Ok(()) => {
                                     ember_auth_verified = true;
                                     info!(
@@ -4337,14 +4521,18 @@ async fn download_parts_from_source(
                                     // `peer_is_friend` binding
                                     // below, so we re-check
                                     // `friend_hashes` inline.
-                                    if let (Some(ref fh_arc), Some(eh)) = (&friend_hashes, hello_caps.ember_hash) {
+                                    if let (Some(ref fh_arc), Some(eh)) =
+                                        (&friend_hashes, hello_caps.ember_hash)
+                                    {
                                         if fh_arc.read().await.contains(&eh) {
                                             if let Some(ref etx) = event_tx {
-                                                let _ = etx.send(DownloadEvent::FriendSeen {
-                                                    ember_hash: eh,
-                                                    ip: addr.ip(),
-                                                    port: addr.port(),
-                                                }).await;
+                                                let _ = etx
+                                                    .send(DownloadEvent::FriendSeen {
+                                                        ember_hash: eh,
+                                                        ip: addr.ip(),
+                                                        port: addr.port(),
+                                                    })
+                                                    .await;
                                                 friend_seen_emitted = true;
                                             }
                                         }
@@ -4390,7 +4578,10 @@ async fn download_parts_from_source(
         // can run `verify_ember_hash_binding` on us and mount the
         // `perform_ember_auth` challenge-response.
         let payload = build_ember_hello(&ember_hash, &our_nickname, Some(&ed25519_public_key));
-        if write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload).await.is_ok() {
+        if write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload)
+            .await
+            .is_ok()
+        {
             sent_ember_hello = true;
         }
     }
@@ -4403,29 +4594,51 @@ async fn download_parts_from_source(
     // lost every EPX update produced while we were queued (often the
     // most useful ones, since other sources arrived and shifted the
     // shareable set).
-    info!("Source {}: is_ember={}, mod_version='{}', ember_hash={}",
-        _src_idx, hello_caps.is_ember, hello_caps.mod_version,
-        peer_ember_hash.map(|h| hex::encode(h)).unwrap_or_else(|| "none".to_string()));
+    info!(
+        "Source {}: is_ember={}, mod_version='{}', ember_hash={}",
+        _src_idx,
+        hello_caps.is_ember,
+        hello_caps.mod_version,
+        peer_ember_hash
+            .map(|h| hex::encode(h))
+            .unwrap_or_else(|| "none".to_string())
+    );
     let mut initial_epx_sent_generation: Option<u64> = None;
     if hello_caps.is_ember {
         let sent_gen = ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed);
         let epx_data = ember_payload.read().await.clone();
         if !epx_data.is_empty() {
-            info!("Sending EPX to Ember source {} ({} bytes, gen {})", _src_idx, epx_data.len(), sent_gen);
-            let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await;
+            info!(
+                "Sending EPX to Ember source {} ({} bytes, gen {})",
+                _src_idx,
+                epx_data.len(),
+                sent_gen
+            );
+            let _ = write_packet_async_ms(
+                &mut *writer,
+                OP_EMULEPROT,
+                OP_EMBER_SOURCEEXCHANGE,
+                &*epx_data,
+            )
+            .await;
             sx_overhead.record_upload((6 + epx_data.len()) as u64);
             initial_epx_sent_generation = Some(sent_gen);
         } else {
-            info!("EPX payload empty, skipping EPX send to source {}", _src_idx);
+            info!(
+                "EPX payload empty, skipping EPX send to source {}",
+                _src_idx
+            );
         }
         if let std::net::IpAddr::V4(v4) = addr.ip() {
             let peer_tcp = addr.port();
             if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
                 if let Some(ref etx) = event_tx {
-                    let _ = etx.send(DownloadEvent::EmberPeerDiscovered {
-                        ip: v4,
-                        tcp_port: peer_tcp,
-                    }).await;
+                    let _ = etx
+                        .send(DownloadEvent::EmberPeerDiscovered {
+                            ip: v4,
+                            tcp_port: peer_tcp,
+                        })
+                        .await;
                 }
             }
         }
@@ -4439,9 +4652,13 @@ async fn download_parts_from_source(
     if hello_caps.is_ember && peer_is_friend {
         info!("Sending friend request to Ember source {}", _src_idx);
         let nick_bytes = our_nickname.as_bytes();
-        let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, nick_bytes).await;
+        let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, nick_bytes)
+            .await;
     } else if peer_is_friend {
-        info!("Source {} is a friend but is_ember=false, skipping friend request", _src_idx);
+        info!(
+            "Source {} is a friend but is_ember=false, skipping friend request",
+            _src_idx
+        );
     }
     // FriendSeen emit is deferred to the PoP-success sites in the
     // file-status-wait loop and the runtime loop. Without PoP a peer
@@ -4483,8 +4700,12 @@ async fn download_parts_from_source(
         let sm = sm.read().await;
         if let Ok(v4) = source.peer_ip.parse::<Ipv4Addr>() {
             sm.can_request_sources_for(file_hash, v4, source.peer_port)
-        } else { true }
-    } else { true };
+        } else {
+            true
+        }
+    } else {
+        true
+    };
 
     if peer_supports_file_ident || peer_supports_ext_multipacket || peer_supports_multipacket {
         // eMule-style multipacket file request.
@@ -4542,9 +4763,16 @@ async fn download_parts_from_source(
             }
         }
     } else {
-        write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_REQUESTFILENAME, &req_file_name_payload).await?;
+        write_packet_async_ms(
+            &mut *writer,
+            OP_EDONKEYHEADER,
+            OP_REQUESTFILENAME,
+            &req_file_name_payload,
+        )
+        .await?;
         if !single_part {
-            write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_SETREQFILEID, &file_req).await?;
+            write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_SETREQFILEID, &file_req)
+                .await?;
         }
     }
 
@@ -4569,7 +4797,10 @@ async fn download_parts_from_source(
         }
         if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
             early_upload_accept = true;
-            debug!("Received early AcceptUploadReq during file-status wait from source {}", _src_idx);
+            debug!(
+                "Received early AcceptUploadReq during file-status wait from source {}",
+                _src_idx
+            );
             continue;
         }
         if proto == OP_EMULEPROT && (opcode == OP_EMULEINFOANSWER || opcode == OP_EMULEINFO) {
@@ -4590,16 +4821,35 @@ async fn download_parts_from_source(
                 if let Some(sm) = &source_mgr {
                     let mut sm = sm.write().await;
                     if let std::net::IpAddr::V4(v4) = addr.ip() {
-                        sm.register_source_full(*file_hash, v4, addr.port(), peer_udp, peer_user_hash);
+                        sm.register_source_full(
+                            *file_hash,
+                            v4,
+                            addr.port(),
+                            peer_udp,
+                            peer_user_hash,
+                        );
                     }
                 }
             }
             if opcode == OP_EMULEINFO {
-                let emule_answer = build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
-                let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_answer).await;
-                debug!("Received peer OP_EMULEINFO from source {} during file-status wait, replied", _src_idx);
+                let emule_answer =
+                    build_emule_info(udp_port, obfuscation_enabled, Some(&ember_hash), None);
+                let _ = write_packet_async_ms(
+                    &mut *writer,
+                    OP_EMULEPROT,
+                    OP_EMULEINFOANSWER,
+                    &emule_answer,
+                )
+                .await;
+                debug!(
+                    "Received peer OP_EMULEINFO from source {} during file-status wait, replied",
+                    _src_idx
+                );
             } else {
-                debug!("Ignoring delayed EmuleInfoAnswer from source {} during file-status wait", _src_idx);
+                debug!(
+                    "Ignoring delayed EmuleInfoAnswer from source {} during file-status wait",
+                    _src_idx
+                );
             }
             continue;
         }
@@ -4626,7 +4876,8 @@ async fn download_parts_from_source(
                     peer_user_hash,
                     peer_secure_ident_level,
                     our_client_id,
-                ).await?;
+                )
+                .await?;
                 debug!(
                     "Replayed deferred SecIdent response to source {} during file-status wait",
                     _src_idx
@@ -4639,13 +4890,15 @@ async fn download_parts_from_source(
                     peer_user_hash,
                     addr,
                     peer_secure_ident_level,
-                ).await?;
+                )
+                .await?;
             }
             continue;
         }
         if proto == OP_EMULEPROT && opcode == OP_SECIDENTSTATE && _payload.len() >= 5 {
             let state = _payload[0];
-            let challenge = u32::from_le_bytes([_payload[1], _payload[2], _payload[3], _payload[4]]);
+            let challenge =
+                u32::from_le_bytes([_payload[1], _payload[2], _payload[3], _payload[4]]);
             let missing_peer_key = if state >= 2 {
                 if let Some(cm) = &credit_mgr {
                     let cm = cm.read().await;
@@ -4668,7 +4921,8 @@ async fn download_parts_from_source(
                     peer_user_hash,
                     peer_secure_ident_level,
                     our_client_id,
-                ).await?;
+                )
+                .await?;
             }
             continue;
         }
@@ -4681,42 +4935,70 @@ async fn download_parts_from_source(
                 peer_secure_ident_level,
                 &_payload,
                 our_client_id,
-            ).await;
+            )
+            .await;
             continue;
         }
         if proto == OP_EMULEPROT && opcode == OP_FILEDESC && _payload.len() >= 5 {
             let rating = _payload[0];
-            let clen = u32::from_le_bytes([_payload[1], _payload[2], _payload[3], _payload[4]]) as usize;
-            if clen.checked_add(5).map_or(false, |need| _payload.len() >= need) {
-                let comment = String::from_utf8_lossy(&_payload[5..5+clen]).to_string();
+            let clen =
+                u32::from_le_bytes([_payload[1], _payload[2], _payload[3], _payload[4]]) as usize;
+            if clen
+                .checked_add(5)
+                .map_or(false, |need| _payload.len() >= need)
+            {
+                let comment = String::from_utf8_lossy(&_payload[5..5 + clen]).to_string();
                 if let Some(cm) = &comment_mgr {
                     let mut cm = cm.write().await;
-                    cm.add_peer_comment(&hex::encode(file_hash), addr.to_string(), rating, comment.clone(), 0);
+                    cm.add_peer_comment(
+                        &hex::encode(file_hash),
+                        addr.to_string(),
+                        rating,
+                        comment.clone(),
+                        0,
+                    );
                 }
                 debug!("Peer comment from source {} during file-status: rating={rating}, comment='{comment}'", _src_idx);
             }
             continue;
         }
         // Ember-only; gated on `hello_caps.is_ember` (see upload.rs).
-        if proto == OP_EMULEPROT && opcode == OP_EMBER_SOURCEEXCHANGE && hello_caps.is_ember && epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
+        if proto == OP_EMULEPROT
+            && opcode == OP_EMBER_SOURCEEXCHANGE
+            && hello_caps.is_ember
+            && epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION
+        {
             sx_overhead.record_download((6 + _payload.len()) as u64);
             epx_packets_received += 1;
-            info!("Received EPX from source {} during file-status-wait ({} bytes)", _src_idx, _payload.len());
+            info!(
+                "Received EPX from source {} during file-status-wait ({} bytes)",
+                _src_idx,
+                _payload.len()
+            );
             match crate::network::ember::parse_exchange_payload(&_payload) {
                 Ok(result) if !result.files.is_empty() || !result.peers.is_empty() => {
                     let (epx_entries, aich_roots) = super::transfer::epx_result_to_entries(&result);
-                    let epx_peers = result.peers.into_iter().map(|p| (p.ip, p.tcp_port)).collect();
+                    let epx_peers = result
+                        .peers
+                        .into_iter()
+                        .map(|p| (p.ip, p.tcp_port))
+                        .collect();
                     if let Some(ref etx) = event_tx {
-                        let _ = etx.send(DownloadEvent::EmberSources {
-                            transfer_id: transfer_id.clone(),
-                            entries: epx_entries,
-                            aich_roots,
-                            ember_peers: epx_peers,
-                        }).await;
+                        let _ = etx
+                            .send(DownloadEvent::EmberSources {
+                                transfer_id: transfer_id.clone(),
+                                entries: epx_entries,
+                                aich_roots,
+                                ember_peers: epx_peers,
+                            })
+                            .await;
                     }
                 }
                 Ok(_) => {}
-                Err(e) => debug!("Failed to parse EPX from source {} during file-status-wait: {e}", _src_idx),
+                Err(e) => debug!(
+                    "Failed to parse EPX from source {} during file-status-wait: {e}",
+                    _src_idx
+                ),
             }
             continue;
         }
@@ -4728,13 +5010,15 @@ async fn download_parts_from_source(
                 // pubkey+hash pair).
                 let verified = ember_auth_verified;
                 info!("Received friend request from source {} during file-status-wait (nick='{}', verified={verified}, pop={}, binding={ember_hash_binding_verified})", _src_idx, nick, ember_auth_verified);
-                let _ = etx.send(DownloadEvent::EmberFriendRequest {
-                    ember_hash: eh,
-                    nickname: nick,
-                    peer_ip: addr.ip().to_string(),
-                    peer_port: addr.port(),
-                    verified,
-                }).await;
+                let _ = etx
+                    .send(DownloadEvent::EmberFriendRequest {
+                        ember_hash: eh,
+                        nickname: nick,
+                        peer_ip: addr.ip().to_string(),
+                        peer_port: addr.port(),
+                        verified,
+                    })
+                    .await;
             }
             continue;
         }
@@ -4748,14 +5032,12 @@ async fn download_parts_from_source(
             if let Some(ident) = parse_ember_hello(&_payload) {
                 hello_caps.is_ember = true;
                 let identity_changed = ember_auth_verified
-                    && (
-                        (ident.ed25519_pubkey.is_some()
-                            && hello_caps.ember_pubkey.is_some()
-                            && ident.ed25519_pubkey != hello_caps.ember_pubkey)
+                    && ((ident.ed25519_pubkey.is_some()
+                        && hello_caps.ember_pubkey.is_some()
+                        && ident.ed25519_pubkey != hello_caps.ember_pubkey)
                         || (ident.ember_hash != [0u8; 16]
                             && hello_caps.ember_hash.is_some()
-                            && Some(ident.ember_hash) != hello_caps.ember_hash)
-                    );
+                            && Some(ident.ember_hash) != hello_caps.ember_hash));
                 if identity_changed {
                     tracing::warn!(
                         "Ember identity-swap rejected from source {} at {} (file-status-wait): peer already PoP-verified",
@@ -4785,16 +5067,27 @@ async fn download_parts_from_source(
                     // Same rationale as the other two Ember-hello sites
                     // in this file: always advertise our pubkey so the
                     // peer can verify our identity binding.
-                    let payload = build_ember_hello(&ember_hash, &our_nickname, Some(&ed25519_public_key));
-                    let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &payload).await;
+                    let payload =
+                        build_ember_hello(&ember_hash, &our_nickname, Some(&ed25519_public_key));
+                    let _ = write_packet_async_ms(
+                        &mut *writer,
+                        OP_EMULEPROT,
+                        OP_EMBER_HELLOANSWER,
+                        &payload,
+                    )
+                    .await;
                     sent_ember_hello = true;
                 }
 
                 // Binding + optional full PoP (mirrors the pre-control
                 // site — see the long comment there for the rationale).
                 if !ember_hash_binding_verified {
-                    if let (Some(ref peer_pk), Some(ref peer_eh)) = (hello_caps.ember_pubkey, hello_caps.ember_hash) {
-                        if crate::network::ember::crypto::verify_ember_hash_binding(peer_pk, peer_eh) {
+                    if let (Some(ref peer_pk), Some(ref peer_eh)) =
+                        (hello_caps.ember_pubkey, hello_caps.ember_hash)
+                    {
+                        if crate::network::ember::crypto::verify_ember_hash_binding(
+                            peer_pk, peer_eh,
+                        ) {
                             ember_hash_binding_verified = true;
                             info!("Ember binding: source {} at {} pubkey BLAKE3-binds (file-status-wait)", _src_idx, addr);
                         } else {
@@ -4806,7 +5099,9 @@ async fn download_parts_from_source(
                     }
                 }
                 if !ember_auth_verified && ember_hash_binding_verified {
-                    if let (Some(peer_pk), Some(peer_eh)) = (hello_caps.ember_pubkey, hello_caps.ember_hash) {
+                    if let (Some(peer_pk), Some(peer_eh)) =
+                        (hello_caps.ember_pubkey, hello_caps.ember_hash)
+                    {
                         match super::friend_connect::perform_ember_auth_buffered(
                             &mut *reader,
                             &mut *writer,
@@ -4816,7 +5111,9 @@ async fn download_parts_from_source(
                             Some(&peer_eh),
                             addr,
                             &mut auth_deferred,
-                        ).await {
+                        )
+                        .await
+                        {
                             Ok(()) => {
                                 ember_auth_verified = true;
                                 info!(
@@ -4824,13 +5121,17 @@ async fn download_parts_from_source(
                                     _src_idx, addr, auth_deferred.len()
                                 );
                                 if !friend_seen_emitted {
-                                    if let (true, Some(eh)) = (peer_is_friend, hello_caps.ember_hash) {
+                                    if let (true, Some(eh)) =
+                                        (peer_is_friend, hello_caps.ember_hash)
+                                    {
                                         if let Some(ref etx) = event_tx {
-                                            let _ = etx.send(DownloadEvent::FriendSeen {
-                                                ember_hash: eh,
-                                                ip: addr.ip(),
-                                                port: addr.port(),
-                                            }).await;
+                                            let _ = etx
+                                                .send(DownloadEvent::FriendSeen {
+                                                    ember_hash: eh,
+                                                    ip: addr.ip(),
+                                                    port: addr.port(),
+                                                })
+                                                .await;
                                             friend_seen_emitted = true;
                                         }
                                     }
@@ -4908,7 +5209,12 @@ async fn download_parts_from_source(
                         );
                     }
                 } else {
-                    debug!("Source {} file status: {}/{} parts available", _src_idx, parts_vec.iter().filter(|&&p| p).count(), parts_vec.len());
+                    debug!(
+                        "Source {} file status: {}/{} parts available",
+                        _src_idx,
+                        parts_vec.iter().filter(|&&p| p).count(),
+                        parts_vec.len()
+                    );
                     let mut padded = parts_vec;
                     if padded.len() < part_count {
                         padded.resize(part_count, false);
@@ -4929,7 +5235,11 @@ async fn download_parts_from_source(
                     aich_hash: None,
                 };
                 if mp.file_hash != *file_hash
-                    || mp.file_identifier.as_ref().map(|id| !local_ident.compare_relaxed(id)).unwrap_or(false)
+                    || mp
+                        .file_identifier
+                        .as_ref()
+                        .map(|id| !local_ident.compare_relaxed(id))
+                        .unwrap_or(false)
                 {
                     continue;
                 }
@@ -4960,7 +5270,12 @@ async fn download_parts_from_source(
                             );
                         }
                     } else {
-                        debug!("Source {} multipacket file status: {}/{} parts available", _src_idx, parts_vec.iter().filter(|&&p| p).count(), parts_vec.len());
+                        debug!(
+                            "Source {} multipacket file status: {}/{} parts available",
+                            _src_idx,
+                            parts_vec.iter().filter(|&&p| p).count(),
+                            parts_vec.len()
+                        );
                         let mut padded = parts_vec;
                         if padded.len() < part_count {
                             padded.resize(part_count, false);
@@ -4988,7 +5303,10 @@ async fn download_parts_from_source(
         }
     }
     if !got_status && (got_filename || early_upload_accept) {
-        debug!("Source {} proceeding without FileStatus (filename-only handshake fallback)", _src_idx);
+        debug!(
+            "Source {} proceeding without FileStatus (filename-only handshake fallback)",
+            _src_idx
+        );
         got_status = true;
     }
     if !got_status {
@@ -5033,12 +5351,7 @@ async fn download_parts_from_source(
     // again 600 ms later — burning a retry-round slot and the
     // handshake cost for nothing.
     let peer_known_missing = |p: usize| -> bool {
-        peer_confirmed_missing_part(
-            &peers_missing_parts,
-            &source.peer_ip,
-            source.peer_port,
-            p,
-        )
+        peer_confirmed_missing_part(&peers_missing_parts, &source.peer_ip, source.peer_port, p)
     };
     let mut filtered_parts: Vec<usize> = parts
         .iter()
@@ -5076,10 +5389,25 @@ async fn download_parts_from_source(
                 }
                 let pp = control.is_preview_priority();
                 let prefer_higher = remaining <= 3 && pc > 1;
-                let active: Vec<usize> = in_prog.iter().enumerate()
-                    .filter(|(_, &ip)| ip).map(|(i, _)| i).collect();
-                if let Some(p) = cs.select_part(&completed, &in_prog, &avail, &active, &gap_bytes, pp, prefer_higher) {
-                    debug!("Source {} pre-assigned parts unavailable, dynamically selected part {}", _src_idx, p);
+                let active: Vec<usize> = in_prog
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &ip)| ip)
+                    .map(|(i, _)| i)
+                    .collect();
+                if let Some(p) = cs.select_part(
+                    &completed,
+                    &in_prog,
+                    &avail,
+                    &active,
+                    &gap_bytes,
+                    pp,
+                    prefer_higher,
+                ) {
+                    debug!(
+                        "Source {} pre-assigned parts unavailable, dynamically selected part {}",
+                        _src_idx, p
+                    );
                     drop(cs);
                     let mut t = tracker.write().await;
                     t.set_in_progress(p, true);
@@ -5136,13 +5464,8 @@ async fn download_parts_from_source(
                 .await?;
             } else {
                 let hashset_req = build_hashset_request(file_hash);
-                write_packet_async_ms(
-                    &mut *writer,
-                    OP_EDONKEYHEADER,
-                    OP_HASHSETREQ,
-                    &hashset_req,
-                )
-                .await?;
+                write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_HASHSETREQ, &hashset_req)
+                    .await?;
             }
             // Read up to 5 packets waiting for the hashset answer.
             // The peer may interleave SecIdent or other control packets.
@@ -5155,14 +5478,21 @@ async fn download_parts_from_source(
                         if proto == OP_EDONKEYHEADER && opcode == OP_HASHSETANSWER =>
                     {
                         if let Ok((_h, hashes)) = parse_hashset_answer(&payload) {
-                            debug!("Got hashset with {} part hashes from source {}", hashes.len(), _src_idx);
+                            debug!(
+                                "Got hashset with {} part hashes from source {}",
+                                hashes.len(),
+                                _src_idx
+                            );
                             if super::transfer::verify_hashset(&file_hash, &hashes, file_size) {
                                 let mut ph = shared_part_hashes.write().await;
                                 if ph.is_empty() {
                                     *ph = hashes;
                                 }
                             } else {
-                                warn!("Hashset from source {} failed verification, discarding", _src_idx);
+                                warn!(
+                                    "Hashset from source {} failed verification, discarding",
+                                    _src_idx
+                                );
                             }
                         }
                         break;
@@ -5235,7 +5565,10 @@ async fn download_parts_from_source(
                         debug!("Source {} waiting for hashset, got proto=0x{proto:02X} op=0x{opcode:02X} — skipping", _src_idx);
                     }
                     Err(_) => {
-                        debug!("No hashset answer from source {} (peer may not support it)", _src_idx);
+                        debug!(
+                            "No hashset answer from source {} (peer may not support it)",
+                            _src_idx
+                        );
                         break;
                     }
                 }
@@ -5248,19 +5581,25 @@ async fn download_parts_from_source(
         let sm = sm.read().await;
         if let Ok(v4) = source.peer_ip.parse::<Ipv4Addr>() {
             sm.can_request_sources_for(file_hash, v4, source.peer_port)
-        } else { true }
-    } else { true };
+        } else {
+            true
+        }
+    } else {
+        true
+    };
     if sx_allowed {
         if peer_supports_source_ex2 {
             let mut sx2_req = Vec::with_capacity(19);
             sx2_req.push(SOURCEEXCHANGE2_VERSION);
             sx2_req.extend_from_slice(&0u16.to_le_bytes());
             sx2_req.extend_from_slice(file_hash);
-            let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_REQUESTSOURCES2, &sx2_req).await;
+            let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_REQUESTSOURCES2, &sx2_req)
+                .await;
             sx_overhead.record_upload((6 + sx2_req.len()) as u64);
         } else {
             let sx_req = build_file_request(file_hash);
-            let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_REQUESTSOURCES, &sx_req).await;
+            let _ =
+                write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_REQUESTSOURCES, &sx_req).await;
             sx_overhead.record_upload((6 + sx_req.len()) as u64);
         }
         if let Some(sm) = &source_mgr {
@@ -5283,8 +5622,14 @@ async fn download_parts_from_source(
         }
     }
 
-    let mut queued_guard = CountGuard { counter: queued_count.clone(), armed: false };
-    let mut _active_guard = CountGuard { counter: active_count.clone(), armed: false };
+    let mut queued_guard = CountGuard {
+        counter: queued_count.clone(),
+        armed: false,
+    };
+    let mut _active_guard = CountGuard {
+        counter: active_count.clone(),
+        armed: false,
+    };
 
     if early_upload_accept {
         active_count.fetch_add(1, Ordering::Relaxed);
@@ -5297,7 +5642,13 @@ async fn download_parts_from_source(
     } else {
         // Request upload slot
         let upload_req = build_file_request(file_hash);
-        write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_STARTUPLOADREQ, &upload_req).await?;
+        write_packet_async_ms(
+            &mut *writer,
+            OP_EDONKEYHEADER,
+            OP_STARTUPLOADREQ,
+            &upload_req,
+        )
+        .await?;
 
         queued_count.fetch_add(1, Ordering::Relaxed);
         queued_guard.armed = true;
@@ -5370,7 +5721,10 @@ async fn download_parts_from_source(
                 queued_count.fetch_sub(1, Ordering::Relaxed);
                 active_count.fetch_add(1, Ordering::Relaxed);
                 _active_guard.armed = true;
-                info!("Source {} ({}) accepted upload request — entering transfer (obfuscated={})", _src_idx, addr, connection_is_obfuscated);
+                info!(
+                    "Source {} ({}) accepted upload request — entering transfer (obfuscated={})",
+                    _src_idx, addr, connection_is_obfuscated
+                );
                 // Don't claim "transferring" yet: the peer granted a slot but
                 // hasn't sent a byte. Some uploaders (overloaded / anti-leech)
                 // accept then send nothing and FIN. Show "stalled" until the
@@ -5396,12 +5750,22 @@ async fn download_parts_from_source(
                 emit_source!("queued", Some(rank), 0u64);
             } else if proto == OP_EMULEPROT && opcode == OP_FILEDESC && payload.len() >= 5 {
                 let rating = payload[0];
-                let clen = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
-                if clen.checked_add(5).map_or(false, |need| payload.len() >= need) {
-                    let comment = String::from_utf8_lossy(&payload[5..5+clen]).to_string();
+                let clen =
+                    u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
+                if clen
+                    .checked_add(5)
+                    .map_or(false, |need| payload.len() >= need)
+                {
+                    let comment = String::from_utf8_lossy(&payload[5..5 + clen]).to_string();
                     if let Some(cm) = &comment_mgr {
                         let mut cm = cm.write().await;
-                        cm.add_peer_comment(&hex::encode(file_hash), addr.to_string(), rating, comment.clone(), 0);
+                        cm.add_peer_comment(
+                            &hex::encode(file_hash),
+                            addr.to_string(),
+                            rating,
+                            comment.clone(),
+                            0,
+                        );
                     }
                     debug!("Peer comment from source {} while queued: rating={rating}, comment='{comment}'", _src_idx);
                 }
@@ -5486,121 +5850,131 @@ async fn download_parts_from_source(
     // Hello/SecIdent/obfuscation reconnect cost on every part-rotation
     // cycle from the same peer.
     'session_loop: loop {
-    while queue_idx < part_queue.len() {
-        check_control(&control).await?;
-        let part_idx = part_queue[queue_idx];
-        queue_idx += 1;
-        if peer_out_of_parts {
-            break;
-        }
+        while queue_idx < part_queue.len() {
+            check_control(&control).await?;
+            let part_idx = part_queue[queue_idx];
+            queue_idx += 1;
+            if peer_out_of_parts {
+                break;
+            }
 
-        // Race-check: another source may have completed this part
-        // while we were on the previous one. Cheap read-lock check.
-        //
-        // Note that this branch is also hit when an *injected* source
-        // (late-arriving from KAD/server source discovery) connects
-        // after the only part originally assigned to it has already
-        // been completed by an earlier-dialing peer. Without the
-        // dynamic-extend below, the source would exit the per-part
-        // loop immediately with `src_transferred=0`, wasting the
-        // whole TCP + Hello + EmuleInfo + SecIdent + obfuscation
-        // handshake round-trip. The extend pulls a fresh in-progress
-        // part from the chunk selector so the source gets real work
-        // to do on the session we already paid to open.
-        {
-            let t = tracker.read().await;
-            if t.is_part_complete(part_idx) {
-                // Drop any stale pipelined state for this part (we'd
-                // pipelined it but no longer need to) and move on.
-                if pipelined_next.as_ref().map(|p| p.part_idx) == Some(part_idx) {
-                    pipelined_next = None;
-                }
-                drop(t);
+            // Race-check: another source may have completed this part
+            // while we were on the previous one. Cheap read-lock check.
+            //
+            // Note that this branch is also hit when an *injected* source
+            // (late-arriving from KAD/server source discovery) connects
+            // after the only part originally assigned to it has already
+            // been completed by an earlier-dialing peer. Without the
+            // dynamic-extend below, the source would exit the per-part
+            // loop immediately with `src_transferred=0`, wasting the
+            // whole TCP + Hello + EmuleInfo + SecIdent + obfuscation
+            // handshake round-trip. The extend pulls a fresh in-progress
+            // part from the chunk selector so the source gets real work
+            // to do on the session we already paid to open.
+            {
+                let t = tracker.read().await;
+                if t.is_part_complete(part_idx) {
+                    // Drop any stale pipelined state for this part (we'd
+                    // pipelined it but no longer need to) and move on.
+                    if pipelined_next.as_ref().map(|p| p.part_idx) == Some(part_idx) {
+                        pipelined_next = None;
+                    }
+                    drop(t);
 
-                // Dynamic-extend attempt. Mirrors the end-of-iteration
-                // block further down, but fires when the current part
-                // was already complete before we could start work on
-                // it — without it, sources with a stale initial queue
-                // (typical for KAD-injected late arrivals) never reach
-                // the end-of-iteration extend point. Capped by
-                // `MAX_CONSECUTIVE_STALE_SKIPS` to prevent a live-lock
-                // if `select_part` keeps handing us parts that race
-                // to completion before we can claim them.
-                if queue_idx >= part_queue.len()
-                    && consecutive_stale_skips < MAX_CONSECUTIVE_STALE_SKIPS
-                {
-                    if let Some(cs) = &chunk_sel {
-                        let cs = cs.read().await;
-                        let t = tracker.read().await;
-                        let completed = t.completed_parts().to_vec();
-                        let in_prog = t.in_progress.clone();
-                        let remaining = t.remaining_count();
-                        let part_count = t.part_count;
-                        let gap_bytes = t.part_gap_bytes_vec();
-                        drop(t);
-                        if remaining > 0 {
-                            let avail = if source_available.is_empty() {
-                                vec![true; part_count]
-                            } else {
-                                source_available.clone()
-                            };
-                            let pp = control.is_preview_priority();
-                            let prefer_higher = remaining <= 3 && part_count > 1;
-                            let active: Vec<usize> = in_prog.iter().enumerate()
-                                .filter(|(_, &ip)| ip).map(|(i, _)| i).collect();
-                            let next_part = cs
-                                .select_part(&completed, &in_prog, &avail, &active, &gap_bytes, pp, prefer_higher)
-                                .or_else(|| {
-                                    let no_in_progress = vec![false; part_count];
-                                    cs.select_part(
+                    // Dynamic-extend attempt. Mirrors the end-of-iteration
+                    // block further down, but fires when the current part
+                    // was already complete before we could start work on
+                    // it — without it, sources with a stale initial queue
+                    // (typical for KAD-injected late arrivals) never reach
+                    // the end-of-iteration extend point. Capped by
+                    // `MAX_CONSECUTIVE_STALE_SKIPS` to prevent a live-lock
+                    // if `select_part` keeps handing us parts that race
+                    // to completion before we can claim them.
+                    if queue_idx >= part_queue.len()
+                        && consecutive_stale_skips < MAX_CONSECUTIVE_STALE_SKIPS
+                    {
+                        if let Some(cs) = &chunk_sel {
+                            let cs = cs.read().await;
+                            let t = tracker.read().await;
+                            let completed = t.completed_parts().to_vec();
+                            let in_prog = t.in_progress.clone();
+                            let remaining = t.remaining_count();
+                            let part_count = t.part_count;
+                            let gap_bytes = t.part_gap_bytes_vec();
+                            drop(t);
+                            if remaining > 0 {
+                                let avail = if source_available.is_empty() {
+                                    vec![true; part_count]
+                                } else {
+                                    source_available.clone()
+                                };
+                                let pp = control.is_preview_priority();
+                                let prefer_higher = remaining <= 3 && part_count > 1;
+                                let active: Vec<usize> = in_prog
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, &ip)| ip)
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                let next_part = cs
+                                    .select_part(
                                         &completed,
-                                        &no_in_progress,
+                                        &in_prog,
                                         &avail,
                                         &active,
                                         &gap_bytes,
                                         pp,
                                         prefer_higher,
                                     )
-                                });
-                            if let Some(next) = next_part {
-                                if !part_queue.contains(&next) {
-                                    part_queue.push(next);
-                                    let mut t = tracker.write().await;
-                                    t.set_in_progress(next, true);
-                                    drop(t);
-                                    ip_guard.mark(next);
-                                    consecutive_stale_skips += 1;
-                                    info!(
+                                    .or_else(|| {
+                                        let no_in_progress = vec![false; part_count];
+                                        cs.select_part(
+                                            &completed,
+                                            &no_in_progress,
+                                            &avail,
+                                            &active,
+                                            &gap_bytes,
+                                            pp,
+                                            prefer_higher,
+                                        )
+                                    });
+                                if let Some(next) = next_part {
+                                    if !part_queue.contains(&next) {
+                                        part_queue.push(next);
+                                        let mut t = tracker.write().await;
+                                        t.set_in_progress(next, true);
+                                        drop(t);
+                                        ip_guard.mark(next);
+                                        consecutive_stale_skips += 1;
+                                        info!(
                                         "DIAG: source {} ({}) stale-queue extend: part {} was already complete, pulled fresh part {} (skip-cycle {}/{})",
                                         _src_idx, addr, part_idx, next,
                                         consecutive_stale_skips, MAX_CONSECUTIVE_STALE_SKIPS,
                                     );
+                                    }
                                 }
                             }
                         }
                     }
+                    continue;
                 }
-                continue;
             }
-        }
 
-        // About to do real work on this part — any prior stale-skip
-        // streak is over; reset the counter so a later skip streak on
-        // this source gets its own fresh budget.
-        consecutive_stale_skips = 0;
+            // About to do real work on this part — any prior stale-skip
+            // streak is over; reset the counter so a later skip streak on
+            // this source gets its own fresh budget.
+            consecutive_stale_skips = 0;
 
-        let mut aich_recovery_data: Option<([u8; 20], Vec<u8>)> = None;
-        let mut pending_compressed: HashMap<u64, PendingCompressedBlock> = HashMap::new();
+            let mut aich_recovery_data: Option<([u8; 20], Vec<u8>)> = None;
+            let mut pending_compressed: HashMap<u64, PendingCompressedBlock> = HashMap::new();
 
-        // Either resume from a pre-pipelined state (the previous
-        // iteration's send-ahead already shipped the first batch
-        // for this part) or compute fresh.
-        let pipelined_for_this = pipelined_next
-            .take()
-            .filter(|p| p.part_idx == part_idx);
-        let resumed = pipelined_for_this.is_some();
-        let (all_blocks, batches, mut sent_idx, needs_i64) =
-            if let Some(p) = pipelined_for_this {
+            // Either resume from a pre-pipelined state (the previous
+            // iteration's send-ahead already shipped the first batch
+            // for this part) or compute fresh.
+            let pipelined_for_this = pipelined_next.take().filter(|p| p.part_idx == part_idx);
+            let resumed = pipelined_for_this.is_some();
+            let (all_blocks, batches, mut sent_idx, needs_i64) = if let Some(p) = pipelined_for_this
+            {
                 (p.all_blocks, p.batches, p.sent_idx, p.needs_i64)
             } else {
                 let (all_blocks, _ps, _pe) = compute_part_blocks_ms(&tracker, part_idx).await;
@@ -5613,622 +5987,697 @@ async fn download_parts_from_source(
                 (all_blocks, batches, 0, needs_i64)
             };
 
-        // Mark in_progress (idempotent — pipelined state already did this,
-        // and the same flag may be set by another source piling on for
-        // MAX_SOURCES_PER_PART-style behaviour).
-        {
-            let mut t = tracker.write().await;
-            t.set_in_progress(part_idx, true);
-        }
-        ip_guard.mark(part_idx);
+            // Mark in_progress (idempotent — pipelined state already did this,
+            // and the same flag may be set by another source piling on for
+            // MAX_SOURCES_PER_PART-style behaviour).
+            {
+                let mut t = tracker.write().await;
+                t.set_in_progress(part_idx, true);
+            }
+            ip_guard.mark(part_idx);
 
-        let (remaining, gap_rem) = {
-            let t = tracker.read().await;
-            (t.remaining_count(), t.remaining_gap_bytes())
-        };
-        let max_outstanding =
-            outstanding_requests_for_speed_ms(measured_speed, remaining, gap_rem);
+            let (remaining, gap_rem) = {
+                let t = tracker.read().await;
+                (t.remaining_count(), t.remaining_gap_bytes())
+            };
+            let max_outstanding =
+                outstanding_requests_for_speed_ms(measured_speed, remaining, gap_rem);
 
-        if all_blocks.is_empty() {
-            debug!("Source {} part {} has no gaps — skipping", _src_idx, part_idx);
-        } else if resumed {
-            info!(
+            if all_blocks.is_empty() {
+                debug!(
+                    "Source {} part {} has no gaps — skipping",
+                    _src_idx, part_idx
+                );
+            } else if resumed {
+                info!(
                 "Source {} ({}) resuming pipelined part {}: {} batches sent ahead, {} more queued",
                 _src_idx, addr, part_idx, sent_idx, batches.len() - sent_idx,
             );
-        } else {
-            info!("Source {} ({}) requesting part {}: {} blocks, {} batches, {} bytes (i64={})",
-                _src_idx, addr, part_idx, all_blocks.len(), batches.len(),
-                all_blocks.iter().map(|(s, e)| e - s).sum::<u64>(),
-                needs_i64);
-        }
-
-        // Send initial batches up to max_outstanding. When `resumed=true`
-        // some batches have already been sent via the previous
-        // iteration's pipeline; `sent_idx` reflects that, so we pick up
-        // exactly where the pipeline left off without re-sending or
-        // missing any batch.
-        //
-        // Match eMule behaviour: only use OP_REQUESTPARTS_I64 when an
-        // offset actually exceeds 32-bit range.  Many peers on the
-        // network (eMule mods) do not implement the I64 handler and
-        // silently drop the request, causing "accepted but no data"
-        // timeouts.
-        while sent_idx < batches.len() && sent_idx < max_outstanding {
-            let batch = &batches[sent_idx];
-            let (req_payload, req_proto, req_op) = if needs_i64 {
-                (build_request_parts_i64(file_hash, batch), OP_EMULEPROT, OP_REQUESTPARTS_I64)
             } else {
-                (build_request_parts(file_hash, batch), OP_EDONKEYHEADER, OP_REQUESTPARTS)
-            };
-            if sent_idx == 0 && !resumed {
-                info!("Source {} ({}) sending OP_REQUESTPARTS: proto=0x{:02X} op=0x{:02X} len={} payload_hex={}",
-                    _src_idx, addr, req_proto, req_op, req_payload.len(), hex::encode(&req_payload));
+                info!(
+                    "Source {} ({}) requesting part {}: {} blocks, {} batches, {} bytes (i64={})",
+                    _src_idx,
+                    addr,
+                    part_idx,
+                    all_blocks.len(),
+                    batches.len(),
+                    all_blocks.iter().map(|(s, e)| e - s).sum::<u64>(),
+                    needs_i64
+                );
             }
-            write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await?;
-            sent_idx += 1;
-        }
 
-        let mut blocks_received_in_current_req: usize = 0;
-        let mut completed_reqs: usize = 0;
-        // Sticky "no next part to pipeline" flag for the current part.
-        //
-        // The cross-part pipeline trigger below fires every time a
-        // request-batch's worth of blocks arrives AND `sent_idx` has
-        // reached `batches.len()` (all batches for this part are in
-        // flight) AND nothing is pipelined yet. On the *last* queued
-        // part (or whenever `pre_pipeline_next_part_ms` returns None
-        // because every other part is in-progress on another source
-        // / already complete), the trigger has no work to do — but it
-        // re-fires every ~50-200 ms for the entire tail of the part
-        // (10+ s near end-of-download), spamming `info!` and
-        // re-acquiring the tracker / chunk-selector / control locks
-        // for nothing. See terminals/31.txt: ~600 lines/s of
-        // "no eligible next part found" diag during the final part.
-        //
-        // Once we determine "no next part is available right now",
-        // there's no event inside this per-part loop that would make
-        // a new part appear (peers don't push new queue entries; the
-        // queue is owned by the outer caller). Setting this flag the
-        // first time the search comes back empty turns the trigger
-        // into a no-op for the remainder of this part. The flag is
-        // declared in the same scope as `completed_reqs` so it
-        // resets to `false` for every new part the source picks up.
-        let mut pipeline_giveup_for_part: bool = false;
-        let mut consecutive_bad_blocks: u32 = 0;
-        const MAX_CONSECUTIVE_BAD_BLOCKS: u32 = 5;
-        let mut data_loop_start = std::time::Instant::now();
-        let mut got_any_data = false;
-        // Trickle-source rotation: timestamp since which this source has been
-        // continuously below `TRICKLE_SLOW_FLOOR_BPS`. Cleared whenever it
-        // recovers. See the rotation check at the top of the receive loop.
-        let mut slow_since: Option<std::time::Instant> = None;
-        // eMule uses DOWNLOADTIMEOUT (100s) as a single timeout for both initial
-        // and mid-transfer stalls.  We use 60s for the initial wait as a
-        // compromise: gives slow uploaders (disk I/O, throttling, busy queue)
-        // enough time to start sending while still cutting off truly dead peers
-        // faster than eMule's full 100s.
-        const INITIAL_DATA_TIMEOUT_SECS: u64 = 60;
-        // When a peer grants the upload slot but then sends no data, eMule
-        // keeps the connection and re-issues its block requests
-        // (SendBlockRequests) rather than abandoning the slot — the uploader
-        // has often re-queued us internally and will start sending shortly.
-        // We mirror that: re-assert the outstanding part request up to
-        // `MAX_NO_DATA_REASSERTS` times, extending patience toward the
-        // configured queue-wait budget, before finally disconnecting.
-        let mut no_data_reasserts: u32 = 0;
-        const MAX_NO_DATA_REASSERTS: u32 = 5;
-        let mut last_epx_resend = std::time::Instant::now();
-        // Use the generation we sent at handshake time as the resend
-        // baseline so any rebuild that happened during file-status / queue
-        // wait gets re-sent on the first periodic check. Falls back to
-        // current generation when we never sent an initial EPX (peer is
-        // not Ember, or our payload was empty at the time).
-        let mut last_epx_generation = initial_epx_sent_generation
-            .unwrap_or_else(|| ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed));
-        const EPX_RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+            // Send initial batches up to max_outstanding. When `resumed=true`
+            // some batches have already been sent via the previous
+            // iteration's pipeline; `sent_idx` reflects that, so we pick up
+            // exactly where the pipeline left off without re-sending or
+            // missing any batch.
+            //
+            // Match eMule behaviour: only use OP_REQUESTPARTS_I64 when an
+            // offset actually exceeds 32-bit range.  Many peers on the
+            // network (eMule mods) do not implement the I64 handler and
+            // silently drop the request, causing "accepted but no data"
+            // timeouts.
+            while sent_idx < batches.len() && sent_idx < max_outstanding {
+                let batch = &batches[sent_idx];
+                let (req_payload, req_proto, req_op) = if needs_i64 {
+                    (
+                        build_request_parts_i64(file_hash, batch),
+                        OP_EMULEPROT,
+                        OP_REQUESTPARTS_I64,
+                    )
+                } else {
+                    (
+                        build_request_parts(file_hash, batch),
+                        OP_EDONKEYHEADER,
+                        OP_REQUESTPARTS,
+                    )
+                };
+                if sent_idx == 0 && !resumed {
+                    info!("Source {} ({}) sending OP_REQUESTPARTS: proto=0x{:02X} op=0x{:02X} len={} payload_hex={}",
+                    _src_idx, addr, req_proto, req_op, req_payload.len(), hex::encode(&req_payload));
+                }
+                write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await?;
+                sent_idx += 1;
+            }
 
-        // Receive loop. Exits when:
-        //   * `peer_out_of_parts` was signalled by the remote, OR
-        //   * the byte-level gap tracker reports `part_idx` complete
-        //     (which is the authoritative signal for "we have every
-        //     byte of this part on disk", regardless of whether the
-        //     bytes came from this source's blocks for `part_idx` or
-        //     from another source piling on for the same part, or
-        //     from this source's pipelined blocks for part N+1
-        //     overlapping nothing in part N).
-        //
-        // Was: `while total_received < total_sent_bytes` — broken under
-        // pipelining because pipelined N+1 bytes also arrive on this
-        // socket and would push `total_received` past
-        // `total_sent_bytes` (which only counts current-part bytes),
-        // exiting before the current part actually finishes.
-        let mut bytes_received_this_part: u64 = 0;
-        let mut chunks_received_this_part: u32 = 0;
-        let mut bytes_received_for_other_parts: u64 = 0;
-        let receive_loop_started = std::time::Instant::now();
-        // DIAG: snapshot the gap state for this part at entry so we can
-        // tell whether is_part_complete tripping mid-loop is "the only
-        // remaining gap got filled" vs "something is wrong with the
-        // tracker".
-        let part_entry_gap_bytes: u64 = {
-            let t = tracker.read().await;
-            let (ps, pe) = t.part_range(part_idx);
-            t.gap_list()
-                .iter()
-                .map(|&(gs, ge)| {
-                    let s = gs.max(ps);
-                    let e = ge.min(pe);
-                    if s < e { e - s } else { 0 }
-                })
-                .sum()
-        };
-        info!(
+            let mut blocks_received_in_current_req: usize = 0;
+            let mut completed_reqs: usize = 0;
+            // Sticky "no next part to pipeline" flag for the current part.
+            //
+            // The cross-part pipeline trigger below fires every time a
+            // request-batch's worth of blocks arrives AND `sent_idx` has
+            // reached `batches.len()` (all batches for this part are in
+            // flight) AND nothing is pipelined yet. On the *last* queued
+            // part (or whenever `pre_pipeline_next_part_ms` returns None
+            // because every other part is in-progress on another source
+            // / already complete), the trigger has no work to do — but it
+            // re-fires every ~50-200 ms for the entire tail of the part
+            // (10+ s near end-of-download), spamming `info!` and
+            // re-acquiring the tracker / chunk-selector / control locks
+            // for nothing. See terminals/31.txt: ~600 lines/s of
+            // "no eligible next part found" diag during the final part.
+            //
+            // Once we determine "no next part is available right now",
+            // there's no event inside this per-part loop that would make
+            // a new part appear (peers don't push new queue entries; the
+            // queue is owned by the outer caller). Setting this flag the
+            // first time the search comes back empty turns the trigger
+            // into a no-op for the remainder of this part. The flag is
+            // declared in the same scope as `completed_reqs` so it
+            // resets to `false` for every new part the source picks up.
+            let mut pipeline_giveup_for_part: bool = false;
+            let mut consecutive_bad_blocks: u32 = 0;
+            const MAX_CONSECUTIVE_BAD_BLOCKS: u32 = 5;
+            let mut data_loop_start = std::time::Instant::now();
+            let mut got_any_data = false;
+            // Trickle-source rotation: timestamp since which this source has been
+            // continuously below `TRICKLE_SLOW_FLOOR_BPS`. Cleared whenever it
+            // recovers. See the rotation check at the top of the receive loop.
+            let mut slow_since: Option<std::time::Instant> = None;
+            // eMule uses DOWNLOADTIMEOUT (100s) as a single timeout for both initial
+            // and mid-transfer stalls.  We use 60s for the initial wait as a
+            // compromise: gives slow uploaders (disk I/O, throttling, busy queue)
+            // enough time to start sending while still cutting off truly dead peers
+            // faster than eMule's full 100s.
+            const INITIAL_DATA_TIMEOUT_SECS: u64 = 60;
+            // When a peer grants the upload slot but then sends no data, eMule
+            // keeps the connection and re-issues its block requests
+            // (SendBlockRequests) rather than abandoning the slot — the uploader
+            // has often re-queued us internally and will start sending shortly.
+            // We mirror that: re-assert the outstanding part request up to
+            // `MAX_NO_DATA_REASSERTS` times, extending patience toward the
+            // configured queue-wait budget, before finally disconnecting.
+            let mut no_data_reasserts: u32 = 0;
+            const MAX_NO_DATA_REASSERTS: u32 = 5;
+            let mut last_epx_resend = std::time::Instant::now();
+            // Use the generation we sent at handshake time as the resend
+            // baseline so any rebuild that happened during file-status / queue
+            // wait gets re-sent on the first periodic check. Falls back to
+            // current generation when we never sent an initial EPX (peer is
+            // not Ember, or our payload was empty at the time).
+            let mut last_epx_generation = initial_epx_sent_generation.unwrap_or_else(|| {
+                ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed)
+            });
+            const EPX_RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+            // Receive loop. Exits when:
+            //   * `peer_out_of_parts` was signalled by the remote, OR
+            //   * the byte-level gap tracker reports `part_idx` complete
+            //     (which is the authoritative signal for "we have every
+            //     byte of this part on disk", regardless of whether the
+            //     bytes came from this source's blocks for `part_idx` or
+            //     from another source piling on for the same part, or
+            //     from this source's pipelined blocks for part N+1
+            //     overlapping nothing in part N).
+            //
+            // Was: `while total_received < total_sent_bytes` — broken under
+            // pipelining because pipelined N+1 bytes also arrive on this
+            // socket and would push `total_received` past
+            // `total_sent_bytes` (which only counts current-part bytes),
+            // exiting before the current part actually finishes.
+            let mut bytes_received_this_part: u64 = 0;
+            let mut chunks_received_this_part: u32 = 0;
+            let mut bytes_received_for_other_parts: u64 = 0;
+            let receive_loop_started = std::time::Instant::now();
+            // DIAG: snapshot the gap state for this part at entry so we can
+            // tell whether is_part_complete tripping mid-loop is "the only
+            // remaining gap got filled" vs "something is wrong with the
+            // tracker".
+            let part_entry_gap_bytes: u64 = {
+                let t = tracker.read().await;
+                let (ps, pe) = t.part_range(part_idx);
+                t.gap_list()
+                    .iter()
+                    .map(|&(gs, ge)| {
+                        let s = gs.max(ps);
+                        let e = ge.min(pe);
+                        if s < e {
+                            e - s
+                        } else {
+                            0
+                        }
+                    })
+                    .sum()
+            };
+            info!(
             "DIAG: source {} ({}) entering receive loop for part {} (resumed={}, sent_idx={}/{}, max_outstanding={}, gap_bytes_in_part={}, all_blocks_bytes={})",
             _src_idx, addr, part_idx, resumed, sent_idx, batches.len(),
             max_outstanding, part_entry_gap_bytes,
             all_blocks.iter().map(|(s, e)| e - s).sum::<u64>(),
         );
-        // Initialised here so the post-loop diagnostic always has a
-        // value even on the (rare) paths where the loop exits via `?`
-        // before any explicit `break` runs.
-        let mut exit_reason: &'static str = "loop_returned_err";
-        loop {
-            check_control(&control).await?;
-            if peer_out_of_parts {
-                exit_reason = "peer_out_of_parts";
-                break;
-            }
-            {
-                let t = tracker.read().await;
-                if t.is_part_complete(part_idx) {
-                    exit_reason = "is_part_complete";
+            // Initialised here so the post-loop diagnostic always has a
+            // value even on the (rare) paths where the loop exits via `?`
+            // before any explicit `break` runs.
+            let mut exit_reason: &'static str = "loop_returned_err";
+            loop {
+                check_control(&control).await?;
+                if peer_out_of_parts {
+                    exit_reason = "peer_out_of_parts";
                     break;
                 }
-            }
+                {
+                    let t = tracker.read().await;
+                    if t.is_part_complete(part_idx) {
+                        exit_reason = "is_part_complete";
+                        break;
+                    }
+                }
 
-            // Trickle-source rotation: a source that delivered data but has now
-            // sat below TRICKLE_SLOW_FLOOR_BPS for TRICKLE_SLOW_WINDOW is wasting
-            // a connection slot. Under genuine contention (this file at its
-            // per-file budget, or the machine-wide cap saturated) rotate it out
-            // via the Path B warm-keep detach so a fresh candidate can take the
-            // slot; the source stays known, gets UDP-reasked, and is re-dialed
-            // later. Gated on holding a global permit so we never drop adopted
-            // inbound / LowID streams (which carry no outbound permit).
-            if got_any_data && _global_conn_permit.is_some() {
-                if measured_speed < TRICKLE_SLOW_FLOOR_BPS {
-                    let since = *slow_since.get_or_insert_with(std::time::Instant::now);
-                    let file_at_budget =
-                        active_count.load(Ordering::Relaxed) >= MAX_CONCURRENT_SOURCES as u32;
-                    if since.elapsed() >= TRICKLE_SLOW_WINDOW
-                        && (file_at_budget || global_dl_conn_contended())
-                    {
-                        note_slow_rotate();
-                        debug!(
+                // Trickle-source rotation: a source that delivered data but has now
+                // sat below TRICKLE_SLOW_FLOOR_BPS for TRICKLE_SLOW_WINDOW is wasting
+                // a connection slot. Under genuine contention (this file at its
+                // per-file budget, or the machine-wide cap saturated) rotate it out
+                // via the Path B warm-keep detach so a fresh candidate can take the
+                // slot; the source stays known, gets UDP-reasked, and is re-dialed
+                // later. Gated on holding a global permit so we never drop adopted
+                // inbound / LowID streams (which carry no outbound permit).
+                if got_any_data && _global_conn_permit.is_some() {
+                    if measured_speed < TRICKLE_SLOW_FLOOR_BPS {
+                        let since = *slow_since.get_or_insert_with(std::time::Instant::now);
+                        let file_at_budget =
+                            active_count.load(Ordering::Relaxed) >= MAX_CONCURRENT_SOURCES as u32;
+                        if since.elapsed() >= TRICKLE_SLOW_WINDOW
+                            && (file_at_budget || global_dl_conn_contended())
+                        {
+                            note_slow_rotate();
+                            debug!(
                             "Source {} ({}) rotating out: {} B/s for {}s under connection pressure — freeing slot for a fresh candidate",
                             _src_idx, addr, measured_speed, since.elapsed().as_secs()
                         );
-                        emit_source!("queued", None, 0u64);
-                        anyhow::bail!(
+                            emit_source!("queued", None, 0u64);
+                            anyhow::bail!(
                             "stage:queue_detached slow source rotated ({measured_speed} B/s under pressure)"
                         );
-                    }
-                } else {
-                    slow_since = None;
-                }
-            }
-
-            // Periodic EPX re-send: if payload has been rebuilt and 5min elapsed
-            if hello_caps.is_ember && last_epx_resend.elapsed() >= EPX_RESEND_INTERVAL {
-                let current_gen = ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed);
-                if current_gen != last_epx_generation {
-                    let epx_data = ember_payload.read().await.clone();
-                    if !epx_data.is_empty() {
-                        debug!("Re-sending EPX to multi-source peer {} (gen {}->{}, {} bytes)", _src_idx, last_epx_generation, current_gen, epx_data.len());
-                        // Only advance the generation marker on a successful
-                        // write so a failed send is retried next interval
-                        // (mirrors upload.rs).
-                        if write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await.is_ok() {
-                            last_epx_generation = current_gen;
-                            sx_overhead.record_upload((6 + epx_data.len()) as u64);
                         }
                     } else {
-                        last_epx_generation = current_gen;
+                        slow_since = None;
                     }
                 }
-                last_epx_resend = std::time::Instant::now();
-            }
 
-            // Use a shorter read timeout until we receive the first data packet.
-            // Prevents waiting 100s on peers that accept but never send data.
-            let read_timeout = if got_any_data {
-                std::time::Duration::from_secs(super::dead_sources::DOWNLOADTIMEOUT_SECS as u64)
-            } else {
-                let elapsed = data_loop_start.elapsed();
-                let budget = std::time::Duration::from_secs(INITIAL_DATA_TIMEOUT_SECS);
-                budget.saturating_sub(elapsed).max(std::time::Duration::from_secs(1))
-            };
-
-            // Wait for the next packet with two distinct deadlines:
-            //   - a short **stall-check tick** (every 2s) that emits a
-            //     fresh `transferring` `SourceDetail` event carrying
-            //     the current (likely falling-to-zero) measured
-            //     speed, so the UI reflects a silent peer in seconds
-            //     rather than 100s;
-            //   - the existing **hard deadline** (`read_timeout`) that
-            //     bails on a truly dead peer.
-            //
-            // The read future is pinned so stall-check ticks don't
-            // drop it — any bytes already consumed by an in-flight
-            // `read_exact` remain accumulated. Only the hard timeout
-            // or the branch consuming the read's `Ready` result
-            // drops the future, matching the previous
-            // `tokio::time::timeout` semantics for those paths.
-            //
-            // Previously the worker was blocked in a single 100s
-            // `tokio::time::timeout` with no intermediate UI
-            // updates, so a source that stopped sending mid-transfer
-            // kept displaying its last measured speed (e.g.
-            // 172.3 KB/s) in the detail panel until the full
-            // timeout fired — leaving the user staring at a row
-            // that looked healthy while the transfer-level health
-            // indicator had already flipped red at the 60s
-            // ACTIVE_STALLED threshold.
-            let hard_deadline = tokio::time::Instant::now() + read_timeout;
-            let read_result: Result<anyhow::Result<(u8, u8, Vec<u8>)>, ()> = {
-                let mut read_fut = std::pin::pin!(read_packet_async_ms(&mut *reader));
-                let timeout_fut = tokio::time::sleep_until(hard_deadline);
-                tokio::pin!(timeout_fut);
-                let mut stall_check =
-                    tokio::time::interval(std::time::Duration::from_secs(2));
-                stall_check.set_missed_tick_behavior(
-                    tokio::time::MissedTickBehavior::Skip,
-                );
-                // Consume the immediate first tick so the first real
-                // stall-check fires 2s after we start waiting, not
-                // instantly (which would spam an emit on every
-                // packet).
-                stall_check.tick().await;
-
-                loop {
-                    tokio::select! {
-                        biased;
-                        // User Stop/Cancel (or a network disconnect) landed
-                        // while we're actively downloading from this source.
-                        // Mirror eMule's CPartFile::PauseFile, which sends
-                        // OP_CANCELTRANSFER to every DS_DOWNLOADING peer so the
-                        // uploader frees our slot immediately rather than
-                        // waiting to notice the dropped TCP socket. Best-effort
-                        // + time-boxed so a wedged socket can't delay the stop,
-                        // then bail (the outer task `select!` grace window lets
-                        // this finish before it would force-drop the future).
-                        // Fires on Pause too: eMule's PauseFile notifies every
-                        // DS_DOWNLOADING source, so a paused active transfer
-                        // also frees the uploader's slot (the transfer's source
-                        // knowledge is kept by `PauseDownload` for fast resume).
-                        _ = control.wait_cancel_or_pause() => {
-                            let _ = tokio::time::timeout(
-                                std::time::Duration::from_millis(400),
-                                write_packet_async_ms(
-                                    &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
-                                ),
-                            ).await;
-                            anyhow::bail!("cancelled by user");
+                // Periodic EPX re-send: if payload has been rebuilt and 5min elapsed
+                if hello_caps.is_ember && last_epx_resend.elapsed() >= EPX_RESEND_INTERVAL {
+                    let current_gen =
+                        ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed);
+                    if current_gen != last_epx_generation {
+                        let epx_data = ember_payload.read().await.clone();
+                        if !epx_data.is_empty() {
+                            debug!(
+                                "Re-sending EPX to multi-source peer {} (gen {}->{}, {} bytes)",
+                                _src_idx,
+                                last_epx_generation,
+                                current_gen,
+                                epx_data.len()
+                            );
+                            // Only advance the generation marker on a successful
+                            // write so a failed send is retried next interval
+                            // (mirrors upload.rs).
+                            if write_packet_async_ms(
+                                &mut *writer,
+                                OP_EMULEPROT,
+                                OP_EMBER_SOURCEEXCHANGE,
+                                &*epx_data,
+                            )
+                            .await
+                            .is_ok()
+                            {
+                                last_epx_generation = current_gen;
+                                sx_overhead.record_upload((6 + epx_data.len()) as u64);
+                            }
+                        } else {
+                            last_epx_generation = current_gen;
                         }
-                        // `read_packet_async_ms` returns `Result<_, io::Error>`;
-                        // hoist into `anyhow::Error` here so the outer
-                        // match arms stay aligned with the error-kind
-                        // classification that the rest of the receive
-                        // loop uses.
-                        res = &mut read_fut => break Ok(res.map_err(anyhow::Error::from)),
-                        _ = &mut timeout_fut => break Err(()),
-                        _ = stall_check.tick() => {
-                            // Emit a fresh `transferring` update
-                            // with recalculated speed (which will
-                            // trend toward 0 as the byte window
-                            // ages out). The same logic that runs
-                            // after packet processing below — just
-                            // triggered on a timer so the UI gets
-                            // updates during silence.
-                            let elapsed = speed_start.elapsed();
-                            if elapsed.as_millis() >= 2000 {
-                                measured_speed =
-                                    (speed_bytes as u128 * 1000
-                                        / elapsed.as_millis().max(1))
-                                        as u64;
-                                speed_bytes = 0;
-                                speed_start = std::time::Instant::now();
-                                emit_source!(
-                                    if got_any_data { "transferring" } else { "stalled" },
-                                    None,
-                                    measured_speed
-                                );
+                    }
+                    last_epx_resend = std::time::Instant::now();
+                }
+
+                // Use a shorter read timeout until we receive the first data packet.
+                // Prevents waiting 100s on peers that accept but never send data.
+                let read_timeout = if got_any_data {
+                    std::time::Duration::from_secs(super::dead_sources::DOWNLOADTIMEOUT_SECS as u64)
+                } else {
+                    let elapsed = data_loop_start.elapsed();
+                    let budget = std::time::Duration::from_secs(INITIAL_DATA_TIMEOUT_SECS);
+                    budget
+                        .saturating_sub(elapsed)
+                        .max(std::time::Duration::from_secs(1))
+                };
+
+                // Wait for the next packet with two distinct deadlines:
+                //   - a short **stall-check tick** (every 2s) that emits a
+                //     fresh `transferring` `SourceDetail` event carrying
+                //     the current (likely falling-to-zero) measured
+                //     speed, so the UI reflects a silent peer in seconds
+                //     rather than 100s;
+                //   - the existing **hard deadline** (`read_timeout`) that
+                //     bails on a truly dead peer.
+                //
+                // The read future is pinned so stall-check ticks don't
+                // drop it — any bytes already consumed by an in-flight
+                // `read_exact` remain accumulated. Only the hard timeout
+                // or the branch consuming the read's `Ready` result
+                // drops the future, matching the previous
+                // `tokio::time::timeout` semantics for those paths.
+                //
+                // Previously the worker was blocked in a single 100s
+                // `tokio::time::timeout` with no intermediate UI
+                // updates, so a source that stopped sending mid-transfer
+                // kept displaying its last measured speed (e.g.
+                // 172.3 KB/s) in the detail panel until the full
+                // timeout fired — leaving the user staring at a row
+                // that looked healthy while the transfer-level health
+                // indicator had already flipped red at the 60s
+                // ACTIVE_STALLED threshold.
+                let hard_deadline = tokio::time::Instant::now() + read_timeout;
+                let read_result: Result<anyhow::Result<(u8, u8, Vec<u8>)>, ()> = {
+                    let mut read_fut = std::pin::pin!(read_packet_async_ms(&mut *reader));
+                    let timeout_fut = tokio::time::sleep_until(hard_deadline);
+                    tokio::pin!(timeout_fut);
+                    let mut stall_check = tokio::time::interval(std::time::Duration::from_secs(2));
+                    stall_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    // Consume the immediate first tick so the first real
+                    // stall-check fires 2s after we start waiting, not
+                    // instantly (which would spam an emit on every
+                    // packet).
+                    stall_check.tick().await;
+
+                    loop {
+                        tokio::select! {
+                            biased;
+                            // User Stop/Cancel (or a network disconnect) landed
+                            // while we're actively downloading from this source.
+                            // Mirror eMule's CPartFile::PauseFile, which sends
+                            // OP_CANCELTRANSFER to every DS_DOWNLOADING peer so the
+                            // uploader frees our slot immediately rather than
+                            // waiting to notice the dropped TCP socket. Best-effort
+                            // + time-boxed so a wedged socket can't delay the stop,
+                            // then bail (the outer task `select!` grace window lets
+                            // this finish before it would force-drop the future).
+                            // Fires on Pause too: eMule's PauseFile notifies every
+                            // DS_DOWNLOADING source, so a paused active transfer
+                            // also frees the uploader's slot (the transfer's source
+                            // knowledge is kept by `PauseDownload` for fast resume).
+                            _ = control.wait_cancel_or_pause() => {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_millis(400),
+                                    write_packet_async_ms(
+                                        &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
+                                    ),
+                                ).await;
+                                anyhow::bail!("cancelled by user");
+                            }
+                            // `read_packet_async_ms` returns `Result<_, io::Error>`;
+                            // hoist into `anyhow::Error` here so the outer
+                            // match arms stay aligned with the error-kind
+                            // classification that the rest of the receive
+                            // loop uses.
+                            res = &mut read_fut => break Ok(res.map_err(anyhow::Error::from)),
+                            _ = &mut timeout_fut => break Err(()),
+                            _ = stall_check.tick() => {
+                                // Emit a fresh `transferring` update
+                                // with recalculated speed (which will
+                                // trend toward 0 as the byte window
+                                // ages out). The same logic that runs
+                                // after packet processing below — just
+                                // triggered on a timer so the UI gets
+                                // updates during silence.
+                                let elapsed = speed_start.elapsed();
+                                if elapsed.as_millis() >= 2000 {
+                                    measured_speed =
+                                        (speed_bytes as u128 * 1000
+                                            / elapsed.as_millis().max(1))
+                                            as u64;
+                                    speed_bytes = 0;
+                                    speed_start = std::time::Instant::now();
+                                    emit_source!(
+                                        if got_any_data { "transferring" } else { "stalled" },
+                                        None,
+                                        measured_speed
+                                    );
+                                }
                             }
                         }
                     }
-                }
-            };
+                };
 
-            let (proto, opcode, payload) = match read_result {
-                Ok(Ok(pkt)) => {
-                    if !got_any_data {
-                        debug!("Source {} ({}) data loop received packet BEFORE first data: proto=0x{:02X} op=0x{:02X} ({} bytes)",
+                let (proto, opcode, payload) = match read_result {
+                    Ok(Ok(pkt)) => {
+                        if !got_any_data {
+                            debug!("Source {} ({}) data loop received packet BEFORE first data: proto=0x{:02X} op=0x{:02X} ({} bytes)",
                             _src_idx, addr, pkt.0, pkt.1, pkt.2.len());
+                        }
+                        pkt
                     }
-                    pkt
-                },
-                Ok(Err(e)) => {
-                    // Fix C: classify the FIN so the log (and, below,
-                    // the shared `peers_missing_parts` registry) can
-                    // tell the difference between:
-                    //   * peer granted our upload slot, then dropped
-                    //     the TCP connection with zero bytes of part
-                    //     data ever received — a strong signal it
-                    //     doesn't actually hold the byte range we
-                    //     asked for (Pattern A in the triage), and
-                    //   * peer was mid-stream and then dropped — a
-                    //     weaker signal that's often just a transient
-                    //     TCP/NAT problem.
-                    // Both used to bubble up as an indistinguishable
-                    // `early eof` / `unexpected end of file`.
-                    let classification = if !got_any_data
-                        && chunks_received_this_part == 0
-                        && bytes_received_this_part == 0
-                    {
-                        "peer_dropped_after_accept"
-                    } else if got_any_data {
-                        "peer_truncated_transfer"
-                    } else {
-                        "read_error"
-                    };
-                    info!(
+                    Ok(Err(e)) => {
+                        // Fix C: classify the FIN so the log (and, below,
+                        // the shared `peers_missing_parts` registry) can
+                        // tell the difference between:
+                        //   * peer granted our upload slot, then dropped
+                        //     the TCP connection with zero bytes of part
+                        //     data ever received — a strong signal it
+                        //     doesn't actually hold the byte range we
+                        //     asked for (Pattern A in the triage), and
+                        //   * peer was mid-stream and then dropped — a
+                        //     weaker signal that's often just a transient
+                        //     TCP/NAT problem.
+                        // Both used to bubble up as an indistinguishable
+                        // `early eof` / `unexpected end of file`.
+                        let classification = if !got_any_data
+                            && chunks_received_this_part == 0
+                            && bytes_received_this_part == 0
+                        {
+                            "peer_dropped_after_accept"
+                        } else if got_any_data {
+                            "peer_truncated_transfer"
+                        } else {
+                            "read_error"
+                        };
+                        info!(
                         "DIAG: source {} ({}) read_packet_async error during part {}: {e:#} (kind={}, chunks_for_part={}, bytes_for_part={}, sent_idx={}/{})",
                         _src_idx, addr, part_idx, classification,
                         chunks_received_this_part, bytes_received_this_part,
                         sent_idx, batches.len(),
                     );
-                    if classification == "peer_dropped_after_accept" {
-                        // Fix B: record this peer as confirmed-missing
-                        // for the part we were just requesting so
-                        // subsequent retry rounds (and the
-                        // post-handshake filter on the next dial) skip
-                        // the part for this peer. The part_queue tail
-                        // past `queue_idx` was NOT requested over the
-                        // wire yet — we only queued it locally — so
-                        // don't mark those as missing; only the part
-                        // the peer actively dropped on is known bad.
-                        record_peer_missing_parts(
-                            &peers_missing_parts,
-                            &source.peer_ip,
-                            source.peer_port,
-                            part_count,
-                            part_idx,
-                            &[],
-                        );
-                        warn!(
+                        if classification == "peer_dropped_after_accept" {
+                            // Fix B: record this peer as confirmed-missing
+                            // for the part we were just requesting so
+                            // subsequent retry rounds (and the
+                            // post-handshake filter on the next dial) skip
+                            // the part for this peer. The part_queue tail
+                            // past `queue_idx` was NOT requested over the
+                            // wire yet — we only queued it locally — so
+                            // don't mark those as missing; only the part
+                            // the peer actively dropped on is known bad.
+                            record_peer_missing_parts(
+                                &peers_missing_parts,
+                                &source.peer_ip,
+                                source.peer_port,
+                                part_count,
+                                part_idx,
+                                &[],
+                            );
+                            warn!(
                             "Source {} ({}) accepted upload for part {} then FINed with zero bytes — marking this peer as missing part {} for this transfer",
                             _src_idx, addr, part_idx, part_idx,
                         );
-                        // Tag the error so `classify_error` can surface
-                        // it distinctly in the UI and so the log grep
-                        // is easy.
-                        return Err(anyhow::Error::from(e).context(
+                            // Tag the error so `classify_error` can surface
+                            // it distinctly in the UI and so the log grep
+                            // is easy.
+                            return Err(anyhow::Error::from(e).context(
                             "stage:peer_dropped_after_accept peer FINed after OP_REQUESTPARTS with 0 bytes received",
                         ));
+                        }
+                        return Err(e.into());
                     }
-                    return Err(e.into());
-                },
-                Err(()) => {
-                    if !got_any_data {
-                        // Peer accepted the slot but hasn't begun sending.
-                        // Stay connected and re-assert our block request like
-                        // eMule, as long as we're within the per-source patience
-                        // budget (bounded by the configured queue-wait time and
-                        // a hard re-assert cap).
-                        if no_data_reasserts < MAX_NO_DATA_REASSERTS
-                            && receive_loop_started.elapsed().as_secs() < queue_wait_secs
-                            && !all_blocks.is_empty()
-                        {
-                            no_data_reasserts += 1;
-                            warn!(
+                    Err(()) => {
+                        if !got_any_data {
+                            // Peer accepted the slot but hasn't begun sending.
+                            // Stay connected and re-assert our block request like
+                            // eMule, as long as we're within the per-source patience
+                            // budget (bounded by the configured queue-wait time and
+                            // a hard re-assert cap).
+                            if no_data_reasserts < MAX_NO_DATA_REASSERTS
+                                && receive_loop_started.elapsed().as_secs() < queue_wait_secs
+                                && !all_blocks.is_empty()
+                            {
+                                no_data_reasserts += 1;
+                                warn!(
                                 "Source {} ({}) accepted upload but sent no data in {}s — re-asserting part {} request (attempt {}/{}), staying connected like eMule",
                                 _src_idx, addr, INITIAL_DATA_TIMEOUT_SECS, part_idx,
                                 no_data_reasserts, MAX_NO_DATA_REASSERTS,
                             );
-                            emit_source!("queued", None, 0u64);
-                            // Re-send the part requests we already had
-                            // outstanding for this part (indices 0..sent_idx).
-                            // Re-sending already-requested ranges is safe: the
-                            // gap tracker ignores bytes for gaps already filled.
-                            for i in 0..sent_idx {
-                                let batch = &batches[i];
-                                let (req_payload, req_proto, req_op) = if needs_i64 {
-                                    (build_request_parts_i64(file_hash, batch), OP_EMULEPROT, OP_REQUESTPARTS_I64)
-                                } else {
-                                    (build_request_parts(file_hash, batch), OP_EDONKEYHEADER, OP_REQUESTPARTS)
-                                };
-                                if write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await.is_err() {
-                                    anyhow::bail!("stage:data_wait connection lost while re-asserting request");
+                                emit_source!("queued", None, 0u64);
+                                // Re-send the part requests we already had
+                                // outstanding for this part (indices 0..sent_idx).
+                                // Re-sending already-requested ranges is safe: the
+                                // gap tracker ignores bytes for gaps already filled.
+                                for i in 0..sent_idx {
+                                    let batch = &batches[i];
+                                    let (req_payload, req_proto, req_op) = if needs_i64 {
+                                        (
+                                            build_request_parts_i64(file_hash, batch),
+                                            OP_EMULEPROT,
+                                            OP_REQUESTPARTS_I64,
+                                        )
+                                    } else {
+                                        (
+                                            build_request_parts(file_hash, batch),
+                                            OP_EDONKEYHEADER,
+                                            OP_REQUESTPARTS,
+                                        )
+                                    };
+                                    if write_packet_async_ms(
+                                        &mut *writer,
+                                        req_proto,
+                                        req_op,
+                                        &req_payload,
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        anyhow::bail!("stage:data_wait connection lost while re-asserting request");
+                                    }
                                 }
+                                data_loop_start = std::time::Instant::now();
+                                continue;
                             }
-                            data_loop_start = std::time::Instant::now();
-                            continue;
-                        }
-                        let _ = write_packet_async_ms(
-                            &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
-                        ).await;
-                        warn!("Source {} ({}) accepted transfer but sent no data after {} re-assert(s) — disconnecting",
+                            let _ = write_packet_async_ms(
+                                &mut *writer,
+                                OP_EDONKEYHEADER,
+                                OP_CANCELTRANSFER,
+                                &[],
+                            )
+                            .await;
+                            warn!("Source {} ({}) accepted transfer but sent no data after {} re-assert(s) — disconnecting",
                             _src_idx, addr, no_data_reasserts);
-                        anyhow::bail!("peer accepted transfer but sent no data after {} re-assert(s)", no_data_reasserts);
-                    } else {
-                        let _ = write_packet_async_ms(
-                            &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
-                        ).await;
-                        anyhow::bail!("stage:data_wait download timeout: no data for {}s", super::dead_sources::DOWNLOADTIMEOUT_SECS);
-                    }
-                }
-            };
-
-            match (proto, opcode) {
-                (OP_EMULEPROT, OP_SENDINGPART_I64) | (OP_EDONKEYHEADER, OP_SENDINGPART) => {
-                    let (hash, start, end, data) = if opcode == OP_SENDINGPART_I64 {
-                        parse_sending_part_i64(&payload)?
-                    } else {
-                        // D19: a 32-bit OP_SENDINGPART cannot address past
-                        // 4 GiB. If our file is larger the peer must use
-                        // OP_SENDINGPART_I64; reject 32-bit frames rather
-                        // than silently wrap / mis-write.
-                        if file_size > u32::MAX as u64 {
                             anyhow::bail!(
+                                "peer accepted transfer but sent no data after {} re-assert(s)",
+                                no_data_reasserts
+                            );
+                        } else {
+                            let _ = write_packet_async_ms(
+                                &mut *writer,
+                                OP_EDONKEYHEADER,
+                                OP_CANCELTRANSFER,
+                                &[],
+                            )
+                            .await;
+                            anyhow::bail!(
+                                "stage:data_wait download timeout: no data for {}s",
+                                super::dead_sources::DOWNLOADTIMEOUT_SECS
+                            );
+                        }
+                    }
+                };
+
+                match (proto, opcode) {
+                    (OP_EMULEPROT, OP_SENDINGPART_I64) | (OP_EDONKEYHEADER, OP_SENDINGPART) => {
+                        let (hash, start, end, data) = if opcode == OP_SENDINGPART_I64 {
+                            parse_sending_part_i64(&payload)?
+                        } else {
+                            // D19: a 32-bit OP_SENDINGPART cannot address past
+                            // 4 GiB. If our file is larger the peer must use
+                            // OP_SENDINGPART_I64; reject 32-bit frames rather
+                            // than silently wrap / mis-write.
+                            if file_size > u32::MAX as u64 {
+                                anyhow::bail!(
                                 "source {_src_idx} sent 32-bit OP_SENDINGPART for a {}-byte file (requires I64)",
                                 file_size
                             );
-                        }
-                        parse_sending_part_32(&payload)?
-                    };
-                    if hash != *file_hash {
-                        anyhow::bail!(
-                            "source {} sent SENDINGPART for wrong file: expected={} got={}",
-                            _src_idx,
-                            hex::encode(file_hash),
-                            hex::encode(hash)
-                        );
-                    }
-
-                    if start >= end || end > file_size || data.len() != (end - start) as usize {
-                        consecutive_bad_blocks += 1;
-                        tracing::warn!("Invalid block offsets from source {_src_idx}: start={start}, end={end}, data={} (bad streak: {consecutive_bad_blocks})", data.len());
-                        if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
-                            anyhow::bail!("source {_src_idx} sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
-                        }
-                        continue;
-                    }
-                    // D18: refuse absurdly small chunks. eMule-family peers
-                    // never ship OP_SENDINGPART below a few KiB; a peer
-                    // sending 1-byte chunks is either broken or abusive
-                    // (work amplification vs our syscall/allocator path).
-                    // 16 bytes keeps the floor trivially low for any legit
-                    // truncated-tail block.
-                    const MIN_BLOCK_BYTES: u64 = 16;
-                    let piece_len = end - start;
-                    if piece_len < MIN_BLOCK_BYTES && end != file_size {
-                        consecutive_bad_blocks += 1;
-                        tracing::warn!(
-                            "source {_src_idx} sent undersized block ({piece_len} bytes); treating as abusive"
-                        );
-                        if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
-                            anyhow::bail!("source {_src_idx} sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
-                        }
-                        continue;
-                    }
-                    consecutive_bad_blocks = 0;
-                    bw.acquire_download(piece_len).await;
-
-                    // D21: never overwrite bytes we already have. With several
-                    // sources in flight (and cross-part pipelining), source B
-                    // can deliver a block covering a range source A already
-                    // wrote — and possibly already MD4-verified. `fill_range`
-                    // leaves `part_verified` set when a write adds no new bytes,
-                    // so re-writing that range would silently replace
-                    // verified-good data on disk (which the upload path then
-                    // serves as safe). Only write/record bytes that overlap a
-                    // gap; duplicate bytes still flow through the request-
-                    // pipeline bookkeeping below (skipping it here could stall
-                    // the pipeline refill that keys off blocks_received).
-                    // D21: write ONLY the gap sub-ranges of this block, never the
-                    // whole block. With several sources in flight (and cross-part
-                    // pipelining) a block can overlap bytes we already wrote — and
-                    // a malformed/hostile block can even span into an adjacent part
-                    // that is already complete and MD4-verified. Writing the whole
-                    // block would clobber that verified-good data on disk (which the
-                    // upload path then serves as "safe"), with corruption only caught
-                    // at the final whole-file hash. Trimming the write to actual gaps
-                    // preserves verified bytes; `fill_range` below stays idempotent.
-                    let fill_subranges = {
-                        let t = tracker.read().await;
-                        t.fillable_subranges(start, end)
-                    };
-                    if !fill_subranges.is_empty() {
-                        // D20: only commit the fill_range to the tracker if every
-                        // sub-range disk write actually succeeded. The PartFileWriter
-                        // serializes the writes for us — this `await` is just an mpsc
-                        // round-trip, not a global file lock acquisition.
-                        let mut write_ok = true;
-                        for &(gs, ge) in &fill_subranges {
-                            let off = (gs - start) as usize;
-                            let len = (ge - gs) as usize;
-                            if let Err(e) = output.write(gs, data[off..off + len].to_vec()).await {
-                                tracing::warn!(
-                                    "source {_src_idx}: disk write failed at start={gs} ({len} bytes): {e}"
-                                );
-                                write_ok = false;
-                                break;
                             }
+                            parse_sending_part_32(&payload)?
+                        };
+                        if hash != *file_hash {
+                            anyhow::bail!(
+                                "source {} sent SENDINGPART for wrong file: expected={} got={}",
+                                _src_idx,
+                                hex::encode(file_hash),
+                                hex::encode(hash)
+                            );
                         }
-                        if !write_ok {
+
+                        if start >= end || end > file_size || data.len() != (end - start) as usize {
+                            consecutive_bad_blocks += 1;
+                            tracing::warn!("Invalid block offsets from source {_src_idx}: start={start}, end={end}, data={} (bad streak: {consecutive_bad_blocks})", data.len());
+                            if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                                anyhow::bail!("source {_src_idx} sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
+                            }
                             continue;
                         }
-
-                        // Update byte-level gap tracker for mid-part resume.
-                        // Only reached when the disk write succeeded.
-                        {
-                            let mut t = tracker.write().await;
-                            t.fill_range(start, end);
+                        // D18: refuse absurdly small chunks. eMule-family peers
+                        // never ship OP_SENDINGPART below a few KiB; a peer
+                        // sending 1-byte chunks is either broken or abusive
+                        // (work amplification vs our syscall/allocator path).
+                        // 16 bytes keeps the floor trivially low for any legit
+                        // truncated-tail block.
+                        const MIN_BLOCK_BYTES: u64 = 16;
+                        let piece_len = end - start;
+                        if piece_len < MIN_BLOCK_BYTES && end != file_size {
+                            consecutive_bad_blocks += 1;
+                            tracing::warn!(
+                            "source {_src_idx} sent undersized block ({piece_len} bytes); treating as abusive"
+                        );
+                            if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                                anyhow::bail!("source {_src_idx} sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
+                            }
+                            continue;
                         }
+                        consecutive_bad_blocks = 0;
+                        bw.acquire_download(piece_len).await;
 
-                        if let (Some(ref etx), std::net::IpAddr::V4(v4)) = (&event_tx, addr.ip()) {
-                            let _ = etx
-                                .send(DownloadEvent::DataReceived {
-                                    file_hash: *file_hash,
-                                    start,
-                                    end,
-                                    sender_ip: v4,
-                                    sender_user_hash: Some(peer_user_hash),
-                                })
-                                .await;
-                        }
-                    } else {
-                        tracing::trace!(
+                        // D21: never overwrite bytes we already have. With several
+                        // sources in flight (and cross-part pipelining), source B
+                        // can deliver a block covering a range source A already
+                        // wrote — and possibly already MD4-verified. `fill_range`
+                        // leaves `part_verified` set when a write adds no new bytes,
+                        // so re-writing that range would silently replace
+                        // verified-good data on disk (which the upload path then
+                        // serves as safe). Only write/record bytes that overlap a
+                        // gap; duplicate bytes still flow through the request-
+                        // pipeline bookkeeping below (skipping it here could stall
+                        // the pipeline refill that keys off blocks_received).
+                        // D21: write ONLY the gap sub-ranges of this block, never the
+                        // whole block. With several sources in flight (and cross-part
+                        // pipelining) a block can overlap bytes we already wrote — and
+                        // a malformed/hostile block can even span into an adjacent part
+                        // that is already complete and MD4-verified. Writing the whole
+                        // block would clobber that verified-good data on disk (which the
+                        // upload path then serves as "safe"), with corruption only caught
+                        // at the final whole-file hash. Trimming the write to actual gaps
+                        // preserves verified bytes; `fill_range` below stays idempotent.
+                        let fill_subranges = {
+                            let t = tracker.read().await;
+                            t.fillable_subranges(start, end)
+                        };
+                        if !fill_subranges.is_empty() {
+                            // D20: only commit the fill_range to the tracker if every
+                            // sub-range disk write actually succeeded. The PartFileWriter
+                            // serializes the writes for us — this `await` is just an mpsc
+                            // round-trip, not a global file lock acquisition.
+                            let mut write_ok = true;
+                            for &(gs, ge) in &fill_subranges {
+                                let off = (gs - start) as usize;
+                                let len = (ge - gs) as usize;
+                                if let Err(e) =
+                                    output.write(gs, data[off..off + len].to_vec()).await
+                                {
+                                    tracing::warn!(
+                                    "source {_src_idx}: disk write failed at start={gs} ({len} bytes): {e}"
+                                );
+                                    write_ok = false;
+                                    break;
+                                }
+                            }
+                            if !write_ok {
+                                continue;
+                            }
+
+                            // Update byte-level gap tracker for mid-part resume.
+                            // Only reached when the disk write succeeded.
+                            {
+                                let mut t = tracker.write().await;
+                                t.fill_range(start, end);
+                            }
+
+                            if let (Some(ref etx), std::net::IpAddr::V4(v4)) =
+                                (&event_tx, addr.ip())
+                            {
+                                let _ = etx
+                                    .send(DownloadEvent::DataReceived {
+                                        file_hash: *file_hash,
+                                        start,
+                                        end,
+                                        sender_ip: v4,
+                                        sender_user_hash: Some(peer_user_hash),
+                                    })
+                                    .await;
+                            }
+                        } else {
+                            tracing::trace!(
                             "source {_src_idx}: duplicate block at start={start} ({piece_len} bytes) — range already present, not rewriting"
                         );
-                    }
+                        }
 
-                    if !got_any_data {
-                        info!("Source {} ({}) first data received for part {} ({} bytes)", _src_idx, addr, part_idx, piece_len);
-                        got_any_data = true;
-                        // First real byte: now it's genuinely transferring.
-                        // Flip the status immediately (the periodic speed emit
-                        // below only fires every 2s, too laggy for the badge).
-                        emit_source!("transferring", None, measured_speed);
+                        if !got_any_data {
+                            info!(
+                                "Source {} ({}) first data received for part {} ({} bytes)",
+                                _src_idx, addr, part_idx, piece_len
+                            );
+                            got_any_data = true;
+                            // First real byte: now it's genuinely transferring.
+                            // Flip the status immediately (the periodic speed emit
+                            // below only fires every 2s, too laggy for the badge).
+                            emit_source!("transferring", None, measured_speed);
+                        }
+                        src_transferred += piece_len;
+                        blocks_received_in_current_req += 1;
+                        speed_bytes += piece_len;
+                        // D12: defer credit accrual until the covered part
+                        // verifies. With cross-part pipelining a block can
+                        // belong to either the current part or the
+                        // pre-pipelined next part — bucket by absolute
+                        // offset so a Mismatch on part N doesn't wipe
+                        // legitimate part N+1 credit.
+                        //
+                        // Credit only the bytes we actually WROTE (the gap-overlap
+                        // sub-ranges), never the full wire piece: a duplicate or
+                        // overlapping block contributes no new data and must not
+                        // inflate the peer's credit ledger.
+                        let newly_written: u64 =
+                            fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
+                        let block_part = (start / PARTSIZE) as usize;
+                        *per_part_credit.entry(block_part).or_insert(0) += newly_written;
+                        if block_part == part_idx {
+                            bytes_received_this_part += piece_len;
+                            chunks_received_this_part += 1;
+                        } else {
+                            bytes_received_for_other_parts += piece_len;
+                        }
+                        let _ = progress_tx.send((_src_idx, piece_len as i64)).await;
                     }
-                    src_transferred += piece_len;
-                    blocks_received_in_current_req += 1;
-                    speed_bytes += piece_len;
-                    // D12: defer credit accrual until the covered part
-                    // verifies. With cross-part pipelining a block can
-                    // belong to either the current part or the
-                    // pre-pipelined next part — bucket by absolute
-                    // offset so a Mismatch on part N doesn't wipe
-                    // legitimate part N+1 credit.
-                    //
-                    // Credit only the bytes we actually WROTE (the gap-overlap
-                    // sub-ranges), never the full wire piece: a duplicate or
-                    // overlapping block contributes no new data and must not
-                    // inflate the peer's credit ledger.
-                    let newly_written: u64 = fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
-                    let block_part = (start / PARTSIZE) as usize;
-                    *per_part_credit.entry(block_part).or_insert(0) += newly_written;
-                    if block_part == part_idx {
-                        bytes_received_this_part += piece_len;
-                        chunks_received_this_part += 1;
-                    } else {
-                        bytes_received_for_other_parts += piece_len;
-                    }
-                    let _ = progress_tx.send((_src_idx, piece_len as i64)).await;
-                }
-                (OP_EMULEPROT, OP_COMPRESSEDPART_I64) | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
-                    let (hash, start, compressed_total_size, compressed) =
-                        if opcode == OP_COMPRESSEDPART_I64 {
+                    (OP_EMULEPROT, OP_COMPRESSEDPART_I64) | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
+                        let (hash, start, compressed_total_size, compressed) = if opcode
+                            == OP_COMPRESSEDPART_I64
+                        {
                             parse_compressed_part_i64(&payload)?
                         } else {
                             // D19 (compressed): mirror the OP_SENDINGPART guard
@@ -6244,685 +6693,817 @@ async fn download_parts_from_source(
                             }
                             parse_compressed_part_32(&payload)?
                         };
-                    if hash != *file_hash {
-                        anyhow::bail!(
-                            "source {} sent COMPRESSEDPART for wrong file: expected={} got={}",
-                            _src_idx,
-                            hex::encode(file_hash),
-                            hex::encode(hash)
-                        );
-                    }
-
-                    let Some(decompressed) = append_compressed_chunk_ms(
-                        &mut pending_compressed,
-                        start,
-                        compressed_total_size,
-                        compressed,
-                    )? else {
-                        continue;
-                    };
-
-                    let piece_len = decompressed.len() as u64;
-                    if start.saturating_add(piece_len) > file_size {
-                        consecutive_bad_blocks += 1;
-                        tracing::warn!("Compressed block exceeds file size from source {_src_idx} (bad streak: {consecutive_bad_blocks})");
-                        if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
-                            anyhow::bail!("source {_src_idx} sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
-                        }
-                        continue;
-                    }
-                    consecutive_bad_blocks = 0;
-                    bw.acquire_download(piece_len).await;
-
-                    // D21 (compressed): mirror the uncompressed gap guard above.
-                    // Write ONLY the gap sub-ranges of the decompressed block,
-                    // never the whole block — a duplicate/overlapping (or
-                    // cross-part) compressed block must not clobber bytes we
-                    // already have, including verified bytes of an adjacent part
-                    // (which the upload path would then serve as "safe").
-                    let fill_subranges = {
-                        let t = tracker.read().await;
-                        t.fillable_subranges(start, start + piece_len)
-                    };
-                    if !fill_subranges.is_empty() {
-                        let mut write_ok = true;
-                        for &(gs, ge) in &fill_subranges {
-                            let off = (gs - start) as usize;
-                            let len = (ge - gs) as usize;
-                            if let Err(e) = output.write(gs, decompressed[off..off + len].to_vec()).await {
-                                tracing::warn!(
-                                    "source {_src_idx}: compressed disk write failed at start={gs} ({len} bytes): {e}"
-                                );
-                                write_ok = false;
-                                break;
-                            }
-                        }
-                        if !write_ok {
-                            continue;
-                        }
-
-                        {
-                            let mut t = tracker.write().await;
-                            t.fill_range(start, start + piece_len);
-                        }
-
-                        if let (Some(ref etx), std::net::IpAddr::V4(v4)) = (&event_tx, addr.ip()) {
-                            let _ = etx
-                                .send(DownloadEvent::DataReceived {
-                                    file_hash: *file_hash,
-                                    start,
-                                    end: start + piece_len,
-                                    sender_ip: v4,
-                                    sender_user_hash: Some(peer_user_hash),
-                                })
-                                .await;
-                        }
-                    } else {
-                        tracing::trace!(
-                            "source {_src_idx}: duplicate compressed block at start={start} ({piece_len} bytes) — range already present, not rewriting"
-                        );
-                    }
-
-                    if !got_any_data {
-                        info!("Source {} ({}) first compressed data received for part {} ({} bytes)", _src_idx, addr, part_idx, piece_len);
-                        got_any_data = true;
-                    }
-                    src_transferred += piece_len;
-                    blocks_received_in_current_req += 1;
-                    speed_bytes += piece_len;
-                    // Per-part credit bucket; see uncompressed branch
-                    // above for rationale. Credit only the bytes actually
-                    // written (gap-overlap), not the full decompressed piece.
-                    let newly_written: u64 = fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
-                    let block_part = (start / PARTSIZE) as usize;
-                    *per_part_credit.entry(block_part).or_insert(0) += newly_written;
-                    if block_part == part_idx {
-                        bytes_received_this_part += piece_len;
-                        chunks_received_this_part += 1;
-                    } else {
-                        bytes_received_for_other_parts += piece_len;
-                    }
-                    let _ = progress_tx.send((_src_idx, piece_len as i64)).await;
-                }
-                (OP_EMULEPROT, OP_AICHANSWER)
-                    if (38..=38 + crate::network::ed2k::aich::MAX_AICH_RECOVERY_BYTES)
-                        .contains(&payload.len()) =>
-                {
-                    let mut ans_hash = [0u8; 16];
-                    ans_hash.copy_from_slice(&payload[..16]);
-                    let ans_part = u16::from_le_bytes([payload[16], payload[17]]) as usize;
-                    let mut root_hash = [0u8; 20];
-                    root_hash.copy_from_slice(&payload[18..38]);
-                    let recovery_data = &payload[38..];
-                    if ans_hash == *file_hash && ans_part == part_idx {
-                        let aich_master_hash = *shared_aich_master.read().await;
-                        let master_ok = aich_master_hash.map_or(false, |m| m == root_hash);
-                        if master_ok {
-                            aich_recovery_data = Some((root_hash, recovery_data.to_vec()));
-                        } else {
-                            debug!(
-                                "Ignoring AICH answer: root {} != trusted master {:?}",
-                                hex::encode(root_hash),
-                                aich_master_hash.map(hex::encode)
+                        if hash != *file_hash {
+                            anyhow::bail!(
+                                "source {} sent COMPRESSEDPART for wrong file: expected={} got={}",
+                                _src_idx,
+                                hex::encode(file_hash),
+                                hex::encode(hash)
                             );
                         }
+
+                        let Some(decompressed) = append_compressed_chunk_ms(
+                            &mut pending_compressed,
+                            start,
+                            compressed_total_size,
+                            compressed,
+                        )?
+                        else {
+                            continue;
+                        };
+
+                        let piece_len = decompressed.len() as u64;
+                        if start.saturating_add(piece_len) > file_size {
+                            consecutive_bad_blocks += 1;
+                            tracing::warn!("Compressed block exceeds file size from source {_src_idx} (bad streak: {consecutive_bad_blocks})");
+                            if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
+                                anyhow::bail!("source {_src_idx} sent {consecutive_bad_blocks} consecutive invalid blocks, disconnecting");
+                            }
+                            continue;
+                        }
+                        consecutive_bad_blocks = 0;
+                        bw.acquire_download(piece_len).await;
+
+                        // D21 (compressed): mirror the uncompressed gap guard above.
+                        // Write ONLY the gap sub-ranges of the decompressed block,
+                        // never the whole block — a duplicate/overlapping (or
+                        // cross-part) compressed block must not clobber bytes we
+                        // already have, including verified bytes of an adjacent part
+                        // (which the upload path would then serve as "safe").
+                        let fill_subranges = {
+                            let t = tracker.read().await;
+                            t.fillable_subranges(start, start + piece_len)
+                        };
+                        if !fill_subranges.is_empty() {
+                            let mut write_ok = true;
+                            for &(gs, ge) in &fill_subranges {
+                                let off = (gs - start) as usize;
+                                let len = (ge - gs) as usize;
+                                if let Err(e) = output
+                                    .write(gs, decompressed[off..off + len].to_vec())
+                                    .await
+                                {
+                                    tracing::warn!(
+                                    "source {_src_idx}: compressed disk write failed at start={gs} ({len} bytes): {e}"
+                                );
+                                    write_ok = false;
+                                    break;
+                                }
+                            }
+                            if !write_ok {
+                                continue;
+                            }
+
+                            {
+                                let mut t = tracker.write().await;
+                                t.fill_range(start, start + piece_len);
+                            }
+
+                            if let (Some(ref etx), std::net::IpAddr::V4(v4)) =
+                                (&event_tx, addr.ip())
+                            {
+                                let _ = etx
+                                    .send(DownloadEvent::DataReceived {
+                                        file_hash: *file_hash,
+                                        start,
+                                        end: start + piece_len,
+                                        sender_ip: v4,
+                                        sender_user_hash: Some(peer_user_hash),
+                                    })
+                                    .await;
+                            }
+                        } else {
+                            tracing::trace!(
+                            "source {_src_idx}: duplicate compressed block at start={start} ({piece_len} bytes) — range already present, not rewriting"
+                        );
+                        }
+
+                        if !got_any_data {
+                            info!("Source {} ({}) first compressed data received for part {} ({} bytes)", _src_idx, addr, part_idx, piece_len);
+                            got_any_data = true;
+                        }
+                        src_transferred += piece_len;
+                        blocks_received_in_current_req += 1;
+                        speed_bytes += piece_len;
+                        // Per-part credit bucket; see uncompressed branch
+                        // above for rationale. Credit only the bytes actually
+                        // written (gap-overlap), not the full decompressed piece.
+                        let newly_written: u64 =
+                            fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
+                        let block_part = (start / PARTSIZE) as usize;
+                        *per_part_credit.entry(block_part).or_insert(0) += newly_written;
+                        if block_part == part_idx {
+                            bytes_received_this_part += piece_len;
+                            chunks_received_this_part += 1;
+                        } else {
+                            bytes_received_for_other_parts += piece_len;
+                        }
+                        let _ = progress_tx.send((_src_idx, piece_len as i64)).await;
                     }
-                }
-                (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
-                    info!(
+                    (OP_EMULEPROT, OP_AICHANSWER)
+                        if (38..=38 + crate::network::ed2k::aich::MAX_AICH_RECOVERY_BYTES)
+                            .contains(&payload.len()) =>
+                    {
+                        let mut ans_hash = [0u8; 16];
+                        ans_hash.copy_from_slice(&payload[..16]);
+                        let ans_part = u16::from_le_bytes([payload[16], payload[17]]) as usize;
+                        let mut root_hash = [0u8; 20];
+                        root_hash.copy_from_slice(&payload[18..38]);
+                        let recovery_data = &payload[38..];
+                        if ans_hash == *file_hash && ans_part == part_idx {
+                            let aich_master_hash = *shared_aich_master.read().await;
+                            let master_ok = aich_master_hash.map_or(false, |m| m == root_hash);
+                            if master_ok {
+                                aich_recovery_data = Some((root_hash, recovery_data.to_vec()));
+                            } else {
+                                debug!(
+                                    "Ignoring AICH answer: root {} != trusted master {:?}",
+                                    hex::encode(root_hash),
+                                    aich_master_hash.map(hex::encode)
+                                );
+                            }
+                        }
+                    }
+                    (OP_EDONKEYHEADER, OP_OUTOFPARTREQS) => {
+                        info!(
                         "DIAG: source {} ({}) sent OP_OUTOFPARTREQS during part {} (sent_idx={}/{}, received_chunks={}, received_bytes={}, pipelined={:?}) — peer's request queue is full, ending session",
                         _src_idx, addr, part_idx, sent_idx, batches.len(),
                         chunks_received_this_part, bytes_received_this_part,
                         pipelined_next.as_ref().map(|p| p.part_idx),
                     );
-                    peer_out_of_parts = true;
-                    break;
-                }
-                // Peer revoked our upload slot mid-transfer (queue recalculation).
-                // OP_QUEUEFULL (0x93) shares its opcode with OP_MULTIPACKETANSWER;
-                // QueueFull always has an empty payload.
-                (OP_EMULEPROT, OP_QUEUEFULL) if payload.is_empty() => {
-                    emit_source!("queue_full", None, measured_speed);
-                    anyhow::bail!("peer revoked upload slot (QueueFull during transfer)");
-                }
-                (OP_EMULEPROT, OP_QUEUERANKING) if payload.len() >= 2 => {
-                    let rank = u16::from_le_bytes([payload[0], payload[1]]);
-                    emit_source!("queued", Some(rank as u32), measured_speed);
-                    anyhow::bail!("peer put us back in queue at rank {} during transfer", rank);
-                }
-                (OP_EDONKEYHEADER, OP_QUEUERANK) if payload.len() >= 4 => {
-                    let rank = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                    emit_source!("queued", Some(rank), measured_speed);
-                    anyhow::bail!("peer put us back in queue at rank {} during transfer", rank);
-                }
-                (OP_EDONKEYHEADER, OP_FILEREQANSNOFIL) => {
-                    anyhow::bail!("peer no longer has the file (FileNotFound during transfer)");
-                }
-                // Source exchange response: register discovered sources and
-                // notify the network loop so they can be injected into the
-                // active download immediately.
-                (OP_EMULEPROT, OP_ANSWERSOURCES) if payload.len() >= 18 => {
-                    sx_overhead.record_download((6 + payload.len()) as u64);
-                    match parse_answer_sources(&payload, peer_source_exchange_ver) {
-                        Ok((version, answer_hash, entries)) if answer_hash == *file_hash => {
-                            let mut sx_count = 0u32;
-                            let mut sx_entries: Vec<super::transfer::SourceExchangeEntry> = Vec::new();
-                            for entry in entries {
-                                if entry.tcp_port == 0 {
-                                    continue;
-                                }
-                                let uh = entry.user_hash.unwrap_or([0u8; 16]);
-                                let co = entry.crypt_options.unwrap_or(0);
-                                // LowID SX source — `entry.source_id` is the
-                                // peer's server-assigned client ID (< 0x01_000_000).
-                                // We can't dial it directly, but we can ask
-                                // the named server (`entry.server_ip:server_port`)
-                                // to send a callback request — same path the
-                                // server-discovered LowID source flow uses.
-                                // eMule does NOT drop these (see
-                                // `PartFile.cpp::AddClientSources`); dropping
-                                // them in V1/V2 silently halved our source pool
-                                // for any well-seeded file in a LowID-heavy
-                                // network. Register them in the source manager
-                                // so the periodic source-asking sweep can
-                                // dispatch the callback when we're connected
-                                // to the matching server.
-                                // Normalize to eMule's hybrid (host-order) ID
-                                // before classifying. For SX versions < 3 the
-                                // wire ID is byte-swapped, so a raw `< 16M`
-                                // test would mis-read a LowID as a HighID.
-                                let hybrid_id = source_exchange_hybrid_id(version, entry.source_id);
-                                if hybrid_id < 16_777_216 {
-                                    if entry.server_ip == 0 || entry.server_port == 0 {
-                                        // Without a server reference we have
-                                        // no way to reach this peer — drop
-                                        // it (matches eMule's `CanAddSource`
-                                        // gate when the server addr is bogus).
+                        peer_out_of_parts = true;
+                        break;
+                    }
+                    // Peer revoked our upload slot mid-transfer (queue recalculation).
+                    // OP_QUEUEFULL (0x93) shares its opcode with OP_MULTIPACKETANSWER;
+                    // QueueFull always has an empty payload.
+                    (OP_EMULEPROT, OP_QUEUEFULL) if payload.is_empty() => {
+                        emit_source!("queue_full", None, measured_speed);
+                        anyhow::bail!("peer revoked upload slot (QueueFull during transfer)");
+                    }
+                    (OP_EMULEPROT, OP_QUEUERANKING) if payload.len() >= 2 => {
+                        let rank = u16::from_le_bytes([payload[0], payload[1]]);
+                        emit_source!("queued", Some(rank as u32), measured_speed);
+                        anyhow::bail!("peer put us back in queue at rank {} during transfer", rank);
+                    }
+                    (OP_EDONKEYHEADER, OP_QUEUERANK) if payload.len() >= 4 => {
+                        let rank =
+                            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                        emit_source!("queued", Some(rank), measured_speed);
+                        anyhow::bail!("peer put us back in queue at rank {} during transfer", rank);
+                    }
+                    (OP_EDONKEYHEADER, OP_FILEREQANSNOFIL) => {
+                        anyhow::bail!("peer no longer has the file (FileNotFound during transfer)");
+                    }
+                    // Source exchange response: register discovered sources and
+                    // notify the network loop so they can be injected into the
+                    // active download immediately.
+                    (OP_EMULEPROT, OP_ANSWERSOURCES) if payload.len() >= 18 => {
+                        sx_overhead.record_download((6 + payload.len()) as u64);
+                        match parse_answer_sources(&payload, peer_source_exchange_ver) {
+                            Ok((version, answer_hash, entries)) if answer_hash == *file_hash => {
+                                let mut sx_count = 0u32;
+                                let mut sx_entries: Vec<super::transfer::SourceExchangeEntry> =
+                                    Vec::new();
+                                for entry in entries {
+                                    if entry.tcp_port == 0 {
+                                        continue;
+                                    }
+                                    let uh = entry.user_hash.unwrap_or([0u8; 16]);
+                                    let co = entry.crypt_options.unwrap_or(0);
+                                    // LowID SX source — `entry.source_id` is the
+                                    // peer's server-assigned client ID (< 0x01_000_000).
+                                    // We can't dial it directly, but we can ask
+                                    // the named server (`entry.server_ip:server_port`)
+                                    // to send a callback request — same path the
+                                    // server-discovered LowID source flow uses.
+                                    // eMule does NOT drop these (see
+                                    // `PartFile.cpp::AddClientSources`); dropping
+                                    // them in V1/V2 silently halved our source pool
+                                    // for any well-seeded file in a LowID-heavy
+                                    // network. Register them in the source manager
+                                    // so the periodic source-asking sweep can
+                                    // dispatch the callback when we're connected
+                                    // to the matching server.
+                                    // Normalize to eMule's hybrid (host-order) ID
+                                    // before classifying. For SX versions < 3 the
+                                    // wire ID is byte-swapped, so a raw `< 16M`
+                                    // test would mis-read a LowID as a HighID.
+                                    let hybrid_id =
+                                        source_exchange_hybrid_id(version, entry.source_id);
+                                    if hybrid_id < 16_777_216 {
+                                        if entry.server_ip == 0 || entry.server_port == 0 {
+                                            // Without a server reference we have
+                                            // no way to reach this peer — drop
+                                            // it (matches eMule's `CanAddSource`
+                                            // gate when the server addr is bogus).
+                                            continue;
+                                        }
+                                        if let Some(sm) = &source_mgr {
+                                            let mut sm = sm.write().await;
+                                            sm.register_lowid_source(
+                                                *file_hash,
+                                                hybrid_id,
+                                                entry.tcp_port,
+                                                entry.server_ip,
+                                                entry.server_port,
+                                                uh,
+                                                co,
+                                            );
+                                        }
+                                        sx_count += 1;
+                                        continue;
+                                    }
+                                    let ip = source_exchange_id_to_ipv4(version, entry.source_id);
+                                    if is_filtered_source_ip(&ip)
+                                        || is_sx_rejected(&ip, entry.tcp_port)
+                                    {
                                         continue;
                                     }
                                     if let Some(sm) = &source_mgr {
                                         let mut sm = sm.write().await;
-                                        sm.register_lowid_source(
-                                            *file_hash, hybrid_id, entry.tcp_port,
-                                            entry.server_ip, entry.server_port, uh, co,
+                                        sm.register_source_full_server(
+                                            *file_hash,
+                                            ip,
+                                            entry.tcp_port,
+                                            0,
+                                            entry.server_ip,
+                                            entry.server_port,
+                                            uh,
+                                            co,
                                         );
                                     }
+                                    sx_entries.push(super::transfer::SourceExchangeEntry {
+                                        ip,
+                                        tcp_port: entry.tcp_port,
+                                        user_hash: uh,
+                                        crypt_options: co,
+                                    });
                                     sx_count += 1;
-                                    continue;
                                 }
-                                let ip = source_exchange_id_to_ipv4(version, entry.source_id);
-                                if is_filtered_source_ip(&ip) || is_sx_rejected(&ip, entry.tcp_port) {
-                                    continue;
-                                }
-                                if let Some(sm) = &source_mgr {
-                                    let mut sm = sm.write().await;
-                                    sm.register_source_full_server(
-                                        *file_hash, ip, entry.tcp_port, 0, entry.server_ip, entry.server_port, uh, co,
-                                    );
-                                }
-                                sx_entries.push(super::transfer::SourceExchangeEntry {
-                                    ip, tcp_port: entry.tcp_port, user_hash: uh, crypt_options: co,
-                                });
-                                sx_count += 1;
-                            }
-                            if sx_count > 0 {
-                                debug!(
+                                if sx_count > 0 {
+                                    debug!(
                                     "Legacy source exchange: registered {sx_count} new sources from multi-source peer {}",
                                     _src_idx
                                 );
-                                if let Some(ref etx) = event_tx {
-                                    let _ = etx.send(DownloadEvent::SourceExchange {
-                                        transfer_id: transfer_id.clone(),
-                                        file_hash: *file_hash,
-                                        sources: sx_entries,
-                                    }).await;
+                                    if let Some(ref etx) = event_tx {
+                                        let _ = etx
+                                            .send(DownloadEvent::SourceExchange {
+                                                transfer_id: transfer_id.clone(),
+                                                file_hash: *file_hash,
+                                                sources: sx_entries,
+                                            })
+                                            .await;
+                                    }
                                 }
                             }
-                        }
-                        Ok((_version, answer_hash, _)) => {
-                            debug!(
+                            Ok((_version, answer_hash, _)) => {
+                                debug!(
                                 "Ignoring OP_ANSWERSOURCES from multi-source peer {} for different file {}",
                                 _src_idx,
                                 hex::encode(answer_hash)
                             );
+                            }
+                            Err(e) => debug!(
+                                "Failed to parse OP_ANSWERSOURCES from multi-source peer {}: {e}",
+                                _src_idx
+                            ),
                         }
-                        Err(e) => debug!("Failed to parse OP_ANSWERSOURCES from multi-source peer {}: {e}", _src_idx),
                     }
-                }
-                (OP_EMULEPROT, OP_ANSWERSOURCES2) if payload.len() >= 19 => {
-                    sx_overhead.record_download((6 + payload.len()) as u64);
-                    match parse_answer_sources2(&payload) {
-                        Ok((version, answer_hash, entries)) if answer_hash == *file_hash => {
-                            let mut sx_count = 0u32;
-                            let mut sx_entries: Vec<super::transfer::SourceExchangeEntry> = Vec::new();
-                            for entry in entries {
-                                if entry.tcp_port == 0 {
-                                    continue;
-                                }
-                                let uh = entry.user_hash.unwrap_or([0u8; 16]);
-                                let co = entry.crypt_options.unwrap_or(0);
-                                // Same LowID handling as the SX1 arm above —
-                                // register with the named server so we can
-                                // request a callback later instead of
-                                // silently dropping every LowID peer the
-                                // upstream client knew about.
-                                let hybrid_id = source_exchange_hybrid_id(version, entry.source_id);
-                                if hybrid_id < 16_777_216 {
-                                    if entry.server_ip == 0 || entry.server_port == 0 {
+                    (OP_EMULEPROT, OP_ANSWERSOURCES2) if payload.len() >= 19 => {
+                        sx_overhead.record_download((6 + payload.len()) as u64);
+                        match parse_answer_sources2(&payload) {
+                            Ok((version, answer_hash, entries)) if answer_hash == *file_hash => {
+                                let mut sx_count = 0u32;
+                                let mut sx_entries: Vec<super::transfer::SourceExchangeEntry> =
+                                    Vec::new();
+                                for entry in entries {
+                                    if entry.tcp_port == 0 {
                                         continue;
+                                    }
+                                    let uh = entry.user_hash.unwrap_or([0u8; 16]);
+                                    let co = entry.crypt_options.unwrap_or(0);
+                                    // Same LowID handling as the SX1 arm above —
+                                    // register with the named server so we can
+                                    // request a callback later instead of
+                                    // silently dropping every LowID peer the
+                                    // upstream client knew about.
+                                    let hybrid_id =
+                                        source_exchange_hybrid_id(version, entry.source_id);
+                                    if hybrid_id < 16_777_216 {
+                                        if entry.server_ip == 0 || entry.server_port == 0 {
+                                            continue;
+                                        }
+                                        if let Some(sm) = &source_mgr {
+                                            let mut sm = sm.write().await;
+                                            sm.register_lowid_source(
+                                                *file_hash,
+                                                hybrid_id,
+                                                entry.tcp_port,
+                                                entry.server_ip,
+                                                entry.server_port,
+                                                uh,
+                                                co,
+                                            );
+                                        }
+                                        sx_count += 1;
+                                        continue;
+                                    }
+                                    let ip = source_exchange_id_to_ipv4(version, entry.source_id);
+                                    if is_filtered_source_ip(&ip)
+                                        || is_sx_rejected(&ip, entry.tcp_port)
+                                    {
+                                        continue;
+                                    }
+                                    if entry.server_ip != 0 {
+                                        debug!(
+                                            "SX2 source {} advertises server {:08X}:{}",
+                                            ip, entry.server_ip, entry.server_port
+                                        );
                                     }
                                     if let Some(sm) = &source_mgr {
                                         let mut sm = sm.write().await;
-                                        sm.register_lowid_source(
-                                            *file_hash, hybrid_id, entry.tcp_port,
-                                            entry.server_ip, entry.server_port, uh, co,
+                                        sm.register_source_full_server(
+                                            *file_hash,
+                                            ip,
+                                            entry.tcp_port,
+                                            0,
+                                            entry.server_ip,
+                                            entry.server_port,
+                                            uh,
+                                            co,
                                         );
                                     }
+                                    sx_entries.push(super::transfer::SourceExchangeEntry {
+                                        ip,
+                                        tcp_port: entry.tcp_port,
+                                        user_hash: uh,
+                                        crypt_options: co,
+                                    });
                                     sx_count += 1;
-                                    continue;
                                 }
-                                let ip = source_exchange_id_to_ipv4(version, entry.source_id);
-                                if is_filtered_source_ip(&ip) || is_sx_rejected(&ip, entry.tcp_port) {
-                                    continue;
-                                }
-                                if entry.server_ip != 0 {
-                                    debug!("SX2 source {} advertises server {:08X}:{}", ip, entry.server_ip, entry.server_port);
-                                }
-                                if let Some(sm) = &source_mgr {
-                                    let mut sm = sm.write().await;
-                                    sm.register_source_full_server(
-                                        *file_hash, ip, entry.tcp_port, 0,
-                                        entry.server_ip, entry.server_port, uh, co,
-                                    );
-                                }
-                                sx_entries.push(super::transfer::SourceExchangeEntry {
-                                    ip, tcp_port: entry.tcp_port, user_hash: uh, crypt_options: co,
-                                });
-                                sx_count += 1;
-                            }
-                            if sx_count > 0 {
-                                debug!("Source exchange: registered {sx_count} new sources from multi-source peer {}", _src_idx);
-                                if let Some(ref etx) = event_tx {
-                                    let _ = etx.send(DownloadEvent::SourceExchange {
-                                        transfer_id: transfer_id.clone(),
-                                        file_hash: *file_hash,
-                                        sources: sx_entries,
-                                    }).await;
+                                if sx_count > 0 {
+                                    debug!("Source exchange: registered {sx_count} new sources from multi-source peer {}", _src_idx);
+                                    if let Some(ref etx) = event_tx {
+                                        let _ = etx
+                                            .send(DownloadEvent::SourceExchange {
+                                                transfer_id: transfer_id.clone(),
+                                                file_hash: *file_hash,
+                                                sources: sx_entries,
+                                            })
+                                            .await;
+                                    }
                                 }
                             }
-                        }
-                        Ok((_version, answer_hash, _)) => {
-                            debug!(
+                            Ok((_version, answer_hash, _)) => {
+                                debug!(
                                 "Ignoring OP_ANSWERSOURCES2 from multi-source peer {} for different file {}",
                                 _src_idx,
                                 hex::encode(answer_hash)
                             );
-                        }
-                        Err(e) => debug!("Failed to parse OP_ANSWERSOURCES2 from multi-source peer {}: {e}", _src_idx),
-                    }
-                }
-                // Ember-only; gated on `hello_caps.is_ember` (see upload.rs).
-                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if hello_caps.is_ember => {
-                    sx_overhead.record_download((6 + payload.len()) as u64);
-                    if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
-                        debug!("Ignoring excess EPX packet from multi-source peer {}", _src_idx);
-                    } else {
-                        epx_packets_received += 1;
-                        match crate::network::ember::parse_exchange_payload(&payload) {
-                            Ok(result) if !result.files.is_empty() || !result.peers.is_empty() => {
-                                info!("Received Ember Peer Exchange from multi-source peer {} ({} files, {} peers)", _src_idx, result.files.len(), result.peers.len());
-                                let (epx_entries, aich_roots) = super::transfer::epx_result_to_entries(&result);
-                                let ember_peers = result.peers.into_iter().map(|p| (p.ip, p.tcp_port)).collect();
-                                if let Some(ref etx) = event_tx {
-                                    let _ = etx.send(DownloadEvent::EmberSources {
-                                        transfer_id: transfer_id.clone(),
-                                        entries: epx_entries,
-                                        aich_roots,
-                                        ember_peers,
-                                    }).await;
-                                }
                             }
-                            Ok(_) => {}
-                            Err(e) => debug!("Failed to parse Ember exchange from peer {}: {e}", _src_idx),
+                            Err(e) => debug!(
+                                "Failed to parse OP_ANSWERSOURCES2 from multi-source peer {}: {e}",
+                                _src_idx
+                            ),
                         }
                     }
-                }
-                (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if hello_caps.is_ember => {
-                    if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
-                        let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
-                        // PoP-only `verified` (see early-friend-request
-                        // site for rationale). Binding tracked
-                        // separately for the log line.
-                        let verified = ember_auth_verified;
-                        info!("Received runtime friend request from source {} (nick='{}', verified={verified}, pop={}, binding={ember_hash_binding_verified})", _src_idx, nick, ember_auth_verified);
-                        let _ = etx.send(DownloadEvent::EmberFriendRequest {
-                            ember_hash: eh,
-                            nickname: nick,
-                            peer_ip: addr.ip().to_string(),
-                            peer_port: addr.port(),
-                            verified,
-                        }).await;
-                    }
-                }
-                // Privilege-granting friend opcodes: `is_ember_friend`
-                // alone means the peer CLAIMS a hash we friend-listed,
-                // which a spoofer can do after harvesting the hash
-                // from KAD/EPX/trackers. Additional gating on
-                // `ember_auth_verified` requires the peer to have
-                // completed the full Ed25519 challenge-response on
-                // THIS session — closing the same residual window
-                // that the upload side guards against. Chat forged as
-                // our friend and spoofed browse results are the two
-                // visible attacks here.
-                (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && ember_auth_verified && payload.len() <= 4096 => {
-                    if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
-                        if let Ok(msg) = std::str::from_utf8(&payload) {
-                            let _ = etx.send(DownloadEvent::EmberChatMessage {
-                                ember_hash: eh,
-                                message: msg.to_string(),
-                            }).await;
+                    // Ember-only; gated on `hello_caps.is_ember` (see upload.rs).
+                    (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if hello_caps.is_ember => {
+                        sx_overhead.record_download((6 + payload.len()) as u64);
+                        if epx_packets_received
+                            >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION
+                        {
+                            debug!(
+                                "Ignoring excess EPX packet from multi-source peer {}",
+                                _src_idx
+                            );
+                        } else {
+                            epx_packets_received += 1;
+                            match crate::network::ember::parse_exchange_payload(&payload) {
+                                Ok(result)
+                                    if !result.files.is_empty() || !result.peers.is_empty() =>
+                                {
+                                    info!("Received Ember Peer Exchange from multi-source peer {} ({} files, {} peers)", _src_idx, result.files.len(), result.peers.len());
+                                    let (epx_entries, aich_roots) =
+                                        super::transfer::epx_result_to_entries(&result);
+                                    let ember_peers = result
+                                        .peers
+                                        .into_iter()
+                                        .map(|p| (p.ip, p.tcp_port))
+                                        .collect();
+                                    if let Some(ref etx) = event_tx {
+                                        let _ = etx
+                                            .send(DownloadEvent::EmberSources {
+                                                transfer_id: transfer_id.clone(),
+                                                entries: epx_entries,
+                                                aich_roots,
+                                                ember_peers,
+                                            })
+                                            .await;
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(e) => debug!(
+                                    "Failed to parse Ember exchange from peer {}: {e}",
+                                    _src_idx
+                                ),
+                            }
                         }
                     }
-                }
-                (OP_EMULEPROT, OP_EMBER_BROWSE_RES) if is_ember_friend && ember_auth_verified => {
-                    if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
-                        let entries = parse_browse_response(&payload);
-                        let _ = etx.send(DownloadEvent::EmberBrowseResponse {
-                            ember_hash: eh,
-                            entries,
-                        }).await;
+                    (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) if hello_caps.is_ember => {
+                        if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
+                            let nick = std::str::from_utf8(&payload).unwrap_or("").to_string();
+                            // PoP-only `verified` (see early-friend-request
+                            // site for rationale). Binding tracked
+                            // separately for the log line.
+                            let verified = ember_auth_verified;
+                            info!("Received runtime friend request from source {} (nick='{}', verified={verified}, pop={}, binding={ember_hash_binding_verified})", _src_idx, nick, ember_auth_verified);
+                            let _ = etx
+                                .send(DownloadEvent::EmberFriendRequest {
+                                    ember_hash: eh,
+                                    nickname: nick,
+                                    peer_ip: addr.ip().to_string(),
+                                    peer_port: addr.port(),
+                                    verified,
+                                })
+                                .await;
+                        }
                     }
-                }
-                (OP_EMULEPROT, OP_FILEDESC) if payload.len() >= 5 => {
-                    let rating = payload[0];
-                    let comment_len = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
-                    if comment_len.checked_add(5).map_or(false, |need| payload.len() >= need) {
-                        let comment = String::from_utf8_lossy(&payload[5..5+comment_len]).to_string();
-                        if let Some(cm) = &comment_mgr {
-                            let mut cm = cm.write().await;
-                            cm.add_peer_comment(
-                                &hex::encode(file_hash),
-                                addr.to_string(),
-                                rating,
-                                comment.clone(),
-                                0,
+                    // Privilege-granting friend opcodes: `is_ember_friend`
+                    // alone means the peer CLAIMS a hash we friend-listed,
+                    // which a spoofer can do after harvesting the hash
+                    // from KAD/EPX/trackers. Additional gating on
+                    // `ember_auth_verified` requires the peer to have
+                    // completed the full Ed25519 challenge-response on
+                    // THIS session — closing the same residual window
+                    // that the upload side guards against. Chat forged as
+                    // our friend and spoofed browse results are the two
+                    // visible attacks here.
+                    (OP_EMULEPROT, OP_EMBER_CHAT_MSG)
+                        if is_ember_friend && ember_auth_verified && payload.len() <= 4096 =>
+                    {
+                        if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
+                            if let Ok(msg) = std::str::from_utf8(&payload) {
+                                let _ = etx
+                                    .send(DownloadEvent::EmberChatMessage {
+                                        ember_hash: eh,
+                                        message: msg.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    (OP_EMULEPROT, OP_EMBER_BROWSE_RES)
+                        if is_ember_friend && ember_auth_verified =>
+                    {
+                        if let (Some(eh), Some(ref etx)) = (peer_ember_hash, &event_tx) {
+                            let entries = parse_browse_response(&payload);
+                            let _ = etx
+                                .send(DownloadEvent::EmberBrowseResponse {
+                                    ember_hash: eh,
+                                    entries,
+                                })
+                                .await;
+                        }
+                    }
+                    (OP_EMULEPROT, OP_FILEDESC) if payload.len() >= 5 => {
+                        let rating = payload[0];
+                        let comment_len =
+                            u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]])
+                                as usize;
+                        if comment_len
+                            .checked_add(5)
+                            .map_or(false, |need| payload.len() >= need)
+                        {
+                            let comment =
+                                String::from_utf8_lossy(&payload[5..5 + comment_len]).to_string();
+                            if let Some(cm) = &comment_mgr {
+                                let mut cm = cm.write().await;
+                                cm.add_peer_comment(
+                                    &hex::encode(file_hash),
+                                    addr.to_string(),
+                                    rating,
+                                    comment.clone(),
+                                    0,
+                                );
+                            }
+                            debug!(
+                                "Peer comment from source {}: rating={rating}, comment='{comment}'",
+                                _src_idx
                             );
                         }
-                        debug!("Peer comment from source {}: rating={rating}, comment='{comment}'", _src_idx);
+                    }
+                    // OP_REASKACK arriving mid-transfer is normal benign
+                    // chatter: peers send it ~100-300 ms after we re-queue
+                    // via OP_STARTUPLOADREQ (in-session re-queue path) and
+                    // some clients also send periodic queue-rank pings even
+                    // while we're actively downloading. Silently drop —
+                    // logging it as "unexpected" misled us into thinking
+                    // the in-session re-queue had a bug.
+                    (OP_EDONKEYHEADER, OP_REASKACK) => {}
+                    _ => {
+                        info!("During data transfer, unexpected packet proto=0x{:02X} op=0x{:02X} ({} bytes) from source {} ({})",
+                        proto, opcode, payload.len(), _src_idx, addr);
                     }
                 }
-                // OP_REASKACK arriving mid-transfer is normal benign
-                // chatter: peers send it ~100-300 ms after we re-queue
-                // via OP_STARTUPLOADREQ (in-session re-queue path) and
-                // some clients also send periodic queue-rank pings even
-                // while we're actively downloading. Silently drop —
-                // logging it as "unexpected" misled us into thinking
-                // the in-session re-queue had a bug.
-                (OP_EDONKEYHEADER, OP_REASKACK) => {}
-                _ => {
-                    info!("During data transfer, unexpected packet proto=0x{:02X} op=0x{:02X} ({} bytes) from source {} ({})",
-                        proto, opcode, payload.len(), _src_idx, addr);
-                }
-            }
 
-            // Pipeline refill when a request's worth of blocks completes
-            let blocks_in_batch = if completed_reqs < batches.len() {
-                batches[completed_reqs].len()
-            } else {
-                MAX_BLOCKS_PER_REQUEST
-            };
-            if blocks_received_in_current_req >= blocks_in_batch {
-                blocks_received_in_current_req = 0;
-                completed_reqs += 1;
-                if sent_idx < batches.len() {
-                    let batch = &batches[sent_idx];
-                    let (req_payload, req_proto, req_op) = if needs_i64 {
-                        (build_request_parts_i64(file_hash, batch), OP_EMULEPROT, OP_REQUESTPARTS_I64)
-                    } else {
-                        (build_request_parts(file_hash, batch), OP_EDONKEYHEADER, OP_REQUESTPARTS)
-                    };
-                    write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await?;
-                    sent_idx += 1;
-                } else if pipelined_next.is_none() && !batches.is_empty() && !pipeline_giveup_for_part {
-                    // CROSS-PART PIPELINE: every batch for the current
-                    // part has been sent, but we're still receiving
-                    // bytes. Pre-pick the next part and ship its first
-                    // OP_REQUESTPARTS so the peer's send queue stays
-                    // saturated through the part-N → part-(N+1)
-                    // hand-off (no round-trip stall, no Hello/SecIdent
-                    // reconnect).
-                    //
-                    // Gated on `!pipeline_giveup_for_part`: once we've
-                    // already discovered there's no next part to
-                    // pipeline (tail of the last queued part, all
-                    // other parts in-progress on other sources, or
-                    // download nearly complete), don't keep retrying
-                    // on every batch completion. See declaration of
-                    // `pipeline_giveup_for_part` for the full
-                    // rationale.
-                    //
-                    // CRITICAL: pipeline the part the next iteration
-                    // will actually pick — i.e. the next entry already
-                    // in `part_queue`. Previously the pipelining asked
-                    // chunk_selector for the "best" part, which can
-                    // diverge from the queued order (especially in
-                    // retry rounds where the queue holds 5-10
-                    // pre-assigned parts). When that happened, the
-                    // resume-state filter `pipelined_next.take().filter(
-                    // |p| p.part_idx == part_idx)` discarded the
-                    // pipelined state, the peer was still processing
-                    // our pipelined OP_REQUESTPARTS for the wrong
-                    // part, AND we sent fresh requests for the
-                    // actually-next part — total in-flight requests
-                    // exceeded the peer's queue cap and they sent
-                    // OP_OUTOFPARTREQS, killing the session after
-                    // ~9.4 MiB.
-                    //
-                    // Only fall back to chunk_selector when the queue
-                    // is exhausted (initial single-part assignment
-                    // case); in that path the new part also gets
-                    // appended to `part_queue` so the resume picks it
-                    // up. Either way, the pipelined `part_idx` is
-                    // guaranteed to match the next iteration's
-                    // `part_idx`.
-                    let next_queued_part: Option<usize> =
-                        part_queue.get(queue_idx).copied();
-                    let pipeline_target: Option<usize> = match next_queued_part {
-                        Some(qp) => {
-                            // Skip if it's already complete (race with
-                            // another source); the next iteration's
-                            // `is_part_complete` check would have
-                            // skipped it anyway.
-                            let still_needed = {
-                                let t = tracker.read().await;
-                                !t.is_part_complete(qp)
-                            };
-                            if still_needed { Some(qp) } else { None }
-                        }
-                        None => {
-                            // Queue exhausted — extend it via the
-                            // chunk_selector pick, same logic as the
-                            // post-iteration dynamic-extend. The new
-                            // part is appended to part_queue so the
-                            // next iteration picks it up; the
-                            // pipelined state will then match.
-                            match pre_pipeline_next_part_ms(
-                                &chunk_sel,
-                                &tracker,
-                                &source_available,
-                                &control,
-                                &part_queue,
-                                peer_supports_large_files,
-                                file_size,
+                // Pipeline refill when a request's worth of blocks completes
+                let blocks_in_batch = if completed_reqs < batches.len() {
+                    batches[completed_reqs].len()
+                } else {
+                    MAX_BLOCKS_PER_REQUEST
+                };
+                if blocks_received_in_current_req >= blocks_in_batch {
+                    blocks_received_in_current_req = 0;
+                    completed_reqs += 1;
+                    if sent_idx < batches.len() {
+                        let batch = &batches[sent_idx];
+                        let (req_payload, req_proto, req_op) = if needs_i64 {
+                            (
+                                build_request_parts_i64(file_hash, batch),
+                                OP_EMULEPROT,
+                                OP_REQUESTPARTS_I64,
                             )
-                            .await
-                            {
-                                Some(c) => {
-                                    if !part_queue.contains(&c.part_idx) {
-                                        part_queue.push(c.part_idx);
-                                    }
-                                    Some(c.part_idx)
+                        } else {
+                            (
+                                build_request_parts(file_hash, batch),
+                                OP_EDONKEYHEADER,
+                                OP_REQUESTPARTS,
+                            )
+                        };
+                        write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload)
+                            .await?;
+                        sent_idx += 1;
+                    } else if pipelined_next.is_none()
+                        && !batches.is_empty()
+                        && !pipeline_giveup_for_part
+                    {
+                        // CROSS-PART PIPELINE: every batch for the current
+                        // part has been sent, but we're still receiving
+                        // bytes. Pre-pick the next part and ship its first
+                        // OP_REQUESTPARTS so the peer's send queue stays
+                        // saturated through the part-N → part-(N+1)
+                        // hand-off (no round-trip stall, no Hello/SecIdent
+                        // reconnect).
+                        //
+                        // Gated on `!pipeline_giveup_for_part`: once we've
+                        // already discovered there's no next part to
+                        // pipeline (tail of the last queued part, all
+                        // other parts in-progress on other sources, or
+                        // download nearly complete), don't keep retrying
+                        // on every batch completion. See declaration of
+                        // `pipeline_giveup_for_part` for the full
+                        // rationale.
+                        //
+                        // CRITICAL: pipeline the part the next iteration
+                        // will actually pick — i.e. the next entry already
+                        // in `part_queue`. Previously the pipelining asked
+                        // chunk_selector for the "best" part, which can
+                        // diverge from the queued order (especially in
+                        // retry rounds where the queue holds 5-10
+                        // pre-assigned parts). When that happened, the
+                        // resume-state filter `pipelined_next.take().filter(
+                        // |p| p.part_idx == part_idx)` discarded the
+                        // pipelined state, the peer was still processing
+                        // our pipelined OP_REQUESTPARTS for the wrong
+                        // part, AND we sent fresh requests for the
+                        // actually-next part — total in-flight requests
+                        // exceeded the peer's queue cap and they sent
+                        // OP_OUTOFPARTREQS, killing the session after
+                        // ~9.4 MiB.
+                        //
+                        // Only fall back to chunk_selector when the queue
+                        // is exhausted (initial single-part assignment
+                        // case); in that path the new part also gets
+                        // appended to `part_queue` so the resume picks it
+                        // up. Either way, the pipelined `part_idx` is
+                        // guaranteed to match the next iteration's
+                        // `part_idx`.
+                        let next_queued_part: Option<usize> = part_queue.get(queue_idx).copied();
+                        let pipeline_target: Option<usize> = match next_queued_part {
+                            Some(qp) => {
+                                // Skip if it's already complete (race with
+                                // another source); the next iteration's
+                                // `is_part_complete` check would have
+                                // skipped it anyway.
+                                let still_needed = {
+                                    let t = tracker.read().await;
+                                    !t.is_part_complete(qp)
+                                };
+                                if still_needed {
+                                    Some(qp)
+                                } else {
+                                    None
                                 }
-                                None => None,
                             }
-                        }
-                    };
+                            None => {
+                                // Queue exhausted — extend it via the
+                                // chunk_selector pick, same logic as the
+                                // post-iteration dynamic-extend. The new
+                                // part is appended to part_queue so the
+                                // next iteration picks it up; the
+                                // pipelined state will then match.
+                                match pre_pipeline_next_part_ms(
+                                    &chunk_sel,
+                                    &tracker,
+                                    &source_available,
+                                    &control,
+                                    &part_queue,
+                                    peer_supports_large_files,
+                                    file_size,
+                                )
+                                .await
+                                {
+                                    Some(c) => {
+                                        if !part_queue.contains(&c.part_idx) {
+                                            part_queue.push(c.part_idx);
+                                        }
+                                        Some(c.part_idx)
+                                    }
+                                    None => None,
+                                }
+                            }
+                        };
 
-                    if let Some(target_part_idx) = pipeline_target {
-                        let (target_blocks, _ps, _pe) =
-                            compute_part_blocks_ms(&tracker, target_part_idx).await;
-                        if target_blocks.is_empty() {
-                            info!(
+                        if let Some(target_part_idx) = pipeline_target {
+                            let (target_blocks, _ps, _pe) =
+                                compute_part_blocks_ms(&tracker, target_part_idx).await;
+                            if target_blocks.is_empty() {
+                                info!(
                                 "DIAG: source {} ({}) cross-part pipeline target part {} has no remaining gaps — skipping",
                                 _src_idx, addr, target_part_idx,
                             );
-                        } else {
-                            let target_batches: Vec<Vec<(u64, u64)>> = target_blocks
-                                .chunks(MAX_BLOCKS_PER_REQUEST)
-                                .map(|c| c.to_vec())
-                                .collect();
-                            let target_needs_i64 = peer_supports_large_files
-                                && target_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
-
-                            // Send only the FIRST block of the first
-                            // batch (~180 KiB), not the whole 3-block
-                            // batch. Just enough to mask the
-                            // round-trip latency for the part-N →
-                            // part-(N+1) hand-off without burning
-                            // multiple slots in the peer's request
-                            // queue. Remaining batches of the target
-                            // are sent by the next iteration's
-                            // normal max_outstanding loop.
-                            let mut first_batch = target_batches[0].clone();
-                            first_batch.truncate(1);
-                            let pipelined_bytes: u64 =
-                                first_batch.iter().map(|(s, e)| e - s).sum();
-                            let (req_payload, req_proto, req_op) = if target_needs_i64 {
-                                (build_request_parts_i64(file_hash, &first_batch), OP_EMULEPROT, OP_REQUESTPARTS_I64)
                             } else {
-                                (build_request_parts(file_hash, &first_batch), OP_EDONKEYHEADER, OP_REQUESTPARTS)
-                            };
-                            if let Err(e) = write_packet_async_ms(&mut *writer, req_proto, req_op, &req_payload).await {
-                                info!(
+                                let target_batches: Vec<Vec<(u64, u64)>> = target_blocks
+                                    .chunks(MAX_BLOCKS_PER_REQUEST)
+                                    .map(|c| c.to_vec())
+                                    .collect();
+                                let target_needs_i64 = peer_supports_large_files
+                                    && target_blocks.iter().any(|&(_, end)| end > u32::MAX as u64);
+
+                                // Send only the FIRST block of the first
+                                // batch (~180 KiB), not the whole 3-block
+                                // batch. Just enough to mask the
+                                // round-trip latency for the part-N →
+                                // part-(N+1) hand-off without burning
+                                // multiple slots in the peer's request
+                                // queue. Remaining batches of the target
+                                // are sent by the next iteration's
+                                // normal max_outstanding loop.
+                                let mut first_batch = target_batches[0].clone();
+                                first_batch.truncate(1);
+                                let pipelined_bytes: u64 =
+                                    first_batch.iter().map(|(s, e)| e - s).sum();
+                                let (req_payload, req_proto, req_op) = if target_needs_i64 {
+                                    (
+                                        build_request_parts_i64(file_hash, &first_batch),
+                                        OP_EMULEPROT,
+                                        OP_REQUESTPARTS_I64,
+                                    )
+                                } else {
+                                    (
+                                        build_request_parts(file_hash, &first_batch),
+                                        OP_EDONKEYHEADER,
+                                        OP_REQUESTPARTS,
+                                    )
+                                };
+                                if let Err(e) = write_packet_async_ms(
+                                    &mut *writer,
+                                    req_proto,
+                                    req_op,
+                                    &req_payload,
+                                )
+                                .await
+                                {
+                                    info!(
                                     "DIAG: source {} ({}) cross-part pipeline send for part {} failed: {e:#} — falling back to non-pipelined hand-off",
                                     _src_idx, addr, target_part_idx,
                                 );
-                            } else {
-                                info!(
+                                } else {
+                                    info!(
                                     "DIAG: source {} ({}) cross-part pipeline: pre-sent first block of part {} ({} bytes, {} blocks) while still receiving part {} (queue_idx_next={}, queue_len={})",
                                     _src_idx, addr, target_part_idx, pipelined_bytes,
                                     first_batch.len(), part_idx,
                                     queue_idx, part_queue.len(),
                                 );
-                                {
-                                    let mut t = tracker.write().await;
-                                    t.set_in_progress(target_part_idx, true);
+                                    {
+                                        let mut t = tracker.write().await;
+                                        t.set_in_progress(target_part_idx, true);
+                                    }
+                                    ip_guard.mark(target_part_idx);
+                                    // The pipelined state must reflect
+                                    // exactly what bytes the peer will
+                                    // send us next. We pipelined ONE
+                                    // block; the resume path needs to
+                                    // send the remainder. If batches[0]
+                                    // had only 1 block, advance sent_idx
+                                    // to 1; otherwise replace batches[0]
+                                    // with the un-pipelined tail so the
+                                    // resume "send batches[sent_idx..]"
+                                    // loop covers it.
+                                    let mut resume_batches = target_batches;
+                                    let resume_sent_idx;
+                                    if resume_batches[0].len() <= 1 {
+                                        resume_sent_idx = 1;
+                                    } else {
+                                        resume_batches[0] = resume_batches[0][1..].to_vec();
+                                        resume_sent_idx = 0;
+                                    }
+                                    pipelined_next = Some(PipelinedNext {
+                                        part_idx: target_part_idx,
+                                        all_blocks: target_blocks,
+                                        batches: resume_batches,
+                                        sent_idx: resume_sent_idx,
+                                        needs_i64: target_needs_i64,
+                                    });
                                 }
-                                ip_guard.mark(target_part_idx);
-                                // The pipelined state must reflect
-                                // exactly what bytes the peer will
-                                // send us next. We pipelined ONE
-                                // block; the resume path needs to
-                                // send the remainder. If batches[0]
-                                // had only 1 block, advance sent_idx
-                                // to 1; otherwise replace batches[0]
-                                // with the un-pipelined tail so the
-                                // resume "send batches[sent_idx..]"
-                                // loop covers it.
-                                let mut resume_batches = target_batches;
-                                let resume_sent_idx;
-                                if resume_batches[0].len() <= 1 {
-                                    resume_sent_idx = 1;
-                                } else {
-                                    resume_batches[0] = resume_batches[0][1..].to_vec();
-                                    resume_sent_idx = 0;
-                                }
-                                pipelined_next = Some(PipelinedNext {
-                                    part_idx: target_part_idx,
-                                    all_blocks: target_blocks,
-                                    batches: resume_batches,
-                                    sent_idx: resume_sent_idx,
-                                    needs_i64: target_needs_i64,
-                                });
                             }
-                        }
-                    } else {
-                        // Downgraded from info! to debug! and gated
-                        // by the giveup flag below: in the prior
-                        // build this fired ~30-50 Hz per source for
-                        // the entire 10+ s tail of the last part of
-                        // a download (terminals/31.txt). Useful as
-                        // a once-per-part breadcrumb but never as
-                        // a steady-state log line.
-                        debug!(
+                        } else {
+                            // Downgraded from info! to debug! and gated
+                            // by the giveup flag below: in the prior
+                            // build this fired ~30-50 Hz per source for
+                            // the entire 10+ s tail of the last part of
+                            // a download (terminals/31.txt). Useful as
+                            // a once-per-part breadcrumb but never as
+                            // a steady-state log line.
+                            debug!(
                             "DIAG: source {} ({}) cross-part pipeline trigger fired for part {} (sent_idx={}/{}) but no eligible next part found (queue_idx={}, queue_len={}); marking pipeline as given up for this part",
                             _src_idx, addr, part_idx, sent_idx, batches.len(),
                             queue_idx, part_queue.len(),
                         );
-                        // Suppress further trigger work for the rest
-                        // of this part — there's no event in this
-                        // per-part loop that would make a new part
-                        // appear in `part_queue`.
-                        pipeline_giveup_for_part = true;
+                            // Suppress further trigger work for the rest
+                            // of this part — there's no event in this
+                            // per-part loop that would make a new part
+                            // appear in `part_queue`.
+                            pipeline_giveup_for_part = true;
+                        }
                     }
+                }
+
+                let elapsed = speed_start.elapsed();
+                if elapsed.as_millis() >= 2000 {
+                    measured_speed =
+                        (speed_bytes as u128 * 1000 / elapsed.as_millis().max(1)) as u64;
+                    speed_bytes = 0;
+                    speed_start = std::time::Instant::now();
+                    emit_source!(
+                        if got_any_data {
+                            "transferring"
+                        } else {
+                            "stalled"
+                        },
+                        None,
+                        measured_speed
+                    );
+                }
+
+                if last_periodic_save.elapsed() >= PERIODIC_SAVE_INTERVAL {
+                    // CRITICAL: take the snapshot under the lock, then drop the
+                    // lock BEFORE the disk write. Previously this held
+                    // `tracker.read().await` across `atomic_write+fsync` —
+                    // which blocked every writer trying to call `fill_range`
+                    // for the duration of the fsync.
+                    let snap = {
+                        let t = tracker.read().await;
+                        t.snapshot_for_save()
+                    };
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = snap.write_to_disk() {
+                            tracing::warn!("periodic part.met save failed: {e}");
+                        }
+                    });
+                    last_periodic_save = std::time::Instant::now();
                 }
             }
 
-            let elapsed = speed_start.elapsed();
-            if elapsed.as_millis() >= 2000 {
-                measured_speed =
-                    (speed_bytes as u128 * 1000 / elapsed.as_millis().max(1)) as u64;
-                speed_bytes = 0;
-                speed_start = std::time::Instant::now();
-                emit_source!(
-                    if got_any_data { "transferring" } else { "stalled" },
-                    None,
-                    measured_speed
-                );
-            }
+            // No pre-verification fsync: the writer thread reads from the same
+            // open file handle it wrote with, so the OS page cache is
+            // self-consistent. Skipping fsync here removes a per-part disk
+            // round-trip (tens of ms on HDDs / network shares) without
+            // affecting correctness — the final fsync still runs at completion.
 
-            if last_periodic_save.elapsed() >= PERIODIC_SAVE_INTERVAL {
-                // CRITICAL: take the snapshot under the lock, then drop the
-                // lock BEFORE the disk write. Previously this held
-                // `tracker.read().await` across `atomic_write+fsync` —
-                // which blocked every writer trying to call `fill_range`
-                // for the duration of the fsync.
-                let snap = {
-                    let t = tracker.read().await;
-                    t.snapshot_for_save()
-                };
-                tokio::task::spawn_blocking(move || {
-                    if let Err(e) = snap.write_to_disk() {
-                        tracing::warn!("periodic part.met save failed: {e}");
-                    }
-                });
-                last_periodic_save = std::time::Instant::now();
-            }
-        }
-
-        // No pre-verification fsync: the writer thread reads from the same
-        // open file handle it wrote with, so the OS page cache is
-        // self-consistent. Skipping fsync here removes a per-part disk
-        // round-trip (tens of ms on HDDs / network shares) without
-        // affecting correctness — the final fsync still runs at completion.
-
-        // DIAG: log every receive-loop exit with the reason and the
-        // counters so we can correlate "peer disappears after 1 chunk"
-        // with the underlying cause (gap-list says complete, peer
-        // signalled out_of_parts, etc.).
-        let part_remaining_after: u64 = {
-            let t = tracker.read().await;
-            let (ps, pe) = t.part_range(part_idx);
-            t.gap_list()
-                .iter()
-                .map(|&(gs, ge)| {
-                    let s = gs.max(ps);
-                    let e = ge.min(pe);
-                    if s < e { e - s } else { 0 }
-                })
-                .sum()
-        };
-        info!(
+            // DIAG: log every receive-loop exit with the reason and the
+            // counters so we can correlate "peer disappears after 1 chunk"
+            // with the underlying cause (gap-list says complete, peer
+            // signalled out_of_parts, etc.).
+            let part_remaining_after: u64 = {
+                let t = tracker.read().await;
+                let (ps, pe) = t.part_range(part_idx);
+                t.gap_list()
+                    .iter()
+                    .map(|&(gs, ge)| {
+                        let s = gs.max(ps);
+                        let e = ge.min(pe);
+                        if s < e {
+                            e - s
+                        } else {
+                            0
+                        }
+                    })
+                    .sum()
+            };
+            info!(
             "DIAG: source {} ({}) receive-loop exit for part {}: reason={}, elapsed={:.2}s, chunks_for_part={}, bytes_for_part={}, bytes_for_other_parts={}, gap_bytes_in_part_at_entry={}, gap_bytes_in_part_after={}, sent_idx={}/{}, completed_reqs={}, peer_out={}, pipelined_now={:?}",
             _src_idx, addr, part_idx, exit_reason,
             receive_loop_started.elapsed().as_secs_f64(),
@@ -6934,29 +7515,7 @@ async fn download_parts_from_source(
             pipelined_next.as_ref().map(|p| p.part_idx),
         );
 
-        if peer_out_of_parts {
-            let snap = {
-                let mut t = tracker.write().await;
-                t.set_in_progress(part_idx, false);
-                t.snapshot_for_save()
-            };
-            spawn_save_snapshot(snap);
-            ip_guard.unmark(part_idx);
-            continue;
-        }
-
-        // Guard against duplicate/overlapping blocks that satisfied the
-        // byte budget without actually closing all gaps in this part.
-        {
-            let t = tracker.read().await;
-            let (ps, pe) = t.part_range(part_idx);
-            let part_has_gaps = t.gap_list().iter().any(|&(gs, ge)| gs < pe && ge > ps);
-            if part_has_gaps {
-                warn!(
-                    "Source {} part {} byte budget met but gaps remain — peer likely sent duplicate blocks, marking for retry",
-                    _src_idx, part_idx
-                );
-                drop(t);
+            if peer_out_of_parts {
                 let snap = {
                     let mut t = tracker.write().await;
                     t.set_in_progress(part_idx, false);
@@ -6966,30 +7525,52 @@ async fn download_parts_from_source(
                 ip_guard.unmark(part_idx);
                 continue;
             }
-        }
 
-        // Verify part hash before marking complete
-        let part_hash_outcome = {
-            let ph = shared_part_hashes.read().await;
-            if part_idx < ph.len() {
-                let expected_hash = ph[part_idx];
+            // Guard against duplicate/overlapping blocks that satisfied the
+            // byte budget without actually closing all gaps in this part.
+            {
                 let t = tracker.read().await;
                 let (ps, pe) = t.part_range(part_idx);
-                let part_len = (pe - ps) as usize;
-                drop(t);
-
-                // Read + MD4 in one writer-thread round-trip: the hash
-                // never runs on an async worker, and there's no second
-                // file-lock acquisition (the writer thread serializes us
-                // anyway).
-                let (part_data, actual_hash) = output
-                    .hash_part_md4(ps, part_len)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("part hash read at {ps}: {e}"))?;
-
-                if actual_hash != expected_hash {
-                    let aich_hs = super::aich::AICHRecoveryHashSet::build_from_data(&part_data);
+                let part_has_gaps = t.gap_list().iter().any(|&(gs, ge)| gs < pe && ge > ps);
+                if part_has_gaps {
                     warn!(
+                    "Source {} part {} byte budget met but gaps remain — peer likely sent duplicate blocks, marking for retry",
+                    _src_idx, part_idx
+                );
+                    drop(t);
+                    let snap = {
+                        let mut t = tracker.write().await;
+                        t.set_in_progress(part_idx, false);
+                        t.snapshot_for_save()
+                    };
+                    spawn_save_snapshot(snap);
+                    ip_guard.unmark(part_idx);
+                    continue;
+                }
+            }
+
+            // Verify part hash before marking complete
+            let part_hash_outcome = {
+                let ph = shared_part_hashes.read().await;
+                if part_idx < ph.len() {
+                    let expected_hash = ph[part_idx];
+                    let t = tracker.read().await;
+                    let (ps, pe) = t.part_range(part_idx);
+                    let part_len = (pe - ps) as usize;
+                    drop(t);
+
+                    // Read + MD4 in one writer-thread round-trip: the hash
+                    // never runs on an async worker, and there's no second
+                    // file-lock acquisition (the writer thread serializes us
+                    // anyway).
+                    let (part_data, actual_hash) = output
+                        .hash_part_md4(ps, part_len)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("part hash read at {ps}: {e}"))?;
+
+                    if actual_hash != expected_hash {
+                        let aich_hs = super::aich::AICHRecoveryHashSet::build_from_data(&part_data);
+                        warn!(
                         "Multi-source part {} hash mismatch from source {}! expected={} got={}, part_aich_root={}, {} AICH leaves",
                         part_idx,
                         _src_idx,
@@ -6999,339 +7580,362 @@ async fn download_parts_from_source(
                         aich_hs.leaf_count(),
                     );
 
-                    let mut recovery_bytes: Option<Vec<u8>> = aich_recovery_data
-                        .as_ref()
-                        .map(|(_, d)| d.clone());
-                    let master_opt = *shared_aich_master.read().await;
-                    if let Some(master_hash) = master_opt {
-                        if recovery_bytes.is_none() && peer_supports_aich {
-                            let aich_should_try = if let std::net::IpAddr::V4(v4) = addr.ip() {
-                                if let Some(ref pending) = aich_pending {
-                                    if let Ok(map) = pending.read() {
-                                        match map.get(&(*file_hash, part_idx as u32)) {
-                                            Some((failed_ips, retry_count)) => {
-                                                !failed_ips.contains(&v4) && *retry_count < 3
+                        let mut recovery_bytes: Option<Vec<u8>> =
+                            aich_recovery_data.as_ref().map(|(_, d)| d.clone());
+                        let master_opt = *shared_aich_master.read().await;
+                        if let Some(master_hash) = master_opt {
+                            if recovery_bytes.is_none() && peer_supports_aich {
+                                let aich_should_try = if let std::net::IpAddr::V4(v4) = addr.ip() {
+                                    if let Some(ref pending) = aich_pending {
+                                        if let Ok(map) = pending.read() {
+                                            match map.get(&(*file_hash, part_idx as u32)) {
+                                                Some((failed_ips, retry_count)) => {
+                                                    !failed_ips.contains(&v4) && *retry_count < 3
+                                                }
+                                                None => true,
                                             }
-                                            None => true,
+                                        } else {
+                                            true
                                         }
-                                    } else { true }
-                                } else { true }
-                            } else { true };
-
-                            if aich_should_try {
-                                let mut aich_req = Vec::with_capacity(38);
-                                aich_req.extend_from_slice(file_hash);
-                                aich_req.extend_from_slice(&(part_idx as u16).to_le_bytes());
-                                aich_req.extend_from_slice(&master_hash);
-                                if let Err(e) = write_packet_async_ms(
-                                    &mut *writer,
-                                    OP_EMULEPROT,
-                                    OP_AICHREQUEST,
-                                    &aich_req,
-                                )
-                                .await
-                                {
-                                    warn!("Failed to send OP_AICHREQUEST: {e}");
+                                    } else {
+                                        true
+                                    }
                                 } else {
-                                    debug!("Sent OP_AICHREQUEST for part {part_idx}, waiting for answer");
-                                    recovery_bytes = wait_for_aich_recovery_answer_ms(
-                                        &mut *reader,
-                                        file_hash,
-                                        part_idx,
-                                        master_hash,
-                                    )
-                                    .await;
-                                }
-                            } else {
-                                debug!("Skipping OP_AICHREQUEST for part {part_idx}: source already tried or retries exhausted");
-                            }
-                        }
+                                    true
+                                };
 
-                        let mut narrowed = false;
-                        if let Some(ref rec) = recovery_bytes {
-                            if let Some(corrupt) = super::aich::corrupt_blocks_from_aich_recovery(
-                                master_hash,
-                                rec,
-                                part_idx,
-                                &part_data,
-                                part_len,
-                                file_size,
-                            ) {
-                                if !corrupt.is_empty() {
-                                    let mut invalidated = 0u64;
-                                    let snap = {
-                                        let mut t = tracker.write().await;
-                                        for &bi in &corrupt {
-                                            let rel = bi as u64 * super::aich::AICH_BLOCK_SIZE as u64;
-                                            let gs = ps + rel;
-                                            let ge = (gs + super::aich::AICH_BLOCK_SIZE as u64)
-                                                .min(ps + part_len as u64);
-                                            t.invalidate_range(gs, ge);
-                                            invalidated += ge - gs;
-                                        }
-                                        t.snapshot_for_save()
-                                    };
-                                    spawn_save_snapshot(snap);
-                                    let _ = progress_tx
-                                        .send((_src_idx, -(invalidated as i64)))
+                                if aich_should_try {
+                                    let mut aich_req = Vec::with_capacity(38);
+                                    aich_req.extend_from_slice(file_hash);
+                                    aich_req.extend_from_slice(&(part_idx as u16).to_le_bytes());
+                                    aich_req.extend_from_slice(&master_hash);
+                                    if let Err(e) = write_packet_async_ms(
+                                        &mut *writer,
+                                        OP_EMULEPROT,
+                                        OP_AICHREQUEST,
+                                        &aich_req,
+                                    )
+                                    .await
+                                    {
+                                        warn!("Failed to send OP_AICHREQUEST: {e}");
+                                    } else {
+                                        debug!("Sent OP_AICHREQUEST for part {part_idx}, waiting for answer");
+                                        recovery_bytes = wait_for_aich_recovery_answer_ms(
+                                            &mut *reader,
+                                            file_hash,
+                                            part_idx,
+                                            master_hash,
+                                        )
                                         .await;
-                                    info!(
+                                    }
+                                } else {
+                                    debug!("Skipping OP_AICHREQUEST for part {part_idx}: source already tried or retries exhausted");
+                                }
+                            }
+
+                            let mut narrowed = false;
+                            if let Some(ref rec) = recovery_bytes {
+                                if let Some(corrupt) =
+                                    super::aich::corrupt_blocks_from_aich_recovery(
+                                        master_hash,
+                                        rec,
+                                        part_idx,
+                                        &part_data,
+                                        part_len,
+                                        file_size,
+                                    )
+                                {
+                                    if !corrupt.is_empty() {
+                                        let mut invalidated = 0u64;
+                                        let snap = {
+                                            let mut t = tracker.write().await;
+                                            for &bi in &corrupt {
+                                                let rel =
+                                                    bi as u64 * super::aich::AICH_BLOCK_SIZE as u64;
+                                                let gs = ps + rel;
+                                                let ge = (gs + super::aich::AICH_BLOCK_SIZE as u64)
+                                                    .min(ps + part_len as u64);
+                                                t.invalidate_range(gs, ge);
+                                                invalidated += ge - gs;
+                                            }
+                                            t.snapshot_for_save()
+                                        };
+                                        spawn_save_snapshot(snap);
+                                        let _ = progress_tx
+                                            .send((_src_idx, -(invalidated as i64)))
+                                            .await;
+                                        info!(
                                         "AICH narrowed part {} to {} bad 180KiB block(s), ~{} bytes to re-fetch",
                                         part_idx,
                                         corrupt.len(),
                                         invalidated
                                     );
-                                    narrowed = true;
+                                        narrowed = true;
+                                    }
                                 }
                             }
-                        }
 
-                        if narrowed {
-                            PartHashOutcome::AichNarrowed
-                        } else {
-                            if let std::net::IpAddr::V4(v4) = addr.ip() {
-                                if let Some(ref etx) = event_tx {
-                                    let _ = etx
-                                        .send(DownloadEvent::AichRecoveryFailed {
-                                            file_hash: *file_hash,
-                                            part_index: part_idx as u32,
-                                            failed_ip: v4,
-                                        })
-                                        .await;
+                            if narrowed {
+                                PartHashOutcome::AichNarrowed
+                            } else {
+                                if let std::net::IpAddr::V4(v4) = addr.ip() {
+                                    if let Some(ref etx) = event_tx {
+                                        let _ = etx
+                                            .send(DownloadEvent::AichRecoveryFailed {
+                                                file_hash: *file_hash,
+                                                part_index: part_idx as u32,
+                                                failed_ip: v4,
+                                            })
+                                            .await;
+                                    }
                                 }
+                                // D15: subtract only the bytes for THIS part,
+                                // not the whole session total. Subtracting
+                                // total_received over-rewinds progress and
+                                // breaks stall detection.
+                                let _ = progress_tx.send((_src_idx, -(part_len as i64))).await;
+                                PartHashOutcome::Mismatch
                             }
-                            // D15: subtract only the bytes for THIS part,
-                            // not the whole session total. Subtracting
-                            // total_received over-rewinds progress and
-                            // breaks stall detection.
-                            let _ = progress_tx
-                                .send((_src_idx, -(part_len as i64)))
-                                .await;
+                        } else {
+                            let _ = progress_tx.send((_src_idx, -(part_len as i64))).await;
                             PartHashOutcome::Mismatch
                         }
                     } else {
-                        let _ = progress_tx
-                            .send((_src_idx, -(part_len as i64)))
-                            .await;
-                        PartHashOutcome::Mismatch
+                        debug!(
+                            "Multi-source part {} hash verified OK (source {})",
+                            part_idx, _src_idx
+                        );
+                        PartHashOutcome::Verified
                     }
                 } else {
-                    debug!("Multi-source part {} hash verified OK (source {})", part_idx, _src_idx);
-                    PartHashOutcome::Verified
+                    PartHashOutcome::Unverified
                 }
-            } else {
-                PartHashOutcome::Unverified
-            }
-        };
+            };
 
-        match part_hash_outcome {
-            PartHashOutcome::AichNarrowed => {
-                let snap = {
-                    let mut t = tracker.write().await;
-                    t.set_in_progress(part_idx, false);
-                    t.snapshot_for_save()
-                };
-                spawn_save_snapshot(snap);
-                ip_guard.unmark(part_idx);
-                continue;
-            }
-            PartHashOutcome::Verified => {
-                let (ps, pe, snap) = {
-                    let mut t = tracker.write().await;
-                    let (ps, pe) = t.part_range(part_idx);
-                    t.mark_complete(part_idx);
-                    // Flip the persistent verified flag so the upload path
-                    // can serve this range (see is_range_safe_to_serve).
-                    t.set_part_verified(part_idx);
-                    t.set_in_progress(part_idx, false);
-                    (ps, pe, t.snapshot_for_save())
-                };
-                spawn_save_snapshot(snap);
-                ip_guard.unmark(part_idx);
-                // D12: flush accumulated bytes to the credit ledger now
-                // that this peer's contribution went into a verified part.
-                // Per-part bucket: only credit bytes that landed in
-                // THIS verified part. With cross-part pipelining the
-                // pending map may also hold bytes for part N+1 that
-                // are still in flight; those stay until N+1 verifies.
-                if let Some(verified_bytes) = per_part_credit.remove(&part_idx) {
-                    if verified_bytes > 0 {
-                        if let Some(cm) = &credit_mgr {
-                            let mut cm = cm.write().await;
-                            cm.add_downloaded(peer_user_hash, verified_bytes);
-                            // Ember credit mirror: record how much
-                            // PoP-verified peers have uploaded to
-                            // us, so their `downloaded` column (from
-                            // our perspective) feeds the decayed
-                            // ratio in `get_ember_score_ratio` when
-                            // THEY later ask to be served by us.
-                            // Gated on `ember_auth_verified` — the
-                            // binding-only fallback isn't strong
-                            // enough to prevent a spoofer from
-                            // claiming credit for a friend's upload
-                            // (they'd still need the friend's secret
-                            // key, but we're belt-and-braces here).
-                            if let Some(pk) = hello_caps.ember_pubkey {
-                                cm.add_ember_downloaded(pk, verified_bytes, ember_auth_verified);
+            match part_hash_outcome {
+                PartHashOutcome::AichNarrowed => {
+                    let snap = {
+                        let mut t = tracker.write().await;
+                        t.set_in_progress(part_idx, false);
+                        t.snapshot_for_save()
+                    };
+                    spawn_save_snapshot(snap);
+                    ip_guard.unmark(part_idx);
+                    continue;
+                }
+                PartHashOutcome::Verified => {
+                    let (ps, pe, snap) = {
+                        let mut t = tracker.write().await;
+                        let (ps, pe) = t.part_range(part_idx);
+                        t.mark_complete(part_idx);
+                        // Flip the persistent verified flag so the upload path
+                        // can serve this range (see is_range_safe_to_serve).
+                        t.set_part_verified(part_idx);
+                        t.set_in_progress(part_idx, false);
+                        (ps, pe, t.snapshot_for_save())
+                    };
+                    spawn_save_snapshot(snap);
+                    ip_guard.unmark(part_idx);
+                    // D12: flush accumulated bytes to the credit ledger now
+                    // that this peer's contribution went into a verified part.
+                    // Per-part bucket: only credit bytes that landed in
+                    // THIS verified part. With cross-part pipelining the
+                    // pending map may also hold bytes for part N+1 that
+                    // are still in flight; those stay until N+1 verifies.
+                    if let Some(verified_bytes) = per_part_credit.remove(&part_idx) {
+                        if verified_bytes > 0 {
+                            if let Some(cm) = &credit_mgr {
+                                let mut cm = cm.write().await;
+                                cm.add_downloaded(peer_user_hash, verified_bytes);
+                                // Ember credit mirror: record how much
+                                // PoP-verified peers have uploaded to
+                                // us, so their `downloaded` column (from
+                                // our perspective) feeds the decayed
+                                // ratio in `get_ember_score_ratio` when
+                                // THEY later ask to be served by us.
+                                // Gated on `ember_auth_verified` — the
+                                // binding-only fallback isn't strong
+                                // enough to prevent a spoofer from
+                                // claiming credit for a friend's upload
+                                // (they'd still need the friend's secret
+                                // key, but we're belt-and-braces here).
+                                if let Some(pk) = hello_caps.ember_pubkey {
+                                    cm.add_ember_downloaded(
+                                        pk,
+                                        verified_bytes,
+                                        ember_auth_verified,
+                                    );
+                                }
                             }
                         }
                     }
+                    if let Some(ref etx) = event_tx {
+                        let _ = etx
+                            .send(DownloadEvent::PartVerified {
+                                file_hash: *file_hash,
+                                part_start: ps,
+                                part_end: pe,
+                                sender_user_hash: Some(peer_user_hash),
+                            })
+                            .await;
+                    }
                 }
-                if let Some(ref etx) = event_tx {
-                    let _ = etx
-                        .send(DownloadEvent::PartVerified {
-                            file_hash: *file_hash,
-                            part_start: ps,
-                            part_end: pe,
-                            sender_user_hash: Some(peer_user_hash),
-                        })
-                        .await;
+                PartHashOutcome::Mismatch => {
+                    let (ps, pe, snap) = {
+                        let mut t = tracker.write().await;
+                        let (ps, pe) = t.part_range(part_idx);
+                        // D15: the inner verification block has already sent a
+                        // progress correction for this part (using part_len);
+                        // don't double-subtract here.
+                        t.mark_incomplete(part_idx);
+                        t.set_in_progress(part_idx, false);
+                        (ps, pe, t.snapshot_for_save())
+                    };
+                    spawn_save_snapshot(snap);
+                    ip_guard.unmark(part_idx);
+                    // D12: drop the per-part credit bucket for THIS part —
+                    // the peer sent data that didn't verify, so no credit
+                    // accrues for this part. With cross-part pipelining
+                    // we leave other parts' buckets intact (they verify
+                    // independently).
+                    per_part_credit.remove(&part_idx);
+                    let _ = progress_tx.send((_src_idx, 0i64)).await;
+                    if let Some(ref etx) = event_tx {
+                        let _ = etx
+                            .send(DownloadEvent::PartCorrupted {
+                                file_hash: *file_hash,
+                                part_start: ps,
+                                part_end: pe,
+                                sender_user_hash: Some(peer_user_hash),
+                            })
+                            .await;
+                    }
+                }
+                PartHashOutcome::Unverified => {
+                    let snap = {
+                        let mut t = tracker.write().await;
+                        t.set_in_progress(part_idx, false);
+                        t.snapshot_for_save()
+                    };
+                    spawn_save_snapshot(snap);
+                    ip_guard.unmark(part_idx);
                 }
             }
-            PartHashOutcome::Mismatch => {
-                let (ps, pe, snap) = {
-                    let mut t = tracker.write().await;
-                    let (ps, pe) = t.part_range(part_idx);
-                    // D15: the inner verification block has already sent a
-                    // progress correction for this part (using part_len);
-                    // don't double-subtract here.
-                    t.mark_incomplete(part_idx);
-                    t.set_in_progress(part_idx, false);
-                    (ps, pe, t.snapshot_for_save())
-                };
-                spawn_save_snapshot(snap);
-                ip_guard.unmark(part_idx);
-                // D12: drop the per-part credit bucket for THIS part —
-                // the peer sent data that didn't verify, so no credit
-                // accrues for this part. With cross-part pipelining
-                // we leave other parts' buckets intact (they verify
-                // independently).
-                per_part_credit.remove(&part_idx);
-                let _ = progress_tx.send((_src_idx, 0i64)).await;
-                if let Some(ref etx) = event_tx {
-                    let _ = etx
-                        .send(DownloadEvent::PartCorrupted {
-                            file_hash: *file_hash,
-                            part_start: ps,
-                            part_end: pe,
-                            sender_user_hash: Some(peer_user_hash),
-                        })
-                        .await;
-                }
-            }
-            PartHashOutcome::Unverified => {
-                let snap = {
-                    let mut t = tracker.write().await;
-                    t.set_in_progress(part_idx, false);
-                    t.snapshot_for_save()
-                };
-                spawn_save_snapshot(snap);
-                ip_guard.unmark(part_idx);
-            }
-        }
 
-        // Dynamically select the next part if we have a shared chunk selector.
-        //
-        // CRITICAL: keep the TCP session alive across multiple parts. If
-        // we can't find a fresh part this loop iteration the source
-        // disconnects and we have to redo the full Hello/SecIdent
-        // handshake (and the peer's `FILEREASKTIME` may force us to
-        // wait minutes before they accept us again — visibly: "DONE,
-        // speed → 0, reconnect, next part").
-        //
-        // Two-stage selection:
-        //   1. Strict: pick a part that NO source is currently
-        //      downloading (rarest-first, anti-herding). This is the
-        //      preferred outcome.
-        //   2. Fallback: if every remaining incomplete part is already
-        //      in_progress on some other source, pile onto one of them.
-        //      This is `MAX_SOURCES_PER_PART`-style behaviour matching
-        //      the initial-assignment phase (which already allows up to
-        //      5 sources per part). The byte-level gap tracker stops
-        //      duplicate writes — source B will request only the still-
-        //      empty ranges of part X via `tracker.gap_list()`, so the
-        //      wasted-bandwidth cost is bounded to the blocks in flight
-        //      at the exact moment of the request.
-        if let Some(cs) = &chunk_sel {
-            let cs = cs.read().await;
-            let t = tracker.read().await;
-            let completed = t.completed_parts().to_vec();
-            let in_prog = t.in_progress.clone();
-            let remaining = t.remaining_count();
-            let part_count = t.part_count;
-            let gap_bytes = t.part_gap_bytes_vec();
-            drop(t);
-            if remaining == 0 {
-                break;
-            }
-            let avail = if source_available.is_empty() {
-                vec![true; part_count]
-            } else {
-                source_available.clone()
-            };
-            let pp = control.is_preview_priority();
-            let prefer_higher = remaining <= 3 && part_count > 1;
-            let active: Vec<usize> = in_prog.iter().enumerate()
-                .filter(|(_, &ip)| ip).map(|(i, _)| i).collect();
-            let next_part = cs
-                .select_part(&completed, &in_prog, &avail, &active, &gap_bytes, pp, prefer_higher)
-                .or_else(|| {
-                    // Fallback: relaxed selection. Treat no part as
-                    // in-progress so we can piggy-back on one another
-                    // source is already pulling. `active_parts` is
-                    // still the real active list, so the
-                    // active-chunk-bonus (lower score) inside
-                    // select_part will prefer joining a part already
-                    // in motion over starting a fresh in-progress
-                    // one — that's also what the eMule endgame mode
-                    // does naturally.
-                    let no_in_progress = vec![false; part_count];
-                    cs.select_part(
+            // Dynamically select the next part if we have a shared chunk selector.
+            //
+            // CRITICAL: keep the TCP session alive across multiple parts. If
+            // we can't find a fresh part this loop iteration the source
+            // disconnects and we have to redo the full Hello/SecIdent
+            // handshake (and the peer's `FILEREASKTIME` may force us to
+            // wait minutes before they accept us again — visibly: "DONE,
+            // speed → 0, reconnect, next part").
+            //
+            // Two-stage selection:
+            //   1. Strict: pick a part that NO source is currently
+            //      downloading (rarest-first, anti-herding). This is the
+            //      preferred outcome.
+            //   2. Fallback: if every remaining incomplete part is already
+            //      in_progress on some other source, pile onto one of them.
+            //      This is `MAX_SOURCES_PER_PART`-style behaviour matching
+            //      the initial-assignment phase (which already allows up to
+            //      5 sources per part). The byte-level gap tracker stops
+            //      duplicate writes — source B will request only the still-
+            //      empty ranges of part X via `tracker.gap_list()`, so the
+            //      wasted-bandwidth cost is bounded to the blocks in flight
+            //      at the exact moment of the request.
+            if let Some(cs) = &chunk_sel {
+                let cs = cs.read().await;
+                let t = tracker.read().await;
+                let completed = t.completed_parts().to_vec();
+                let in_prog = t.in_progress.clone();
+                let remaining = t.remaining_count();
+                let part_count = t.part_count;
+                let gap_bytes = t.part_gap_bytes_vec();
+                drop(t);
+                if remaining == 0 {
+                    break;
+                }
+                let avail = if source_available.is_empty() {
+                    vec![true; part_count]
+                } else {
+                    source_available.clone()
+                };
+                let pp = control.is_preview_priority();
+                let prefer_higher = remaining <= 3 && part_count > 1;
+                let active: Vec<usize> = in_prog
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &ip)| ip)
+                    .map(|(i, _)| i)
+                    .collect();
+                let next_part = cs
+                    .select_part(
                         &completed,
-                        &no_in_progress,
+                        &in_prog,
                         &avail,
                         &active,
                         &gap_bytes,
                         pp,
                         prefer_higher,
                     )
-                });
-            if let Some(next) = next_part {
-                if !part_queue.contains(&next) {
-                    part_queue.push(next);
-                    // Mark in_progress (idempotent — may already be
-                    // set by another source). `ip_guard.mark` records
-                    // that THIS source contributed to this part so
-                    // teardown unmarks correctly even when another
-                    // source also claimed it.
-                    let mut t = tracker.write().await;
-                    t.set_in_progress(next, true);
-                    drop(t);
-                    ip_guard.mark(next);
-                }
-            } else {
-                // No remaining part is reachable from this source
-                // (the peer's `available_parts` doesn't intersect the
-                // not-yet-complete set). Genuinely nothing left to do
-                // here — let the loop fall through to the natural
-                // `OP_END_OF_DOWNLOAD` exit.
-                let (cur_remaining, cur_in_progress_count, cur_avail_intersect) = {
-                    let t = tracker.read().await;
-                    let r = t.remaining_count();
-                    let ip_count = t.in_progress.iter().filter(|&&v| v).count();
-                    let intersect = if source_available.is_empty() {
-                        r
-                    } else {
-                        (0..t.part_count)
-                            .filter(|&i| {
-                                !t.is_part_complete(i)
-                                    && source_available.get(i).copied().unwrap_or(false)
-                            })
-                            .count()
+                    .or_else(|| {
+                        // Fallback: relaxed selection. Treat no part as
+                        // in-progress so we can piggy-back on one another
+                        // source is already pulling. `active_parts` is
+                        // still the real active list, so the
+                        // active-chunk-bonus (lower score) inside
+                        // select_part will prefer joining a part already
+                        // in motion over starting a fresh in-progress
+                        // one — that's also what the eMule endgame mode
+                        // does naturally.
+                        let no_in_progress = vec![false; part_count];
+                        cs.select_part(
+                            &completed,
+                            &no_in_progress,
+                            &avail,
+                            &active,
+                            &gap_bytes,
+                            pp,
+                            prefer_higher,
+                        )
+                    });
+                if let Some(next) = next_part {
+                    if !part_queue.contains(&next) {
+                        part_queue.push(next);
+                        // Mark in_progress (idempotent — may already be
+                        // set by another source). `ip_guard.mark` records
+                        // that THIS source contributed to this part so
+                        // teardown unmarks correctly even when another
+                        // source also claimed it.
+                        let mut t = tracker.write().await;
+                        t.set_in_progress(next, true);
+                        drop(t);
+                        ip_guard.mark(next);
+                    }
+                } else {
+                    // No remaining part is reachable from this source
+                    // (the peer's `available_parts` doesn't intersect the
+                    // not-yet-complete set). Genuinely nothing left to do
+                    // here — let the loop fall through to the natural
+                    // `OP_END_OF_DOWNLOAD` exit.
+                    let (cur_remaining, cur_in_progress_count, cur_avail_intersect) = {
+                        let t = tracker.read().await;
+                        let r = t.remaining_count();
+                        let ip_count = t.in_progress.iter().filter(|&&v| v).count();
+                        let intersect = if source_available.is_empty() {
+                            r
+                        } else {
+                            (0..t.part_count)
+                                .filter(|&i| {
+                                    !t.is_part_complete(i)
+                                        && source_available.get(i).copied().unwrap_or(false)
+                                })
+                                .count()
+                        };
+                        (r, ip_count, intersect)
                     };
-                    (r, ip_count, intersect)
-                };
-                info!(
+                    info!(
                     "DIAG: source {} ({}) dynamic-extend found NO next part after part {}: remaining={}, in_progress_globally={}, peer-available-intersect-incomplete={}, source_available_len={}, queue=[{}], pipelined={:?}",
                     _src_idx, addr, part_idx,
                     cur_remaining, cur_in_progress_count, cur_avail_intersect,
@@ -7339,13 +7943,13 @@ async fn download_parts_from_source(
                     part_queue.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","),
                     pipelined_next.as_ref().map(|p| p.part_idx),
                 );
+                }
             }
         }
-    }
-    // DIAG: per-part loop exited (queue exhausted or peer_out_of_parts).
-    // This used to be a silent path — the function returned Ok(()) with
-    // nothing in the log to explain why the source disconnected.
-    info!(
+        // DIAG: per-part loop exited (queue exhausted or peer_out_of_parts).
+        // This used to be a silent path — the function returned Ok(()) with
+        // nothing in the log to explain why the source disconnected.
+        info!(
         "DIAG: source {} ({}) per-part loop exit: queue_idx={}/{}, peer_out_of_parts={}, src_transferred={}, queue=[{}], pipelined={:?}",
         _src_idx, addr,
         queue_idx, part_queue.len(), peer_out_of_parts,
@@ -7354,151 +7958,145 @@ async fn download_parts_from_source(
         pipelined_next.as_ref().map(|p| p.part_idx),
     );
 
-    // In-session re-queue: only attempt when the per-part loop exited
-    // because the peer hit their SESSIONMAXTRANS cap (sent
-    // OP_OUTOFPARTREQS). For any other exit reason the queue is
-    // genuinely exhausted (no more parts this peer can serve) and
-    // re-queueing would just stall.
-    if !peer_out_of_parts {
-        break 'session_loop;
-    }
-    // Verify there's still work for this peer to do before we burn
-    // ~90s of TCP+IO waiting in their queue. If every remaining part
-    // is either complete or unavailable on this peer, exit cleanly.
-    let work_remaining = {
-        let t = tracker.read().await;
-        if t.all_complete() {
-            false
-        } else if source_available.is_empty() {
-            t.remaining_count() > 0
-        } else {
-            (0..t.part_count).any(|i| {
-                !t.is_part_complete(i)
-                    && source_available.get(i).copied().unwrap_or(false)
-            })
+        // In-session re-queue: only attempt when the per-part loop exited
+        // because the peer hit their SESSIONMAXTRANS cap (sent
+        // OP_OUTOFPARTREQS). For any other exit reason the queue is
+        // genuinely exhausted (no more parts this peer can serve) and
+        // re-queueing would just stall.
+        if !peer_out_of_parts {
+            break 'session_loop;
         }
-    };
-    if !work_remaining {
-        info!(
+        // Verify there's still work for this peer to do before we burn
+        // ~90s of TCP+IO waiting in their queue. If every remaining part
+        // is either complete or unavailable on this peer, exit cleanly.
+        let work_remaining = {
+            let t = tracker.read().await;
+            if t.all_complete() {
+                false
+            } else if source_available.is_empty() {
+                t.remaining_count() > 0
+            } else {
+                (0..t.part_count).any(|i| {
+                    !t.is_part_complete(i) && source_available.get(i).copied().unwrap_or(false)
+                })
+            }
+        };
+        if !work_remaining {
+            info!(
             "DIAG: source {} ({}) OUTOFPARTREQS but no remaining parts available from this peer — closing cleanly",
             _src_idx, addr,
         );
-        break 'session_loop;
-    }
-    // Cap re-queue wait at the configured slot wait but never less
-    // than 60s (eMule's queue rotation interval is typically 30-120s
-    // depending on peer load and our queue position).
-    let requeue_timeout_secs = queue_wait_secs.max(60).min(180);
-    info!(
+            break 'session_loop;
+        }
+        // Cap re-queue wait at the configured slot wait but never less
+        // than 60s (eMule's queue rotation interval is typically 30-120s
+        // depending on peer load and our queue position).
+        let requeue_timeout_secs = queue_wait_secs.max(60).min(180);
+        info!(
         "DIAG: source {} ({}) attempting in-session re-queue after OUTOFPARTREQS (timeout={}s, src_transferred={})",
         _src_idx, addr, requeue_timeout_secs, src_transferred,
     );
-    // Briefly transition to "queued" status while we wait. The
-    // active/queued counts mirror the UI state; without this the
-    // user would see the source as "active" while it sits idle in
-    // the peer's queue.
-    if _active_guard.armed {
-        _active_guard.armed = false;
-        active_count.fetch_sub(1, Ordering::Relaxed);
-    }
-    queued_count.fetch_add(1, Ordering::Relaxed);
-    queued_guard.armed = true;
-    emit_source!("queued", None, measured_speed);
+        // Briefly transition to "queued" status while we wait. The
+        // active/queued counts mirror the UI state; without this the
+        // user would see the source as "active" while it sits idle in
+        // the peer's queue.
+        if _active_guard.armed {
+            _active_guard.armed = false;
+            active_count.fetch_sub(1, Ordering::Relaxed);
+        }
+        queued_count.fetch_add(1, Ordering::Relaxed);
+        queued_guard.armed = true;
+        emit_source!("queued", None, measured_speed);
 
-    let requeue_outcome = try_in_session_requeue(
-        &mut *writer,
-        &mut *reader,
-        file_hash,
-        requeue_timeout_secs,
-        &control,
-    )
-    .await;
+        let requeue_outcome = try_in_session_requeue(
+            &mut *writer,
+            &mut *reader,
+            file_hash,
+            requeue_timeout_secs,
+            &control,
+        )
+        .await;
 
-    match requeue_outcome {
-        InSessionRequeueResult::Promoted => {
-            // Peer gave us a fresh slot on the same TCP connection.
-            // Reset per-session state and re-enter the per-part
-            // loop.  pipelined_next / per_part_credit stay because
-            // any in-flight bytes still belong to this peer's
-            // credit ledger; queue_idx and pipelined_next are reset
-            // so we don't try to consume stale state from the
-            // previous session.
-            queued_guard.armed = false;
-            queued_count.fetch_sub(1, Ordering::Relaxed);
-            active_count.fetch_add(1, Ordering::Relaxed);
-            _active_guard.armed = true;
-            emit_source!("transferring", None, measured_speed);
-            info!(
+        match requeue_outcome {
+            InSessionRequeueResult::Promoted => {
+                // Peer gave us a fresh slot on the same TCP connection.
+                // Reset per-session state and re-enter the per-part
+                // loop.  pipelined_next / per_part_credit stay because
+                // any in-flight bytes still belong to this peer's
+                // credit ledger; queue_idx and pipelined_next are reset
+                // so we don't try to consume stale state from the
+                // previous session.
+                queued_guard.armed = false;
+                queued_count.fetch_sub(1, Ordering::Relaxed);
+                active_count.fetch_add(1, Ordering::Relaxed);
+                _active_guard.armed = true;
+                emit_source!("transferring", None, measured_speed);
+                info!(
                 "DIAG: source {} ({}) re-promoted in-session after OUTOFPARTREQS — saved Hello/SecIdent reconnect, resuming downloads",
                 _src_idx, addr,
             );
-            peer_out_of_parts = false;
-            queue_idx = 0;
-            pipelined_next = None;
-            // Reset the speed-measurement window so the post-rotation
-            // throughput emits a fresh `transferring` rate instead of
-            // averaging in the dead time we spent waiting for the
-            // queue.
-            speed_start = std::time::Instant::now();
-            speed_bytes = 0;
-            // Recompute a fresh seed for part_queue. The cross-part
-            // pipeline + post-iteration dynamic-extend will grow it
-            // from there.
-            part_queue = seed_fresh_part_queue_after_requeue(
-                &chunk_sel,
-                &tracker,
-                &source_available,
-                &control,
-            )
-            .await;
-            if part_queue.is_empty() {
-                info!(
+                peer_out_of_parts = false;
+                queue_idx = 0;
+                pipelined_next = None;
+                // Reset the speed-measurement window so the post-rotation
+                // throughput emits a fresh `transferring` rate instead of
+                // averaging in the dead time we spent waiting for the
+                // queue.
+                speed_start = std::time::Instant::now();
+                speed_bytes = 0;
+                // Recompute a fresh seed for part_queue. The cross-part
+                // pipeline + post-iteration dynamic-extend will grow it
+                // from there.
+                part_queue = seed_fresh_part_queue_after_requeue(
+                    &chunk_sel,
+                    &tracker,
+                    &source_available,
+                    &control,
+                )
+                .await;
+                if part_queue.is_empty() {
+                    info!(
                     "DIAG: source {} ({}) re-promoted but no part this peer can serve remains — closing cleanly",
                     _src_idx, addr,
                 );
-                break 'session_loop;
-            }
-            info!(
+                    break 'session_loop;
+                }
+                info!(
                 "DIAG: source {} ({}) re-promoted; seeded fresh queue=[{}] (cross-part pipeline + dynamic extend will grow it)",
                 _src_idx, addr,
                 part_queue.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","),
             );
-            continue 'session_loop;
-        }
-        InSessionRequeueResult::Timeout(reason) => {
-            info!(
-                "DIAG: source {} ({}) in-session re-queue timed out: {} — closing TCP",
-                _src_idx, addr, reason,
-            );
-            break 'session_loop;
-        }
-        InSessionRequeueResult::Disconnected(reason) => {
-            info!(
-                "DIAG: source {} ({}) in-session re-queue lost TCP: {} — exiting",
-                _src_idx, addr, reason,
-            );
-            // No point in OP_END_OF_DOWNLOAD — the socket is gone.
-            // Decrement queued counter (active was already reset).
-            if queued_guard.armed {
-                queued_guard.armed = false;
-                queued_count.fetch_sub(1, Ordering::Relaxed);
+                continue 'session_loop;
             }
-            // Bail with an error so the spawn handler logs and emits
-            // a SourceDetail "failed" event.
-            anyhow::bail!("in-session re-queue lost connection: {reason}");
+            InSessionRequeueResult::Timeout(reason) => {
+                info!(
+                    "DIAG: source {} ({}) in-session re-queue timed out: {} — closing TCP",
+                    _src_idx, addr, reason,
+                );
+                break 'session_loop;
+            }
+            InSessionRequeueResult::Disconnected(reason) => {
+                info!(
+                    "DIAG: source {} ({}) in-session re-queue lost TCP: {} — exiting",
+                    _src_idx, addr, reason,
+                );
+                // No point in OP_END_OF_DOWNLOAD — the socket is gone.
+                // Decrement queued counter (active was already reset).
+                if queued_guard.armed {
+                    queued_guard.armed = false;
+                    queued_count.fetch_sub(1, Ordering::Relaxed);
+                }
+                // Bail with an error so the spawn handler logs and emits
+                // a SourceDetail "failed" event.
+                anyhow::bail!("in-session re-queue lost connection: {reason}");
+            }
         }
-    }
     } // end 'session_loop
 
     // Signal the uploader that we're done
-    write_packet_async_ms(
-        &mut *writer,
-        OP_EDONKEYHEADER,
-        OP_END_OF_DOWNLOAD,
-        &[],
-    )
-    .await
-    .ok();
+    write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_END_OF_DOWNLOAD, &[])
+        .await
+        .ok();
 
     emit_source!("completed", None, measured_speed);
 
@@ -7838,12 +8436,21 @@ async fn read_packet_async_ms<R: AsyncReadExt + Unpin + ?Sized>(
         let mut unpacked = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
-            let n = decoder.read(&mut buf)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("packed decode failed: {e}")))?;
-            if n == 0 { break; }
+            let n = decoder.read(&mut buf).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("packed decode failed: {e}"),
+                )
+            })?;
+            if n == 0 {
+                break;
+            }
             unpacked.extend_from_slice(&buf[..n]);
             if unpacked.len() > 10 * 1024 * 1024 {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "packed packet decompressed size exceeds limit"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "packed packet decompressed size exceeds limit",
+                ));
             }
         }
         return Ok((super::messages::OP_EMULEPROT, opcode, unpacked));
@@ -7860,7 +8467,9 @@ fn decompress_ed2k_part_ms(compressed: &[u8]) -> anyhow::Result<Vec<u8>> {
         (|| -> anyhow::Result<Vec<u8>> {
             loop {
                 let n = decoder.read(&mut buf)?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 decompressed.extend_from_slice(&buf[..n]);
                 if decompressed.len() > MAX_DECOMPRESSED_PART {
                     anyhow::bail!("decompressed part exceeds size limit");
@@ -7878,7 +8487,9 @@ fn decompress_ed2k_part_ms(compressed: &[u8]) -> anyhow::Result<Vec<u8>> {
     let deflate_result: anyhow::Result<Vec<u8>> = (|| {
         loop {
             let n = decoder.read(&mut buf)?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             decompressed.extend_from_slice(&buf[..n]);
             if decompressed.len() > MAX_DECOMPRESSED_PART {
                 anyhow::bail!("decompressed part exceeds size limit");
@@ -7898,8 +8509,9 @@ async fn write_packet_async_ms<W: AsyncWriteExt + Unpin + ?Sized>(
     opcode: u8,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    let pkt_len = u32::try_from(1 + payload.len())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "packet payload too large"))?;
+    let pkt_len = u32::try_from(1 + payload.len()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "packet payload too large")
+    })?;
     writer.write_u8(protocol).await?;
     writer.write_u32_le(pkt_len).await?;
     writer.write_u8(opcode).await?;
@@ -7945,8 +8557,8 @@ mod tests {
         // Normal file: plenty of remaining parts, plenty of gap bytes.
         let packets = outstanding_requests_for_speed_ms(
             0,
-            100,                         // remaining_parts > 4
-            1024 * 1024 * 1024,          // plenty of gap to pull from
+            100,                // remaining_parts > 4
+            1024 * 1024 * 1024, // plenty of gap to pull from
         );
         assert!(
             packets >= 2,
@@ -7984,23 +8596,29 @@ const MAX_BROWSE_NAME_BYTES: usize = 256;
 
 pub(crate) fn parse_browse_response(data: &[u8]) -> Vec<(String, u64, String)> {
     let mut entries = Vec::new();
-    if data.len() < 4 { return entries; }
+    if data.len() < 4 {
+        return entries;
+    }
     let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
     let mut pos = 4;
     for _ in 0..count.min(MAX_BROWSE_ENTRIES) {
-        if pos + 16 + 8 + 2 > data.len() { break; }
-        let hash = hex::encode(&data[pos..pos+16]);
+        if pos + 16 + 8 + 2 > data.len() {
+            break;
+        }
+        let hash = hex::encode(&data[pos..pos + 16]);
         pos += 16;
-        let size = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap_or([0;8]));
+        let size = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap_or([0; 8]));
         pos += 8;
-        let name_len = u16::from_le_bytes([data[pos], data[pos+1]]) as usize;
+        let name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
-        if pos + name_len > data.len() { break; }
+        if pos + name_len > data.len() {
+            break;
+        }
         // Truncate the *byte view* of the name before lossy decode,
         // not the resulting String, so we never pay for decoding a
         // multi-megabyte mojibake string.
         let name_byte_end = name_len.min(MAX_BROWSE_NAME_BYTES);
-        let name = String::from_utf8_lossy(&data[pos..pos+name_byte_end]).to_string();
+        let name = String::from_utf8_lossy(&data[pos..pos + name_byte_end]).to_string();
         pos += name_len;
         entries.push((hash, size, name));
     }

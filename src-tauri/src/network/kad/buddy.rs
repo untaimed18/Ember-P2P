@@ -122,7 +122,9 @@ impl BuddyManager {
         self.serving_writer = None;
         self.serving_buddy_for = None;
         self.serving_callback_check = None;
-        if let Ok(mut guard) = self.pending_buddy_hashes.try_lock() { guard.clear(); }
+        if let Ok(mut guard) = self.pending_buddy_hashes.try_lock() {
+            guard.clear();
+        }
     }
 
     pub fn state(&self) -> BuddyState {
@@ -191,7 +193,10 @@ impl BuddyManager {
         self.state = BuddyState::FindingBuddy;
         self.last_find_attempt = chrono::Utc::now().timestamp();
         self.find_attempt_count += 1;
-        info!("Starting buddy search (attempt #{})", self.find_attempt_count);
+        info!(
+            "Starting buddy search (attempt #{})",
+            self.find_attempt_count
+        );
     }
 
     pub fn find_failed(&mut self) {
@@ -234,7 +239,11 @@ impl BuddyManager {
         peer_user_hash: [u8; 16],
         connect_options: u8,
         allow_obfuscation: bool,
-    ) -> Option<(mpsc::Receiver<BuddyEvent>, BuddyWriteStream, tokio::task::JoinHandle<()>)> {
+    ) -> Option<(
+        mpsc::Receiver<BuddyEvent>,
+        BuddyWriteStream,
+        tokio::task::JoinHandle<()>,
+    )> {
         let addr = SocketAddr::new(buddy_ip.into(), tcp_port);
         info!("Connecting to buddy {} at {}", buddy_id, addr);
 
@@ -261,7 +270,10 @@ impl BuddyManager {
         let supports_crypt = (connect_options & 0x01) != 0;
         let use_obf = allow_obfuscation && supports_crypt && peer_user_hash != [0u8; 16];
         if requires_crypt && !use_obf {
-            warn!("Buddy {} requires obfuscation but it is unavailable", buddy_id);
+            warn!(
+                "Buddy {} requires obfuscation but it is unavailable",
+                buddy_id
+            );
             self.find_failed();
             return None;
         }
@@ -271,7 +283,13 @@ impl BuddyManager {
         let mut raw_reader = BufReader::new(reader);
 
         let (mut reader, mut writer): (BuddyReadStream, BuddyWriteStream) = if use_obf {
-            match tcp_obfuscation::negotiate_outgoing(&mut raw_reader, &mut raw_writer, &peer_user_hash).await {
+            match tcp_obfuscation::negotiate_outgoing(
+                &mut raw_reader,
+                &mut raw_writer,
+                &peer_user_hash,
+            )
+            .await
+            {
                 Ok((recv_key, send_key)) => (
                     Box::new(BufReader::new(Rc4Reader::new(raw_reader, recv_key))),
                     Box::new(BufWriter::new(Rc4Writer::new(raw_writer, send_key))),
@@ -288,7 +306,9 @@ impl BuddyManager {
                     let plain_stream = match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
                         tokio::net::TcpStream::connect(addr),
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(Ok(s)) => s,
                         Ok(Err(e)) => {
                             warn!("Plain reconnect to buddy failed: {e}");
@@ -309,10 +329,7 @@ impl BuddyManager {
                 }
             }
         } else {
-            (
-                Box::new(raw_reader),
-                Box::new(raw_writer),
-            )
+            (Box::new(raw_reader), Box::new(raw_writer))
         };
 
         // Outgoing buddy: we send Hello first, read HelloAnswer
@@ -403,11 +420,10 @@ impl BuddyManager {
             match tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 w.write_all(&pkt).await?;
                 w.flush().await
-            }).await
+            })
+            .await
             {
-                Ok(Ok(())) => {
-                    true
-                }
+                Ok(Ok(())) => true,
                 _ => {
                     warn!("Buddy ping failed, connection lost");
                     self.disconnect_buddy();
@@ -457,16 +473,13 @@ impl BuddyManager {
             payload.extend_from_slice(&u32::from(client_ip).to_le_bytes());
             payload.extend_from_slice(&client_port.to_le_bytes());
             let pkt = build_emule_packet(OP_CALLBACK, &payload);
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                async {
-                    w.write_all(&pkt).await?;
-                    w.flush().await
-                },
-            ).await {
-                Ok(Ok(())) => {
-                    true
-                }
+            match tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                w.write_all(&pkt).await?;
+                w.flush().await
+            })
+            .await
+            {
+                Ok(Ok(())) => true,
                 Ok(Err(e)) => {
                     warn!("Failed to relay callback: {e}");
                     self.disconnect_serving();
@@ -519,13 +532,10 @@ impl BuddyManager {
         payload.extend_from_slice(&sender_port.to_le_bytes());
         payload.extend_from_slice(trailing);
         let pkt = build_emule_packet(OP_REASKCALLBACKTCP, &payload);
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            async {
-                w.write_all(&pkt).await?;
-                w.flush().await
-            },
-        )
+        match tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            w.write_all(&pkt).await?;
+            w.flush().await
+        })
         .await
         {
             Ok(Ok(())) => true,
@@ -550,7 +560,9 @@ impl BuddyManager {
         self.buddy_id = None;
         self.buddy_addr = None;
         self.state = BuddyState::NoBuddy;
-        if let Ok(mut guard) = self.pending_buddy_hashes.try_lock() { guard.clear(); }
+        if let Ok(mut guard) = self.pending_buddy_hashes.try_lock() {
+            guard.clear();
+        }
         info!("Buddy disconnected");
     }
 
@@ -626,12 +638,11 @@ async fn buddy_hello_handshake_outgoing(
             .map_err(|_| anyhow::anyhow!("Hello handshake timeout"))??;
 
     if proto != OP_EDONKEYHEADER || opcode != OP_HELLOANSWER {
-        anyhow::bail!(
-            "Expected HelloAnswer, got proto=0x{proto:02X} op=0x{opcode:02X}"
-        );
+        anyhow::bail!("Expected HelloAnswer, got proto=0x{proto:02X} op=0x{opcode:02X}");
     }
 
-    let emule_info = crate::network::ed2k::messages::build_emule_info(udp_port, obfuscation_enabled, None, None);
+    let emule_info =
+        crate::network::ed2k::messages::build_emule_info(udp_port, obfuscation_enabled, None, None);
     write_ed2k_packet(writer, OP_EMULEPROT, OP_EMULEINFO, &emule_info).await?;
 
     let (proto2, opcode2, _) =
@@ -650,7 +661,10 @@ async fn buddy_hello_handshake_outgoing(
 }
 
 /// Spawn a buddy reader task and return the event receiver and task handle.
-fn event_rx_from_reader(reader: BuddyReadStream, buddy_id: KadId) -> (mpsc::Receiver<BuddyEvent>, tokio::task::JoinHandle<()>) {
+fn event_rx_from_reader(
+    reader: BuddyReadStream,
+    buddy_id: KadId,
+) -> (mpsc::Receiver<BuddyEvent>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(BUDDY_EVENT_CHANNEL_SIZE);
     let handle = tokio::spawn(run_buddy_reader(reader, tx, Some(buddy_id)));
     (rx, handle)
@@ -692,12 +706,15 @@ async fn run_buddy_reader(
                                 } else {
                                     let mut file_hash = [0u8; 16];
                                     file_hash.copy_from_slice(&payload[16..32]);
-                                    let ip_bytes = [payload[32], payload[33], payload[34], payload[35]];
+                                    let ip_bytes =
+                                        [payload[32], payload[33], payload[34], payload[35]];
                                     let dest_ip = Ipv4Addr::from(u32::from_le_bytes(ip_bytes));
                                     let dest_port = u16::from_le_bytes([payload[36], payload[37]]);
                                     debug!(
                                         "Received OP_CALLBACK: {}:{} file={}",
-                                        dest_ip, dest_port, hex::encode(file_hash)
+                                        dest_ip,
+                                        dest_port,
+                                        hex::encode(file_hash)
                                     );
                                     Some(BuddyEvent::Callback {
                                         file_hash,
@@ -736,9 +753,7 @@ async fn run_buddy_reader(
                             let dest_port = u16::from_le_bytes([payload[4], payload[5]]);
                             let mut file_hash = [0u8; 16];
                             file_hash.copy_from_slice(&payload[6..22]);
-                            if dest_port == 0
-                                || crate::security::is_special_use_v4(dest_ip)
-                            {
+                            if dest_port == 0 || crate::security::is_special_use_v4(dest_ip) {
                                 debug!(
                                     "Rejecting OP_REASKCALLBACKTCP: bad dest {}:{}",
                                     dest_ip, dest_port
@@ -771,9 +786,7 @@ async fn run_buddy_reader(
                         None
                     }
                     _ => {
-                        debug!(
-                            "Buddy reader: ignoring proto=0x{proto:02X} op=0x{opcode:02X}"
-                        );
+                        debug!("Buddy reader: ignoring proto=0x{proto:02X} op=0x{opcode:02X}");
                         None
                     }
                 };

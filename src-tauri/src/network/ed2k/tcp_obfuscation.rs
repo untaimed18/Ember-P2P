@@ -52,8 +52,13 @@ fn semi_random_not_protocol_marker() -> u8 {
 }
 
 pub enum NegotiationResult {
-    Plain { first_byte: u8 },
-    Obfuscated { recv_key: Rc4State, send_key: Rc4State },
+    Plain {
+        first_byte: u8,
+    },
+    Obfuscated {
+        recv_key: Rc4State,
+        send_key: Rc4State,
+    },
 }
 
 /// Negotiate an incoming TCP connection. Reads the first byte to determine
@@ -117,10 +122,14 @@ where
     let magic = u32::from_le_bytes(dec_magic);
 
     if magic != MAGICVALUE_SYNC {
-        info!("TCP obfuscation: magic MISMATCH: got 0x{magic:08X}, expected 0x{MAGICVALUE_SYNC:08X}");
+        info!(
+            "TCP obfuscation: magic MISMATCH: got 0x{magic:08X}, expected 0x{MAGICVALUE_SYNC:08X}"
+        );
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("obfuscation handshake: bad magic 0x{magic:08X}, expected 0x{MAGICVALUE_SYNC:08X}"),
+            format!(
+                "obfuscation handshake: bad magic 0x{magic:08X}, expected 0x{MAGICVALUE_SYNC:08X}"
+            ),
         ));
     }
     info!("TCP obfuscation: magic verified OK");
@@ -215,7 +224,10 @@ where
     let mut dec_magic = [0u8; 4];
     recv_key.process(&enc_magic, &mut dec_magic);
     if u32::from_le_bytes(dec_magic) != MAGICVALUE_SYNC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad obfuscated peer magic"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad obfuscated peer magic",
+        ));
     }
 
     let mut enc_tags = [0u8; 2];
@@ -223,7 +235,10 @@ where
     let mut dec_tags = [0u8; 2];
     recv_key.process(&enc_tags, &mut dec_tags);
     if dec_tags[0] != ENM_OBFUSCATION {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported obfuscation method"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported obfuscation method",
+        ));
     }
     let response_pad_len = dec_tags[1] as usize;
     if response_pad_len > 0 {
@@ -288,7 +303,13 @@ pub struct Rc4Writer<W> {
 
 impl<W> Rc4Writer<W> {
     pub fn new(inner: W, rc4: Rc4State) -> Self {
-        Self { inner, rc4, pending: Vec::new(), pending_offset: 0, pending_plaintext_len: 0 }
+        Self {
+            inner,
+            rc4,
+            pending: Vec::new(),
+            pending_offset: 0,
+            pending_plaintext_len: 0,
+        }
     }
 }
 

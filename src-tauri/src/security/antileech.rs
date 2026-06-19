@@ -305,8 +305,7 @@ impl AntiLeechFilter {
             buf.push_str(pat);
             buf.push('\n');
         }
-        crate::security::atomic_write(path, buf.as_bytes(), false)
-            .map_err(std::io::Error::other)
+        crate::security::atomic_write(path, buf.as_bytes(), false).map_err(std::io::Error::other)
     }
 
     /// Hot-path matcher. Returns the first matching pattern (for log
@@ -550,13 +549,15 @@ MagicMule
             filter.check("NewLeechMod 1.0").is_some(),
             "new pattern must take effect"
         );
-        assert!(filter.enabled(), "enabled flag must be preserved across replace");
+        assert!(
+            filter.enabled(),
+            "enabled flag must be preserved across replace"
+        );
     }
 
     #[test]
     fn case_insensitive_by_default() {
-        let (filter, _) =
-            AntiLeechFilter::from_patterns(vec!["BadMod".to_string()], true);
+        let (filter, _) = AntiLeechFilter::from_patterns(vec!["BadMod".to_string()], true);
         assert!(filter.check("BADMOD 1.0").is_some());
         assert!(filter.check("badmod 2.0").is_some());
         assert!(filter.check("BaDmOd").is_some());
@@ -576,10 +577,16 @@ MagicMule
         let (mut bad_filter, errors) =
             AntiLeechFilter::from_patterns(vec!["[invalid".to_string()], true);
         assert!(!errors.is_empty(), "invalid regex must surface in errors");
-        assert!(!bad_filter.enabled(), "enabled must be forced off when set is None");
+        assert!(
+            !bad_filter.enabled(),
+            "enabled must be forced off when set is None"
+        );
         let res = bad_filter.set_enabled(true);
         assert!(res.is_err(), "must refuse to enable without a compiled set");
-        assert!(!bad_filter.enabled(), "state must remain disabled after refusal");
+        assert!(
+            !bad_filter.enabled(),
+            "state must remain disabled after refusal"
+        );
         // Disabling should always succeed regardless of set state.
         let _ = filter.set_enabled(false);
         assert!(filter.set_enabled(false).is_ok());

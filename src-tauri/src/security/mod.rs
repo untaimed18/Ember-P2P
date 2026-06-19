@@ -23,12 +23,51 @@ fn unique_tmp_path(final_path: &Path) -> PathBuf {
 }
 
 const DANGEROUS_EXTENSIONS: &[&str] = &[
-    "exe", "bat", "cmd", "com", "scr", "pif", "msi", "msp", "mst",
-    "cpl", "hta", "inf", "ins", "isp", "jse", "lnk", "reg", "rgs",
-    "sct", "shb", "shs", "vbe", "vbs", "wsc", "wsf", "wsh", "ws",
-    "ps1", "ps1xml", "ps2", "ps2xml", "psc1", "psc2", "psm1",
-    "application", "gadget", "msh", "msh1", "msh2", "mshxml",
-    "msh1xml", "msh2xml", "dll", "sys", "drv",
+    "exe",
+    "bat",
+    "cmd",
+    "com",
+    "scr",
+    "pif",
+    "msi",
+    "msp",
+    "mst",
+    "cpl",
+    "hta",
+    "inf",
+    "ins",
+    "isp",
+    "jse",
+    "lnk",
+    "reg",
+    "rgs",
+    "sct",
+    "shb",
+    "shs",
+    "vbe",
+    "vbs",
+    "wsc",
+    "wsf",
+    "wsh",
+    "ws",
+    "ps1",
+    "ps1xml",
+    "ps2",
+    "ps2xml",
+    "psc1",
+    "psc2",
+    "psm1",
+    "application",
+    "gadget",
+    "msh",
+    "msh1",
+    "msh2",
+    "mshxml",
+    "msh1xml",
+    "msh2xml",
+    "dll",
+    "sys",
+    "drv",
 ];
 
 /// Render a fatal network error for display in the UI without leaking IP
@@ -81,8 +120,11 @@ pub fn is_dangerous_extension(filename: &str) -> bool {
 }
 
 pub(crate) fn is_special_use_v4(v4: std::net::Ipv4Addr) -> bool {
-    v4.is_loopback() || v4.is_private() || v4.is_link_local()
-        || v4.is_unspecified() || v4.is_broadcast()
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
         || is_shared_address(v4)
         || is_documentation_v4(v4)
         || is_benchmarking_v4(v4)
@@ -126,8 +168,10 @@ pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {
             let is_v4_mapped = segs[0..5] == [0, 0, 0, 0, 0] && segs[5] == 0xFFFF;
             if is_v4_mapped {
                 let mapped = std::net::Ipv4Addr::new(
-                    (segs[6] >> 8) as u8, segs[6] as u8,
-                    (segs[7] >> 8) as u8, segs[7] as u8,
+                    (segs[6] >> 8) as u8,
+                    segs[6] as u8,
+                    (segs[7] >> 8) as u8,
+                    segs[7] as u8,
                 );
                 return is_special_use_v4(mapped);
             }
@@ -153,15 +197,15 @@ pub const MAX_FETCH_URL_LEN: usize = 2048;
 /// (the pin only proves *which* host you reached, not that the bytes
 /// weren't modified in flight). Users who paste a custom http:// URL
 /// into the IP filter import field get a clear "https only" error.
-pub async fn validate_fetch_url(url: &str) -> Result<(String, String, Vec<std::net::SocketAddr>), String> {
+pub async fn validate_fetch_url(
+    url: &str,
+) -> Result<(String, String, Vec<std::net::SocketAddr>), String> {
     let url = url.trim();
     if url.is_empty() {
         return Err("URL is empty".into());
     }
     if url.len() > MAX_FETCH_URL_LEN {
-        return Err(format!(
-            "URL exceeds {MAX_FETCH_URL_LEN} bytes",
-        ));
+        return Err(format!("URL exceeds {MAX_FETCH_URL_LEN} bytes",));
     }
     let url_lower = url.to_ascii_lowercase();
     if !url_lower.starts_with("https://") {
@@ -171,9 +215,7 @@ pub async fn validate_fetch_url(url: &str) -> Result<(String, String, Vec<std::n
     let scheme_port: u16 = 443;
     let scheme_str = "https://";
 
-    let host_part = url_lower
-        .strip_prefix("https://")
-        .unwrap_or("");
+    let host_part = url_lower.strip_prefix("https://").unwrap_or("");
     let raw_authority = host_part.split('/').next().unwrap_or("");
     if raw_authority.contains('@') {
         return Err("URLs with userinfo (user:pass@host) are not allowed".into());
@@ -181,7 +223,12 @@ pub async fn validate_fetch_url(url: &str) -> Result<(String, String, Vec<std::n
     let authority = raw_authority;
 
     let host = if authority.starts_with('[') {
-        authority.split(']').next().unwrap_or("").trim_start_matches('[').to_lowercase()
+        authority
+            .split(']')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('[')
+            .to_lowercase()
     } else {
         authority.split(':').next().unwrap_or("").to_lowercase()
     };
@@ -207,16 +254,23 @@ pub async fn validate_fetch_url(url: &str) -> Result<(String, String, Vec<std::n
     }
 
     let original_after_scheme = &url[scheme_str.len()..];
-    let path_and_rest = original_after_scheme.find('/').map(|i| &original_after_scheme[i..]).unwrap_or("");
+    let path_and_rest = original_after_scheme
+        .find('/')
+        .map(|i| &original_after_scheme[i..])
+        .unwrap_or("");
     let normalized_url = format!("{}{}{}", scheme_str, authority, path_and_rest);
 
     let url_port = if authority.starts_with('[') {
-        authority.rsplit(']').next()
+        authority
+            .rsplit(']')
+            .next()
             .and_then(|rest| rest.strip_prefix(':'))
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap_or(scheme_port)
     } else if authority.matches(':').count() == 1 {
-        authority.split(':').nth(1)
+        authority
+            .split(':')
+            .nth(1)
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap_or(scheme_port)
     } else {
@@ -226,9 +280,15 @@ pub async fn validate_fetch_url(url: &str) -> Result<(String, String, Vec<std::n
     let mut resolved_addrs = Vec::new();
 
     if let Ok(ipv4) = host.parse::<std::net::Ipv4Addr>() {
-        resolved_addrs.push(std::net::SocketAddr::new(std::net::IpAddr::V4(ipv4), url_port));
+        resolved_addrs.push(std::net::SocketAddr::new(
+            std::net::IpAddr::V4(ipv4),
+            url_port,
+        ));
     } else if let Ok(ipv6) = host.parse::<std::net::Ipv6Addr>() {
-        resolved_addrs.push(std::net::SocketAddr::new(std::net::IpAddr::V6(ipv6), url_port));
+        resolved_addrs.push(std::net::SocketAddr::new(
+            std::net::IpAddr::V6(ipv6),
+            url_port,
+        ));
     } else {
         let lookup_host = host.clone();
         let lookup_addr = format!("{lookup_host}:{scheme_port}");
@@ -247,7 +307,8 @@ pub async fn validate_fetch_url(url: &str) -> Result<(String, String, Vec<std::n
                 return Err("URL hostname resolves to a private/loopback address".into());
             }
         }
-        resolved_addrs = addrs.iter()
+        resolved_addrs = addrs
+            .iter()
             .map(|a| std::net::SocketAddr::new(a.ip(), url_port))
             .collect();
     }
@@ -265,7 +326,10 @@ pub async fn validate_fetch_url(url: &str) -> Result<(String, String, Vec<std::n
 /// hostname) sail straight past the private-IP checks in
 /// [`validate_fetch_url`]. Callers must follow redirects via
 /// [`fetch_pinned_get`], which re-validates every hop.
-pub fn build_pinned_client(host: &str, addrs: &[std::net::SocketAddr]) -> Result<reqwest::Client, String> {
+pub fn build_pinned_client(
+    host: &str,
+    addrs: &[std::net::SocketAddr],
+) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         // Hard per-request ceiling. Bootstrap downloads should be small
@@ -275,7 +339,9 @@ pub fn build_pinned_client(host: &str, addrs: &[std::net::SocketAddr]) -> Result
     for addr in addrs {
         builder = builder.resolve(host, *addr);
     }
-    builder.build().map_err(|e| format!("Failed to build HTTP client: {e}"))
+    builder
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {e}"))
 }
 
 /// Maximum number of HTTP redirects [`fetch_pinned_get`] will follow before
@@ -322,20 +388,22 @@ pub async fn fetch_pinned_get(initial_url: &str) -> Result<reqwest::Response, St
 
         return Ok(resp);
     }
-    Err(format!("Too many redirects (more than {MAX_FETCH_REDIRECTS})"))
+    Err(format!(
+        "Too many redirects (more than {MAX_FETCH_REDIRECTS})"
+    ))
 }
 
 /// Check whether a canonical path is within one of the allowed directories.
 pub fn is_path_within_dirs(canonical: &Path, allowed_dirs: &[String]) -> bool {
-    allowed_dirs.iter().any(|dir| {
-        match std::fs::canonicalize(dir) {
+    allowed_dirs
+        .iter()
+        .any(|dir| match std::fs::canonicalize(dir) {
             Ok(canon_dir) => canonical.starts_with(&canon_dir),
             Err(e) => {
                 tracing::debug!("Skipping non-canonicalizable allowed dir {dir:?}: {e}");
                 false
             }
-        }
-    })
+        })
 }
 
 fn normalize_match_path(path: &str) -> String {
@@ -543,7 +611,9 @@ fn whoami() -> String {
 
 /// Clean up log files older than the given number of days.
 pub fn cleanup_old_logs(log_dir: &Path, max_age_days: u64) {
-    let Ok(entries) = std::fs::read_dir(log_dir) else { return };
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -596,9 +666,8 @@ pub fn sanitize_filename(name: &str) -> String {
     let upper = safe.to_uppercase();
     let base = upper.split('.').next().unwrap_or("");
     let reserved = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
-        "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     if reserved.contains(&base) {
         return format!("_{safe}");
@@ -614,7 +683,9 @@ pub fn sanitize_filename(name: &str) -> String {
         safe
     };
 
-    let safe = safe.trim_end_matches(|c: char| c == '.' || c == ' ').to_string();
+    let safe = safe
+        .trim_end_matches(|c: char| c == '.' || c == ' ')
+        .to_string();
     if safe.is_empty() {
         return "unnamed_file".to_string();
     }
@@ -787,7 +858,10 @@ mod tests {
         assert_eq!(sanitize_display_name("Frank\u{FE0F}"), "Frank");
         // A nickname that's purely invisible chars falls back like
         // an empty input would.
-        assert_eq!(sanitize_display_name("\u{202E}\u{200B}\u{FEFF}"), "Anonymous");
+        assert_eq!(
+            sanitize_display_name("\u{202E}\u{200B}\u{FEFF}"),
+            "Anonymous"
+        );
     }
 
     #[test]

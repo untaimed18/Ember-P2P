@@ -98,7 +98,8 @@ pub fn encode_message(
     buf.write_all(&msg.sender_id.0).unwrap();
 
     if include_pub_key {
-        buf.write_all(&signing_key.verifying_key().to_bytes()).unwrap();
+        buf.write_all(&signing_key.verifying_key().to_bytes())
+            .unwrap();
     }
 
     buf.write_u16::<LittleEndian>(payload_len as u16).unwrap();
@@ -119,7 +120,10 @@ pub fn decode_message(data: &[u8], has_pub_key: bool) -> anyhow::Result<DhtMessa
     let pub_key_size = if has_pub_key { 32 } else { 0 };
     let min_size = HEADER_MIN_SIZE + pub_key_size + 2 + 64; // header + payload_len + signature
     if data.len() < min_size {
-        anyhow::bail!("DHT message too short ({} bytes, need at least {min_size})", data.len());
+        anyhow::bail!(
+            "DHT message too short ({} bytes, need at least {min_size})",
+            data.len()
+        );
     }
 
     let mut cursor = Cursor::new(data);
@@ -216,11 +220,7 @@ pub fn build_pong(sender_id: EmberNodeId, request_id: u32) -> DhtMessage {
 }
 
 /// Build a FIND_NODE request.
-pub fn build_find_node(
-    sender_id: EmberNodeId,
-    request_id: u32,
-    target: EmberNodeId,
-) -> DhtMessage {
+pub fn build_find_node(sender_id: EmberNodeId, request_id: u32, target: EmberNodeId) -> DhtMessage {
     DhtMessage {
         version: EMBER_DHT_VERSION,
         msg_type: MSG_FIND_NODE,
@@ -255,9 +255,9 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
     match payload {
         DhtPayload::Ping | DhtPayload::Pong => Vec::new(),
         DhtPayload::FindNode { target } => target.0.to_vec(),
-        DhtPayload::FoundNode { contacts } | DhtPayload::AnnouncePeer { contacts } | DhtPayload::PeerList { contacts } => {
-            encode_contact_list(contacts)
-        }
+        DhtPayload::FoundNode { contacts }
+        | DhtPayload::AnnouncePeer { contacts }
+        | DhtPayload::PeerList { contacts } => encode_contact_list(contacts),
         DhtPayload::StoreRecord {
             key,
             record,
@@ -587,7 +587,9 @@ mod tests {
         let decoded = decode_message(&encoded, true).unwrap();
 
         match decoded.payload {
-            DhtPayload::FoundNode { contacts: decoded_contacts } => {
+            DhtPayload::FoundNode {
+                contacts: decoded_contacts,
+            } => {
                 assert_eq!(decoded_contacts.len(), 2);
                 assert_eq!(decoded_contacts[0].node_id, contacts[0].node_id);
                 assert_eq!(decoded_contacts[0].addr, contacts[0].addr);
@@ -636,7 +638,10 @@ mod tests {
         let decoded = decode_contact_list(&encoded).unwrap();
 
         assert_eq!(decoded.len(), 2);
-        assert_eq!(decoded[0].addr, "10.0.0.1:1000".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            decoded[0].addr,
+            "10.0.0.1:1000".parse::<SocketAddr>().unwrap()
+        );
         assert_eq!(
             decoded[1].addr,
             "[2001:db8::1]:2000".parse::<SocketAddr>().unwrap()

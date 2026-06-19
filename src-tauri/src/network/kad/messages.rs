@@ -234,7 +234,8 @@ pub fn decode_packet(data: &[u8]) -> io::Result<KadMessage> {
                 }
             };
 
-            if matches!(&decompress_result, Err(e) if matches!(e.kind(), io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof | io::ErrorKind::Other)) {
+            if matches!(&decompress_result, Err(e) if matches!(e.kind(), io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof | io::ErrorKind::Other))
+            {
                 decompressed.clear();
                 let mut decoder2 = DeflateDecoder::new(compressed);
                 let mut buf = vec![0u8; 4096];
@@ -457,7 +458,11 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
             let target = KadId::read_from(cursor)?;
             let sender_id = KadId::read_from(cursor)?;
             let tags = read_tag_list(cursor)?;
-            Ok(KadMessage::PublishNotesReq { target, sender_id, tags })
+            Ok(KadMessage::PublishNotesReq {
+                target,
+                sender_id,
+                tags,
+            })
         }
 
         KADEMLIA2_PUBLISH_RES_ACK => Ok(KadMessage::PublishResAck),
@@ -483,7 +488,11 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
             let mut user_hash = [0u8; 16];
             cursor.read_exact(&mut user_hash)?;
             let connect_options = cursor.read_u8()?;
-            Ok(KadMessage::Firewalled2Req { tcp_port, user_hash, connect_options })
+            Ok(KadMessage::Firewalled2Req {
+                tcp_port,
+                user_hash,
+                connect_options,
+            })
         }
 
         KADEMLIA_FIREWALLED_RES => {
@@ -494,14 +503,21 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
         KADEMLIA2_FIREWALLUDP => {
             let error_code = cursor.read_u8()?;
             let udp_port = cursor.read_u16::<LittleEndian>()?;
-            Ok(KadMessage::FirewallUdp { error_code, udp_port })
+            Ok(KadMessage::FirewallUdp {
+                error_code,
+                udp_port,
+            })
         }
 
         KADEMLIA_FINDBUDDY_REQ => {
             let buddy_id = KadId::read_from(cursor)?;
             let user_id = KadId::read_from(cursor)?;
             let tcp_port = cursor.read_u16::<LittleEndian>()?;
-            Ok(KadMessage::FindBuddyReq { buddy_id, user_id, tcp_port })
+            Ok(KadMessage::FindBuddyReq {
+                buddy_id,
+                user_id,
+                tcp_port,
+            })
         }
 
         KADEMLIA_FINDBUDDY_RES => {
@@ -514,14 +530,23 @@ fn decode_message(opcode: u8, cursor: &mut Cursor<&[u8]>) -> io::Result<KadMessa
             } else {
                 0
             };
-            Ok(KadMessage::FindBuddyRes { buddy_id, user_hash, tcp_port, connect_options })
+            Ok(KadMessage::FindBuddyRes {
+                buddy_id,
+                user_hash,
+                tcp_port,
+                connect_options,
+            })
         }
 
         KADEMLIA_CALLBACK_REQ => {
             let buddy_id = KadId::read_from(cursor)?;
             let file_id = KadId::read_from(cursor)?;
             let tcp_port = cursor.read_u16::<LittleEndian>()?;
-            Ok(KadMessage::CallbackReq { buddy_id, file_id, tcp_port })
+            Ok(KadMessage::CallbackReq {
+                buddy_id,
+                file_id,
+                tcp_port,
+            })
         }
 
         KADEMLIA_FIREWALLED_ACK_RES => Ok(KadMessage::FirewalledAckRes),
@@ -767,7 +792,11 @@ fn encode_message(msg: &KadMessage, out: &mut Vec<u8>) -> io::Result<()> {
             out.write_u64::<LittleEndian>(*file_size)?;
         }
 
-        KadMessage::PublishNotesReq { target, sender_id, tags } => {
+        KadMessage::PublishNotesReq {
+            target,
+            sender_id,
+            tags,
+        } => {
             out.write_u8(KADEMLIA2_PUBLISH_NOTES_REQ)?;
             target.write_to(out)?;
             sender_id.write_to(out)?;
@@ -792,7 +821,11 @@ fn encode_message(msg: &KadMessage, out: &mut Vec<u8>) -> io::Result<()> {
             out.write_u16::<LittleEndian>(*tcp_port)?;
         }
 
-        KadMessage::Firewalled2Req { tcp_port, user_hash, connect_options } => {
+        KadMessage::Firewalled2Req {
+            tcp_port,
+            user_hash,
+            connect_options,
+        } => {
             out.write_u8(KADEMLIA_FIREWALLED2_REQ)?;
             out.write_u16::<LittleEndian>(*tcp_port)?;
             out.write_all(user_hash)?;
@@ -804,20 +837,32 @@ fn encode_message(msg: &KadMessage, out: &mut Vec<u8>) -> io::Result<()> {
             out.write_u32::<LittleEndian>(*ip)?;
         }
 
-        KadMessage::FirewallUdp { error_code, udp_port } => {
+        KadMessage::FirewallUdp {
+            error_code,
+            udp_port,
+        } => {
             out.write_u8(KADEMLIA2_FIREWALLUDP)?;
             out.write_u8(*error_code)?;
             out.write_u16::<LittleEndian>(*udp_port)?;
         }
 
-        KadMessage::FindBuddyReq { buddy_id, user_id, tcp_port } => {
+        KadMessage::FindBuddyReq {
+            buddy_id,
+            user_id,
+            tcp_port,
+        } => {
             out.write_u8(KADEMLIA_FINDBUDDY_REQ)?;
             buddy_id.write_to(out)?;
             user_id.write_to(out)?;
             out.write_u16::<LittleEndian>(*tcp_port)?;
         }
 
-        KadMessage::FindBuddyRes { buddy_id, user_hash, tcp_port, connect_options } => {
+        KadMessage::FindBuddyRes {
+            buddy_id,
+            user_hash,
+            tcp_port,
+            connect_options,
+        } => {
             out.write_u8(KADEMLIA_FINDBUDDY_RES)?;
             buddy_id.write_to(out)?;
             out.write_all(user_hash)?;
@@ -825,7 +870,11 @@ fn encode_message(msg: &KadMessage, out: &mut Vec<u8>) -> io::Result<()> {
             out.write_u8(*connect_options)?;
         }
 
-        KadMessage::CallbackReq { buddy_id, file_id, tcp_port } => {
+        KadMessage::CallbackReq {
+            buddy_id,
+            file_id,
+            tcp_port,
+        } => {
             out.write_u8(KADEMLIA_CALLBACK_REQ)?;
             buddy_id.write_to(out)?;
             file_id.write_to(out)?;
@@ -1000,7 +1049,12 @@ pub fn build_search_expression(keywords: &[String], constraints: &SearchConstrai
 
     if let Some(min_avail) = constraints.min_availability.filter(|v| *v > 0) {
         let mut n = Vec::new();
-        write_numeric_leaf(&mut n, min_avail as u64, ED2K_SEARCH_OP_GREATER_EQUAL, TAG_SOURCES);
+        write_numeric_leaf(
+            &mut n,
+            min_avail as u64,
+            ED2K_SEARCH_OP_GREATER_EQUAL,
+            TAG_SOURCES,
+        );
         nodes.push(n);
     }
 
@@ -1065,7 +1119,10 @@ mod search_expr_tests {
         // Backward-compat: AND(keyword, FT_FILETYPE meta-string).
         let out = build_search_expression(
             &kw("movie"),
-            &SearchConstraints { file_type: Some("Video"), ..Default::default() },
+            &SearchConstraints {
+                file_type: Some("Video"),
+                ..Default::default()
+            },
         );
         let mut expected = vec![0x00, 0x00];
         expected.extend(string_leaf("movie"));
@@ -1077,7 +1134,10 @@ mod search_expr_tests {
     fn min_size_emits_u32_numeric_ge_filesize() {
         let out = build_search_expression(
             &kw("movie"),
-            &SearchConstraints { min_size: Some(1024), ..Default::default() },
+            &SearchConstraints {
+                min_size: Some(1024),
+                ..Default::default()
+            },
         );
         let mut expected = vec![0x00, 0x00];
         expected.extend(string_leaf("movie"));
@@ -1095,7 +1155,10 @@ mod search_expr_tests {
         let big = (u32::MAX as u64) + 1; // 4 GiB + 1 byte
         let out = build_search_expression(
             &kw("iso"),
-            &SearchConstraints { max_size: Some(big), ..Default::default() },
+            &SearchConstraints {
+                max_size: Some(big),
+                ..Default::default()
+            },
         );
         let mut expected = vec![0x00, 0x00];
         expected.extend(string_leaf("iso"));
@@ -1111,7 +1174,10 @@ mod search_expr_tests {
     fn extension_is_dot_stripped_fileformat_meta() {
         let out = build_search_expression(
             &kw("song"),
-            &SearchConstraints { file_extension: Some(".mp3"), ..Default::default() },
+            &SearchConstraints {
+                file_extension: Some(".mp3"),
+                ..Default::default()
+            },
         );
         let mut expected = vec![0x00, 0x00];
         expected.extend(string_leaf("song"));
@@ -1139,7 +1205,10 @@ mod search_expr_tests {
         // No keywords: the lone constraint leaf is emitted without an AND.
         let out = build_search_expression(
             &[],
-            &SearchConstraints { file_type: Some("Audio"), ..Default::default() },
+            &SearchConstraints {
+                file_type: Some("Audio"),
+                ..Default::default()
+            },
         );
         assert_eq!(out, meta_string("Audio", TAG_FILETYPE));
     }
@@ -1161,7 +1230,10 @@ mod search_expr_tests {
         // => 3 leading AND operator pairs (0x00 0x00) at the chain joints,
         //    plus the internal AND from the 2-keyword tree.
         let and_pairs = out.windows(2).filter(|w| w == b"\x00\x00").count();
-        assert!(and_pairs >= 3, "expected at least 3 AND joints, got {and_pairs}");
+        assert!(
+            and_pairs >= 3,
+            "expected at least 3 AND joints, got {and_pairs}"
+        );
         assert!(!out.is_empty());
     }
 }
