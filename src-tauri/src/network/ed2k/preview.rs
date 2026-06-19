@@ -7,8 +7,8 @@ const MIN_PREVIEW_SIZE: u64 = 16 * 1024;
 const COPY_BUFFER_SIZE: usize = 16 * 1024;
 
 const VIDEO_EXTENSIONS: &[&str] = &[
-    "avi", "mp4", "mkv", "wmv", "mpg", "mpeg", "mov", "flv", "webm",
-    "m4v", "3gp", "divx", "ogm", "ogv", "rm", "rmvb", "ts", "vob",
+    "avi", "mp4", "mkv", "wmv", "mpg", "mpeg", "mov", "flv", "webm", "m4v", "3gp", "divx", "ogm",
+    "ogv", "rm", "rmvb", "ts", "vob",
 ];
 
 const AUDIO_EXTENSIONS: &[&str] = &[
@@ -73,7 +73,9 @@ pub fn can_preview(
     if required_parts == 0 || required_parts > verified_complete_parts.len() {
         return false;
     }
-    verified_complete_parts[..required_parts].iter().all(|&ok| ok)
+    verified_complete_parts[..required_parts]
+        .iter()
+        .all(|&ok| ok)
 }
 
 /// Create a temporary preview file by copying filled ranges.
@@ -126,7 +128,9 @@ pub fn create_preview_file(
             if n == 0 {
                 tracing::warn!(
                     "Preview: unexpected EOF copying range [{}, {}), {} bytes remaining",
-                    range.start, range.end, remaining
+                    range.start,
+                    range.end,
+                    remaining
                 );
                 break;
             }
@@ -151,9 +155,7 @@ pub fn launch_preview(file_path: &Path) -> anyhow::Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open")
-            .arg(file_path)
-            .spawn()?;
+        std::process::Command::new("open").arg(file_path).spawn()?;
     }
 
     #[cfg(target_os = "linux")]

@@ -1,7 +1,7 @@
+pub mod broker;
 pub mod crypto;
 pub mod nat;
 pub mod quic;
-pub mod broker;
 pub mod relay;
 
 // Ember-native modules below are still dormant. `reputation` is the exception:
@@ -18,8 +18,8 @@ pub mod transport;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read, Write};
 use std::net::Ipv4Addr;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 pub const EPX_VERSION: u8 = 4;
@@ -123,7 +123,11 @@ pub fn build_exchange_payload(entries: &[EmberFileEntry], peers: &[EmberPeer]) -
         buf.write_all(&entry.file_hash).unwrap();
         buf.write_u64::<LittleEndian>(entry.file_size).unwrap();
 
-        let file_flags = if entry.aich_root.is_some() { FILE_FLAG_HAS_AICH } else { 0 };
+        let file_flags = if entry.aich_root.is_some() {
+            FILE_FLAG_HAS_AICH
+        } else {
+            0
+        };
         buf.write_u8(file_flags).unwrap();
         if let Some(ref aich) = entry.aich_root {
             buf.write_all(aich).unwrap();
@@ -194,9 +198,16 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
     let mut files_fully_parsed = true;
     for _ in 0..file_count {
         let remaining = data.len() - cursor.position() as usize;
-        let min_header = if version >= 3 { V3_FILE_ENTRY_HEADER_SIZE } else { V2_FILE_ENTRY_HEADER_SIZE };
+        let min_header = if version >= 3 {
+            V3_FILE_ENTRY_HEADER_SIZE
+        } else {
+            V2_FILE_ENTRY_HEADER_SIZE
+        };
         if remaining < min_header {
-            tracing::debug!("EPX payload truncated: declared {file_count} files but only parsed {}", entries.len());
+            tracing::debug!(
+                "EPX payload truncated: declared {file_count} files but only parsed {}",
+                entries.len()
+            );
             files_fully_parsed = false;
             break;
         }
@@ -210,7 +221,10 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
             let aich = if file_flags & FILE_FLAG_HAS_AICH != 0 {
                 let remaining = data.len() - cursor.position() as usize;
                 if remaining < 20 {
-                    tracing::debug!("EPX payload truncated: missing AICH root for {}", hex::encode(file_hash));
+                    tracing::debug!(
+                        "EPX payload truncated: missing AICH root for {}",
+                        hex::encode(file_hash)
+                    );
                     files_fully_parsed = false;
                     break;
                 }
@@ -227,13 +241,19 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
 
         let source_count = cursor.read_u16::<LittleEndian>()? as usize;
         if source_count > MAX_EPX_SOURCES_PER_FILE {
-            anyhow::bail!("EPX source_count {source_count} exceeds limit for hash {}", hex::encode(file_hash));
+            anyhow::bail!(
+                "EPX source_count {source_count} exceeds limit for hash {}",
+                hex::encode(file_hash)
+            );
         }
 
         let sources_bytes_needed = source_count * source_entry_size;
         let remaining = data.len() - cursor.position() as usize;
         if remaining < sources_bytes_needed {
-            tracing::debug!("EPX payload truncated: not enough bytes for sources of file {}", hex::encode(file_hash));
+            tracing::debug!(
+                "EPX payload truncated: not enough bytes for sources of file {}",
+                hex::encode(file_hash)
+            );
             files_fully_parsed = false;
             break;
         }
@@ -257,7 +277,12 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
                 continue;
             }
 
-            sources.push(EmberSource { ip, tcp_port, udp_port, flags });
+            sources.push(EmberSource {
+                ip,
+                tcp_port,
+                udp_port,
+                flags,
+            });
         }
 
         if file_hash == [0u8; 16] || file_size == 0 {
@@ -314,7 +339,10 @@ pub fn parse_exchange_payload(data: &[u8]) -> anyhow::Result<ExchangeResult> {
         }
     }
 
-    Ok(ExchangeResult { files: entries, peers })
+    Ok(ExchangeResult {
+        files: entries,
+        peers,
+    })
 }
 
 #[cfg(test)]
@@ -345,10 +373,7 @@ mod tests {
             file_hash: [1u8; 16],
             file_size: 12345,
             aich_root: None,
-            sources: vec![
-                make_source(1, 2, 3, 4, 4662),
-                make_source(5, 6, 7, 8, 4663),
-            ],
+            sources: vec![make_source(1, 2, 3, 4, 4662), make_source(5, 6, 7, 8, 4663)],
         }];
         let payload = build_exchange_payload(&entries, &[]);
         let result = parse_exchange_payload(&payload).unwrap();
@@ -394,14 +419,23 @@ mod tests {
         }];
         let payload = build_exchange_payload(&entries, &[]);
         let result = parse_exchange_payload(&payload).unwrap();
-        assert_eq!(result.files[0].sources[0].flags, SOURCE_FLAG_FIREWALLED | SOURCE_FLAG_OBFUSCATION);
+        assert_eq!(
+            result.files[0].sources[0].flags,
+            SOURCE_FLAG_FIREWALLED | SOURCE_FLAG_OBFUSCATION
+        );
     }
 
     #[test]
     fn round_trip_with_peers() {
         let peers = vec![
-            EmberPeer { ip: Ipv4Addr::new(1, 1, 1, 1), tcp_port: 4662 },
-            EmberPeer { ip: Ipv4Addr::new(2, 2, 2, 2), tcp_port: 4663 },
+            EmberPeer {
+                ip: Ipv4Addr::new(1, 1, 1, 1),
+                tcp_port: 4662,
+            },
+            EmberPeer {
+                ip: Ipv4Addr::new(2, 2, 2, 2),
+                tcp_port: 4663,
+            },
         ];
         let payload = build_exchange_payload(&[], &peers);
         let result = parse_exchange_payload(&payload).unwrap();
@@ -426,9 +460,24 @@ mod tests {
                 file_size: 200,
                 aich_root: None,
                 sources: vec![
-                    EmberSource { ip: Ipv4Addr::UNSPECIFIED, tcp_port: 100, udp_port: 0, flags: 0 },
-                    EmberSource { ip: Ipv4Addr::new(10, 0, 0, 1), tcp_port: 0, udp_port: 0, flags: 0 },
-                    EmberSource { ip: Ipv4Addr::new(88, 1, 2, 3), tcp_port: 4662, udp_port: 4672, flags: 0 },
+                    EmberSource {
+                        ip: Ipv4Addr::UNSPECIFIED,
+                        tcp_port: 100,
+                        udp_port: 0,
+                        flags: 0,
+                    },
+                    EmberSource {
+                        ip: Ipv4Addr::new(10, 0, 0, 1),
+                        tcp_port: 0,
+                        udp_port: 0,
+                        flags: 0,
+                    },
+                    EmberSource {
+                        ip: Ipv4Addr::new(88, 1, 2, 3),
+                        tcp_port: 4662,
+                        udp_port: 4672,
+                        flags: 0,
+                    },
                 ],
             },
         ];
@@ -463,7 +512,9 @@ mod tests {
     fn rejects_declared_file_count_over_limit() {
         let mut payload = Vec::new();
         payload.write_u8(EPX_VERSION).unwrap();
-        payload.write_u16::<LittleEndian>((MAX_EPX_FILES + 1) as u16).unwrap();
+        payload
+            .write_u16::<LittleEndian>((MAX_EPX_FILES + 1) as u16)
+            .unwrap();
 
         let err = parse_exchange_payload(&payload).unwrap_err().to_string();
         assert!(err.contains("file_count"));
@@ -477,7 +528,9 @@ mod tests {
         payload.write_all(&[7u8; 16]).unwrap();
         payload.write_u64::<LittleEndian>(123).unwrap();
         payload.write_u8(0).unwrap();
-        payload.write_u16::<LittleEndian>((MAX_EPX_SOURCES_PER_FILE + 1) as u16).unwrap();
+        payload
+            .write_u16::<LittleEndian>((MAX_EPX_SOURCES_PER_FILE + 1) as u16)
+            .unwrap();
 
         let err = parse_exchange_payload(&payload).unwrap_err().to_string();
         assert!(err.contains("source_count"));
@@ -579,12 +632,42 @@ mod tests {
             file_size: 500,
             aich_root: None,
             sources: vec![
-                EmberSource { ip: Ipv4Addr::new(192, 168, 1, 1), tcp_port: 4662, udp_port: 0, flags: 0 },
-                EmberSource { ip: Ipv4Addr::new(10, 0, 0, 1), tcp_port: 4663, udp_port: 0, flags: 0 },
-                EmberSource { ip: Ipv4Addr::new(172, 16, 0, 1), tcp_port: 4664, udp_port: 0, flags: 0 },
-                EmberSource { ip: Ipv4Addr::new(169, 254, 1, 1), tcp_port: 4665, udp_port: 0, flags: 0 },
-                EmberSource { ip: Ipv4Addr::new(127, 0, 0, 1), tcp_port: 4666, udp_port: 0, flags: 0 },
-                EmberSource { ip: Ipv4Addr::new(44, 55, 66, 77), tcp_port: 4667, udp_port: 4677, flags: 0 },
+                EmberSource {
+                    ip: Ipv4Addr::new(192, 168, 1, 1),
+                    tcp_port: 4662,
+                    udp_port: 0,
+                    flags: 0,
+                },
+                EmberSource {
+                    ip: Ipv4Addr::new(10, 0, 0, 1),
+                    tcp_port: 4663,
+                    udp_port: 0,
+                    flags: 0,
+                },
+                EmberSource {
+                    ip: Ipv4Addr::new(172, 16, 0, 1),
+                    tcp_port: 4664,
+                    udp_port: 0,
+                    flags: 0,
+                },
+                EmberSource {
+                    ip: Ipv4Addr::new(169, 254, 1, 1),
+                    tcp_port: 4665,
+                    udp_port: 0,
+                    flags: 0,
+                },
+                EmberSource {
+                    ip: Ipv4Addr::new(127, 0, 0, 1),
+                    tcp_port: 4666,
+                    udp_port: 0,
+                    flags: 0,
+                },
+                EmberSource {
+                    ip: Ipv4Addr::new(44, 55, 66, 77),
+                    tcp_port: 4667,
+                    udp_port: 4677,
+                    flags: 0,
+                },
             ],
         }];
         let payload = build_exchange_payload(&entries, &[]);
@@ -596,8 +679,14 @@ mod tests {
     #[test]
     fn filters_private_peers() {
         let peers = vec![
-            EmberPeer { ip: Ipv4Addr::new(192, 168, 1, 1), tcp_port: 4662 },
-            EmberPeer { ip: Ipv4Addr::new(44, 55, 66, 77), tcp_port: 4662 },
+            EmberPeer {
+                ip: Ipv4Addr::new(192, 168, 1, 1),
+                tcp_port: 4662,
+            },
+            EmberPeer {
+                ip: Ipv4Addr::new(44, 55, 66, 77),
+                tcp_port: 4662,
+            },
         ];
         let payload = build_exchange_payload(&[], &peers);
         let result = parse_exchange_payload(&payload).unwrap();
@@ -613,32 +702,29 @@ mod tests {
                 file_hash: [1u8; 16],
                 file_size: 50000,
                 aich_root: Some(aich),
-                sources: vec![
-                    EmberSource {
-                        ip: Ipv4Addr::new(80, 1, 2, 3),
-                        tcp_port: 4662,
-                        udp_port: 4672,
-                        flags: SOURCE_FLAG_OBFUSCATION,
-                    },
-                ],
+                sources: vec![EmberSource {
+                    ip: Ipv4Addr::new(80, 1, 2, 3),
+                    tcp_port: 4662,
+                    udp_port: 4672,
+                    flags: SOURCE_FLAG_OBFUSCATION,
+                }],
             },
             EmberFileEntry {
                 file_hash: [2u8; 16],
                 file_size: 100000,
                 aich_root: None,
-                sources: vec![
-                    EmberSource {
-                        ip: Ipv4Addr::new(90, 1, 2, 3),
-                        tcp_port: 4662,
-                        udp_port: 0,
-                        flags: SOURCE_FLAG_FIREWALLED,
-                    },
-                ],
+                sources: vec![EmberSource {
+                    ip: Ipv4Addr::new(90, 1, 2, 3),
+                    tcp_port: 4662,
+                    udp_port: 0,
+                    flags: SOURCE_FLAG_FIREWALLED,
+                }],
             },
         ];
-        let peers = vec![
-            EmberPeer { ip: Ipv4Addr::new(33, 44, 55, 66), tcp_port: 4662 },
-        ];
+        let peers = vec![EmberPeer {
+            ip: Ipv4Addr::new(33, 44, 55, 66),
+            tcp_port: 4662,
+        }];
         let payload = build_exchange_payload(&entries, &peers);
         let result = parse_exchange_payload(&payload).unwrap();
 

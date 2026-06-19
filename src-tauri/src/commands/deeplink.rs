@@ -114,7 +114,13 @@ pub async fn open_collection_file(path: String) -> Result<Collection, String> {
 
     let canonical = tokio::task::spawn_blocking(move || std::fs::canonicalize(&p))
         .await
-        .map_err(|e| coded_ctx("collections_canonicalize_task_failed", "Canonicalize task failed", e))?
+        .map_err(|e| {
+            coded_ctx(
+                "collections_canonicalize_task_failed",
+                "Canonicalize task failed",
+                e,
+            )
+        })?
         .map_err(|e| coded_ctx("collections_cannot_resolve_path", "Cannot resolve path", e))?;
 
     let meta = tokio::fs::metadata(&canonical)
@@ -124,7 +130,10 @@ pub async fn open_collection_file(path: String) -> Result<Collection, String> {
         return Err(coded("collections_file_not_found", "File does not exist"));
     }
     if meta.len() > MAX_COLLECTION_BYTES {
-        return Err(coded("collections_too_large", "Collection file is too large"));
+        return Err(coded(
+            "collections_too_large",
+            "Collection file is too large",
+        ));
     }
 
     tokio::task::spawn_blocking(move || {

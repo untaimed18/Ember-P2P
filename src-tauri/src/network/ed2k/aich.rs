@@ -26,7 +26,10 @@ pub fn compute_aich_root(path: &Path) -> anyhow::Result<[u8; 20]> {
     compute_aich_root_cancellable(path, &NEVER)
 }
 
-pub fn compute_aich_root_cancellable(path: &Path, cancelled: &AtomicBool) -> anyhow::Result<[u8; 20]> {
+pub fn compute_aich_root_cancellable(
+    path: &Path,
+    cancelled: &AtomicBool,
+) -> anyhow::Result<[u8; 20]> {
     let mut file = std::fs::File::open(path)?;
     let file_size = file.metadata()?.len();
 
@@ -112,7 +115,11 @@ pub(crate) fn hierarchical_root(all_leaves: &[[u8; 20]], file_size: u64) -> [u8;
             PARTSIZE
         } else {
             let rem = (file_size % PARTSIZE as u64) as usize;
-            if rem == 0 { PARTSIZE } else { rem }
+            if rem == 0 {
+                PARTSIZE
+            } else {
+                rem
+            }
         };
         let blocks_in_part = (part_data_size + AICH_BLOCK_SIZE - 1) / AICH_BLOCK_SIZE;
         let end = (offset + blocks_in_part).min(all_leaves.len());
@@ -273,7 +280,8 @@ fn parse_emule_aich_tree(data: &[u8]) -> Option<Vec<[u8; 20]>> {
     // position minus the leftmost leaf at that depth. Build a correctly
     // sized vec with gaps filled by zeros for missing leaves.
     let leftmost_at_depth = 1u64 << max_depth;
-    let max_idx = leaves.iter()
+    let max_idx = leaves
+        .iter()
         .map(|&(pos, _)| (pos.saturating_sub(leftmost_at_depth)) as usize)
         .max()
         .unwrap_or(0);
@@ -428,7 +436,12 @@ impl AICHRecoveryHashSet {
     /// Supports both the eMule tree format (tree-position identifiers + hashes)
     /// and the Ember flat format (block_count + raw hashes). The eMule format is
     /// tried first; if the data doesn't structurally match, we fall back to flat.
-    pub fn read_recovery_data(&mut self, data: &[u8], part_index: usize, _part_size: usize) -> bool {
+    pub fn read_recovery_data(
+        &mut self,
+        data: &[u8],
+        part_index: usize,
+        _part_size: usize,
+    ) -> bool {
         if let Some(leaves) = parse_emule_aich_tree(data) {
             let start_block = part_index * BLOCKS_PER_FULL_PART;
             while self.leaf_hashes.len() < start_block + leaves.len() {
@@ -495,7 +508,9 @@ pub fn corrupt_blocks_from_aich_recovery(
     let start_block = part_index * BLOCKS_PER_FULL_PART;
     let received_blocks = hs.leaf_hashes.len().saturating_sub(start_block);
     if received_blocks < expected_blocks {
-        tracing::warn!("AICH recovery: received {received_blocks} leaf hashes but expected {expected_blocks}");
+        tracing::warn!(
+            "AICH recovery: received {received_blocks} leaf hashes but expected {expected_blocks}"
+        );
         return None;
     }
 
@@ -504,11 +519,14 @@ pub fn corrupt_blocks_from_aich_recovery(
         let part_leaves = &hs.leaf_hashes[start_block..start_block + expected_blocks];
         let computed_root = merkle_root(part_leaves);
         if computed_root != trusted_master {
-            tracing::warn!("AICH recovery: Merkle root of received leaves does not match trusted master");
+            tracing::warn!(
+                "AICH recovery: Merkle root of received leaves does not match trusted master"
+            );
             return None;
         }
     } else {
-        let total_blocks = ((file_size as u64 + AICH_BLOCK_SIZE as u64 - 1) / AICH_BLOCK_SIZE as u64) as usize;
+        let total_blocks =
+            ((file_size as u64 + AICH_BLOCK_SIZE as u64 - 1) / AICH_BLOCK_SIZE as u64) as usize;
         if hs.leaf_hashes.len() >= total_blocks {
             let computed_root = hierarchical_root(&hs.leaf_hashes, file_size);
             if computed_root != trusted_master {
@@ -540,7 +558,10 @@ const KNOWN2_MET_VERSION: u8 = 0x02;
 
 /// Save AICH hash sets to known2_64.met (eMule SHAHashSet.cpp format).
 /// Format: version(u8) + repeated [master_hash(20) + hash_count(u32) + hashes(20*count)]
-pub fn save_known2_met(path: &std::path::Path, hash_sets: &[AICHRecoveryHashSet]) -> std::io::Result<()> {
+pub fn save_known2_met(
+    path: &std::path::Path,
+    hash_sets: &[AICHRecoveryHashSet],
+) -> std::io::Result<()> {
     use std::io::Write;
     let mut buf: Vec<u8> = Vec::new();
     buf.write_all(&[KNOWN2_MET_VERSION])?;
@@ -575,7 +596,10 @@ pub fn load_known2_met(path: &std::path::Path) -> std::io::Result<Vec<([u8; 20],
         master.copy_from_slice(&data[offset..offset + 20]);
         offset += 20;
         let count = u32::from_le_bytes([
-            data[offset], data[offset + 1], data[offset + 2], data[offset + 3],
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
         ]) as usize;
         offset += 4;
         if offset + count * 20 > data.len() {
@@ -705,10 +729,7 @@ mod tests {
         let root = hash_internal(&leaf_a, &leaf_b);
 
         // Tree: root(1) -> leaf_a(2), leaf_b(3)
-        let data = build_emule_tree_payload(
-            &[(1, root), (2, leaf_a), (3, leaf_b)],
-            &[],
-        );
+        let data = build_emule_tree_payload(&[(1, root), (2, leaf_a), (3, leaf_b)], &[]);
 
         let leaves = parse_emule_aich_tree(&data).expect("should parse eMule tree");
         assert_eq!(leaves.len(), 2);
@@ -725,7 +746,15 @@ mod tests {
 
         // depth-0: root(1), depth-1: n2(2), n3(3), depth-2: leaves 4..7
         let data = build_emule_tree_payload(
-            &[(1, root), (2, n2), (3, n3), (4, h[0]), (5, h[1]), (6, h[2]), (7, h[3])],
+            &[
+                (1, root),
+                (2, n2),
+                (3, n3),
+                (4, h[0]),
+                (5, h[1]),
+                (6, h[2]),
+                (7, h[3]),
+            ],
             &[],
         );
 
@@ -740,10 +769,7 @@ mod tests {
         let root = hash_internal(&leaf_a, &leaf_b);
 
         // All entries in the 32-bit section
-        let data = build_emule_tree_payload(
-            &[],
-            &[(1, root), (2, leaf_a), (3, leaf_b)],
-        );
+        let data = build_emule_tree_payload(&[], &[(1, root), (2, leaf_a), (3, leaf_b)]);
 
         let leaves = parse_emule_aich_tree(&data).expect("should parse 32-bit entries");
         assert_eq!(leaves.len(), 2);
@@ -769,10 +795,8 @@ mod tests {
         let leaf_a = trusted.leaf_hashes[0];
         let leaf_b = trusted.leaf_hashes[1];
 
-        let emule_payload = build_emule_tree_payload(
-            &[(1, trusted.root_hash), (2, leaf_a), (3, leaf_b)],
-            &[],
-        );
+        let emule_payload =
+            build_emule_tree_payload(&[(1, trusted.root_hash), (2, leaf_a), (3, leaf_b)], &[]);
 
         // Clean recovery — no blocks should be corrupt
         let result = corrupt_blocks_from_aich_recovery(

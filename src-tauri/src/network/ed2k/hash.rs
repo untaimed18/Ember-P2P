@@ -75,7 +75,9 @@ pub fn ed2k_hash_file_cancellable(path: &Path, cancelled: &AtomicBool) -> anyhow
                 anyhow::bail!("cancelled");
             }
             let n = file.read(&mut buf)?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             hasher.update(&buf[..n]);
         }
         return Ok(hex::encode(hasher.finalize()));
@@ -97,7 +99,10 @@ pub fn ed2k_hash_file_cancellable(path: &Path, cancelled: &AtomicBool) -> anyhow
             let to_read = (chunk_remaining as usize).min(buf.len());
             let n = file.read(&mut buf[..to_read])?;
             if n == 0 {
-                anyhow::bail!("unexpected EOF: {} bytes remaining in chunk", chunk_remaining);
+                anyhow::bail!(
+                    "unexpected EOF: {} bytes remaining in chunk",
+                    chunk_remaining
+                );
             }
             hasher.update(&buf[..n]);
             chunk_remaining -= n as u64;
@@ -249,9 +254,22 @@ fn percent_encode_ed2k(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for &b in name.as_bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~'
-            | b'(' | b')' | b'[' | b']' | b'!' | b'\'' | b',' | b';' | b'@' => {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'('
+            | b')'
+            | b'['
+            | b']'
+            | b'!'
+            | b'\''
+            | b','
+            | b';'
+            | b'@' => {
                 out.push(b as char);
             }
             _ => {
@@ -387,10 +405,9 @@ pub fn percent_decode_str(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
-                16,
-            ) {
+            if let Ok(byte) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 result.push(byte);
                 i += 3;
                 continue;
@@ -511,4 +528,3 @@ mod link_tests {
         assert!(aich.is_none());
     }
 }
-

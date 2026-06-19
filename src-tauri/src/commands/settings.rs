@@ -1,7 +1,6 @@
 use tauri::Manager;
 use tracing::info;
 
-
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
 use crate::network::kad::bootstrap;
@@ -12,9 +11,7 @@ const NODES_DAT_URL: &str = "https://upd.emule-security.org/nodes.dat";
 const IPFILTER_URL: &str = "https://emuling.gitlab.io/ipfilter.dat";
 
 #[tauri::command]
-pub async fn get_settings(
-    state: tauri::State<'_, AppState>,
-) -> Result<AppSettings, String> {
+pub async fn get_settings(state: tauri::State<'_, AppState>) -> Result<AppSettings, String> {
     let config = state.config.read().await;
     Ok(config.settings.clone())
 }
@@ -29,8 +26,14 @@ const MAX_URL_LEN: usize = 2 * 1024;
 const MAX_FILENAME_CLEANUPS_LEN: usize = 16 * 1024;
 
 fn validate_settings(settings: &AppSettings) -> Result<(), String> {
-    if settings.spam_filter_profile != "relaxed" && settings.spam_filter_profile != "balanced" && settings.spam_filter_profile != "aggressive" {
-        return Err(coded("settings_spam_filter_profile_invalid", "Spam filter profile must be 'relaxed', 'balanced', or 'aggressive'"));
+    if settings.spam_filter_profile != "relaxed"
+        && settings.spam_filter_profile != "balanced"
+        && settings.spam_filter_profile != "aggressive"
+    {
+        return Err(coded(
+            "settings_spam_filter_profile_invalid",
+            "Spam filter profile must be 'relaxed', 'balanced', or 'aggressive'",
+        ));
     }
     // Accept the same three values the UI exposes; reject anything else
     // so a future migration / hand-edited config can't silently disable
@@ -39,85 +42,175 @@ fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         && settings.close_to_tray_behavior != "tray"
         && settings.close_to_tray_behavior != "exit"
     {
-        return Err(coded("settings_close_behavior_invalid", "Close behavior must be 'ask', 'tray', or 'exit'"));
+        return Err(coded(
+            "settings_close_behavior_invalid",
+            "Close behavior must be 'ask', 'tray', or 'exit'",
+        ));
     }
     if settings.download_folder.len() > MAX_PATH_LEN {
-        return Err(coded_ctx("settings_download_folder_too_long", format!("Download folder path exceeds {MAX_PATH_LEN} bytes"), MAX_PATH_LEN));
+        return Err(coded_ctx(
+            "settings_download_folder_too_long",
+            format!("Download folder path exceeds {MAX_PATH_LEN} bytes"),
+            MAX_PATH_LEN,
+        ));
     }
     if settings.shared_folders.len() > MAX_SHARED_FOLDERS {
-        return Err(coded_ctx("settings_too_many_shared_folders", format!("Too many shared folders (max {MAX_SHARED_FOLDERS})"), MAX_SHARED_FOLDERS));
+        return Err(coded_ctx(
+            "settings_too_many_shared_folders",
+            format!("Too many shared folders (max {MAX_SHARED_FOLDERS})"),
+            MAX_SHARED_FOLDERS,
+        ));
     }
     for folder in &settings.shared_folders {
         if folder.len() > MAX_PATH_LEN {
-            return Err(coded_ctx("settings_shared_folder_too_long", format!("Shared folder path exceeds {MAX_PATH_LEN} bytes"), MAX_PATH_LEN));
+            return Err(coded_ctx(
+                "settings_shared_folder_too_long",
+                format!("Shared folder path exceeds {MAX_PATH_LEN} bytes"),
+                MAX_PATH_LEN,
+            ));
         }
     }
     if settings.rendezvous_url.len() > MAX_URL_LEN {
-        return Err(coded_ctx("settings_rendezvous_url_too_long", format!("Rendezvous URL exceeds {MAX_URL_LEN} bytes"), MAX_URL_LEN));
+        return Err(coded_ctx(
+            "settings_rendezvous_url_too_long",
+            format!("Rendezvous URL exceeds {MAX_URL_LEN} bytes"),
+            MAX_URL_LEN,
+        ));
     }
     if settings.nodes_dat_path.len() > MAX_PATH_LEN {
-        return Err(coded_ctx("settings_nodes_dat_path_too_long", format!("nodes.dat path exceeds {MAX_PATH_LEN} bytes"), MAX_PATH_LEN));
+        return Err(coded_ctx(
+            "settings_nodes_dat_path_too_long",
+            format!("nodes.dat path exceeds {MAX_PATH_LEN} bytes"),
+            MAX_PATH_LEN,
+        ));
     }
     if settings.server_list_path.len() > MAX_PATH_LEN {
-        return Err(coded_ctx("settings_server_list_path_too_long", format!("server.met path exceeds {MAX_PATH_LEN} bytes"), MAX_PATH_LEN));
+        return Err(coded_ctx(
+            "settings_server_list_path_too_long",
+            format!("server.met path exceeds {MAX_PATH_LEN} bytes"),
+            MAX_PATH_LEN,
+        ));
     }
     if settings.filename_cleanups.len() > MAX_FILENAME_CLEANUPS_LEN {
-        return Err(coded_ctx("settings_filename_cleanups_too_long",
+        return Err(coded_ctx(
+            "settings_filename_cleanups_too_long",
             format!("filename_cleanups exceeds {MAX_FILENAME_CLEANUPS_LEN} bytes"),
-            MAX_FILENAME_CLEANUPS_LEN));
+            MAX_FILENAME_CLEANUPS_LEN,
+        ));
     }
     if settings.tcp_port == 0 {
-        return Err(coded("settings_tcp_port_invalid", "TCP port must be between 1 and 65535"));
+        return Err(coded(
+            "settings_tcp_port_invalid",
+            "TCP port must be between 1 and 65535",
+        ));
     }
     if settings.udp_port == 0 {
-        return Err(coded("settings_udp_port_invalid", "UDP port must be between 1 and 65535"));
+        return Err(coded(
+            "settings_udp_port_invalid",
+            "UDP port must be between 1 and 65535",
+        ));
     }
     if settings.max_concurrent_downloads == 0 || settings.max_concurrent_downloads > 50 {
-        return Err(coded("settings_max_concurrent_downloads_invalid", "Max concurrent downloads must be between 1 and 50"));
+        return Err(coded(
+            "settings_max_concurrent_downloads_invalid",
+            "Max concurrent downloads must be between 1 and 50",
+        ));
     }
     if settings.max_concurrent_uploads == 0 || settings.max_concurrent_uploads > 50 {
-        return Err(coded("settings_max_concurrent_uploads_invalid", "Max concurrent uploads must be between 1 and 50"));
+        return Err(coded(
+            "settings_max_concurrent_uploads_invalid",
+            "Max concurrent uploads must be between 1 and 50",
+        ));
     }
     if !(60..=14400).contains(&settings.download_queue_wait_secs) {
-        return Err(coded("settings_download_queue_wait_invalid", "Download queue wait must be between 60 and 14400 seconds"));
+        return Err(coded(
+            "settings_download_queue_wait_invalid",
+            "Download queue wait must be between 60 and 14400 seconds",
+        ));
     }
     if !(1..=2000).contains(&settings.max_sources_per_file) {
-        return Err(coded("settings_max_sources_per_file_invalid", "Max sources per file must be between 1 and 2000"));
+        return Err(coded(
+            "settings_max_sources_per_file_invalid",
+            "Max sources per file must be between 1 and 2000",
+        ));
     }
     if !(1..=2000).contains(&settings.max_connections) {
-        return Err(coded("settings_max_connections_invalid", "Max connections must be between 1 and 2000"));
+        return Err(coded(
+            "settings_max_connections_invalid",
+            "Max connections must be between 1 and 2000",
+        ));
     }
     if !(1..=20).contains(&settings.multisource_retry_rounds) {
-        return Err(coded("settings_multisource_retry_rounds_invalid", "Multi-source retry rounds must be between 1 and 20"));
+        return Err(coded(
+            "settings_multisource_retry_rounds_invalid",
+            "Multi-source retry rounds must be between 1 and 20",
+        ));
     }
     if !(1..=20).contains(&settings.download_part_retry_rounds) {
-        return Err(coded("settings_download_part_retry_rounds_invalid", "Part hash retry rounds must be between 1 and 20"));
+        return Err(coded(
+            "settings_download_part_retry_rounds_invalid",
+            "Part hash retry rounds must be between 1 and 20",
+        ));
     }
     if !(1..=16_384).contains(&settings.max_download_file_size_gib) {
-        return Err(coded("settings_max_download_file_size_invalid", "Max download file size must be between 1 and 16384 GiB"));
+        return Err(coded(
+            "settings_max_download_file_size_invalid",
+            "Max download file size must be between 1 and 16384 GiB",
+        ));
     }
     if !(30..=600).contains(&settings.search_timeout_secs) {
-        return Err(coded("settings_search_timeout_invalid", "Search timeout must be between 30 and 600 seconds"));
+        return Err(coded(
+            "settings_search_timeout_invalid",
+            "Search timeout must be between 30 and 600 seconds",
+        ));
     }
     if !(1..=500).contains(&settings.max_friends) {
-        return Err(coded("settings_max_friends_invalid", "Max friends must be between 1 and 500"));
+        return Err(coded(
+            "settings_max_friends_invalid",
+            "Max friends must be between 1 and 500",
+        ));
     }
     if settings.nickname.trim().is_empty() {
-        return Err(coded("settings_nickname_empty", "Nickname must not be empty"));
+        return Err(coded(
+            "settings_nickname_empty",
+            "Nickname must not be empty",
+        ));
     }
     if settings.nickname.len() > 128 {
-        return Err(coded("settings_nickname_too_long", "Nickname must be 128 bytes or fewer"));
+        return Err(coded(
+            "settings_nickname_too_long",
+            "Nickname must be 128 bytes or fewer",
+        ));
     }
     let blocked_segments: &[&str] = &[
-        "windows", "program files", "program files (x86)",
-        "programdata", ".ssh", ".gnupg",
-        "etc", "usr", "bin", "sbin", "var", "root",
-        "tmp", "temp", "proc", "sys", "dev",
+        "windows",
+        "program files",
+        "program files (x86)",
+        "programdata",
+        ".ssh",
+        ".gnupg",
+        "etc",
+        "usr",
+        "bin",
+        "sbin",
+        "var",
+        "root",
+        "tmp",
+        "temp",
+        "proc",
+        "sys",
+        "dev",
     ];
     if !settings.download_folder.is_empty() {
         let path = std::path::Path::new(&settings.download_folder);
-        if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-            return Err(coded("settings_download_folder_parent_dir", "Download folder must not contain '..' path components"));
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(coded(
+                "settings_download_folder_parent_dir",
+                "Download folder must not contain '..' path components",
+            ));
         }
         // Scan the literal path AND (best-effort) its canonical form. A
         // junction/symlink can point a benign-looking folder at a blocked
@@ -131,7 +224,11 @@ fn validate_settings(settings: &AppSettings) -> Result<(), String> {
                 if let std::path::Component::Normal(seg) = component {
                     let seg_lower = seg.to_string_lossy().to_lowercase();
                     if blocked_segments.contains(&seg_lower.as_str()) {
-                        return Err(coded_ctx("settings_download_folder_system_dir", "Cannot use system directory as download folder", &settings.download_folder));
+                        return Err(coded_ctx(
+                            "settings_download_folder_system_dir",
+                            "Cannot use system directory as download folder",
+                            &settings.download_folder,
+                        ));
                     }
                 }
             }
@@ -140,21 +237,37 @@ fn validate_settings(settings: &AppSettings) -> Result<(), String> {
     if !settings.rendezvous_url.is_empty() {
         let url_lower = settings.rendezvous_url.to_ascii_lowercase();
         if !url_lower.starts_with("https://") {
-            return Err(coded("settings_rendezvous_url_not_https", "Rendezvous URL must use HTTPS"));
+            return Err(coded(
+                "settings_rendezvous_url_not_https",
+                "Rendezvous URL must use HTTPS",
+            ));
         }
         let after_scheme = &settings.rendezvous_url["https://".len()..];
         if after_scheme.is_empty() || after_scheme.starts_with('/') {
-            return Err(coded("settings_rendezvous_url_no_host", "Rendezvous URL must have a valid host"));
+            return Err(coded(
+                "settings_rendezvous_url_no_host",
+                "Rendezvous URL must have a valid host",
+            ));
         }
         if after_scheme.contains('@') {
-            return Err(coded("settings_rendezvous_url_has_credentials", "Rendezvous URL must not contain credentials"));
+            return Err(coded(
+                "settings_rendezvous_url_has_credentials",
+                "Rendezvous URL must not contain credentials",
+            ));
         }
     }
 
     for folder in &settings.shared_folders {
         let path = std::path::Path::new(folder);
-        if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-            return Err(coded_ctx("settings_shared_folder_parent_dir", "Shared folder must not contain '..' path components", folder));
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(coded_ctx(
+                "settings_shared_folder_parent_dir",
+                "Shared folder must not contain '..' path components",
+                folder,
+            ));
         }
         // Scan the literal path AND (best-effort) its canonical form. A
         // junction/symlink can point a benign-looking folder at a blocked
@@ -169,10 +282,15 @@ fn validate_settings(settings: &AppSettings) -> Result<(), String> {
                 if let std::path::Component::Normal(seg) = component {
                     let seg_lower = seg.to_string_lossy().to_lowercase();
                     if blocked_segments.contains(&seg_lower.as_str()) {
-                        return Err(coded_ctx("settings_shared_folder_system_dir", "Cannot share system directory", folder));
+                        return Err(coded_ctx(
+                            "settings_shared_folder_system_dir",
+                            "Cannot share system directory",
+                            folder,
+                        ));
                     }
                     if seg_lower == "appdata" {
-                        let rest: String = scan_path.components()
+                        let rest: String = scan_path
+                            .components()
                             .skip_while(|c| {
                                 if let std::path::Component::Normal(s) = c {
                                     s.to_string_lossy().to_lowercase() != "appdata"
@@ -185,7 +303,11 @@ fn validate_settings(settings: &AppSettings) -> Result<(), String> {
                             .collect::<Vec<_>>()
                             .join("/");
                         if rest.starts_with("local/temp") || rest.starts_with("local\\temp") {
-                            return Err(coded_ctx("settings_shared_folder_system_dir", "Cannot share system directory", folder));
+                            return Err(coded_ctx(
+                                "settings_shared_folder_system_dir",
+                                "Cannot share system directory",
+                                folder,
+                            ));
                         }
                     }
                 }
@@ -217,7 +339,9 @@ pub async fn update_settings(
     settings.nickname = settings
         .nickname
         .chars()
-        .filter(|c| !c.is_control() && *c != '\0' && !crate::security::is_invisible_or_bidi_control_pub(*c))
+        .filter(|c| {
+            !c.is_control() && *c != '\0' && !crate::security::is_invisible_or_bidi_control_pub(*c)
+        })
         .collect::<String>()
         .trim()
         .to_string();
@@ -228,19 +352,28 @@ pub async fn update_settings(
         config.settings.clone()
     };
 
-    let port_changed = settings.tcp_port != old_settings.tcp_port
-        || settings.udp_port != old_settings.udp_port;
+    let port_changed =
+        settings.tcp_port != old_settings.tcp_port || settings.udp_port != old_settings.udp_port;
 
     let save_data = {
         let mut config = state.config.write().await;
         config.settings = settings.clone();
-        config.prepare_save().map_err(|e| coded_ctx("settings_serialize_failed", "Failed to serialize settings", e))?
+        config.prepare_save().map_err(|e| {
+            coded_ctx(
+                "settings_serialize_failed",
+                "Failed to serialize settings",
+                e,
+            )
+        })?
     };
     {
         let (data, tmp, final_path) = save_data;
         tokio::task::spawn_blocking(move || {
             crate::storage::config::AppConfig::write_to_disk(&data, &tmp, &final_path)
-        }).await.map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?.map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
+        })
+        .await
+        .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?
+        .map_err(|e| coded_ctx("settings_save_failed", "Save failed", e))?;
     }
 
     // Keep the synchronous mirror used by the close-event handler in sync
@@ -288,7 +421,9 @@ pub async fn update_settings(
     if let Err(e) = state.network_tx.try_send(NetworkCommand::UpdateSettings {
         settings: settings.clone(),
     }) {
-        tracing::warn!("Settings saved to disk, but live network update was dropped (channel full): {e}");
+        tracing::warn!(
+            "Settings saved to disk, but live network update was dropped (channel full): {e}"
+        );
     }
 
     if port_changed {
@@ -306,13 +441,17 @@ pub async fn download_nodes_dat(
     info!("Downloading nodes.dat from {NODES_DAT_URL}");
 
     const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
-    let response = crate::security::fetch_pinned_get(NODES_DAT_URL).await
+    let response = crate::security::fetch_pinned_get(NODES_DAT_URL)
+        .await
         .map_err(|e| coded_ctx("settings_http_request_failed", "HTTP request failed", e))?
         .error_for_status()
         .map_err(|e| coded_ctx("settings_http_error", "HTTP error", e))?;
     if let Some(cl) = response.content_length() {
         if cl > MAX_RESPONSE_BYTES as u64 {
-            return Err(coded("settings_response_too_large", "Response too large (Content-Length exceeds limit)"));
+            return Err(coded(
+                "settings_response_too_large",
+                "Response too large (Content-Length exceeds limit)",
+            ));
         }
     }
     let bytes = {
@@ -320,7 +459,13 @@ pub async fn download_nodes_dat(
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| coded_ctx("settings_response_read_failed", "Failed to read response body", e))?;
+            let chunk = chunk.map_err(|e| {
+                coded_ctx(
+                    "settings_response_read_failed",
+                    "Failed to read response body",
+                    e,
+                )
+            })?;
             body.extend_from_slice(&chunk);
             if body.len() > MAX_RESPONSE_BYTES {
                 return Err(coded("settings_response_too_large", "Response too large"));
@@ -330,33 +475,57 @@ pub async fn download_nodes_dat(
     };
 
     let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
-    tokio::fs::create_dir_all(&data_dir)
-        .await
-        .map_err(|e| coded_ctx("settings_create_data_dir_failed", "Failed to create data dir", e))?;
+    tokio::fs::create_dir_all(&data_dir).await.map_err(|e| {
+        coded_ctx(
+            "settings_create_data_dir_failed",
+            "Failed to create data dir",
+            e,
+        )
+    })?;
 
     let nodes_path = data_dir.join("nodes.dat");
     // Parse-validate the buffer in-memory first so we never leave a half-written
     // temp file on disk and so the atomic_write path is also the last write.
     let validation_bytes = bytes.clone();
     let contacts = {
-        let scratch = data_dir.join(format!(".nodes.dat.validate.{}.{}.tmp",
+        let scratch = data_dir.join(format!(
+            ".nodes.dat.validate.{}.{}.tmp",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)));
+                .unwrap_or(0)
+        ));
         let scratch_w = scratch.clone();
         tokio::fs::write(&scratch_w, &validation_bytes)
             .await
-            .map_err(|e| coded_ctx("settings_nodes_dat_scratch_write_failed", "Failed to write nodes.dat scratch", e))?;
+            .map_err(|e| {
+                coded_ctx(
+                    "settings_nodes_dat_scratch_write_failed",
+                    "Failed to write nodes.dat scratch",
+                    e,
+                )
+            })?;
         let scratch_r = scratch.clone();
         let parsed = tokio::task::spawn_blocking(move || bootstrap::load_nodes_dat(&scratch_r))
             .await
-            .map_err(|e| coded_ctx("settings_validation_task_failed", "Validation task failed", e))?;
+            .map_err(|e| {
+                coded_ctx(
+                    "settings_validation_task_failed",
+                    "Validation task failed",
+                    e,
+                )
+            })?;
         let _ = tokio::fs::remove_file(&scratch).await;
         match parsed {
             Ok(c) => c,
-            Err(e) => return Err(coded_ctx("settings_nodes_dat_corrupt", "Downloaded file is corrupt", e)),
+            Err(e) => {
+                return Err(coded_ctx(
+                    "settings_nodes_dat_corrupt",
+                    "Downloaded file is corrupt",
+                    e,
+                ))
+            }
         }
     };
 
@@ -368,7 +537,13 @@ pub async fn download_nodes_dat(
         })
         .await
         .map_err(|e| coded_ctx("settings_save_task_failed", "Save task failed", e))?
-        .map_err(|e| coded_ctx("settings_finalize_nodes_dat_failed", "Failed to finalize nodes.dat", e))?;
+        .map_err(|e| {
+            coded_ctx(
+                "settings_finalize_nodes_dat_failed",
+                "Failed to finalize nodes.dat",
+                e,
+            )
+        })?;
     }
 
     let contact_count = contacts.len();
@@ -408,13 +583,17 @@ pub async fn download_ipfilter(
     info!("Downloading ipfilter.dat from {IPFILTER_URL}");
 
     const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
-    let response = crate::security::fetch_pinned_get(IPFILTER_URL).await
+    let response = crate::security::fetch_pinned_get(IPFILTER_URL)
+        .await
         .map_err(|e| coded_ctx("settings_http_request_failed", "HTTP request failed", e))?
         .error_for_status()
         .map_err(|e| coded_ctx("settings_http_error", "HTTP error", e))?;
     if let Some(cl) = response.content_length() {
         if cl > MAX_RESPONSE_BYTES as u64 {
-            return Err(coded("settings_response_too_large", "Response too large (Content-Length exceeds limit)"));
+            return Err(coded(
+                "settings_response_too_large",
+                "Response too large (Content-Length exceeds limit)",
+            ));
         }
     }
     let bytes = {
@@ -422,7 +601,13 @@ pub async fn download_ipfilter(
         let mut body = Vec::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| coded_ctx("settings_response_read_failed", "Failed to read response body", e))?;
+            let chunk = chunk.map_err(|e| {
+                coded_ctx(
+                    "settings_response_read_failed",
+                    "Failed to read response body",
+                    e,
+                )
+            })?;
             body.extend_from_slice(&chunk);
             if body.len() > MAX_RESPONSE_BYTES {
                 return Err(coded("settings_response_too_large", "Response too large"));
@@ -432,9 +617,13 @@ pub async fn download_ipfilter(
     };
 
     let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
-    tokio::fs::create_dir_all(&data_dir)
-        .await
-        .map_err(|e| coded_ctx("settings_create_data_dir_failed", "Failed to create data dir", e))?;
+    tokio::fs::create_dir_all(&data_dir).await.map_err(|e| {
+        coded_ctx(
+            "settings_create_data_dir_failed",
+            "Failed to create data dir",
+            e,
+        )
+    })?;
 
     let filter_path = data_dir.join("ipfilter.dat");
     {
@@ -445,7 +634,13 @@ pub async fn download_ipfilter(
         })
         .await
         .map_err(|e| coded_ctx("settings_save_task_failed", "Save task failed", e))?
-        .map_err(|e| coded_ctx("settings_finalize_ipfilter_failed", "Failed to finalize ipfilter.dat", e))?;
+        .map_err(|e| {
+            coded_ctx(
+                "settings_finalize_ipfilter_failed",
+                "Failed to finalize ipfilter.dat",
+                e,
+            )
+        })?;
     }
 
     let byte_count = bytes.len();
@@ -453,9 +648,7 @@ pub async fn download_ipfilter(
 
     let reload_ok = state
         .network_tx
-        .try_send(NetworkCommand::ReloadIpFilter {
-            path: filter_path,
-        })
+        .try_send(NetworkCommand::ReloadIpFilter { path: filter_path })
         .is_ok();
 
     let msg = if reload_ok {
@@ -489,9 +682,13 @@ pub async fn download_ipfilter(
 #[tauri::command]
 pub async fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("main") {
-        window
-            .hide()
-            .map_err(|e| coded_ctx("settings_hide_window_failed", "Failed to hide main window", e))?;
+        window.hide().map_err(|e| {
+            coded_ctx(
+                "settings_hide_window_failed",
+                "Failed to hide main window",
+                e,
+            )
+        })?;
     }
     Ok(())
 }
@@ -504,16 +701,23 @@ pub async fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
         // double-click would be a no-op for users who minimized through
         // the title-bar instead of closing.
         let _ = window.unminimize();
-        window
-            .show()
-            .map_err(|e| coded_ctx("settings_show_window_failed", "Failed to show main window", e))?;
+        window.show().map_err(|e| {
+            coded_ctx(
+                "settings_show_window_failed",
+                "Failed to show main window",
+                e,
+            )
+        })?;
         let _ = window.set_focus();
     }
     Ok(())
 }
 
 #[tauri::command]
-pub async fn quit_app(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+pub async fn quit_app(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
     // Mark the close as user-confirmed so the `WindowEvent::CloseRequested`
     // hook in `lib::run` lets the destroy proceed even when the saved
     // behavior is "tray" or "ask". Exit is initiated via `app.exit(0)`,
@@ -532,14 +736,21 @@ pub async fn set_close_behavior(
 ) -> Result<(), String> {
     let normalized = behavior.trim().to_ascii_lowercase();
     if normalized != "ask" && normalized != "tray" && normalized != "exit" {
-        return Err(coded("settings_close_behavior_invalid", "Close behavior must be 'ask', 'tray', or 'exit'"));
+        return Err(coded(
+            "settings_close_behavior_invalid",
+            "Close behavior must be 'ask', 'tray', or 'exit'",
+        ));
     }
     let save_data = {
         let mut config = state.config.write().await;
         config.settings.close_to_tray_behavior = normalized.clone();
-        config
-            .prepare_save()
-            .map_err(|e| coded_ctx("settings_serialize_failed", "Failed to serialize settings", e))?
+        config.prepare_save().map_err(|e| {
+            coded_ctx(
+                "settings_serialize_failed",
+                "Failed to serialize settings",
+                e,
+            )
+        })?
     };
     let (data, tmp, final_path) = save_data;
     tokio::task::spawn_blocking(move || {

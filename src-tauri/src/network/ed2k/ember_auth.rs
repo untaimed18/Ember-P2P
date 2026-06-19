@@ -177,9 +177,7 @@ pub fn handle_challenge(
         // dispatcher may want to bump a counter. Surface it at warn
         // so "CHALLENGE replay observed" is greppable without
         // custom instrumentation.
-        warn!(
-            "Ember auth: rejecting CHALLENGE in unexpected state {state:?} (possible replay)"
-        );
+        warn!("Ember auth: rejecting CHALLENGE in unexpected state {state:?} (possible replay)");
         return Err(AuthError::UnexpectedPacket);
     }
 
@@ -239,9 +237,7 @@ pub fn handle_response(
             // CHALLENGE; in Verified/Failed it's a replay or a buggy
             // peer. Same forensics rationale as the CHALLENGE path
             // above — log at warn so the anomaly is visible.
-            warn!(
-                "Ember auth: rejecting RESPONSE in unexpected state {state:?}"
-            );
+            warn!("Ember auth: rejecting RESPONSE in unexpected state {state:?}");
             return Err(AuthError::UnexpectedPacket);
         }
     };
@@ -328,7 +324,10 @@ mod tests {
         let resp_response_sig = Signature::from_bytes(&resp_response_sig_bytes);
         let resp_vk = VerifyingKey::from_bytes(&resp_response_pk).unwrap();
         assert!(resp_vk.verify(&init_nonce, &resp_response_sig).is_ok());
-        assert!(crate::network::ember::crypto::verify_ember_hash_binding(&resp_response_pk, &resp_hash));
+        assert!(crate::network::ember::crypto::verify_ember_hash_binding(
+            &resp_response_pk,
+            &resp_hash
+        ));
 
         // Responder receives initiator's RESPONSE. Must transition to Verified.
         let result = handle_response(&mut resp_state, &init_response, &init_pk, &init_hash);
@@ -523,7 +522,10 @@ mod tests {
     #[test]
     fn is_verified_only_in_verified_state() {
         assert!(!EmberAuthState::NotStarted.is_verified());
-        assert!(!EmberAuthState::PeerChallenged { our_nonce: [0u8; NONCE_LEN] }.is_verified());
+        assert!(!EmberAuthState::PeerChallenged {
+            our_nonce: [0u8; NONCE_LEN]
+        }
+        .is_verified());
         assert!(!EmberAuthState::Failed.is_verified());
         assert!(EmberAuthState::Verified.is_verified());
     }

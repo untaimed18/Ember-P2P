@@ -203,17 +203,31 @@ impl RelayManager {
         file_hash: [u8; 16],
     ) -> Option<u32> {
         if self.sessions.len() >= MAX_CONCURRENT_RELAY_SESSIONS {
-            debug!("RelayManager: at capacity ({} sessions)", self.sessions.len());
+            debug!(
+                "RelayManager: at capacity ({} sessions)",
+                self.sessions.len()
+            );
             return None;
         }
 
         let id = self.next_session_id;
         self.next_session_id = self.next_session_id.wrapping_add(1);
 
-        self.sessions.insert(id, RelaySession::new(
-            id, initiator_ip, initiator_port, target_ip, target_port, file_hash,
-        ));
-        info!("RelayManager: created session {} ({} -> {}:{})", id, initiator_ip, target_ip, target_port);
+        self.sessions.insert(
+            id,
+            RelaySession::new(
+                id,
+                initiator_ip,
+                initiator_port,
+                target_ip,
+                target_port,
+                file_hash,
+            ),
+        );
+        info!(
+            "RelayManager: created session {} ({} -> {}:{})",
+            id, initiator_ip, target_ip, target_port
+        );
         Some(id)
     }
 
@@ -232,14 +246,19 @@ impl RelayManager {
 
     /// Clean up expired sessions.
     pub fn cleanup(&mut self) -> Vec<u32> {
-        let expired: Vec<u32> = self.sessions.iter()
+        let expired: Vec<u32> = self
+            .sessions
+            .iter()
             .filter(|(_, s)| s.is_expired())
             .map(|(id, _)| *id)
             .collect();
 
         for id in &expired {
             if let Some(session) = self.sessions.remove(id) {
-                info!("RelayManager: expired session {} ({} bytes relayed)", id, session.bytes_relayed);
+                info!(
+                    "RelayManager: expired session {} ({} bytes relayed)",
+                    id, session.bytes_relayed
+                );
                 self.total_bytes_relayed += session.bytes_relayed;
             }
         }
@@ -310,7 +329,12 @@ pub fn decode_relay_header(data: &[u8]) -> Option<(u8, u32, u16)> {
 }
 
 /// Build a RELAY_REQUEST message.
-pub fn build_relay_request(session_id: u32, target_ip: Ipv4Addr, target_port: u16, file_hash: &[u8; 16]) -> Vec<u8> {
+pub fn build_relay_request(
+    session_id: u32,
+    target_ip: Ipv4Addr,
+    target_port: u16,
+    file_hash: &[u8; 16],
+) -> Vec<u8> {
     let mut payload = Vec::with_capacity(22);
     payload.extend_from_slice(&target_ip.octets());
     payload.extend_from_slice(&target_port.to_le_bytes());
@@ -401,10 +425,7 @@ pub async fn register_punch(
 }
 
 /// Client-side helper: poll for incoming punch requests.
-pub async fn poll_punch(
-    rendezvous_url: &str,
-    our_id: &str,
-) -> Result<Option<PunchInfo>, String> {
+pub async fn poll_punch(rendezvous_url: &str, our_id: &str) -> Result<Option<PunchInfo>, String> {
     require_https(rendezvous_url)?;
     let url = format!("{}/punch/{}", rendezvous_url, our_id);
     let client = relay_http_client();
@@ -496,8 +517,8 @@ pub async fn connect_to_peer_relay(
     full.extend_from_slice(&resp_header);
     full.extend_from_slice(&payload_buf);
 
-    let (msg_type, returned_sid, _payload) = decode_relay_message(&full)
-        .ok_or_else(|| "invalid relay response".to_string())?;
+    let (msg_type, returned_sid, _payload) =
+        decode_relay_message(&full).ok_or_else(|| "invalid relay response".to_string())?;
 
     if msg_type == MSG_RELAY_REJECT {
         return Err("relay peer rejected request".to_string());
@@ -586,10 +607,7 @@ impl AsyncRead for WsStream {
                     }
                 }
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e,
-                    )));
+                    return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
                 }
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
                 Poll::Pending => return Poll::Pending,
@@ -608,12 +626,10 @@ impl AsyncWrite for WsStream {
 
         let msg = Message::Binary(buf.to_vec().into());
         match Sink::poll_ready(Pin::new(&mut self.inner), cx) {
-            Poll::Ready(Ok(())) => {
-                match Sink::start_send(Pin::new(&mut self.inner), msg) {
-                    Ok(()) => Poll::Ready(Ok(buf.len())),
-                    Err(e) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e))),
-                }
-            }
+            Poll::Ready(Ok(())) => match Sink::start_send(Pin::new(&mut self.inner), msg) {
+                Ok(()) => Poll::Ready(Ok(buf.len())),
+                Err(e) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e))),
+            },
             Poll::Ready(Err(e)) => {
                 Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
             }
@@ -621,11 +637,11 @@ impl AsyncWrite for WsStream {
         }
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match Sink::<tokio_tungstenite::tungstenite::Message>::poll_flush(Pin::new(&mut self.inner), cx) {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match Sink::<tokio_tungstenite::tungstenite::Message>::poll_flush(
+            Pin::new(&mut self.inner),
+            cx,
+        ) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => {
                 Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
@@ -634,11 +650,11 @@ impl AsyncWrite for WsStream {
         }
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match Sink::<tokio_tungstenite::tungstenite::Message>::poll_close(Pin::new(&mut self.inner), cx) {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match Sink::<tokio_tungstenite::tungstenite::Message>::poll_close(
+            Pin::new(&mut self.inner),
+            cx,
+        ) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => {
                 Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
@@ -768,14 +784,13 @@ pub async fn run_quic_accept_loop(
                 // which requires the full body (payload_len = 22 for
                 // RELAY_REQUEST) to be present and would otherwise reject
                 // every spec-compliant initiator.
-                let (_mt, peer_session_id, payload_len) =
-                    match decode_relay_header(&header) {
-                        Some(decoded) => decoded,
-                        None => {
-                            debug!("QUIC accept: invalid RELAY_REQUEST header from {remote}");
-                            return;
-                        }
-                    };
+                let (_mt, peer_session_id, payload_len) = match decode_relay_header(&header) {
+                    Some(decoded) => decoded,
+                    None => {
+                        debug!("QUIC accept: invalid RELAY_REQUEST header from {remote}");
+                        return;
+                    }
+                };
                 if payload_len as usize != 22 {
                     debug!(
                         "QUIC accept: RELAY_REQUEST from {remote} has unexpected payload_len {payload_len} (want 22)"
@@ -846,10 +861,7 @@ pub async fn run_quic_accept_loop(
                     "Relay session {session_id}: accepted from {initiator_ip}:{initiator_port}, connecting to target {target_ip}:{target_port}"
                 );
 
-                let target_addr = SocketAddr::new(
-                    std::net::IpAddr::V4(target_ip),
-                    target_port,
-                );
+                let target_addr = SocketAddr::new(std::net::IpAddr::V4(target_ip), target_port);
 
                 let target_result = tokio::time::timeout(
                     RELAY_TARGET_CONNECT_TIMEOUT,
@@ -880,7 +892,10 @@ pub async fn run_quic_accept_loop(
                     if let Some(session) = mgr_lock.get_session_mut(session_id) {
                         session.mark_active();
                     }
-                    info!("Relay session {session_id}: bridging ({} active sessions)", mgr_lock.active_count());
+                    info!(
+                        "Relay session {session_id}: bridging ({} active sessions)",
+                        mgr_lock.active_count()
+                    );
                 }
 
                 let bw_limit = RELAY_MAX_BYTES_PER_DIRECTION;
@@ -935,7 +950,6 @@ pub async fn run_quic_accept_loop(
                         );
                     }
                 }
-
             } else if msg_type == MSG_RELAY_CONNECT {
                 // === Relay target: a relay node is forwarding a client to us ===
                 let payload_len = u16::from_le_bytes([header[5], header[6]]) as usize;
@@ -945,7 +959,9 @@ pub async fn run_quic_accept_loop(
                 }
                 let mut file_hash = [0u8; 16];
                 if let Err(e) = init_recv.read_exact(&mut file_hash).await {
-                    debug!("QUIC accept: failed to read RELAY_CONNECT file hash from {remote}: {e}");
+                    debug!(
+                        "QUIC accept: failed to read RELAY_CONNECT file hash from {remote}: {e}"
+                    );
                     return;
                 }
                 if payload_len > 16 {
@@ -961,7 +977,10 @@ pub async fn run_quic_accept_loop(
                     }
                 };
 
-                info!("QUIC accept: relay-target connection from {remote}, file {}", hex::encode(file_hash));
+                info!(
+                    "QUIC accept: relay-target connection from {remote}, file {}",
+                    hex::encode(file_hash)
+                );
 
                 let parts = crate::network::ed2k::upload::KadCallbackParts {
                     peer_ip,
@@ -974,7 +993,6 @@ pub async fn run_quic_accept_loop(
                     peer_caps: Default::default(),
                 };
                 let _ = cb_tx.send(parts).await;
-
             } else {
                 // === Hole-punch or other direct connection ===
                 let peer_ip = match remote.ip() {
@@ -985,7 +1003,10 @@ pub async fn run_quic_accept_loop(
                     }
                 };
 
-                info!("QUIC accept: direct connection from {remote} (first byte 0x{:02X})", header[0]);
+                info!(
+                    "QUIC accept: direct connection from {remote} (first byte 0x{:02X})",
+                    header[0]
+                );
 
                 let chained = std::io::Cursor::new(header.to_vec()).chain(init_recv);
                 let parts = crate::network::ed2k::upload::KadCallbackParts {
@@ -1115,12 +1136,13 @@ pub async fn post_relay_invite(
 
 /// Poll the rendezvous server for pending relay invitations targeting us.
 /// Returns a list of session_ids we should connect to via server relay.
-pub async fn poll_relay_invites(
-    rendezvous_url: &str,
-    our_id: &str,
-) -> Result<Vec<String>, String> {
+pub async fn poll_relay_invites(rendezvous_url: &str, our_id: &str) -> Result<Vec<String>, String> {
     require_https(rendezvous_url)?;
-    let url = format!("{}/relay-invites/{}", rendezvous_url.trim_end_matches('/'), our_id);
+    let url = format!(
+        "{}/relay-invites/{}",
+        rendezvous_url.trim_end_matches('/'),
+        our_id
+    );
     let client = relay_http_client();
     let resp = client
         .get(&url)
@@ -1138,7 +1160,8 @@ pub async fn poll_relay_invites(
 
     let body: Vec<serde_json::Value> =
         read_json_capped(resp, MAX_RENDEZVOUS_JSON_BYTES, "relay invite poll").await?;
-    Ok(body.iter()
+    Ok(body
+        .iter()
         .filter_map(|v| v["session_id"].as_str().map(|s| s.to_string()))
         .collect())
 }
@@ -1185,11 +1208,15 @@ mod tests {
         let mut mgr = RelayManager::new();
         assert_eq!(mgr.active_count(), 0);
 
-        let sid = mgr.create_session(
-            Ipv4Addr::new(1, 2, 3, 4), 4662,
-            Ipv4Addr::new(5, 6, 7, 8), 4663,
-            [1u8; 16],
-        ).unwrap();
+        let sid = mgr
+            .create_session(
+                Ipv4Addr::new(1, 2, 3, 4),
+                4662,
+                Ipv4Addr::new(5, 6, 7, 8),
+                4663,
+                [1u8; 16],
+            )
+            .unwrap();
 
         assert_eq!(mgr.active_count(), 1);
         assert!(mgr.get_session(sid).is_some());
@@ -1208,18 +1235,26 @@ mod tests {
         for i in 0..MAX_CONCURRENT_RELAY_SESSIONS {
             let mut ip_bytes = [0u8; 4];
             ip_bytes[3] = (i + 1) as u8;
-            assert!(mgr.create_session(
-                Ipv4Addr::from(ip_bytes), 4662,
-                Ipv4Addr::new(10, 10, 10, 10), 4663,
-                [i as u8; 16],
-            ).is_some());
+            assert!(mgr
+                .create_session(
+                    Ipv4Addr::from(ip_bytes),
+                    4662,
+                    Ipv4Addr::new(10, 10, 10, 10),
+                    4663,
+                    [i as u8; 16],
+                )
+                .is_some());
         }
         // Next one should fail
-        assert!(mgr.create_session(
-            Ipv4Addr::new(99, 99, 99, 99), 4662,
-            Ipv4Addr::new(10, 10, 10, 10), 4663,
-            [0xFF; 16],
-        ).is_none());
+        assert!(mgr
+            .create_session(
+                Ipv4Addr::new(99, 99, 99, 99),
+                4662,
+                Ipv4Addr::new(10, 10, 10, 10),
+                4663,
+                [0xFF; 16],
+            )
+            .is_none());
     }
 
     #[test]

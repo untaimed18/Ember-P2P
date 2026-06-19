@@ -91,7 +91,9 @@ impl RoutingBin {
             return false;
         }
         let snet = subnet_key(contact.ip);
-        let same_subnets = self.contacts.iter()
+        let same_subnets = self
+            .contacts
+            .iter()
             .filter(|c| subnet_key(c.ip) == snet)
             .count();
         if same_subnets >= MAX_CONTACTS_SUBNET_PER_BIN && !ip_filter::is_lan_ip(contact.ip) {
@@ -182,7 +184,9 @@ impl RoutingBin {
                 if snet_count >= MAX_CONTACTS_SUBNET {
                     return false;
                 }
-                let bin_count = self.contacts.iter()
+                let bin_count = self
+                    .contacts
+                    .iter()
                     .filter(|c| subnet_key(c.ip) == new_snet)
                     .count();
                 if bin_count >= MAX_CONTACTS_SUBNET_PER_BIN {
@@ -332,14 +336,18 @@ impl RoutingZone {
         }
 
         let should_merge = if let Some(children) = &self.children {
-            children.0.is_leaf() && children.1.is_leaf()
-                && children.0.get_num_contacts() + children.1.get_num_contacts() < (K_BUCKET_SIZE / 2) as u32
+            children.0.is_leaf()
+                && children.1.is_leaf()
+                && children.0.get_num_contacts() + children.1.get_num_contacts()
+                    < (K_BUCKET_SIZE / 2) as u32
         } else {
             false
         };
 
         if should_merge {
-            let Some(children) = self.children.take() else { return merge_count; };
+            let Some(children) = self.children.take() else {
+                return merge_count;
+            };
             let mut new_bin = RoutingBin::new();
             if let Some(bin0) = children.0.bin {
                 for c in bin0.contacts {
@@ -374,7 +382,10 @@ impl RoutingZone {
         if let Some(bin) = &self.bin {
             bin.len() as u32
         } else if let Some(children) = &self.children {
-            children.0.get_num_contacts().saturating_add(children.1.get_num_contacts())
+            children
+                .0
+                .get_num_contacts()
+                .saturating_add(children.1.get_num_contacts())
         } else {
             0
         }
@@ -432,9 +443,23 @@ impl RoutingZone {
                 let distance = local_id.xor_distance(&contact.id);
                 let side = distance.get_bit_number(self.level);
                 return if side == 0 {
-                    children.0.add(contact, local_id, global_ip_count, global_subnet_count, order_gen, split_dropped_ips)
+                    children.0.add(
+                        contact,
+                        local_id,
+                        global_ip_count,
+                        global_subnet_count,
+                        order_gen,
+                        split_dropped_ips,
+                    )
                 } else {
-                    children.1.add(contact, local_id, global_ip_count, global_subnet_count, order_gen, split_dropped_ips)
+                    children.1.add(
+                        contact,
+                        local_id,
+                        global_ip_count,
+                        global_subnet_count,
+                        order_gen,
+                        split_dropped_ips,
+                    )
                 };
             }
         }
@@ -463,9 +488,23 @@ impl RoutingZone {
                 let distance = local_id.xor_distance(&contact.id);
                 let side = distance.get_bit_number(self.level);
                 return if side == 0 {
-                    children.0.add(contact, local_id, global_ip_count, global_subnet_count, order_gen, split_dropped_ips)
+                    children.0.add(
+                        contact,
+                        local_id,
+                        global_ip_count,
+                        global_subnet_count,
+                        order_gen,
+                        split_dropped_ips,
+                    )
                 } else {
-                    children.1.add(contact, local_id, global_ip_count, global_subnet_count, order_gen, split_dropped_ips)
+                    children.1.add(
+                        contact,
+                        local_id,
+                        global_ip_count,
+                        global_subnet_count,
+                        order_gen,
+                        split_dropped_ips,
+                    )
                 };
             }
         }
@@ -477,8 +516,7 @@ impl RoutingZone {
         // through `split_dropped_ips` so `RoutingTable::insert` removes it
         // from the global IP/subnet accounting, exactly as it does for IPs
         // dropped during a split.
-        if contact.verified
-            && check_global_limits(contact.ip, global_ip_count, global_subnet_count)
+        if contact.verified && check_global_limits(contact.ip, global_ip_count, global_subnet_count)
         {
             if let Some(bin) = self.bin.as_mut() {
                 if let Some(evicted_ip) = bin.replace_unverified(contact) {
@@ -508,14 +546,22 @@ impl RoutingZone {
         if let Some(children) = &self.children {
             let closer = distance.get_bit_number(self.level);
             if closer == 0 {
-                children.0.get_closest_to(max_type, target, distance, max_required, result);
+                children
+                    .0
+                    .get_closest_to(max_type, target, distance, max_required, result);
                 if result.len() < max_required {
-                    children.1.get_closest_to(max_type, target, distance, max_required, result);
+                    children
+                        .1
+                        .get_closest_to(max_type, target, distance, max_required, result);
                 }
             } else {
-                children.1.get_closest_to(max_type, target, distance, max_required, result);
+                children
+                    .1
+                    .get_closest_to(max_type, target, distance, max_required, result);
                 if result.len() < max_required {
-                    children.0.get_closest_to(max_type, target, distance, max_required, result);
+                    children
+                        .0
+                        .get_closest_to(max_type, target, distance, max_required, result);
                 }
             }
         }
@@ -585,8 +631,7 @@ impl RoutingZone {
         }
 
         let zone_time_ok = now >= self.next_big_timer
-            || last_kad_contact
-                .is_some_and(|t| now >= t + BIG_TIMER_DISCONNECT_BYPASS_SECS);
+            || last_kad_contact.is_some_and(|t| now >= t + BIG_TIMER_DISCONNECT_BYPASS_SECS);
         if !zone_time_ok {
             return None;
         }
@@ -618,13 +663,19 @@ impl RoutingZone {
     ) {
         if !self.is_leaf() {
             if let Some(children) = &mut self.children {
-                children.0.on_small_timer(now, to_probe, ips_removed, in_use_contacts);
-                children.1.on_small_timer(now, to_probe, ips_removed, in_use_contacts);
+                children
+                    .0
+                    .on_small_timer(now, to_probe, ips_removed, in_use_contacts);
+                children
+                    .1
+                    .on_small_timer(now, to_probe, ips_removed, in_use_contacts);
             }
             return;
         }
 
-        let Some(bin) = self.bin.as_mut() else { return; };
+        let Some(bin) = self.bin.as_mut() else {
+            return;
+        };
         if bin.contacts.is_empty() {
             return;
         }
@@ -651,7 +702,9 @@ impl RoutingZone {
             return;
         }
 
-        let Some(oldest) = bin.contacts.front() else { return; };
+        let Some(oldest) = bin.contacts.front() else {
+            return;
+        };
         if oldest.expires_at >= now || oldest.contact_type >= CONTACT_TYPE_DEAD {
             if let Some(c) = bin.contacts.pop_front() {
                 bin.contacts.push_back(c);
@@ -667,7 +720,12 @@ impl RoutingZone {
     }
 
     /// Remove stale/expired contacts from all bins. Returns IPs removed.
-    fn remove_stale(&mut self, now: i64, max_age_secs: i64, ips_removed: &mut Vec<Ipv4Addr>) -> usize {
+    fn remove_stale(
+        &mut self,
+        now: i64,
+        max_age_secs: i64,
+        ips_removed: &mut Vec<Ipv4Addr>,
+    ) -> usize {
         if let Some(bin) = &mut self.bin {
             let before = bin.len();
             bin.contacts.retain(|c| {
@@ -690,7 +748,12 @@ impl RoutingZone {
     /// Remove dead+expired contacts from all bins. Returns IPs removed.
     /// Contacts referenced by active searches (`in_use_contacts`) are kept
     /// even if dead+expired, matching eMule's InUse protection.
-    fn remove_dead(&mut self, now: i64, ips_removed: &mut Vec<Ipv4Addr>, in_use: &HashMap<KadId, u32>) -> usize {
+    fn remove_dead(
+        &mut self,
+        now: i64,
+        ips_removed: &mut Vec<Ipv4Addr>,
+        in_use: &HashMap<KadId, u32>,
+    ) -> usize {
         if let Some(bin) = &mut self.bin {
             let before = bin.len();
             bin.contacts.retain(|c| {
@@ -756,7 +819,11 @@ impl RoutingZone {
     /// Find contact by IP+port across all bins. Returns mutable ref for SetAlive.
     fn touch_contact_by_addr(&mut self, ip: Ipv4Addr, udp_port: u16) -> bool {
         if let Some(bin) = &mut self.bin {
-            if let Some(pos) = bin.contacts.iter().position(|c| c.ip == ip && c.udp_port == udp_port) {
+            if let Some(pos) = bin
+                .contacts
+                .iter()
+                .position(|c| c.ip == ip && c.udp_port == udp_port)
+            {
                 let contact = &mut bin.contacts[pos];
                 contact.update_type();
                 let id = contact.id;
@@ -771,7 +838,6 @@ impl RoutingZone {
             false
         }
     }
-
 }
 
 #[derive(Debug, PartialEq)]
@@ -918,12 +984,19 @@ impl RoutingTable {
             match filter.read() {
                 Ok(snap) => {
                     if snap.is_blocked(contact.ip) {
-                        tracing::debug!("RT reject {}: IP {} blocked by range filter", contact.id, contact.ip);
+                        tracing::debug!(
+                            "RT reject {}: IP {} blocked by range filter",
+                            contact.id,
+                            contact.ip
+                        );
                         return false;
                     }
                 }
                 Err(_) => {
-                    tracing::warn!("IP filter lock poisoned, rejecting contact {} as a precaution", contact.id);
+                    tracing::warn!(
+                        "IP filter lock poisoned, rejecting contact {} as a precaution",
+                        contact.id
+                    );
                     return false;
                 }
             }
@@ -952,17 +1025,21 @@ impl RoutingTable {
 
         // Check if contact already exists -- handle update path
         {
-            let Some(bin) = self.root.find_bin_mut(&distance) else { return false; };
+            let Some(bin) = self.root.find_bin_mut(&distance) else {
+                return false;
+            };
             if let Some(existing) = bin.get_contact_mut(&contact.id) {
                 // eMule UDPKey sender verification: if the existing contact has a
                 // valid UDP key for our IP, the incoming contact must present the
                 // same key. Prevents contact hijacking.
                 if let Some(our_ip) = self.external_ip {
-                    let existing_key_val = existing.udp_key
+                    let existing_key_val = existing
+                        .udp_key
                         .map(|k| k.get_key_value(our_ip))
                         .unwrap_or(0);
                     if existing_key_val != 0 {
-                        let incoming_key_val = contact.udp_key
+                        let incoming_key_val = contact
+                            .udp_key
                             .map(|k| k.get_key_value(our_ip))
                             .unwrap_or(0);
                         if existing_key_val != incoming_key_val {
@@ -1128,7 +1205,8 @@ impl RoutingTable {
     ) -> Vec<KadContact> {
         let distance = self.local_id.xor_distance(target);
         let mut result = BTreeMap::new();
-        self.root.get_closest_to(max_type, target, &distance, count, &mut result);
+        self.root
+            .get_closest_to(max_type, target, &distance, count, &mut result);
         result.into_values().collect()
     }
 
@@ -1172,7 +1250,12 @@ impl RoutingTable {
                 .cmp(&b.1.is_udp_firewalled())
                 .then_with(|| a.0.cmp(&b.0))
         });
-        verified.extend(unverified.into_iter().take(remaining).map(|(_, c)| c.clone()));
+        verified.extend(
+            unverified
+                .into_iter()
+                .take(remaining)
+                .map(|(_, c)| c.clone()),
+        );
         verified
     }
 
@@ -1313,7 +1396,8 @@ impl RoutingTable {
         }
         if removed > 0 {
             let mut consolidate_dropped = Vec::new();
-            self.root.consolidate(&mut self.next_zone_event_order, &mut consolidate_dropped);
+            self.root
+                .consolidate(&mut self.next_zone_event_order, &mut consolidate_dropped);
             for ip in consolidate_dropped {
                 self.track_ip_remove(ip);
             }
@@ -1324,13 +1408,16 @@ impl RoutingTable {
     pub fn remove_dead_contacts(&mut self) -> usize {
         let now = chrono::Utc::now().timestamp();
         let mut ips_removed = Vec::new();
-        let removed = self.root.remove_dead(now, &mut ips_removed, &self.in_use_contacts);
+        let removed = self
+            .root
+            .remove_dead(now, &mut ips_removed, &self.in_use_contacts);
         for ip in ips_removed {
             self.track_ip_remove(ip);
         }
         if removed > 0 {
             let mut consolidate_dropped = Vec::new();
-            self.root.consolidate(&mut self.next_zone_event_order, &mut consolidate_dropped);
+            self.root
+                .consolidate(&mut self.next_zone_event_order, &mut consolidate_dropped);
             for ip in consolidate_dropped {
                 self.track_ip_remove(ip);
             }
@@ -1367,7 +1454,8 @@ impl RoutingTable {
         let mut to_probe = Vec::new();
         let mut ips_removed = Vec::new();
         let in_use = self.in_use_contacts.clone();
-        self.root.on_small_timer(now, &mut to_probe, &mut ips_removed, &in_use);
+        self.root
+            .on_small_timer(now, &mut to_probe, &mut ips_removed, &in_use);
         for ip in ips_removed {
             self.track_ip_remove(ip);
         }
@@ -1377,7 +1465,9 @@ impl RoutingTable {
     /// eMule Consolidate -- merge sparse sibling leaf zones.
     pub fn consolidate(&mut self) -> u32 {
         let mut consolidate_dropped = Vec::new();
-        let count = self.root.consolidate(&mut self.next_zone_event_order, &mut consolidate_dropped);
+        let count = self
+            .root
+            .consolidate(&mut self.next_zone_event_order, &mut consolidate_dropped);
         for ip in consolidate_dropped {
             self.track_ip_remove(ip);
         }
@@ -1422,8 +1512,6 @@ impl RoutingTable {
         let ancestor_contacts = self.root.ancestor_contacts_at(ancestor_level);
 
         let modify = ancestor_contacts as f64 / (K_BUCKET_SIZE as f64 * 2.0);
-        (2.0f64.powi(leaf_level as i32 - 2)
-            * K_BUCKET_SIZE as f64
-            * modify) as u32
+        (2.0f64.powi(leaf_level as i32 - 2) * K_BUCKET_SIZE as f64 * modify) as u32
     }
 }

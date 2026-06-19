@@ -125,13 +125,19 @@ impl DhtStore {
         let records = self.entries.entry(key).or_insert_with(Vec::new);
 
         // Deduplicate: replace if same publisher already has a record for this key
-        if let Some(pos) = records.iter().position(|r| r.publisher_key == publisher_key) {
+        if let Some(pos) = records
+            .iter()
+            .position(|r| r.publisher_key == publisher_key)
+        {
             records[pos] = record;
             return true;
         }
 
         if records.len() >= MAX_RECORDS_PER_KEY {
-            debug!("Key {} has {MAX_RECORDS_PER_KEY} records, rejecting", hex::encode(key));
+            debug!(
+                "Key {} has {MAX_RECORDS_PER_KEY} records, rejecting",
+                hex::encode(key)
+            );
             return false;
         }
 

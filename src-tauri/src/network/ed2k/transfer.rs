@@ -15,8 +15,8 @@ use crate::bandwidth::limiter::BandwidthLimiter;
 use crate::sharing::manager::TransferControl;
 use crate::types::Ed2kDownloadLimits;
 
-use super::credits::{CreditManager, IdentState};
 use super::comments::CommentManager;
+use super::credits::{CreditManager, IdentState};
 use super::messages::*;
 use super::part_tracker::PartTracker;
 use super::sources::SourceManager;
@@ -48,7 +48,11 @@ pub(super) fn epx_result_to_entries(
         .files
         .iter()
         .map(|e| {
-            let srcs = e.sources.iter().map(|s| (s.ip, s.tcp_port, s.udp_port, s.flags)).collect();
+            let srcs = e
+                .sources
+                .iter()
+                .map(|s| (s.ip, s.tcp_port, s.udp_port, s.flags))
+                .collect();
             (e.file_hash, srcs)
         })
         .collect();
@@ -296,9 +300,9 @@ pub enum DownloadEvent {
 
 /// Shared pending AICH recovery retries: `(file_hash, part_index) -> (failed_ips, retry_count)`.
 /// Written by the network event loop, read by download tasks before sending OP_AICHREQUEST.
-pub type SharedAichPending = std::sync::Arc<std::sync::RwLock<
-    std::collections::HashMap<([u8; 16], u32), (Vec<std::net::Ipv4Addr>, u32)>,
->>;
+pub type SharedAichPending = std::sync::Arc<
+    std::sync::RwLock<std::collections::HashMap<([u8; 16], u32), (Vec<std::net::Ipv4Addr>, u32)>>,
+>;
 
 #[derive(Debug, Clone)]
 pub struct SourceExchangeEntry {
@@ -318,9 +322,7 @@ pub fn classify_error(err: &str) -> SourceFailureKind {
         || lower.contains("hash verification failed")
     {
         SourceFailureKind::Permanent
-    } else if lower.contains("download timeout")
-        || lower.contains("more than 100 seconds")
-    {
+    } else if lower.contains("download timeout") || lower.contains("more than 100 seconds") {
         SourceFailureKind::DownloadTimeout
     } else {
         SourceFailureKind::Transient
@@ -480,7 +482,10 @@ mod tests {
     fn summarize_timeout_error_is_user_friendly() {
         let kind = classify_error("stage:data_wait download timeout: no data for 100s");
         assert_eq!(kind, SourceFailureKind::DownloadTimeout);
-        assert_eq!(summarize_error("stage:data_wait download timeout: no data for 100s", &kind), "Download timed out");
+        assert_eq!(
+            summarize_error("stage:data_wait download timeout: no data for 100s", &kind),
+            "Download timed out"
+        );
         assert_eq!(failure_kind_name(&kind), "download_timeout");
     }
 
@@ -488,7 +493,10 @@ mod tests {
     fn summarize_missing_file_error_is_user_friendly() {
         let kind = classify_error("peer does not have the file");
         assert_eq!(kind, SourceFailureKind::Permanent);
-        assert_eq!(summarize_error("peer does not have the file", &kind), "Remote missing file");
+        assert_eq!(
+            summarize_error("peer does not have the file", &kind),
+            "Remote missing file"
+        );
     }
 }
 
@@ -533,8 +541,12 @@ impl Ed2kDownload {
     }
 
     /// Zero-byte ed2k files: no P2P; hash must be MD4 of empty payload ([`super::hash::empty_ed2k_file_md4`]).
-    async fn complete_zero_byte_local(&self, event_tx: &mpsc::Sender<DownloadEvent>) -> anyhow::Result<std::path::PathBuf> {
-        self.emit_source_detail(event_tx, "connecting", None, 0, 0, "", "").await;
+    async fn complete_zero_byte_local(
+        &self,
+        event_tx: &mpsc::Sender<DownloadEvent>,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        self.emit_source_detail(event_tx, "connecting", None, 0, 0, "", "")
+            .await;
         let _ = event_tx
             .send(DownloadEvent::Verifying {
                 transfer_id: self.transfer_id.clone(),
@@ -547,7 +559,8 @@ impl Ed2kDownload {
             &self.download_dir,
         )
         .await?;
-        self.emit_source_detail(event_tx, "completed", None, 0, 0, "", "").await;
+        self.emit_source_detail(event_tx, "completed", None, 0, 0, "", "")
+            .await;
         let _ = event_tx
             .send(DownloadEvent::Progress {
                 transfer_id: self.transfer_id.clone(),
@@ -568,7 +581,18 @@ impl Ed2kDownload {
         client_software: &str,
         peer_name: &str,
     ) {
-        self.emit_source_detail_parts(event_tx, status, queue_rank, speed, transferred, client_software, peer_name, None, None).await;
+        self.emit_source_detail_parts(
+            event_tx,
+            status,
+            queue_rank,
+            speed,
+            transferred,
+            client_software,
+            peer_name,
+            None,
+            None,
+        )
+        .await;
     }
 
     fn country_code(&self) -> Option<String> {
@@ -645,7 +669,8 @@ impl Ed2kDownload {
     ) -> anyhow::Result<()> {
         info!(
             "Starting callback download {} from {}",
-            hex::encode(self.file_hash), self.source_addr
+            hex::encode(self.file_hash),
+            self.source_addr
         );
 
         if self.file_size == 0 {
@@ -659,7 +684,8 @@ impl Ed2kDownload {
             return Ok(());
         }
 
-        self.emit_source_detail(&event_tx, "connected (callback)", None, 0, 0, "", "").await;
+        self.emit_source_detail(&event_tx, "connected (callback)", None, 0, 0, "", "")
+            .await;
 
         if let Some(sm) = &self.source_manager {
             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
@@ -669,15 +695,18 @@ impl Ed2kDownload {
         }
 
         let mut completed_path_out: Option<String> = None;
-        match self.download_from_streams(
-            &mut *reader,
-            &mut *writer,
-            peer_user_hash,
-            PeerCapabilities::default(),
-            &event_tx,
-            emule_info_done,
-            &mut completed_path_out,
-        ).await {
+        match self
+            .download_from_streams(
+                &mut *reader,
+                &mut *writer,
+                peer_user_hash,
+                PeerCapabilities::default(),
+                &event_tx,
+                emule_info_done,
+                &mut completed_path_out,
+            )
+            .await
+        {
             Ok(_) => {
                 let _ = event_tx
                     .send(DownloadEvent::Completed {
@@ -775,11 +804,13 @@ impl Ed2kDownload {
         let mut deferred_packet: Option<(u8, u8, Vec<u8>)> = None;
         let mut client_software_label = client_software_from_caps(&initial_caps);
         let mut peer_name_label = initial_caps.peer_name.clone();
-        let our_client_id = self.external_ip
+        let our_client_id = self
+            .external_ip
             .map(|ip| u32::from_le_bytes(ip.octets()))
             .unwrap_or(0);
 
-        let peer_is_new_emule = initial_caps.emule_version_min > 0 || initial_caps.version_major > 0;
+        let peer_is_new_emule =
+            initial_caps.emule_version_min > 0 || initial_caps.version_major > 0;
         // `did_proactive_challenge` tracks whether `maybe_send_secident_challenge`
         // fired inside the branches below (it does, for the classic pre-EmuleInfo
         // peer path). After the match we send it unconditionally if we haven't
@@ -792,9 +823,16 @@ impl Ed2kDownload {
         // same way, which is exactly the symptom we just fixed on uploads.
         let mut did_proactive_challenge = false;
         if skip_emule_info || peer_is_new_emule {
-            debug!("Skipping EmuleInfo exchange (already done via obfuscation or Hello eMule tags)");
+            debug!(
+                "Skipping EmuleInfo exchange (already done via obfuscation or Hello eMule tags)"
+            );
         } else {
-            let emule_payload = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash), None);
+            let emule_payload = build_emule_info(
+                self.udp_port,
+                self.obfuscation_enabled,
+                Some(&self.ember_hash),
+                None,
+            );
             write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFO, &emule_payload).await?;
 
             let (proto2, opcode2, payload2) = read_packet_with_timeout(&mut reader)
@@ -808,17 +846,26 @@ impl Ed2kDownload {
                      crypt={}/{}/{}, multi={}/{}, aich={}, unicode={}, secident={}, \
                      preview={}, captcha={}, file_ident={}, direct_cb={}, \
                      compat={}, emule_min={}, mod={}",
-                    peer_caps.compression_ver, peer_caps.supports_large_files,
-                    peer_caps.source_exchange_ver, peer_caps.supports_source_ex2,
-                    peer_caps.kad_version, peer_caps.kad_port,
-                    peer_caps.supports_crypt_layer, peer_caps.requests_crypt_layer,
+                    peer_caps.compression_ver,
+                    peer_caps.supports_large_files,
+                    peer_caps.source_exchange_ver,
+                    peer_caps.supports_source_ex2,
+                    peer_caps.kad_version,
+                    peer_caps.kad_port,
+                    peer_caps.supports_crypt_layer,
+                    peer_caps.requests_crypt_layer,
                     peer_caps.requires_crypt_layer,
-                    peer_caps.supports_multi_packet, peer_caps.ext_multi_packet,
-                    peer_caps.supports_aich, peer_caps.supports_unicode,
-                    peer_caps.supports_secure_ident, peer_caps.supports_preview,
-                    peer_caps.supports_captcha, peer_caps.supports_file_ident,
+                    peer_caps.supports_multi_packet,
+                    peer_caps.ext_multi_packet,
+                    peer_caps.supports_aich,
+                    peer_caps.supports_unicode,
+                    peer_caps.supports_secure_ident,
+                    peer_caps.supports_preview,
+                    peer_caps.supports_captcha,
+                    peer_caps.supports_file_ident,
                     peer_caps.supports_direct_udp_callback,
-                    peer_caps.compatible_client, peer_caps.emule_version_min,
+                    peer_caps.compatible_client,
+                    peer_caps.emule_version_min,
                     peer_caps.mod_version,
                 );
                 let peer_udp = peer_caps.udp_port;
@@ -841,7 +888,13 @@ impl Ed2kDownload {
                     if let Some(sm) = &self.source_manager {
                         let mut sm = sm.write().await;
                         if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
-                            sm.register_source_full(self.file_hash, v4, self.source_addr.port(), peer_udp, peer_user_hash);
+                            sm.register_source_full(
+                                self.file_hash,
+                                v4,
+                                self.source_addr.port(),
+                                peer_udp,
+                                peer_user_hash,
+                            );
                         }
                     }
                     debug!("Got EmuleInfoAnswer (peer UDP port: {peer_udp})");
@@ -854,7 +907,8 @@ impl Ed2kDownload {
                     peer_user_hash,
                     self.source_addr,
                     peer_secure_ident_level,
-                ).await?;
+                )
+                .await?;
                 did_proactive_challenge = true;
             } else if proto2 == OP_EMULEPROT && opcode2 == OP_EMULEINFO {
                 // Peer sent OP_EMULEINFO instead of OP_EMULEINFOANSWER — parse
@@ -881,12 +935,24 @@ impl Ed2kDownload {
                     if let Some(sm) = &self.source_manager {
                         let mut sm = sm.write().await;
                         if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
-                            sm.register_source_full(self.file_hash, v4, self.source_addr.port(), peer_udp, peer_user_hash);
+                            sm.register_source_full(
+                                self.file_hash,
+                                v4,
+                                self.source_addr.port(),
+                                peer_udp,
+                                peer_user_hash,
+                            );
                         }
                     }
                 }
-                let emule_answer = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash), None);
-                write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_answer).await?;
+                let emule_answer = build_emule_info(
+                    self.udp_port,
+                    self.obfuscation_enabled,
+                    Some(&self.ember_hash),
+                    None,
+                );
+                write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_answer)
+                    .await?;
                 debug!("Received peer OP_EMULEINFO, replied with OP_EMULEINFOANSWER");
                 pending_secident_challenge = maybe_send_secident_challenge(
                     &mut writer,
@@ -894,7 +960,8 @@ impl Ed2kDownload {
                     peer_user_hash,
                     self.source_addr,
                     peer_secure_ident_level,
-                ).await?;
+                )
+                .await?;
                 did_proactive_challenge = true;
             } else {
                 debug!("Peer skipped EmuleInfoAnswer (got proto=0x{proto2:02X} op=0x{opcode2:02X}), deferring");
@@ -919,7 +986,8 @@ impl Ed2kDownload {
                 peer_user_hash,
                 self.source_addr,
                 peer_secure_ident_level,
-            ).await?;
+            )
+            .await?;
         }
 
         // Handle secure identification packets that may arrive before file requests.
@@ -948,7 +1016,9 @@ impl Ed2kDownload {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(3),
                     read_packet_async(&mut reader),
-                ).await {
+                )
+                .await
+                {
                     Ok(Ok(pkt)) => pkt,
                     _ => break,
                 }
@@ -975,7 +1045,8 @@ impl Ed2kDownload {
                             peer_user_hash,
                             peer_secure_ident_level,
                             our_client_id,
-                        ).await?;
+                        )
+                        .await?;
                     }
                     if pending_secident_challenge.is_none() {
                         pending_secident_challenge = maybe_send_secident_challenge(
@@ -984,7 +1055,8 @@ impl Ed2kDownload {
                             peer_user_hash,
                             self.source_addr,
                             peer_secure_ident_level,
-                        ).await?;
+                        )
+                        .await?;
                     }
                     debug!("Received peer's public key");
                 }
@@ -1013,7 +1085,8 @@ impl Ed2kDownload {
                             peer_user_hash,
                             peer_secure_ident_level,
                             our_client_id,
-                        ).await?;
+                        )
+                        .await?;
                     }
                     debug!("Responded to SecIdent challenge");
                 }
@@ -1026,7 +1099,8 @@ impl Ed2kDownload {
                         peer_secure_ident_level,
                         &pl,
                         our_client_id,
-                    ).await;
+                    )
+                    .await;
                 }
                 (OP_EMULEPROT, OP_EMULEINFOANSWER) | (OP_EMULEPROT, OP_EMULEINFO) => {
                     let mut peer_caps = initial_caps.clone();
@@ -1051,14 +1125,33 @@ impl Ed2kDownload {
                         if let Some(sm) = &self.source_manager {
                             let mut sm = sm.write().await;
                             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
-                                sm.register_source_full(self.file_hash, v4, self.source_addr.port(), peer_udp, peer_user_hash);
+                                sm.register_source_full(
+                                    self.file_hash,
+                                    v4,
+                                    self.source_addr.port(),
+                                    peer_udp,
+                                    peer_user_hash,
+                                );
                             }
                         }
                     }
                     if o == OP_EMULEINFO {
-                        let emule_answer = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash), None);
-                        let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_answer).await;
-                        debug!("Received delayed peer OP_EMULEINFO, replied with OP_EMULEINFOANSWER");
+                        let emule_answer = build_emule_info(
+                            self.udp_port,
+                            self.obfuscation_enabled,
+                            Some(&self.ember_hash),
+                            None,
+                        );
+                        let _ = write_packet_async(
+                            &mut writer,
+                            OP_EMULEPROT,
+                            OP_EMULEINFOANSWER,
+                            &emule_answer,
+                        )
+                        .await;
+                        debug!(
+                            "Received delayed peer OP_EMULEINFO, replied with OP_EMULEINFOANSWER"
+                        );
                     } else {
                         debug!("Got delayed EmuleInfoAnswer");
                     }
@@ -1073,23 +1166,39 @@ impl Ed2kDownload {
                 // non-Ember (or hostile) peer we're downloading from could
                 // inject crafted source/peer hints into our mesh
                 // (`known_ember_peers`, broker relay candidates).
-                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if peer_is_ember && epx_packets_received < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION => {
+                (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE)
+                    if peer_is_ember
+                        && epx_packets_received
+                            < crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION =>
+                {
                     self.sx_overhead.record_download((6 + pl.len()) as u64);
                     epx_packets_received += 1;
-                    info!("Received early EPX from {} during pre-control ({} bytes)", self.source_addr, pl.len());
+                    info!(
+                        "Received early EPX from {} during pre-control ({} bytes)",
+                        self.source_addr,
+                        pl.len()
+                    );
                     match crate::network::ember::parse_exchange_payload(&pl) {
                         Ok(result) if !result.files.is_empty() || !result.peers.is_empty() => {
                             let (epx_entries, aich_roots) = epx_result_to_entries(&result);
-                            let epx_peers = result.peers.into_iter().map(|ep| (ep.ip, ep.tcp_port)).collect();
-                            let _ = event_tx.send(DownloadEvent::EmberSources {
-                                transfer_id: self.transfer_id.clone(),
-                                entries: epx_entries,
-                                aich_roots,
-                                ember_peers: epx_peers,
-                            }).await;
+                            let epx_peers = result
+                                .peers
+                                .into_iter()
+                                .map(|ep| (ep.ip, ep.tcp_port))
+                                .collect();
+                            let _ = event_tx
+                                .send(DownloadEvent::EmberSources {
+                                    transfer_id: self.transfer_id.clone(),
+                                    entries: epx_entries,
+                                    aich_roots,
+                                    ember_peers: epx_peers,
+                                })
+                                .await;
                         }
                         Ok(_) => {}
-                        Err(e) => debug!("Failed to parse early EPX from {}: {e}", self.source_addr),
+                        Err(e) => {
+                            debug!("Failed to parse early EPX from {}: {e}", self.source_addr)
+                        }
                     }
                 }
                 (OP_EMULEPROT, OP_EMBER_FRIEND_REQ) => {
@@ -1109,13 +1218,15 @@ impl Ed2kDownload {
                             "Received early friend request from {} (nick='{}', verified={verified}, pop={}, binding={ember_hash_binding_verified})",
                             self.source_addr, nick, ember_auth_verified
                         );
-                        let _ = event_tx.send(DownloadEvent::EmberFriendRequest {
-                            ember_hash: eh,
-                            nickname: nick,
-                            peer_ip: self.source_addr.ip().to_string(),
-                            peer_port: self.source_addr.port(),
-                            verified,
-                        }).await;
+                        let _ = event_tx
+                            .send(DownloadEvent::EmberFriendRequest {
+                                ember_hash: eh,
+                                nickname: nick,
+                                peer_ip: self.source_addr.ip().to_string(),
+                                peer_port: self.source_addr.port(),
+                                verified,
+                            })
+                            .await;
                     }
                 }
                 // Authoritative Ember peer detection. A peer that emits a
@@ -1135,14 +1246,12 @@ impl Ed2kDownload {
                         // after PoP verification (see upload.rs for
                         // the full rationale — same accounting risk).
                         let identity_changed = ember_auth_verified
-                            && (
-                                (ident.ed25519_pubkey.is_some()
-                                    && peer_ember_pubkey.is_some()
-                                    && ident.ed25519_pubkey != peer_ember_pubkey)
+                            && ((ident.ed25519_pubkey.is_some()
+                                && peer_ember_pubkey.is_some()
+                                && ident.ed25519_pubkey != peer_ember_pubkey)
                                 || (ident.ember_hash != [0u8; 16]
                                     && peer_ember_hash.is_some()
-                                    && Some(ident.ember_hash) != peer_ember_hash)
-                            );
+                                    && Some(ident.ember_hash) != peer_ember_hash));
                         if identity_changed {
                             tracing::warn!(
                                 "Ember identity-swap rejected from {}: peer already PoP-verified, ignoring re-keyed OP_EMBER_HELLO (old_hash={:?}, new_hash={})",
@@ -1260,13 +1369,17 @@ impl Ed2kDownload {
                                         // inline to gate the
                                         // FriendSeen emit on PoP.
                                         if !friend_seen_emitted {
-                                            if let (Some(ref fh_arc), Some(eh)) = (&self.friend_hashes, peer_ember_hash) {
+                                            if let (Some(ref fh_arc), Some(eh)) =
+                                                (&self.friend_hashes, peer_ember_hash)
+                                            {
                                                 if fh_arc.read().await.contains(&eh) {
-                                                    let _ = event_tx.send(DownloadEvent::FriendSeen {
-                                                        ember_hash: eh,
-                                                        ip: self.source_addr.ip(),
-                                                        port: self.source_addr.port(),
-                                                    }).await;
+                                                    let _ = event_tx
+                                                        .send(DownloadEvent::FriendSeen {
+                                                            ember_hash: eh,
+                                                            ip: self.source_addr.ip(),
+                                                            port: self.source_addr.port(),
+                                                        })
+                                                        .await;
                                                     friend_seen_emitted = true;
                                                 }
                                             }
@@ -1326,33 +1439,50 @@ impl Ed2kDownload {
         // (See `multi_source.rs` for the symmetric fix.)
         let mut initial_epx_sent_generation: Option<u64> = None;
         if peer_is_ember {
-            let sent_gen = self.ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed);
+            let sent_gen = self
+                .ember_payload_generation
+                .load(std::sync::atomic::Ordering::Relaxed);
             let epx_data = self.ember_payload.read().await.clone();
             if !epx_data.is_empty() {
-                debug!("Sending Ember Peer Exchange to {} ({} bytes, gen {})", self.source_addr, epx_data.len(), sent_gen);
-                let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await;
+                debug!(
+                    "Sending Ember Peer Exchange to {} ({} bytes, gen {})",
+                    self.source_addr,
+                    epx_data.len(),
+                    sent_gen
+                );
+                let _ = write_packet_async(
+                    &mut writer,
+                    OP_EMULEPROT,
+                    OP_EMBER_SOURCEEXCHANGE,
+                    &*epx_data,
+                )
+                .await;
                 self.sx_overhead.record_upload((6 + epx_data.len()) as u64);
                 initial_epx_sent_generation = Some(sent_gen);
             }
             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                 let peer_tcp = self.source_addr.port();
                 if peer_tcp > 0 && !crate::security::is_special_use_v4(v4) {
-                    let _ = event_tx.send(DownloadEvent::EmberPeerDiscovered {
-                        ip: v4,
-                        tcp_port: peer_tcp,
-                    }).await;
+                    let _ = event_tx
+                        .send(DownloadEvent::EmberPeerDiscovered {
+                            ip: v4,
+                            tcp_port: peer_tcp,
+                        })
+                        .await;
                 }
             }
         }
 
-        let peer_is_friend = if let (Some(ref fh), Some(eh)) = (&self.friend_hashes, peer_ember_hash) {
-            fh.read().await.contains(&eh)
-        } else {
-            false
-        };
+        let peer_is_friend =
+            if let (Some(ref fh), Some(eh)) = (&self.friend_hashes, peer_ember_hash) {
+                fh.read().await.contains(&eh)
+            } else {
+                false
+            };
         if peer_is_ember && peer_is_friend {
             let nick_bytes = self.our_nickname.as_bytes();
-            let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, nick_bytes).await;
+            let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, nick_bytes)
+                .await;
         }
         // FriendSeen emit is deferred to PoP-success sites. The
         // dispatcher promotes FriendSeen to `update_friend_address`
@@ -1383,8 +1513,12 @@ impl Ed2kDownload {
             let sm = sm.read().await;
             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
                 sm.can_request_sources_for(&self.file_hash, v4, self.source_addr.port())
-            } else { true }
-        } else { true };
+            } else {
+                true
+            }
+        } else {
+            true
+        };
 
         if peer_supports_file_ident || peer_supports_ext_multipacket || peer_supports_multipacket {
             // eMule-style multipacket file request.
@@ -1443,20 +1577,23 @@ impl Ed2kDownload {
                 }
             }
         } else {
-            write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_REQUESTFILENAME, &req_file_name_payload).await?;
+            write_packet_async(
+                &mut writer,
+                OP_EDONKEYHEADER,
+                OP_REQUESTFILENAME,
+                &req_file_name_payload,
+            )
+            .await?;
             if !single_part {
-                write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_SETREQFILEID, &file_req).await?;
+                write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_SETREQFILEID, &file_req)
+                    .await?;
             }
         }
 
         // Read FileStatus and FileName responses
         let mut got_status = single_part;
         let mut got_filename = false;
-        let mut available_parts: Vec<bool> = if single_part {
-            vec![true]
-        } else {
-            Vec::new()
-        };
+        let mut available_parts: Vec<bool> = if single_part { vec![true] } else { Vec::new() };
 
         for _ in 0..12 {
             let (proto, opcode, payload) = if let Some(pkt) = deferred_packet.take() {
@@ -1485,7 +1622,10 @@ impl Ed2kDownload {
                         );
                     }
                     if parts.is_empty() {
-                        debug!("FileStatus: part_count=0 → peer has complete file ({} parts)", part_count);
+                        debug!(
+                            "FileStatus: part_count=0 → peer has complete file ({} parts)",
+                            part_count
+                        );
                         available_parts = vec![true; part_count.max(1)];
                     } else {
                         debug!("FileStatus: {} parts", parts.len());
@@ -1523,13 +1663,30 @@ impl Ed2kDownload {
                         if let Some(sm) = &self.source_manager {
                             let mut sm = sm.write().await;
                             if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
-                                sm.register_source_full(self.file_hash, v4, self.source_addr.port(), peer_udp, peer_user_hash);
+                                sm.register_source_full(
+                                    self.file_hash,
+                                    v4,
+                                    self.source_addr.port(),
+                                    peer_udp,
+                                    peer_user_hash,
+                                );
                             }
                         }
                     }
                     if opcode == OP_EMULEINFO {
-                        let emule_answer = build_emule_info(self.udp_port, self.obfuscation_enabled, Some(&self.ember_hash), None);
-                        let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_answer).await;
+                        let emule_answer = build_emule_info(
+                            self.udp_port,
+                            self.obfuscation_enabled,
+                            Some(&self.ember_hash),
+                            None,
+                        );
+                        let _ = write_packet_async(
+                            &mut writer,
+                            OP_EMULEPROT,
+                            OP_EMULEINFOANSWER,
+                            &emule_answer,
+                        )
+                        .await;
                         debug!("Received peer OP_EMULEINFO during file-status wait, replied");
                     } else {
                         debug!("Ignoring delayed EmuleInfoAnswer during file-status wait");
@@ -1552,7 +1709,8 @@ impl Ed2kDownload {
                             peer_user_hash,
                             self.source_addr,
                             peer_secure_ident_level,
-                        ).await?;
+                        )
+                        .await?;
                     }
                 }
                 (OP_EMULEPROT, OP_SECIDENTSTATE) if payload.len() >= 5 => {
@@ -1565,7 +1723,8 @@ impl Ed2kDownload {
                         peer_user_hash,
                         peer_secure_ident_level,
                         our_client_id,
-                    ).await?;
+                    )
+                    .await?;
                 }
                 (OP_EMULEPROT, OP_SIGNATURE) if payload.len() >= 2 => {
                     handle_secident_signature(
@@ -1576,7 +1735,8 @@ impl Ed2kDownload {
                         peer_secure_ident_level,
                         &payload,
                         our_client_id,
-                    ).await;
+                    )
+                    .await;
                 }
                 (OP_EMULEPROT, OP_MULTIPACKETANSWER)
                 | (OP_EMULEPROT, OP_MULTIPACKETANSWER_EXT2) => {
@@ -1587,7 +1747,11 @@ impl Ed2kDownload {
                             aich_hash: None,
                         };
                         if mp.file_hash != self.file_hash
-                            || mp.file_identifier.as_ref().map(|id| !local_ident.compare_relaxed(id)).unwrap_or(false)
+                            || mp
+                                .file_identifier
+                                .as_ref()
+                                .map(|id| !local_ident.compare_relaxed(id))
+                                .unwrap_or(false)
                         {
                             continue;
                         }
@@ -1617,15 +1781,25 @@ impl Ed2kDownload {
                 // Ember-only; gated on `peer_is_ember` (see upload.rs).
                 (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if peer_is_ember => {
                     self.sx_overhead.record_download((6 + payload.len()) as u64);
-                    if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
+                    if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION
+                    {
                         debug!("Ignoring excess EPX packet from {}", self.source_addr);
                     } else {
                         epx_packets_received += 1;
                         match crate::network::ember::parse_exchange_payload(&payload) {
                             Ok(result) if !result.files.is_empty() || !result.peers.is_empty() => {
-                                info!("Received Ember Peer Exchange from {} ({} files, {} peers)", self.source_addr, result.files.len(), result.peers.len());
+                                info!(
+                                    "Received Ember Peer Exchange from {} ({} files, {} peers)",
+                                    self.source_addr,
+                                    result.files.len(),
+                                    result.peers.len()
+                                );
                                 let (epx_entries, aich_roots) = epx_result_to_entries(&result);
-                                let ember_peers = result.peers.into_iter().map(|p| (p.ip, p.tcp_port)).collect();
+                                let ember_peers = result
+                                    .peers
+                                    .into_iter()
+                                    .map(|p| (p.ip, p.tcp_port))
+                                    .collect();
                                 let _ = event_tx
                                     .send(DownloadEvent::EmberSources {
                                         transfer_id: self.transfer_id.clone(),
@@ -1636,7 +1810,10 @@ impl Ed2kDownload {
                                     .await;
                             }
                             Ok(_) => {}
-                            Err(e) => debug!("Failed to parse Ember exchange from {}: {e}", self.source_addr),
+                            Err(e) => debug!(
+                                "Failed to parse Ember exchange from {}: {e}",
+                                self.source_addr
+                            ),
                         }
                     }
                 }
@@ -1652,13 +1829,15 @@ impl Ed2kDownload {
                         // PoP-only (binding is replayable; see early
                         // friend-request site).
                         let verified = ember_auth_verified;
-                        let _ = event_tx.send(DownloadEvent::EmberFriendRequest {
-                            ember_hash: eh,
-                            nickname: nick,
-                            peer_ip: self.source_addr.ip().to_string(),
-                            peer_port: self.source_addr.port(),
-                            verified,
-                        }).await;
+                        let _ = event_tx
+                            .send(DownloadEvent::EmberFriendRequest {
+                                ember_hash: eh,
+                                nickname: nick,
+                                peer_ip: self.source_addr.ip().to_string(),
+                                peer_port: self.source_addr.port(),
+                                verified,
+                            })
+                            .await;
                     }
                 }
                 // Peer may delay their `OP_EMBER_HELLOANSWER` past the
@@ -1671,14 +1850,12 @@ impl Ed2kDownload {
                         peer_is_ember = true;
                         // Identity lock (see pre-control arm).
                         let identity_changed = ember_auth_verified
-                            && (
-                                (ident.ed25519_pubkey.is_some()
-                                    && peer_ember_pubkey.is_some()
-                                    && ident.ed25519_pubkey != peer_ember_pubkey)
+                            && ((ident.ed25519_pubkey.is_some()
+                                && peer_ember_pubkey.is_some()
+                                && ident.ed25519_pubkey != peer_ember_pubkey)
                                 || (ident.ember_hash != [0u8; 16]
                                     && peer_ember_hash.is_some()
-                                    && Some(ident.ember_hash) != peer_ember_hash)
-                            );
+                                    && Some(ident.ember_hash) != peer_ember_hash));
                         if identity_changed {
                             tracing::warn!(
                                 "Ember identity-swap rejected from {} (file-status-wait): peer already PoP-verified",
@@ -1765,12 +1942,16 @@ impl Ed2kDownload {
                                             auth_deferred.len()
                                         );
                                         if !friend_seen_emitted {
-                                            if let (true, Some(eh)) = (peer_is_friend, peer_ember_hash) {
-                                                let _ = event_tx.send(DownloadEvent::FriendSeen {
-                                                    ember_hash: eh,
-                                                    ip: self.source_addr.ip(),
-                                                    port: self.source_addr.port(),
-                                                }).await;
+                                            if let (true, Some(eh)) =
+                                                (peer_is_friend, peer_ember_hash)
+                                            {
+                                                let _ = event_tx
+                                                    .send(DownloadEvent::FriendSeen {
+                                                        ember_hash: eh,
+                                                        ip: self.source_addr.ip(),
+                                                        port: self.source_addr.port(),
+                                                    })
+                                                    .await;
                                                 friend_seen_emitted = true;
                                             }
                                         }
@@ -1786,13 +1967,17 @@ impl Ed2kDownload {
                         }
                     }
                 }
-                (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && ember_auth_verified && payload.len() <= 4096 => {
+                (OP_EMULEPROT, OP_EMBER_CHAT_MSG)
+                    if is_ember_friend && ember_auth_verified && payload.len() <= 4096 =>
+                {
                     if let Some(eh) = peer_ember_hash {
                         if let Ok(msg) = std::str::from_utf8(&payload) {
-                            let _ = event_tx.send(DownloadEvent::EmberChatMessage {
-                                ember_hash: eh,
-                                message: msg.to_string(),
-                            }).await;
+                            let _ = event_tx
+                                .send(DownloadEvent::EmberChatMessage {
+                                    ember_hash: eh,
+                                    message: msg.to_string(),
+                                })
+                                .await;
                         }
                     }
                 }
@@ -1818,13 +2003,16 @@ impl Ed2kDownload {
             anyhow::bail!("never received FileStatus");
         }
 
-        let src_avail_parts: Option<u32> = Some(available_parts.iter().filter(|&&p| p).count() as u32);
+        let src_avail_parts: Option<u32> =
+            Some(available_parts.iter().filter(|&&p| p).count() as u32);
         let src_total_parts: Option<u32> = Some(available_parts.len() as u32);
 
         // Request part hashset for verification
         if peer_supports_file_ident {
-            let hashset_req2 = build_hashset_request2(&self.file_hash, self.file_size, None, true, false);
-            write_packet_async(&mut writer, OP_EMULEPROT, OP_HASHSETREQUEST2, &hashset_req2).await?;
+            let hashset_req2 =
+                build_hashset_request2(&self.file_hash, self.file_size, None, true, false);
+            write_packet_async(&mut writer, OP_EMULEPROT, OP_HASHSETREQUEST2, &hashset_req2)
+                .await?;
         } else {
             let hashset_req = build_hashset_request(&self.file_hash);
             write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_HASHSETREQ, &hashset_req).await?;
@@ -1844,7 +2032,10 @@ impl Ed2kDownload {
                         match parse_hashset_answer(&payload) {
                             Ok((_hash, hashes)) => {
                                 if verify_hashset(&self.file_hash, &hashes, self.file_size) {
-                                    debug!("Got verified hashset with {} part hashes", hashes.len());
+                                    debug!(
+                                        "Got verified hashset with {} part hashes",
+                                        hashes.len()
+                                    );
                                     part_hashes = hashes;
                                 } else {
                                     warn!("Hashset verification failed - combined hash doesn't match file hash");
@@ -1876,7 +2067,10 @@ impl Ed2kDownload {
                                 }
                                 if let Some(hashes) = resp.md4_hashes {
                                     if verify_hashset(&self.file_hash, &hashes, self.file_size) {
-                                        debug!("Got verified hashset2 with {} part hashes", hashes.len());
+                                        debug!(
+                                            "Got verified hashset2 with {} part hashes",
+                                            hashes.len()
+                                        );
                                         part_hashes = hashes;
                                     } else {
                                         warn!("Hashset2 verification failed - combined hash doesn't match file hash");
@@ -1902,7 +2096,9 @@ impl Ed2kDownload {
         }
 
         // Request source exchange only when not already sent in multipacket, and throttled
-        if !(peer_supports_file_ident || peer_supports_ext_multipacket || peer_supports_multipacket) && sx_allowed {
+        if !(peer_supports_file_ident || peer_supports_ext_multipacket || peer_supports_multipacket)
+            && sx_allowed
+        {
             if peer_supports_source_ex2 {
                 let mut sx2_req = Vec::with_capacity(19);
                 sx2_req.push(SOURCEEXCHANGE2_VERSION);
@@ -1925,7 +2121,18 @@ impl Ed2kDownload {
 
         if early_upload_accept {
             debug!("Using early AcceptUploadReq without sending StartUploadReq");
-            self.emit_source_detail_parts(event_tx, "transferring", None, 0, 0, &client_software_label, &peer_name_label, src_avail_parts, src_total_parts).await;
+            self.emit_source_detail_parts(
+                event_tx,
+                "transferring",
+                None,
+                0,
+                0,
+                &client_software_label,
+                &peer_name_label,
+                src_avail_parts,
+                src_total_parts,
+            )
+            .await;
             let _ = event_tx
                 .send(DownloadEvent::SourcesUpdate {
                     transfer_id: self.transfer_id.clone(),
@@ -1937,7 +2144,13 @@ impl Ed2kDownload {
         } else {
             // Request upload slot
             let upload_req = build_file_request(&self.file_hash);
-            write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_STARTUPLOADREQ, &upload_req).await?;
+            write_packet_async(
+                &mut writer,
+                OP_EDONKEYHEADER,
+                OP_STARTUPLOADREQ,
+                &upload_req,
+            )
+            .await?;
 
             let _ = event_tx
                 .send(DownloadEvent::SourcesUpdate {
@@ -1952,14 +2165,27 @@ impl Ed2kDownload {
             // we simply keep the connection open and listen. Re-requesting too
             // aggressively gets clients penalised by eMule servers.
             let queue_start = std::time::Instant::now();
-            self.emit_source_detail_parts(event_tx, "queued", None, 0, 0, &client_software_label, &peer_name_label, src_avail_parts, src_total_parts).await;
+            self.emit_source_detail_parts(
+                event_tx,
+                "queued",
+                None,
+                0,
+                0,
+                &client_software_label,
+                &peer_name_label,
+                src_avail_parts,
+                src_total_parts,
+            )
+            .await;
 
             loop {
                 self.check_control().await?;
 
                 let qwait = self.ed2k_limits.queue_wait_secs;
                 if queue_start.elapsed().as_secs() > qwait {
-                    anyhow::bail!("stage:queue_wait timed out waiting for upload slot after {qwait}s");
+                    anyhow::bail!(
+                        "stage:queue_wait timed out waiting for upload slot after {qwait}s"
+                    );
                 }
 
                 // Use a longer timeout while queued — the uploader will push
@@ -1976,15 +2202,30 @@ impl Ed2kDownload {
 
                 let (proto, opcode, payload) = match result {
                     Ok(Ok(p)) => p,
-                    Ok(Err(e)) => anyhow::bail!("stage:queue_detached connection lost while queued: {e}"),
+                    Ok(Err(e)) => {
+                        anyhow::bail!("stage:queue_detached connection lost while queued: {e}")
+                    }
                     Err(_) => {
-                        anyhow::bail!("stage:queue_wait timed out waiting for upload slot after {qwait}s");
+                        anyhow::bail!(
+                            "stage:queue_wait timed out waiting for upload slot after {qwait}s"
+                        );
                     }
                 };
 
                 if proto == OP_EDONKEYHEADER && opcode == OP_ACCEPTUPLOADREQ {
                     debug!("Upload accepted");
-                    self.emit_source_detail_parts(event_tx, "transferring", None, 0, 0, &client_software_label, &peer_name_label, src_avail_parts, src_total_parts).await;
+                    self.emit_source_detail_parts(
+                        event_tx,
+                        "transferring",
+                        None,
+                        0,
+                        0,
+                        &client_software_label,
+                        &peer_name_label,
+                        src_avail_parts,
+                        src_total_parts,
+                    )
+                    .await;
                     let _ = event_tx
                         .send(DownloadEvent::SourcesUpdate {
                             transfer_id: self.transfer_id.clone(),
@@ -1997,29 +2238,57 @@ impl Ed2kDownload {
                 }
 
                 if proto == OP_EMULEPROT && opcode == OP_QUEUEFULL && payload.is_empty() {
-                    self.emit_source_detail_parts(event_tx, "queue_full", None, 0, 0, &client_software_label, &peer_name_label, src_avail_parts, src_total_parts).await;
+                    self.emit_source_detail_parts(
+                        event_tx,
+                        "queue_full",
+                        None,
+                        0,
+                        0,
+                        &client_software_label,
+                        &peer_name_label,
+                        src_avail_parts,
+                        src_total_parts,
+                    )
+                    .await;
                     anyhow::bail!("stage:queue_wait peer queue is full");
                 }
 
                 if proto == OP_EMULEPROT && opcode == OP_QUEUERANKING && payload.len() >= 2 {
                     let rank = u16::from_le_bytes([payload[0], payload[1]]);
-                    info!(
-                        "Queued at position {} on peer {}",
-                        rank, self.source_addr
-                    );
-                    self.emit_source_detail_parts(event_tx, "queued", Some(rank as u32), 0, 0, &client_software_label, &peer_name_label, src_avail_parts, src_total_parts).await;
+                    info!("Queued at position {} on peer {}", rank, self.source_addr);
+                    self.emit_source_detail_parts(
+                        event_tx,
+                        "queued",
+                        Some(rank as u32),
+                        0,
+                        0,
+                        &client_software_label,
+                        &peer_name_label,
+                        src_avail_parts,
+                        src_total_parts,
+                    )
+                    .await;
                     continue;
                 }
 
                 if proto == OP_EDONKEYHEADER && opcode == OP_QUEUERANK && payload.len() >= 4 {
-                    let rank = u32::from_le_bytes([
-                        payload[0], payload[1], payload[2], payload[3],
-                    ]);
+                    let rank = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                     info!(
                         "Queued at position {} on peer {} (legacy)",
                         rank, self.source_addr
                     );
-                    self.emit_source_detail_parts(event_tx, "queued", Some(rank), 0, 0, &client_software_label, &peer_name_label, src_avail_parts, src_total_parts).await;
+                    self.emit_source_detail_parts(
+                        event_tx,
+                        "queued",
+                        Some(rank),
+                        0,
+                        0,
+                        &client_software_label,
+                        &peer_name_label,
+                        src_avail_parts,
+                        src_total_parts,
+                    )
+                    .await;
                     continue;
                 }
 
@@ -2053,35 +2322,54 @@ impl Ed2kDownload {
                                     if let Some(sm) = &self.source_manager {
                                         let mut sm = sm.write().await;
                                         sm.register_lowid_source(
-                                            self.file_hash, hybrid_id, entry.tcp_port,
-                                            entry.server_ip, entry.server_port, uh, co,
+                                            self.file_hash,
+                                            hybrid_id,
+                                            entry.tcp_port,
+                                            entry.server_ip,
+                                            entry.server_port,
+                                            uh,
+                                            co,
                                         );
                                     }
                                     sx_count += 1;
                                     continue;
                                 }
                                 let ip = source_exchange_id_to_ipv4(version, entry.source_id);
-                                if is_filtered_source_ip(&ip) || self.is_sx_source_rejected(&ip, entry.tcp_port) {
+                                if is_filtered_source_ip(&ip)
+                                    || self.is_sx_source_rejected(&ip, entry.tcp_port)
+                                {
                                     continue;
                                 }
                                 if let Some(sm) = &self.source_manager {
                                     let mut sm = sm.write().await;
                                     sm.register_source_full_server(
-                                        self.file_hash, ip, entry.tcp_port, 0, entry.server_ip, entry.server_port, uh, co,
+                                        self.file_hash,
+                                        ip,
+                                        entry.tcp_port,
+                                        0,
+                                        entry.server_ip,
+                                        entry.server_port,
+                                        uh,
+                                        co,
                                     );
                                 }
                                 sx_entries.push(SourceExchangeEntry {
-                                    ip, tcp_port: entry.tcp_port, user_hash: uh, crypt_options: co,
+                                    ip,
+                                    tcp_port: entry.tcp_port,
+                                    user_hash: uh,
+                                    crypt_options: co,
                                 });
                                 sx_count += 1;
                             }
                             if sx_count > 0 {
                                 debug!("Legacy source exchange: registered {sx_count} new sources from {}", self.source_addr);
-                                let _ = event_tx.send(DownloadEvent::SourceExchange {
-                                    transfer_id: self.transfer_id.clone(),
-                                    file_hash: self.file_hash,
-                                    sources: sx_entries,
-                                }).await;
+                                let _ = event_tx
+                                    .send(DownloadEvent::SourceExchange {
+                                        transfer_id: self.transfer_id.clone(),
+                                        file_hash: self.file_hash,
+                                        sources: sx_entries,
+                                    })
+                                    .await;
                             }
                         }
                         Ok((_version, answer_hash, _)) => {
@@ -2091,7 +2379,10 @@ impl Ed2kDownload {
                                 hex::encode(answer_hash)
                             );
                         }
-                        Err(e) => debug!("Failed to parse OP_ANSWERSOURCES from {}: {e}", self.source_addr),
+                        Err(e) => debug!(
+                            "Failed to parse OP_ANSWERSOURCES from {}: {e}",
+                            self.source_addr
+                        ),
                     }
                     continue;
                 }
@@ -2120,39 +2411,63 @@ impl Ed2kDownload {
                                     if let Some(sm) = &self.source_manager {
                                         let mut sm = sm.write().await;
                                         sm.register_lowid_source(
-                                            self.file_hash, hybrid_id, entry.tcp_port,
-                                            entry.server_ip, entry.server_port, uh, co,
+                                            self.file_hash,
+                                            hybrid_id,
+                                            entry.tcp_port,
+                                            entry.server_ip,
+                                            entry.server_port,
+                                            uh,
+                                            co,
                                         );
                                     }
                                     sx_count += 1;
                                     continue;
                                 }
                                 let ip = source_exchange_id_to_ipv4(version, entry.source_id);
-                                if is_filtered_source_ip(&ip) || self.is_sx_source_rejected(&ip, entry.tcp_port) {
+                                if is_filtered_source_ip(&ip)
+                                    || self.is_sx_source_rejected(&ip, entry.tcp_port)
+                                {
                                     continue;
                                 }
                                 if entry.server_ip != 0 {
-                                    debug!("SX2 source {} advertises server {:08X}:{}", ip, entry.server_ip, entry.server_port);
+                                    debug!(
+                                        "SX2 source {} advertises server {:08X}:{}",
+                                        ip, entry.server_ip, entry.server_port
+                                    );
                                 }
                                 if let Some(sm) = &self.source_manager {
                                     let mut sm = sm.write().await;
                                     sm.register_source_full_server(
-                                        self.file_hash, ip, entry.tcp_port, 0,
-                                        entry.server_ip, entry.server_port, uh, co,
+                                        self.file_hash,
+                                        ip,
+                                        entry.tcp_port,
+                                        0,
+                                        entry.server_ip,
+                                        entry.server_port,
+                                        uh,
+                                        co,
                                     );
                                 }
                                 sx_entries.push(SourceExchangeEntry {
-                                    ip, tcp_port: entry.tcp_port, user_hash: uh, crypt_options: co,
+                                    ip,
+                                    tcp_port: entry.tcp_port,
+                                    user_hash: uh,
+                                    crypt_options: co,
                                 });
                                 sx_count += 1;
                             }
                             if sx_count > 0 {
-                                debug!("Source exchange: registered {sx_count} new sources from {}", self.source_addr);
-                                let _ = event_tx.send(DownloadEvent::SourceExchange {
-                                    transfer_id: self.transfer_id.clone(),
-                                    file_hash: self.file_hash,
-                                    sources: sx_entries,
-                                }).await;
+                                debug!(
+                                    "Source exchange: registered {sx_count} new sources from {}",
+                                    self.source_addr
+                                );
+                                let _ = event_tx
+                                    .send(DownloadEvent::SourceExchange {
+                                        transfer_id: self.transfer_id.clone(),
+                                        file_hash: self.file_hash,
+                                        sources: sx_entries,
+                                    })
+                                    .await;
                             }
                         }
                         Ok((_version, answer_hash, _)) => {
@@ -2162,14 +2477,28 @@ impl Ed2kDownload {
                                 hex::encode(answer_hash)
                             );
                         }
-                        Err(e) => debug!("Failed to parse OP_ANSWERSOURCES2 from {}: {e}", self.source_addr),
+                        Err(e) => debug!(
+                            "Failed to parse OP_ANSWERSOURCES2 from {}: {e}",
+                            self.source_addr
+                        ),
                     }
                     continue;
                 }
 
                 if proto == OP_EDONKEYHEADER && opcode == OP_OUTOFPARTREQS {
                     info!("Peer rejected with OutOfPartReqs, will retry later");
-                    self.emit_source_detail_parts(event_tx, "no_needed_parts", None, 0, 0, &client_software_label, &peer_name_label, src_avail_parts, src_total_parts).await;
+                    self.emit_source_detail_parts(
+                        event_tx,
+                        "no_needed_parts",
+                        None,
+                        0,
+                        0,
+                        &client_software_label,
+                        &peer_name_label,
+                        src_avail_parts,
+                        src_total_parts,
+                    )
+                    .await;
                     anyhow::bail!("peer has no free upload slots (OutOfPartReqs)");
                 }
 
@@ -2220,7 +2549,10 @@ impl Ed2kDownload {
             let completed_parts = tracker.completed_count();
             let total_parts = tracker.part_count;
             let existing_len = if part_path.exists() {
-                tokio::fs::metadata(&part_path).await.map(|m| m.len()).unwrap_or(0)
+                tokio::fs::metadata(&part_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0)
             } else {
                 0
             };
@@ -2229,9 +2561,7 @@ impl Ed2kDownload {
             let resuming = completed_bytes > 0 || existing_len > 0;
             if resuming {
                 if completed_bytes > 0 {
-                    info!(
-                        "Resuming download: {completed_parts}/{total_parts} parts complete"
-                    );
+                    info!("Resuming download: {completed_parts}/{total_parts} parts complete");
                 } else {
                     warn!(
                         "Preserving non-empty .part ({existing_len} bytes) while resume metadata shows no completed bytes — \
@@ -2242,7 +2572,11 @@ impl Ed2kDownload {
             super::write_coordinator::PartFileWriter::open(
                 part_path.clone(),
                 super::write_coordinator::OpenMode::CreateOrOpen {
-                    set_len_to: if self.file_size > 0 { Some(self.file_size) } else { None },
+                    set_len_to: if self.file_size > 0 {
+                        Some(self.file_size)
+                    } else {
+                        None
+                    },
                     truncate_existing: !resuming,
                 },
             )
@@ -2278,8 +2612,10 @@ impl Ed2kDownload {
         // any rebuild during file-status / queue wait gets re-sent on the
         // first periodic check. Falls back to current generation when we
         // never sent (peer not Ember, or our payload was empty at the time).
-        let mut last_epx_generation = initial_epx_sent_generation
-            .unwrap_or_else(|| self.ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed));
+        let mut last_epx_generation = initial_epx_sent_generation.unwrap_or_else(|| {
+            self.ember_payload_generation
+                .load(std::sync::atomic::Ordering::Relaxed)
+        });
         const EPX_RESEND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
         for retry_round in 0..=max_part_rounds {
@@ -2306,7 +2642,9 @@ impl Ed2kDownload {
             if retry_round > 0 {
                 warn!(
                     "Retry round {}/{} for {} hash-failed parts",
-                    retry_round, max_part_rounds, needed.len()
+                    retry_round,
+                    max_part_rounds,
+                    needed.len()
                 );
             }
 
@@ -2380,17 +2718,19 @@ impl Ed2kDownload {
                 while sent_idx < batches.len() && sent_idx < max_outstanding {
                     let batch = &batches[sent_idx];
                     let (req_payload, req_proto, req_op) = if needs_i64 {
-                        (build_request_parts_i64(&self.file_hash, batch), OP_EMULEPROT, OP_REQUESTPARTS_I64)
+                        (
+                            build_request_parts_i64(&self.file_hash, batch),
+                            OP_EMULEPROT,
+                            OP_REQUESTPARTS_I64,
+                        )
                     } else {
-                        (build_request_parts(&self.file_hash, batch), OP_EDONKEYHEADER, OP_REQUESTPARTS)
+                        (
+                            build_request_parts(&self.file_hash, batch),
+                            OP_EDONKEYHEADER,
+                            OP_REQUESTPARTS,
+                        )
                     };
-                    write_packet_async(
-                        &mut writer,
-                        req_proto,
-                        req_op,
-                        &req_payload,
-                    )
-                    .await?;
+                    write_packet_async(&mut writer, req_proto, req_op, &req_payload).await?;
                     total_sent_bytes += batch.iter().map(|(s, e)| e - s).sum::<u64>();
                     sent_idx += 1;
                 }
@@ -2412,16 +2752,32 @@ impl Ed2kDownload {
 
                     // Periodic EPX re-send: if payload has been rebuilt and 5min elapsed
                     if peer_is_ember && last_epx_resend.elapsed() >= EPX_RESEND_INTERVAL {
-                        let current_gen = self.ember_payload_generation.load(std::sync::atomic::Ordering::Relaxed);
+                        let current_gen = self
+                            .ember_payload_generation
+                            .load(std::sync::atomic::Ordering::Relaxed);
                         if current_gen != last_epx_generation {
                             let epx_data = self.ember_payload.read().await.clone();
                             if !epx_data.is_empty() {
-                                debug!("Re-sending EPX to {} (gen {}->{}, {} bytes)", self.source_addr, last_epx_generation, current_gen, epx_data.len());
+                                debug!(
+                                    "Re-sending EPX to {} (gen {}->{}, {} bytes)",
+                                    self.source_addr,
+                                    last_epx_generation,
+                                    current_gen,
+                                    epx_data.len()
+                                );
                                 // Only advance the generation marker on a
                                 // successful write; otherwise a failed/back-
                                 // pressured send would suppress the retry on
                                 // the next interval (mirrors upload.rs).
-                                if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await.is_ok() {
+                                if write_packet_async(
+                                    &mut writer,
+                                    OP_EMULEPROT,
+                                    OP_EMBER_SOURCEEXCHANGE,
+                                    &*epx_data,
+                                )
+                                .await
+                                .is_ok()
+                                {
                                     last_epx_generation = current_gen;
                                     self.sx_overhead.record_upload((6 + epx_data.len()) as u64);
                                 }
@@ -2440,7 +2796,9 @@ impl Ed2kDownload {
                     } else {
                         let elapsed = data_loop_start.elapsed();
                         let budget = std::time::Duration::from_secs(INITIAL_DATA_TIMEOUT_SECS);
-                        budget.saturating_sub(elapsed).max(std::time::Duration::from_secs(1))
+                        budget
+                            .saturating_sub(elapsed)
+                            .max(std::time::Duration::from_secs(1))
                     };
 
                     let read_outcome = tokio::select! {
@@ -2474,38 +2832,46 @@ impl Ed2kDownload {
                         Ok(Err(e)) => return Err(e.into()),
                         Err(_) => {
                             let _ = write_packet_async(
-                                &mut writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
-                            ).await;
+                                &mut writer,
+                                OP_EDONKEYHEADER,
+                                OP_CANCELTRANSFER,
+                                &[],
+                            )
+                            .await;
                             if !got_any_data {
                                 warn!("Source {} accepted transfer but sent no data in {}s — disconnecting",
                                     self.source_addr, INITIAL_DATA_TIMEOUT_SECS);
-                                anyhow::bail!("peer accepted transfer but sent no data in {}s", INITIAL_DATA_TIMEOUT_SECS);
+                                anyhow::bail!(
+                                    "peer accepted transfer but sent no data in {}s",
+                                    INITIAL_DATA_TIMEOUT_SECS
+                                );
                             } else {
-                                anyhow::bail!("stage:data_wait download timeout: no data for {}s", READ_TIMEOUT_SECS);
+                                anyhow::bail!(
+                                    "stage:data_wait download timeout: no data for {}s",
+                                    READ_TIMEOUT_SECS
+                                );
                             }
                         }
                     };
 
                     match (proto, opcode) {
-                        (OP_EMULEPROT, OP_SENDINGPART_I64)
-                        | (OP_EDONKEYHEADER, OP_SENDINGPART) => {
-                            let (hash, start, end, data) =
-                                if opcode == OP_SENDINGPART_I64 {
-                                    parse_sending_part_i64(&payload)?
-                                } else {
-                                    // D19: a 32-bit SENDINGPART cannot
-                                    // address past 4 GiB; refuse it for
-                                    // larger files so a mis-negotiated or
-                                    // malicious peer can't silently wrap
-                                    // the offset and corrupt the part.
-                                    if self.file_size > u32::MAX as u64 {
-                                        anyhow::bail!(
+                        (OP_EMULEPROT, OP_SENDINGPART_I64) | (OP_EDONKEYHEADER, OP_SENDINGPART) => {
+                            let (hash, start, end, data) = if opcode == OP_SENDINGPART_I64 {
+                                parse_sending_part_i64(&payload)?
+                            } else {
+                                // D19: a 32-bit SENDINGPART cannot
+                                // address past 4 GiB; refuse it for
+                                // larger files so a mis-negotiated or
+                                // malicious peer can't silently wrap
+                                // the offset and corrupt the part.
+                                if self.file_size > u32::MAX as u64 {
+                                    anyhow::bail!(
                                             "peer sent 32-bit OP_SENDINGPART for a {}-byte file (requires I64)",
                                             self.file_size
                                         );
-                                    }
-                                    parse_sending_part_32(&payload)?
-                                };
+                                }
+                                parse_sending_part_32(&payload)?
+                            };
                             if hash != self.file_hash {
                                 anyhow::bail!(
                                     "peer sent SENDINGPART for wrong file: expected={} got={}",
@@ -2514,7 +2880,10 @@ impl Ed2kDownload {
                                 );
                             }
 
-                            if start >= end || end > self.file_size || data.len() != (end - start) as usize {
+                            if start >= end
+                                || end > self.file_size
+                                || data.len() != (end - start) as usize
+                            {
                                 consecutive_bad_blocks += 1;
                                 warn!("Invalid block offsets: start={start}, end={end}, data_len={}, file_size={} (bad streak: {consecutive_bad_blocks})", data.len(), self.file_size);
                                 if consecutive_bad_blocks >= MAX_CONSECUTIVE_BAD_BLOCKS {
@@ -2571,7 +2940,10 @@ impl Ed2kDownload {
                             }
 
                             if !got_any_data {
-                                info!("Source {} first data received for part {} ({} bytes)", self.source_addr, part_idx, piece_len);
+                                info!(
+                                    "Source {} first data received for part {} ({} bytes)",
+                                    self.source_addr, part_idx, piece_len
+                                );
                                 got_any_data = true;
                             }
                             total_received += piece_len;
@@ -2583,8 +2955,10 @@ impl Ed2kDownload {
                             // the bytes actually written (gap-overlap sub-ranges), not
                             // the full wire piece — a duplicate/overlapping block adds
                             // no new data and must not inflate the peer's credit.
-                            let newly_written: u64 = fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
-                            pending_credit_bytes = pending_credit_bytes.saturating_add(newly_written);
+                            let newly_written: u64 =
+                                fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
+                            pending_credit_bytes =
+                                pending_credit_bytes.saturating_add(newly_written);
 
                             if last_progress_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
                                 let _ = event_tx
@@ -2599,25 +2973,26 @@ impl Ed2kDownload {
                         }
                         (OP_EMULEPROT, OP_COMPRESSEDPART_I64)
                         | (OP_EMULEPROT, OP_COMPRESSEDPART) => {
-                            let (hash, start, compressed_total_size, compressed) =
-                                if opcode == OP_COMPRESSEDPART_I64 {
-                                    parse_compressed_part_i64(&payload)?
-                                } else {
-                                    // D19 (compressed): a 32-bit OP_COMPRESSEDPART
-                                    // cannot address past 4 GiB. eMule sends
-                                    // OP_COMPRESSEDPART_I64 for large files (see
-                                    // CUpDownClient::CreatePackedPackets), so a
-                                    // 32-bit frame for a >4 GiB file would have its
-                                    // start offset truncated by parse_compressed_part_32
-                                    // and mis-write the .part. Reject rather than wrap.
-                                    if self.file_size > u32::MAX as u64 {
-                                        anyhow::bail!(
+                            let (hash, start, compressed_total_size, compressed) = if opcode
+                                == OP_COMPRESSEDPART_I64
+                            {
+                                parse_compressed_part_i64(&payload)?
+                            } else {
+                                // D19 (compressed): a 32-bit OP_COMPRESSEDPART
+                                // cannot address past 4 GiB. eMule sends
+                                // OP_COMPRESSEDPART_I64 for large files (see
+                                // CUpDownClient::CreatePackedPackets), so a
+                                // 32-bit frame for a >4 GiB file would have its
+                                // start offset truncated by parse_compressed_part_32
+                                // and mis-write the .part. Reject rather than wrap.
+                                if self.file_size > u32::MAX as u64 {
+                                    anyhow::bail!(
                                             "peer sent 32-bit OP_COMPRESSEDPART for a {}-byte file (requires I64)",
                                             self.file_size
                                         );
-                                    }
-                                    parse_compressed_part_32(&payload)?
-                                };
+                                }
+                                parse_compressed_part_32(&payload)?
+                            };
                             if hash != self.file_hash {
                                 anyhow::bail!(
                                     "peer sent COMPRESSEDPART for wrong file: expected={} got={}",
@@ -2631,7 +3006,8 @@ impl Ed2kDownload {
                                 start,
                                 compressed_total_size,
                                 compressed,
-                            )? else {
+                            )?
+                            else {
                                 continue;
                             };
 
@@ -2659,7 +3035,8 @@ impl Ed2kDownload {
                             // decompressed block, never the whole block — see the
                             // uncompressed branch above. Prevents an overlapping or
                             // cross-part block from clobbering verified bytes.
-                            let fill_subranges = tracker.fillable_subranges(start, start + piece_len);
+                            let fill_subranges =
+                                tracker.fillable_subranges(start, start + piece_len);
                             if !fill_subranges.is_empty() {
                                 for &(gs, ge) in &fill_subranges {
                                     let off = (gs - start) as usize;
@@ -2697,8 +3074,10 @@ impl Ed2kDownload {
                             // the bytes actually written (gap-overlap sub-ranges), not
                             // the full wire piece — a duplicate/overlapping block adds
                             // no new data and must not inflate the peer's credit.
-                            let newly_written: u64 = fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
-                            pending_credit_bytes = pending_credit_bytes.saturating_add(newly_written);
+                            let newly_written: u64 =
+                                fill_subranges.iter().map(|(gs, ge)| ge - gs).sum();
+                            pending_credit_bytes =
+                                pending_credit_bytes.saturating_add(newly_written);
 
                             if last_progress_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
                                 let _ = event_tx
@@ -2717,28 +3096,72 @@ impl Ed2kDownload {
                             break;
                         }
                         (OP_EMULEPROT, OP_QUEUEFULL) if payload.is_empty() => {
-                            self.emit_source_detail_parts(event_tx, "queue_full", None, 0, 0, &client_software_label, &peer_name_label, src_avail_parts, src_total_parts).await;
+                            self.emit_source_detail_parts(
+                                event_tx,
+                                "queue_full",
+                                None,
+                                0,
+                                0,
+                                &client_software_label,
+                                &peer_name_label,
+                                src_avail_parts,
+                                src_total_parts,
+                            )
+                            .await;
                             anyhow::bail!("peer revoked upload slot (QueueFull during transfer)");
                         }
                         (OP_EMULEPROT, OP_QUEUERANKING) if payload.len() >= 2 => {
                             let rank = u16::from_le_bytes([payload[0], payload[1]]);
-                            self.emit_source_detail_parts(event_tx, "queued", Some(rank as u32), 0, 0, &client_software_label, &peer_name_label, src_avail_parts, src_total_parts).await;
-                            anyhow::bail!("peer put us back in queue at rank {} during transfer", rank);
+                            self.emit_source_detail_parts(
+                                event_tx,
+                                "queued",
+                                Some(rank as u32),
+                                0,
+                                0,
+                                &client_software_label,
+                                &peer_name_label,
+                                src_avail_parts,
+                                src_total_parts,
+                            )
+                            .await;
+                            anyhow::bail!(
+                                "peer put us back in queue at rank {} during transfer",
+                                rank
+                            );
                         }
                         (OP_EDONKEYHEADER, OP_QUEUERANK) if payload.len() >= 4 => {
-                            let rank = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                            self.emit_source_detail_parts(event_tx, "queued", Some(rank), 0, 0, &client_software_label, &peer_name_label, src_avail_parts, src_total_parts).await;
-                            anyhow::bail!("peer put us back in queue at rank {} during transfer", rank);
+                            let rank = u32::from_le_bytes([
+                                payload[0], payload[1], payload[2], payload[3],
+                            ]);
+                            self.emit_source_detail_parts(
+                                event_tx,
+                                "queued",
+                                Some(rank),
+                                0,
+                                0,
+                                &client_software_label,
+                                &peer_name_label,
+                                src_avail_parts,
+                                src_total_parts,
+                            )
+                            .await;
+                            anyhow::bail!(
+                                "peer put us back in queue at rank {} during transfer",
+                                rank
+                            );
                         }
                         (OP_EDONKEYHEADER, OP_FILEREQANSNOFIL) => {
-                            anyhow::bail!("peer no longer has the file (FileNotFound during transfer)");
+                            anyhow::bail!(
+                                "peer no longer has the file (FileNotFound during transfer)"
+                            );
                         }
                         (OP_EMULEPROT, OP_PUBLICKEY) if !payload.is_empty() => {
-                            let key = if payload.len() >= 2 && payload[0] as usize == payload.len() - 1 {
-                                payload[1..].to_vec()
-                            } else {
-                                payload.clone()
-                            };
+                            let key =
+                                if payload.len() >= 2 && payload[0] as usize == payload.len() - 1 {
+                                    payload[1..].to_vec()
+                                } else {
+                                    payload.clone()
+                                };
                             if let Some(cm) = &self.credit_manager {
                                 let mut cm = cm.write().await;
                                 cm.set_public_key(peer_user_hash, key);
@@ -2750,7 +3173,8 @@ impl Ed2kDownload {
                                     peer_user_hash,
                                     self.source_addr,
                                     peer_secure_ident_level,
-                                ).await?;
+                                )
+                                .await?;
                             }
                         }
                         (OP_EMULEPROT, OP_SECIDENTSTATE) if payload.len() >= 5 => {
@@ -2758,12 +3182,15 @@ impl Ed2kDownload {
                                 &mut writer,
                                 self.credit_manager.as_ref(),
                                 payload[0],
-                                u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]),
+                                u32::from_le_bytes([
+                                    payload[1], payload[2], payload[3], payload[4],
+                                ]),
                                 self.source_addr,
                                 peer_user_hash,
                                 peer_secure_ident_level,
                                 our_client_id,
-                            ).await?;
+                            )
+                            .await?;
                         }
                         (OP_EMULEPROT, OP_SIGNATURE) if payload.len() >= 2 => {
                             handle_secident_signature(
@@ -2774,14 +3201,21 @@ impl Ed2kDownload {
                                 peer_secure_ident_level,
                                 &payload,
                                 our_client_id,
-                            ).await;
+                            )
+                            .await;
                         }
                         // eMule OP_FILEDESC: peer sends comment/rating for the file
                         (OP_EMULEPROT, OP_FILEDESC) if payload.len() >= 5 => {
                             let rating = payload[0];
-                            let comment_len = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]) as usize;
-                            if comment_len.checked_add(5).map_or(false, |need| payload.len() >= need) {
-                                let comment = String::from_utf8_lossy(&payload[5..5+comment_len]).to_string();
+                            let comment_len = u32::from_le_bytes([
+                                payload[1], payload[2], payload[3], payload[4],
+                            ]) as usize;
+                            if comment_len
+                                .checked_add(5)
+                                .map_or(false, |need| payload.len() >= need)
+                            {
+                                let comment = String::from_utf8_lossy(&payload[5..5 + comment_len])
+                                    .to_string();
                                 if let Some(cm) = &self.comment_manager {
                                     let mut cm = cm.write().await;
                                     cm.add_peer_comment(
@@ -2813,7 +3247,9 @@ impl Ed2kDownload {
                             let recovery_data = &payload[38..];
                             debug!(
                                 "AICH answer: part={}, root={}, recovery={} bytes",
-                                ans_part, hex::encode(root_hash), recovery_data.len()
+                                ans_part,
+                                hex::encode(root_hash),
+                                recovery_data.len()
                             );
                             if ans_hash == self.file_hash && ans_part == part_idx {
                                 let master_ok = aich_master_hash.map_or(false, |m| m == root_hash);
@@ -2831,15 +3267,27 @@ impl Ed2kDownload {
                         // Ember-only; gated on `peer_is_ember` (see upload.rs).
                         (OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE) if peer_is_ember => {
                             self.sx_overhead.record_download((6 + payload.len()) as u64);
-                            if epx_packets_received >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION {
-                                debug!("Ignoring excess EPX packet during download from {}", self.source_addr);
+                            if epx_packets_received
+                                >= crate::network::ember::MAX_EPX_PACKETS_PER_CONNECTION
+                            {
+                                debug!(
+                                    "Ignoring excess EPX packet during download from {}",
+                                    self.source_addr
+                                );
                             } else {
                                 epx_packets_received += 1;
                                 match crate::network::ember::parse_exchange_payload(&payload) {
-                                    Ok(result) if !result.files.is_empty() || !result.peers.is_empty() => {
+                                    Ok(result)
+                                        if !result.files.is_empty() || !result.peers.is_empty() =>
+                                    {
                                         info!("Received Ember Peer Exchange during download from {} ({} files, {} peers)", self.source_addr, result.files.len(), result.peers.len());
-                                        let (epx_entries, aich_roots) = epx_result_to_entries(&result);
-                                        let ember_peers = result.peers.into_iter().map(|p| (p.ip, p.tcp_port)).collect();
+                                        let (epx_entries, aich_roots) =
+                                            epx_result_to_entries(&result);
+                                        let ember_peers = result
+                                            .peers
+                                            .into_iter()
+                                            .map(|p| (p.ip, p.tcp_port))
+                                            .collect();
                                         let _ = event_tx
                                             .send(DownloadEvent::EmberSources {
                                                 transfer_id: self.transfer_id.clone(),
@@ -2866,13 +3314,15 @@ impl Ed2kDownload {
                                 // (pubkey, ember_hash) leaks (KAD,
                                 // EPX, public trackers).
                                 let verified = ember_auth_verified;
-                                let _ = event_tx.send(DownloadEvent::EmberFriendRequest {
-                                    ember_hash: eh,
-                                    nickname: nick,
-                                    peer_ip: self.source_addr.ip().to_string(),
-                                    peer_port: self.source_addr.port(),
-                                    verified,
-                                }).await;
+                                let _ = event_tx
+                                    .send(DownloadEvent::EmberFriendRequest {
+                                        ember_hash: eh,
+                                        nickname: nick,
+                                        peer_ip: self.source_addr.ip().to_string(),
+                                        peer_port: self.source_addr.port(),
+                                        verified,
+                                    })
+                                    .await;
                             }
                         }
                         // Late Ember-Hello during the data loop. Some
@@ -2887,14 +3337,12 @@ impl Ed2kDownload {
                                 peer_is_ember = true;
                                 // Identity lock (see pre-control arm).
                                 let identity_changed = ember_auth_verified
-                                    && (
-                                        (ident.ed25519_pubkey.is_some()
-                                            && peer_ember_pubkey.is_some()
-                                            && ident.ed25519_pubkey != peer_ember_pubkey)
+                                    && ((ident.ed25519_pubkey.is_some()
+                                        && peer_ember_pubkey.is_some()
+                                        && ident.ed25519_pubkey != peer_ember_pubkey)
                                         || (ident.ember_hash != [0u8; 16]
                                             && peer_ember_hash.is_some()
-                                            && Some(ident.ember_hash) != peer_ember_hash)
-                                    );
+                                            && Some(ident.ember_hash) != peer_ember_hash));
                                 if identity_changed {
                                     tracing::warn!(
                                         "Ember identity-swap rejected from {} (data-loop): peer already PoP-verified",
@@ -2928,7 +3376,9 @@ impl Ed2kDownload {
                                     if let (Some(ref pk), Some(ref eh)) =
                                         (peer_ember_pubkey, peer_ember_hash)
                                     {
-                                        if crate::network::ember::crypto::verify_ember_hash_binding(pk, eh) {
+                                        if crate::network::ember::crypto::verify_ember_hash_binding(
+                                            pk, eh,
+                                        ) {
                                             ember_hash_binding_verified = true;
                                             info!(
                                                 "Ember binding: peer {} pubkey BLAKE3-binds (data loop)",
@@ -2944,13 +3394,17 @@ impl Ed2kDownload {
                                 }
                             }
                         }
-                        (OP_EMULEPROT, OP_EMBER_CHAT_MSG) if is_ember_friend && ember_auth_verified && payload.len() <= 4096 => {
+                        (OP_EMULEPROT, OP_EMBER_CHAT_MSG)
+                            if is_ember_friend && ember_auth_verified && payload.len() <= 4096 =>
+                        {
                             if let Some(eh) = peer_ember_hash {
                                 if let Ok(msg) = std::str::from_utf8(&payload) {
-                                    let _ = event_tx.send(DownloadEvent::EmberChatMessage {
-                                        ember_hash: eh,
-                                        message: msg.to_string(),
-                                    }).await;
+                                    let _ = event_tx
+                                        .send(DownloadEvent::EmberChatMessage {
+                                            ember_hash: eh,
+                                            message: msg.to_string(),
+                                        })
+                                        .await;
                                 }
                             }
                         }
@@ -2974,17 +3428,20 @@ impl Ed2kDownload {
                         if sent_idx < batches.len() {
                             let batch = &batches[sent_idx];
                             let (req_payload, req_proto, req_op) = if needs_i64 {
-                                (build_request_parts_i64(&self.file_hash, batch), OP_EMULEPROT, OP_REQUESTPARTS_I64)
+                                (
+                                    build_request_parts_i64(&self.file_hash, batch),
+                                    OP_EMULEPROT,
+                                    OP_REQUESTPARTS_I64,
+                                )
                             } else {
-                                (build_request_parts(&self.file_hash, batch), OP_EDONKEYHEADER, OP_REQUESTPARTS)
+                                (
+                                    build_request_parts(&self.file_hash, batch),
+                                    OP_EDONKEYHEADER,
+                                    OP_REQUESTPARTS,
+                                )
                             };
-                            write_packet_async(
-                                &mut writer,
-                                req_proto,
-                                req_op,
-                                &req_payload,
-                            )
-                            .await?;
+                            write_packet_async(&mut writer, req_proto, req_op, &req_payload)
+                                .await?;
                             total_sent_bytes += batch.iter().map(|(s, e)| e - s).sum::<u64>();
                             sent_idx += 1;
                         }
@@ -2994,13 +3451,22 @@ impl Ed2kDownload {
                     let elapsed = speed_measure_start.elapsed();
                     if elapsed.as_millis() >= 2000 {
                         measured_speed = (speed_measure_bytes as u128 * 1000
-                            / elapsed.as_millis().max(1)) as u64;
+                            / elapsed.as_millis().max(1))
+                            as u64;
                         speed_measure_bytes = 0;
                         speed_measure_start = std::time::Instant::now();
                         self.emit_source_detail_parts(
-                            event_tx, "transferring", None, measured_speed, downloaded,
-                            &client_software_label, &peer_name_label, src_avail_parts, src_total_parts,
-                        ).await;
+                            event_tx,
+                            "transferring",
+                            None,
+                            measured_speed,
+                            downloaded,
+                            &client_software_label,
+                            &peer_name_label,
+                            src_avail_parts,
+                            src_total_parts,
+                        )
+                        .await;
                     }
 
                     if last_periodic_save.elapsed() >= PERIODIC_SAVE_INTERVAL {
@@ -3027,7 +3493,10 @@ impl Ed2kDownload {
                 // byte budget without actually closing all gaps in this part.
                 {
                     let (ps, pe) = tracker.part_range(part_idx);
-                    let part_has_gaps = tracker.gap_list().iter().any(|&(gs, ge)| gs < pe && ge > ps);
+                    let part_has_gaps = tracker
+                        .gap_list()
+                        .iter()
+                        .any(|&(gs, ge)| gs < pe && ge > ps);
                     if part_has_gaps {
                         warn!(
                             "Part {} byte budget met but gaps remain — peer likely sent duplicate blocks, marking for retry",
@@ -3065,12 +3534,13 @@ impl Ed2kDownload {
                             total_blocks,
                         );
 
-                        let mut recovery_bytes: Option<Vec<u8>> = aich_recovery_data
-                            .as_ref()
-                            .map(|(_, d)| d.clone());
+                        let mut recovery_bytes: Option<Vec<u8>> =
+                            aich_recovery_data.as_ref().map(|(_, d)| d.clone());
                         if let Some(master_hash) = aich_master_hash {
                             if recovery_bytes.is_none() && peer_supports_aich {
-                                let aich_should_try = if let std::net::IpAddr::V4(v4) = self.source_addr.ip() {
+                                let aich_should_try = if let std::net::IpAddr::V4(v4) =
+                                    self.source_addr.ip()
+                                {
                                     if let Some(ref pending) = self.aich_pending {
                                         if let Ok(map) = pending.read() {
                                             match map.get(&(self.file_hash, part_idx as u32)) {
@@ -3079,17 +3549,28 @@ impl Ed2kDownload {
                                                 }
                                                 None => true,
                                             }
-                                        } else { true }
-                                    } else { true }
-                                } else { true };
+                                        } else {
+                                            true
+                                        }
+                                    } else {
+                                        true
+                                    }
+                                } else {
+                                    true
+                                };
 
                                 if aich_should_try {
                                     let mut aich_req = Vec::with_capacity(38);
                                     aich_req.extend_from_slice(&self.file_hash);
                                     aich_req.extend_from_slice(&(part_idx as u16).to_le_bytes());
                                     aich_req.extend_from_slice(&master_hash);
-                                    if let Err(e) =
-                                        write_packet_async(&mut writer, OP_EMULEPROT, OP_AICHREQUEST, &aich_req).await
+                                    if let Err(e) = write_packet_async(
+                                        &mut writer,
+                                        OP_EMULEPROT,
+                                        OP_AICHREQUEST,
+                                        &aich_req,
+                                    )
+                                    .await
                                     {
                                         warn!("Failed to send OP_AICHREQUEST: {e}");
                                     } else {
@@ -3109,19 +3590,22 @@ impl Ed2kDownload {
 
                             let mut narrowed = false;
                             if let Some(ref rec) = recovery_bytes {
-                                if let Some(corrupt) = super::aich::corrupt_blocks_from_aich_recovery(
-                                    master_hash,
-                                    rec,
-                                    part_idx,
-                                    &part_data,
-                                    part_len,
-                                    self.file_size,
-                                ) {
+                                if let Some(corrupt) =
+                                    super::aich::corrupt_blocks_from_aich_recovery(
+                                        master_hash,
+                                        rec,
+                                        part_idx,
+                                        &part_data,
+                                        part_len,
+                                        self.file_size,
+                                    )
+                                {
                                     if !corrupt.is_empty() {
                                         let (ps, _) = tracker.part_range(part_idx);
                                         let mut invalidated = 0u64;
                                         for &bi in &corrupt {
-                                            let rel = bi as u64 * super::aich::AICH_BLOCK_SIZE as u64;
+                                            let rel =
+                                                bi as u64 * super::aich::AICH_BLOCK_SIZE as u64;
                                             let gs = ps + rel;
                                             let ge = (gs + super::aich::AICH_BLOCK_SIZE as u64)
                                                 .min(ps + part_len as u64);
@@ -3174,7 +3658,9 @@ impl Ed2kDownload {
                         // next-iteration read via saturating_add through
                         // the nested `continue` control flow).
                         #[allow(unused_assignments)]
-                        { pending_credit_bytes = 0; }
+                        {
+                            pending_credit_bytes = 0;
+                        }
                         let _ = event_tx
                             .send(DownloadEvent::PartCorrupted {
                                 file_hash: self.file_hash,
@@ -3221,11 +3707,17 @@ impl Ed2kDownload {
                             // PoP is what cryptographically ties the
                             // bytes to the peer's Ed25519 keypair).
                             if let Some(pk) = peer_ember_pubkey {
-                                cm.add_ember_downloaded(pk, pending_credit_bytes, ember_auth_verified);
+                                cm.add_ember_downloaded(
+                                    pk,
+                                    pending_credit_bytes,
+                                    ember_auth_verified,
+                                );
                             }
                         }
                         #[allow(unused_assignments)]
-                        { pending_credit_bytes = 0; }
+                        {
+                            pending_credit_bytes = 0;
+                        }
                     }
                 }
                 // Force one Progress emit at part boundary so the UI sees
@@ -3249,18 +3741,22 @@ impl Ed2kDownload {
         }
 
         // Signal the uploader that we're done downloading from them
-        write_packet_async(
-            &mut writer,
-            OP_EDONKEYHEADER,
-            OP_END_OF_DOWNLOAD,
-            &[],
-        )
-        .await
-        .ok();
+        write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_END_OF_DOWNLOAD, &[])
+            .await
+            .ok();
 
         self.emit_source_detail_parts(
-            event_tx, "completed", None, measured_speed, downloaded.min(self.file_size), &client_software_label, &peer_name_label, src_avail_parts, src_total_parts,
-        ).await;
+            event_tx,
+            "completed",
+            None,
+            measured_speed,
+            downloaded.min(self.file_size),
+            &client_software_label,
+            &peer_name_label,
+            src_avail_parts,
+            src_total_parts,
+        )
+        .await;
 
         if !tracker.all_complete() {
             let remaining = tracker.part_count - tracker.completed_count();
@@ -3270,7 +3766,8 @@ impl Ed2kDownload {
                 downloaded.min(self.file_size),
                 &client_software_label,
                 &peer_name_label,
-            ).await;
+            )
+            .await;
             anyhow::bail!(
                 "{remaining} parts still failing hash verification after {max_part_rounds} retries"
             );
@@ -3303,7 +3800,8 @@ impl Ed2kDownload {
         // per-part MD4 check) would be published as verified. When any part is
         // unverified we fall through to the full on-disk re-read instead.
         let expected_hash = hex::encode(self.file_hash);
-        let num_parts = ((self.file_size + super::hash::PARTSIZE - 1) / super::hash::PARTSIZE) as usize;
+        let num_parts =
+            ((self.file_size + super::hash::PARTSIZE - 1) / super::hash::PARTSIZE) as usize;
         let can_use_fast_verify = self.file_size >= super::hash::PARTSIZE
             && !part_hashes.is_empty()
             && part_hashes.len() >= num_parts
@@ -3312,7 +3810,10 @@ impl Ed2kDownload {
         let verified_ok = if can_use_fast_verify {
             let actual_hash = super::hash::ed2k_hash_from_parts(&part_hashes, self.file_size);
             if actual_hash == expected_hash {
-                info!("Download verified from part hashes (no re-read): {}", self.file_name);
+                info!(
+                    "Download verified from part hashes (no re-read): {}",
+                    self.file_name
+                );
                 true
             } else {
                 warn!(
@@ -3320,20 +3821,35 @@ impl Ed2kDownload {
                     self.file_name, expected_hash, actual_hash
                 );
                 let verify_path = part_path.clone();
-                match tokio::task::spawn_blocking(move || {
-                    super::hash::ed2k_hash_file(&verify_path)
-                }).await {
-                    Ok(Ok(h)) if h == expected_hash => { info!("Full rehash matched for {}", self.file_name); true }
-                    Ok(Ok(h)) => { warn!("Full rehash also mismatched for {}: got={}", self.file_name, h); false }
-                    Ok(Err(e)) => { warn!("Full rehash failed for {}: {e}", self.file_name); false }
-                    Err(e) => { warn!("Full rehash task failed for {}: {e}", self.file_name); false }
+                match tokio::task::spawn_blocking(move || super::hash::ed2k_hash_file(&verify_path))
+                    .await
+                {
+                    Ok(Ok(h)) if h == expected_hash => {
+                        info!("Full rehash matched for {}", self.file_name);
+                        true
+                    }
+                    Ok(Ok(h)) => {
+                        warn!(
+                            "Full rehash also mismatched for {}: got={}",
+                            self.file_name, h
+                        );
+                        false
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Full rehash failed for {}: {e}", self.file_name);
+                        false
+                    }
+                    Err(e) => {
+                        warn!("Full rehash task failed for {}: {e}", self.file_name);
+                        false
+                    }
                 }
             }
         } else {
             let verify_path = part_path.clone();
-            match tokio::task::spawn_blocking(move || {
-                super::hash::ed2k_hash_file(&verify_path)
-            }).await {
+            match tokio::task::spawn_blocking(move || super::hash::ed2k_hash_file(&verify_path))
+                .await
+            {
                 Ok(Ok(actual_hash)) if actual_hash == expected_hash => {
                     info!("Download complete and verified: {}", self.file_name);
                     true
@@ -3346,11 +3862,17 @@ impl Ed2kDownload {
                     false
                 }
                 Ok(Err(e)) => {
-                    warn!("Could not verify hash for {}: {e} — treating as failed", self.file_name);
+                    warn!(
+                        "Could not verify hash for {}: {e} — treating as failed",
+                        self.file_name
+                    );
                     false
                 }
                 Err(e) => {
-                    warn!("Hash verification task failed for {}: {e} — treating as failed", self.file_name);
+                    warn!(
+                        "Hash verification task failed for {}: {e} — treating as failed",
+                        self.file_name
+                    );
                     false
                 }
             }
@@ -3418,10 +3940,12 @@ fn append_compressed_chunk(
             MAX_PENDING_COMPRESSED_BLOCKS
         );
     }
-    let entry = pending.entry(start).or_insert_with(|| PendingCompressedBlock {
-        compressed_total_size: total_packed_size,
-        compressed: Vec::with_capacity(total_packed),
-    });
+    let entry = pending
+        .entry(start)
+        .or_insert_with(|| PendingCompressedBlock {
+            compressed_total_size: total_packed_size,
+            compressed: Vec::with_capacity(total_packed),
+        });
     if entry.compressed_total_size != total_packed_size {
         let old_size = entry.compressed_total_size;
         let _ = entry;
@@ -3523,7 +4047,9 @@ fn decompress_ed2k_part(compressed: &[u8]) -> anyhow::Result<Vec<u8>> {
         let mut buf = [0u8; 8192];
         loop {
             let n = decoder.read(&mut buf)?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             out.extend_from_slice(&buf[..n]);
             if out.len() > MAX_DECOMPRESSED_PART {
                 anyhow::bail!("decompressed part exceeds size limit");
@@ -3540,7 +4066,9 @@ fn decompress_ed2k_part(compressed: &[u8]) -> anyhow::Result<Vec<u8>> {
         let mut buf = [0u8; 8192];
         loop {
             let n = decoder.read(&mut buf)?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             out.extend_from_slice(&buf[..n]);
             if out.len() > MAX_DECOMPRESSED_PART {
                 anyhow::bail!("decompressed part exceeds size limit");
@@ -3604,9 +4132,13 @@ pub(super) async fn finalize_zero_ed2k_file(
 
 fn is_cross_device_error(e: &std::io::Error) -> bool {
     #[cfg(windows)]
-    { matches!(e.raw_os_error(), Some(17)) } // ERROR_NOT_SAME_DEVICE
+    {
+        matches!(e.raw_os_error(), Some(17))
+    } // ERROR_NOT_SAME_DEVICE
     #[cfg(not(windows))]
-    { matches!(e.raw_os_error(), Some(18)) } // EXDEV
+    {
+        matches!(e.raw_os_error(), Some(18))
+    } // EXDEV
 }
 
 /// eMule-style filename deduplication: if `base` already exists, try
@@ -3680,7 +4212,11 @@ pub(crate) fn move_part_to_final(
 ///
 /// Special case: `file_size < PARTSIZE` with a single hash — the file hash is `MD4(data)` (not `MD4(MD4(data)‖…)`),
 /// so we compare the lone part hash to the file hash directly.
-pub(super) fn verify_hashset(file_hash: &[u8; 16], part_hashes: &[[u8; 16]], file_size: u64) -> bool {
+pub(super) fn verify_hashset(
+    file_hash: &[u8; 16],
+    part_hashes: &[[u8; 16]],
+    file_size: u64,
+) -> bool {
     use md4::{Digest, Md4};
     if part_hashes.is_empty() {
         return false;
@@ -3726,7 +4262,10 @@ pub(crate) async fn maybe_send_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     };
     let peer_ip_u32 = match peer_addr.ip() {
         std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| u32::from_be_bytes(v4.octets())).unwrap_or(0),
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(|v4| u32::from_be_bytes(v4.octets()))
+            .unwrap_or(0),
     };
     // Read the request state under a short-lived guard and drop it before the
     // socket write. Holding the `CreditManager` read guard across
@@ -3764,16 +4303,27 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     };
     let peer_ip_u32 = match peer_addr.ip() {
         std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| u32::from_be_bytes(v4.octets())).unwrap_or(0),
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(|v4| u32::from_be_bytes(v4.octets()))
+            .unwrap_or(0),
     };
     let (challenge_ip_kind, challenge_ip, add_trailer) = if (peer_secident_level & 1) != 0 {
         (None, 0u32, false)
     } else {
         // eMule: use REMOTECLIENT if we don't know our own public IP (LowID)
         if our_client_id == 0 || our_client_id < 0x0100_0000 {
-            (Some(super::credits::CRYPT_CIP_REMOTECLIENT), peer_ip_u32, true)
+            (
+                Some(super::credits::CRYPT_CIP_REMOTECLIENT),
+                peer_ip_u32,
+                true,
+            )
         } else {
-            (Some(super::credits::CRYPT_CIP_LOCALCLIENT), our_client_id, true)
+            (
+                Some(super::credits::CRYPT_CIP_LOCALCLIENT),
+                our_client_id,
+                true,
+            )
         }
     };
     // Pull the public key and signature bytes out of the credit manager under a
@@ -3783,8 +4333,17 @@ pub(crate) async fn respond_to_secident_challenge<W: AsyncWriteExt + Unpin + ?Si
     // a backpressured peer socket. Mirrors `handle_secident_signature`.
     let (pub_key, sig) = {
         let cm = cm.read().await;
-        let pub_key = if state >= 2 { cm.our_public_key().to_vec() } else { Vec::new() };
-        let sig = cm.create_signature_for_peer(&peer_user_hash, challenge, challenge_ip, challenge_ip_kind);
+        let pub_key = if state >= 2 {
+            cm.our_public_key().to_vec()
+        } else {
+            Vec::new()
+        };
+        let sig = cm.create_signature_for_peer(
+            &peer_user_hash,
+            challenge,
+            challenge_ip,
+            challenge_ip_kind,
+        );
         (pub_key, sig)
     };
     if state >= 2 && !pub_key.is_empty() {
@@ -3826,7 +4385,10 @@ pub(crate) async fn handle_secident_signature(
     };
     let peer_ip_u32 = match peer_addr.ip() {
         std::net::IpAddr::V4(v4) => u32::from_be_bytes(v4.octets()),
-        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(|v4| u32::from_be_bytes(v4.octets())).unwrap_or(0),
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(|v4| u32::from_be_bytes(v4.octets()))
+            .unwrap_or(0),
     };
     let sig_bytes = &payload[1..1 + sig_len];
     let challenge_kind = if payload.len() == 1 + sig_len {
@@ -3838,8 +4400,19 @@ pub(crate) async fn handle_secident_signature(
     };
     let verified = {
         let cm = cm.read().await;
-        let local_ip = if our_client_id >= 0x0100_0000 { our_client_id } else { 0 };
-        cm.verify_signature(&peer_user_hash, challenge, challenge_kind, peer_ip_u32, local_ip, sig_bytes)
+        let local_ip = if our_client_id >= 0x0100_0000 {
+            our_client_id
+        } else {
+            0
+        };
+        cm.verify_signature(
+            &peer_user_hash,
+            challenge,
+            challenge_kind,
+            peer_ip_u32,
+            local_ip,
+            sig_bytes,
+        )
     };
     let mut cm = cm.write().await;
     if verified {
@@ -3934,12 +4507,21 @@ async fn read_packet_async<R: AsyncReadExt + Unpin + ?Sized>(
         let mut unpacked = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
-            let n = decoder.read(&mut buf)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("packed decode failed: {e}")))?;
-            if n == 0 { break; }
+            let n = decoder.read(&mut buf).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("packed decode failed: {e}"),
+                )
+            })?;
+            if n == 0 {
+                break;
+            }
             unpacked.extend_from_slice(&buf[..n]);
             if unpacked.len() > 10 * 1024 * 1024 {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "packed packet decompressed size exceeds limit"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "packed packet decompressed size exceeds limit",
+                ));
             }
         }
         return Ok((OP_EMULEPROT, opcode, unpacked));
@@ -3954,8 +4536,9 @@ async fn write_packet_async<W: AsyncWriteExt + Unpin + ?Sized>(
     payload: &[u8],
 ) -> std::io::Result<()> {
     writer.write_u8(protocol).await?;
-    let pkt_len = u32::try_from(1 + payload.len())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "packet payload too large"))?;
+    let pkt_len = u32::try_from(1 + payload.len()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "packet payload too large")
+    })?;
     writer.write_u32_le(pkt_len).await?;
     writer.write_u8(opcode).await?;
     writer.write_all(payload).await?;

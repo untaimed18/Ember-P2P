@@ -16,18 +16,19 @@ const LOOKUP_MIN_QUERIES: usize = 10;
 const LOOKUP_MAX_QUERIES: usize = 200;
 const LOOKUP_CONTACT_POOL: usize = 200;
 const LOOKUP_FORCE_FETCH_SECS: i64 = 15;
+pub const STORE_PUBLISH_TARGET_TOTAL: usize = 10;
 
 /// eMule seeds searches with 50 contacts (Search.cpp Go() -> GetClosestTo(..., 50, ...))
 pub const SEARCH_INITIAL_CONTACTS: usize = 50;
 
 /// eMule Defines.h search lifetime values (in seconds)
-const TIMEOUT_FIND_NODE: i64 = 45;    // SEARCHNODE_LIFETIME
-const TIMEOUT_KEYWORD: i64 = 45;      // SEARCHKEYWORD_LIFETIME
-const TIMEOUT_SOURCE: i64 = 45;       // SEARCHFINDSOURCE_LIFETIME
-const TIMEOUT_NOTES: i64 = 45;        // SEARCHNOTES_LIFETIME
+const TIMEOUT_FIND_NODE: i64 = 45; // SEARCHNODE_LIFETIME
+const TIMEOUT_KEYWORD: i64 = 45; // SEARCHKEYWORD_LIFETIME
+const TIMEOUT_SOURCE: i64 = 45; // SEARCHFINDSOURCE_LIFETIME
+const TIMEOUT_NOTES: i64 = 45; // SEARCHNOTES_LIFETIME
 const TIMEOUT_STORE_KEYWORD: i64 = 140; // SEARCHSTOREKEYWORD_LIFETIME
 const TIMEOUT_STORE_NOTES: i64 = 100; // SEARCHSTORENOTES_LIFETIME
-const TIMEOUT_FIND_BUDDY: i64 = 100;  // SEARCHFINDBUDDY_LIFETIME
+const TIMEOUT_FIND_BUDDY: i64 = 100; // SEARCHFINDBUDDY_LIFETIME
 /// Grace period after entering fetch phase for late results (eMule PrepareToStop gives 15s)
 const FETCH_TIMEOUT_SECS: i64 = 15;
 
@@ -221,7 +222,11 @@ impl SearchState {
         }
         let now = chrono::Utc::now().timestamp();
         let mut batch = Vec::new();
-        let max_batch = if matches!(self.search_type, SearchType::FindNode) { 1 } else { ALPHA };
+        let max_batch = if matches!(self.search_type, SearchType::FindNode) {
+            1
+        } else {
+            ALPHA
+        };
 
         match self.phase {
             SearchPhase::Lookup => {
@@ -309,9 +314,14 @@ impl SearchState {
             return Vec::new();
         }
 
+        let remaining = STORE_PUBLISH_TARGET_TOTAL.saturating_sub(self.store_sent.len());
+        if remaining == 0 {
+            return Vec::new();
+        }
+
         let mut contacts = Vec::new();
         for contact in &self.closest {
-            if contacts.len() >= ALPHA {
+            if contacts.len() >= ALPHA.min(remaining) {
                 break;
             }
             if self.responded_during_lookup.contains(&contact.id)
@@ -377,7 +387,11 @@ impl SearchState {
     fn build_fetch_message_for(&self, receiver: &KadContact) -> KadMessage {
         match self.search_type {
             SearchType::FindKeyword => {
-                let offset = self.fetch_page_offset.get(&receiver.id).copied().unwrap_or(0);
+                let offset = self
+                    .fetch_page_offset
+                    .get(&receiver.id)
+                    .copied()
+                    .unwrap_or(0);
                 KadMessage::SearchKeyReq {
                     target: self.target,
                     start_position: offset,
@@ -385,19 +399,21 @@ impl SearchState {
                 }
             }
             SearchType::FindSource { file_size } => {
-                let offset = self.fetch_page_offset.get(&receiver.id).copied().unwrap_or(0);
+                let offset = self
+                    .fetch_page_offset
+                    .get(&receiver.id)
+                    .copied()
+                    .unwrap_or(0);
                 KadMessage::SearchSourceReq {
                     target: self.target,
                     start_position: offset,
                     file_size,
                 }
             }
-            SearchType::FindNotes { file_size } => {
-                KadMessage::SearchNotesReq {
-                    target: self.target,
-                    file_size,
-                }
-            }
+            SearchType::FindNotes { file_size } => KadMessage::SearchNotesReq {
+                target: self.target,
+                file_size,
+            },
             _ => KadMessage::Ping,
         }
     }
@@ -424,7 +440,10 @@ impl SearchState {
         self.responded_during_lookup.insert(*from);
 
         let from_distance = self.target.xor_distance(from);
-        let old_best = self.closest.first().map(|c| self.target.xor_distance(&c.id));
+        let old_best = self
+            .closest
+            .first()
+            .map(|c| self.target.xor_distance(&c.id));
 
         let mut new_contacts = Vec::new();
         for c in contacts {
@@ -448,10 +467,13 @@ impl SearchState {
                 if nc_distance >= from_distance {
                     continue;
                 }
-                let rank = self.closest.iter()
+                let rank = self
+                    .closest
+                    .iter()
                     .position(|c| c.id == nc.id)
                     .unwrap_or(usize::MAX);
-                if rank < ALPHA && !self.queried.contains(&nc.id) && !self.pending.contains(&nc.id) {
+                if rank < ALPHA && !self.queried.contains(&nc.id) && !self.pending.contains(&nc.id)
+                {
                     if !self.priority_queries.iter().any(|p| p.id == nc.id) {
                         self.priority_queries.push(nc.clone());
                     }
@@ -459,7 +481,10 @@ impl SearchState {
             }
         }
 
-        let new_best = self.closest.first().map(|c| self.target.xor_distance(&c.id));
+        let new_best = self
+            .closest
+            .first()
+            .map(|c| self.target.xor_distance(&c.id));
         let improved = match (&old_best, &new_best) {
             (Some(old), Some(new)) => new < old,
             (None, Some(_)) => true,
@@ -499,7 +524,10 @@ impl SearchState {
         if count >= FETCH_PAGE_SIZE
             && !self.stop_querying
             && self.results.len() < 5000
-            && matches!(self.search_type, SearchType::FindKeyword | SearchType::FindSource { .. })
+            && matches!(
+                self.search_type,
+                SearchType::FindKeyword | SearchType::FindSource { .. }
+            )
         {
             let current_offset = self.fetch_page_offset.get(from).copied().unwrap_or(0);
             let next_offset = current_offset + FETCH_PAGE_SIZE as u16;
@@ -593,7 +621,10 @@ impl SearchState {
         if self.phase != SearchPhase::Lookup {
             return;
         }
-        if matches!(self.search_type, SearchType::FindNode | SearchType::FindBuddy) {
+        if matches!(
+            self.search_type,
+            SearchType::FindNode | SearchType::FindBuddy
+        ) {
             return;
         }
 
@@ -604,17 +635,21 @@ impl SearchState {
             return;
         }
 
-        let all_queried = self.pending.is_empty()
-            && !self.closest.iter().any(|c| !self.queried.contains(&c.id));
+        let all_queried =
+            self.pending.is_empty() && !self.closest.iter().any(|c| !self.queried.contains(&c.id));
 
         let enough_queried = self.queried.len() >= LOOKUP_MIN_QUERIES
             && self.lookup_stale_rounds >= LOOKUP_CONVERGE_COUNT;
 
         let max_lookup_reached = self.queried.len() >= LOOKUP_MAX_QUERIES;
 
-        let tolerance_candidates: Vec<&KadContact> = self.closest.iter()
-            .filter(|c| self.responded_during_lookup.contains(&c.id)
-                && within_search_tolerance(&self.target, &c.id))
+        let tolerance_candidates: Vec<&KadContact> = self
+            .closest
+            .iter()
+            .filter(|c| {
+                self.responded_during_lookup.contains(&c.id)
+                    && within_search_tolerance(&self.target, &c.id)
+            })
             .collect();
 
         let is_store = matches!(
@@ -623,7 +658,9 @@ impl SearchState {
         );
 
         if all_queried || enough_queried || max_lookup_reached {
-            let responded_candidates: Vec<&KadContact> = self.closest.iter()
+            let responded_candidates: Vec<&KadContact> = self
+                .closest
+                .iter()
                 .filter(|c| self.responded_during_lookup.contains(&c.id))
                 .collect();
             info!(
@@ -662,12 +699,13 @@ impl SearchState {
 
         match self.phase {
             SearchPhase::Lookup => {
-                if matches!(self.search_type, SearchType::FindNode | SearchType::FindBuddy) {
+                if matches!(
+                    self.search_type,
+                    SearchType::FindNode | SearchType::FindBuddy
+                ) {
                     if self.pending.is_empty() {
-                        let has_unqueried = self
-                            .closest
-                            .iter()
-                            .any(|c| !self.queried.contains(&c.id));
+                        let has_unqueried =
+                            self.closest.iter().any(|c| !self.queried.contains(&c.id));
                         // Strict completion: every contact in `closest` has
                         // been queried (the original eMule rule).
                         if !has_unqueried {
@@ -700,15 +738,17 @@ impl SearchState {
                 // after transitioning from Lookup to Fetch. However, if
                 // store_sent is non-empty, fetch queries were already sent
                 // during Lookup (eMule StorePacket pattern).
-                if self.fetched.is_empty() && self.pending.is_empty() && self.store_sent.is_empty() {
+                if self.fetched.is_empty() && self.pending.is_empty() && self.store_sent.is_empty()
+                {
                     return;
                 }
                 // Wait for both routing query and store query responses
                 if self.pending.is_empty() && self.store_pending.is_empty() {
-                    let has_unfetched = !self.stop_querying && self
-                        .closest
-                        .iter()
-                        .any(|c| self.is_fetch_candidate(c) && !self.fetched.contains(&c.id));
+                    let has_unfetched = !self.stop_querying
+                        && self
+                            .closest
+                            .iter()
+                            .any(|c| self.is_fetch_candidate(c) && !self.fetched.contains(&c.id));
                     if !has_unfetched {
                         self.completed = true;
                     }
@@ -746,8 +786,13 @@ impl SearchState {
     pub fn get_expected_response_count(&self) -> u8 {
         match self.search_type {
             SearchType::FindNode => KADEMLIA_FIND_NODE,
-            SearchType::FindKeyword | SearchType::FindSource { .. } | SearchType::FindNotes { .. } => KADEMLIA_FIND_VALUE,
-            SearchType::FindBuddy | SearchType::StoreFile | SearchType::StoreKeyword | SearchType::StoreNotes => KADEMLIA_STORE,
+            SearchType::FindKeyword
+            | SearchType::FindSource { .. }
+            | SearchType::FindNotes { .. } => KADEMLIA_FIND_VALUE,
+            SearchType::FindBuddy
+            | SearchType::StoreFile
+            | SearchType::StoreKeyword
+            | SearchType::StoreNotes => KADEMLIA_STORE,
         }
     }
 
@@ -760,9 +805,10 @@ impl SearchState {
         match self.phase {
             SearchPhase::Lookup => {
                 let search_type = match self.search_type {
-                    SearchType::StoreFile | SearchType::StoreKeyword | SearchType::StoreNotes | SearchType::FindBuddy => {
-                        KADEMLIA_STORE
-                    }
+                    SearchType::StoreFile
+                    | SearchType::StoreKeyword
+                    | SearchType::StoreNotes
+                    | SearchType::FindBuddy => KADEMLIA_STORE,
                     SearchType::FindNode => KADEMLIA_FIND_NODE,
                     SearchType::FindKeyword
                     | SearchType::FindSource { .. }
@@ -869,7 +915,9 @@ impl SearchManager {
         const MAX_ACTIVE_SEARCHES: usize = 20;
         let active = self.active_count();
         if active >= MAX_ACTIVE_SEARCHES {
-            let completed: Vec<SearchId> = self.active.iter()
+            let completed: Vec<SearchId> = self
+                .active
+                .iter()
                 .filter(|(_, s)| s.completed)
                 .map(|(id, _)| *id)
                 .collect();
@@ -886,7 +934,10 @@ impl SearchManager {
                 }
             }
             if self.active_count() >= MAX_ACTIVE_SEARCHES {
-                debug!("Rejecting search ({search_type:?}): {} active searches at cap", self.active_count());
+                debug!(
+                    "Rejecting search ({search_type:?}): {} active searches at cap",
+                    self.active_count()
+                );
                 return SearchId(0);
             }
         }
@@ -959,7 +1010,13 @@ impl SearchManager {
             // transition to fetch late enough to allow slower lookups, while still
             // leaving room for fetch responses before overall expiry.
             let elapsed = chrono::Utc::now().timestamp() - state.started_at;
-            if should_force_fetch_after_lookup(state.phase, state.search_type, elapsed, state.queried.len(), state.responded_during_lookup.len()) {
+            if should_force_fetch_after_lookup(
+                state.phase,
+                state.search_type,
+                elapsed,
+                state.queried.len(),
+                state.responded_during_lookup.len(),
+            ) {
                 info!(
                     "Search {}: forcing transition to fetch after {}s in lookup (queried={}, verified={})",
                     sid.0, elapsed, state.queried.len(), state.responded_during_lookup.len()
@@ -988,7 +1045,10 @@ impl SearchManager {
                 // like failures even when the walk had successfully
                 // populated the routing table — print contact-pool /
                 // verified counts instead so the line reads honestly.
-                if matches!(state.search_type, SearchType::FindNode | SearchType::FindBuddy) {
+                if matches!(
+                    state.search_type,
+                    SearchType::FindNode | SearchType::FindBuddy
+                ) {
                     info!(
                         "Search {} ({}) lookup ended after {}s (queried={}, responded={}, closest_pool={})",
                         sid.0,
@@ -1113,7 +1173,8 @@ mod tests {
         state.pending.insert(old);
         state.pending.insert(fresh);
         state.pending_times.insert(old, now - PENDING_TIMEOUT_SECS);
-        state.pending_times
+        state
+            .pending_times
             .insert(fresh, now - (PENDING_TIMEOUT_SECS - 1));
 
         let timed_out = state.expire_pending();
@@ -1190,8 +1251,16 @@ mod tests {
         let target = kad_id(11);
         let mut manager = SearchManager::new();
 
-        let first = manager.start_search(target, SearchType::FindSource { file_size: 50000 }, Vec::new());
-        let second = manager.start_search(target, SearchType::FindSource { file_size: 50000 }, Vec::new());
+        let first = manager.start_search(
+            target,
+            SearchType::FindSource { file_size: 50000 },
+            Vec::new(),
+        );
+        let second = manager.start_search(
+            target,
+            SearchType::FindSource { file_size: 50000 },
+            Vec::new(),
+        );
 
         assert_eq!(first, second, "same target + same file_size should reuse");
     }
@@ -1201,10 +1270,18 @@ mod tests {
         let target = kad_id(13);
         let mut manager = SearchManager::new();
 
-        let download = manager.start_search(target, SearchType::FindSource { file_size: 50000 }, Vec::new());
-        let friend = manager.start_search(target, SearchType::FindSource { file_size: 1 }, Vec::new());
+        let download = manager.start_search(
+            target,
+            SearchType::FindSource { file_size: 50000 },
+            Vec::new(),
+        );
+        let friend =
+            manager.start_search(target, SearchType::FindSource { file_size: 1 }, Vec::new());
 
-        assert_ne!(download, friend, "different file_size must not reuse (friend vs download)");
+        assert_ne!(
+            download, friend,
+            "different file_size must not reuse (friend vs download)"
+        );
     }
 
     #[test]
@@ -1216,6 +1293,9 @@ mod tests {
         assert_ne!(sid, SearchId(0));
 
         let expected = manager.get_expected_response_count(&target);
-        assert!(expected > 0, "keyword search must have nonzero expected response count");
+        assert!(
+            expected > 0,
+            "keyword search must have nonzero expected response count"
+        );
     }
 }

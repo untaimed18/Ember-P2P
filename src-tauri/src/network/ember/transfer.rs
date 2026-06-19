@@ -171,7 +171,8 @@ impl ChunkData {
         buf.push(MSG_CHUNK_DATA);
         buf.extend_from_slice(&self.ember_file_hash);
         buf.write_u32::<LittleEndian>(self.chunk_index).unwrap();
-        buf.write_u32::<LittleEndian>(self.data.len() as u32).unwrap();
+        buf.write_u32::<LittleEndian>(self.data.len() as u32)
+            .unwrap();
         buf.extend_from_slice(&self.data);
         buf
     }
@@ -225,12 +226,7 @@ pub struct MergedSource {
 }
 
 impl MergedSource {
-    pub fn ember(
-        node_id: [u8; 16],
-        addr: SocketAddr,
-        noise_pub: [u8; 32],
-        last_seen: i64,
-    ) -> Self {
+    pub fn ember(node_id: [u8; 16], addr: SocketAddr, noise_pub: [u8; 32], last_seen: i64) -> Self {
         Self {
             source_type: SourceType::Ember {
                 node_id,
@@ -275,11 +271,9 @@ impl SourceMerger {
             SourceType::Legacy { addr, .. } => *addr,
         };
 
-        if let Some(existing) = self.sources.iter_mut().find(|s| {
-            match &s.source_type {
-                SourceType::Ember { addr: a, .. } => *a == addr,
-                SourceType::Legacy { addr: a, .. } => *a == addr,
-            }
+        if let Some(existing) = self.sources.iter_mut().find(|s| match &s.source_type {
+            SourceType::Ember { addr: a, .. } => *a == addr,
+            SourceType::Legacy { addr: a, .. } => *a == addr,
         }) {
             // Update: prefer the newer/better source
             if source.priority < existing.priority || source.last_seen > existing.last_seen {
@@ -293,7 +287,11 @@ impl SourceMerger {
     /// Get all sources sorted by priority (best first).
     pub fn sorted_sources(&self) -> Vec<&MergedSource> {
         let mut sorted: Vec<&MergedSource> = self.sources.iter().collect();
-        sorted.sort_by(|a, b| a.priority.cmp(&b.priority).then(b.last_seen.cmp(&a.last_seen)));
+        sorted.sort_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then(b.last_seen.cmp(&a.last_seen))
+        });
         sorted
     }
 

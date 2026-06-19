@@ -243,11 +243,7 @@ pub async fn register(
         // user-facing logs should not deanonymize the identity. Keep a terse
         // success message at info and the identifying bits at debug.
         info!("Rendezvous: registration succeeded on port {port}");
-        debug!(
-            "Rendezvous: registered {}… (ip={})",
-            &id[..8],
-            external_ip
-        );
+        debug!("Rendezvous: registered {}… (ip={})", &id[..8], external_ip);
         Ok(())
     } else {
         let status = resp.status();
@@ -268,7 +264,10 @@ pub async fn register(
 /// filter these at registration time (see `rendezvous-server/src/main.rs::register`),
 /// but mirroring the check on the client side closes the gap if a
 /// future server change regresses it.
-pub async fn lookup(base_url: &str, friend_hash: &[u8; 16]) -> Result<Option<(Ipv4Addr, u16)>, String> {
+pub async fn lookup(
+    base_url: &str,
+    friend_hash: &[u8; 16],
+) -> Result<Option<(Ipv4Addr, u16)>, String> {
     require_https(base_url)?;
     let id = hashed_id(friend_hash);
     let url = format!("{}/lookup/{}", base_url.trim_end_matches('/'), id);
@@ -285,8 +284,8 @@ pub async fn lookup(base_url: &str, friend_hash: &[u8; 16]) -> Result<Option<(Ip
         return Err(format!("rendezvous lookup returned {status}"));
     }
     let bytes = read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?;
-    let body: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("rendezvous lookup bad body: {e}"))?;
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("rendezvous lookup bad body: {e}"))?;
     let ip_str = body["ip"].as_str().unwrap_or_default();
     let raw_port = body["port"].as_u64().unwrap_or_default();
     if raw_port == 0 || raw_port > u16::MAX as u64 {
@@ -398,7 +397,11 @@ mod lookup_filter_tests {
 /// the call came from the same identity that registered. Mirrors the
 /// `register` signing scheme — the server pins pubkey on register,
 /// then re-checks on every state-mutating request for that id.
-pub async fn unregister(base_url: &str, ember_hash: &[u8; 16], secret_key: &[u8; 32]) -> Result<(), String> {
+pub async fn unregister(
+    base_url: &str,
+    ember_hash: &[u8; 16],
+    secret_key: &[u8; 32],
+) -> Result<(), String> {
     require_https(base_url)?;
     let url = format!("{}/unregister", base_url.trim_end_matches('/'));
     let id = hashed_id(ember_hash);

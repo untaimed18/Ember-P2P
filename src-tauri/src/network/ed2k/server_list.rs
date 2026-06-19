@@ -145,12 +145,14 @@ impl ServerEntry {
 fn apply_server_int_tag(entry: &mut ServerEntry, name_id: u8, v: u32) {
     match name_id {
         0x0D | 0x85 => entry.fail_count = v,
-        0x0E => entry.priority = match v {
-            0 => ServerPriority::Normal,
-            1 => ServerPriority::High,
-            2 => ServerPriority::Low,
-            _ => ServerPriority::Normal,
-        },
+        0x0E => {
+            entry.priority = match v {
+                0 => ServerPriority::Normal,
+                1 => ServerPriority::High,
+                2 => ServerPriority::Low,
+                _ => ServerPriority::Normal,
+            }
+        }
         0x83 => entry.user_count = v,
         0x84 => entry.file_count = v,
         0x86 => entry.last_ping = v as i64,
@@ -228,7 +230,11 @@ impl ServerList {
                 ..ServerEntry::new(String::new(), 0)
             },
         ];
-        Self { servers, current_index: 0, needs_sort: true }
+        Self {
+            servers,
+            current_index: 0,
+            needs_sort: true,
+        }
     }
 
     fn connect_cooldown_secs(entry: &ServerEntry) -> i64 {
@@ -243,7 +249,11 @@ impl ServerList {
     }
 
     pub fn add(&mut self, entry: ServerEntry) {
-        if !self.servers.iter().any(|s| s.ip == entry.ip && s.port == entry.port) {
+        if !self
+            .servers
+            .iter()
+            .any(|s| s.ip == entry.ip && s.port == entry.port)
+        {
             self.servers.push(entry);
             self.needs_sort = true;
         }
@@ -251,7 +261,10 @@ impl ServerList {
 
     /// Remove all servers whose IP is blocked by the IP filter.
     /// Returns the number of servers removed.
-    pub fn remove_filtered(&mut self, ip_filter: &mut crate::network::kad::ip_filter::IpFilter) -> usize {
+    pub fn remove_filtered(
+        &mut self,
+        ip_filter: &mut crate::network::kad::ip_filter::IpFilter,
+    ) -> usize {
         let before = self.servers.len();
         self.servers.retain(|s| {
             if let Ok(addr) = s.ip.parse::<Ipv4Addr>() {
@@ -266,7 +279,10 @@ impl ServerList {
     }
 
     /// Check if a server IP is blocked by the IP filter, matching eMule's FilterServerByIP.
-    pub fn is_ip_filtered(ip_str: &str, ip_filter: &mut crate::network::kad::ip_filter::IpFilter) -> bool {
+    pub fn is_ip_filtered(
+        ip_str: &str,
+        ip_filter: &mut crate::network::kad::ip_filter::IpFilter,
+    ) -> bool {
         if let Ok(addr) = ip_str.parse::<Ipv4Addr>() {
             ip_filter.is_blocked(addr)
         } else {
@@ -282,7 +298,11 @@ impl ServerList {
         filter_by_ip: bool,
         ip_filter: &mut crate::network::kad::ip_filter::IpFilter,
     ) -> AddServerOutcome {
-        if self.servers.iter().any(|s| s.ip == entry.ip && s.port == entry.port) {
+        if self
+            .servers
+            .iter()
+            .any(|s| s.ip == entry.ip && s.port == entry.port)
+        {
             return AddServerOutcome::Duplicate;
         }
         if filter_by_ip && Self::is_ip_filtered(&entry.ip, ip_filter) {
@@ -370,8 +390,16 @@ impl ServerList {
 
         if self.needs_sort {
             self.servers.sort_by(|a, b| {
-                let pa = match a.priority { ServerPriority::High => 0, ServerPriority::Normal => 1, ServerPriority::Low => 2 };
-                let pb = match b.priority { ServerPriority::High => 0, ServerPriority::Normal => 1, ServerPriority::Low => 2 };
+                let pa = match a.priority {
+                    ServerPriority::High => 0,
+                    ServerPriority::Normal => 1,
+                    ServerPriority::Low => 2,
+                };
+                let pb = match b.priority {
+                    ServerPriority::High => 0,
+                    ServerPriority::Normal => 1,
+                    ServerPriority::Low => 2,
+                };
                 pa.cmp(&pb).then(a.fail_count.cmp(&b.fail_count))
             });
             self.needs_sort = false;
@@ -395,16 +423,25 @@ impl ServerList {
     const MAX_FAIL_COUNT: u32 = 10;
 
     pub fn record_failure(&mut self, ip: &str, port: u16) {
-        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+        if let Some(entry) = self
+            .servers
+            .iter_mut()
+            .find(|s| s.ip == ip && s.port == port)
+        {
             entry.fail_count += 1;
             entry.last_failed_at = chrono::Utc::now().timestamp();
             self.needs_sort = true;
         }
         // eMule: remove non-static servers that exceed MAX_SERVERFAILCOUNT
         self.servers.retain(|s| {
-            if s.is_static { return true; }
+            if s.is_static {
+                return true;
+            }
             if s.fail_count >= Self::MAX_FAIL_COUNT {
-                info!("Removing server {}:{} after {} consecutive failures", s.ip, s.port, s.fail_count);
+                info!(
+                    "Removing server {}:{} after {} consecutive failures",
+                    s.ip, s.port, s.fail_count
+                );
                 return false;
             }
             true
@@ -427,7 +464,11 @@ impl ServerList {
     /// load.
     pub fn record_udp_query_sent(&mut self, ip: &str, port: u16) {
         const UDP_FAILURE_COOLDOWN_SECS: i64 = 30;
-        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+        if let Some(entry) = self
+            .servers
+            .iter_mut()
+            .find(|s| s.ip == ip && s.port == port)
+        {
             let now = chrono::Utc::now().timestamp();
             // Only count (and advance the anchor) once per cooldown window. The
             // anchor must NOT be refreshed on suppressed calls — otherwise the
@@ -449,7 +490,11 @@ impl ServerList {
     /// or found-sources). Resets the failure counter and timestamps the
     /// reply for the periodic UDP-health log.
     pub fn record_udp_reply(&mut self, ip: &str, port: u16) {
-        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+        if let Some(entry) = self
+            .servers
+            .iter_mut()
+            .find(|s| s.ip == ip && s.port == port)
+        {
             if entry.udp_consecutive_failures != 0 {
                 self.needs_sort = true;
             }
@@ -466,13 +511,21 @@ impl ServerList {
     /// UDP-health log so the user can see which servers are useful
     /// for source discovery vs which are just status-ping-alive.
     pub fn record_udp_source_reply(&mut self, ip: &str, port: u16) {
-        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+        if let Some(entry) = self
+            .servers
+            .iter_mut()
+            .find(|s| s.ip == ip && s.port == port)
+        {
             entry.last_udp_source_reply_at = chrono::Utc::now().timestamp();
         }
     }
 
     pub fn record_success(&mut self, ip: &str, port: u16) {
-        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+        if let Some(entry) = self
+            .servers
+            .iter_mut()
+            .find(|s| s.ip == ip && s.port == port)
+        {
             if entry.fail_count != 0 {
                 self.needs_sort = true;
             }
@@ -553,7 +606,9 @@ impl ServerList {
                 if name_len > MAX_SERVER_TAG_NAME_LEN {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("server.met entry for {ip}:{port} tag name_len {name_len} exceeds cap"),
+                        format!(
+                            "server.met entry for {ip}:{port} tag name_len {name_len} exceeds cap"
+                        ),
                     ));
                 }
                 let mut name = vec![0u8; name_len];
@@ -581,8 +636,12 @@ impl ServerList {
                         let v = cursor.read_u32::<LittleEndian>()?;
                         apply_server_int_tag(&mut entry, name_id, v);
                     }
-                    0x08 => { let _ = cursor.read_u16::<LittleEndian>(); }
-                    0x09 => { let _ = cursor.read_u8(); }
+                    0x08 => {
+                        let _ = cursor.read_u16::<LittleEndian>();
+                    }
+                    0x09 => {
+                        let _ = cursor.read_u8();
+                    }
                     // Unknown tag type: bail the whole load. The
                     // tag's payload size depends on its type so we
                     // can't safely skip past it — `break`-ing would
@@ -676,11 +735,17 @@ impl ServerList {
             for _ in 0..tag_count {
                 let tag_type = match cursor.read_u8() {
                     Ok(v) => v,
-                    Err(_) => { unknown_tag = true; break; }
+                    Err(_) => {
+                        unknown_tag = true;
+                        break;
+                    }
                 };
                 let name_len = match cursor.read_u16::<LittleEndian>() {
                     Ok(v) => v as usize,
-                    Err(_) => { unknown_tag = true; break; }
+                    Err(_) => {
+                        unknown_tag = true;
+                        break;
+                    }
                 };
                 // Cap before allocating (see load_server_met): abort the merge
                 // rather than letting an unchecked u16 drive a huge allocation.
@@ -699,7 +764,10 @@ impl ServerList {
                     0x02 => {
                         let slen = match cursor.read_u16::<LittleEndian>() {
                             Ok(v) => v as usize,
-                            Err(_) => { unknown_tag = true; break; }
+                            Err(_) => {
+                                unknown_tag = true;
+                                break;
+                            }
                         };
                         if slen > MAX_SERVER_TAG_STR_LEN {
                             unknown_tag = true;
@@ -719,7 +787,10 @@ impl ServerList {
                     0x03 => {
                         let v = match cursor.read_u32::<LittleEndian>() {
                             Ok(v) => v,
-                            Err(_) => { unknown_tag = true; break; }
+                            Err(_) => {
+                                unknown_tag = true;
+                                break;
+                            }
                         };
                         apply_server_int_tag(&mut entry, name_id, v);
                     }
@@ -748,7 +819,11 @@ impl ServerList {
                 break;
             }
 
-            if let Some(existing) = self.servers.iter_mut().find(|s| s.ip == entry.ip && s.port == entry.port) {
+            if let Some(existing) = self
+                .servers
+                .iter_mut()
+                .find(|s| s.ip == entry.ip && s.port == entry.port)
+            {
                 if !entry.name.is_empty() {
                     existing.name = entry.name;
                 }
@@ -823,8 +898,19 @@ impl ServerList {
         self.merge_from_bytes_filtered(data, false, None)
     }
 
-    pub fn update_server_stats(&mut self, ip: &str, port: u16, users: u32, files: u32, obfuscation_port_tcp: u16) {
-        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+    pub fn update_server_stats(
+        &mut self,
+        ip: &str,
+        port: u16,
+        users: u32,
+        files: u32,
+        obfuscation_port_tcp: u16,
+    ) {
+        if let Some(entry) = self
+            .servers
+            .iter_mut()
+            .find(|s| s.ip == ip && s.port == port)
+        {
             entry.user_count = users;
             entry.file_count = files;
             entry.last_ping = chrono::Utc::now().timestamp();
@@ -847,7 +933,11 @@ impl ServerList {
         if soft_files == 0 {
             return;
         }
-        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+        if let Some(entry) = self
+            .servers
+            .iter_mut()
+            .find(|s| s.ip == ip && s.port == port)
+        {
             if entry.soft_files != soft_files {
                 tracing::info!(
                     "Learned soft file limit {soft_files} for server {ip}:{port} from UDP status"
@@ -870,7 +960,11 @@ impl ServerList {
         obfuscation_port_udp: u16,
         server_udp_key: u32,
     ) {
-        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+        if let Some(entry) = self
+            .servers
+            .iter_mut()
+            .find(|s| s.ip == ip && s.port == port)
+        {
             if obfuscation_port_udp != 0 {
                 entry.obfuscation_port_udp = obfuscation_port_udp;
             }
@@ -927,11 +1021,7 @@ impl ServerList {
     /// Returns `None` only when no server in the list matches the
     /// given source `(ip, port)` pair via either the standard UDP
     /// port (TCP+4) or the advertised obfuscation UDP port.
-    pub fn lookup_for_udp_addr(
-        &self,
-        ip: std::net::Ipv4Addr,
-        src_port: u16,
-    ) -> Option<(u32, u16)> {
+    pub fn lookup_for_udp_addr(&self, ip: std::net::Ipv4Addr, src_port: u16) -> Option<(u32, u16)> {
         let ip_str = ip.to_string();
         for entry in &self.servers {
             if entry.ip != ip_str {
@@ -965,7 +1055,11 @@ impl ServerList {
 
     /// Store per-server UDP capability flags from status ping responses.
     pub fn update_udp_flags(&mut self, ip: &str, port: u16, udp_flags: u32) {
-        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+        if let Some(entry) = self
+            .servers
+            .iter_mut()
+            .find(|s| s.ip == ip && s.port == port)
+        {
             entry.udp_flags = udp_flags;
         }
     }
@@ -977,9 +1071,14 @@ impl ServerList {
         if trimmed.is_empty() {
             return false;
         }
-        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+        if let Some(entry) = self
+            .servers
+            .iter_mut()
+            .find(|s| s.ip == ip && s.port == port)
+        {
             let existing = entry.name.trim();
-            let existing_is_ip_like = existing.parse::<Ipv4Addr>().is_ok() || existing.eq_ignore_ascii_case(&entry.ip);
+            let existing_is_ip_like =
+                existing.parse::<Ipv4Addr>().is_ok() || existing.eq_ignore_ascii_case(&entry.ip);
             if existing.is_empty() || existing_is_ip_like {
                 if existing != trimmed {
                     entry.name = trimmed.to_string();
@@ -997,7 +1096,8 @@ impl ServerList {
         buf.write_u32::<LittleEndian>(self.servers.len() as u32)?;
 
         for entry in &self.servers {
-            let ip: std::net::Ipv4Addr = entry.ip.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+            let ip: std::net::Ipv4Addr =
+                entry.ip.parse().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
             buf.write_u32::<LittleEndian>(u32::from_le_bytes(ip.octets()))?;
             buf.write_u16::<LittleEndian>(entry.port)?;
 
@@ -1047,7 +1147,11 @@ impl ServerList {
 
             // CT_LASTPING (0x86) - uint32
             if entry.last_ping > 0 {
-                write_met_uint32_tag(&mut tag_buf, 0x86, (entry.last_ping as u64).min(u32::MAX as u64) as u32);
+                write_met_uint32_tag(
+                    &mut tag_buf,
+                    0x86,
+                    (entry.last_ping as u64).min(u32::MAX as u64) as u32,
+                );
                 tag_count += 1;
             }
 

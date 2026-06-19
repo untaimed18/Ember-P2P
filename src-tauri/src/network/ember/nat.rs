@@ -45,7 +45,10 @@ pub enum NatType {
 #[allow(dead_code)]
 impl NatType {
     pub fn is_punchable(&self) -> bool {
-        matches!(self, NatType::Open | NatType::FullCone | NatType::RestrictedCone | NatType::PortRestricted)
+        matches!(
+            self,
+            NatType::Open | NatType::FullCone | NatType::RestrictedCone | NatType::PortRestricted
+        )
     }
 
     pub fn is_relayable(&self) -> bool {
@@ -199,7 +202,12 @@ pub async fn probe_nat(local_socket: &UdpSocket) -> NatInfo {
         // Surface the first two failures in the WARN so the user can
         // tell DNS/blocked-egress/timeout apart without having to flip
         // the whole logger to debug.
-        let detail = failures.iter().take(2).cloned().collect::<Vec<_>>().join("; ");
+        let detail = failures
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
         if detail.is_empty() {
             warn!("NAT probe: all STUN servers failed");
         } else {
@@ -216,15 +224,25 @@ pub async fn probe_nat(local_socket: &UdpSocket) -> NatInfo {
     let local_addr = local_socket.local_addr().ok();
 
     let nat_type = if let Some(local) = local_addr {
-        if local.ip() == external_addr.ip() && !local.ip().is_loopback() && !local.ip().is_unspecified() {
+        if local.ip() == external_addr.ip()
+            && !local.ip().is_loopback()
+            && !local.ip().is_unspecified()
+        {
             NatType::Open
         } else if results.len() >= 2 && results[0].port() != results[1].port() {
             // Different external ports from different servers = symmetric NAT
-            info!("NAT probe: symmetric NAT detected (ports {} vs {})", results[0].port(), results[1].port());
+            info!(
+                "NAT probe: symmetric NAT detected (ports {} vs {})",
+                results[0].port(),
+                results[1].port()
+            );
             NatType::Symmetric
         } else if results.len() >= 2 {
             // Same external port from different servers = at least port-restricted cone
-            info!("NAT probe: port-restricted or better NAT (consistent port {})", external_addr.port());
+            info!(
+                "NAT probe: port-restricted or better NAT (consistent port {})",
+                external_addr.port()
+            );
             NatType::PortRestricted
         } else {
             // Only one STUN reply made it back — usually the other servers
@@ -255,10 +273,7 @@ pub async fn probe_nat(local_socket: &UdpSocket) -> NatInfo {
     }
 }
 
-async fn try_stun_server(
-    socket: &UdpSocket,
-    server: &str,
-) -> Result<SocketAddr, String> {
+async fn try_stun_server(socket: &UdpSocket, server: &str) -> Result<SocketAddr, String> {
     // Filter to IPv4 explicitly. The KAD UDP socket is bound IPv4-only
     // (`socket2::Domain::IPV4` in `start_network`), and on a dual-stack
     // resolver `lookup_host(...).next()` can return an IPv6 entry first
@@ -331,7 +346,9 @@ async fn try_stun_server(
         }
     }
 
-    Err(format!("STUN {server} failed after {STUN_MAX_RETRIES} attempts"))
+    Err(format!(
+        "STUN {server} failed after {STUN_MAX_RETRIES} attempts"
+    ))
 }
 
 fn build_binding_request(txn_id: &[u8; 12]) -> Vec<u8> {
@@ -472,7 +489,14 @@ mod tests {
 
     #[test]
     fn nat_type_serialization() {
-        for t in [NatType::Open, NatType::FullCone, NatType::RestrictedCone, NatType::PortRestricted, NatType::Symmetric, NatType::Unknown] {
+        for t in [
+            NatType::Open,
+            NatType::FullCone,
+            NatType::RestrictedCone,
+            NatType::PortRestricted,
+            NatType::Symmetric,
+            NatType::Unknown,
+        ] {
             assert_eq!(NatType::from_u8(t.as_u8()), t);
         }
     }
@@ -480,13 +504,11 @@ mod tests {
     #[test]
     fn highid_fallback_upgrades_unknown_with_no_addr() {
         let mut info = NatInfo::unknown();
-        let applied = info.apply_highid_fallback(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)), 4242);
+        let applied =
+            info.apply_highid_fallback(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)), 4242);
         assert!(applied);
         assert_eq!(info.nat_type, NatType::PortRestricted);
-        assert_eq!(
-            info.external_addr,
-            Some("8.8.8.8:4242".parse().unwrap()),
-        );
+        assert_eq!(info.external_addr, Some("8.8.8.8:4242".parse().unwrap()),);
     }
 
     #[test]
@@ -500,7 +522,8 @@ mod tests {
             external_addr: Some("1.2.3.4:9999".parse().unwrap()),
             last_probed: Instant::now(),
         };
-        let applied = info.apply_highid_fallback(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)), 4242);
+        let applied =
+            info.apply_highid_fallback(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)), 4242);
         assert!(applied);
         assert_eq!(info.nat_type, NatType::PortRestricted);
         assert_eq!(
@@ -517,7 +540,8 @@ mod tests {
             external_addr: None,
             last_probed: Instant::now(),
         };
-        let applied = info.apply_highid_fallback(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)), 4242);
+        let applied =
+            info.apply_highid_fallback(IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)), 4242);
         assert!(!applied);
         assert_eq!(info.nat_type, NatType::FullCone);
         assert_eq!(info.external_addr, None);

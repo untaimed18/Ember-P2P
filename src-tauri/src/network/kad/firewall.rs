@@ -106,7 +106,10 @@ impl FirewallChecker {
         // probes can be dispatched immediately without waiting for new pongs.
         // Port votes are cleared so pongs from this cycle can refine it.
         self.udp_port_votes.clear();
-        info!("Starting firewall check cycle (current TCP={:?}, UDP={:?}, ext_udp={:?})", self.tcp_status, self.udp_status, self.external_udp_port);
+        info!(
+            "Starting firewall check cycle (current TCP={:?}, UDP={:?}, ext_udp={:?})",
+            self.tcp_status, self.udp_status, self.external_udp_port
+        );
     }
 
     pub fn record_tcp_request_sent(&mut self, peer_ip: Ipv4Addr) {
@@ -121,8 +124,7 @@ impl FirewallChecker {
 
     /// Pings are only used to learn the external UDP port. They do not prove
     /// whether we are UDP-firewalled.
-    pub fn record_udp_port_probe_sent(&mut self) {
-    }
+    pub fn record_udp_port_probe_sent(&mut self) {}
 
     pub fn is_udp_firewall_check_ip(&self, ip: Ipv4Addr) -> bool {
         self.pending_udp_check_ips.contains(&ip)
@@ -182,7 +184,10 @@ impl FirewallChecker {
                 .iter()
                 .map(|(ip, nets)| format!("{}={}", ip, nets.len()))
                 .collect();
-            info!("External IP votes disagree (distinct /24s): [{}]", tally.join(", "));
+            info!(
+                "External IP votes disagree (distinct /24s): [{}]",
+                tally.join(", ")
+            );
         } else {
             debug!(
                 "External IP vote for {reported_ip} (distinct /24 voters: {})",
@@ -228,7 +233,10 @@ impl FirewallChecker {
     pub fn handle_tcp_connect_back(&mut self) {
         self.tcp_responses_received += 1;
         self.tcp_status = FirewallStatus::Open;
-        debug!("TCP firewall check: open (connect-back received, {} total)", self.tcp_responses_received);
+        debug!(
+            "TCP firewall check: open (connect-back received, {} total)",
+            self.tcp_responses_received
+        );
     }
 
     /// Handle KADEMLIA2_PONG: peer reports what UDP port it sees us on.
@@ -242,7 +250,9 @@ impl FirewallChecker {
             .or_default()
             .insert(reporter_net);
 
-        let best_port = self.udp_port_votes.iter()
+        let best_port = self
+            .udp_port_votes
+            .iter()
             .max_by_key(|(_, nets)| nets.len())
             .map(|(&port, _)| port);
 
@@ -264,7 +274,9 @@ impl FirewallChecker {
     }
 
     pub fn needs_udp_firewall_probes(&self) -> bool {
-        self.checking && self.udp_requests_sent < MAX_UDP_FIREWALL_PROBES && !self.udp_firewall_succeeded
+        self.checking
+            && self.udp_requests_sent < MAX_UDP_FIREWALL_PROBES
+            && !self.udp_firewall_succeeded
     }
 
     /// Called periodically to evaluate results if the response window has elapsed.
@@ -284,7 +296,9 @@ impl FirewallChecker {
         // we have no data to make a determination and shouldn't overwrite whatever
         // the caller already has.
         if self.tcp_requests_sent == 0 && self.udp_requests_sent == 0 {
-            debug!("Firewall check cycle completed with no requests sent, preserving existing status");
+            debug!(
+                "Firewall check cycle completed with no requests sent, preserving existing status"
+            );
             return false;
         }
 
@@ -295,7 +309,10 @@ impl FirewallChecker {
             self.tcp_status = FirewallStatus::Open;
         } else if self.tcp_requests_sent > 0 && self.tcp_status != FirewallStatus::Open {
             self.tcp_status = FirewallStatus::Firewalled;
-            info!("TCP firewall check complete: FIREWALLED (0/{} responses)", self.tcp_requests_sent);
+            info!(
+                "TCP firewall check complete: FIREWALLED (0/{} responses)",
+                self.tcp_requests_sent
+            );
         }
 
         if self.udp_firewall_succeeded {

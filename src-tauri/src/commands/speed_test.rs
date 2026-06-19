@@ -1,7 +1,7 @@
+use crate::commands::errors::coded_ctx;
 use futures::StreamExt;
 use serde::Serialize;
 use tracing::info;
-use crate::commands::errors::coded_ctx;
 
 const DOWNLOAD_TEST_URL: &str = "https://speed.cloudflare.com/__down?bytes=5000000";
 const UPLOAD_TEST_URL: &str = "https://speed.cloudflare.com/__up";
@@ -43,8 +43,9 @@ pub async fn run_speed_test() -> Result<SpeedTestResult, String> {
         let mut stream = resp.bytes_stream();
         let mut actual_bytes: u64 = 0;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|e| coded_ctx("speed_download_read_failed", "Download test read failed", e))?;
+            let chunk = chunk.map_err(|e| {
+                coded_ctx("speed_download_read_failed", "Download test read failed", e)
+            })?;
             actual_bytes += chunk.len() as u64;
             if actual_bytes >= MAX_DOWNLOAD_TEST_BYTES {
                 break;

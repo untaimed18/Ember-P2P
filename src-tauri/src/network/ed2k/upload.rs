@@ -1,17 +1,17 @@
+use std::collections::HashMap;
 use std::io::{self, Read as _, Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::collections::HashMap;
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use futures::FutureExt;
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
-use futures::FutureExt;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 
 use crate::bandwidth::limiter::BandwidthLimiter;
 use crate::network::ed2k::a4af::A4AFManager;
@@ -38,8 +38,15 @@ struct UploadSlotGuard {
 }
 
 impl UploadSlotGuard {
-    fn new(active_count: Arc<std::sync::atomic::AtomicUsize>, slot_notify: Arc<tokio::sync::Notify>) -> Self {
-        Self { active_count, slot_notify, armed: false }
+    fn new(
+        active_count: Arc<std::sync::atomic::AtomicUsize>,
+        slot_notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            active_count,
+            slot_notify,
+            armed: false,
+        }
     }
 
     /// Atomically reserve a slot iff the live count is still below `limit`.
@@ -78,7 +85,8 @@ impl UploadSlotGuard {
 
     fn deactivate(&mut self) {
         if self.armed {
-            self.active_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.active_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             self.armed = false;
             self.slot_notify.notify_waiters();
         }
@@ -88,7 +96,8 @@ impl UploadSlotGuard {
 impl Drop for UploadSlotGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.active_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.active_count
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             self.slot_notify.notify_waiters();
         }
     }
@@ -274,7 +283,11 @@ const MAX_UP_CLIENTS_ALLOWED: usize = 100;
 /// m7: Hard queue limit = soft + max(soft, 800) / 4.  Between soft and hard,
 /// only clients with above-average score are admitted; above hard, all rejected.
 const HARD_UPLOAD_QUEUE_SIZE: usize = MAX_UPLOAD_QUEUE_SIZE
-    + (if MAX_UPLOAD_QUEUE_SIZE > 800 { MAX_UPLOAD_QUEUE_SIZE } else { 800 }) / 4;
+    + (if MAX_UPLOAD_QUEUE_SIZE > 800 {
+        MAX_UPLOAD_QUEUE_SIZE
+    } else {
+        800
+    }) / 4;
 /// m6: Score multiplier for peers we are simultaneously downloading from.
 const DOWNLOAD_BONUS_MULTIPLIER: f64 = 1.5;
 
@@ -290,7 +303,9 @@ struct FileRequestTracker {
 
 impl FileRequestTracker {
     fn new() -> Self {
-        Self { entries: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+        }
     }
 
     /// Returns true if the client should be banned.
@@ -312,7 +327,8 @@ impl FileRequestTracker {
     }
 
     fn cleanup_stale(&mut self) {
-        self.entries.retain(|_, (t, _)| t.elapsed().as_secs() < 3600);
+        self.entries
+            .retain(|_, (t, _)| t.elapsed().as_secs() < 3600);
         // Hard cap: a peer rotating through millions of distinct file
         // hashes within the 1h window could otherwise grow this map
         // without bound (cleanup_stale only drops entries older than 1h).
@@ -534,7 +550,8 @@ struct UploadHandler {
     max_concurrent_uploads: Arc<std::sync::atomic::AtomicUsize>,
     upload_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     upload_queue: Arc<tokio::sync::Mutex<Vec<QueueEntry>>>,
-    ip_connection_counts: Arc<tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    ip_connection_counts:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
     total_connections: Arc<std::sync::atomic::AtomicUsize>,
     source_manager: Arc<RwLock<SourceManager>>,
     comment_manager: Arc<RwLock<CommentManager>>,
@@ -642,12 +659,20 @@ struct UploadHandler {
 const MAX_AICH_CACHE_ENTRIES: usize = 50;
 
 struct AichCache {
-    entries: HashMap<String, (crate::network::ed2k::aich::AICHRecoveryHashSet, std::time::Instant)>,
+    entries: HashMap<
+        String,
+        (
+            crate::network::ed2k::aich::AICHRecoveryHashSet,
+            std::time::Instant,
+        ),
+    >,
 }
 
 impl AichCache {
     fn new() -> Self {
-        Self { entries: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+        }
     }
 
     fn get(&mut self, key: &str) -> Option<crate::network::ed2k::aich::AICHRecoveryHashSet> {
@@ -661,7 +686,9 @@ impl AichCache {
 
     fn insert(&mut self, key: String, value: crate::network::ed2k::aich::AICHRecoveryHashSet) {
         if self.entries.len() >= MAX_AICH_CACHE_ENTRIES {
-            if let Some(oldest_key) = self.entries.iter()
+            if let Some(oldest_key) = self
+                .entries
+                .iter()
                 .min_by_key(|(_, (_, t))| *t)
                 .map(|(k, _)| k.clone())
             {
@@ -800,7 +827,11 @@ impl AbuseTracker {
 
         if entry.request_count > MAX_REQUESTS_PER_WINDOW {
             entry.banned_until = Some(now + std::time::Duration::from_secs(BAN_DURATION_SECS));
-            tracing::warn!("Auto-banned {ip}: {} requests in {}s window", entry.request_count, ABUSE_WINDOW_SECS);
+            tracing::warn!(
+                "Auto-banned {ip}: {} requests in {}s window",
+                entry.request_count,
+                ABUSE_WINDOW_SECS
+            );
             return true;
         }
 
@@ -822,7 +853,10 @@ impl AbuseTracker {
 
         if entry.file_not_found_count > MAX_FILE_NOT_FOUND {
             entry.banned_until = Some(now + std::time::Duration::from_secs(BAN_DURATION_SECS));
-            tracing::warn!("Auto-banned {ip}: {} file-not-found requests (hash probing)", entry.file_not_found_count);
+            tracing::warn!(
+                "Auto-banned {ip}: {} file-not-found requests (hash probing)",
+                entry.file_not_found_count
+            );
             return true;
         }
 
@@ -833,11 +867,11 @@ impl AbuseTracker {
 /// eMule file priority to score multiplier, matching GetFilePrioAsNumber()/10.
 pub(crate) fn priority_weight(priority: &str) -> f64 {
     match priority {
-        "release" => 1.8,   // maps to eMule VeryHigh (18/10)
-        "high" => 0.9,      // maps to eMule High (9/10)
-        "normal" => 0.7,    // maps to eMule Normal (7/10)
-        "low" => 0.6,       // maps to eMule Low (6/10)
-        "verylow" => 0.2,   // maps to eMule VeryLow (2/10)
+        "release" => 1.8, // maps to eMule VeryHigh (18/10)
+        "high" => 0.9,    // maps to eMule High (9/10)
+        "normal" => 0.7,  // maps to eMule Normal (7/10)
+        "low" => 0.6,     // maps to eMule Low (6/10)
+        "verylow" => 0.2, // maps to eMule VeryLow (2/10)
         _ => 0.7,
     }
 }
@@ -1046,7 +1080,9 @@ pub async fn start_upload_server(
     credit_manager: Arc<RwLock<CreditManager>>,
     a4af_manager: Arc<RwLock<A4AFManager>>,
     pending_download_hashes: Arc<RwLock<Vec<[u8; 16]>>>,
-    active_port_tests: Arc<tokio::sync::Mutex<HashMap<std::net::IpAddr, tokio::sync::mpsc::Sender<()>>>>,
+    active_port_tests: Arc<
+        tokio::sync::Mutex<HashMap<std::net::IpAddr, tokio::sync::mpsc::Sender<()>>>,
+    >,
     pending_buddy_hashes: PendingBuddySet,
     buddy_conn_tx: tokio::sync::mpsc::Sender<BuddyConnectionParts>,
     shared_buddy_info: SharedBuddyInfo,
@@ -1091,12 +1127,16 @@ pub async fn start_upload_server(
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!("TCP port {tcp_port} is already in use: {e}. Peer-to-peer uploads will not work.");
+            tracing::error!(
+                "TCP port {tcp_port} is already in use: {e}. Peer-to-peer uploads will not work."
+            );
             anyhow::bail!("TCP port {tcp_port} already in use: {e}");
         }
     };
     let current_max = max_concurrent_uploads.load(std::sync::atomic::Ordering::Relaxed);
-    info!("Peer-to-peer upload listener started on TCP port {tcp_port} (max {current_max} uploads)");
+    info!(
+        "Peer-to-peer upload listener started on TCP port {tcp_port} (max {current_max} uploads)"
+    );
 
     let active_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let slot_notify = Arc::new(tokio::sync::Notify::new());
@@ -1410,7 +1450,9 @@ impl UploadHandler {
                 .or_else(|| {
                     mgr.queue
                         .iter()
-                        .find(|t| t.direction == TransferDirection::Download && t.file_hash == hash_hex)
+                        .find(|t| {
+                            t.direction == TransferDirection::Download && t.file_hash == hash_hex
+                        })
                         .cloned()
                 })
         }?;
@@ -1433,11 +1475,7 @@ impl UploadHandler {
     }
 
     /// One "request" per file per incoming connection (eMule-style asked count).
-    async fn record_share_request_once(
-        &self,
-        hash: &[u8; 16],
-        recorded: &mut Option<[u8; 16]>,
-    ) {
+    async fn record_share_request_once(&self, hash: &[u8; 16], recorded: &mut Option<[u8; 16]>) {
         if recorded.as_ref() == Some(hash) {
             return;
         }
@@ -1480,7 +1518,9 @@ impl UploadHandler {
     /// if the formula would allow it.
     fn compute_dynamic_slot_count(&self) -> usize {
         let active = self.active_count.load(std::sync::atomic::Ordering::Relaxed);
-        let max_configured = self.max_concurrent_uploads.load(std::sync::atomic::Ordering::Relaxed);
+        let max_configured = self
+            .max_concurrent_uploads
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         let observed_rate = self.bandwidth_limiter.smoothed_upload_speed();
         let effective_rate = if observed_rate > 0 || active > 0 {
@@ -1500,7 +1540,9 @@ impl UploadHandler {
         };
 
         let computed = (effective_rate / target_per_slot).max(MIN_UP_CLIENTS_ALLOWED as u64);
-        let computed = (computed as usize).min(MAX_UP_CLIENTS_ALLOWED).min(max_configured);
+        let computed = (computed as usize)
+            .min(MAX_UP_CLIENTS_ALLOWED)
+            .min(max_configured);
 
         if active >= 2 {
             let rates = self.slot_rates.lock().unwrap_or_else(|e| e.into_inner());
@@ -1530,8 +1572,12 @@ impl UploadHandler {
         HelloOptions {
             udp_port: self.udp_port,
             kad_port: self.udp_port,
-            supports_crypt_layer: self.obfuscation_enabled.load(std::sync::atomic::Ordering::Relaxed),
-            requests_crypt_layer: self.obfuscation_enabled.load(std::sync::atomic::Ordering::Relaxed),
+            supports_crypt_layer: self
+                .obfuscation_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            requests_crypt_layer: self
+                .obfuscation_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
             requires_crypt_layer: false,
             supports_direct_udp_callback: false,
             supports_captcha: false,
@@ -1650,8 +1696,15 @@ impl UploadHandler {
         // Negotiate obfuscation with full handshake response.
         let negotiation = match tokio::time::timeout(
             std::time::Duration::from_secs(CLIENT_TIMEOUT_SECS),
-            tcp_obfuscation::negotiate_incoming(&mut raw_reader, &mut raw_writer, &self.user_hash, true),
-        ).await {
+            tcp_obfuscation::negotiate_incoming(
+                &mut raw_reader,
+                &mut raw_writer,
+                &self.user_hash,
+                true,
+            ),
+        )
+        .await
+        {
             Ok(Ok(result)) => result,
             Ok(Err(e)) if is_connection_closed(&e) => {
                 info!("Probe connection from {peer_addr} (closed immediately)");
@@ -1671,15 +1724,27 @@ impl UploadHandler {
         // We use an enum to avoid dyn dispatch issues with AsyncReadExt.
         enum StreamReader {
             Plain(tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>),
-            Obfuscated(tokio::io::BufReader<Rc4Reader<tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>>>),
+            Obfuscated(
+                tokio::io::BufReader<
+                    Rc4Reader<tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>>,
+                >,
+            ),
         }
         enum StreamWriter {
             Plain(tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>),
-            Obfuscated(tokio::io::BufWriter<Rc4Writer<tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>>>),
+            Obfuscated(
+                tokio::io::BufWriter<
+                    Rc4Writer<tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>>,
+                >,
+            ),
         }
 
         impl AsyncRead for StreamReader {
-            fn poll_read(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<io::Result<()>> {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
                 match self.get_mut() {
                     StreamReader::Plain(r) => Pin::new(r).poll_read(cx, buf),
                     StreamReader::Obfuscated(r) => Pin::new(r).poll_read(cx, buf),
@@ -1688,19 +1753,29 @@ impl UploadHandler {
         }
 
         impl AsyncWrite for StreamWriter {
-            fn poll_write(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<io::Result<usize>> {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<io::Result<usize>> {
                 match self.get_mut() {
                     StreamWriter::Plain(w) => Pin::new(w).poll_write(cx, buf),
                     StreamWriter::Obfuscated(w) => Pin::new(w).poll_write(cx, buf),
                 }
             }
-            fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
                 match self.get_mut() {
                     StreamWriter::Plain(w) => Pin::new(w).poll_flush(cx),
                     StreamWriter::Obfuscated(w) => Pin::new(w).poll_flush(cx),
                 }
             }
-            fn poll_shutdown(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
                 match self.get_mut() {
                     StreamWriter::Plain(w) => Pin::new(w).poll_shutdown(cx),
                     StreamWriter::Obfuscated(w) => Pin::new(w).poll_shutdown(cx),
@@ -1713,15 +1788,21 @@ impl UploadHandler {
         // Use a short timeout so we respond quickly without blocking the main login.
         let is_server_port_test = {
             let server_addr = self.shared_server_addr.read().await;
-            server_addr.map(|a| a.ip() == peer_addr.ip()).unwrap_or(false)
+            server_addr
+                .map(|a| a.ip() == peer_addr.ip())
+                .unwrap_or(false)
         };
 
         let mut obf_ember_hash: Option<[u8; 16]> = None;
         let mut obf_emule_caps: Option<PeerCapabilities> = None;
         let (mut reader, mut writer, hello_data, peer_user_hash) = match negotiation {
-            NegotiationResult::Obfuscated { recv_key, mut send_key } => {
+            NegotiationResult::Obfuscated {
+                recv_key,
+                mut send_key,
+            } => {
                 info!("Obfuscated connection from {peer_addr}");
-                let mut obf_reader = tokio::io::BufReader::new(Rc4Reader::new(raw_reader, recv_key));
+                let mut obf_reader =
+                    tokio::io::BufReader::new(Rc4Reader::new(raw_reader, recv_key));
 
                 let probe_timeout = if is_server_port_test {
                     info!("Server port test detected from {peer_addr}");
@@ -1729,12 +1810,18 @@ impl UploadHandler {
                 } else {
                     std::time::Duration::from_secs(15)
                 };
-                let first_pkt = tokio::time::timeout(probe_timeout, read_packet_async_inner(&mut obf_reader)).await;
+                let first_pkt =
+                    tokio::time::timeout(probe_timeout, read_packet_async_inner(&mut obf_reader))
+                        .await;
 
                 match first_pkt {
-                    Ok(Ok((proto, opcode, payload))) if proto == OP_EDONKEYHEADER && opcode == OP_HELLO => {
+                    Ok(Ok((proto, opcode, payload)))
+                        if proto == OP_EDONKEYHEADER && opcode == OP_HELLO =>
+                    {
                         let mut puh = [0u8; 16];
-                        if payload.len() >= 17 { puh.copy_from_slice(&payload[1..17]); }
+                        if payload.len() >= 17 {
+                            puh.copy_from_slice(&payload[1..17]);
+                        }
 
                         let buddy = self.shared_buddy_info.read().await.clone();
                         let hello_options = self.hello_options().await;
@@ -1767,7 +1854,8 @@ impl UploadHandler {
 
                         let emule_payload = build_emule_info(
                             self.udp_port,
-                            self.obfuscation_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                            self.obfuscation_enabled
+                                .load(std::sync::atomic::Ordering::Relaxed),
                             Some(&self.ember_hash),
                             None,
                         );
@@ -1784,17 +1872,16 @@ impl UploadHandler {
                         if is_server_port_test {
                             info!("Server port test from {peer_addr}: replied to Hello+EmuleInfo, port verified");
                             let mut discard = [0u8; 4096];
-                            let _ = tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                async {
+                            let _ =
+                                tokio::time::timeout(std::time::Duration::from_secs(5), async {
                                     loop {
                                         match obf_reader.read(&mut discard).await {
                                             Ok(0) | Err(_) => break,
                                             Ok(_) => continue,
                                         }
                                     }
-                                }
-                            ).await;
+                                })
+                                .await;
                             return Ok(());
                         }
 
@@ -1802,9 +1889,16 @@ impl UploadHandler {
                         let mut obf_peer_ember_hash: Option<[u8; 16]> = None;
                         let mut obf_peer_caps: Option<PeerCapabilities> = None;
                         for _ in 0..5 {
-                            match tokio::time::timeout(std::time::Duration::from_secs(5), read_packet_async_inner(&mut obf_reader)).await {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                read_packet_async_inner(&mut obf_reader),
+                            )
+                            .await
+                            {
                                 Ok(Ok((p, o, ref data))) => {
-                                    if p == OP_EMULEPROT && (o == OP_EMULEINFOANSWER || o == OP_EMULEINFO) {
+                                    if p == OP_EMULEPROT
+                                        && (o == OP_EMULEINFOANSWER || o == OP_EMULEINFO)
+                                    {
                                         let ic = parse_emule_info(data);
                                         if ic.ember_hash.is_some() {
                                             obf_peer_ember_hash = ic.ember_hash;
@@ -1817,12 +1911,20 @@ impl UploadHandler {
                             }
                         }
 
-                        let obf_writer = tokio::io::BufWriter::new(Rc4Writer::new(raw_writer, send_key));
+                        let obf_writer =
+                            tokio::io::BufWriter::new(Rc4Writer::new(raw_writer, send_key));
                         obf_ember_hash = obf_peer_ember_hash;
                         obf_emule_caps = obf_peer_caps;
-                        (StreamReader::Obfuscated(obf_reader), StreamWriter::Obfuscated(obf_writer), payload, puh)
+                        (
+                            StreamReader::Obfuscated(obf_reader),
+                            StreamWriter::Obfuscated(obf_writer),
+                            payload,
+                            puh,
+                        )
                     }
-                    Ok(Ok((proto, opcode, _))) if proto == OP_EMULEPROT && opcode == OP_PORTTEST => {
+                    Ok(Ok((proto, opcode, _)))
+                        if proto == OP_EMULEPROT && opcode == OP_PORTTEST =>
+                    {
                         let mut pkt = Vec::with_capacity(8);
                         pkt.push(OP_EMULEPROT);
                         pkt.extend_from_slice(&2u32.to_le_bytes());
@@ -1854,9 +1956,16 @@ impl UploadHandler {
                     let reply = [0x12u8];
                     write_packet_async(&mut wr, proto, OP_PORTTEST, &reply).await?;
                     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-                    { let mut waiters = self.active_port_tests.lock().await; waiters.insert(peer_addr.ip(), tx); }
-                    let signal = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await;
-                    { let mut waiters = self.active_port_tests.lock().await; waiters.remove(&peer_addr.ip()); }
+                    {
+                        let mut waiters = self.active_port_tests.lock().await;
+                        waiters.insert(peer_addr.ip(), tx);
+                    }
+                    let signal =
+                        tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await;
+                    {
+                        let mut waiters = self.active_port_tests.lock().await;
+                        waiters.remove(&peer_addr.ip());
+                    }
                     if let Ok(Some(_)) = signal {
                         write_packet_async(&mut wr, proto, OP_PORTTEST, &reply).await?;
                     }
@@ -1864,13 +1973,17 @@ impl UploadHandler {
                 }
 
                 if proto != OP_EDONKEYHEADER || opcode != OP_HELLO {
-                    info!("Non-Hello packet from {peer_addr}: proto=0x{proto:02X} op=0x{opcode:02X}");
+                    info!(
+                        "Non-Hello packet from {peer_addr}: proto=0x{proto:02X} op=0x{opcode:02X}"
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     return Ok(());
                 }
 
                 let mut puh = [0u8; 16];
-                if hd.len() >= 17 { puh.copy_from_slice(&hd[1..17]); }
+                if hd.len() >= 17 {
+                    puh.copy_from_slice(&hd[1..17]);
+                }
                 debug!("Got Hello from {peer_addr}");
 
                 let buddy = self.shared_buddy_info.read().await.clone();
@@ -1888,7 +2001,8 @@ impl UploadHandler {
                     buddy,
                     &hello_options,
                 );
-                write_packet_async(&mut wr, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_payload).await?;
+                write_packet_async(&mut wr, OP_EDONKEYHEADER, OP_HELLOANSWER, &hello_payload)
+                    .await?;
 
                 // Mirror eMule's ListenSocket::ProcessPacket OP_HELLO path
                 // (ListenSocket.cpp:273): after responding with OP_HELLOANSWER,
@@ -1924,31 +2038,41 @@ impl UploadHandler {
                 // is why this regression only ever bit callback flows.
                 let emule_payload = build_emule_info(
                     self.udp_port,
-                    self.obfuscation_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                    self.obfuscation_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
                     Some(&self.ember_hash),
                     None,
                 );
-                write_packet_async(&mut wr, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_payload).await?;
+                write_packet_async(&mut wr, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_payload)
+                    .await?;
                 (rd, wr, hd, puh)
             }
         };
 
-        let (_, mut hello_caps) =
-            parse_hello_packet(&hello_data).unwrap_or_else(|_| ([0u8; 16], PeerCapabilities::default()));
+        let (_, mut hello_caps) = parse_hello_packet(&hello_data)
+            .unwrap_or_else(|_| ([0u8; 16], PeerCapabilities::default()));
         if let Some(obf_caps) = obf_emule_caps.take() {
             merge_caps(&mut hello_caps, obf_caps);
         }
         let peer_source_exchange_ver = hello_caps.source_exchange_ver.max(1);
         let peer_secure_ident_level = hello_caps.secure_ident_level;
         let peer_compression_ver = hello_caps.compression_ver;
-        let mut ul_peer_name = if hello_caps.peer_name.is_empty() { peer_addr.to_string() } else { hello_caps.peer_name.clone() };
+        let mut ul_peer_name = if hello_caps.peer_name.is_empty() {
+            peer_addr.to_string()
+        } else {
+            hello_caps.peer_name.clone()
+        };
         let mut ul_client_software = client_software_from_caps(&hello_caps);
         let ul_country_code = crate::geoip::lookup_country(&self.geoip, peer_addr.ip());
 
         if peer_user_hash != [0u8; 16] {
             if let Ok(set) = self.banned_hashes.read() {
                 if set.contains(&peer_user_hash) {
-                    info!("Rejecting upload session from banned user {} ({})", crate::security::short_hash(&peer_user_hash), peer_addr);
+                    info!(
+                        "Rejecting upload session from banned user {} ({})",
+                        crate::security::short_hash(&peer_user_hash),
+                        peer_addr
+                    );
                     return Ok(());
                 }
             }
@@ -1977,7 +2101,10 @@ impl UploadHandler {
                     return Ok(());
                 }
             };
-            let _ = self.buddy_conn_tx.send((peer_user_hash, callback_check, tcp_reader, tcp_writer)).await;
+            let _ = self
+                .buddy_conn_tx
+                .send((peer_user_hash, callback_check, tcp_reader, tcp_writer))
+                .await;
             return Ok(());
         }
 
@@ -2019,7 +2146,8 @@ impl UploadHandler {
                         (!entries.is_empty()).then_some(0)
                     } else {
                         entries.iter().position(|e| {
-                            peer_hello_port == 0 || e.expected_tcp_port == 0
+                            peer_hello_port == 0
+                                || e.expected_tcp_port == 0
                                 || e.expected_tcp_port == peer_hello_port
                         })
                     };
@@ -2060,10 +2188,21 @@ impl UploadHandler {
                 matched
             };
             if let Some(file_hash) = callback_file {
-                info!("Recognized KAD callback connection from {peer_addr} for file {}", hex::encode(file_hash));
-                let (dyn_reader, dyn_writer, emule_done): (Box<dyn tokio::io::AsyncRead + Unpin + Send>, Box<dyn tokio::io::AsyncWrite + Unpin + Send>, bool) = match (reader, writer) {
-                    (StreamReader::Plain(r), StreamWriter::Plain(w)) => (Box::new(r), Box::new(w), false),
-                    (StreamReader::Obfuscated(r), StreamWriter::Obfuscated(w)) => (Box::new(r), Box::new(w), true),
+                info!(
+                    "Recognized KAD callback connection from {peer_addr} for file {}",
+                    hex::encode(file_hash)
+                );
+                let (dyn_reader, dyn_writer, emule_done): (
+                    Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                    Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                    bool,
+                ) = match (reader, writer) {
+                    (StreamReader::Plain(r), StreamWriter::Plain(w)) => {
+                        (Box::new(r), Box::new(w), false)
+                    }
+                    (StreamReader::Obfuscated(r), StreamWriter::Obfuscated(w)) => {
+                        (Box::new(r), Box::new(w), true)
+                    }
                     _ => {
                         warn!("Mismatched reader/writer types for KAD callback");
                         return Ok(());
@@ -2120,20 +2259,16 @@ impl UploadHandler {
                         hex::encode(file_hash)
                     );
                     let (dyn_reader, dyn_writer, emule_done) = match (reader, writer) {
-                        (StreamReader::Plain(r), StreamWriter::Plain(w)) => {
-                            (
-                                Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-                                Box::new(w) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-                                false,
-                            )
-                        }
-                        (StreamReader::Obfuscated(r), StreamWriter::Obfuscated(w)) => {
-                            (
-                                Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-                                Box::new(w) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-                                true,
-                            )
-                        }
+                        (StreamReader::Plain(r), StreamWriter::Plain(w)) => (
+                            Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                            Box::new(w) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                            false,
+                        ),
+                        (StreamReader::Obfuscated(r), StreamWriter::Obfuscated(w)) => (
+                            Box::new(r) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                            Box::new(w) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                            true,
+                        ),
                         _ => {
                             warn!("Mismatched reader/writer types for server callback");
                             return Ok(());
@@ -2231,7 +2366,8 @@ impl UploadHandler {
             let banned = tracker.record_request(peer_addr.ip());
             drop(tracker);
             if banned {
-                self.emit_auto_ban(peer_addr.ip(), "excessive upload requests (rate limit)").await;
+                self.emit_auto_ban(peer_addr.ip(), "excessive upload requests (rate limit)")
+                    .await;
                 anyhow::bail!("auto-banned for excessive requests");
             }
         }
@@ -2277,11 +2413,18 @@ impl UploadHandler {
             }
             let emule_payload = build_emule_info(
                 self.udp_port,
-                self.obfuscation_enabled.load(std::sync::atomic::Ordering::Relaxed),
+                self.obfuscation_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
                 Some(&self.ember_hash),
                 None,
             );
-            write_packet_async(&mut writer, OP_EMULEPROT, OP_EMULEINFOANSWER, &emule_payload).await?;
+            write_packet_async(
+                &mut writer,
+                OP_EMULEPROT,
+                OP_EMULEINFOANSWER,
+                &emule_payload,
+            )
+            .await?;
         } else {
             deferred_packet = Some((proto2, opcode2, payload2));
         }
@@ -2325,8 +2468,15 @@ impl UploadHandler {
             // has a verifier to challenge us with. Previously this
             // site passed `None`, which silently disabled Ember
             // identity verification on every upload session.
-            let payload = build_ember_hello(&self.ember_hash, &self.nickname, Some(&self.ed25519_public_key));
-            if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload).await.is_ok() {
+            let payload = build_ember_hello(
+                &self.ember_hash,
+                &self.nickname,
+                Some(&self.ed25519_public_key),
+            );
+            if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_HELLO, &payload)
+                .await
+                .is_ok()
+            {
                 ul_sent_ember_hello = true;
             }
         }
@@ -2388,22 +2538,29 @@ impl UploadHandler {
         // EmuleInfo advertise the same level on a stock eMule, and the
         // EMULEINFO branch above refreshes it if the peer chose to send
         // one).
-        let mut pending_secident_challenge: Option<u32> = super::transfer::maybe_send_secident_challenge(
-            &mut writer,
-            Some(&self.credit_manager),
-            peer_user_hash,
-            peer_addr,
-            peer_secure_ident_level,
-        ).await?;
+        let mut pending_secident_challenge: Option<u32> =
+            super::transfer::maybe_send_secident_challenge(
+                &mut writer,
+                Some(&self.credit_manager),
+                peer_user_hash,
+                peer_addr,
+                peer_secure_ident_level,
+            )
+            .await?;
 
         // Ember Peer Exchange: send our source list to Ember peers.
         // Snapshot the generation we sent so the periodic resend loop
         // below only re-ships when the shared payload has actually been
         // rebuilt with new sources/peers, not on every timer tick.
-        info!("Peer {peer_addr}: is_ember={}, mod_version='{}', ember_hash={}, client='{}'",
-            hello_caps.is_ember, hello_caps.mod_version,
-            peer_ember_hash.map(|h| hex::encode(h)).unwrap_or_else(|| "none".to_string()),
-            ul_client_software);
+        info!(
+            "Peer {peer_addr}: is_ember={}, mod_version='{}', ember_hash={}, client='{}'",
+            hello_caps.is_ember,
+            hello_caps.mod_version,
+            peer_ember_hash
+                .map(|h| hex::encode(h))
+                .unwrap_or_else(|| "none".to_string()),
+            ul_client_software
+        );
         let mut last_epx_generation: u64 = self
             .ember_payload_generation
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -2411,21 +2568,34 @@ impl UploadHandler {
         if hello_caps.is_ember {
             let epx_data = self.ember_payload.read().await.clone();
             if !epx_data.is_empty() {
-                info!("Sending EPX to Ember peer {peer_addr} ({} bytes, gen {})", epx_data.len(), last_epx_generation);
-                let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_SOURCEEXCHANGE, &*epx_data).await;
+                info!(
+                    "Sending EPX to Ember peer {peer_addr} ({} bytes, gen {})",
+                    epx_data.len(),
+                    last_epx_generation
+                );
+                let _ = write_packet_async(
+                    &mut writer,
+                    OP_EMULEPROT,
+                    OP_EMBER_SOURCEEXCHANGE,
+                    &*epx_data,
+                )
+                .await;
                 self.sx_overhead.record_upload((6 + epx_data.len()) as u64);
             } else {
                 info!("EPX payload empty, skipping EPX send to {peer_addr}");
             }
             if let std::net::IpAddr::V4(v4) = peer_addr.ip() {
                 if hello_caps.tcp_port > 0 && !crate::security::is_special_use_v4(v4) {
-                    let _ = self.upload_event_tx.send(UploadEvent {
-                        transfer_id: String::new(),
-                        kind: UploadEventKind::EmberPeerDiscovered {
-                            ip: v4,
-                            tcp_port: hello_caps.tcp_port,
-                        },
-                    }).await;
+                    let _ = self
+                        .upload_event_tx
+                        .send(UploadEvent {
+                            transfer_id: String::new(),
+                            kind: UploadEventKind::EmberPeerDiscovered {
+                                ip: v4,
+                                tcp_port: hello_caps.tcp_port,
+                            },
+                        })
+                        .await;
                 }
             }
         }
@@ -2483,7 +2653,10 @@ impl UploadHandler {
         if is_friend && hello_caps.is_ember {
             info!("Sending friend request to Ember peer {peer_addr}");
             let nick_bytes = self.nickname.as_bytes();
-            if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, nick_bytes).await.is_ok() {
+            if write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_FRIEND_REQ, nick_bytes)
+                .await
+                .is_ok()
+            {
                 friend_request_sent = true;
             }
         } else if is_friend {
@@ -2535,7 +2708,8 @@ impl UploadHandler {
         // flag and terminates the connection, letting all the normal
         // cleanup (slot guard drop, queue retain, completion event) run.
         let mut user_cancelled = false;
-        let mut slot_guard = UploadSlotGuard::new(self.active_count.clone(), self.slot_notify.clone());
+        let mut slot_guard =
+            UploadSlotGuard::new(self.active_count.clone(), self.slot_notify.clone());
         let mut session_start: Option<std::time::Instant> = None;
         let mut rate_tracker = SessionRateTracker::new();
         // (SecureIdent state `pending_secident_challenge` / `pending_peer_challenge`
@@ -2604,8 +2778,11 @@ impl UploadHandler {
         // happen after every handshake opcode; they invalidate when the peer
         // switches to a different file path mid-session.
         let mut cached_serve_file: Option<(PathBuf, std::fs::File)> = None;
-        let mut cached_part_tracker: Option<(PathBuf, super::part_tracker::PartTracker, std::time::Instant)>
-            = None;
+        let mut cached_part_tracker: Option<(
+            PathBuf,
+            super::part_tracker::PartTracker,
+            std::time::Instant,
+        )> = None;
         let mut cached_is_video_ext: Option<(PathBuf, bool)> = None;
         const PART_TRACKER_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -2617,7 +2794,8 @@ impl UploadHandler {
         // middle of a frame, causing desync and connection loss. Moving the
         // read into its own task keeps frame state private; the select! site
         // consumes whole packets from a channel and is trivially cancel-safe.
-        let (pkt_tx, mut pkt_rx) = tokio::sync::mpsc::channel::<std::io::Result<(u8, u8, Vec<u8>)>>(4);
+        let (pkt_tx, mut pkt_rx) =
+            tokio::sync::mpsc::channel::<std::io::Result<(u8, u8, Vec<u8>)>>(4);
         let reader_task = tokio::spawn(async move {
             loop {
                 let res = read_packet_async_inner(&mut reader).await;
@@ -5799,10 +5977,13 @@ impl UploadHandler {
 
         if let (true, Some(eh)) = (owns_ember_slot, peer_ember_hash) {
             self.ember_sessions.write().await.remove(&eh);
-            let _ = self.upload_event_tx.send(UploadEvent {
-                transfer_id: String::new(),
-                kind: UploadEventKind::EmberFriendDisconnected { ember_hash: eh },
-            }).await;
+            let _ = self
+                .upload_event_tx
+                .send(UploadEvent {
+                    transfer_id: String::new(),
+                    kind: UploadEventKind::EmberFriendDisconnected { ember_hash: eh },
+                })
+                .await;
         }
 
         // Remove from upload queue on disconnect
@@ -5811,7 +5992,10 @@ impl UploadHandler {
             queue.retain(|e| e.identity != queue_identity);
         }
 
-        self.slot_rates.lock().unwrap_or_else(|e| e.into_inner()).remove(&peer_addr);
+        self.slot_rates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&peer_addr);
 
         // slot_guard Drop handles upload slot release automatically
 
@@ -5890,10 +6074,13 @@ impl UploadHandler {
                     error: "Peer disconnected before any data transferred".to_string(),
                 }
             };
-            let _ = self.upload_event_tx.send(UploadEvent {
-                transfer_id: tid.clone(),
-                kind,
-            }).await;
+            let _ = self
+                .upload_event_tx
+                .send(UploadEvent {
+                    transfer_id: tid.clone(),
+                    kind,
+                })
+                .await;
         } else {
             let err_label = session_result
                 .as_ref()
@@ -5927,13 +6114,10 @@ fn parse_request_parts_i64(payload: &[u8]) -> anyhow::Result<Vec<(u64, u64)>> {
 
     for i in 0..3 {
         let start = u64::from_le_bytes(
-            payload[starts_offset + i * 8..starts_offset + i * 8 + 8]
-                .try_into()?,
+            payload[starts_offset + i * 8..starts_offset + i * 8 + 8].try_into()?,
         );
-        let end = u64::from_le_bytes(
-            payload[ends_offset + i * 8..ends_offset + i * 8 + 8]
-                .try_into()?,
-        );
+        let end =
+            u64::from_le_bytes(payload[ends_offset + i * 8..ends_offset + i * 8 + 8].try_into()?);
         if start > 0 || end > 0 {
             offsets.push((start, end));
         }
@@ -5981,13 +6165,11 @@ fn parse_request_parts_32(payload: &[u8]) -> anyhow::Result<Vec<(u64, u64)>> {
 
     for i in 0..3 {
         let start = u32::from_le_bytes(
-            payload[starts_offset + i * 4..starts_offset + i * 4 + 4]
-                .try_into()?,
+            payload[starts_offset + i * 4..starts_offset + i * 4 + 4].try_into()?,
         ) as u64;
-        let end = u32::from_le_bytes(
-            payload[ends_offset + i * 4..ends_offset + i * 4 + 4]
-                .try_into()?,
-        ) as u64;
+        let end =
+            u32::from_le_bytes(payload[ends_offset + i * 4..ends_offset + i * 4 + 4].try_into()?)
+                as u64;
         if start > 0 || end > 0 {
             offsets.push((start, end));
         }
@@ -6086,12 +6268,21 @@ async fn read_packet_async_inner<R: AsyncReadExt + Unpin>(
         let mut unpacked = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
-            let n = decoder.read(&mut buf)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("packed decode failed: {e}")))?;
-            if n == 0 { break; }
+            let n = decoder.read(&mut buf).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("packed decode failed: {e}"),
+                )
+            })?;
+            if n == 0 {
+                break;
+            }
             unpacked.extend_from_slice(&buf[..n]);
             if unpacked.len() > 1024 * 1024 {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "packed packet decompressed size exceeds limit"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "packed packet decompressed size exceeds limit",
+                ));
             }
         }
         return Ok((OP_EMULEPROT, opcode, unpacked));
@@ -6181,16 +6372,19 @@ mod scoring_tests {
     //! — and its interaction with the friend-slot override, version
     //! penalty, and BadGuy short-circuit.
     use super::*;
-    use crate::search::index::LocalIndex;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use chrono::Utc;
     use crate::network::ed2k::credits::{
-        CreditManager, EMBER_RELIABILITY_MAX, EMBER_RELIABILITY_MIN, EMBER_SPEED_BASELINE_BPS,
-        IdentState,
+        CreditManager, IdentState, EMBER_RELIABILITY_MAX, EMBER_RELIABILITY_MIN,
+        EMBER_SPEED_BASELINE_BPS,
     };
+    use crate::search::index::LocalIndex;
+    use chrono::Utc;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn addr() -> Option<SocketAddr> {
-        Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 4662))
+        Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            4662,
+        ))
     }
 
     /// Seed an eMule credit record so `get_queue_score` returns a
@@ -6230,14 +6424,28 @@ mod scoring_tests {
         seed_ember_credits(&mut cm, pubkey);
 
         let emule_score = score_queue_entry(
-            &cm, &idx, &user_hash, [0u8; 16], 300, addr(),
-            /* emule_version */ 0x42, /* is_friend_slot */ false,
-            /* ember_pubkey */ None, /* ember_verified */ false,
+            &cm,
+            &idx,
+            &user_hash,
+            [0u8; 16],
+            300,
+            addr(),
+            /* emule_version */ 0x42,
+            /* is_friend_slot */ false,
+            /* ember_pubkey */ None,
+            /* ember_verified */ false,
         );
         let ember_score = score_queue_entry(
-            &cm, &idx, &user_hash, [0u8; 16], 300, addr(),
-            0x42, false,
-            Some(&pubkey), true,
+            &cm,
+            &idx,
+            &user_hash,
+            [0u8; 16],
+            300,
+            addr(),
+            0x42,
+            false,
+            Some(&pubkey),
+            true,
         );
 
         // With 100% reliability (×1.5) and 2× baseline speed (×1.2),
@@ -6264,14 +6472,28 @@ mod scoring_tests {
         // hash-spoofer who hasn't proven possession. Must NOT pick
         // up the Ember ledger's multipliers.
         let scored_without_verification = score_queue_entry(
-            &cm, &idx, &user_hash, [0u8; 16], 300, addr(),
-            0x42, false,
-            Some(&pubkey), false,
+            &cm,
+            &idx,
+            &user_hash,
+            [0u8; 16],
+            300,
+            addr(),
+            0x42,
+            false,
+            Some(&pubkey),
+            false,
         );
         let emule_only = score_queue_entry(
-            &cm, &idx, &user_hash, [0u8; 16], 300, addr(),
-            0x42, false,
-            None, false,
+            &cm,
+            &idx,
+            &user_hash,
+            [0u8; 16],
+            300,
+            addr(),
+            0x42,
+            false,
+            None,
+            false,
         );
         assert_eq!(
             scored_without_verification, emule_only,
@@ -6292,16 +6514,33 @@ mod scoring_tests {
         seed_emule_credits(&mut cm, user_hash);
 
         let with_none = score_queue_entry(
-            &cm, &idx, &user_hash, [0u8; 16], 300, addr(),
-            0x42, false,
-            None, true,
+            &cm,
+            &idx,
+            &user_hash,
+            [0u8; 16],
+            300,
+            addr(),
+            0x42,
+            false,
+            None,
+            true,
         );
         let baseline = score_queue_entry(
-            &cm, &idx, &user_hash, [0u8; 16], 300, addr(),
-            0x42, false,
-            None, false,
+            &cm,
+            &idx,
+            &user_hash,
+            [0u8; 16],
+            300,
+            addr(),
+            0x42,
+            false,
+            None,
+            false,
         );
-        assert_eq!(with_none, baseline, "None pubkey must take eMule path regardless of verified flag");
+        assert_eq!(
+            with_none, baseline,
+            "None pubkey must take eMule path regardless of verified flag"
+        );
     }
 
     #[test]
@@ -6320,14 +6559,28 @@ mod scoring_tests {
         seed_ember_credits(&mut cm, pubkey);
 
         let ember_friend_score = score_queue_entry(
-            &cm, &idx, &user_hash, [0u8; 16], 300, addr(),
-            0x42, /* is_friend_slot */ true,
-            Some(&pubkey), true,
+            &cm,
+            &idx,
+            &user_hash,
+            [0u8; 16],
+            300,
+            addr(),
+            0x42,
+            /* is_friend_slot */ true,
+            Some(&pubkey),
+            true,
         );
         let emule_friend_score = score_queue_entry(
-            &cm, &idx, &user_hash, [0u8; 16], 300, addr(),
-            0x42, true,
-            None, false,
+            &cm,
+            &idx,
+            &user_hash,
+            [0u8; 16],
+            300,
+            addr(),
+            0x42,
+            true,
+            None,
+            false,
         );
         assert_eq!(
             ember_friend_score, emule_friend_score,
@@ -6354,15 +6607,28 @@ mod scoring_tests {
 
         // Pin the peer's verified ident to a fixed IP, then call
         // scoring from a different IP → BadGuy → eMule score 0.0.
-        let bad_addr = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 4662));
+        let bad_addr = Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            4662,
+        ));
         cm.check_identity_ip(user_hash, 0x0A000001); // 10.0.0.1 pinned
 
         let score = score_queue_entry(
-            &cm, &idx, &user_hash, [0u8; 16], 300, bad_addr,
-            /* emule_version */ 0, false,
-            Some(&pubkey), true,
+            &cm,
+            &idx,
+            &user_hash,
+            [0u8; 16],
+            300,
+            bad_addr,
+            /* emule_version */ 0,
+            false,
+            Some(&pubkey),
+            true,
         );
-        assert_eq!(score, 0.0, "BadGuy short-circuit must zero both routing paths");
+        assert_eq!(
+            score, 0.0,
+            "BadGuy short-circuit must zero both routing paths"
+        );
     }
 
     #[test]
@@ -6377,8 +6643,14 @@ mod scoring_tests {
         let bad_user = [0x02u8; 16];
         let good_pk = [0x11u8; 32];
         let bad_pk = [0x22u8; 32];
-        let good_addr = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 4662));
-        let bad_addr = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 4662));
+        let good_addr = Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            4662,
+        ));
+        let bad_addr = Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            4662,
+        ));
 
         seed_emule_credits(&mut cm, good_user);
         seed_emule_credits(&mut cm, bad_user);
@@ -6395,12 +6667,28 @@ mod scoring_tests {
         }
 
         let good = score_queue_entry(
-            &cm, &idx, &good_user, [0u8; 16], 300, good_addr,
-            0, false, Some(&good_pk), true,
+            &cm,
+            &idx,
+            &good_user,
+            [0u8; 16],
+            300,
+            good_addr,
+            0,
+            false,
+            Some(&good_pk),
+            true,
         );
         let bad = score_queue_entry(
-            &cm, &idx, &bad_user, [0u8; 16], 300, bad_addr,
-            0, false, Some(&bad_pk), true,
+            &cm,
+            &idx,
+            &bad_user,
+            [0u8; 16],
+            300,
+            bad_addr,
+            0,
+            false,
+            Some(&bad_pk),
+            true,
         );
         // Reliability multiplier differential only. Expected:
         // MAX / MIN = 1.5 / 0.8 ≈ 1.875. Assert at least 1.6× to

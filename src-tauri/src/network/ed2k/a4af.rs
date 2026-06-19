@@ -119,10 +119,7 @@ impl A4AFManager {
     /// - Queue rank: peers with low rank (<=50) on current file are less likely to swap
     /// - Credit weighting: higher-credit peers are more valuable to keep
     /// - Source count: prefer files with fewer active sources
-    pub fn process_swaps(
-        &self,
-        file_info: &HashMap<[u8; 16], FileSwapInfo>,
-    ) -> Vec<SwapAction> {
+    pub fn process_swaps(&self, file_info: &HashMap<[u8; 16], FileSwapInfo>) -> Vec<SwapAction> {
         let mut swaps = Vec::new();
         let now = chrono::Utc::now().timestamp();
 
@@ -143,9 +140,7 @@ impl A4AFManager {
                 } else {
                     PURGE_SOURCE_SWAP_STOP_SECS
                 };
-                if entry.last_swap_time > 0
-                    && now - entry.last_swap_time < cooldown_secs
-                {
+                if entry.last_swap_time > 0 && now - entry.last_swap_time < cooldown_secs {
                     continue;
                 }
 
@@ -191,8 +186,13 @@ impl A4AFManager {
     /// an A4AF candidate for any other file (i.e., it may be swapped away).
     pub fn is_swap_candidate(&self, peer_addr: SocketAddr, current_file: &[u8; 16]) -> bool {
         for (target_hash, entries) in &self.a4af_sources {
-            if target_hash == current_file { continue; }
-            if entries.iter().any(|e| e.peer_addr == peer_addr && e.assigned_file_hash == *current_file) {
+            if target_hash == current_file {
+                continue;
+            }
+            if entries
+                .iter()
+                .any(|e| e.peer_addr == peer_addr && e.assigned_file_hash == *current_file)
+            {
                 return true;
             }
         }
@@ -230,7 +230,9 @@ fn evaluate_swap(
 
     // High-credit peers are less likely to be swapped: require the target to
     // have meaningfully fewer sources before swapping a valuable peer away.
-    let source_advantage = assigned.active_source_count.saturating_sub(target.active_source_count + 1);
+    let source_advantage = assigned
+        .active_source_count
+        .saturating_sub(target.active_source_count + 1);
     if credit_ratio > 5.0 && source_advantage < 3 && has_needed_parts_on_assigned {
         return false;
     }

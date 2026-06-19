@@ -127,10 +127,7 @@ impl PartFileWriter {
             ))
             .spawn(move || writer_loop(file, &mut rx))
             .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("spawn writer thread: {e}"),
-                )
+                io::Error::new(io::ErrorKind::Other, format!("spawn writer thread: {e}"))
             })?;
 
         Ok(Self {
@@ -170,11 +167,7 @@ impl PartFileWriter {
     /// worker thread. Returns `(buffer, md4_hash)`. The buffer is returned
     /// alongside the hash so callers can run AICH recovery on a hash
     /// mismatch without re-reading the part.
-    pub async fn hash_part_md4(
-        &self,
-        offset: u64,
-        len: usize,
-    ) -> io::Result<(Vec<u8>, [u8; 16])> {
+    pub async fn hash_part_md4(&self, offset: u64, len: usize) -> io::Result<(Vec<u8>, [u8; 16])> {
         let (ack, ack_rx) = oneshot::channel();
         self.inner
             .tx

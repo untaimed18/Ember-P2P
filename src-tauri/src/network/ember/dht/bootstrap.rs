@@ -180,14 +180,16 @@ pub fn load_nodes(path: &Path) -> anyhow::Result<Vec<EmberContact>> {
         }
     }
 
-    info!("Loaded {} Ember DHT contacts from {}", contacts.len(), path.display());
+    info!(
+        "Loaded {} Ember DHT contacts from {}",
+        contacts.len(),
+        path.display()
+    );
     Ok(contacts)
 }
 
 /// Fetch bootstrap nodes from the rendezvous server.
-pub async fn fetch_bootstrap_nodes(
-    rendezvous_url: &str,
-) -> Result<Vec<BootstrapNode>, String> {
+pub async fn fetch_bootstrap_nodes(rendezvous_url: &str) -> Result<Vec<BootstrapNode>, String> {
     let url = format!("{}/bootstrap", rendezvous_url.trim_end_matches('/'));
     // https_only mirrors the rendezvous client: refuse to send the bootstrap
     // request in cleartext (or follow an http redirect), so a tampered/mistyped

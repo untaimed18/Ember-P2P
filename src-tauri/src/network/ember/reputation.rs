@@ -148,9 +148,10 @@ impl ReputationManager {
     /// Returns `true` if this event caused the peer to become banned.
     pub fn record_event(&mut self, node_id: &[u8; 16], event: ReputationEvent) -> bool {
         let now = now_secs();
-        let entry = self.peers.entry(*node_id).or_insert_with(|| {
-            PeerReputation::new(*node_id, now)
-        });
+        let entry = self
+            .peers
+            .entry(*node_id)
+            .or_insert_with(|| PeerReputation::new(*node_id, now));
         let was_banned = entry.is_banned(now);
         entry.apply_event(event, now);
         let now_banned = entry.is_banned(now);
@@ -165,20 +166,22 @@ impl ReputationManager {
     /// Get a peer's current score, applying decay first.
     pub fn get_score(&mut self, node_id: &[u8; 16]) -> i32 {
         self.maybe_decay();
-        self.peers.get(node_id).map_or(DEFAULT_REPUTATION, |p| p.score)
+        self.peers
+            .get(node_id)
+            .map_or(DEFAULT_REPUTATION, |p| p.score)
     }
 
     /// Get a peer's score without triggering decay (for use in immutable contexts).
     pub fn score(&self, node_id: &[u8; 16]) -> i32 {
-        self.peers.get(node_id).map_or(DEFAULT_REPUTATION, |p| p.score)
+        self.peers
+            .get(node_id)
+            .map_or(DEFAULT_REPUTATION, |p| p.score)
     }
 
     /// Check if a peer is currently banned.
     pub fn is_banned(&self, node_id: &[u8; 16]) -> bool {
         let now = now_secs();
-        self.peers
-            .get(node_id)
-            .map_or(false, |p| p.is_banned(now))
+        self.peers.get(node_id).map_or(false, |p| p.is_banned(now))
     }
 
     /// Get full reputation record for a peer.
@@ -246,8 +249,7 @@ impl ReputationManager {
         let serializable: Vec<&PeerReputation> = self.peers.values().collect();
         let json = serde_json::to_string(&serializable)
             .map_err(|e| format!("reputation serialize: {e}"))?;
-        std::fs::write(path, json)
-            .map_err(|e| format!("reputation write: {e}"))
+        std::fs::write(path, json).map_err(|e| format!("reputation write: {e}"))
     }
 
     /// Load reputation data from disk. Returns a new manager on any error.
@@ -274,9 +276,10 @@ impl ReputationManager {
         let mut peers = HashMap::with_capacity(entries.len());
         for mut entry in entries {
             entry.score = entry.score.clamp(MIN_REPUTATION, MAX_REPUTATION);
-            entry.banned_until = entry.banned_until.map(|until| {
-                if until > max_ban { max_ban } else { until }
-            });
+            entry.banned_until =
+                entry
+                    .banned_until
+                    .map(|until| if until > max_ban { max_ban } else { until });
             peers.insert(entry.node_id, entry);
         }
         let mut mgr = Self {
