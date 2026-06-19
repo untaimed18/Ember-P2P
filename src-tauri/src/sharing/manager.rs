@@ -37,6 +37,8 @@ pub fn global_preview_priority() -> bool {
 pub struct TransferControl {
     cancelled: AtomicBool,
     paused: AtomicBool,
+    cancel_notify: tokio::sync::Notify,
+    pause_notify: tokio::sync::Notify,
     preview_priority: AtomicBool,
     /// Set by the download worker once `preview_file` would succeed for this
     /// transfer (first part verified + previewable media type). Read by
@@ -62,6 +64,8 @@ impl TransferControl {
         Arc::new(Self {
             cancelled: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            cancel_notify: tokio::sync::Notify::new(),
+            pause_notify: tokio::sync::Notify::new(),
             preview_priority: AtomicBool::new(false),
             preview_ready: AtomicBool::new(false),
             download_priority: AtomicU8::new(2),
@@ -70,10 +74,16 @@ impl TransferControl {
 
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
+        self.cancel_notify.notify_waiters();
     }
 
     pub fn pause(&self) {
         self.paused.store(true, Ordering::Release);
+        // Wake any per-source data loop parked on `wait_cancel_or_pause` so it
+        // can send a graceful OP_CANCELTRANSFER to its peer (eMule's
+        // CPartFile::PauseFile notifies every DS_DOWNLOADING source) before the
+        // worker is torn down by the `PauseDownload` network command.
+        self.pause_notify.notify_waiters();
     }
 
     pub fn resume(&self) {
@@ -82,6 +92,64 @@ impl TransferControl {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Resolves as soon as the control is cancelled. Used by network tasks
+    /// that may be parked in socket I/O: checking `is_cancelled()` between
+    /// reads is not enough for an immediate Stop/Disconnect because a pending
+    /// read can wait until its timeout. Racing the transfer future against this
+    /// notification lets the task drop the socket future immediately.
+    pub async fn wait_cancelled(&self) {
+        loop {
+            // Register the waiter BEFORE checking the flag. `Notify` only
+            // wakes already-registered waiters and stores no permit, so a
+            // `notify_waiters()` that races the flag check would otherwise be
+            // lost — leaving a task parked on a long socket read until it
+            // times out. `enable()` arms the future so any cancel after this
+            // point is observed by the `.await` below.
+            let notified = self.cancel_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+            if self.is_cancelled() {
+                return;
+            }
+        }
+    }
+
+    /// Resolves as soon as the control is cancelled **or** paused. The
+    /// per-source data-receive loop races its socket read against this so that,
+    /// on either a user Stop/Cancel or a user Pause, it can send
+    /// OP_CANCELTRANSFER to the peer it is actively downloading from before the
+    /// task unwinds — mirroring eMule's `CPartFile::PauseFile`, which walks its
+    /// source list and notifies every `DS_DOWNLOADING` peer so the uploader
+    /// frees our slot immediately instead of waiting to notice a dropped
+    /// socket. Pause keeps the transfer's source knowledge (so resume is fast);
+    /// only the active wire transfer is told to stop.
+    pub async fn wait_cancel_or_pause(&self) {
+        loop {
+            // Arm both waiters BEFORE re-checking the flags so a
+            // `notify_waiters()` racing the check is not lost (see
+            // `wait_cancelled` for the full rationale).
+            let cancelled = self.cancel_notify.notified();
+            let paused = self.pause_notify.notified();
+            tokio::pin!(cancelled, paused);
+            cancelled.as_mut().enable();
+            paused.as_mut().enable();
+            if self.is_cancelled() || self.is_paused() {
+                return;
+            }
+            tokio::select! {
+                _ = cancelled => {}
+                _ = paused => {}
+            }
+            if self.is_cancelled() || self.is_paused() {
+                return;
+            }
+        }
     }
 
     pub fn is_paused(&self) -> bool {

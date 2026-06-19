@@ -409,6 +409,19 @@ pub(crate) fn is_queue_detached_error(error: &str) -> bool {
     error.contains("stage:queue_detached") || error.contains("connection lost while queued")
 }
 
+/// True when a per-source download task unwound because the user
+/// Stopped/Cancelled/Paused the transfer (the strings produced by the
+/// `TransferControl` cancel/pause arms and `check_control`), rather than
+/// because the source genuinely failed. Such unwinds must NOT emit a
+/// `SourceDetail{status:"failed"}` event, because that applies a reputation
+/// penalty (`set_failed_with_penalty`) — and `PauseDownload` keeps the
+/// per-file source list for fast resume, so repeated pause/resume cycles
+/// would otherwise steadily degrade and eventually evict a transfer's best
+/// peers. eMule treats a user pause/stop as a clean teardown.
+pub(crate) fn is_user_cancel_error(error: &str) -> bool {
+    error.contains("cancelled by user") || error.contains("cancelled while paused")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2430,10 +2443,33 @@ impl Ed2kDownload {
                         budget.saturating_sub(elapsed).max(std::time::Duration::from_secs(1))
                     };
 
-                    let (proto, opcode, payload) = match tokio::time::timeout(
-                        read_timeout,
-                        read_packet_async(&mut reader),
-                    ).await {
+                    let read_outcome = tokio::select! {
+                        biased;
+                        // User Stop/Cancel (or a network disconnect) landed
+                        // while we're actively downloading from this callback
+                        // source. Mirror eMule's CPartFile::PauseFile: send
+                        // OP_CANCELTRANSFER so the uploader frees our slot
+                        // immediately rather than waiting to notice the dropped
+                        // TCP socket. Best-effort + time-boxed, then bail.
+                        // Fires on Pause too (eMule's PauseFile notifies every
+                        // DS_DOWNLOADING source); the Failed handler ignores the
+                        // resulting unwind because the transfer is already
+                        // marked Paused.
+                        _ = self.control.wait_cancel_or_pause() => {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_millis(400),
+                                write_packet_async(
+                                    &mut writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
+                                ),
+                            ).await;
+                            anyhow::bail!("cancelled by user");
+                        }
+                        r = tokio::time::timeout(
+                            read_timeout,
+                            read_packet_async(&mut reader),
+                        ) => r,
+                    };
+                    let (proto, opcode, payload) = match read_outcome {
                         Ok(Ok(pkt)) => pkt,
                         Ok(Err(e)) => return Err(e.into()),
                         Err(_) => {

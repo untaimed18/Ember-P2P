@@ -132,7 +132,12 @@ impl ServerUdpSocket {
             if count >= MAX_REQUESTS_PER_SERVER {
                 break;
             }
-            let is_large = *size > u32::MAX as u64;
+            // eMule's IsLargeFile() boundary is OLD_MAX_EMULE_FILE_SIZE, not
+            // u32::MAX: files in the (OLD_MAX_EMULE_FILE_SIZE, u32::MAX] window
+            // must use the 64-bit encoding so the server's large-file index
+            // matches (see the constant's doc). Using u32::MAX here silently
+            // dropped sources for ~4 GiB files on every UDP server.
+            let is_large = *size > super::messages::OLD_MAX_EMULE_FILE_SIZE;
             if is_large && !supports_large {
                 continue;
             }
@@ -447,6 +452,10 @@ pub enum ServerUdpResponse {
         challenge: u32,
         user_count: u32,
         file_count: u32,
+        /// Server's soft per-client file limit (extended status, offset 16,
+        /// u32 LE). `0` if not advertised. eMule caps OP_OFFERFILES at this
+        /// (or 200), so we learn + persist it to apply the same cap.
+        soft_files: u32,
         obfuscation_port_tcp: u16,
         /// Alternate UDP port the server uses for **obfuscated** UDP
         /// traffic (extended status, offset 32, u16 LE). `0` if the
@@ -507,9 +516,10 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
             let user_count = cursor.read_u32::<LittleEndian>().ok()?;
             let file_count = cursor.read_u32::<LittleEndian>().ok()?;
 
+            let mut soft_files: u32 = 0;
             let udp_flags = if payload.len() >= 28 {
                 let _ = cursor.read_u32::<LittleEndian>(); // max_users (offset 12)
-                let _ = cursor.read_u32::<LittleEndian>(); // soft_files (offset 16)
+                soft_files = cursor.read_u32::<LittleEndian>().unwrap_or(0); // soft_files (offset 16)
                 let _ = cursor.read_u32::<LittleEndian>(); // hard_files (offset 20)
                 cursor.read_u32::<LittleEndian>().unwrap_or(0) // udp_flags (offset 24)
             } else {
@@ -555,6 +565,7 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
                 challenge,
                 user_count,
                 file_count,
+                soft_files,
                 obfuscation_port_tcp: tcp_obf_port,
                 obfuscation_port_udp: udp_obf_port,
                 udp_flags,
@@ -562,17 +573,25 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
             })
         }
         OP_GLOBFOUNDSOURCES => {
-            // eMule's UDP servers PACK MULTIPLE file responses into a single
-            // OP_GLOBFOUNDSOURCES datagram, separated by a re-emission of the
-            // `<OP_EDONKEYPROT><OP_GLOBFOUNDSOURCES>` header (see
-            // `UDPSocket.cpp:268-313`). The previous parser only read the
-            // first file's response and dropped every subsequent one in the
-            // same packet — silently halving (or worse) the source pool any
-            // time we batched multiple file hashes into one OP_GLOBGETSOURCES2
-            // request, which is the default for any session with >1 active
-            // download. We now drain every entry the packet contains and emit
-            // them all in one `FoundSources` so the recv handler injects all
-            // file hits at once.
+            // eMule/Lugdunum UDP servers PACK MULTIPLE file responses into a
+            // single OP_GLOBFOUNDSOURCES datagram, laid out CONTIGUOUSLY with
+            // NO per-block separator: <hash><count><sources> repeats back to
+            // back until the datagram ends. (eMule's own client parser proves
+            // this — for files it doesn't recognise it manually skips
+            // `count * 6` bytes to reach the next block, which is only
+            // necessary because there is no header to scan for.)
+            //
+            // A previous version required a re-emitted
+            // `<OP_EDONKEYPROT><OP_GLOBFOUNDSOURCES>` header between blocks and
+            // stopped at the first block not preceded by one — i.e. every
+            // block after the first in a packed reply. That silently dropped
+            // the sources for all-but-one file whenever more than one download
+            // was active (we batch hashes into OP_GLOBGETSOURCES2), which
+            // surfaced as "UDP returned no sources". We now read every
+            // contiguous block until the datagram is exhausted, and we do NOT
+            // probe for an inter-block header: a file hash legitimately
+            // starting with the two header bytes would otherwise misalign the
+            // whole rest of the packet.
             //
             // Per-entry layout: <file_hash[16]><source_count u8><sources(6 each)>.
             // Per-source layout: <id u32 LE><port u16 LE>. id < LOWID_THRESHOLD
@@ -617,28 +636,8 @@ fn parse_server_udp_response(data: &[u8], addr: SocketAddr) -> Option<ServerUdpR
                     break;
                 }
                 all_files.push((file_hash, sources));
-
-                // Look for `<OP_EDONKEYPROT><OP_GLOBFOUNDSOURCES>` separator
-                // introducing the next file's entry. Anything else (or end
-                // of buffer) terminates the loop.
-                let saved_pos = cursor.position();
-                let p_byte = match cursor.read_u8() {
-                    Ok(b) => b,
-                    Err(_) => break,
-                };
-                if p_byte != OP_EDONKEYPROT {
-                    cursor.set_position(saved_pos);
-                    break;
-                }
-                let o_byte = match cursor.read_u8() {
-                    Ok(b) => b,
-                    Err(_) => break,
-                };
-                if o_byte != OP_GLOBFOUNDSOURCES {
-                    cursor.set_position(saved_pos);
-                    break;
-                }
-                // Header consumed — loop reads the next file's entry.
+                // Next iteration reads the following contiguous block (if any);
+                // `read_exact` of the file hash fails cleanly at end-of-datagram.
             }
             if all_files.is_empty() {
                 return None;
@@ -943,28 +942,75 @@ mod tests {
         }
     }
 
-    /// eMule's UDP servers can pack multiple OP_GLOBFOUNDSOURCES file
-    /// responses in a single datagram (UDPSocket.cpp:268-313). Verify the
-    /// parser walks every entry and recognises the
-    /// `<OP_EDONKEYPROT><OP_GLOBFOUNDSOURCES>` separator between them.
+    /// eMule/Lugdunum UDP servers pack multiple OP_GLOBFOUNDSOURCES file
+    /// responses CONTIGUOUSLY in a single datagram, with NO separator between
+    /// blocks. Verify the parser walks every contiguous entry.
+    ///
+    /// Regression: a previous parser required a re-emitted
+    /// `<OP_EDONKEYPROT><OP_GLOBFOUNDSOURCES>` header between blocks and
+    /// dropped every file after the first in a packed reply — surfacing as
+    /// "UDP returned no sources" whenever more than one download was active.
     #[test]
     fn parse_multi_file_globfoundsources_packet_drains_all_entries() {
         let addr: SocketAddr = "10.0.0.1:4665".parse().unwrap();
         let hash_a = [0x11u8; 16];
         let hash_b = [0x22u8; 16];
+        let hash_c = [0x33u8; 16];
         let high_a = u32::from_le_bytes([1, 2, 3, 4]);
         let high_b = u32::from_le_bytes([5, 6, 7, 8]);
+        let low_c = 7u32;
 
         let mut packet = vec![OP_GLOBFOUNDSOURCES];
-        // First file: 1 source
+        // First file: 1 source — the next block follows immediately, no header.
         packet.extend_from_slice(&hash_a);
         packet.push(1);
         packet.extend_from_slice(&high_a.to_le_bytes());
         packet.extend_from_slice(&4662u16.to_le_bytes());
-        // Inter-file separator
-        packet.push(OP_EDONKEYPROT);
-        packet.push(OP_GLOBFOUNDSOURCES);
-        // Second file: 1 source
+        // Second file, contiguous: 1 HighID source.
+        packet.extend_from_slice(&hash_b);
+        packet.push(1);
+        packet.extend_from_slice(&high_b.to_le_bytes());
+        packet.extend_from_slice(&4663u16.to_le_bytes());
+        // Third file, contiguous: 1 LowID source.
+        packet.extend_from_slice(&hash_c);
+        packet.push(1);
+        packet.extend_from_slice(&low_c.to_le_bytes());
+        packet.extend_from_slice(&4664u16.to_le_bytes());
+
+        let parsed = parse_server_udp_response(&packet, addr).unwrap();
+        match parsed {
+            ServerUdpResponse::FoundSources { files, .. } => {
+                assert_eq!(files.len(), 3, "must drain ALL contiguous file entries");
+                assert_eq!(files[0].0, hash_a);
+                assert_eq!(files[0].1[0], (Ipv4Addr::new(1, 2, 3, 4), 4662, 0));
+                assert_eq!(files[1].0, hash_b);
+                assert_eq!(files[1].1[0], (Ipv4Addr::new(5, 6, 7, 8), 4663, 0));
+                assert_eq!(files[2].0, hash_c);
+                assert_eq!(files[2].1[0], (Ipv4Addr::UNSPECIFIED, 4664, low_c));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// A file hash whose first two bytes happen to equal
+    /// `<OP_EDONKEYPROT><OP_GLOBFOUNDSOURCES>` must NOT be mistaken for an
+    /// inter-block header — doing so would misalign the rest of the packet.
+    /// Guards the fix from regressing back into header-probing.
+    #[test]
+    fn parse_globfoundsources_does_not_treat_hash_prefix_as_separator() {
+        let addr: SocketAddr = "10.0.0.2:4665".parse().unwrap();
+        let hash_a = [0xABu8; 16];
+        let mut hash_b = [0x55u8; 16];
+        hash_b[0] = OP_EDONKEYPROT;
+        hash_b[1] = OP_GLOBFOUNDSOURCES;
+        let high_a = u32::from_le_bytes([1, 2, 3, 4]);
+        let high_b = u32::from_le_bytes([9, 9, 9, 9]);
+
+        let mut packet = vec![OP_GLOBFOUNDSOURCES];
+        packet.extend_from_slice(&hash_a);
+        packet.push(1);
+        packet.extend_from_slice(&high_a.to_le_bytes());
+        packet.extend_from_slice(&4662u16.to_le_bytes());
         packet.extend_from_slice(&hash_b);
         packet.push(1);
         packet.extend_from_slice(&high_b.to_le_bytes());
@@ -973,11 +1019,9 @@ mod tests {
         let parsed = parse_server_udp_response(&packet, addr).unwrap();
         match parsed {
             ServerUdpResponse::FoundSources { files, .. } => {
-                assert_eq!(files.len(), 2, "must drain BOTH file entries");
-                assert_eq!(files[0].0, hash_a);
-                assert_eq!(files[0].1[0], (Ipv4Addr::new(1, 2, 3, 4), 4662, 0));
-                assert_eq!(files[1].0, hash_b);
-                assert_eq!(files[1].1[0], (Ipv4Addr::new(5, 6, 7, 8), 4663, 0));
+                assert_eq!(files.len(), 2, "both blocks must parse");
+                assert_eq!(files[1].0, hash_b, "hash starting with header bytes must parse intact");
+                assert_eq!(files[1].1[0], (Ipv4Addr::new(9, 9, 9, 9), 4663, 0));
             }
             other => panic!("unexpected response: {other:?}"),
         }

@@ -45,8 +45,15 @@
    * this are trimmed from the front of the array; they remain in the database
    * and can be re-fetched with "Load older". Without the cap a long-running
    * session (or a friend spamming the channel) causes unbounded memory growth.
+   *
+   * Tied to `MAX_LOADED_MESSAGES` on purpose. When this was smaller (500) than
+   * the "Load older" bound (2000), the first live message that arrived after
+   * the user paged in older history sliced the array back down to the live cap
+   * and silently discarded the 1000+ messages they had just loaded and
+   * scrolled to. Keeping the two caps equal means a live message only trims
+   * once the array actually exceeds the same bound "Load older" enforces.
    */
-  const MAX_LIVE_MESSAGES = 500;
+  const MAX_LIVE_MESSAGES = MAX_LOADED_MESSAGES;
 
   let messages: ChatMessage[] = $state([]);
   let inputText = $state('');

@@ -4183,6 +4183,19 @@ impl UploadHandler {
                             }
                         }
 
+                        // Terminate promptly when the network is disconnected,
+                        // mid-batch. The outer session loop also checks this, but
+                        // only between OP_REQUESTPARTS batches, so without this a
+                        // large in-flight batch keeps streaming to the peer for
+                        // several seconds after the user clicked Disconnect.
+                        // Breaking returns to the outer loop, whose own
+                        // network-disconnected check ends the session and runs
+                        // the normal cleanup.
+                        if self.network_disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+                            info!("Upload to {peer_addr} ending: network disconnected mid-batch");
+                            break;
+                        }
+
                         // Stop serving blocks the moment the peer is banned so
                         // an in-flight transfer can't keep streaming through a
                         // multi-block OP_REQUESTPARTS. Breaking the block loop
