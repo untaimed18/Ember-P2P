@@ -76,6 +76,17 @@ pub(crate) async fn start_promoted_downloads(state: &AppState, promoted: &[Trans
     for transfer in promoted {
         let control = {
             let mut manager = state.transfer_manager.write().await;
+            // Cancel any control already registered for this transfer before
+            // replacing it. A previous worker generation's per-source tasks are
+            // detached `tokio::spawn`s that hold a clone of that old control and
+            // only stop when it is cancelled — aborting the worker handle does
+            // NOT abort them. Without this, a pause→resume (or any respawn)
+            // overwrote the registered control with a fresh one and left the old
+            // children transferring on an orphaned control, so a later Stop (or
+            // disconnect) could never reach them and the download never stopped.
+            if let Some(old) = manager.get_control(&transfer.id) {
+                old.cancel();
+            }
             let control = TransferControl::new();
             manager.register_control(&transfer.id, control.clone());
             control
