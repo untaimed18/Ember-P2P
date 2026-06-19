@@ -634,6 +634,16 @@ const KAD_CALLBACK_PLACEHOLDER_TIMEOUT_SECS: i64 =
 /// source-request flood limits (Lugdunum tolerates well under this rate).
 const STARVED_SERVER_REASK_SECS: i64 = 45;
 
+/// Grace period after a successful server login before we send the connection
+/// its first OP_GETSOURCES requests. The server streams its post-login welcome
+/// (OP_SERVERSTATUS / message / server list / ident) over the first ~1-2s;
+/// firing source requests inside that window — especially the
+/// login-batch + warm-start + starved-re-ask burst — is both premature and a
+/// flood-protection risk on Lugdunum servers, which then silently drop the
+/// requests. Holding off briefly lets the connection settle, matching eMule's
+/// paced ProcessLocalRequests behaviour.
+const SERVER_SOURCE_SETTLE_SECS: i64 = 3;
+
 async fn register_or_refresh_pending_kad_callback(
     pending: &upload_server::PendingKadCallbacks,
     source_ip: Ipv4Addr,
@@ -974,29 +984,49 @@ fn inject_source_into_active_transfers(
     stats
 }
 
-async fn try_connect_server(ip: &str, port: u16, obf_port: u16, app: &tauri::AppHandle, force_plain: bool) -> anyhow::Result<(Ed2kServerConnection, SocketAddr)> {
-    if !force_plain && obf_port != 0 {
-        let obf_addr = tokio::net::lookup_host((ip, obf_port))
-            .await?
-            .find(|addr| addr.is_ipv4())
-            .ok_or_else(|| anyhow::anyhow!("No IPv4 address found for {ip}:{obf_port}"))?;
-        info!("Trying encrypted DH connection to server {ip}:{obf_port}");
-        emit_server_log(app, &format!("Trying encrypted connection to {ip}:{obf_port}..."));
-        match Ed2kServerConnection::connect_encrypted(obf_addr).await {
-            Ok(conn) => {
-                info!("Encrypted DH connection to server {ip}:{obf_port} established");
-                emit_server_log(app, "Encrypted connection established");
-                return Ok((conn, obf_addr));
-            }
-            Err(e) => {
-                warn!("Encrypted DH connection to server {ip}:{obf_port} failed: {e}, falling back to plain");
-                emit_server_log(app, &format!("Encrypted connection failed, trying plain TCP on port {port}..."));
-            }
-        }
-    } else if force_plain {
-        info!("Skipping encryption (force_plain) for server {ip}:{port}");
+async fn try_connect_server(ip: &str, port: u16, obf_port: u16, app: &tauri::AppHandle, force_plain: bool, obfuscation_enabled: bool) -> anyhow::Result<(Ed2kServerConnection, SocketAddr)> {
+    // Decide whether/where to attempt the obfuscated (DH) server handshake.
+    // eMule negotiates protocol obfuscation via a DH agreement on the server's
+    // *standard* port when no separate obfuscation port is advertised (its log:
+    // "Connecting to … (45.82.80.155:5687 - using Protocol Obfuscation)" /
+    // "Obfuscated connection established on: … (45.82.80.155:5687)"). Crucially,
+    // some servers — notably "eMule Security" — return source lists ONLY over an
+    // obfuscated connection, so connecting plain there yields a working login
+    // (HighID, status, welcome) but zero OP_FOUNDSOURCES. So prefer obfuscation
+    // whenever it's enabled: use the dedicated obfuscation port if we learned
+    // one, otherwise the standard port. Fall back to plain if the DH handshake
+    // fails (e.g. a server that doesn't actually support obfuscation).
+    let enc_port = if obf_port != 0 {
+        Some(obf_port)
+    } else if obfuscation_enabled {
+        Some(port)
     } else {
-        info!("No obfuscation port known for server {ip}:{port}, using plain TCP");
+        None
+    };
+    if !force_plain {
+        if let Some(enc_port) = enc_port {
+            let enc_addr = tokio::net::lookup_host((ip, enc_port))
+                .await?
+                .find(|addr| addr.is_ipv4())
+                .ok_or_else(|| anyhow::anyhow!("No IPv4 address found for {ip}:{enc_port}"))?;
+            info!("Trying encrypted DH connection to server {ip}:{enc_port}");
+            emit_server_log(app, &format!("Trying encrypted connection to {ip}:{enc_port}..."));
+            match Ed2kServerConnection::connect_encrypted(enc_addr).await {
+                Ok(conn) => {
+                    info!("Encrypted DH connection to server {ip}:{enc_port} established");
+                    emit_server_log(app, "Encrypted connection established");
+                    return Ok((conn, enc_addr));
+                }
+                Err(e) => {
+                    warn!("Encrypted DH connection to server {ip}:{enc_port} failed: {e}, falling back to plain");
+                    emit_server_log(app, &format!("Encrypted connection failed, trying plain TCP on port {port}..."));
+                }
+            }
+        } else {
+            info!("Obfuscation disabled and no obfuscation port for server {ip}:{port}, using plain TCP");
+        }
+    } else {
+        info!("Skipping encryption (force_plain) for server {ip}:{port}");
     }
     let addr = tokio::net::lookup_host((ip, port))
         .await?
@@ -2260,6 +2290,17 @@ struct NetworkState {
     udp_source_queue: VecDeque<(Vec<u8>, std::net::SocketAddr)>,
     /// Round-robin cursor for TCP OP_GETSOURCES batching across downloads.
     server_tcp_getsources_cursor: usize,
+    /// Unix-seconds timestamp of the most recent successful server login.
+    /// Server source requests (OP_GETSOURCES) are held off until the
+    /// connection has settled for `SERVER_SOURCE_SETTLE_SECS` so we don't
+    /// blast a burst at the server before it has finished its post-login
+    /// welcome sequence (OP_SERVERSTATUS / message / list / ident). eMule
+    /// likewise paces source requests from its periodic ProcessLocalRequests
+    /// loop rather than firing them the instant OP_IDCHANGE arrives; sending
+    /// too early risks the server's flood protection silently dropping the
+    /// request (and, on some servers, the rest of the session's source
+    /// replies). 0 means "no server connected".
+    server_connected_at: i64,
     /// Per-file (hash hex) timestamp of the last *starved* fast re-ask of the
     /// connected server for sources. eMule keeps pulling the connected
     /// server's (growing) source list for a download that has no working
@@ -3810,7 +3851,7 @@ pub async fn start_network(
     // Mutable: a failed startup mapping auto-disables UPnP for the rest of
     // this session (see the emission below), which gates off the maintenance
     // retries, the QUIC port mapping, and the shutdown teardown.
-    let mut upnp_enabled = settings.upnp_enabled;
+    let upnp_enabled = settings.upnp_enabled;
 
     // Run UPnP setup and IP filter load concurrently since they're
     // independent. Gateway discovery is bounded to ~5s inside `setup()`, so a
@@ -3851,26 +3892,36 @@ pub async fn start_network(
     // when the user opted out. `gateway_found` lets the frontend distinguish
     // "no UPnP router" from "router rejected the mapping".
     //
-    // When the attempt failed we auto-disable UPnP: turning off the loop-owned
-    // flag stops the maintenance retries, the QUIC mapping, and the teardown
-    // from running for the rest of the session, and `auto_disabled: true` tells
-    // the frontend to persist the setting as off (the user is shown how to
-    // forward ports manually / via VPN and can re-enable it later). A
-    // mid-session loss is handled differently — see the `maintain` tick, which
-    // keeps retrying rather than disabling, since a router reboot usually
-    // recovers on its own.
+    // A failed *startup* mapping is treated the same as a mid-session loss: we
+    // do NOT disable UPnP. A slow or briefly-unavailable IGD at launch (SSDP
+    // not answered within the 5s discovery window, the network stack not fully
+    // up yet) is usually transient, and the periodic `maintain` tick already
+    // retries discovery + mapping with backoff and clears the firewalled flag
+    // on recovery. The old behaviour disabled the loop-owned flag here (killing
+    // those retries for the session) AND told the frontend to persist
+    // `upnp_enabled = false`, so a transient launch hiccup left the client
+    // permanently firewalled/LowID across restarts until the user manually
+    // re-enabled UPnP. We still surface the failure to the UI — the frontend
+    // toasts on a `!mapped` startup event regardless of `auto_disabled` — so
+    // the user can set up manual forwarding if the background retries don't
+    // succeed.
     if upnp_enabled {
-        let auto_disabled = !upnp_success;
-        if auto_disabled {
-            warn!("UPnP enabled but initial port mapping failed; disabling UPnP for this session");
-            upnp_enabled = false;
+        if !upnp_success {
+            warn!(
+                "UPnP initial port mapping failed; keeping UPnP enabled and \
+                 retrying in the background (set up manual port forwarding if \
+                 peers can't reach you)"
+            );
         }
         let _ = app_handle.emit(
             "upnp-status",
             serde_json::json!({
                 "mapped": upnp_success,
                 "gateway_found": upnp_mappings.has_gateway(),
-                "auto_disabled": auto_disabled,
+                // Never auto-disable on a startup failure anymore — the
+                // `maintain` tick keeps retrying — so this stays false and the
+                // setting is never persisted off behind the user's back.
+                "auto_disabled": false,
                 "tcp_port": tcp_port,
                 "udp_port": udp_port,
             }),
@@ -4068,6 +4119,7 @@ pub async fn start_network(
         server_addr: None,
         udp_source_queue: VecDeque::new(),
         server_tcp_getsources_cursor: 0,
+        server_connected_at: 0,
         starved_server_reask_at: std::collections::HashMap::new(),
         kad_source_search_cursor: 0,
         dead_sources: DeadSourceList::new(),
@@ -11213,10 +11265,16 @@ pub async fn start_network(
                                 state.udp_source_queue.extend(packets.into_iter().take(room));
                             }
                         }
-                        // Immediate TCP OP_GETSOURCES over the connected server.
+                        // TCP OP_GETSOURCES over the connected server — but only
+                        // once the connection has settled past its post-login
+                        // welcome (see `SERVER_SOURCE_SETTLE_SECS`). Before then
+                        // the periodic source timer (fast-forwarded on connect)
+                        // sends the initial batch; this on-demand kick would just
+                        // add to a premature, flood-prone burst.
                         if !state.low_id
                             && state.server_connected
                             && state.server_connection.is_some()
+                            && now.saturating_sub(state.server_connected_at) >= SERVER_SOURCE_SETTLE_SECS
                         {
                             if let Some(conn) = state.server_connection.as_mut() {
                                 for (tid, fh, file_size) in &targets {
@@ -11562,7 +11620,12 @@ pub async fn start_network(
                         }
                         out
                     };
-                    if !starved.is_empty() {
+                    // Hold off until the connection has settled past its
+                    // post-login welcome (see `SERVER_SOURCE_SETTLE_SECS`); the
+                    // periodic source timer covers the initial batch.
+                    if !starved.is_empty()
+                        && now.saturating_sub(state.server_connected_at) >= SERVER_SOURCE_SETTLE_SECS
+                    {
                         if let Some(conn) = state.server_connection.as_mut() {
                             for (tid, fh, file_size) in &starved {
                                 if let Ok(bytes) = conn.send_get_sources(fh, *file_size).await {
@@ -12461,6 +12524,7 @@ pub async fn start_network(
                         let nickname = settings.nickname.clone();
                         let tcp_port = state.tcp_port;
                         let force_plain = state.server_reconnect_failures >= 3;
+                        let obfuscation_enabled = state.obfuscation_enabled;
                         state.server_last_connect_attempt = Some(std::time::Instant::now());
                         // Pre-set server addr so upload handler can detect HighID port test callbacks
                         if let Ok(ip_addr) = ip.parse::<std::net::IpAddr>() {
@@ -12482,7 +12546,7 @@ pub async fn start_network(
                                         emit_server_log(&app_for_auto, &format!("Retrying ({})...", attempt + 1));
                                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                                     }
-                                    let (mut conn, resolved_addr) = match try_connect_server(&ip, port, obf_port, &app_for_auto, force_plain).await {
+                                    let (mut conn, resolved_addr) = match try_connect_server(&ip, port, obf_port, &app_for_auto, force_plain, obfuscation_enabled).await {
                                         Ok(r) => r,
                                         Err(e) => { last_err = format!("Connect failed: {e}"); continue; }
                                     };
@@ -12616,7 +12680,7 @@ pub async fn start_network(
                         }
                     }
                     match resp {
-                        ServerUdpResponse::StatusResponse { addr, challenge, user_count, file_count, obfuscation_port_tcp, obfuscation_port_udp, udp_flags, server_udp_key } => {
+                        ServerUdpResponse::StatusResponse { addr, challenge, user_count, file_count, soft_files, obfuscation_port_tcp, obfuscation_port_udp, udp_flags, server_udp_key } => {
                             // eMule: verify challenge to prevent spoofed status responses
                             let expected = server_udp.take_challenge(&addr);
                             if expected != Some(challenge) {
@@ -12625,6 +12689,12 @@ pub async fn start_network(
                                 let tcp_port = addr.port().saturating_sub(4);
                                 state.server_list.update_server_stats(
                                     &addr.ip().to_string(), tcp_port, user_count, file_count, obfuscation_port_tcp,
+                                );
+                                // Learn the server's soft per-client file limit so
+                                // OP_OFFERFILES gets capped like eMule on the next
+                                // connect (persisted to server.met via ST_SOFTFILES).
+                                state.server_list.update_soft_files(
+                                    &addr.ip().to_string(), tcp_port, soft_files,
                                 );
                                 // L11: Store per-server UDP flags for feature gating
                                 state.server_list.update_udp_flags(
@@ -13035,8 +13105,19 @@ pub async fn start_network(
                         state.server_connected = true;
                         state.server_reconnect_failures = 0;
                         last_server_activity_at = chrono::Utc::now().timestamp();
+                        state.server_connected_at = last_server_activity_at;
                         state.server_addr = Some(addr);
                         *shared_server_addr.write().await = Some(addr);
+
+                        // Cap OP_OFFERFILES at this server's soft per-client file
+                        // limit, the way eMule's SendListToServer does. Looked up
+                        // from the server-list metadata (ST_SOFTFILES); 0 => the
+                        // 200-file default. Set before the post-login offer below.
+                        let server_soft_files = state.server_list.servers().iter()
+                            .find(|s| s.ip == ip && s.port == port)
+                            .map(|s| s.soft_files)
+                            .unwrap_or(0);
+                        conn.set_soft_files(server_soft_files);
 
                         // HighID from server is the most reliable TCP firewall test:
                         // the server successfully connected back to our TCP port.
@@ -13226,66 +13307,24 @@ pub async fn start_network(
                             }
                         }
 
-                        // eMule: request sources for incomplete downloads after server login.
-                        // Send a small initial batch immediately (up to 5), then let the
-                        // periodic TCP source timer drain the rest. Sending all at once
-                        // triggers server flood protection.
-                        {
-                            let mut all_hashes: Vec<([u8; 16], u64)> = Vec::new();
-                            for pd in state.pending_downloads.values() {
-                                if pd.control.is_cancelled() || pd.control.is_paused() { continue; }
-                                if let Ok(hash_bytes) = hex::decode(&pd.file_hash) {
-                                    if hash_bytes.len() == 16 {
-                                        let mut fh = [0u8; 16];
-                                        fh.copy_from_slice(&hash_bytes);
-                                        all_hashes.push((fh, pd.file_size));
-                                    }
-                                }
-                            }
-                            {
-                                let mgr = transfer_manager.read().await;
-                                let seen: std::collections::HashSet<[u8; 16]> =
-                                    all_hashes.iter().map(|(fh, _)| *fh).collect();
-                                for tid in state.active_source_senders.keys() {
-                                    if let Some(transfer) = mgr.get_transfer(tid) {
-                                        if let Ok(raw) = hex::decode(&transfer.file_hash) {
-                                            if raw.len() == 16 {
-                                                let mut fh = [0u8; 16];
-                                                fh.copy_from_slice(&raw[..16]);
-                                                if !seen.contains(&fh) {
-                                                    all_hashes.push((fh, transfer.total_size));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            let total = all_hashes.len();
-                            const LOGIN_BATCH_LIMIT: usize = 5;
-                            let immediate = total.min(LOGIN_BATCH_LIMIT);
-                            let mut sent = 0u32;
-                            for (fh, file_size) in all_hashes.iter().take(immediate) {
-                                if let Ok(bytes) = conn.send_get_sources(fh, *file_size).await {
-                                    if bytes > 0 {
-                                        sent += 1;
-                                        // TCP source request to the connected
-                                        // server is source-discovery overhead.
-                                        stats_manager.add_overhead(
-                                            crate::storage::statistics::OverheadCategory::SourceExchange,
-                                            crate::storage::statistics::OverheadDirection::Upload,
-                                            bytes,
-                                        );
-                                    }
-                                }
-                            }
-                            let deferred = total - immediate;
-                            if deferred > 0 {
-                                state.server_tcp_getsources_cursor = 0;
-                                info!("Sent OP_GETSOURCES for {sent}/{total} downloads on login ({deferred} deferred to periodic batch)");
-                            } else if total > 0 {
-                                info!("Sent OP_GETSOURCES to server for {sent}/{total} downloads");
-                            }
-                        }
+                        // eMule: request sources for incomplete downloads after
+                        // server login — but NOT in the same instant we receive
+                        // OP_IDCHANGE. The server is still streaming its welcome
+                        // (OP_SERVERSTATUS / message / list / ident) for the next
+                        // ~1-2s, and bursting OP_GETSOURCES into that window
+                        // (login batch + warm-start + starved re-ask all at once)
+                        // is both premature and trips Lugdunum flood protection,
+                        // which then silently drops source requests. Instead, let
+                        // the connection settle: fast-forward the periodic TCP
+                        // source timer to fire just after `SERVER_SOURCE_SETTLE_SECS`
+                        // so the first OP_GETSOURCES batch goes out once the server
+                        // is ready (it already covers every pending + active
+                        // download). The on-demand warm-start / starved-re-ask
+                        // paths below are likewise gated on `server_connected_at`.
+                        state.server_tcp_getsources_cursor = 0;
+                        server_tcp_source_timer.reset_after(std::time::Duration::from_secs(
+                            SERVER_SOURCE_SETTLE_SECS as u64,
+                        ));
 
                         state.server_connection = Some(conn);
                         state.stats.server_status = "connected".to_string();
@@ -19446,6 +19485,25 @@ async fn handle_command_inner(
                 }
             }
 
+            // Cancel each active download's control BEFORE aborting its worker
+            // handle. The per-source connection tasks are detached
+            // `tokio::spawn`s; aborting the worker handle does NOT abort them,
+            // so without cancelling the shared control they keep their TCP
+            // connections open and keep transferring even though the network is
+            // logically disconnected. Cancelling trips the cooperative
+            // `check_control` at the top of each source loop so they bail and
+            // drop their sockets. The re-queue below registers fresh controls
+            // for the resume-on-reconnect entries, so this only affects the
+            // now-dead generation.
+            {
+                let mgr = transfer_manager.read().await;
+                for tid in state.download_handles.keys() {
+                    if let Some(control) = mgr.get_control(tid) {
+                        control.cancel();
+                    }
+                }
+            }
+
             for (tid, handle) in state.download_handles.drain() {
                 handle.abort();
                 // Bounded wait so one download stuck in blocking I/O cannot
@@ -19842,6 +19900,7 @@ async fn handle_command_inner(
                 .find(|s| s.ip == ip && s.port == port)
                 .map(|s| s.obfuscation_port_tcp)
                 .unwrap_or(0);
+            let obfuscation_enabled = state.obfuscation_enabled;
             let ip_clone = ip.clone();
             let app_for_connect = app_handle.clone();
             // Pre-set server addr so upload handler can detect HighID port test callbacks
@@ -19862,7 +19921,7 @@ async fn handle_command_inner(
                             emit_server_log(&app_for_connect, &format!("Retrying ({})...", attempt + 1));
                             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         }
-                        let (mut conn, resolved_addr) = match try_connect_server(&ip_clone, port, obf_port, &app_for_connect, false).await {
+                        let (mut conn, resolved_addr) = match try_connect_server(&ip_clone, port, obf_port, &app_for_connect, false, obfuscation_enabled).await {
                             Ok(r) => r,
                             Err(e) => { last_err = format!("Connect failed: {e}"); continue; }
                         };

@@ -93,6 +93,15 @@ pub struct ServerEntry {
     /// health log distinguish "server is dead" from "server is
     /// alive but doesn't have what we want".
     pub last_udp_source_reply_at: i64,
+    /// Last time (Unix timestamp, seconds) we SENT this server a UDP source
+    /// query. Runtime-only (not persisted). Collapses the burst of
+    /// per-download source queries fired at one server within a single search
+    /// round into a single "unanswered round" for failure accounting, so a
+    /// session with many active downloads doesn't excise a healthy-but-silent
+    /// server after only a few seconds. (eMule servers stay silent when they
+    /// don't index a given hash, so the per-packet `udp_consecutive_failures`
+    /// counter otherwise raced past the exclusion threshold under load.)
+    pub last_udp_query_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +136,7 @@ impl ServerEntry {
             udp_consecutive_failures: 0,
             last_udp_reply_at: 0,
             last_udp_source_reply_at: 0,
+            last_udp_query_at: 0,
         }
     }
 }
@@ -403,13 +413,35 @@ impl ServerList {
 
     /// Record that we sent a UDP source-discovery query
     /// (`OP_GLOBGETSOURCES` / `OP_GLOBGETSOURCES2`) to this server.
-    /// Bumps `udp_consecutive_failures`; the next inbound UDP packet
-    /// from the same server will reset it via `record_udp_reply`.
-    /// Saturating arithmetic so a long-running session against a
-    /// dead server can't overflow.
+    /// Records that we sent this server a UDP source query and, at most once
+    /// per cooldown window, bumps `udp_consecutive_failures`. The next inbound
+    /// UDP packet from the same server resets the counter via
+    /// `record_udp_reply`. Saturating arithmetic so a long-running session
+    /// against a dead server can't overflow.
+    ///
+    /// The cooldown collapses the burst of per-download source queries sent to
+    /// one server within a single search round into a single unanswered-round
+    /// increment. Without it, `K` active downloads bumped the counter `K`
+    /// times per ~5s round, racing past `MAX_UDP_CONSECUTIVE_FAILURES` within
+    /// seconds and excluding healthy-but-silent servers under multi-download
+    /// load.
     pub fn record_udp_query_sent(&mut self, ip: &str, port: u16) {
+        const UDP_FAILURE_COOLDOWN_SECS: i64 = 30;
         if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
-            entry.udp_consecutive_failures = entry.udp_consecutive_failures.saturating_add(1);
+            let now = chrono::Utc::now().timestamp();
+            // Only count (and advance the anchor) once per cooldown window. The
+            // anchor must NOT be refreshed on suppressed calls — otherwise the
+            // ~5s retry loop keeps pushing it forward so the 30s gap is never
+            // reached, the counter sticks at 1, and a genuinely dead server is
+            // never excluded. Advancing the anchor only on a real bump means a
+            // silent server accrues ~1 failure per 30s and is pruned after
+            // MAX_UDP_CONSECUTIVE_FAILURES windows, while a multi-download burst
+            // within a single window still counts once. A reply resets the
+            // counter to 0 via `record_udp_reply`.
+            if now.saturating_sub(entry.last_udp_query_at) >= UDP_FAILURE_COOLDOWN_SECS {
+                entry.udp_consecutive_failures = entry.udp_consecutive_failures.saturating_add(1);
+                entry.last_udp_query_at = now;
+            }
         }
     }
 
@@ -802,6 +834,25 @@ impl ServerList {
                     obfuscation_port_tcp
                 );
                 entry.obfuscation_port_tcp = obfuscation_port_tcp;
+            }
+        }
+    }
+
+    /// Store the server's soft per-client file limit (from extended UDP
+    /// status). eMule caps `OP_OFFERFILES` at `min(soft_files, 200)`; we
+    /// learn + persist it (ST_SOFTFILES) so the cap matches on later
+    /// connects. Only overwrite with a non-zero value so a status reply
+    /// without the extended fields can't clear a previously learned limit.
+    pub fn update_soft_files(&mut self, ip: &str, port: u16, soft_files: u32) {
+        if soft_files == 0 {
+            return;
+        }
+        if let Some(entry) = self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+            if entry.soft_files != soft_files {
+                tracing::info!(
+                    "Learned soft file limit {soft_files} for server {ip}:{port} from UDP status"
+                );
+                entry.soft_files = soft_files;
             }
         }
     }

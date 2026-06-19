@@ -706,6 +706,27 @@ async fn check_control(control: &TransferControl) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Grace window a per-source task gets, after its control is cancelled, to
+/// shut down gracefully on its own before the outer task `select!` force-drops
+/// it.
+///
+/// eMule's `CPartFile::PauseFile` (which `StopFile` calls) walks its source
+/// list and sends `OP_CANCELTRANSFER` to every peer it is actively downloading
+/// from, so the uploader frees our slot immediately instead of waiting to
+/// notice a vanished TCP socket. Our per-source download lives inside
+/// `download_parts_from_source`; when it is actively in the data-receive loop
+/// it reacts to cancellation by sending that same packet and then returning.
+/// The outer `select!` that races the whole future against `wait_cancelled()`
+/// would otherwise drop the future mid-send, so this backstop waits a short,
+/// bounded window first. If the task is parked in a phase that cannot send the
+/// packet (TCP connect / handshake — where the peer isn't an active uploader
+/// anyway), the function will not return on its own and this still force-drops
+/// it within the grace window, keeping Stop/Cancel near-immediate.
+async fn cancel_with_grace(control: &TransferControl) {
+    control.wait_cancelled().await;
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+}
+
 /// Outcome of an in-session re-queue attempt after `OP_OUTOFPARTREQS`.
 /// `Promoted` means the peer accepted us back into an active upload
 /// slot on the same TCP connection — caller should reset per-session
@@ -1450,56 +1471,59 @@ impl MultiSourceDownload {
                     Err(_) => return (src_idx, parts, Err(anyhow::anyhow!("download cancelled"))),
                 };
                 let freq_avail = src_avail.clone();
-                let result = download_parts_from_source(
-                    src_idx,
-                    &source,
-                    &parts,
-                    tracker,
-                    &part_path,
-                    &file_hash,
-                    file_size,
-                    &user_hash,
-                    &nickname,
-                    tcp_port,
-                    udp_port,
-                    bw,
-                    progress_tx,
-                    ph,
-                    aich_m,
-                    src_active.clone(),
-                    src_queued.clone(),
-                    sm_clone,
-                    cm_clone,
-                    cmt_clone,
-                    Some(cs_clone.clone()),
-                    src_avail,
-                    Some(etx_clone),
-                    tid_clone,
-                    bi_clone,
-                    ctrl_clone,
-                    obf_enabled,
-                    hello_server,
-                    qw,
-                    Some(shared_out),
-                    epx_payload.clone(),
-                    epx_gen.clone(),
-                    aich_p,
-                    sx_ipf,
-                    sx_ban,
-                    sx_ext,
-                    geo_clone.clone(),
-                    fh_clone.clone(),
-                    src_ember_hash,
-                    src_ember_pubkey,
-                    src_ember_secret,
-                    nick_for_src.clone(),
-                    sx_oh.clone(),
-                    // No pre-established stream — this is the initial-
-                    // sources path; we always dial these peers fresh.
-                    None,
-                    init_missing_parts,
-                )
-                .await;
+                let cancel_ctrl = ctrl_clone.clone();
+                let result = tokio::select! {
+                    res = download_parts_from_source(
+                        src_idx,
+                        &source,
+                        &parts,
+                        tracker,
+                        &part_path,
+                        &file_hash,
+                        file_size,
+                        &user_hash,
+                        &nickname,
+                        tcp_port,
+                        udp_port,
+                        bw,
+                        progress_tx,
+                        ph,
+                        aich_m,
+                        src_active.clone(),
+                        src_queued.clone(),
+                        sm_clone,
+                        cm_clone,
+                        cmt_clone,
+                        Some(cs_clone.clone()),
+                        src_avail,
+                        Some(etx_clone),
+                        tid_clone,
+                        bi_clone,
+                        ctrl_clone,
+                        obf_enabled,
+                        hello_server,
+                        qw,
+                        Some(shared_out),
+                        epx_payload.clone(),
+                        epx_gen.clone(),
+                        aich_p,
+                        sx_ipf,
+                        sx_ban,
+                        sx_ext,
+                        geo_clone.clone(),
+                        fh_clone.clone(),
+                        src_ember_hash,
+                        src_ember_pubkey,
+                        src_ember_secret,
+                        nick_for_src.clone(),
+                        sx_oh.clone(),
+                        // No pre-established stream — this is the initial-
+                        // sources path; we always dial these peers fresh.
+                        None,
+                        init_missing_parts,
+                    ) => res,
+                    _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
+                };
 
                 if !freq_avail.is_empty() {
                     let mut cs = cs_clone.write().await;
@@ -1537,6 +1561,11 @@ impl MultiSourceDownload {
                             "Source {} ({}): TCP dropped while queued — cooling down before re-dial",
                             src_idx, fail_ip,
                         );
+                    } else if super::transfer::is_user_cancel_error(&err_str) {
+                        // User Stop/Cancel/Pause — a clean teardown, not a
+                        // source failure. Skip the "failed" SourceDetail so we
+                        // don't penalize (and eventually evict) a good peer.
+                        info!("Source {} ({}): stopped by user", src_idx, fail_ip);
                     } else {
                         warn!("Source {} ({}) failed: {e:#}", src_idx, fail_ip);
                         let _ = fail_etx.send(DownloadEvent::SourceDetail {
@@ -1605,6 +1634,7 @@ impl MultiSourceDownload {
             let mut injection_deadline: Option<tokio::time::Instant> = None;
             let mut injection_channel_open = true;
             loop {
+                check_control(&self.control).await?;
                 let all_done = {
                     let t = tracker.read().await;
                     t.all_complete()
@@ -1656,6 +1686,9 @@ impl MultiSourceDownload {
                         }
                     } => {
                         let _ = result;
+                    }
+                    _ = self.control.wait_cancelled() => {
+                        anyhow::bail!("cancelled by user");
                     }
                     // Accept new source from the injection channel
                     new_src = new_source_rx.recv() => {
@@ -1795,33 +1828,38 @@ impl MultiSourceDownload {
                                     Err(_) => return (src_idx, Vec::new(), Err(anyhow::anyhow!("download cancelled"))),
                                 };
                                 let freq_avail = avail.clone();
-                                let result = download_parts_from_source(
-                                    src_idx, &src, &parts, trk, &pp, &fh, fs, &uh, &nn,
-                                    tp, up, bw, inj_progress_tx, ph, aich_m, sa, sq, sm, cm,
-                                    cmt, Some(cs.clone()), avail, Some(etx), tid, bi, ctrl,
-                                    obf_enabled, hello_server, inj_qw,
-                                    Some(inj_shared_out), inj_epx, inj_epx_gen,
-                                    inj_aich_p,
-                                    inj_ipf, inj_ban, inj_ext,
-                                    inj_geo, inj_fh,
-                                    inj_ember_hash,
-                                    inj_ember_pubkey,
-                                    inj_ember_secret,
-                                    inj_nick,
-                                    inj_sx_oh,
-                                    // Metadata-only injection (peer
-                                    // discovered via KAD/server source
-                                    // exchange); no pre-handshaked
-                                    // stream available.
-                                    None,
-                                    inj_missing_parts,
-                                ).await;
+                                let cancel_ctrl = ctrl.clone();
+                                let result = tokio::select! {
+                                    res = download_parts_from_source(
+                                        src_idx, &src, &parts, trk, &pp, &fh, fs, &uh, &nn,
+                                        tp, up, bw, inj_progress_tx, ph, aich_m, sa, sq, sm, cm,
+                                        cmt, Some(cs.clone()), avail, Some(etx), tid, bi, ctrl,
+                                        obf_enabled, hello_server, inj_qw,
+                                        Some(inj_shared_out), inj_epx, inj_epx_gen,
+                                        inj_aich_p,
+                                        inj_ipf, inj_ban, inj_ext,
+                                        inj_geo, inj_fh,
+                                        inj_ember_hash,
+                                        inj_ember_pubkey,
+                                        inj_ember_secret,
+                                        inj_nick,
+                                        inj_sx_oh,
+                                        // Metadata-only injection (peer
+                                        // discovered via KAD/server source
+                                        // exchange); no pre-handshaked
+                                        // stream available.
+                                        None,
+                                        inj_missing_parts,
+                                    ) => res,
+                                    _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
+                                };
                                 if !freq_avail.is_empty() {
                                     let mut csel = cs.write().await;
                                     csel.remove_source(&freq_avail);
                                 }
                                 if let Err(e) = &result {
-                                    if !super::transfer::is_queue_detached_error(&e.to_string()) {
+                                    if !super::transfer::is_queue_detached_error(&e.to_string())
+                                        && !super::transfer::is_user_cancel_error(&e.to_string()) {
                                         warn!("Injected source {} ({}) failed: {e:#}", src_idx, fail_ip);
                                         let _ = fail_etx.send(DownloadEvent::SourceDetail {
                                             transfer_id: fail_tid,
@@ -2012,34 +2050,39 @@ impl MultiSourceDownload {
                                     Err(_) => return (src_idx, Vec::new(), Err(anyhow::anyhow!("download cancelled"))),
                                 };
                                 let freq_avail = avail.clone();
-                                let result = download_parts_from_source(
-                                    src_idx, &src, &parts, trk, &pp, &fh, fs, &uh, &nn,
-                                    tp, up, bw, inj_progress_tx, ph, aich_m, sa, sq, sm, cm,
-                                    cmt, Some(cs.clone()), avail, Some(etx), tid, bi, ctrl,
-                                    obf_enabled, hello_server, inj_qw,
-                                    Some(inj_shared_out), inj_epx, inj_epx_gen,
-                                    inj_aich_p,
-                                    inj_ipf, inj_ban, inj_ext,
-                                    inj_geo, inj_fh,
-                                    inj_ember_hash,
-                                    inj_ember_pubkey,
-                                    inj_ember_secret,
-                                    inj_nick,
-                                    inj_sx_oh,
-                                    // The crucial bit: hand the
-                                    // already-handshaked stream to
-                                    // download_parts_from_source so it
-                                    // takes the adoption branch instead
-                                    // of dialing the LowID peer back.
-                                    Some(stream),
-                                    inj_missing_parts,
-                                ).await;
+                                let cancel_ctrl = ctrl.clone();
+                                let result = tokio::select! {
+                                    res = download_parts_from_source(
+                                        src_idx, &src, &parts, trk, &pp, &fh, fs, &uh, &nn,
+                                        tp, up, bw, inj_progress_tx, ph, aich_m, sa, sq, sm, cm,
+                                        cmt, Some(cs.clone()), avail, Some(etx), tid, bi, ctrl,
+                                        obf_enabled, hello_server, inj_qw,
+                                        Some(inj_shared_out), inj_epx, inj_epx_gen,
+                                        inj_aich_p,
+                                        inj_ipf, inj_ban, inj_ext,
+                                        inj_geo, inj_fh,
+                                        inj_ember_hash,
+                                        inj_ember_pubkey,
+                                        inj_ember_secret,
+                                        inj_nick,
+                                        inj_sx_oh,
+                                        // The crucial bit: hand the
+                                        // already-handshaked stream to
+                                        // download_parts_from_source so it
+                                        // takes the adoption branch instead
+                                        // of dialing the LowID peer back.
+                                        Some(stream),
+                                        inj_missing_parts,
+                                    ) => res,
+                                    _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
+                                };
                                 if !freq_avail.is_empty() {
                                     let mut csel = cs.write().await;
                                     csel.remove_source(&freq_avail);
                                 }
                                 if let Err(e) = &result {
-                                    if !super::transfer::is_queue_detached_error(&e.to_string()) {
+                                    if !super::transfer::is_queue_detached_error(&e.to_string())
+                                        && !super::transfer::is_user_cancel_error(&e.to_string()) {
                                         warn!("Pre-established source {} ({}) failed: {e:#}", src_idx, fail_ip);
                                         let _ = fail_etx.send(DownloadEvent::SourceDetail {
                                             transfer_id: fail_tid,
@@ -2258,7 +2301,12 @@ impl MultiSourceDownload {
                         elapsed.as_secs_f64(),
                         wait.as_secs_f64(),
                     );
-                    tokio::time::sleep(wait).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = self.control.wait_cancelled() => {
+                            anyhow::bail!("cancelled by user");
+                        }
+                    }
                     check_control(&self.control).await?;
                 }
             }
@@ -2427,29 +2475,34 @@ impl MultiSourceDownload {
                         Err(_) => return,
                     };
                     let freq_avail = avail.clone();
-                    let result = download_parts_from_source(
-                        src_idx, &src, &parts, trk, &pp, &fh, fs, &uh, &nn,
-                        tp, up, bw, a_progress_tx, ph, aich_m, sa, sq, sm, cm,
-                        cmt, Some(cs.clone()), avail, Some(etx), tid, bi, ctrl,
-                        obf_enabled, hello_server, a_qw,
-                        Some(a_shared_out), a_epx, a_epx_gen,
-                        a_aich_p,
-                        a_ipf, a_ban, a_ext,
-                        a_geo, a_fh,
-                        a_ember_hash,
-                        a_ember_pubkey,
-                        a_ember_secret,
-                        a_nick,
-                        a_sx_oh,
-                        Some(stream),
-                        a_missing_parts,
-                    ).await;
+                    let cancel_ctrl = ctrl.clone();
+                    let result = tokio::select! {
+                        res = download_parts_from_source(
+                            src_idx, &src, &parts, trk, &pp, &fh, fs, &uh, &nn,
+                            tp, up, bw, a_progress_tx, ph, aich_m, sa, sq, sm, cm,
+                            cmt, Some(cs.clone()), avail, Some(etx), tid, bi, ctrl,
+                            obf_enabled, hello_server, a_qw,
+                            Some(a_shared_out), a_epx, a_epx_gen,
+                            a_aich_p,
+                            a_ipf, a_ban, a_ext,
+                            a_geo, a_fh,
+                            a_ember_hash,
+                            a_ember_pubkey,
+                            a_ember_secret,
+                            a_nick,
+                            a_sx_oh,
+                            Some(stream),
+                            a_missing_parts,
+                        ) => res,
+                        _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
+                    };
                     if !freq_avail.is_empty() {
                         let mut csel = cs.write().await;
                         csel.remove_source(&freq_avail);
                     }
                     if let Err(e) = &result {
-                        if !super::transfer::is_queue_detached_error(&e.to_string()) {
+                        if !super::transfer::is_queue_detached_error(&e.to_string())
+                                        && !super::transfer::is_user_cancel_error(&e.to_string()) {
                             warn!("Adopted callback source {} ({}) failed: {e:#}", src_idx, fail_ip);
                             let _ = fail_etx.send(DownloadEvent::SourceDetail {
                                 transfer_id: fail_tid,
@@ -2661,6 +2714,9 @@ impl MultiSourceDownload {
                         // arm inert when its channel is already closed.
                         tokio::select! {
                             biased;
+                            _ = self.control.wait_cancelled() => {
+                                anyhow::bail!("cancelled by user");
+                            }
                             _ = tokio::time::sleep(slice) => {}
                             new_src = async {
                                 match post_phase_new_source_rx.as_mut() {
@@ -2837,29 +2893,33 @@ impl MultiSourceDownload {
                         Ok(p) => p,
                         Err(_) => return,
                     };
-                    if let Err(e) = download_parts_from_source(
-                        src_idx, &source, &parts, tracker, &part_path,
-                        &file_hash, file_size, &user_hash, &nickname,
-                        tcp_port, udp_port, bw, retry_tx, ph, aich_m,
-                        ra, rq, rsm, rcm, rcmt, Some(rcs), ravail,
-                        Some(retx), rtid, rbi, rctrl, robf, rserver, r_qw,
-                        Some(r_shared_out), r_epx, r_epx_gen,
-                        r_aich_p,
-                        r_ipf, r_ban, r_ext,
-                        r_geo, r_fh,
-                        r_ember_hash,
-                        r_ember_pubkey,
-                        r_ember_secret,
-                        r_nick,
-                        r_sx_oh,
-                        // Retry round always re-dials; the original
-                        // pre-established stream (if any) was consumed
-                        // by the initial attempt and is no longer
-                        // alive by the time we retry.
-                        None,
-                        r_missing_parts,
-                    )
-                    .await {
+                    let cancel_ctrl = rctrl.clone();
+                    let result = tokio::select! {
+                        res = download_parts_from_source(
+                            src_idx, &source, &parts, tracker, &part_path,
+                            &file_hash, file_size, &user_hash, &nickname,
+                            tcp_port, udp_port, bw, retry_tx, ph, aich_m,
+                            ra, rq, rsm, rcm, rcmt, Some(rcs), ravail,
+                            Some(retx), rtid, rbi, rctrl, robf, rserver, r_qw,
+                            Some(r_shared_out), r_epx, r_epx_gen,
+                            r_aich_p,
+                            r_ipf, r_ban, r_ext,
+                            r_geo, r_fh,
+                            r_ember_hash,
+                            r_ember_pubkey,
+                            r_ember_secret,
+                            r_nick,
+                            r_sx_oh,
+                            // Retry round always re-dials; the original
+                            // pre-established stream (if any) was consumed
+                            // by the initial attempt and is no longer
+                            // alive by the time we retry.
+                            None,
+                            r_missing_parts,
+                        ) => res,
+                        _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
+                    };
+                    if let Err(e) = result {
                         let err_str = e.to_string();
                         // Queue-phase errors (peer kicked us from its
                         // upload queue, TCP dropped while queued, queue
@@ -2898,6 +2958,10 @@ impl MultiSourceDownload {
                                 "Retry source {} ({}): TCP dropped while queued — will re-dial after {}s cooldown",
                                 src_idx, r_src_ip, SOURCE_RETRY_COOLDOWN_SECS,
                             );
+                        } else if super::transfer::is_user_cancel_error(&err_str) {
+                            // User Stop/Cancel/Pause — clean teardown, not a
+                            // source failure; skip the penalty-bearing event.
+                            info!("Retry source {} ({}): stopped by user", src_idx, r_src_ip);
                         } else {
                             let _ = rfail_etx.send(DownloadEvent::SourceDetail {
                                 transfer_id: rfail_tid,
@@ -5829,6 +5893,28 @@ async fn download_parts_from_source(
                 loop {
                     tokio::select! {
                         biased;
+                        // User Stop/Cancel (or a network disconnect) landed
+                        // while we're actively downloading from this source.
+                        // Mirror eMule's CPartFile::PauseFile, which sends
+                        // OP_CANCELTRANSFER to every DS_DOWNLOADING peer so the
+                        // uploader frees our slot immediately rather than
+                        // waiting to notice the dropped TCP socket. Best-effort
+                        // + time-boxed so a wedged socket can't delay the stop,
+                        // then bail (the outer task `select!` grace window lets
+                        // this finish before it would force-drop the future).
+                        // Fires on Pause too: eMule's PauseFile notifies every
+                        // DS_DOWNLOADING source, so a paused active transfer
+                        // also frees the uploader's slot (the transfer's source
+                        // knowledge is kept by `PauseDownload` for fast resume).
+                        _ = control.wait_cancel_or_pause() => {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_millis(400),
+                                write_packet_async_ms(
+                                    &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
+                                ),
+                            ).await;
+                            anyhow::bail!("cancelled by user");
+                        }
                         // `read_packet_async_ms` returns `Result<_, io::Error>`;
                         // hoist into `anyhow::Error` here so the outer
                         // match arms stay aligned with the error-kind

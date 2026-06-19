@@ -125,6 +125,20 @@ pub const OP_EMBER_HELLOANSWER: u8 = 0xF9;
 pub const EMBLOCKSIZE: u64 = 184_320;
 pub const PARTSIZE: u64 = 9_728_000;
 
+/// eMule's "large file" threshold (`OLD_MAX_EMULE_FILE_SIZE`). A file is
+/// treated as *large* — and therefore offered to / requested from servers
+/// using the 64-bit size encoding — when its size **exceeds** this value, not
+/// when it exceeds `u32::MAX`. It is the largest whole number of parts that
+/// still fits in 32 bits: `(u32::MAX / PARTSIZE) * PARTSIZE` = 441 * 9_728_000.
+///
+/// This boundary matters on the wire: uploaders offer files in the
+/// `(OLD_MAX_EMULE_FILE_SIZE, u32::MAX]` window as large files (FT_FILESIZE +
+/// FT_FILESIZE_HI=0), so a server indexes them as large. A source request that
+/// uses only a 32-bit size for such a file won't match the server's large-file
+/// entry and comes back empty — which is why we must classify large files the
+/// same way eMule does in every OP_OFFERFILES / OP_GETSOURCES / OP_GLOBGETSOURCES2.
+pub const OLD_MAX_EMULE_FILE_SIZE: u64 = 4_290_048_000;
+
 /// Number of actual data chunks (≈9.28 MiB each) for a given file size.
 ///
 /// Matches eMule `CKnownFile::GetPartCount()` = `ceil(filesize / PARTSIZE)`.

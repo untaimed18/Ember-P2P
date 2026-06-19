@@ -304,8 +304,29 @@
         case 'kad_empty': msg = m.transfers_src_kad_empty(); break;
         default: msg = d.kind; break;
       }
-      searchStatus.set(d.transfer_id, msg);
-      searchStatus = new Map(searchStatus);
+      // Source-search events arrive per server / per KAD search and interleave
+      // across channels, so the status must not be clobbered by a less-useful
+      // later event. Rule: once a transfer has reported a "found" result, only
+      // another "found" may update its visible status — routine "empty" results
+      // (eMule servers stay silent for hashes they don't index, so most return
+      // nothing even when others have sources) AND in-progress "querying /
+      // searching" messages are both suppressed. Without this, a genuine find
+      // got overwritten — e.g. UDP returns sources, then a later `server_query`
+      // resets the status to "Searching…" and the trailing empties are
+      // suppressed, leaving the row stuck on "Searching…" despite having
+      // sources. Before any find, every kind updates the status normally (so a
+      // channel that finishes empty replaces "Searching…" rather than looking
+      // stuck).
+      const isFoundKind =
+        d.kind === 'server_found' || d.kind === 'udp_found' ||
+        d.kind === 'kad_found' || d.kind === 'kad_indirect';
+      if (isFoundKind) {
+        searchFoundIds.add(d.transfer_id);
+      }
+      if (isFoundKind || !searchFoundIds.has(d.transfer_id)) {
+        searchStatus.set(d.transfer_id, msg);
+        searchStatus = new Map(searchStatus);
+      }
       if (
         d.transfer_id === expandedTransferId &&
         count > 0 &&
@@ -351,6 +372,12 @@
   });
 
   let searchStatus: Map<string, string> = $state(new Map());
+  // Transfers that have reported at least one "found" source result. Used so a
+  // routine per-server/per-search "empty" event can't downgrade a genuine
+  // "found" status back to "no sources". Plain Set (not reactive) — it only
+  // gates handler logic and isn't rendered directly. Pruned alongside
+  // `searchStatus` when a transfer leaves the list.
+  const searchFoundIds = new Set<string>();
   let transferError: string | null = $state(null);
   let transferInfo: string | null = $state(null);
   let infoTimers: ReturnType<typeof setTimeout>[] = [];
@@ -2259,6 +2286,7 @@
       for (const key of searchStatus.keys()) {
         if (!ids.has(key)) {
           searchStatus.delete(key);
+          searchFoundIds.delete(key);
           mutated = true;
         }
       }
