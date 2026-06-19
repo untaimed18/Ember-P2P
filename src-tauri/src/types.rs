@@ -256,6 +256,7 @@ pub enum SourceStatus {
     Queued,
     QueueFull,
     NoNeededParts,
+    Stalled,
     Transferring,
     Completed,
     Failed,

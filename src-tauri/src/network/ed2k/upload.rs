@@ -1000,7 +1000,7 @@ pub(crate) fn compute_queue_rank(
 }
 
 /// eMule MAX_PURGEQUEUETIME: 1 hour in seconds
-const MAX_PURGEQUEUETIME_SECS: u64 = 3600;
+pub(crate) const MAX_PURGEQUEUETIME_SECS: u64 = 3600;
 
 /// Compute the rank of a queued peer reached over UDP (OP_REASKFILEPING).
 ///
@@ -2717,7 +2717,7 @@ impl UploadHandler {
         // challenge there can populate `pending_secident_challenge`.)
         let queue_identity = QueueIdentity::from_peer(peer_user_hash, peer_addr);
         let mut queued_identity: Option<QueueIdentity> = None;
-        let queue_join_time: std::time::Instant = std::time::Instant::now();
+        let mut queue_join_time: std::time::Instant = std::time::Instant::now();
         let mut queue_wait_at_grant: u64 = 0;
         let mut last_rank_sent: Option<u16> = None;
         let mut last_rank_resend = std::time::Instant::now();
@@ -3686,6 +3686,7 @@ impl UploadHandler {
                         .load(std::sync::atomic::Ordering::Relaxed);
 
                     let dynamic_slots = self.compute_dynamic_slot_count();
+                    let mut removed_queue_join_time: Option<std::time::Instant> = None;
                     let should_accept = if current_active >= dynamic_slots {
                         false
                     } else {
@@ -3711,7 +3712,8 @@ impl UploadHandler {
                             // slot, so this cannot over-grant.
                             let mut queue = self.upload_queue.lock().await;
                             if let Some(pos) = queue.iter().position(|e| e.identity == queue_identity) {
-                                queue.remove(pos);
+                                let removed = queue.remove(pos);
+                                removed_queue_join_time = Some(removed.join_time);
                             }
                             true
                         } else {
@@ -3770,7 +3772,8 @@ impl UploadHandler {
                                 Some(bi) if bi == queue_identity => {
                                     let mut queue = self.upload_queue.lock().await;
                                     if let Some(pos) = queue.iter().position(|e| e.identity == queue_identity) {
-                                        queue.remove(pos);
+                                        let removed = queue.remove(pos);
+                                        removed_queue_join_time = Some(removed.join_time);
                                     }
                                     true
                                 }
@@ -3788,6 +3791,9 @@ impl UploadHandler {
                     // race we fall through to the queue path (which re-inserts the
                     // entry that the `should_accept` scoring may have removed).
                     let should_accept = should_accept && slot_guard.try_activate(dynamic_slots);
+                    if let Some(join_time) = removed_queue_join_time {
+                        queue_join_time = join_time;
+                    }
 
                     if !should_accept {
                         // Friend-slot priority requires proof-of-possession
@@ -3816,9 +3822,13 @@ impl UploadHandler {
                             if is_verified_friend {
                                 queue[pos].is_friend_slot = true;
                             }
+                            let ember_verified = ember_auth_state.is_verified();
+                            queue[pos].ember_verified |= ember_verified;
+                            if queue[pos].ember_pubkey.is_none() {
+                                queue[pos].ember_pubkey = hello_caps.ember_pubkey;
+                            }
                             let cm = self.credit_manager.read().await;
                             let idx_snap = self.local_index.read().await;
-                            let ember_verified = ember_auth_state.is_verified();
                             let my_score = score_queue_entry(
                                 &cm, &idx_snap, &peer_user_hash,
                                 current_file_hash.unwrap_or([0u8; 16]),
@@ -3863,7 +3873,7 @@ impl UploadHandler {
                                 total / queue.len() as f64
                             };
                             if new_score >= avg_score {
-                                let join_time = std::time::Instant::now();
+                                let join_time = queue_join_time;
                                 queue.push(QueueEntry {
                                     identity: queue_identity.clone(),
                                     current_addr: Some(peer_addr),
@@ -3895,7 +3905,7 @@ impl UploadHandler {
                             let cm = self.credit_manager.read().await;
                             let idx_snap = self.local_index.read().await;
                             let new_fh = current_file_hash.unwrap_or([0u8; 16]);
-                            let join_time = std::time::Instant::now();
+                            let join_time = queue_join_time;
                             let ember_verified = ember_auth_state.is_verified();
                             queue.push(QueueEntry {
                                 identity: queue_identity.clone(),
@@ -5986,10 +5996,20 @@ impl UploadHandler {
                 .await;
         }
 
-        // Remove from upload queue on disconnect
+        // Keep queued peers on disconnect, but mark them disconnected.
+        // eMule preserves LowID/disconnected queue entries until the normal
+        // purge window; immediate removal destroys seniority and makes the
+        // `add_next_connect` fast path unreachable. The queue's 1-hour purge
+        // cap bounds stale entries.
         {
             let mut queue = self.upload_queue.lock().await;
-            queue.retain(|e| e.identity != queue_identity);
+            queue.retain_mut(|e| {
+                if e.identity != queue_identity {
+                    return true;
+                }
+                e.current_addr = None;
+                true
+            });
         }
 
         self.slot_rates

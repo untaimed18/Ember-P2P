@@ -5,8 +5,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
+use digest::Digest;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 use futures::stream::{FuturesUnordered, StreamExt};
+use md4::Md4;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
@@ -59,6 +61,56 @@ pub(crate) fn peer_confirmed_missing_part(
         }
     }
     false
+}
+
+fn corrupt_part_indices_on_disk(
+    path: &std::path::Path,
+    file_size: u64,
+    expected_part_hashes: &[[u8; 16]],
+) -> anyhow::Result<Vec<usize>> {
+    let part_count = file_size.div_ceil(super::hash::PARTSIZE) as usize;
+    if part_count == 0 {
+        return Ok(Vec::new());
+    }
+    if expected_part_hashes.len() < part_count {
+        return Ok((0..part_count).collect());
+    }
+
+    let mut file = std::fs::File::open(path)?;
+    let actual_len = file.metadata()?.len();
+    if actual_len != file_size {
+        return Ok((0..part_count).collect());
+    }
+
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut corrupt = Vec::new();
+    let mut remaining_file = file_size;
+
+    for (part_idx, expected_hash) in expected_part_hashes.iter().take(part_count).enumerate() {
+        let part_len = remaining_file.min(super::hash::PARTSIZE);
+        let mut part_remaining = part_len;
+        let mut hasher = Md4::new();
+
+        while part_remaining > 0 {
+            use std::io::Read;
+            let to_read = (part_remaining as usize).min(buf.len());
+            let read = file.read(&mut buf[..to_read])?;
+            if read == 0 {
+                corrupt.extend(part_idx..part_count);
+                return Ok(corrupt);
+            }
+            hasher.update(&buf[..read]);
+            part_remaining -= read as u64;
+        }
+
+        let actual_hash: [u8; 16] = hasher.finalize().into();
+        if &actual_hash != expected_hash {
+            corrupt.push(part_idx);
+        }
+        remaining_file = remaining_file.saturating_sub(part_len);
+    }
+
+    Ok(corrupt)
 }
 
 /// Record that peer `(ip, port)` dropped the TCP connection immediately
@@ -3093,104 +3145,45 @@ impl MultiSourceDownload {
                 warn!("Pre-finalize fsync failed for {}: {e}", self.file_name);
             }
 
-            // Fast path: recompute the file hash from the part hashes (no disk
-            // I/O). Crucially this is only sound when EVERY part was actually
-            // MD4-verified during download: `ed2k_hash_from_parts` derives the
-            // hash from the already-hashset-verified part hashes, so it always
-            // equals `file_hash` and reads nothing from disk — it does NOT
-            // check the on-disk bytes. A part whose gaps were filled by
-            // cross-part pipelining (then race-skipped) or loaded complete-but-
-            // unverified from a resumed `.part` would otherwise sail through.
-            // Gate on `all_parts_verified()` and fall back to a full disk
-            // re-read so corrupt bytes can't be published as a verified file.
+            // Always re-read the `.part` file before finalizing. eMule's
+            // completion path trusts verified parts, but our process can be
+            // killed between metadata and data writes, and external tools can
+            // touch Temp files. A hash-of-known-part-hashes cannot detect that
+            // the bytes currently on disk diverged from the verified state.
             let expected = hex::encode(self.file_hash);
-            let num_parts =
-                ((self.file_size + super::hash::PARTSIZE - 1) / super::hash::PARTSIZE) as usize;
-            let all_parts_verified = {
-                let t = tracker.read().await;
-                t.all_parts_verified()
-            };
-            let ph = part_hashes.read().await;
-            let can_use_fast_verify = self.file_size >= super::hash::PARTSIZE
-                && !ph.is_empty()
-                && ph.len() >= num_parts
-                && all_parts_verified;
-
-            let verified_ok = if can_use_fast_verify {
-                let actual = super::hash::ed2k_hash_from_parts(&ph, self.file_size);
-                drop(ph);
-                if actual == expected {
+            let verify_path = part_path.clone();
+            let verified_ok = match tokio::task::spawn_blocking(move || {
+                super::hash::ed2k_hash_file(&verify_path)
+            })
+            .await
+            {
+                Ok(Ok(actual)) if actual == expected => {
                     info!(
-                        "Multi-source download verified from part hashes (no re-read): {}",
+                        "Multi-source download complete and verified from disk: {}",
                         self.file_name
                     );
                     true
-                } else {
+                }
+                Ok(Ok(actual)) => {
                     warn!(
-                        "Multi-source hash mismatch from parts for {}: expected={}, got={} — falling back to full rehash",
+                        "Multi-source download hash mismatch for {}: expected={}, got={}",
                         self.file_name, expected, actual
                     );
-                    let verify_path = part_path.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        super::hash::ed2k_hash_file(&verify_path)
-                    })
-                    .await
-                    {
-                        Ok(Ok(h)) if h == expected => {
-                            info!("Full rehash matched for {}", self.file_name);
-                            true
-                        }
-                        Ok(Ok(h)) => {
-                            warn!(
-                                "Full rehash also mismatched for {}: got={}",
-                                self.file_name, h
-                            );
-                            false
-                        }
-                        Ok(Err(e)) => {
-                            warn!("Full rehash failed for {}: {e}", self.file_name);
-                            false
-                        }
-                        Err(e) => {
-                            warn!("Full rehash task failed for {}: {e}", self.file_name);
-                            false
-                        }
-                    }
+                    false
                 }
-            } else {
-                drop(ph);
-                let verify_path = part_path.clone();
-                match tokio::task::spawn_blocking(move || super::hash::ed2k_hash_file(&verify_path))
-                    .await
-                {
-                    Ok(Ok(actual)) if actual == expected => {
-                        info!(
-                            "Multi-source download complete and verified: {}",
-                            self.file_name
-                        );
-                        true
-                    }
-                    Ok(Ok(actual)) => {
-                        warn!(
-                            "Multi-source download hash mismatch for {}: expected={}, got={}",
-                            self.file_name, expected, actual
-                        );
-                        false
-                    }
-                    Ok(Err(e)) => {
-                        warn!(
-                            "Could not verify hash for {}: {e} — treating as failed",
-                            self.file_name
-                        );
-                        false
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Hash verification task failed for {}: {e} — treating as failed",
-                            self.file_name
-                        );
-                        false
-                    }
+                Ok(Err(e)) => {
+                    warn!(
+                        "Could not verify hash for {}: {e} — treating as failed",
+                        self.file_name
+                    );
+                    false
+                }
+                Err(e) => {
+                    warn!(
+                        "Hash verification task failed for {}: {e} — treating as failed",
+                        self.file_name
+                    );
+                    false
                 }
             };
 
@@ -3223,17 +3216,36 @@ impl MultiSourceDownload {
                     })
                     .await;
             } else {
-                // Hash failed — re-open all parts as incomplete so retries
-                // can re-download them (we can't identify which parts are
-                // corrupt without per-part hashes).
+                let expected_part_hashes = part_hashes.read().await.clone();
+                let diagnose_path = part_path.clone();
+                let diagnose_size = self.file_size;
+                let corrupt_parts = tokio::task::spawn_blocking(move || {
+                    corrupt_part_indices_on_disk(
+                        &diagnose_path,
+                        diagnose_size,
+                        &expected_part_hashes,
+                    )
+                })
+                .await
+                .ok()
+                .and_then(Result::ok);
+
                 let (corrected_bytes, snap) = {
                     let mut t = tracker.write().await;
-                    for i in 0..t.part_count {
-                        t.mark_incomplete(i);
+                    let mut parts_to_reopen = corrupt_parts.unwrap_or_default();
+                    if parts_to_reopen.is_empty() {
+                        parts_to_reopen = (0..t.part_count).collect();
+                    }
+                    for &i in &parts_to_reopen {
+                        if i < t.part_count {
+                            t.mark_incomplete(i);
+                        }
                     }
                     warn!(
-                        "Final hash failed for {} — re-opened all {} parts for retry",
-                        self.file_name, t.part_count
+                        "Final hash failed for {} — re-opened {}/{} part(s) for retry",
+                        self.file_name,
+                        parts_to_reopen.len(),
+                        t.part_count
                     );
                     (t.completed_bytes(), t.snapshot_for_save())
                 };
